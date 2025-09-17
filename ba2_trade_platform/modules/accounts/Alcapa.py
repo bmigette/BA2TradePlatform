@@ -6,7 +6,7 @@ from ...logger import logger
 from ...core.models import TradingOrder, Position
 from ...core.types import OrderStatus
 from ...config import APCA_API_KEY_ID, APCA_API_SECRET_KEY, APCA_API_BASE_URL
-from .AccountInterface import AccountInterface
+from ...core.AccountInterface import AccountInterface
 
 class AlpacaAccount(AccountInterface):
     """
