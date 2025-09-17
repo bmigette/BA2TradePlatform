@@ -1,7 +1,9 @@
 # my tools
 nicegui
-ibind
-sqlalchemy
+alpaca-py
+sqlmodel
+python-dotenv
+
 
 # TradingAgents Tools
 typing-extensions
