@@ -1,6 +1,6 @@
 from contextlib import contextmanager
 
-from .menu import menu
+from .menus import topmenu, sidemenu
 
 from nicegui import ui
 
@@ -13,7 +13,7 @@ def layout_render(navigation_title: str):
         ui.label('Footer')
 
     with ui.left_drawer().classes('bg-[#36454F] text-white') as left_drawer:
-        ui.label('Side menu')
+        sidemenu()
 
     with ui.page_sticky(position='bottom-right', x_offset=20, y_offset=20):
         ui.button(on_click=footer.toggle, icon='contact_support').props('fab')
@@ -24,6 +24,6 @@ def layout_render(navigation_title: str):
         ui.label(navigation_title)
         ui.space()
         with ui.row():
-            menu()
-    with ui.column().classes('absolute-center items-center'):
+            topmenu()
+    with ui.column().classes('items-center'):
         yield
