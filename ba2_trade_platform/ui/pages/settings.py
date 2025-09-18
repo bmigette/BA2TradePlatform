@@ -4,7 +4,7 @@ from sqlmodel import select
 
 from ...core.models import AccountDefinition, AccountSetting
 from ...logger import logger
-from ...core.db import get_db
+from ...core.db import get_db, get_all_instances, delete_instance, add_instance, update_instance, get_instance
 
 class AccountDefinitionsTab:
     def __init__(self):
@@ -13,13 +13,22 @@ class AccountDefinitionsTab:
         self.accounts_table = None
         self.account_settings()
 
+    def _update_table_rows(self):
+        if self.accounts_table:
+            accounts = list(get_all_instances(AccountDefinition))
+            self.accounts_table.rows = [dict(a) for a in accounts]
+            #self.accounts_table.refresh()
+            logger.info('Accounts table rows updated')
+        else:
+            logger.warning('Accounts table is not initialized yet')
+
     def save_account(self, account: Optional[AccountDefinition] = None) -> None:
         try:
             if account:
                 account.provider = self.type_select.value
                 account.name = self.name_input.value
                 account.description = self.desc_input.value
-                account.save()
+                update_instance(account)
                 logger.info(f"Updated account: {account.name}")
             else:
                 new_account = AccountDefinition(
@@ -27,14 +36,10 @@ class AccountDefinitionsTab:
                     name=self.name_input.value,
                     description=self.desc_input.value
                 )
-                session = get_db()
-                try:
-                    session.add(new_account)
-                    session.commit()
-                finally:
-                    session.close()
+                add_instance(new_account)
                 logger.info(f"Created new account: {self.name_input.value}")
             self.dialog.close()
+            self._update_table_rows()
             
         except Exception as e:
             logger.error(f"Error saving account: {str(e)}", exc_info=True)
@@ -42,9 +47,9 @@ class AccountDefinitionsTab:
 
     def delete_account(self, account: AccountDefinition) -> None:
         try:
-            account.delete()
+            delete_instance(account)
             logger.info(f"Deleted account: {account.name}")
-            self.accounts_table.refresh()
+            self._update_table_rows()
         except Exception as e:
             logger.error(f"Error deleting account: {str(e)}")
             ui.notify("Error deleting account", type="error")
@@ -64,21 +69,39 @@ class AccountDefinitionsTab:
                 ui.button('Save', on_click=lambda: self.save_account(account))
         self.dialog.open()
 
+    def _on_table_edit_click(self, msg) -> None:
+        logger.debug('Handling edit account from table, data %s', msg)
+        row = msg.args['row']
+        account_id = row['id']
+        account = get_instance(AccountDefinition, account_id)
+        if account:
+            self.show_dialog(account)
+        else:
+            ui.notify("Account not found", type="error")
+            logger.warning(f"Account with id {account_id} not found")
+    
+    def _on_table_del_click(self, msg) -> None:
+        logger.debug('Handling delete account from table, data %s', msg)
+        row = msg.args['row']
+        account_id = row['id']
+        account = get_instance(AccountDefinition, account_id)
+        if account:
+            self.delete_account(account)
+        else:
+            ui.notify("Account not found", type="error")
+            logger.warning(f"Account with id {account_id} not found")
+
     def account_settings(self) -> None:
         logger.debug('Loading account settings')
-        session = get_db()
-        try:
-            statement = select(AccountDefinition)
-            accounts = list(session.exec(statement))
-            logger.info(f'Loaded {len(accounts)} accounts')
-        finally:
-            session.close()
+        accounts = list(get_all_instances(AccountDefinition))
+        logger.info(f'Loaded {len(accounts)} accounts')
+
 
         with ui.card().classes('w-full'):
             ui.button('Add Account', on_click=lambda: self.show_dialog())
             self.accounts_table = ui.table(
                 columns=[
-                    {'name': 'type', 'label': 'Type', 'field': 'provider'},
+                    {'name': 'provider', 'label': 'Provider', 'field': 'provider'},
                     {'name': 'name', 'label': 'Name', 'field': 'name'},
                     {'name': 'description', 'label': 'Description', 'field': 'description'},
                     {'name': 'actions', 'label': 'Actions', 'field': 'actions'}
@@ -92,9 +115,9 @@ class AccountDefinitionsTab:
                     <q-btn @click="$parent.$emit('del', props)" icon="delete" flat dense color='red'/>
                 </q-td>
             """)
-            
-            self.accounts_table.on('edit', lambda msg: ui.notify("edit: "+ str(msg)))
-            self.accounts_table.on('del', lambda msg: ui.notify("del: "+ str(msg)))
+
+            self.accounts_table.on('edit', self._on_table_edit_click)
+            self.accounts_table.on('del', self._on_table_del_click)
             # for row in accounts:
             #     with self.accounts_table.add_slot('body-cell-actions', row):
             #         ui.button(icon='edit', on_click=lambda r=row: self.show_dialog(r))

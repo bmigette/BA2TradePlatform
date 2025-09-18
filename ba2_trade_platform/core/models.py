@@ -5,29 +5,29 @@ from .types import InstrumentType, OrderStatus, OrderDirection
 from datetime import datetime
 
 class AppSetting(SQLModel, table=True):
-    dbid: int | None = Field(default=None, primary_key=True)
+    id: int | None = Field(default=None, primary_key=True)
     key: str 
     value_str: str | None 
     value_json:  Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict)
     value_float: float | None 
 
 class AccountSetting(SQLModel, table=True):
-    dbid: int | None = Field(default=None, primary_key=True)
-    account_id: int = Field(foreign_key="accountdefinition.dbid", nullable=False)
+    id: int | None = Field(default=None, primary_key=True)
+    account_id: int = Field(foreign_key="accountdefinition.id", nullable=False)
     value_str: str | None 
     value_json:  Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict)
     value_float: float | None 
 
 class AccountDefinition(SQLModel, table=True):
-    dbid: int | None = Field(default=None, primary_key=True)
+    id: int | None = Field(default=None, primary_key=True)
     name: str 
     provider: str 
     description: str | None 
 
 
 class TradingOrder(SQLModel, table=True):
-    dbid: int | None = Field(default=None, primary_key=True)
-    id: str | None
+    id: int | None = Field(default=None, primary_key=True)
+    order_id: str | None
     symbol: str
     quantity: float
     side: str 
@@ -66,7 +66,7 @@ class Position(SQLModel, table=True):
     including price, quantity, profit/loss metrics, and other trading-related information.
 
     Attributes:
-        dbid (int | None): Primary key for database record identification.
+        id (int | None): Primary key for database record identification.
         asset_class (str): Name of the asset's asset class.
         avg_entry_price (float): The average entry price of the position.
         avg_entry_swap_rate (float | None): The average exchange rate the price was converted into the local currency at.
@@ -86,7 +86,7 @@ class Position(SQLModel, table=True):
         unrealized_pl (float): Unrealized profit/loss in dollars.
         unrealized_plpc (float): Unrealized profit/loss percent.
     """
-    dbid: int | None = Field(default=None, primary_key=True)
+    id: int | None = Field(default=None, primary_key=True)
     asset_class: str
     avg_entry_price: float
     avg_entry_swap_rate: float | None

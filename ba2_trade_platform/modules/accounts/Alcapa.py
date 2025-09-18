@@ -45,7 +45,7 @@ class AlpacaAccount(AccountInterface):
             TradingOrder: A TradingOrder object containing the order information.
         """
         return TradingOrder(
-            id=getattr(order, "id", None),
+            order_id=getattr(order, "id", None),
             symbol=getattr(order, "symbol", None),
             quantity=getattr(order, "qty", None),
             side=getattr(order, "side", None),
