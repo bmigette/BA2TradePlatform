@@ -18,7 +18,7 @@ def layout_render(navigation_title: str):
     with ui.page_sticky(position='bottom-right', x_offset=20, y_offset=20):
         ui.button(on_click=footer.toggle, icon='contact_support').props('fab')
 
-    with ui.header():
+    with ui.header().classes('text-xl no-wrap'):
         ui.button(on_click=lambda: left_drawer.toggle(), icon='menu').props('flat color=white')
         ui.space()
         ui.label(navigation_title)

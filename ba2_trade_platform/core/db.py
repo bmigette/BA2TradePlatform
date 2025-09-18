@@ -18,11 +18,15 @@ def init_db():
     os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
     SQLModel.metadata.create_all(engine)
 
-def get_db():
+def get_db_gen():
     """Dependency to get DB session."""
-    session = Session(engine)
-    try:       
-       yield session
-    finally:
-        session.close()
+    with Session(engine) as session:
+        try: 
+            yield session
+        finally:
+            session.close()
+
+def get_db():
+    """Get a DB session without yielding."""
+    return Session(engine)
 
