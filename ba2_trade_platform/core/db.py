@@ -2,7 +2,7 @@ from sqlmodel import  Field, Session, SQLModel, create_engine
 
 from ..config import DB_FILE
 from ..logger import logger
-from sqlalchemy import String, Float, JSON
+from sqlalchemy import String, Float, JSON, select
 import os
 
 
@@ -89,9 +89,11 @@ def get_all_instances(model_class):
     """Retrieve all instances of a model."""
     try:
         with Session(engine) as session:
-            instances = session.query(model_class).all()
+            statement = select(model_class)
+            results = session.exec(statement)
+            instances = results.all()
             logger.info(f"Retrieved {len(instances)} instances of {model_class.__name__}")
-            return instances
+            return [i[0] for i in instances] # https://stackoverflow.com/questions/1958219/how-to-convert-sqlalchemy-row-object-to-a-python-dict
     except Exception as e:
         logger.error(f"Error retrieving all instances: {e}", exc_info=True)
         raise

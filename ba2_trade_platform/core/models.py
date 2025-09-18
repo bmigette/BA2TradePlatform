@@ -14,6 +14,7 @@ class AppSetting(SQLModel, table=True):
 class AccountSetting(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     account_id: int = Field(foreign_key="accountdefinition.id", nullable=False)
+    key: str
     value_str: str | None 
     value_json:  Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict)
     value_float: float | None 

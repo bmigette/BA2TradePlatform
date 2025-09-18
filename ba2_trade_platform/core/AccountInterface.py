@@ -1,14 +1,66 @@
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
 from ..logger import logger
-
+from ..core.models import AccountSetting
+from ..core.db import get_instance, get_db
+from sqlmodel import select
 class AccountInterface(ABC):
     """
     Abstract base class for trading account interfaces.
     Defines the required methods for account implementations.
     """
+    def __init__(self, id: int):
+        """
+        Initialize the account with a unique identifier.
+
+        Args:
+            id (int): The unique identifier for the account.
+        """
+        self.id = id
 
 
+    @classmethod
+    @abstractmethod
+    def get_settings_definitions(cls) -> Dict[str, Any]:
+        """
+        Return a dictionary defining the required configuration/settings for the account implementation.
+
+        Returns:
+            Dict[str, Any]: A dictionary where keys are setting names and values are metadata such as:
+                - type: The expected type (str, float, json)
+                - required: Whether the setting is mandatory
+                - description: Human-readable description of the setting
+        """
+        pass
+
+    @property
+    def settings(self) -> Dict[str, Any]:
+        """
+        Loads and returns account settings using the AccountSetting model
+        based on the settings definitions provided by the implementation.
+        """
+        try:
+            definitions = type(self).get_settings_definitions()
+            session = get_db()
+            statement = select(AccountSetting).where(AccountSetting.account_id == self.id)
+            results = session.exec(statement)
+            settings_value_from_db = results.all()
+            settings = {k : None for k in definitions.keys()}
+
+            for setting in settings_value_from_db:
+                definition = definitions.get(setting.key, {})
+                value_type = definition.get("type", "str")
+                if value_type == "json":
+                    settings[setting.key] = setting.value_json
+                elif value_type == "float":
+                    settings[setting.key] = setting.value_float
+                else:
+                    settings[setting.key] = setting.value_str
+            logger.info(f"Loaded settings for account ID {self.id}: {settings}")
+            return settings
+        except Exception as e:
+            logger.error(f"Error loading account settings: {e}")
+            raise
 
     @abstractmethod
     def get_account_info(self) -> Dict[str, Any]:

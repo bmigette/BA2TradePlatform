@@ -5,6 +5,7 @@ from sqlmodel import select
 from ...core.models import AccountDefinition, AccountSetting
 from ...logger import logger
 from ...core.db import get_db, get_all_instances, delete_instance, add_instance, update_instance, get_instance
+from ...modules.accounts import providers
 
 class AccountDefinitionsTab:
     def __init__(self):
@@ -58,16 +59,45 @@ class AccountDefinitionsTab:
         logger.debug(f'Showing account dialog for account: {account.name if account else "new account"}')
         with self.dialog:
             self.dialog.clear()
-               
-            with ui.card():
-                self.type_select = ui.select(['alpaca'], label='Account Provider').classes('w-full')
+            provider_names = list(providers.keys())
+            with ui.card() as card:
+                self.type_select = ui.select(provider_names, label='Account Provider').classes('w-full')
                 self.name_input = ui.input(label='Account Name')
                 self.desc_input = ui.input(label='Description')
-                self.type_select.value = account.provider if account else 'alpaca'
+                self.type_select.value = account.provider if account else provider_names[0]
                 self.name_input.value = account.name if account else ''
                 self.desc_input.value = account.description if account else ''
+                self.dynamic_settings_container = ui.column().classes('w-full')
+                self._render_dynamic_settings(self.type_select.value, account)
+                self.type_select.on('update:model-value', lambda e: self._on_provider_change(e, account))
                 ui.button('Save', on_click=lambda: self.save_account(account))
         self.dialog.open()
+
+    def _on_provider_change(self, event, account):
+        provider = event.value if hasattr(event, 'value') else event
+        logger.debug(f'Provider changed to: {provider}')
+        self.dynamic_settings_container.clear()
+        self._render_dynamic_settings(provider, account)
+
+    def _render_dynamic_settings(self, provider, account=None):
+        # Example: Render provider-specific fields dynamically
+        provider_config = providers.get(provider, {})
+        settings_def = provider_config.get_settings_definitions()
+        settings_values = provider_config(account.id).settings if account else {}
+        self.settings_inputs = {}
+        if settings_def and len(settings_def.keys()) > 0:
+            for key, meta in settings_def.items():
+                label = meta.get("description", key)
+                value = settings_values.get(key, None) if settings_values else None
+                if meta["type"] == "str":
+                    inp = ui.input(label=label, value=value or "").classes('w-full')
+                elif meta["type"] == "bool":
+                    inp = ui.checkbox(text=label, value=bool(value) if value is not None else False)
+                else:
+                    inp = ui.input(label=label, value=value or "").classes('w-full')
+                self.settings_inputs[key] = inp
+        else:
+            ui.label("No provider-specific settings available.")
 
     def _on_table_edit_click(self, msg) -> None:
         logger.debug('Handling edit account from table, data %s', msg)

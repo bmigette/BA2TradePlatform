@@ -14,26 +14,44 @@ class AlpacaAccount(AccountInterface):
     This class provides methods for managing orders, positions, and account information through
     the Alpaca trading API.
     """
-    def __init__(self):
+    def __init__(self, id: int):
         """
         Initialize the AlpacaAccount with API credentials.
         Establishes connection with Alpaca trading API using credentials from config.
+
+        Args:
+            id (int): The unique identifier for the account.
         
         Raises:
             Exception: If initialization of Alpaca TradingClient fails.
         """
+        super().__init__(id)
+
         try:
-            self.client = TradingClient(
-                api_key=APCA_API_KEY_ID,
-                secret_key=APCA_API_SECRET_KEY,
-                paper=True if "paper" in APCA_API_BASE_URL else False,
-                #base_url=APCA_API_BASE_URL
-            )
+            # FIXME
+            # self.client = TradingClient(
+            #     api_key=APCA_API_KEY_ID,
+            #     secret_key=APCA_API_SECRET_KEY,
+            #     paper=True if "paper" in APCA_API_BASE_URL else False,
+            #     #base_url=APCA_API_BASE_URL
+            # )
             logger.info("Alpaca TradingClient initialized.")
         except Exception as e:
             logger.error(f"Failed to initialize Alpaca TradingClient: {e}")
             raise
-    
+        
+    def get_settings_definitions() -> Dict[str, Any]:
+        """
+        Return the settings definitions required for AlpacaAccount.
+
+        Returns:
+            dict: Dictionary with setting names and their types.
+        """
+        return {
+            "api_key": {"type": 'str', "required": True, "description": "Alpaca API Key ID"},
+            "api_secret": {"type": 'str', "required": True, "description": "Alpaca API Secret Key"},
+            "paper_account": {"type": 'bool', "required": True, "description": "Is this a paper trading account?"}
+        }
     def alpaca_order_to_tradingorder(self, order):
         """
         Convert an Alpaca order object to a TradingOrder object.
