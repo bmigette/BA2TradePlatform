@@ -1,12 +1,93 @@
+import pandas as pd
 from nicegui import ui
 from typing import Optional
 from sqlmodel import select
 
-from ...core.models import AccountDefinition, AccountSetting, AppSetting
+
+from ...core.models import AccountDefinition, AccountSetting, AppSetting, Instrument
 from ...logger import logger
 from ...core.db import get_db, get_all_instances, delete_instance, add_instance, update_instance, get_instance
 from ...modules.accounts import providers
 from ...core.AccountInterface import AccountInterface
+
+# --- InstrumentSettingsTab ---
+class InstrumentSettingsTab:
+    """
+    UI tab for managing instruments (Instrument SQL Model).
+    Features: table with filter, fetch info, import, and add instrument.
+    """
+    def __init__(self):
+        self.filter_text = ''
+        self.render()
+
+    def render(self):
+        with ui.card().classes('w-full'):
+            ui.label('Instrument Management')
+            
+            with ui.row():
+                ui.input(label='Filter', on_change=self.on_filter_change).bind_value(self, 'filter_text')
+                ui.button('Fetch Info', on_click=self.fetch_info)
+                ui.button('Import', on_click=self.import_instruments)
+                ui.button('Add Instrument', on_click=self.add_instrument_dialog)
+            self.table = ui.table(
+                columns=[
+                    {'name': 'id', 'label': 'ID', 'field': 'id'},
+                    {'name': 'name', 'label': 'Name', 'field': 'name'},
+                    {'name': 'instrument_type', 'label': 'Type', 'field': 'instrument_type'},
+                    {'name': 'categories', 'label': 'Categories', 'field': 'categories'},
+                    {'name': 'labels', 'label': 'Labels', 'field': 'labels'},
+                ],
+                rows=self.get_filtered_rows(),
+                row_key='id',
+                #filter=self.filter_text #TODO FIXME
+            ).classes('w-full')
+
+    def get_filtered_rows(self):
+        session = get_db()
+        instruments = session.query(Instrument).all()
+        if self.filter_text:
+            return [i.__dict__ for i in instruments if self.filter_text.lower() in i.name.lower()]
+        return [i.__dict__ for i in instruments]
+
+    def on_filter_change(self):
+        self.table.rows = self.get_filtered_rows()
+        self.table.refresh()
+
+    def fetch_info(self):
+        ui.notify('Fetch info not implemented (stub)', type='warning')
+
+    def import_instruments(self):
+        # Example: Import S&P 500 from Wikipedia
+        url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+        try:
+            table = pd.read_html(url)[0]
+            names = table['Symbol'].tolist()
+            session = get_db()
+            for name in names:
+                if not session.query(Instrument).filter_by(name=name).first():
+                    inst = Instrument(name=name, instrument_type='stock', categories=[], labels=[])
+                    add_instance(inst, session)
+            session.commit()
+            ui.notify(f'Imported {len(names)} instruments.', type='positive')
+            self.on_filter_change()
+        except Exception as e:
+            ui.notify(f'Import failed: {e}', type='negative')
+
+    def add_instrument_dialog(self):
+        with ui.dialog() as dialog:
+            dialog.clear()
+            name_input = ui.input(label='Instrument Name')
+            type_input = ui.input(label='Instrument Type')
+            def save():
+                session = get_db()
+                inst = Instrument(name=name_input.value, instrument_type=type_input.value, categories=[], labels=[])
+                add_instance(inst, session)
+                session.commit()
+                dialog.close()
+                self.on_filter_change()
+                ui.notify('Instrument added!', type='positive')
+            ui.button('Save', on_click=save)
+        dialog.open()
 
 # --- AppSettingsTab for static settings ---
 class AppSettingsTab:
@@ -262,4 +343,4 @@ def content() -> None:
         with ui.tab_panel('Trade Settings'):
             ui.label('Trade Settings')
         with ui.tab_panel('Instruments'):
-            ui.label('Instruments Settings')
+            InstrumentSettingsTab()
