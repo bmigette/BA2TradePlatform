@@ -3,7 +3,7 @@ nicegui
 alpaca-py
 sqlmodel
 python-dotenv
-
+yahooquery
 
 # TradingAgents Tools
 typing-extensions

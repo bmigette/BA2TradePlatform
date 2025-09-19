@@ -2,11 +2,58 @@ from nicegui import ui
 from typing import Optional
 from sqlmodel import select
 
-from ...core.models import AccountDefinition, AccountSetting
+from ...core.models import AccountDefinition, AccountSetting, AppSetting
 from ...logger import logger
 from ...core.db import get_db, get_all_instances, delete_instance, add_instance, update_instance, get_instance
 from ...modules.accounts import providers
 from ...core.AccountInterface import AccountInterface
+
+# --- AppSettingsTab for static settings ---
+class AppSettingsTab:
+    """
+    UI tab for editing and saving static application settings (OpenAI API Key, Finnhub API Key).
+    Uses the AppSetting model for persistence. Renders directly in the tab.
+    """
+    def __init__(self):
+        self.openai_input = None
+        self.finnhub_input = None
+        self.render()
+
+    def render(self):
+        session = get_db()
+        openai = session.exec(select(AppSetting).where(AppSetting.key == 'openai_api_key')).first()
+        finnhub = session.exec(select(AppSetting).where(AppSetting.key == 'finnhub_api_key')).first()
+        with ui.card().classes('w-full'):
+            self.openai_input = ui.input(label='OpenAI API Key', value=openai.value_str if openai else '').classes('w-full')
+            self.finnhub_input = ui.input(label='Finnhub API Key', value=finnhub.value_str if finnhub else '').classes('w-full')
+            ui.button('Save', on_click=self.save_settings)
+
+    def save_settings(self):
+        try:
+            session = get_db()
+            # OpenAI
+            openai = session.exec(select(AppSetting).where(AppSetting.key == 'openai_api_key')).first()
+            if openai:
+                openai.value_str = self.openai_input.value
+                update_instance(openai, session)
+            else:
+                openai = AppSetting(key='openai_api_key', value_str=self.openai_input.value)
+                add_instance(openai, session)
+
+            # Finnhub
+            finnhub = session.exec(select(AppSetting).where(AppSetting.key == 'finnhub_api_key')).first()
+            if finnhub:
+                finnhub.value_str = self.finnhub_input.value
+                update_instance(finnhub, session)
+            else:
+                finnhub = AppSetting(key='finnhub_api_key', value_str=self.finnhub_input.value)
+                add_instance(finnhub, session)
+            
+            session.commit()
+            ui.notify('Settings saved successfully', type='positive')
+        except Exception as e:
+            logger.error(f"Error saving settings: {str(e)}", exc_info=True)
+            ui.notify('Error saving settings', type='negative')
 class AccountDefinitionsTab:
     def __init__(self):
         logger.debug('Initializing AccountDefinitionsTab')
@@ -202,14 +249,17 @@ def content() -> None:
         ui.tab('Account Settings')
         ui.tab('Expert Settings')
         ui.tab('Trade Settings')
+        ui.tab('Instruments')
     logger.info('Settings page tabs initialized')
             
     with ui.tab_panels(tabs, value='Global Settings').classes('w-full'):
         with ui.tab_panel('Global Settings'):
-            ui.label('Global Settings')
+            AppSettingsTab()
         with ui.tab_panel('Account Settings'):
             AccountDefinitionsTab()
         with ui.tab_panel('Expert Settings'):
             ui.label('Expert Settings')
         with ui.tab_panel('Trade Settings'):
             ui.label('Trade Settings')
+        with ui.tab_panel('Instruments'):
+            ui.label('Instruments Settings')

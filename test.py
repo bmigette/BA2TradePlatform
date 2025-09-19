@@ -4,7 +4,7 @@ from ba2_trade_platform.modules.accounts.AlpacaAccount import AlpacaAccount
 from ba2_trade_platform.logger import logger
 from ba2_trade_platform.core.db import init_db, get_db
 
-acc = AlpacaAccount()
+acc = AlpacaAccount(1)
 orders = acc.get_orders()
 logger.info(f"Retrieved {len(orders)} orders from Alpaca.")
 logger.debug(orders)

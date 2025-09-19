@@ -4,8 +4,8 @@ from typing import Any, Dict, Optional
 
 from ...logger import logger
 from ...core.models import TradingOrder, Position
-from ...core.types import OrderStatus
-from ...config import APCA_API_KEY_ID, APCA_API_SECRET_KEY, APCA_API_BASE_URL
+from ...core.types import OrderDirection, OrderStatus
+
 from ...core.AccountInterface import AccountInterface
 
 class AlpacaAccount(AccountInterface):
@@ -28,13 +28,12 @@ class AlpacaAccount(AccountInterface):
         super().__init__(id)
 
         try:
-            # FIXME
-            # self.client = TradingClient(
-            #     api_key=APCA_API_KEY_ID,
-            #     secret_key=APCA_API_SECRET_KEY,
-            #     paper=True if "paper" in APCA_API_BASE_URL else False,
-            #     #base_url=APCA_API_BASE_URL
-            # )
+         
+            self.client = TradingClient(
+                api_key=self.settings["api_key"],
+                secret_key=self.settings["api_secret"],
+                paper=self.settings["paper_account"], # True if "paper" in APCA_API_BASE_URL else False
+            )
             logger.info("Alpaca TradingClient initialized.")
         except Exception as e:
             logger.error(f"Failed to initialize Alpaca TradingClient: {e}")
@@ -89,20 +88,20 @@ class AlpacaAccount(AccountInterface):
         """
         return Position(
             symbol=getattr(position, "symbol", None),
-            quantity=getattr(position, "qty", None),
-            qty_available=getattr(position, "qty_available", None),
-            average_entry_price=getattr(position, "avg_entry_price", None),
-            avg_entry_swap_rate=getattr(position, "avg_entry_swap_rate", None),
-            current_price=getattr(position, "current_price", None),
-            lastday_price=getattr(position, "lastday_price", None),
-            change_today=getattr(position, "change_today", None),
-            unrealized_pl=getattr(position, "unrealized_pl", None),
-            unrealized_plpc=getattr(position, "unrealized_plpc", None),
-            unrealized_intraday_pl=getattr(position, "unrealized_intraday_pl", None),
-            unrealized_intraday_plpc=getattr(position, "unrealized_intraday_plpc", None),
-            market_value=getattr(position, "market_value", None),
-            cost_basis=getattr(position, "cost_basis", None),
-            side=getattr(position, "side", None),
+            qty=float(getattr(position, "qty")) if getattr(position, "qty") is not None else None,
+            qty_available=float(getattr(position, "qty_available")) if getattr(position, "qty_available") is not None else None,
+            avg_entry_price=float(getattr(position, "avg_entry_price")) if getattr(position, "avg_entry_price") is not None else None,
+            avg_entry_swap_rate=float(getattr(position, "avg_entry_swap_rate")) if getattr(position, "avg_entry_swap_rate") is not None else None,
+            current_price=float(getattr(position, "current_price")) if getattr(position, "current_price") is not None else None,
+            lastday_price=float(getattr(position, "lastday_price")) if getattr(position, "lastday_price") is not None else None,
+            change_today=float(getattr(position, "change_today")) if getattr(position, "change_today") is not None else None,
+            unrealized_pl=float(getattr(position, "unrealized_pl")) if getattr(position, "unrealized_pl") is not None else None,
+            unrealized_plpc=float(getattr(position, "unrealized_plpc")) if getattr(position, "unrealized_plpc") is not None else None,
+            unrealized_intraday_pl=float(getattr(position, "unrealized_intraday_pl")) if getattr(position, "unrealized_intraday_pl") is not None else None,
+            unrealized_intraday_plpc=float(getattr(position, "unrealized_intraday_plpc")) if getattr(position, "unrealized_intraday_plpc") is not None else None,
+            market_value=float(getattr(position, "market_value")) if getattr(position, "market_value") is not None else None,
+            cost_basis=float(getattr(position, "cost_basis")) if getattr(position, "cost_basis") is not None else None,
+            side=OrderDirection.BUY if getattr(position, "side") == "long" or getattr(position, "side") == "buy" else OrderDirection.SELL,
             exchange=getattr(position, "exchange", None),
             asset_class=getattr(position, "asset_class", None),
             swap_rate=getattr(position, "swap_rate", None)
@@ -131,7 +130,7 @@ class AlpacaAccount(AccountInterface):
             logger.error(f"Error listing Alpaca orders: {e}", exc_info=True)
             return []
 
-    def submit_order(self, symbol: str, qty: float, side: str, type: str, time_in_force: str, **kwargs) -> TradingOrder:
+    def submit_order(self, symbol: str, qty: float, side: str, type: str, time_in_force: str, comment: str, **kwargs) -> TradingOrder:
         """
         Submit a new order to Alpaca.
         
@@ -142,7 +141,18 @@ class AlpacaAccount(AccountInterface):
             TradingOrder: The created order if successful, None if an error occurs.
         """
         try:
-            raise NotImplementedError("Method not implemented yet.")
+            client_order_id = comment
+            order = self.client.submit_order(
+                symbol=symbol,
+                qty=qty,
+                side=side,
+                type=type,
+                time_in_force=time_in_force,
+                client_order_id=client_order_id,
+                **kwargs
+            )
+            logger.info(f"Submitted Alpaca order: {order.id}")
+            return self.alpaca_order_to_tradingorder(order)
         except Exception as e:
             logger.error(f"Error creating Alpaca order: {e}")
             return None

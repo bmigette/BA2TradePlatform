@@ -1,5 +1,5 @@
 from sqlmodel import  Field, Session, SQLModel, create_engine, Column
-from sqlalchemy import String, Float, JSON
+from sqlalchemy import String, Float, JSON, UniqueConstraint
 from typing import Optional, Dict, Any
 from .types import InstrumentType, OrderStatus, OrderDirection
 from datetime import datetime
@@ -11,7 +11,22 @@ class AppSetting(SQLModel, table=True):
     value_json:  Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict)
     value_float: float | None 
 
-from sqlalchemy import UniqueConstraint
+class ExpertInstance(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    account_id: int = Field(foreign_key="accountdefinition.id", nullable=False, ondelete="CASCADE")
+    expert: str     
+    description: str | None
+    enabled: bool = Field(default=True)
+    virtual_equity: float = Field(default=100.0)
+
+class ExpertSetting(SQLModel, table=True):
+    __table_args__ = (UniqueConstraint('instance_id', 'key', name='uix_expertsetting_instanceid_key'),)
+    id: int | None = Field(default=None, primary_key=True)
+    instance_id: int = Field(foreign_key="expertinstance.id", nullable=False, ondelete="CASCADE")
+    key: str
+    value_str: str | None 
+    value_json:  Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict)
+    value_float: float | None 
 
 class AccountSetting(SQLModel, table=True):
     __table_args__ = (UniqueConstraint('account_id', 'key', name='uix_accountsetting_accountid_key'),)
@@ -59,7 +74,8 @@ class Instrument(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     name: str 
     instrument_type: InstrumentType
-    
+    categories: list[str] = Field(sa_column=Column(JSON), default_factory=dict)
+    labels: list[str] = Field(sa_column=Column(JSON), default_factory=dict)
     def __str__(self):
         return f"{self.name} ({self.instrument_type})"
 
