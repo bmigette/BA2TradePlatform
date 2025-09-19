@@ -101,92 +101,77 @@ class InstrumentSettingsTab:
             return True
         return False
 
-    async def fetch_info(self): # TODO: This blocks ui execution, need to check how to do async
-
-        logger.debug('Fetching info for all instruments (parallel)')
+    async def fetch_info(self):
+        logger.debug('Fetching info for all instruments (batch mode)')
         session = get_db()
         statement = select(Instrument)
         results = session.exec(statement)
         instruments = results.all()
-        session.close()  # We'll use a new session per thread
+        session.close()
 
+        if not instruments:
+            logger.info('No instruments found to fetch info for.')
+            ui.notify('No instruments found.', type='warning')
+            return
+
+        symbol_to_instrument = {inst.name: inst for inst in instruments}
+        symbols = list(symbol_to_instrument.keys())
         updated = 0
         errors = 0
 
-        def fetch_and_update(instrument_id, instrument_name):
-            local_session = get_db()
-            instrument = local_session.get(Instrument, instrument_id)
-            try:
-                logger.debug(f'Fetching info for instrument: {instrument_name}')
-                ticker = Ticker(instrument_name)
+        try:
+            ticker = Ticker(symbols)
+            profiles = ticker.asset_profile
+            prices = ticker.price
+
+            for symbol, instrument in symbol_to_instrument.items():
+                local_session = get_db()
+                db_instrument = local_session.get(Instrument, instrument.id)
+                updated_flag = False
                 try:
-                    profile = ticker.asset_profile # {'HUM': 'Invalid Crumb'}
-                    if profile and instrument_name.upper() in profile:
-                        profile_data = profile[instrument_name.upper()]
+                    profile_data = profiles.get(symbol.upper())
+                    if profile_data:
                         sector = profile_data.get("sector")
                         if sector:
-                            if self._add_to_list_field(instrument, 'categories', sector, local_session):
-                                logger.debug(f'Added sector {sector} to instrument {instrument_name}')
+                            if self._add_to_list_field(db_instrument, 'categories', sector, local_session):
+                                logger.debug(f'Added sector {sector} to instrument {symbol}')
                                 local_session.commit()
                                 updated_flag = True
-                            else:
-                                updated_flag = False
                         else:
-                            logger.debug(f'No sector found for instrument {instrument_name}')
-                            updated_flag = False
+                            logger.debug(f'No sector found for instrument {symbol}')
                     else:
-                        self._add_to_list_field(instrument, 'labels', 'not_found', local_session)
-                        logger.warning(f'Instrument {instrument_name} not found in asset profile')
+                        self._add_to_list_field(db_instrument, 'labels', 'not_found', local_session)
+                        logger.warning(f'Instrument {symbol} not found in asset profile')
                         local_session.commit()
-                        updated_flag = False
 
-                    # Update company_name using ticker.price[name.upper()]["longname"]
-                    try:
-                        price_info = ticker.price
-                        longname = None
-                        if price_info and instrument_name.upper() in price_info:
-                            longname = price_info[instrument_name.upper()].get("longName")
-                        if longname:
-                            instrument.company_name = longname
-                            local_session.add(instrument)
-                            local_session.commit()
-                            logger.debug(f'Updated company_name for {instrument_name}: {longname}')
-                            updated_flag = True
-                    except Exception as name_error:
-                        logger.warning(f'Could not update company_name for {instrument_name}: {name_error}')
+                    price_info = prices.get(symbol.upper())
+                    longname = price_info.get("longName") if price_info else None
+                    if longname:
+                        db_instrument.company_name = longname
+                        local_session.add(db_instrument)
+                        local_session.commit()
+                        logger.debug(f'Updated company_name for {symbol}: {longname}')
+                        updated_flag = True
+
                     if updated_flag:
-                        if 'not_found' in instrument.labels:
-                            labels = list(instrument.labels)
+                        if db_instrument.labels and 'not_found' in db_instrument.labels:
+                            labels = list(db_instrument.labels)
                             labels.remove('not_found')
-                            instrument.labels = labels
-                            local_session.add(instrument)
+                            db_instrument.labels = labels
+                            local_session.add(db_instrument)
                             local_session.commit()
-                    return updated_flag
-                except Exception as profile_error:
-                    self._add_to_list_field(instrument, 'labels', 'not_found', local_session)
-                    logger.warning(f'Could not get asset profile for {instrument_name}: {profile_error}', exc_info=True)
-                    local_session.commit()
-                    return False
-            except Exception as e:
-                self._add_to_list_field(instrument, 'labels', 'not_found', local_session)
-                logger.error(f"Error fetching info for {instrument_name}: {e}", exc_info=True)
-                local_session.commit()
-            finally:
-                local_session.close()
-            return False
-
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = [
-                executor.submit(fetch_and_update, instrument.id, instrument.name)
-                for instrument in instruments
-            ]
-            for future in as_completed(futures):
-                try:
-                    if future.result():
                         updated += 1
                 except Exception as e:
+                    self._add_to_list_field(db_instrument, 'labels', 'not_found', local_session)
+                    logger.error(f"Error fetching info for {symbol}: {e}", exc_info=True)
+                    local_session.commit()
                     errors += 1
-                    logger.error(f"Error in fetch_info thread: {e}")
+                finally:
+                    local_session.close()
+        except Exception as e:
+            logger.error(f"Error fetching batch info: {e}", exc_info=True)
+            ui.notify(f'Error fetching batch info: {e}', type='negative')
+            return
 
         logger.info(f'Fetched info for {updated} instruments. Errors: {errors}')
         ui.notify(f'Fetched info for {updated} instruments. Errors: {errors}', type='positive' if errors == 0 else 'warning')
