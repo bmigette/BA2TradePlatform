@@ -73,6 +73,7 @@ class TradingOrder(SQLModel, table=True):
 class Instrument(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     name: str 
+    company_name: str
     instrument_type: InstrumentType
     categories: list[str] = Field(sa_column=Column(JSON), default_factory=list)
     labels: list[str] = Field(sa_column=Column(JSON), default_factory=list)

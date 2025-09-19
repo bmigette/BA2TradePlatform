@@ -12,6 +12,8 @@ from ...modules.accounts import providers
 from ...core.AccountInterface import AccountInterface
 from ...core.types import InstrumentType
 from yahooquery import Ticker, search as yq_search
+from nicegui.events import UploadEventArguments
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- InstrumentSettingsTab ---
 class InstrumentSettingsTab:
@@ -38,6 +40,7 @@ class InstrumentSettingsTab:
                     {'name': 'checkbox', 'label': '', 'field': 'checkbox', 'type': 'checkbox', 'sortable': False},
                     {'name': 'id', 'label': 'ID', 'field': 'id'},
                     {'name': 'name', 'label': 'Name', 'field': 'name'},
+                    {'name': 'company_name', 'label': 'Company', 'field': 'company_name'},
                     {'name': 'instrument_type', 'label': 'Type', 'field': 'instrument_type'},
                     {'name': 'categories', 'label': 'Categories', 'field': 'categories'},
                     {'name': 'labels', 'label': 'Labels', 'field': 'labels'},
@@ -55,6 +58,7 @@ class InstrumentSettingsTab:
             """)
             self.table.on('edit', self._on_table_edit_click)
             self.table.on('del', self._on_table_del_click)
+            filter_input.bind_value(self.table, "filter")
         logger.debug('InstrumentSettingsTab UI rendered')
 
     def _get_all_instruments(self):
@@ -97,75 +101,124 @@ class InstrumentSettingsTab:
             return True
         return False
 
-    def fetch_info(self):
-        logger.debug('Fetching info for all instruments')
+    async def fetch_info(self): # TODO: This blocks ui execution, need to check how to do async
+
+        logger.debug('Fetching info for all instruments (parallel)')
         session = get_db()
-        
-        # Query instruments directly within the session to maintain attachment
         statement = select(Instrument)
         results = session.exec(statement)
         instruments = results.all()
-        
+        session.close()  # We'll use a new session per thread
+
         updated = 0
-        
-        for instrument in instruments:
+        errors = 0
+
+        def fetch_and_update(instrument_id, instrument_name):
+            local_session = get_db()
+            instrument = local_session.get(Instrument, instrument_id)
             try:
-                logger.debug(f'Fetching info for instrument: {instrument.name}')
-                ticker = Ticker(instrument.name)
-                
+                logger.debug(f'Fetching info for instrument: {instrument_name}')
+                ticker = Ticker(instrument_name)
                 try:
-                    # Try to get sector information
-                    profile = ticker.asset_profile
-                    if profile and instrument.name.upper() in profile:
-                        profile_data = profile[instrument.name.upper()]
+                    profile = ticker.asset_profile # {'HUM': 'Invalid Crumb'}
+                    if profile and instrument_name.upper() in profile:
+                        profile_data = profile[instrument_name.upper()]
                         sector = profile_data.get("sector")
                         if sector:
-                            if self._add_to_list_field(instrument, 'categories', sector, session):
-                                logger.debug(f'Added sector {sector} to instrument {instrument.name}')
-                                updated += 1
+                            if self._add_to_list_field(instrument, 'categories', sector, local_session):
+                                logger.debug(f'Added sector {sector} to instrument {instrument_name}')
+                                local_session.commit()
+                                updated_flag = True
+                            else:
+                                updated_flag = False
                         else:
-                            logger.debug(f'No sector found for instrument {instrument.name}')
+                            logger.debug(f'No sector found for instrument {instrument_name}')
+                            updated_flag = False
                     else:
-                        # Mark as not found
-                        self._add_to_list_field(instrument, 'labels', 'not_found', session)
-                        logger.warning(f'Instrument {instrument.name} not found in asset profile')
-                        
+                        self._add_to_list_field(instrument, 'labels', 'not_found', local_session)
+                        logger.warning(f'Instrument {instrument_name} not found in asset profile')
+                        local_session.commit()
+                        updated_flag = False
+
+                    # Update company_name using ticker.price[name.upper()]["longname"]
+                    try:
+                        price_info = ticker.price
+                        longname = None
+                        if price_info and instrument_name.upper() in price_info:
+                            longname = price_info[instrument_name.upper()].get("longName")
+                        if longname:
+                            instrument.company_name = longname
+                            local_session.add(instrument)
+                            local_session.commit()
+                            logger.debug(f'Updated company_name for {instrument_name}: {longname}')
+                            updated_flag = True
+                    except Exception as name_error:
+                        logger.warning(f'Could not update company_name for {instrument_name}: {name_error}')
+                    if updated_flag:
+                        if 'not_found' in instrument.labels:
+                            labels = list(instrument.labels)
+                            labels.remove('not_found')
+                            instrument.labels = labels
+                            local_session.add(instrument)
+                            local_session.commit()
+                    return updated_flag
                 except Exception as profile_error:
-                    # Mark as not found on error
-                    self._add_to_list_field(instrument, 'labels', 'not_found', session)
-                    logger.warning(f'Could not get asset profile for {instrument.name}: {profile_error}')
-
+                    self._add_to_list_field(instrument, 'labels', 'not_found', local_session)
+                    logger.warning(f'Could not get asset profile for {instrument_name}: {profile_error}', exc_info=True)
+                    local_session.commit()
+                    return False
             except Exception as e:
-                # Mark as not found on general error
-                self._add_to_list_field(instrument, 'labels', 'not_found', session)
-                logger.error(f"Error fetching info for {instrument.name}: {e}")
+                self._add_to_list_field(instrument, 'labels', 'not_found', local_session)
+                logger.error(f"Error fetching info for {instrument_name}: {e}", exc_info=True)
+                local_session.commit()
+            finally:
+                local_session.close()
+            return False
 
-        # Commit all changes at once
-        session.commit()
-        session.close()
-        logger.info(f'Fetched info for {updated} instruments.')
-        ui.notify(f'Fetched info for {updated} instruments.', type='positive')
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [
+                executor.submit(fetch_and_update, instrument.id, instrument.name)
+                for instrument in instruments
+            ]
+            for future in as_completed(futures):
+                try:
+                    if future.result():
+                        updated += 1
+                except Exception as e:
+                    errors += 1
+                    logger.error(f"Error in fetch_info thread: {e}")
+
+        logger.info(f'Fetched info for {updated} instruments. Errors: {errors}')
+        ui.notify(f'Fetched info for {updated} instruments. Errors: {errors}', type='positive' if errors == 0 else 'warning')
         self._update_table_rows()
 
     def import_instruments(self):
-        logger.debug('Importing instruments from Wikipedia S&P 500 list')
-        url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
-        try:
-            table = pd.read_html(url)[0]
-            names = table['Symbol'].tolist()
-            session = get_db()
-            added = 0
-            for name in names:
-                if not session.query(Instrument).filter_by(name=name).first():
-                    inst = Instrument(name=name, instrument_type='stock', categories=[], labels=[])
-                    add_instance(inst, session)
-                    added += 1
-            session.commit()
-            logger.info(f'Imported {added} new instruments from S&P 500 list')
-            ui.notify(f'Imported {len(names)} instruments.', type='positive')
-        except Exception as e:
-            logger.error(f'Import failed: {e}')
-            ui.notify(f'Import failed: {e}', type='negative')
+        logger.debug('Importing instruments from a text file')
+
+        def handle_upload(e: UploadEventArguments):
+            try:
+                # Read content from the uploaded file
+                e.content.seek(0)  # Ensure we're at the beginning of the file
+                content = e.content.read().decode('utf-8')
+                names = [line.strip() for line in content.splitlines() if line.strip()]
+                session = get_db()
+                added = 0
+                existing_names = {inst.name for inst in session.exec(select(Instrument)).all()}
+                for name in names:
+                    if name not in existing_names:
+                        inst = Instrument(name=name, instrument_type='stock', categories=[], labels=[])
+                        add_instance(inst, session)
+                        added += 1
+                        existing_names.add(name)
+                session.commit()
+                logger.info(f'Imported {added} new instruments from file')
+                ui.notify(f'Imported {added} new instruments.', type='positive')
+                self._update_table_rows()
+            except Exception as e:
+                logger.error(f'Import failed: {e}')
+                ui.notify(f'Import failed: {e}', type='negative')
+
+        ui.upload(label='Upload instrument list (.txt)', on_upload=handle_upload, max_files=1, auto_upload=True)
 
     def add_instrument_dialog(self, instrument=None):
         if not hasattr(self, 'add_dialog'):
