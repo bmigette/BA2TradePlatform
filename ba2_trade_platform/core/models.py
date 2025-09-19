@@ -74,8 +74,8 @@ class Instrument(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     name: str 
     instrument_type: InstrumentType
-    categories: list[str] = Field(sa_column=Column(JSON), default_factory=dict)
-    labels: list[str] = Field(sa_column=Column(JSON), default_factory=dict)
+    categories: list[str] = Field(sa_column=Column(JSON), default_factory=list)
+    labels: list[str] = Field(sa_column=Column(JSON), default_factory=list)
     def __str__(self):
         return f"{self.name} ({self.instrument_type})"
 

@@ -1,3 +1,4 @@
+import logging
 import pandas as pd
 from nicegui import ui
 from typing import Optional
@@ -9,6 +10,8 @@ from ...logger import logger
 from ...core.db import get_db, get_all_instances, delete_instance, add_instance, update_instance, get_instance
 from ...modules.accounts import providers
 from ...core.AccountInterface import AccountInterface
+from ...core.types import InstrumentType
+from yahooquery import Ticker, search as yq_search
 
 # --- InstrumentSettingsTab ---
 class InstrumentSettingsTab:
@@ -17,77 +20,225 @@ class InstrumentSettingsTab:
     Features: table with filter, fetch info, import, and add instrument.
     """
     def __init__(self):
+        logger.debug('Initializing InstrumentSettingsTab')
         self.filter_text = ''
         self.render()
 
     def render(self):
+        logger.debug('Rendering InstrumentSettingsTab UI')
         with ui.card().classes('w-full'):
             ui.label('Instrument Management')
-            
             with ui.row():
-                ui.input(label='Filter', on_change=self.on_filter_change).bind_value(self, 'filter_text')
+                filter_input = ui.input(label='Filter') #, on_change=self.on_filter_change)
                 ui.button('Fetch Info', on_click=self.fetch_info)
                 ui.button('Import', on_click=self.import_instruments)
-                ui.button('Add Instrument', on_click=self.add_instrument_dialog)
+                ui.button('Add Instrument', on_click=lambda: self.add_instrument_dialog())
             self.table = ui.table(
                 columns=[
+                    {'name': 'checkbox', 'label': '', 'field': 'checkbox', 'type': 'checkbox', 'sortable': False},
                     {'name': 'id', 'label': 'ID', 'field': 'id'},
                     {'name': 'name', 'label': 'Name', 'field': 'name'},
                     {'name': 'instrument_type', 'label': 'Type', 'field': 'instrument_type'},
                     {'name': 'categories', 'label': 'Categories', 'field': 'categories'},
                     {'name': 'labels', 'label': 'Labels', 'field': 'labels'},
+                    {'name': 'actions', 'label': 'Actions', 'field': 'actions'},
                 ],
-                rows=self.get_filtered_rows(),
+                rows=self._get_all_instruments(),
                 row_key='id',
-                #filter=self.filter_text #TODO FIXME
+                selection='multiple',
             ).classes('w-full')
+            self.table.add_slot('body-cell-actions', """
+                <q-td :props="props">
+                    <q-btn @click="$parent.$emit('edit', props)" icon="edit" flat dense color='blue'/>
+                    <q-btn @click="$parent.$emit('del', props)" icon="delete" flat dense color='red'/>
+                </q-td>
+            """)
+            self.table.on('edit', self._on_table_edit_click)
+            self.table.on('del', self._on_table_del_click)
+        logger.debug('InstrumentSettingsTab UI rendered')
 
-    def get_filtered_rows(self):
-        session = get_db()
-        instruments = session.query(Instrument).all()
-        if self.filter_text:
-            return [i.__dict__ for i in instruments if self.filter_text.lower() in i.name.lower()]
-        return [i.__dict__ for i in instruments]
+    def _get_all_instruments(self):
+        logger.debug('Fetching all instruments for table')
+        r = []
+        for instrument in get_all_instances(Instrument):
+            inst = dict(instrument)
+            inst['categories'] = ", ".join(instrument.categories) if instrument.categories else ""
+            inst['labels'] = ", ".join(instrument.labels) if instrument.labels else ""
+            r.append(inst)
+        logger.debug(f'Fetched {len(r)} instruments')
+        return r
+    
+    def _update_table_rows(self):
+        logger.debug('Updating instrument table rows')
+        if self.table:
+            instruments = self._get_all_instruments()
+            self.table.rows = instruments
+            logger.debug('Instrument table rows updated')
 
-    def on_filter_change(self):
-        self.table.rows = self.get_filtered_rows()
-        self.table.refresh()
+
+
+    def _ensure_list_field(self, instrument, field_name):
+        """Ensure a field is initialized as a list."""
+        current_value = getattr(instrument, field_name)
+        if current_value is None:
+            setattr(instrument, field_name, [])
+            return []
+        return current_value
+    
+    def _add_to_list_field(self, instrument, field_name, value, session):
+        """Add a value to a list field if not already present, using SQLModel-compatible approach."""
+        current_list = self._ensure_list_field(instrument, field_name)
+        if value not in current_list:
+            # Create new list to force SQLModel to detect change
+            new_list = list(current_list)
+            new_list.append(value)
+            setattr(instrument, field_name, new_list)
+            session.add(instrument)
+            return True
+        return False
 
     def fetch_info(self):
-        ui.notify('Fetch info not implemented (stub)', type='warning')
+        logger.debug('Fetching info for all instruments')
+        session = get_db()
+        
+        # Query instruments directly within the session to maintain attachment
+        statement = select(Instrument)
+        results = session.exec(statement)
+        instruments = results.all()
+        
+        updated = 0
+        
+        for instrument in instruments:
+            try:
+                logger.debug(f'Fetching info for instrument: {instrument.name}')
+                ticker = Ticker(instrument.name)
+                
+                try:
+                    # Try to get sector information
+                    profile = ticker.asset_profile
+                    if profile and instrument.name.upper() in profile:
+                        profile_data = profile[instrument.name.upper()]
+                        sector = profile_data.get("sector")
+                        if sector:
+                            if self._add_to_list_field(instrument, 'categories', sector, session):
+                                logger.debug(f'Added sector {sector} to instrument {instrument.name}')
+                                updated += 1
+                        else:
+                            logger.debug(f'No sector found for instrument {instrument.name}')
+                    else:
+                        # Mark as not found
+                        self._add_to_list_field(instrument, 'labels', 'not_found', session)
+                        logger.warning(f'Instrument {instrument.name} not found in asset profile')
+                        
+                except Exception as profile_error:
+                    # Mark as not found on error
+                    self._add_to_list_field(instrument, 'labels', 'not_found', session)
+                    logger.warning(f'Could not get asset profile for {instrument.name}: {profile_error}')
+
+            except Exception as e:
+                # Mark as not found on general error
+                self._add_to_list_field(instrument, 'labels', 'not_found', session)
+                logger.error(f"Error fetching info for {instrument.name}: {e}")
+
+        # Commit all changes at once
+        session.commit()
+        session.close()
+        logger.info(f'Fetched info for {updated} instruments.')
+        ui.notify(f'Fetched info for {updated} instruments.', type='positive')
+        self._update_table_rows()
 
     def import_instruments(self):
-        # Example: Import S&P 500 from Wikipedia
+        logger.debug('Importing instruments from Wikipedia S&P 500 list')
         url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
         try:
             table = pd.read_html(url)[0]
             names = table['Symbol'].tolist()
             session = get_db()
+            added = 0
             for name in names:
                 if not session.query(Instrument).filter_by(name=name).first():
                     inst = Instrument(name=name, instrument_type='stock', categories=[], labels=[])
                     add_instance(inst, session)
+                    added += 1
             session.commit()
+            logger.info(f'Imported {added} new instruments from S&P 500 list')
             ui.notify(f'Imported {len(names)} instruments.', type='positive')
-            self.on_filter_change()
         except Exception as e:
+            logger.error(f'Import failed: {e}')
             ui.notify(f'Import failed: {e}', type='negative')
 
-    def add_instrument_dialog(self):
-        with ui.dialog() as dialog:
-            dialog.clear()
-            name_input = ui.input(label='Instrument Name')
-            type_input = ui.input(label='Instrument Type')
-            def save():
-                session = get_db()
-                inst = Instrument(name=name_input.value, instrument_type=type_input.value, categories=[], labels=[])
-                add_instance(inst, session)
-                session.commit()
-                dialog.close()
-                self.on_filter_change()
-                ui.notify('Instrument added!', type='positive')
-            ui.button('Save', on_click=save)
-        dialog.open()
+    def add_instrument_dialog(self, instrument=None):
+        if not hasattr(self, 'add_dialog'):
+            self.add_dialog = ui.dialog()
+        self.add_dialog.clear()
+        is_edit = instrument is not None
+        with self.add_dialog:
+            with ui.card():
+                name_input = ui.input(label='Instrument Name', value=instrument.name if is_edit else '')
+                type_input = ui.select(
+                    options=[t.value for t in InstrumentType],
+                    label='Instrument Type',
+                    value=instrument.instrument_type if is_edit else InstrumentType.STOCK
+                )
+                labels_input = ui.input(label='Labels (comma separated)', value=(', '.join(instrument.labels) if is_edit and hasattr(instrument, 'labels') else ''))
+                def save():
+                    session = get_db()
+                    labels = [l.strip() for l in labels_input.value.split(',')] if labels_input.value else []
+                    if is_edit:
+                        logger.debug(f'Editing instrument {instrument.id}: {name_input.value}')
+                        instrument.name = name_input.value
+                        instrument.instrument_type = type_input.value
+                        instrument.labels = labels
+                        update_instance(instrument, session)
+                        session.commit()
+                        logger.info(f'Instrument {instrument.id} updated')
+                        ui.notify('Instrument updated!', type='positive')
+                    else:
+                        logger.debug(f'Adding new instrument: {name_input.value}')
+                        inst = Instrument(
+                            name=name_input.value,
+                            instrument_type=type_input.value,
+                            categories=[],
+                            labels=labels
+                        )
+                        add_instance(inst, session)
+                        session.commit()
+                        logger.info(f'Instrument {name_input.value} added')
+                        ui.notify('Instrument added!', type='positive')
+                    self.add_dialog.close()
+                    self._update_table_rows()
+                ui.button('Save', on_click=save)
+        self.add_dialog.open()
+
+    def _on_table_edit_click(self, msg):
+        logger.debug(f'Edit instrument table click: {msg}')
+        row = msg.args['row']
+        instrument_id = row['id']
+        instrument = get_instance(Instrument, instrument_id)
+        if instrument:
+            self.add_instrument_dialog(instrument)
+        else:
+            logger.warning(f'Instrument with id {instrument_id} not found')
+            ui.notify('Instrument not found', type='error')
+
+    def _on_table_del_click(self, msg):
+        logger.debug(f'Delete instrument table click: {msg}')
+        row = msg.args['row']
+        instrument_id = row['id']
+        instrument = get_instance(Instrument, instrument_id)
+        if instrument:
+            try:
+                logger.debug(f'Deleting instrument {instrument_id}')
+                delete_instance(instrument)
+                logger.info(f'Instrument {instrument_id} deleted')
+                ui.notify('Instrument deleted', type='positive')
+                self._update_table_rows()
+            except Exception as e:
+                logger.error(f'Error deleting instrument {instrument_id}: {e}')
+                ui.notify(f'Error deleting instrument: {e}', type='negative')
+        else:
+            logger.warning(f'Instrument with id {instrument_id} not found')
+            ui.notify('Instrument not found', type='error')
 
 # --- AppSettingsTab for static settings ---
 class AppSettingsTab:

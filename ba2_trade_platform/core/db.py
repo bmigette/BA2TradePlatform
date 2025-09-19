@@ -157,24 +157,30 @@ def get_instance(model_class, instance_id):
     except Exception as e:
         logger.error(f"Error retrieving instance: {e}", exc_info=True)
         raise
-
-def get_all_instances(model_class):
+    
+def get_all_instances(model_class, session: Session | None = None):
     """
     Retrieve all instances of a given model class from the database.
 
     Args:
         model_class: The SQLModel class to query.
+        session (Session, optional): An existing SQLModel session. If not provided, a new session is created.
 
     Returns:
         List of all instances of the model class.
     """
     try:
-        with Session(engine) as session:
+        if session:
             statement = select(model_class)
             results = session.exec(statement)
             instances = results.all()
-            logger.info(f"Retrieved {len(instances)} instances of {model_class.__name__}")
-            return [i[0] for i in instances] # https://stackoverflow.com/questions/1958219/how-to-convert-sqlalchemy-row-object-to-a-python-dict
+        else:
+            with Session(engine) as session:
+                statement = select(model_class)
+                results = session.exec(statement)
+                instances = results.all()
+        logger.info(f"Retrieved {len(instances)} instances of {model_class.__name__}")
+        return [i[0] for i in instances]
     except Exception as e:
         logger.error(f"Error retrieving all instances: {e}", exc_info=True)
         raise
