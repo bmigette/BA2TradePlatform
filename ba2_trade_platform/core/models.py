@@ -11,9 +11,12 @@ class AppSetting(SQLModel, table=True):
     value_json:  Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict)
     value_float: float | None 
 
+from sqlalchemy import UniqueConstraint
+
 class AccountSetting(SQLModel, table=True):
+    __table_args__ = (UniqueConstraint('account_id', 'key', name='uix_accountsetting_accountid_key'),)
     id: int | None = Field(default=None, primary_key=True)
-    account_id: int = Field(foreign_key="accountdefinition.id", nullable=False)
+    account_id: int = Field(foreign_key="accountdefinition.id", nullable=False, ondelete="CASCADE")
     key: str
     value_str: str | None 
     value_json:  Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict)

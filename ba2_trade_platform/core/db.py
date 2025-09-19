@@ -13,7 +13,10 @@ engine = create_engine(f"sqlite:///{DB_FILE}", connect_args={"check_same_thread"
 
 
 def init_db():
-    """Import models and create tables."""
+    """
+    Import models and create all database tables if they do not exist.
+    Ensures the database directory exists before table creation.
+    """
     logger.debug("Importing models for table creation")
     from . import models  # Import the models module to register all models
     logger.debug("Models imported successfully")
@@ -22,7 +25,13 @@ def init_db():
     SQLModel.metadata.create_all(engine)
 
 def get_db_gen():
-    """Dependency to get DB session."""
+    """
+    Yields a database session for use in dependency injection or context management.
+    Closes the session after use.
+
+    Yields:
+        Session: An active SQLModel session.
+    """
     with Session(engine) as session:
         try: 
             yield session
@@ -30,49 +39,113 @@ def get_db_gen():
             session.close()
 
 def get_db():
-    """Get a DB session without yielding."""
+    """
+    Returns a new database session. Caller is responsible for closing the session.
+
+    Returns:
+        Session: An active SQLModel session.
+    """
     return Session(engine)
 
-def add_instance(instance):
-    """Add a new instance to the database."""
+def add_instance(instance, session: Session | None = None):
+    """
+    Add a new instance to the database.
+    If a session is provided, use it; otherwise, create a new session.
+    Commits the transaction after adding.
+
+    Args:
+        instance: The instance to add.
+        session (Session, optional): An existing SQLModel session. If not provided, a new session is created.
+
+    Returns:
+        The added instance.
+    """
     try:
-        with Session(engine) as session:
+        if session:
             session.add(instance)
             session.commit()
             logger.info(f"Added instance: {instance}")
-            return instance
+            return instance.id
+        else:
+            with Session(engine) as session:
+                session.add(instance)
+                session.commit()
+                logger.info(f"Added instance: {instance}")
+                return instance.id
     except Exception as e:
         logger.error(f"Error adding instance: {e}", exc_info=True)
         raise
 
-def update_instance(instance):
-    """Update an existing instance in the database."""
+def update_instance(instance, session: Session | None = None):
+    """
+    Update an existing instance in the database.
+    If a session is provided, use it; otherwise, create a new session.
+    Commits and refreshes the instance after updating.
+
+    Args:
+        instance: The instance to update.
+        session (Session, optional): An existing SQLModel session. If not provided, a new session is created.
+
+    Returns:
+        The updated instance.
+    """
     try:
-        with Session(engine) as session:
+        if session:
             session.add(instance)
             session.commit()
             session.refresh(instance)
             logger.info(f"Updated instance: {instance}")
-            return instance
+        else:
+            with Session(engine) as session:
+                session.add(instance)
+                session.commit()
+                session.refresh(instance)
+                logger.info(f"Updated instance: {instance}")
     except Exception as e:
         logger.error(f"Error updating instance: {e}", exc_info=True)
         raise
 
-def delete_instance(instance):
-    """Delete an instance from the database."""
+def delete_instance(instance, session: Session | None = None):
+    """
+    Delete an instance from the database.
+    If a session is provided, use it; otherwise, create a new session.
+    Commits the transaction after deleting.
+
+    Args:
+        instance: The instance to delete.
+        session (Session, optional): An existing SQLModel session. If not provided, a new session is created.
+
+    Returns:
+        True if deletion was successful.
+    """
     try:
-        with Session(engine) as session:
-            instance_id = instance.id
+        instance_id = instance.id
+        if session:
             session.delete(instance)
             session.commit()
             logger.info(f"Deleted instance with id: {instance_id}")
             return True
+        else:
+            with Session(engine) as session:
+                session.delete(instance)
+                session.commit()
+                logger.info(f"Deleted instance with id: {instance_id}")
+                return True
     except Exception as e:
         logger.error(f"Error deleting instance: {e}", exc_info=True)
         raise
 
 def get_instance(model_class, instance_id):
-    """Retrieve a single instance by model and ID."""
+    """
+    Retrieve a single instance by model class and primary key ID.
+
+    Args:
+        model_class: The SQLModel class to query.
+        instance_id: The primary key value of the instance.
+
+    Returns:
+        The instance if found, otherwise None.
+    """
     try:
         with Session(engine) as session:
             instance = session.get(model_class, instance_id)
@@ -86,7 +159,15 @@ def get_instance(model_class, instance_id):
         raise
 
 def get_all_instances(model_class):
-    """Retrieve all instances of a model."""
+    """
+    Retrieve all instances of a given model class from the database.
+
+    Args:
+        model_class: The SQLModel class to query.
+
+    Returns:
+        List of all instances of the model class.
+    """
     try:
         with Session(engine) as session:
             statement = select(model_class)

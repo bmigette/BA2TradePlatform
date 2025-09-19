@@ -1,10 +1,57 @@
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
+from unittest import result
 from ..logger import logger
 from ..core.models import AccountSetting
-from ..core.db import get_instance, get_db
+from ..core.db import get_instance, get_db, update_instance, add_instance
 from sqlmodel import select
 class AccountInterface(ABC):
+
+    def save_settings(self, settings: Dict[str, Any]):
+        """
+        Save account settings to the database, converting bool to JSON for storage.
+        """
+        from ..core.models import AccountSetting
+        from sqlmodel import select
+        import json
+        session = get_db()
+        definitions = type(self).get_settings_definitions()
+        try:
+            for key, value in settings.items():
+                definition = definitions.get(key, {})
+                value_type = definition.get("type", "str")
+                stmt = select(AccountSetting).where(AccountSetting.account_id == self.id, AccountSetting.key == key)
+                setting = session.exec(stmt).first()
+                if value_type == "json" or value_type == "bool":
+                    json_value = json.dumps(value)
+                    if setting:
+                        setting.value_json = json_value
+                        update_instance(setting, session)
+                    else:
+                        setting = AccountSetting(account_id=self.id, key=key, value_json=json_value)
+                        add_instance(setting, session)
+                elif value_type == "float":
+                    if setting:
+                        setting.value_float = float(value)
+                        update_instance(setting, session)
+                    else:
+                        setting = AccountSetting(account_id=self.id, key=key, value_float=float(value))
+                        add_instance(setting, session)
+                else:
+                    if setting:
+                        setting.value_str = str(value)
+                        update_instance(setting, session)
+                    else:
+                        setting = AccountSetting(account_id=self.id, key=key, value_str=str(value))
+                        add_instance(setting, session)
+            session.commit()
+            logger.info(f"Saved settings for account ID {self.id}: {settings}")
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Error saving account settings: {e}")
+            raise
+        finally:
+            session.close()
     """
     Abstract base class for trading account interfaces.
     Defines the required methods for account implementations.
@@ -38,7 +85,9 @@ class AccountInterface(ABC):
         """
         Loads and returns account settings using the AccountSetting model
         based on the settings definitions provided by the implementation.
+        Handles JSON->bool conversion for bool types.
         """
+        import json
         try:
             definitions = type(self).get_settings_definitions()
             session = get_db()
@@ -52,6 +101,12 @@ class AccountInterface(ABC):
                 value_type = definition.get("type", "str")
                 if value_type == "json":
                     settings[setting.key] = setting.value_json
+                elif value_type == "bool":
+                    # Convert JSON string to bool
+                    try:
+                        settings[setting.key] = json.loads(setting.value_json)
+                    except Exception:
+                        settings[setting.key] = False
                 elif value_type == "float":
                     settings[setting.key] = setting.value_float
                 else:

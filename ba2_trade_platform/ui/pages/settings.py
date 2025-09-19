@@ -6,7 +6,7 @@ from ...core.models import AccountDefinition, AccountSetting
 from ...logger import logger
 from ...core.db import get_db, get_all_instances, delete_instance, add_instance, update_instance, get_instance
 from ...modules.accounts import providers
-
+from ...core.AccountInterface import AccountInterface
 class AccountDefinitionsTab:
     def __init__(self):
         logger.debug('Initializing AccountDefinitionsTab')
@@ -24,30 +24,75 @@ class AccountDefinitionsTab:
             logger.warning('Accounts table is not initialized yet')
 
     def save_account(self, account: Optional[AccountDefinition] = None) -> None:
+        """Save or update an account configuration.
+        This method handles both creating new accounts and updating existing ones.
+        It saves both the basic account information and any provider-specific dynamic settings.
+        Args:
+            account (Optional[AccountDefinition]): The existing account to update. 
+                If None, a new account will be created.
+        Returns:
+            None
+        Raises:
+            Exception: If there is an error during the save process.
+                The error will be logged and a UI notification will be shown.
+        Notes:
+            - For existing accounts, it updates the provider, name, and description
+            - For new accounts, it creates a new AccountDefinition entry
+            - Dynamic settings are saved via the provider's AccountInterface
+            - UI dialog is closed and table rows are updated on successful save
+        """
+        
         try:
+            
+            provider = self.type_select.value
+            provider_cls = providers.get(provider, None)
+            dynamic_settings = {}
+            if hasattr(self, 'settings_inputs') and self.settings_inputs:
+                for key, inp in self.settings_inputs.items():
+                    dynamic_settings[key] = inp.value
+            logger.debug(f'Saving account with provider: {provider}, name: {self.name_input.value}, description: {self.desc_input.value}, dynamic_settings: {dynamic_settings}') 
             if account:
-                account.provider = self.type_select.value
+                account.provider = provider
                 account.name = self.name_input.value
                 account.description = self.desc_input.value
                 update_instance(account)
                 logger.info(f"Updated account: {account.name}")
+                # Save dynamic settings using AccountInterface
+
+                acc_iface = provider_cls(account.id)
+                if isinstance(acc_iface, AccountInterface):
+                    acc_iface.save_settings(dynamic_settings)
             else:
                 new_account = AccountDefinition(
-                    provider=self.type_select.value,
+                    provider=provider,
                     name=self.name_input.value,
                     description=self.desc_input.value
                 )
-                add_instance(new_account)
-                logger.info(f"Created new account: {self.name_input.value}")
+                new_account_id = add_instance(new_account)
+                logger.info(f"Created new account: {self.name_input.value} with id {new_account_id}")
+                # Save dynamic settings for new account
+                # Get the new account's id
+                acc_iface = provider_cls(new_account_id)
+                if isinstance(acc_iface, AccountInterface):
+                    acc_iface.save_settings(dynamic_settings)
             self.dialog.close()
             self._update_table_rows()
-            
         except Exception as e:
             logger.error(f"Error saving account: {str(e)}", exc_info=True)
             ui.notify("Error saving account", type="error")
 
     def delete_account(self, account: AccountDefinition) -> None:
         try:
+            # First delete related account settings
+            with get_db() as session:
+                settings = session.exec(
+                    select(AccountSetting).where(AccountSetting.account_id == account.id)
+                ).all()
+                for setting in settings:
+                    delete_instance(setting, session)
+                logger.info(f"Deleted {len(settings)} settings for account: {account.name}")
+            
+            # Then delete the account
             delete_instance(account)
             logger.info(f"Deleted account: {account.name}")
             self._update_table_rows()
@@ -148,10 +193,7 @@ class AccountDefinitionsTab:
 
             self.accounts_table.on('edit', self._on_table_edit_click)
             self.accounts_table.on('del', self._on_table_del_click)
-            # for row in accounts:
-            #     with self.accounts_table.add_slot('body-cell-actions', row):
-            #         ui.button(icon='edit', on_click=lambda r=row: self.show_dialog(r))
-            #         ui.button(icon='delete', on_click=lambda r=row: self.delete_account(r))
+
 
 def content() -> None:
     logger.debug('Initializing settings page')
