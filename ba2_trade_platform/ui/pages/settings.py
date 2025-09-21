@@ -883,7 +883,7 @@ class ExpertSettingsTab:
             if expert_instance:
                 expert = expert_class(expert_instance.id)
                 settings_def = expert.get_settings_definitions()
-                current_settings = {s.key: s for s in expert.get_all_settings()}
+                current_settings = expert.get_all_settings() # TODO FIXME {'enabled_instruments': None}
             else:
                 # For new instances, create a temporary expert to get definitions
                 settings_def = expert_class.get_settings_definitions()
