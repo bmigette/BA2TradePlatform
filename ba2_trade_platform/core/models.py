@@ -15,8 +15,8 @@ class ExpertInstance(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     account_id: int = Field(foreign_key="accountdefinition.id", nullable=False, ondelete="CASCADE")
     expert: str     
-    description: str | None
     enabled: bool = Field(default=True)
+    user_description: str | None = Field(default=None)
     virtual_equity: float = Field(default=100.0)
 
 class ExpertSetting(SQLModel, table=True):
@@ -42,6 +42,17 @@ class AccountDefinition(SQLModel, table=True):
     name: str 
     provider: str 
     description: str | None 
+
+
+class EventAction(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    type: str
+    subtype: str | None 
+    name: str
+    trigger: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict)
+    action: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict) 
+    extra_parameters: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict)
+
 
 
 class TradingOrder(SQLModel, table=True):

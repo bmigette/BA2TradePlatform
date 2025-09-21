@@ -23,6 +23,16 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         """
         self.id = id
 
+    @classmethod
+    @abstractmethod
+    def description(cls) -> str:
+        """
+        Abstract property for a human-readable description of the expert.
+        Returns:
+            str: Description of the expert instance.
+        """
+        pass
+
     @abstractmethod
     def get_prediction_for_instrument(self, instrument: str) -> Any:
         """

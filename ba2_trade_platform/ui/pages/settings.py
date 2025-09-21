@@ -5,7 +5,7 @@ from typing import Optional
 from sqlmodel import select
 
 
-from ...core.models import AccountDefinition, AccountSetting, AppSetting, Instrument
+from ...core.models import AccountDefinition, AccountSetting, AppSetting, Instrument, ExpertInstance
 from ...logger import logger
 from ...core.db import get_db, get_all_instances, delete_instance, add_instance, update_instance, get_instance
 from ...modules.accounts import providers
@@ -13,6 +13,8 @@ from ...core.AccountInterface import AccountInterface
 from ...core.types import InstrumentType
 from yahooquery import Ticker, search as yq_search
 from nicegui.events import UploadEventArguments
+from ...modules.experts import experts
+from ..components.InstrumentSelector import InstrumentSelector
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- InstrumentSettingsTab ---
@@ -178,32 +180,109 @@ class InstrumentSettingsTab:
         self._update_table_rows()
 
     def import_instruments(self):
-        logger.debug('Importing instruments from a text file')
-
-        def handle_upload(e: UploadEventArguments):
-            try:
-                # Read content from the uploaded file
-                e.content.seek(0)  # Ensure we're at the beginning of the file
-                content = e.content.read().decode('utf-8')
-                names = [line.strip() for line in content.splitlines() if line.strip()]
-                session = get_db()
-                added = 0
-                existing_names = {inst.name for inst in session.exec(select(Instrument)).all()}
-                for name in names:
-                    if name not in existing_names:
-                        inst = Instrument(name=name, instrument_type='stock', categories=[], labels=[])
-                        add_instance(inst, session)
-                        added += 1
-                        existing_names.add(name)
-                session.commit()
-                logger.info(f'Imported {added} new instruments from file')
-                ui.notify(f'Imported {added} new instruments.', type='positive')
-                self._update_table_rows()
-            except Exception as e:
-                logger.error(f'Import failed: {e}')
-                ui.notify(f'Import failed: {e}', type='negative')
-
-        ui.upload(label='Upload instrument list (.txt)', on_upload=handle_upload, max_files=1, auto_upload=True)
+        logger.debug('Opening import instruments dialog')
+        
+        if not hasattr(self, 'import_dialog'):
+            self.import_dialog = ui.dialog()
+        
+        self.import_dialog.clear()
+        
+        with self.import_dialog:
+            with ui.card().classes('w-full max-w-lg'):
+                ui.label('Import Instruments').classes('text-h6 mb-4')
+                
+                # Labels input
+                self.import_labels_input = ui.input(
+                    label='Labels (comma separated)',
+                    placeholder='e.g. tech, growth, blue-chip'
+                ).classes('w-full mb-4')
+                
+                ui.label('Select file with instrument symbols (one per line):').classes('mb-2')
+                
+                def handle_upload(e: UploadEventArguments):
+                    try:
+                        # Read content from the uploaded file
+                        e.content.seek(0)  # Ensure we're at the beginning of the file
+                        content = e.content.read().decode('utf-8')
+                        names = [line.strip() for line in content.splitlines() if line.strip()]
+                        
+                        # Parse labels
+                        labels = []
+                        if self.import_labels_input.value:
+                            labels = [label.strip() for label in self.import_labels_input.value.split(',') if label.strip()]
+                        
+                        session = get_db()
+                        added = 0
+                        updated = 0
+                        
+                        # Get existing instruments
+                        existing_instruments = {inst.name: inst for inst in session.exec(select(Instrument)).all()}
+                        
+                        for name in names:
+                            if name in existing_instruments:
+                                # Instrument exists, add labels if any specified
+                                if labels:
+                                    instrument = existing_instruments[name]
+                                    existing_labels = instrument.labels or []
+                                    
+                                    # Add new labels that don't already exist
+                                    labels_added = False
+                                    for label in labels:
+                                        if label not in existing_labels:
+                                            existing_labels.append(label)
+                                            labels_added = True
+                                    
+                                    if labels_added:
+                                        instrument.labels = existing_labels
+                                        update_instance(instrument, session)
+                                        updated += 1
+                                        logger.debug(f'Added labels {labels} to existing instrument {name}')
+                            else:
+                                # Create new instrument
+                                inst = Instrument(
+                                    name=name, 
+                                    instrument_type='stock', 
+                                    categories=[], 
+                                    labels=labels.copy()
+                                )
+                                add_instance(inst, session)
+                                added += 1
+                                logger.debug(f'Added new instrument {name} with labels {labels}')
+                        
+                        session.commit()
+                        session.close()
+                        
+                        logger.info(f'Import completed: {added} new instruments added, {updated} existing instruments updated with labels')
+                        
+                        if added > 0 and updated > 0:
+                            ui.notify(f'Import completed: {added} new instruments added, {updated} existing instruments updated with labels', type='positive')
+                        elif added > 0:
+                            ui.notify(f'Imported {added} new instruments', type='positive')
+                        elif updated > 0:
+                            ui.notify(f'Updated {updated} existing instruments with new labels', type='positive')
+                        else:
+                            ui.notify('No changes made - all instruments already exist with specified labels', type='info')
+                        
+                        self._update_table_rows()
+                        self.import_dialog.close()
+                        
+                    except Exception as e:
+                        logger.error(f'Import failed: {e}', exc_info=True)
+                        ui.notify(f'Import failed: {e}', type='negative')
+                
+                # File upload
+                ui.upload(
+                    label='Upload instrument list (.txt)', 
+                    on_upload=handle_upload, 
+                    max_files=1, 
+                    auto_upload=True
+                ).classes('w-full')
+                
+                # Buttons
+                with ui.row().classes('w-full justify-end mt-4'):
+                    ui.button('Cancel', on_click=self.import_dialog.close).props('flat')
+        
+        self.import_dialog.open()
 
     def add_instrument_dialog(self, instrument=None):
         if not hasattr(self, 'add_dialog'):
@@ -272,7 +351,7 @@ class InstrumentSettingsTab:
                 ui.notify('Instrument deleted', type='positive')
                 self._update_table_rows()
             except Exception as e:
-                logger.error(f'Error deleting instrument {instrument_id}: {e}')
+                logger.error(f'Error deleting instrument {instrument_id}: {e}', exc_info=True)
                 ui.notify(f'Error deleting instrument: {e}', type='negative')
         else:
             logger.warning(f'Instrument with id {instrument_id} not found')
@@ -414,7 +493,7 @@ class AccountDefinitionsTab:
             logger.info(f"Deleted account: {account.name}")
             self._update_table_rows()
         except Exception as e:
-            logger.error(f"Error deleting account: {str(e)}")
+            logger.error(f"Error deleting account: {str(e)}", exc_info=True)
             ui.notify("Error deleting account", type="error")
 
     def show_dialog(self, account: Optional[AccountDefinition] = None) -> None:
@@ -512,6 +591,472 @@ class AccountDefinitionsTab:
             self.accounts_table.on('del', self._on_table_del_click)
 
 
+class ExpertSettingsTab:
+    """
+    UI tab for managing expert instances (ExpertInstance SQL Model).
+    Features: table with experts, add/edit experts with settings and instrument selection.
+    """
+    
+    def __init__(self):
+        logger.debug('Initializing ExpertSettingsTab')
+        self.dialog = ui.dialog()
+        self.experts_table = None
+        self.instrument_selector = None
+        self.render()
+    
+    def render(self):
+        logger.debug('Rendering ExpertSettingsTab UI')
+        with ui.card().classes('w-full'):
+            ui.label('Expert Management').classes('text-h6')
+            
+            ui.button('Add Expert', on_click=lambda: self.show_dialog())
+            
+            self.experts_table = ui.table(
+                columns=[
+                    {'name': 'expert', 'label': 'Expert Type', 'field': 'expert', 'sortable': True},
+                    {'name': 'user_description', 'label': 'User Notes', 'field': 'user_description'},
+                    {'name': 'enabled', 'label': 'Enabled', 'field': 'enabled', 'align': 'center'},
+                    {'name': 'virtual_equity', 'label': 'Virtual Equity', 'field': 'virtual_equity', 'align': 'right'},
+                    {'name': 'account_id', 'label': 'Account ID', 'field': 'account_id'},
+                    {'name': 'actions', 'label': 'Actions', 'field': 'actions'}
+                ],
+                rows=self._get_all_expert_instances(),
+                row_key='id'
+            ).classes('w-full')
+            
+            self.experts_table.add_slot('body-cell-enabled', '''
+                <q-td :props="props">
+                    <q-icon :name="props.value ? 'check_circle' : 'cancel'" 
+                            :color="props.value ? 'green' : 'red'" />
+                </q-td>
+            ''')
+            
+            self.experts_table.add_slot('body-cell-actions', """
+                <q-td :props="props">
+                    <q-btn @click="$parent.$emit('edit', props)" icon="edit" flat dense color='blue'/>
+                    <q-btn @click="$parent.$emit('del', props)" icon="delete" flat dense color='red'/>
+                </q-td>
+            """)
+            
+            self.experts_table.on('edit', self._on_table_edit_click)
+            self.experts_table.on('del', self._on_table_del_click)
+        
+        logger.debug('ExpertSettingsTab UI rendered')
+    
+    def _get_all_expert_instances(self):
+        """Get all expert instances for the table."""
+        logger.debug('Fetching all expert instances for table')
+        try:
+            instances = get_all_instances(ExpertInstance)
+            rows = []
+            for instance in instances:
+                row = dict(instance)
+                
+                # Ensure user_description is displayed properly (truncate if too long for table)
+                user_desc = instance.user_description or ''
+                if len(user_desc) > 50:
+                    row['user_description'] = user_desc[:47] + '...'
+                else:
+                    row['user_description'] = user_desc
+                
+                rows.append(row)
+            logger.debug(f'Fetched {len(rows)} expert instances')
+            return rows
+        except Exception as e:
+            logger.error(f'Error fetching expert instances: {e}', exc_info=True)
+            return []
+    
+    def _update_table_rows(self):
+        """Update the table with fresh data."""
+        if self.experts_table:
+            self.experts_table.rows = self._get_all_expert_instances()
+            logger.debug('Expert instances table rows updated')
+    
+    def _get_available_expert_types(self):
+        """Get list of available expert types."""
+        expert_types = []
+        for expert_class in experts:
+            expert_types.append(expert_class.__name__)
+        return expert_types
+    
+    def _get_available_accounts(self):
+        """Get list of available accounts."""
+        accounts = get_all_instances(AccountDefinition)
+        return [f"{acc.name} ({acc.provider})" for acc in accounts]
+    
+    def _get_account_id_from_display_string(self, display_string):
+        """Get account ID from display string like 'Account Name (provider)'."""
+        if not display_string:
+            return None
+        
+        accounts = get_all_instances(AccountDefinition)
+        for acc in accounts:
+            if f"{acc.name} ({acc.provider})" == display_string:
+                return acc.id
+        return None
+    
+    def show_dialog(self, expert_instance=None):
+        """Show the add/edit expert dialog."""
+        logger.debug(f'Showing expert dialog for instance: {expert_instance.id if expert_instance else "new instance"}')
+        
+        is_edit = expert_instance is not None
+        
+        with self.dialog:
+            self.dialog.clear()
+            
+            with ui.card().classes('w-full').style('width: 90vw; max-width: 1400px; height: 95vh; margin: auto; display: flex; flex-direction: column'):
+                ui.label('Add Expert' if not is_edit else 'Edit Expert').classes('text-h6')
+                
+                # Basic expert information
+                with ui.column().classes('w-full gap-4'):
+                    expert_types = self._get_available_expert_types()
+                    self.expert_select = ui.select(
+                        expert_types, 
+                        label='Expert Type'
+                    ).classes('w-full')
+                    
+                    # Description as read-only display
+                    self.description_label = ui.label('').classes('text-grey-7 mb-2')
+                    
+                    # User description as editable textarea
+                    self.user_description_textarea = ui.textarea(
+                        label='User Notes',
+                        placeholder='Add your own notes about this expert instance...'
+                    ).classes('w-full')
+                    
+                    with ui.row().classes('w-full'):
+                        self.enabled_checkbox = ui.checkbox('Enabled', value=True)
+                        self.virtual_equity_input = ui.input(
+                            label='Virtual Equity', 
+                            value='100.0'
+                        ).classes('w-48')
+                    
+                    accounts = self._get_available_accounts()
+                    self.account_select = ui.select(
+                        accounts,
+                        label='Trading Account'
+                    ).classes('w-full')
+                
+                # Fill values if editing
+                if is_edit:
+                    self.expert_select.value = expert_instance.expert
+                    self.user_description_textarea.value = expert_instance.user_description or ''
+                    self.enabled_checkbox.value = expert_instance.enabled
+                    self.virtual_equity_input.value = str(expert_instance.virtual_equity)
+                    
+                    # Find and set the account display string
+                    account_instance = get_instance(AccountDefinition, expert_instance.account_id)
+                    if account_instance:
+                        self.account_select.value = f"{account_instance.name} ({account_instance.provider})"
+                else:
+                    if expert_types:
+                        self.expert_select.value = expert_types[0]
+                    if accounts:
+                        self.account_select.value = accounts[0]
+                
+                # Update description when expert type changes
+                self.expert_select.on('update:model-value', 
+                                    lambda e: self._on_expert_type_change_dialog(e, expert_instance))
+                
+                # Set initial description
+                self._update_expert_description()
+                
+                # Tabs for different settings sections
+                with ui.tabs() as settings_tabs:
+                    ui.tab('Instruments', icon='trending_up')
+                    ui.tab('Expert Settings', icon='settings')
+                
+                with ui.tab_panels(settings_tabs, value='Instruments').classes('w-full').style('flex: 1; overflow-y: auto'):
+                    # Instruments tab
+                    with ui.tab_panel('Instruments'):
+                        ui.label('Select and configure instruments for this expert:').classes('text-subtitle1 mb-4')
+                        
+                        # Create instrument selector
+                        self.instrument_selector = InstrumentSelector(
+                            on_selection_change=self._on_instrument_selection_change
+                        )
+                        self.instrument_selector.render()
+                        
+                        # Load current instrument configuration if editing
+                        if is_edit:
+                            self._load_expert_instrument_config(expert_instance)
+                    
+                    # Expert-specific settings tab  
+                    with ui.tab_panel('Expert Settings'):
+                        ui.label('Expert-specific settings:').classes('text-subtitle1 mb-4')
+                        self.expert_settings_container = ui.column().classes('w-full')
+                        
+                        # Render expert-specific settings
+                        self._render_expert_settings(expert_instance)
+                        
+                        # Update settings when expert type changes
+                        self.expert_select.on('update:model-value', 
+                                            lambda e: self._on_expert_type_change(e, expert_instance))
+                
+                # Save button
+                with ui.row().classes('w-full justify-end mt-4'):
+                    ui.button('Cancel', on_click=self.dialog.close).props('flat')
+                    ui.button('Save', on_click=lambda: self._save_expert(expert_instance))
+        
+        self.dialog.open()
+    
+    def _load_expert_instrument_config(self, expert_instance):
+        """Load instrument configuration for an existing expert."""
+        try:
+            # Get the expert class and create an instance
+            expert_class = self._get_expert_class(expert_instance.expert)
+            if expert_class:
+                expert = expert_class(expert_instance.id)
+                
+                # Get enabled instruments configuration
+                enabled_config = expert._get_enabled_instruments_config()
+                
+                # Convert to format expected by InstrumentSelector
+                instrument_configs = {}
+                for symbol, config in enabled_config.items():
+                    # Find the instrument ID by symbol
+                    session = get_db()
+                    from sqlmodel import select
+                    statement = select(Instrument).where(Instrument.name == symbol)
+                    result = session.exec(statement).first()
+                    if result:
+                        instrument_configs[result.id] = {
+                            'enabled': True,
+                            'weight': config.get('weight', 100.0)
+                        }
+                    session.close()
+                
+                # Set the configuration in the selector
+                if self.instrument_selector:
+                    self.instrument_selector.set_selected_instruments(instrument_configs)
+                    
+        except Exception as e:
+            logger.error(f'Error loading expert instrument config: {e}', exc_info=True)
+    
+    def _get_expert_class(self, expert_type):
+        """Get the expert class by type name."""
+        for expert_class in experts:
+            if expert_class.__name__ == expert_type:
+                return expert_class
+        return None
+    
+    def _update_expert_description(self):
+        """Update the description display based on selected expert type."""
+        expert_type = self.expert_select.value if hasattr(self, 'expert_select') else None
+        if expert_type:
+            expert_class = self._get_expert_class(expert_type)
+            if expert_class:
+                try:
+                    description = expert_class.description()
+                except Exception as e:
+                    logger.debug(f'Error getting description for {expert_type}: {e}')
+                    description = f'{expert_type} - Trading expert'
+                
+                self.description_label.text = f"Description: {description}"
+            else:
+                self.description_label.text = "Description: Unknown expert type"
+        else:
+            self.description_label.text = "Description: Select an expert type"
+    
+    def _on_expert_type_change_dialog(self, event, expert_instance):
+        """Handle expert type change in the dialog."""
+        logger.debug(f'Expert type changed in dialog to: {event.value if hasattr(event, "value") else event}')
+        self._update_expert_description()
+        self._render_expert_settings(expert_instance)
+    
+    def _render_expert_settings(self, expert_instance=None):
+        """Render expert-specific settings based on the selected expert type."""
+        self.expert_settings_container.clear()
+        
+        expert_type = self.expert_select.value if hasattr(self, 'expert_select') else None
+        if not expert_type:
+            ui.label('Select an expert type to see settings').move(self.expert_settings_container)
+            return
+        
+        expert_class = self._get_expert_class(expert_type)
+        if not expert_class:
+            ui.label('No settings available for this expert type').move(self.expert_settings_container)
+            return
+        
+        try:
+            # Get settings definitions
+            if expert_instance:
+                expert = expert_class(expert_instance.id)
+                settings_def = expert.get_settings_definitions()
+                current_settings = {s.key: s for s in expert.get_all_settings()}
+            else:
+                # For new instances, create a temporary expert to get definitions
+                settings_def = expert_class.get_settings_definitions()
+                current_settings = {}
+            
+            self.expert_settings_inputs = {}
+            
+            if settings_def and len(settings_def.keys()) > 0:
+                for key, meta in settings_def.items():
+                    label = meta.get("description", key)
+                    current_setting = current_settings.get(key)
+                    
+                    if meta["type"] == "str":
+                        value = current_setting.value_str if current_setting else meta.get("default", "")
+                        inp = ui.input(label=label, value=value).classes('w-full')
+                    elif meta["type"] == "bool":
+                        value = bool(current_setting.value_str) if current_setting else meta.get("default", False)
+                        inp = ui.checkbox(text=label, value=value)
+                    elif meta["type"] == "float":
+                        value = current_setting.value_float if current_setting else meta.get("default", 0.0)
+                        inp = ui.input(label=label, value=str(value)).classes('w-full')
+                    else:
+                        value = current_setting.value_str if current_setting else meta.get("default", "")
+                        inp = ui.input(label=label, value=value).classes('w-full')
+                    
+                    inp.move(self.expert_settings_container)
+                    self.expert_settings_inputs[key] = inp
+            else:
+                ui.label("No expert-specific settings available.").move(self.expert_settings_container)
+                
+        except Exception as e:
+            logger.error(f'Error rendering expert settings: {e}', exc_info=True)
+            ui.label(f"Error loading settings: {e}").move(self.expert_settings_container)
+    
+    def _on_expert_type_change(self, event, expert_instance):
+        """Handle expert type change."""
+        logger.debug(f'Expert type changed to: {event.value if hasattr(event, "value") else event}')
+        self._render_expert_settings(expert_instance)
+    
+    def _on_instrument_selection_change(self, selected_instruments):
+        """Handle instrument selection changes."""
+        logger.debug(f'Instrument selection changed: {len(selected_instruments)} instruments selected')
+    
+    def _save_expert(self, expert_instance=None):
+        """Save the expert instance."""
+        try:
+            is_edit = expert_instance is not None
+            
+            # Get account ID from the selected account string
+            account_id = self._get_account_id_from_display_string(self.account_select.value)
+            if not account_id:
+                ui.notify('Please select a valid trading account', type='negative')
+                return
+            
+            if is_edit:
+                # Update existing instance
+                expert_instance.expert = self.expert_select.value
+                expert_instance.user_description = self.user_description_textarea.value or None
+                expert_instance.enabled = self.enabled_checkbox.value
+                expert_instance.virtual_equity = float(self.virtual_equity_input.value)
+                expert_instance.account_id = account_id
+                
+                update_instance(expert_instance)
+                logger.info(f"Updated expert instance: {expert_instance.id}")
+                
+                expert_id = expert_instance.id
+            else:
+                # Create new instance
+                new_instance = ExpertInstance(
+                    expert=self.expert_select.value,
+                    user_description=self.user_description_textarea.value or None,
+                    enabled=self.enabled_checkbox.value,
+                    virtual_equity=float(self.virtual_equity_input.value),
+                    account_id=account_id
+                )
+                
+                expert_id = add_instance(new_instance)
+                logger.info(f"Created new expert instance: {expert_id}")
+            
+            # Save expert-specific settings
+            self._save_expert_settings(expert_id)
+            
+            # Save instrument configuration
+            self._save_instrument_configuration(expert_id)
+            
+            self.dialog.close()
+            self._update_table_rows()
+            ui.notify('Expert saved successfully!', type='positive')
+            
+        except Exception as e:
+            logger.error(f"Error saving expert: {e}", exc_info=True)
+            ui.notify(f"Error saving expert: {e}", type='negative')
+    
+    def _save_expert_settings(self, expert_id):
+        """Save expert-specific settings."""
+        if not hasattr(self, 'expert_settings_inputs') or not self.expert_settings_inputs:
+            return
+        
+        expert_class = self._get_expert_class(self.expert_select.value)
+        if not expert_class:
+            return
+        
+        expert = expert_class(expert_id)
+        settings_def = expert.get_settings_definitions()
+        
+        for key, inp in self.expert_settings_inputs.items():
+            meta = settings_def.get(key, {})
+            
+            if meta.get("type") == "bool":
+                expert.save_setting(key, inp.value, setting_type="bool")
+            elif meta.get("type") == "float":
+                expert.save_setting(key, float(inp.value or 0), setting_type="float")
+            else:
+                expert.save_setting(key, inp.value, setting_type="str")
+        
+        logger.debug(f'Saved expert settings for instance {expert_id}')
+    
+    def _save_instrument_configuration(self, expert_id):
+        """Save instrument selection and configuration."""
+        if not self.instrument_selector:
+            return
+        
+        selected_instruments = self.instrument_selector.get_selected_instruments()
+        
+        # Convert to format expected by expert
+        instrument_configs = {}
+        for inst in selected_instruments:
+            instrument_configs[inst['name']] = {
+                'enabled': True,
+                'weight': inst['weight']
+            }
+        
+        # Get expert and save configuration
+        expert_class = self._get_expert_class(self.expert_select.value)
+        if expert_class:
+            expert = expert_class(expert_id)
+            expert.set_enabled_instruments(instrument_configs)
+            
+        logger.debug(f'Saved instrument configuration for expert {expert_id}: {len(instrument_configs)} instruments')
+    
+    def _on_table_edit_click(self, msg):
+        """Handle edit button click from table."""
+        logger.debug(f'Edit expert table click: {msg}')
+        row = msg.args['row']
+        expert_id = row['id']
+        expert_instance = get_instance(ExpertInstance, expert_id)
+        if expert_instance:
+            self.show_dialog(expert_instance)
+        else:
+            logger.warning(f'Expert instance with id {expert_id} not found')
+            ui.notify('Expert instance not found', type='error')
+    
+    def _on_table_del_click(self, msg):
+        """Handle delete button click from table."""
+        logger.debug(f'Delete expert table click: {msg}')
+        row = msg.args['row']
+        expert_id = row['id']
+        expert_instance = get_instance(ExpertInstance, expert_id)
+        if expert_instance:
+            try:
+                logger.debug(f'Deleting expert instance {expert_id}')
+                delete_instance(expert_instance)
+                logger.info(f'Expert instance {expert_id} deleted')
+                ui.notify('Expert instance deleted', type='positive')
+                self._update_table_rows()
+            except Exception as e:
+                logger.error(f'Error deleting expert instance {expert_id}: {e}', exc_info=True)
+                ui.notify(f'Error deleting expert instance: {e}', type='negative')
+        else:
+            logger.warning(f'Expert instance with id {expert_id} not found')
+            ui.notify('Expert instance not found', type='error')
+
+
 def content() -> None:
     logger.debug('Initializing settings page')
     with ui.tabs() as tabs:
@@ -528,7 +1073,7 @@ def content() -> None:
         with ui.tab_panel('Account Settings'):
             AccountDefinitionsTab()
         with ui.tab_panel('Expert Settings'):
-            ui.label('Expert Settings')
+            ExpertSettingsTab()
         with ui.tab_panel('Trade Settings'):
             ui.label('Trade Settings')
         with ui.tab_panel('Instruments'):

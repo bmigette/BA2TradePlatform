@@ -7,6 +7,25 @@ import json
 
 class ExtendableSettingsInterface(ABC):
     
+    def _determine_value_type(self, value: Any) -> str:
+        """
+        Determine the appropriate value type based on the actual value provided.
+        
+        Args:
+            value: The value to analyze
+            
+        Returns:
+            str: The determined type ('str', 'float', 'bool', 'json')
+        """
+        if isinstance(value, bool):
+            return "bool"
+        elif isinstance(value, (int, float)):
+            return "float"
+        elif isinstance(value, (dict, list)):
+            return "json"
+        else:
+            return "str"
+    
     @classmethod
     @abstractmethod
     def get_settings_definitions(cls) -> Dict[str, Any]:
@@ -21,7 +40,58 @@ class ExtendableSettingsInterface(ABC):
         """
         pass
 
+    def save_setting(self, key: str, value: Any):
+        """
+        Save a single account setting to the database, converting bool to JSON for storage.
+        """
+        setting_model = type(self).SETTING_MODEL
+        lk_field = type(self).SETTING_LOOKUP_FIELD
 
+        session = get_db()
+        definitions = type(self).get_settings_definitions()
+        try:
+            definition = definitions.get(key, {})
+            value_type = definition.get("type", None)
+            
+            # If no definition exists, determine type from the value itself
+            if value_type is None:
+                value_type = self._determine_value_type(value)
+                logger.debug(f"No definition found for setting '{key}', determined type: {value_type}")
+            
+            where_kwargs = {lk_field: self.id, "key": key}
+            stmt = select(setting_model).filter_by(**where_kwargs)
+            setting = session.exec(stmt).first()
+            if value_type == "json" or value_type == "bool":
+                json_value = json.dumps(value)
+                if setting:
+                    setting.value_json = json_value
+                    update_instance(setting, session)
+                else:
+                    setting = setting_model(**{lk_field: self.id, "key": key, "value_json": json_value})
+                    add_instance(setting, session)
+            elif value_type == "float":
+                if setting:
+                    setting.value_float = float(value)
+                    update_instance(setting, session)
+                else:
+                    setting = setting_model(**{lk_field: self.id, "key": key, "value_float": float(value)})
+                    add_instance(setting, session)
+            else:
+                if setting:
+                    setting.value_str = str(value)
+                    update_instance(setting, session)
+                else:
+                    setting = setting_model(**{lk_field: self.id, "key": key, "value_str": str(value)})
+                    add_instance(setting, session)
+            session.commit()
+            logger.info(f"Saved setting '{key}' for {lk_field}={self.id}: {value}")
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Error saving account setting '{key}': {e}", exc_info=True)
+            raise
+        finally:
+            session.close()
+            
     def save_settings(self, settings: Dict[str, Any]):
         """
         Save account settings to the database, converting bool to JSON for storage.
@@ -66,11 +136,17 @@ class ExtendableSettingsInterface(ABC):
             logger.info(f"Saved settings for {lk_field}={self.id}: {settings}")
         except Exception as e:
             session.rollback()
-            logger.error(f"Error saving account settings: {e}")
+            logger.error(f"Error saving account settings: {e}", exc_info=True)
             raise
         finally:
             session.close()
-   
+    
+    def get_all_settings(self) -> Dict[str, Any]:
+        """
+        Returns all settings from the database for this account instance without applying definitions.
+        """
+        return self.settings
+    
     @property
     def settings(self) -> Dict[str, Any]:
         """
@@ -79,7 +155,7 @@ class ExtendableSettingsInterface(ABC):
         Handles JSON->bool conversion for bool types.
         """
         setting_model = type(self).SETTING_MODEL
-        lk_field = getattr(type(self), "SETTING_lk_field", "account_id")
+        lk_field = type(self).SETTING_LOOKUP_FIELD
         try:
             definitions = type(self).get_settings_definitions()
             session = get_db()
@@ -106,5 +182,5 @@ class ExtendableSettingsInterface(ABC):
             logger.info(f"Loaded settings for {lk_field}={self.id}: {settings}")
             return settings
         except Exception as e:
-            logger.error(f"Error loading account settings: {e}")
+            logger.error(f"Error loading account settings: {e}", exc_info=True)
             raise
