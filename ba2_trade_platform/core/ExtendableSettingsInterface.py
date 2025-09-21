@@ -148,7 +148,7 @@ class ExtendableSettingsInterface(ABC):
         return self.settings
     
     @property
-    def settings(self) -> Dict[str, Any]:
+    def settings(self) -> Dict[str, Any]: #TODO FIXME handle settings in db but not in definition
         """
         Loads and returns account settings using the setting_model model
         based on the settings definitions provided by the implementation.
