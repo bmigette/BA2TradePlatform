@@ -27,22 +27,31 @@ class ExtendableSettingsInterface(ABC):
             return "str"
     
     @classmethod
-    @abstractmethod
     def get_settings_definitions(cls) -> Dict[str, Any]:
         """
-        Return a dictionary defining the required configuration/settings for the account implementation.
+        Return a dictionary defining the required configuration/settings for the implementation.
+        This provides default settings that can be overridden by subclasses.
 
         Returns:
             Dict[str, Any]: A dictionary where keys are setting names and values are metadata such as:
-                - type: The expected type (str, float, json)
+                - type: The expected type (str, float, json, bool)
                 - required: Whether the setting is mandatory
                 - description: Human-readable description of the setting
+                - default: Default value for the setting
+                - valid_values: List of valid values for the setting (optional)
         """
         pass
 
-    def save_setting(self, key: str, value: Any):
+    def save_setting(self, key: str, value: Any, setting_type: Optional[str] = None):
         """
         Save a single account setting to the database, converting bool to JSON for storage.
+        
+        Args:
+            key: The setting key
+            value: The setting value
+            setting_type: Optional type override when no definitions exist.
+                         Should not be used to override existing definitions.
+                         If not provided and no definition exists, will use _determine_value_type.
         """
         setting_model = type(self).SETTING_MODEL
         lk_field = type(self).SETTING_LOOKUP_FIELD
@@ -53,10 +62,14 @@ class ExtendableSettingsInterface(ABC):
             definition = definitions.get(key, {})
             value_type = definition.get("type", None)
             
-            # If no definition exists, determine type from the value itself
+            # If no definition exists, use setting_type or determine type from the value itself
             if value_type is None:
-                value_type = self._determine_value_type(value)
-                logger.debug(f"No definition found for setting '{key}', determined type: {value_type}")
+                if setting_type is not None:
+                    value_type = setting_type
+                    logger.debug(f"No definition found for setting '{key}', using provided type: {value_type}")
+                else:
+                    value_type = self._determine_value_type(value)
+                    logger.debug(f"No definition found for setting '{key}', determined type: {value_type}")
             
             where_kwargs = {lk_field: self.id, "key": key}
             stmt = select(setting_model).filter_by(**where_kwargs)
@@ -148,11 +161,12 @@ class ExtendableSettingsInterface(ABC):
         return self.settings
     
     @property
-    def settings(self) -> Dict[str, Any]: #TODO FIXME handle settings in db but not in definition
+    def settings(self) -> Dict[str, Any]:
         """
         Loads and returns account settings using the setting_model model
         based on the settings definitions provided by the implementation.
         Handles JSON->bool conversion for bool types.
+        Also includes settings from database that don't have definitions.
         """
         setting_model = type(self).SETTING_MODEL
         lk_field = type(self).SETTING_LOOKUP_FIELD
@@ -162,11 +176,24 @@ class ExtendableSettingsInterface(ABC):
             statement = select(setting_model).filter_by(**{lk_field: self.id})
             results = session.exec(statement)
             settings_value_from_db = results.all()
+            
+            # Initialize with definitions (set to None if not found in DB)
             settings = {k : None for k in definitions.keys()}
 
             for setting in settings_value_from_db:
                 definition = definitions.get(setting.key, {})
-                value_type = definition.get("type", "str")
+                value_type = definition.get("type", None)
+                
+                # If no definition exists, determine type from the stored data
+                if value_type is None:
+                    if setting.value_json is not None:
+                        value_type = "json"
+                    elif setting.value_float is not None:
+                        value_type = "float"
+                    else:
+                        value_type = "str"
+                    logger.debug(f"Setting '{setting.key}' found in DB but not in definitions, using type: {value_type}")
+                
                 if value_type == "json":
                     settings[setting.key] = setting.value_json
                 elif value_type == "bool":
@@ -179,6 +206,7 @@ class ExtendableSettingsInterface(ABC):
                     settings[setting.key] = setting.value_float
                 else:
                     settings[setting.key] = setting.value_str
+                    
             logger.info(f"Loaded settings for {lk_field}={self.id}: {settings}")
             return settings
         except Exception as e:

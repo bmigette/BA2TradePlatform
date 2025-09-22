@@ -38,7 +38,25 @@ class TradingAgents(MarketExpertInterface):
     @classmethod
     def get_settings_definitions(cls) -> Dict[str, Any]:
         return {
-            
+            "debates_new_positions": {
+            "type": "float",
+            "required": True,
+            "description": "Number of debates for new positions",
+            "default": 3.0
+            },
+            "debates_existing_positions": {
+            "type": "float", 
+            "required": True,
+            "description": "Number of debates for existing positions",
+            "default": 3.0
+            },
+            "timeframe": {
+            "type": "str",
+            "required": True, 
+            "description": "Timeframe (1m, 5m, 15m, 30m, 1h, 1d, 1wk, 1mo)",
+            "valid_values": ["1m", "5m", "15m", "30m", "1h", "1d", "1wk", "1mo"],
+            "default": "1h"
+            }
         }
     def get_prediction_for_instrument(self, instrument: str) -> Any:
         """

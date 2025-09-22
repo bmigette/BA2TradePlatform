@@ -880,34 +880,53 @@ class ExpertSettingsTab:
         
         try:
             # Get settings definitions
+            settings_def = expert_class.get_settings_definitions()
+            current_settings = {}
+            
             if expert_instance:
                 expert = expert_class(expert_instance.id)
-                settings_def = expert.get_settings_definitions()
-                current_settings = expert.get_all_settings() # TODO FIXME {'enabled_instruments': None}
-            else:
-                # For new instances, create a temporary expert to get definitions
-                settings_def = expert_class.get_settings_definitions()
-                current_settings = {}
+                current_settings = expert.settings  # This will include defaults for missing values
             
             self.expert_settings_inputs = {}
             
             if settings_def and len(settings_def.keys()) > 0:
                 for key, meta in settings_def.items():
                     label = meta.get("description", key)
-                    current_setting = current_settings.get(key)
+                    # Use current setting value or fall back to default
+                    current_value = current_settings.get(key)
+                    default_value = meta.get("default")
+                    
+                    # Check if setting has valid_values (dropdown)
+                    valid_values = meta.get("valid_values")
                     
                     if meta["type"] == "str":
-                        value = current_setting.value_str if current_setting else meta.get("default", "")
-                        inp = ui.input(label=label, value=value).classes('w-full')
+                        value = current_value if current_value is not None else default_value or ""
+                        if valid_values:
+                            # Show as dropdown
+                            inp = ui.select(
+                                options=valid_values,
+                                label=label,
+                                value=value if value in valid_values else (valid_values[0] if valid_values else "")
+                            ).classes('w-full')
+                        else:
+                            inp = ui.input(label=label, value=value).classes('w-full')
                     elif meta["type"] == "bool":
-                        value = bool(current_setting.value_str) if current_setting else meta.get("default", False)
-                        inp = ui.checkbox(text=label, value=value)
+                        value = current_value if current_value is not None else default_value or False
+                        inp = ui.checkbox(text=label, value=bool(value))
                     elif meta["type"] == "float":
-                        value = current_setting.value_float if current_setting else meta.get("default", 0.0)
+                        value = current_value if current_value is not None else default_value or 0.0
                         inp = ui.input(label=label, value=str(value)).classes('w-full')
                     else:
-                        value = current_setting.value_str if current_setting else meta.get("default", "")
-                        inp = ui.input(label=label, value=value).classes('w-full')
+                        value = current_value if current_value is not None else default_value or ""
+                        if valid_values:
+                            # Show as dropdown for other types too if valid_values exist
+                            inp = ui.select(
+                                options=valid_values,
+                                label=label,
+                                value=value if value in valid_values else (valid_values[0] if valid_values else "")
+                            ).classes('w-full')
+                        else:
+                            inp = ui.input(label=label, value=str(value)).classes('w-full')
                     
                     inp.move(self.expert_settings_container)
                     self.expert_settings_inputs[key] = inp

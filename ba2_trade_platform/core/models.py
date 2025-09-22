@@ -1,8 +1,15 @@
-from sqlmodel import  Field, Session, SQLModel, create_engine, Column
-from sqlalchemy import String, Float, JSON, UniqueConstraint
-from typing import Optional, Dict, Any
+from sqlmodel import  Field, Session, SQLModel, create_engine, Column, Relationship
+from sqlalchemy import String, Float, JSON, UniqueConstraint, Table, Integer, ForeignKey
+from typing import Optional, Dict, Any, List
 from .types import InstrumentType, OrderStatus, OrderDirection
 from datetime import datetime
+
+# Association table for many-to-many relationship between Ruleset and EventAction
+class RulesetEventActionLink(SQLModel, table=True):
+    __tablename__ = "ruleset_eventaction_link"
+    
+    ruleset_id: int = Field(foreign_key="ruleset.id", primary_key=True)
+    eventaction_id: int = Field(foreign_key="eventaction.id", primary_key=True)
 
 class AppSetting(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
@@ -44,6 +51,18 @@ class AccountDefinition(SQLModel, table=True):
     description: str | None 
 
 
+class Ruleset(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    name: str
+    description: str | None = Field(default=None)
+    
+    # Many-to-many relationship with EventAction
+    event_actions: List["EventAction"] = Relationship(
+        back_populates="rulesets", 
+        link_model=RulesetEventActionLink
+    )
+
+
 class EventAction(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     type: str
@@ -52,6 +71,13 @@ class EventAction(SQLModel, table=True):
     trigger: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict)
     action: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict) 
     extra_parameters: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict)
+    
+    # Many-to-many relationship with Ruleset
+    rulesets: List["Ruleset"] = Relationship(
+        back_populates="event_actions", 
+        link_model=RulesetEventActionLink
+    )
+
 
 
 
