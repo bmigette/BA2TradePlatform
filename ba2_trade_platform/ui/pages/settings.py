@@ -5,12 +5,12 @@ from typing import Optional
 from sqlmodel import select
 
 
-from ...core.models import AccountDefinition, AccountSetting, AppSetting, Instrument, ExpertInstance
+from ...core.models import AccountDefinition, AccountSetting, AppSetting, Instrument, ExpertInstance, EventAction, Ruleset
 from ...logger import logger
 from ...core.db import get_db, get_all_instances, delete_instance, add_instance, update_instance, get_instance
 from ...modules.accounts import providers
 from ...core.AccountInterface import AccountInterface
-from ...core.types import InstrumentType
+from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action
 from yahooquery import Ticker, search as yq_search
 from nicegui.events import UploadEventArguments
 from ...modules.experts import experts
@@ -1076,6 +1076,674 @@ class ExpertSettingsTab:
             ui.notify('Expert instance not found', type='error')
 
 
+class TradeSettingsTab:
+    """
+    UI tab for managing trading rules and rulesets.
+    Features: separate sections for rules (EventAction) and rulesets (Ruleset) with edit/delete functions.
+    """
+    
+    def __init__(self):
+        logger.debug('Initializing TradeSettingsTab')
+        self.rules_dialog = ui.dialog()
+        self.rulesets_dialog = ui.dialog()
+        self.rules_table = None
+        self.rulesets_table = None
+        self.triggers = {}
+        self.actions = {}
+        self.render()
+    
+    def render(self):
+        logger.debug('Rendering TradeSettingsTab UI')
+        
+        with ui.card().classes('w-full'):
+            ui.label('Trading Rules and Rulesets Management').classes('text-h6 mb-4')
+            
+            # Create tabs for rules and rulesets
+            with ui.tabs() as trade_tabs:
+                ui.tab('Rules', icon='rule')
+                ui.tab('Rulesets', icon='list_alt')
+            
+            with ui.tab_panels(trade_tabs, value='Rules').classes('w-full'):
+                # Rules tab
+                with ui.tab_panel('Rules'):
+                    ui.label('Trading Rules (EventAction)').classes('text-h6 mb-2')
+                    ui.label('Rules define triggers and actions for automated trading decisions.').classes('text-grey-7 mb-4')
+                    
+                    ui.button('Add Rule', on_click=lambda: self.show_rule_dialog(), icon='add').classes('mb-4')
+                    
+                    self.rules_table = ui.table(
+                        columns=[
+                            {'name': 'name', 'label': 'Name', 'field': 'name', 'sortable': True},
+                            {'name': 'triggers_count', 'label': 'Triggers', 'field': 'triggers_count', 'align': 'center'},
+                            {'name': 'actions_count', 'label': 'Actions', 'field': 'actions_count', 'align': 'center'},
+                            {'name': 'continue_processing', 'label': 'Continue Processing', 'field': 'continue_processing', 'align': 'center'},
+                            {'name': 'actions', 'label': 'Actions', 'field': 'actions'}
+                        ],
+                        rows=self._get_all_rules(),
+                        row_key='id'
+                    ).classes('w-full')
+                    
+                    self.rules_table.add_slot('body-cell-continue_processing', '''
+                        <q-td :props="props">
+                            <q-icon :name="props.value ? 'check_circle' : 'cancel'" 
+                                    :color="props.value ? 'green' : 'red'" />
+                        </q-td>
+                    ''')
+                    
+                    self.rules_table.add_slot('body-cell-actions', """
+                        <q-td :props="props">
+                            <q-btn @click="$parent.$emit('edit', props)" icon="edit" flat dense color='blue'/>
+                            <q-btn @click="$parent.$emit('del', props)" icon="delete" flat dense color='red'/>
+                        </q-td>
+                    """)
+                    
+                    self.rules_table.on('edit', self._on_rule_edit_click)
+                    self.rules_table.on('del', self._on_rule_del_click)
+                
+                # Rulesets tab
+                with ui.tab_panel('Rulesets'):
+                    ui.label('Trading Rulesets').classes('text-h6 mb-2')
+                    ui.label('Rulesets are collections of rules that work together for specific trading strategies.').classes('text-grey-7 mb-4')
+                    
+                    ui.button('Add Ruleset', on_click=lambda: self.show_ruleset_dialog(), icon='add').classes('mb-4')
+                    
+                    self.rulesets_table = ui.table(
+                        columns=[
+                            {'name': 'name', 'label': 'Name', 'field': 'name', 'sortable': True},
+                            {'name': 'description', 'label': 'Description', 'field': 'description'},
+                            {'name': 'rules_count', 'label': 'Rules Count', 'field': 'rules_count', 'align': 'center'},
+                            {'name': 'actions', 'label': 'Actions', 'field': 'actions'}
+                        ],
+                        rows=self._get_all_rulesets(),
+                        row_key='id'
+                    ).classes('w-full')
+                    
+                    self.rulesets_table.add_slot('body-cell-actions', """
+                        <q-td :props="props">
+                            <q-btn @click="$parent.$emit('edit', props)" icon="edit" flat dense color='blue'/>
+                            <q-btn @click="$parent.$emit('del', props)" icon="delete" flat dense color='red'/>
+                        </q-td>
+                    """)
+                    
+                    self.rulesets_table.on('edit', self._on_ruleset_edit_click)
+                    self.rulesets_table.on('del', self._on_ruleset_del_click)
+        
+        logger.debug('TradeSettingsTab UI rendered')
+    
+    def _get_all_rules(self):
+        """Get all rules (EventAction) for the table."""
+        logger.debug('Fetching all rules for table')
+        try:
+            rules = get_all_instances(EventAction)
+            rows = []
+            for rule in rules:
+                # Manually create dict with JSON-serializable values
+                row = {
+                    'id': rule.id,
+                    'name': rule.name,
+                    'type': rule.type.value if rule.type else None,  # Convert enum to string
+                    'subtype': rule.subtype,
+                    'continue_processing': rule.continue_processing,
+                    'triggers_count': len(rule.triggers) if rule.triggers else 0,
+                    'actions_count': len(rule.actions) if rule.actions else 0
+                }
+                rows.append(row)
+            logger.debug(f'Fetched {len(rows)} rules')
+            return rows
+        except Exception as e:
+            logger.error(f'Error fetching rules: {e}', exc_info=True)
+            return []
+    
+    def _get_all_rulesets(self):
+        """Get all rulesets for the table."""
+        logger.debug('Fetching all rulesets for table')
+        try:
+            session = get_db()
+            from sqlmodel import select
+            from sqlalchemy.orm import selectinload
+            
+            # Use selectinload to eagerly load the event_actions relationship
+            statement = select(Ruleset).options(selectinload(Ruleset.event_actions))
+            results = session.exec(statement)
+            rulesets = results.all()
+            
+            rows = []
+            for ruleset in rulesets:
+                # Manually create dict with JSON-serializable values
+                row = {
+                    'id': ruleset.id,
+                    'name': ruleset.name,
+                    'description': ruleset.description[:47] + '...' if ruleset.description and len(ruleset.description) > 50 else ruleset.description,
+                    'rules_count': len(ruleset.event_actions) if ruleset.event_actions else 0
+                }
+                rows.append(row)
+            
+            session.close()
+            logger.debug(f'Fetched {len(rows)} rulesets')
+            return rows
+        except Exception as e:
+            logger.error(f'Error fetching rulesets: {e}', exc_info=True)
+            return []
+    
+    def _update_rules_table(self):
+        """Update the rules table with fresh data."""
+        if self.rules_table:
+            self.rules_table.rows = self._get_all_rules()
+            logger.debug('Rules table rows updated')
+    
+    def _update_rulesets_table(self):
+        """Update the rulesets table with fresh data."""
+        if self.rulesets_table:
+            self.rulesets_table.rows = self._get_all_rulesets()
+            logger.debug('Rulesets table rows updated')
+    
+    def show_rule_dialog(self, rule=None):
+        """Show the add/edit rule dialog."""
+        logger.debug(f'Showing rule dialog for rule: {rule.id if rule else "new rule"}')
+        
+        is_edit = rule is not None
+        
+        with self.rules_dialog:
+            self.rules_dialog.clear()
+            
+            with ui.card().classes('w-full').style('width: 90vw; max-width: 1200px; height: 90vh; margin: auto; display: flex; flex-direction: column'):
+                ui.label('Add Rule' if not is_edit else 'Edit Rule').classes('text-h6 mb-4')
+                
+                # Basic rule information
+                with ui.column().classes('w-full gap-4'):
+                    self.rule_name_input = ui.input(
+                        label='Rule Name',
+                        value=rule.name if is_edit else ''
+                    ).classes('w-full')
+                    
+                    self.continue_processing_checkbox = ui.checkbox(
+                        'Continue processing other rules after this one',
+                        value=rule.continue_processing if is_edit else False
+                    )
+                
+                # Tabs for triggers and actions
+                with ui.tabs() as rule_tabs:
+                    ui.tab('Triggers', icon='play_arrow')
+                    ui.tab('Actions', icon='settings')
+                
+                with ui.tab_panels(rule_tabs, value='Triggers').classes('w-full').style('flex: 1; overflow-y: auto'):
+                    # Triggers tab
+                    with ui.tab_panel('Triggers'):
+                        ui.label('Configure Triggers').classes('text-subtitle1 mb-4')
+                        ui.label('Triggers define when this rule should activate.').classes('text-grey-7 mb-4')
+                        
+                        self.triggers_container = ui.column().classes('w-full')
+                        self.triggers = {}
+                        
+                        # Load existing triggers if editing
+                        if is_edit and rule.triggers:
+                            for trigger_key, trigger_config in rule.triggers.items():
+                                self._add_trigger_row(trigger_key, trigger_config)
+                        
+                        ui.button('Add Trigger', on_click=lambda: self._add_trigger_row(), icon='add').classes('mt-4')
+                    
+                    # Actions tab
+                    with ui.tab_panel('Actions'):
+                        ui.label('Configure Actions').classes('text-subtitle1 mb-4')
+                        ui.label('Actions define what should happen when triggers are met.').classes('text-grey-7 mb-4')
+                        
+                        self.actions_container = ui.column().classes('w-full')
+                        self.actions = {}
+                        
+                        # Load existing actions if editing
+                        if is_edit and rule.actions:
+                            for action_key, action_config in rule.actions.items():
+                                self._add_action_row(action_key, action_config)
+                        
+                        ui.button('Add Action', on_click=lambda: self._add_action_row(), icon='add').classes('mt-4')
+                
+                # Save button
+                with ui.row().classes('w-full justify-end mt-4'):
+                    ui.button('Cancel', on_click=self.rules_dialog.close).props('flat')
+                    ui.button('Save', on_click=lambda: self._save_rule(rule))
+        
+        self.rules_dialog.open()
+    
+    def _add_trigger_row(self, trigger_key=None, trigger_config=None):
+        """Add a trigger configuration row."""
+        if not hasattr(self, 'triggers_container') or self.triggers_container is None:
+            logger.error("Triggers container not initialized")
+            return
+            
+        trigger_id = trigger_key or f"trigger_{len(self.triggers)}"
+        
+        with self.triggers_container:
+            with ui.card().classes('w-full p-4') as trigger_card:
+                with ui.row().classes('w-full items-center'):
+                    # Trigger type selection
+                    trigger_select = ui.select(
+                        options=[t.value for t in ExpertEventType],
+                        label='Trigger Type',
+                        value=trigger_config.get('type') if trigger_config else ExpertEventType.F_HAS_POSITION.value
+                    ).classes('flex-1')
+                    
+                    # Remove button
+                    ui.button('Remove', on_click=lambda: self._remove_trigger_row(trigger_id, trigger_card), 
+                             icon='delete', color='red').props('flat dense')
+                
+                # Value input (for N_ types)
+                value_row = ui.row().classes('w-full')
+                operator_select = None
+                value_input = None
+                
+                def update_value_inputs():
+                    value_row.clear()
+                    selected_type = trigger_select.value
+                    
+                    if selected_type and is_numeric_event(selected_type):
+                        # Numeric trigger - show operator and value
+                        with value_row:
+                            nonlocal operator_select, value_input
+                            operator_select = ui.select(
+                                options=['<', '>', '=', '!=', '<=', '>='],
+                                label='Operator',
+                                value=trigger_config.get('operator', '>') if trigger_config else '>'
+                            ).classes('w-32')
+                            
+                            value_input = ui.input(
+                                label='Value',
+                                value=str(trigger_config.get('value', '')) if trigger_config else ''
+                            ).classes('flex-1')
+                    else:
+                        # Flag trigger - no additional inputs needed
+                        with value_row:
+                            ui.label('Flag trigger - no additional configuration needed').classes('text-grey-7')
+                
+                # Initial setup
+                update_value_inputs()
+                trigger_select.on('update:model-value', lambda: update_value_inputs())
+                
+                # Store references
+                self.triggers[trigger_id] = {
+                    'card': trigger_card,
+                    'type_select': trigger_select,
+                    'operator_select': lambda: operator_select,
+                    'value_input': lambda: value_input
+                }
+    
+    def _remove_trigger_row(self, trigger_id, trigger_card):
+        """Remove a trigger row."""
+        trigger_card.delete()
+        if trigger_id in self.triggers:
+            del self.triggers[trigger_id]
+    
+    def _add_action_row(self, action_key=None, action_config=None):
+        """Add an action configuration row."""
+        if not hasattr(self, 'actions_container') or self.actions_container is None:
+            logger.error("Actions container not initialized")
+            return
+            
+        action_id = action_key or f"action_{len(self.actions)}"
+        
+        with self.actions_container:
+            with ui.card().classes('w-full p-4') as action_card:
+                with ui.row().classes('w-full items-center'):
+                    # Action type selection
+                    action_select = ui.select(
+                        options=[a.value for a in ExpertActionType],
+                        label='Action Type',
+                        value=action_config.get('type') if action_config else ExpertActionType.BUY.value
+                    ).classes('flex-1')
+                    
+                    # Remove button
+                    ui.button('Remove', on_click=lambda: self._remove_action_row(action_id, action_card), 
+                             icon='delete', color='red').props('flat dense')
+                
+                # Value input (for ADJUST_ types)
+                value_row = ui.row().classes('w-full')
+                value_input = None
+                reference_select = None
+                
+                def update_action_inputs():
+                    value_row.clear()
+                    selected_type = action_select.value
+                    
+                    if selected_type and is_adjustment_action(selected_type):
+                        # Adjustment action - show value input and reference selector
+                        with value_row:
+                            with ui.column().classes('w-full gap-2'):
+                                nonlocal value_input, reference_select
+                                
+                                # Value input
+                                value_input = ui.input(
+                                    label='Adjustment Value (can be positive or negative)',
+                                    value=str(action_config.get('value', '')) if action_config else '',
+                                    placeholder='e.g. 5.0 or -2.5'
+                                ).classes('w-full')
+                                
+                                # Reference value selector
+                                reference_options = {
+                                    ReferenceValue.ORDER_OPEN_PRICE.value: 'Order Open Price',
+                                    ReferenceValue.CURRENT_PRICE.value: 'Current Market Price',
+                                    ReferenceValue.EXPERT_TARGET_PRICE.value: 'Expert Target Price'
+                                }
+                                reference_select = ui.select(
+                                    options=reference_options,
+                                    label='Reference Value',
+                                    value=action_config.get('reference_value', ReferenceValue.CURRENT_PRICE.value) if action_config else ReferenceValue.CURRENT_PRICE.value
+                                ).classes('w-full')
+                    else:
+                        # Simple action - no additional inputs needed
+                        with value_row:
+                            ui.label('Simple action - no additional configuration needed').classes('text-grey-7')
+                
+                # Initial setup
+                update_action_inputs()
+                action_select.on('update:model-value', lambda: update_action_inputs())
+                
+                # Store references
+                self.actions[action_id] = {
+                    'card': action_card,
+                    'type_select': action_select,
+                    'value_input': lambda: value_input,
+                    'reference_select': lambda: reference_select
+                }
+    
+    def _remove_action_row(self, action_id, action_card):
+        """Remove an action row."""
+        action_card.delete()
+        if action_id in self.actions:
+            del self.actions[action_id]
+    
+    def _save_rule(self, rule=None):
+        """Save the rule (EventAction)."""
+        try:
+            is_edit = rule is not None
+            
+            # Collect triggers
+            triggers_data = {}
+            for trigger_id, trigger_refs in self.triggers.items():
+                trigger_type = trigger_refs['type_select'].value
+                trigger_config = {'type': trigger_type}
+                
+                if is_numeric_event(trigger_type):
+                    # Numeric trigger
+                    operator_select = trigger_refs['operator_select']()
+                    value_input = trigger_refs['value_input']()
+                    if operator_select and value_input:
+                        trigger_config['operator'] = operator_select.value
+                        try:
+                            trigger_config['value'] = float(value_input.value)
+                        except (ValueError, TypeError):
+                            ui.notify(f'Invalid numeric value for trigger {trigger_type}', type='negative')
+                            return
+                
+                triggers_data[trigger_id] = trigger_config
+            
+            # Collect actions
+            actions_data = {}
+            for action_id, action_refs in self.actions.items():
+                action_type = action_refs['type_select'].value
+                action_config = {'type': action_type}
+                
+                if is_adjustment_action(action_type):
+                    # Adjustment action
+                    value_input = action_refs['value_input']()
+                    reference_select = action_refs['reference_select']()
+                    
+                    if value_input and value_input.value:
+                        try:
+                            action_config['value'] = float(value_input.value)
+                        except (ValueError, TypeError):
+                            ui.notify(f'Invalid numeric value for action {action_type}', type='negative')
+                            return
+                    
+                    # Save reference value (always save, even if value is empty)
+                    if reference_select:
+                        action_config['reference_value'] = reference_select.value
+                
+                actions_data[action_id] = action_config
+            
+            if is_edit:
+                # Update existing rule
+                rule.name = self.rule_name_input.value
+                rule.type = ExpertEventRuleType.TRADING_RECOMMENDATION_RULE
+                rule.subtype = None  # Not used, always set to None
+                rule.triggers = triggers_data
+                rule.actions = actions_data
+                rule.continue_processing = self.continue_processing_checkbox.value
+                
+                update_instance(rule)
+                logger.info(f"Updated rule: {rule.id}")
+            else:
+                # Create new rule
+                new_rule = EventAction(
+                    name=self.rule_name_input.value,
+                    type=ExpertEventRuleType.TRADING_RECOMMENDATION_RULE,
+                    subtype=None,  # Not used, always set to None
+                    triggers=triggers_data,
+                    actions=actions_data,
+                    extra_parameters={},
+                    continue_processing=self.continue_processing_checkbox.value
+                )
+                
+                rule_id = add_instance(new_rule)
+                logger.info(f"Created new rule: {rule_id}")
+            
+            self.rules_dialog.close()
+            self._update_rules_table()
+            ui.notify('Rule saved successfully!', type='positive')
+            
+        except Exception as e:
+            logger.error(f"Error saving rule: {e}", exc_info=True)
+            ui.notify(f"Error saving rule: {e}", type='negative')
+    
+    def show_ruleset_dialog(self, ruleset=None):
+        """Show the add/edit ruleset dialog."""
+        logger.debug(f'Showing ruleset dialog for ruleset: {ruleset.id if ruleset else "new ruleset"}')
+        
+        is_edit = ruleset is not None
+        
+        with self.rulesets_dialog:
+            self.rulesets_dialog.clear()
+            
+            with ui.card().classes('w-full').style('width: 90vw; max-width: 1200px; height: 90vh; margin: auto; display: flex; flex-direction: column'):
+                ui.label('Add Ruleset' if not is_edit else 'Edit Ruleset').classes('text-h6 mb-4')
+                
+                # Basic ruleset information
+                with ui.column().classes('w-full gap-4'):
+                    self.ruleset_name_input = ui.input(
+                        label='Ruleset Name',
+                        value=ruleset.name if is_edit else ''
+                    ).classes('w-full')
+                    
+                    self.ruleset_description_input = ui.textarea(
+                        label='Description',
+                        value=ruleset.description if is_edit and ruleset.description else ''
+                    ).classes('w-full')
+                
+                # Rules selection section
+                ui.label('Select Rules for this Ruleset').classes('text-subtitle1 mt-4 mb-2')
+                ui.label('Choose which rules should be part of this ruleset.').classes('text-grey-7 mb-4')
+                
+                # Get all available rules
+                available_rules = get_all_instances(EventAction)
+                if not available_rules:
+                    ui.label('No rules available. Create some rules first.').classes('text-orange')
+                else:
+                    self.selected_rules = {}
+                    
+                    with ui.column().classes('w-full').style('max-height: 400px; overflow-y: auto') as rules_container:
+                        for rule in available_rules:
+                            # Check if rule is currently associated with this ruleset
+                            is_selected = False
+                            if is_edit and ruleset.event_actions:
+                                is_selected = rule.id in [r.id for r in ruleset.event_actions]
+                            
+                            with ui.card().classes('w-full p-4 mb-2'):
+                                with ui.row().classes('w-full items-center'):
+                                    # Checkbox for selection
+                                    rule_checkbox = ui.checkbox(
+                                        text='',
+                                        value=is_selected
+                                    )
+                                    
+                                    # Rule information
+                                    with ui.column().classes('flex-1'):
+                                        ui.label(f'{rule.name}').classes('font-medium')
+                                        ui.label(f'Continue Processing: {"Yes" if rule.continue_processing else "No"}').classes('text-sm text-grey-6')
+                                        if rule.triggers:
+                                            trigger_summary = ', '.join([f"{k}: {v.get('type', 'unknown')}" for k, v in rule.triggers.items()])
+                                            ui.label(f'Triggers: {trigger_summary}').classes('text-sm text-grey-6')
+                                        if rule.actions:
+                                            action_summary = ', '.join([f"{k}: {v.get('type', 'unknown')}" for k, v in rule.actions.items()])
+                                            ui.label(f'Actions: {action_summary}').classes('text-sm text-grey-6')
+                            
+                            self.selected_rules[rule.id] = rule_checkbox
+                
+                # Save button
+                with ui.row().classes('w-full justify-end mt-4'):
+                    ui.button('Cancel', on_click=self.rulesets_dialog.close).props('flat')
+                    ui.button('Save', on_click=lambda: self._save_ruleset(ruleset))
+        
+        self.rulesets_dialog.open()
+    
+    def _save_ruleset(self, ruleset=None):
+        """Save the ruleset."""
+        try:
+            is_edit = ruleset is not None
+            
+            # Collect selected rules
+            selected_rule_ids = []
+            for rule_id, checkbox in self.selected_rules.items():
+                if checkbox.value:
+                    selected_rule_ids.append(rule_id)
+            
+            if is_edit:
+                # Update existing ruleset
+                ruleset.name = self.ruleset_name_input.value
+                ruleset.description = self.ruleset_description_input.value or None
+                
+                update_instance(ruleset)
+                
+                # Update rule associations
+                session = get_db()
+                # Clear existing associations
+                from sqlmodel import delete
+                from ...core.models import RulesetEventActionLink
+                stmt = delete(RulesetEventActionLink).where(RulesetEventActionLink.ruleset_id == ruleset.id)
+                session.exec(stmt)
+                
+                # Add new associations
+                for rule_id in selected_rule_ids:
+                    link = RulesetEventActionLink(ruleset_id=ruleset.id, eventaction_id=rule_id)
+                    session.add(link)
+                
+                session.commit()
+                session.close()
+                
+                logger.info(f"Updated ruleset: {ruleset.id}")
+            else:
+                # Create new ruleset
+                new_ruleset = Ruleset(
+                    name=self.ruleset_name_input.value,
+                    description=self.ruleset_description_input.value or None
+                )
+                
+                ruleset_id = add_instance(new_ruleset)
+                
+                # Add rule associations
+                if selected_rule_ids:
+                    session = get_db()
+                    for rule_id in selected_rule_ids:
+                        from ...core.models import RulesetEventActionLink
+                        link = RulesetEventActionLink(ruleset_id=ruleset_id, eventaction_id=rule_id)
+                        session.add(link)
+                    session.commit()
+                    session.close()
+                
+                logger.info(f"Created new ruleset: {ruleset_id}")
+            
+            self.rulesets_dialog.close()
+            self._update_rulesets_table()
+            ui.notify('Ruleset saved successfully!', type='positive')
+            
+        except Exception as e:
+            logger.error(f"Error saving ruleset: {e}", exc_info=True)
+            ui.notify(f"Error saving ruleset: {e}", type='negative')
+    
+    def _on_rule_edit_click(self, msg):
+        """Handle edit button click for rules."""
+        logger.debug(f'Edit rule table click: {msg}')
+        row = msg.args['row']
+        rule_id = row['id']
+        rule = get_instance(EventAction, rule_id)
+        if rule:
+            self.show_rule_dialog(rule)
+        else:
+            logger.warning(f'Rule with id {rule_id} not found')
+            ui.notify('Rule not found', type='error')
+    
+    def _on_rule_del_click(self, msg):
+        """Handle delete button click for rules."""
+        logger.debug(f'Delete rule table click: {msg}')
+        row = msg.args['row']
+        rule_id = row['id']
+        rule = get_instance(EventAction, rule_id)
+        if rule:
+            try:
+                logger.debug(f'Deleting rule {rule_id}')
+                delete_instance(rule)
+                logger.info(f'Rule {rule_id} deleted')
+                ui.notify('Rule deleted', type='positive')
+                self._update_rules_table()
+                # Also update rulesets table as rule counts may have changed
+                self._update_rulesets_table()
+            except Exception as e:
+                logger.error(f'Error deleting rule {rule_id}: {e}', exc_info=True)
+                ui.notify(f'Error deleting rule: {e}', type='negative')
+        else:
+            logger.warning(f'Rule with id {rule_id} not found')
+            ui.notify('Rule not found', type='error')
+    
+    def _on_ruleset_edit_click(self, msg):
+        """Handle edit button click for rulesets."""
+        logger.debug(f'Edit ruleset table click: {msg}')
+        row = msg.args['row']
+        ruleset_id = row['id']
+        ruleset = get_instance(Ruleset, ruleset_id)
+        if ruleset:
+            self.show_ruleset_dialog(ruleset)
+        else:
+            logger.warning(f'Ruleset with id {ruleset_id} not found')
+            ui.notify('Ruleset not found', type='error')
+    
+    def _on_ruleset_del_click(self, msg):
+        """Handle delete button click for rulesets."""
+        logger.debug(f'Delete ruleset table click: {msg}')
+        row = msg.args['row']
+        ruleset_id = row['id']
+        ruleset = get_instance(Ruleset, ruleset_id)
+        if ruleset:
+            try:
+                logger.debug(f'Deleting ruleset {ruleset_id}')
+                # Delete associations first
+                session = get_db()
+                from sqlmodel import delete
+                from ...core.models import RulesetEventActionLink
+                stmt = delete(RulesetEventActionLink).where(RulesetEventActionLink.ruleset_id == ruleset_id)
+                session.exec(stmt)
+                session.commit()
+                session.close()
+                
+                # Delete the ruleset
+                delete_instance(ruleset)
+                logger.info(f'Ruleset {ruleset_id} deleted')
+                ui.notify('Ruleset deleted', type='positive')
+                self._update_rulesets_table()
+            except Exception as e:
+                logger.error(f'Error deleting ruleset {ruleset_id}: {e}', exc_info=True)
+                ui.notify(f'Error deleting ruleset: {e}', type='negative')
+        else:
+            logger.warning(f'Ruleset with id {ruleset_id} not found')
+            ui.notify('Ruleset not found', type='error')
+
+
 def content() -> None:
     logger.debug('Initializing settings page')
     with ui.tabs() as tabs:
@@ -1094,6 +1762,6 @@ def content() -> None:
         with ui.tab_panel('Expert Settings'):
             ExpertSettingsTab()
         with ui.tab_panel('Trade Settings'):
-            ui.label('Trade Settings')
+            TradeSettingsTab()
         with ui.tab_panel('Instruments'):
             InstrumentSettingsTab()

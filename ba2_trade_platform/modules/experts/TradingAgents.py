@@ -28,6 +28,13 @@ class TradingAgents(MarketExpertInterface):
         super().__init__(id)
         logger.debug(f'Initializing TradingAgent with instance id: {id}')
         
+        # Set environment variables from database for API keys
+        try:
+            from ...thirdparties.TradingAgents.tradingagents.dataflows.config import set_environment_variables_from_database
+            set_environment_variables_from_database()
+        except Exception as e:
+            logger.warning(f"Could not set API keys from database: {e}")
+        
         # Load the expert instance from database
         self.instance = get_instance(ExpertInstance, id)
         if not self.instance:
@@ -182,8 +189,18 @@ class TradingAgents(MarketExpertInterface):
         # Get enabled instruments from expert settings
         enabled_instruments_setting = self.settings.get('enabled_instruments')
         
-        if enabled_instruments_setting and enabled_instruments_setting.value_json:
-            return enabled_instruments_setting.value_json
+        if enabled_instruments_setting:
+            # If it's already a dict, return it directly
+            if isinstance(enabled_instruments_setting, dict):
+                return enabled_instruments_setting
+            # If it's a string, try to parse it as JSON
+            elif isinstance(enabled_instruments_setting, str):
+                try:
+                    import json
+                    return json.loads(enabled_instruments_setting)
+                except (json.JSONDecodeError, ValueError):
+                    logger.warning(f"Failed to parse enabled_instruments setting as JSON: {enabled_instruments_setting}")
+                    return {}
         
         # Return empty dict if no enabled instruments configured
         return {}

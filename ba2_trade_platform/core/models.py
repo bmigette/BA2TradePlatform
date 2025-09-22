@@ -1,8 +1,8 @@
 from sqlmodel import  Field, Session, SQLModel, create_engine, Column, Relationship
 from sqlalchemy import String, Float, JSON, UniqueConstraint, Table, Integer, ForeignKey
 from typing import Optional, Dict, Any, List
-from .types import InstrumentType, OrderStatus, OrderDirection
-from datetime import datetime
+from .types import InstrumentType, OrderStatus, OrderDirection, ExpertEventRuleType
+from datetime import datetime, timezone
 
 # Association table for many-to-many relationship between Ruleset and EventAction
 class RulesetEventActionLink(SQLModel, table=True):
@@ -55,7 +55,6 @@ class Ruleset(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     name: str
     description: str | None = Field(default=None)
-    
     # Many-to-many relationship with EventAction
     event_actions: List["EventAction"] = Relationship(
         back_populates="rulesets", 
@@ -65,19 +64,29 @@ class Ruleset(SQLModel, table=True):
 
 class EventAction(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    type: str
+    type: ExpertEventRuleType
     subtype: str | None 
     name: str
-    trigger: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict)
-    action: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict) 
+    triggers: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict)
+    actions: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict) 
     extra_parameters: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict)
-    
+    continue_processing: bool = Field(default=False)
     # Many-to-many relationship with Ruleset
     rulesets: List["Ruleset"] = Relationship(
         back_populates="event_actions", 
         link_model=RulesetEventActionLink
     )
 
+class ExpertRecommendation(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    instance_id: int = Field(foreign_key="expertinstance.id", nullable=False, ondelete="CASCADE")
+    symbol: str
+    recommended_action: OrderDirection
+    expected_profit_percent: float
+    price_at_date: float
+    details: str | None
+    confidence: float | None
+    created_at: datetime | None = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 

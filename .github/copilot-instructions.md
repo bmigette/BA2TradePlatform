@@ -1,56 +1,125 @@
 # BA2 Trade Platform - AI Assistant Instructions
 
 ## Project Overview
-BA2 Trade Platform is a Python-based algorithmic trading platform that integrates various market data sources, technical analysis tools, and AI/ML capabilities for automated trading.
+BA2 Trade Platform is a Python-based algorithmic trading platform built around a plugin architecture for accounts and market experts. It features a SQLModel-based ORM, NiceGUI web interface, and extensible settings system for AI-driven trading strategies.
 
-## Architecture
-- `ba2_trade_platform/` - Main package directory
-  - `modules/` - Core functional modules
-    - `accounts/` - Trading account management
-    - `marketexperts/` - Market analysis and trading strategies
-  - `ui/` - User interface components
-  - `config.py` - Global configuration settings
-  - `logger.py` - Centralized logging configuration
+## Core Architecture
 
-## Key Patterns and Conventions
-1. **Logging**:
-   - Uses Python's built-in logging with both file and stdout output
-   - Log files are stored in `logs/` directory with rotation (10MB max size, 7 backups)
-   - Debug level for detailed logs (`app.debug.log`) and Info level for main logs (`app.log`)
+### Plugin System
+- **Account Interfaces**: Implement `AccountInterface` for different brokers (e.g., `AlpacaAccount`)
+- **Market Experts**: Implement `MarketExpertInterface` for AI trading strategies (e.g., `TradingAgents`)
+- **Extensible Settings**: Both interfaces extend `ExtendableSettingsInterface` for flexible configuration
 
-2. **Configuration**:
-   - Core settings in `config.py`
-   - Uses environment-based configuration with `HOME` and `HOME_PARENT` path variables
-   - Feature flags like `STDOUT_LOGGING` and `FILE_LOGGING` control logging behavior
+### Database Layer
+- **SQLModel ORM**: All models in `ba2_trade_platform/core/models.py`
+- **SQLite Database**: Located at `~/Documents/ba2_trade_platform/db.sqlite`
+- **Database Functions**: Use `ba2_trade_platform/core/db.py` helpers (`get_instance`, `add_instance`, etc.)
+
+### Directory Structure
+```
+ba2_trade_platform/
+├── core/                    # Core interfaces and data models
+│   ├── AccountInterface.py  # Abstract base for trading accounts
+│   ├── MarketExpertInterface.py  # Abstract base for AI experts
+│   ├── ExtendableSettingsInterface.py  # Settings management
+│   ├── models.py           # SQLModel database models
+│   ├── types.py            # Enums (OrderStatus, ExpertActionType, etc.)
+│   └── db.py              # Database utilities
+├── modules/
+│   ├── accounts/          # Account implementations (AlpacaAccount)
+│   └── experts/           # Expert implementations (TradingAgents)
+├── ui/                    # NiceGUI web interface
+│   ├── main.py           # Route definitions
+│   ├── pages/            # Page components
+│   └── components/       # Reusable UI components
+├── config.py             # Global configuration and environment variables
+└── logger.py             # Centralized logging setup
+```
+
+## Key Patterns
+
+### 1. **Settings Management**
+All plugins use the ExtendableSettingsInterface pattern:
+```python
+class MyAccount(AccountInterface):
+    @classmethod
+    def get_settings_definitions(cls) -> Dict[str, Any]:
+        return {
+            "api_key": {"type": "str", "required": True, "description": "API Key"},
+            "paper_account": {"type": "bool", "required": True, "description": "Paper trading?"}
+        }
+    
+    def __init__(self, id: int):
+        super().__init__(id)
+        # Access settings via self.settings["api_key"]
+```
+
+### 2. **Type System**
+Use enums from `core/types.py` for consistency:
+- `OrderStatus`, `OrderDirection`, `OrderType` for trading
+- `ExpertActionType`, `ExpertEventType` for AI recommendations
+- `InstrumentType` for asset classifications
+
+### 3. **Database Operations**
+Always use the core database helpers:
+```python
+from ba2_trade_platform.core.db import get_instance, add_instance, update_instance
+from ba2_trade_platform.core.models import ExpertInstance
+
+# Get instance
+expert = get_instance(ExpertInstance, expert_id)
+
+# Create new instance
+new_expert = ExpertInstance(account_id=1, expert="TradingAgents")
+expert_id = add_instance(new_expert)
+```
+
+### 4. **Logging**
+Centralized logging with file rotation:
+```python
+from ba2_trade_platform.logger import logger
+
+logger.debug("Detailed debug info")  # Goes to app.debug.log
+logger.info("General execution info")  # Goes to both logs
+logger.error("Error conditions")
+```
 
 ## Dependencies
-Key integrations include:
-- Market Data: `yfinance`, `eodhd`, `akshare`, `tushare`, `finnhub-python`
-- Trading: `backtrader`, `ibind`
-- AI/ML: `langchain` ecosystem (`langchain-openai`, `langchain-anthropic`, `langchain-google-genai`)
-- Data Storage: `chromadb`, `redis`, `sqlalchemy`
-- UI: `nicegui`, `chainlit`, `rich`
+- **Trading**: `alpaca-py` (primary broker), `yfinance`, `backtrader`
+- **AI/ML**: `langchain-*` ecosystem, `stockstats`
+- **Data**: `sqlmodel`, `chromadb`, `redis`, `pandas`
+- **UI**: `nicegui`, `rich`, `questionary`
+- **External APIs**: `finnhub-python`, `eodhd`, `tushare`, `akshare`
+
+## Common Tasks
+
+### Adding New Account Provider
+1. Create class in `modules/accounts/` extending `AccountInterface`
+2. Implement all abstract methods (`get_account_info`, `submit_order`, etc.)
+3. Define `get_settings_definitions()` for required configuration
+
+### Adding New Market Expert
+1. Create class in `modules/experts/` extending `MarketExpertInterface`
+2. Implement prediction methods (`get_prediction_for_instrument`, etc.)
+3. Handle instrument enablement via settings system
+
+### Database Schema Changes
+1. Modify models in `core/models.py`
+2. Database recreates automatically on next run (SQLite auto-migration)
+3. Use proper SQLModel field definitions with relationships
 
 ## Development Workflow
-1. **Python Environment**:
-   - Project uses Python virtual environments
-   - Install dependencies: `pip install -r requirements.txt`
 
-2. **Project Setup**:
-   - Ensure `logs/` directory exists for logging
-   - Configure required API keys for data providers
-   - Set up database connections if using persistent storage
+### Setup
+1. Install dependencies: `pip install -r requirements.txt`
+2. Database auto-initializes on first run via `main.py`
+3. Set environment variables in `.env` file (API keys, etc.)
 
-## Best Practices
-1. **Logging**:
-   ```python
-   from ba2_trade_platform.logger import logger
-   
-   logger.debug("Detailed debug info")
-   logger.info("General execution info")
-   logger.error("Error conditions")
-   ```
+### Running
+- **Main Application**: `python main.py` (starts NiceGUI web interface)
+- **Configuration**: Environment variables loaded from `.env` via `config.load_config_from_env()`
 
-2. **Error Handling**:
-   - Use proper exception handling with logging
-   - Implement graceful degradation for market data sources
+### Testing
+- Manual testing through web UI at http://localhost:8080
+- Test file: `test.py` (basic testing utilities)
+

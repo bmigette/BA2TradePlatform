@@ -184,3 +184,29 @@ def get_all_instances(model_class, session: Session | None = None):
     except Exception as e:
         logger.error(f"Error retrieving all instances: {e}", exc_info=True)
         raise
+
+
+def get_setting(key: str) -> str | None:
+    """
+    Retrieve an AppSetting value by key.
+
+    Args:
+        key: The setting key to retrieve.
+
+    Returns:
+        The value_str field of the AppSetting if found, otherwise None.
+    """
+    try:
+        from .models import AppSetting
+        with Session(engine) as session:
+            statement = select(AppSetting).where(AppSetting.key == key)
+            result = session.exec(statement).first()
+            if result:
+                logger.info(f"Retrieved setting {key}: {result.value_str}")
+                return result.value_str
+            else:
+                logger.warning(f"Setting {key} not found in database")
+                return None
+    except Exception as e:
+        logger.error(f"Error retrieving setting {key}: {e}", exc_info=True)
+        return None
