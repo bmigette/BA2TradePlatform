@@ -417,3 +417,100 @@ class Toolkit:
         )
 
         return openai_fundamentals_results
+
+    @staticmethod
+    @tool
+    def get_fred_series_data(
+        series_id: Annotated[str, "FRED series ID (e.g., 'FEDFUNDS', 'CPIAUCSL', 'UNRATE')"],
+        start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
+        end_date: Annotated[str, "End date in yyyy-mm-dd format"],
+    ):
+        """
+        Retrieve economic data from FRED (Federal Reserve Economic Data) API.
+        Args:
+            series_id (str): FRED series ID (e.g., 'FEDFUNDS' for federal funds rate, 'CPIAUCSL' for inflation)
+            start_date (str): Start date in yyyy-mm-dd format
+            end_date (str): End date in yyyy-mm-dd format
+        Returns:
+            str: A formatted string containing the economic data from FRED for the specified series and date range.
+        """
+        from ...dataflows.macro_utils import get_fred_data
+        
+        fred_result = get_fred_data(series_id, start_date, end_date)
+        return str(fred_result)
+
+    @staticmethod
+    @tool
+    def get_economic_calendar(
+        start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
+        end_date: Annotated[str, "End date in yyyy-mm-dd format"],
+    ):
+        """
+        Retrieve economic calendar events and data for a given date range.
+        Args:
+            start_date (str): Start date in yyyy-mm-dd format
+            end_date (str): End date in yyyy-mm-dd format
+        Returns:
+            str: A formatted string containing economic calendar events and their impact.
+        """
+        from ...dataflows.macro_utils import get_economic_calendar_data
+        
+        calendar_result = get_economic_calendar_data(start_date, end_date)
+        return str(calendar_result)
+
+    @staticmethod
+    @tool
+    def get_treasury_yield_curve(
+        start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
+        end_date: Annotated[str, "End date in yyyy-mm-dd format"],
+    ):
+        """
+        Retrieve US Treasury yield curve data from FRED.
+        Args:
+            start_date (str): Start date in yyyy-mm-dd format
+            end_date (str): End date in yyyy-mm-dd format
+        Returns:
+            str: A formatted string containing treasury yield curve data and analysis.
+        """
+        from ...dataflows.macro_utils import get_treasury_yield_curve_data
+        
+        yield_result = get_treasury_yield_curve_data(start_date, end_date)
+        return str(yield_result)
+
+    @staticmethod
+    @tool
+    def get_inflation_data(
+        start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
+        end_date: Annotated[str, "End date in yyyy-mm-dd format"],
+    ):
+        """
+        Retrieve inflation indicators from FRED (CPI, Core CPI, PCE).
+        Args:
+            start_date (str): Start date in yyyy-mm-dd format
+            end_date (str): End date in yyyy-mm-dd format
+        Returns:
+            str: A formatted string containing inflation data and trends.
+        """
+        from ...dataflows.macro_utils import get_inflation_indicators
+        
+        inflation_result = get_inflation_indicators(start_date, end_date)
+        return str(inflation_result)
+
+    @staticmethod
+    @tool
+    def get_employment_data(
+        start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
+        end_date: Annotated[str, "End date in yyyy-mm-dd format"],
+    ):
+        """
+        Retrieve employment data from FRED (unemployment rate, job openings, etc.).
+        Args:
+            start_date (str): Start date in yyyy-mm-dd format
+            end_date (str): End date in yyyy-mm-dd format
+        Returns:
+            str: A formatted string containing employment data and labor market indicators.
+        """
+        from ...dataflows.macro_utils import get_employment_indicators
+        
+        employment_result = get_employment_indicators(start_date, end_date)
+        return str(employment_result)

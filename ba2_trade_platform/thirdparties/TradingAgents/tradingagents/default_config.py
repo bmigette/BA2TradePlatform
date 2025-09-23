@@ -19,4 +19,9 @@ DEFAULT_CONFIG = {
     "max_recur_limit": 100,
     # Tool settings
     "online_tools": True,
+    # Data fetching settings
+    "news_lookback_days": 7,
+    "market_history_days": 90,
+    "economic_data_days": 90,
+    "social_sentiment_days": 3,
 }

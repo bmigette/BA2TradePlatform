@@ -4,25 +4,23 @@ import json
 from ...prompts import format_analyst_prompt, get_prompt
 
 
-def create_fundamentals_analyst(llm, toolkit):
-    def fundamentals_analyst_node(state):
+def create_macro_analyst(llm, toolkit):
+    def macro_analyst_node(state):
         current_date = state["trade_date"]
         ticker = state["company_of_interest"]
         company_name = state["company_of_interest"]
 
-        if toolkit.config["online_tools"]:
-            tools = [toolkit.get_fundamentals_openai]
-        else:
-            tools = [
-                toolkit.get_finnhub_company_insider_sentiment,
-                toolkit.get_finnhub_company_insider_transactions,
-                toolkit.get_simfin_balance_sheet,
-                toolkit.get_simfin_cashflow,
-                toolkit.get_simfin_income_stmt,
-            ]
+        # Use macro tools for FRED data and economic indicators
+        tools = [
+            toolkit.get_fred_series_data,
+            toolkit.get_economic_calendar,
+            toolkit.get_treasury_yield_curve,
+            toolkit.get_inflation_data,
+            toolkit.get_employment_data,
+        ]
 
         # Get system prompt from centralized prompts
-        system_message = get_prompt("fundamentals_analyst")
+        system_message = get_prompt("macro_analyst")
 
         # Format analyst collaboration prompt
         prompt_config = format_analyst_prompt(
@@ -50,7 +48,7 @@ def create_fundamentals_analyst(llm, toolkit):
 
         return {
             "messages": [result],
-            "fundamentals_report": report,
+            "macro_report": report,
         }
 
-    return fundamentals_analyst_node
+    return macro_analyst_node

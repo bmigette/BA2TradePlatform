@@ -366,15 +366,18 @@ class AppSettingsTab:
     def __init__(self):
         self.openai_input = None
         self.finnhub_input = None
+        self.fred_input = None
         self.render()
 
     def render(self):
         session = get_db()
         openai = session.exec(select(AppSetting).where(AppSetting.key == 'openai_api_key')).first()
         finnhub = session.exec(select(AppSetting).where(AppSetting.key == 'finnhub_api_key')).first()
+        fred = session.exec(select(AppSetting).where(AppSetting.key == 'fred_api_key')).first()
         with ui.card().classes('w-full'):
             self.openai_input = ui.input(label='OpenAI API Key', value=openai.value_str if openai else '').classes('w-full')
             self.finnhub_input = ui.input(label='Finnhub API Key', value=finnhub.value_str if finnhub else '').classes('w-full')
+            self.fred_input = ui.input(label='FRED API Key', value=fred.value_str if fred else '').classes('w-full')
             ui.button('Save', on_click=self.save_settings)
 
     def save_settings(self):
@@ -397,6 +400,15 @@ class AppSettingsTab:
             else:
                 finnhub = AppSetting(key='finnhub_api_key', value_str=self.finnhub_input.value)
                 add_instance(finnhub, session)
+
+            # FRED
+            fred = session.exec(select(AppSetting).where(AppSetting.key == 'fred_api_key')).first()
+            if fred:
+                fred.value_str = self.fred_input.value
+                update_instance(fred, session)
+            else:
+                fred = AppSetting(key='fred_api_key', value_str=self.fred_input.value)
+                add_instance(fred, session)
             
             session.commit()
             ui.notify('Settings saved successfully', type='positive')
@@ -595,6 +607,28 @@ class ExpertSettingsTab:
     """
     UI tab for managing expert instances (ExpertInstance SQL Model).
     Features: table with experts, add/edit experts with settings and instrument selection.
+    
+    This tab manages three main categories of settings:
+    
+    1. **General Settings** (saved as ExpertSetting records):
+       - execution_schedule (JSON): Schedule configuration containing:
+         - days: Dict of weekday names (monday, tuesday, etc.) to boolean values
+         - times: List of execution times in HH:MM format
+       - enable_buy (bool): Whether the expert can place BUY orders (default: True)
+       - enable_sell (bool): Whether the expert can place SELL orders (default: False)
+    
+    2. **Expert-Specific Settings** (saved as ExpertSetting records):
+       - Settings defined by each expert class's get_settings_definitions() method
+       - Automatically detects setting types (str, bool, float, json) and handles valid_values
+       - Uses default values when available from settings definitions
+    
+    3. **Instrument Configuration** (saved as ExpertSetting records):
+       - Instrument selection and weight configuration
+       - Managed through the InstrumentSelector component
+       - Stores enabled instruments with their respective trading weights
+    
+    All settings are persisted using the ExtendableSettingsInterface save_setting() method
+    with appropriate setting_type parameters to ensure proper data type handling.
     """
     
     def __init__(self):
@@ -763,10 +797,44 @@ class ExpertSettingsTab:
                 
                 # Tabs for different settings sections
                 with ui.tabs() as settings_tabs:
+                    ui.tab('General Settings', icon='schedule')
                     ui.tab('Instruments', icon='trending_up')
                     ui.tab('Expert Settings', icon='settings')
                 
-                with ui.tab_panels(settings_tabs, value='Instruments').classes('w-full').style('flex: 1; overflow-y: auto'):
+                with ui.tab_panels(settings_tabs, value='General Settings').classes('w-full').style('flex: 1; overflow-y: auto'):
+                    # General Settings tab
+                    with ui.tab_panel('General Settings'):
+                        ui.label('General Expert Configuration:').classes('text-subtitle1 mb-4')
+                        
+                        # Schedule settings
+                        ui.label('Execution Schedule:').classes('text-subtitle2 mb-2')
+                        ui.label('Select days when the expert should run:').classes('text-body2 mb-2')
+                        
+                        with ui.row().classes('w-full gap-2 mb-4'):
+                            self.schedule_days = {}
+                            for day in ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']:
+                                self.schedule_days[day.lower()] = ui.checkbox(day, value=True).classes('mb-2')
+                        
+                        ui.label('Execution times (24-hour format, e.g., 09:30, 15:00):').classes('text-body2 mb-2')
+                        self.execution_times_container = ui.column().classes('w-full mb-4')
+                        self.execution_times = []
+                        
+                        # Add initial time input
+                        self._add_time_input('09:30')
+                        
+                        with ui.row().classes('w-full gap-2 mb-4'):
+                            ui.button('Add Time', on_click=self._add_time_input, icon='add_alarm').props('flat')
+                        
+                        ui.separator().classes('my-4')
+                        
+                        # Trading direction settings
+                        ui.label('Trading Permissions:').classes('text-subtitle2 mb-2')
+                        ui.label('Select which trading actions this expert can perform:').classes('text-body2 mb-2')
+                        
+                        with ui.row().classes('w-full gap-4'):
+                            self.enable_buy_checkbox = ui.checkbox('Enable BUY orders', value=True)
+                            self.enable_sell_checkbox = ui.checkbox('Enable SELL orders', value=False)
+                    
                     # Instruments tab
                     with ui.tab_panel('Instruments'):
                         ui.label('Select and configure instruments for this expert:').classes('text-subtitle1 mb-4')
@@ -792,6 +860,10 @@ class ExpertSettingsTab:
                         # Update settings when expert type changes
                         self.expert_select.on('update:model-value', 
                                             lambda e: self._on_expert_type_change(e, expert_instance))
+                
+                # Load general settings if editing
+                if is_edit:
+                    self._load_general_settings(expert_instance)
                 
                 # Save button
                 with ui.row().classes('w-full justify-end mt-4'):
@@ -857,6 +929,156 @@ class ExpertSettingsTab:
                 self.description_label.text = "Description: Unknown expert type"
         else:
             self.description_label.text = "Description: Select an expert type"
+    
+    def _add_time_input(self, initial_time=''):
+        """Add a new time input field to the execution times container."""
+        with ui.row().classes('w-full gap-2').move(self.execution_times_container):
+            time_input = ui.input(
+                label='Time (HH:MM)', 
+                value=initial_time,
+                placeholder='09:30'
+            ).classes('flex-grow')
+            
+            # Validate time format on change
+            def validate_time(e):
+                try:
+                    time_str = e.value
+                    if time_str and ':' in time_str:
+                        hours, minutes = time_str.split(':')
+                        hours_int = int(hours)
+                        minutes_int = int(minutes)
+                        if 0 <= hours_int <= 23 and 0 <= minutes_int <= 59:
+                            time_input.props('error=false')
+                        else:
+                            time_input.props('error=true error-message="Invalid time format"')
+                    elif time_str:
+                        time_input.props('error=true error-message="Use HH:MM format"')
+                    else:
+                        time_input.props('error=false')
+                except ValueError:
+                    time_input.props('error=true error-message="Invalid time format"')
+            
+            time_input.on('input', validate_time)
+            
+            remove_btn = ui.button(icon='remove', on_click=lambda: self._remove_time_input(time_input))
+            remove_btn.props('flat dense color=red size=sm')
+            
+            # Only show remove button if there's more than one time input
+            if len(self.execution_times) == 0:
+                remove_btn.set_visibility(False)
+            
+            self.execution_times.append(time_input)
+            
+            # Show remove buttons for all inputs if there's more than one
+            if len(self.execution_times) > 1:
+                for time_inp in self.execution_times:
+                    # Find the remove button for this input
+                    parent = time_inp.parent_slot.parent
+                    for child in parent._props.get('children', []):
+                        if hasattr(child, 'props') and 'remove' in str(child.props):
+                            child.set_visibility(True)
+                            break
+    
+    def _remove_time_input(self, time_input):
+        """Remove a time input field."""
+        if len(self.execution_times) <= 1:
+            return  # Don't remove the last time input
+            
+        # Find and remove the input from our list
+        if time_input in self.execution_times:
+            self.execution_times.remove(time_input)
+            
+        # Remove the entire row containing the input and button
+        parent = time_input.parent_slot.parent
+        parent.delete()
+        
+        # Hide remove buttons if only one input remains
+        if len(self.execution_times) == 1:
+            for time_inp in self.execution_times:
+                parent = time_inp.parent_slot.parent
+                for child in parent._props.get('children', []):
+                    if hasattr(child, 'props') and 'remove' in str(child.props):
+                        child.set_visibility(False)
+                        break
+    
+    def _get_schedule_config(self):
+        """Get the current schedule configuration as a JSON-serializable dict."""
+        schedule = {
+            'days': {},
+            'times': []
+        }
+        
+        # Get selected days
+        for day, checkbox in self.schedule_days.items():
+            schedule['days'][day] = checkbox.value
+        
+        # Get execution times
+        for time_input in self.execution_times:
+            time_value = time_input.value.strip()
+            if time_value and ':' in time_value:
+                try:
+                    hours, minutes = time_value.split(':')
+                    hours_int = int(hours)
+                    minutes_int = int(minutes)
+                    if 0 <= hours_int <= 23 and 0 <= minutes_int <= 59:
+                        schedule['times'].append(time_value)
+                except ValueError:
+                    pass  # Skip invalid times
+        
+        return schedule
+    
+    def _load_schedule_config(self, schedule_config):
+        """Load schedule configuration from a JSON dict."""
+        if not schedule_config:
+            return
+            
+        # Load days
+        days = schedule_config.get('days', {})
+        for day, checkbox in self.schedule_days.items():
+            checkbox.value = days.get(day, True)  # Default to True if not specified
+        
+        # Load times
+        times = schedule_config.get('times', ['09:30'])
+        
+        # Clear existing time inputs
+        self.execution_times.clear()
+        self.execution_times_container.clear()
+        
+        # Add time inputs for each configured time
+        for time_str in times:
+            self._add_time_input(time_str)
+        
+        # If no times were configured, add a default
+        if not times:
+            self._add_time_input('09:30')
+    
+    def _load_general_settings(self, expert_instance):
+        """Load general settings (schedule and trading permissions) for an existing expert."""
+        try:
+            expert_class = self._get_expert_class(expert_instance.expert)
+            if not expert_class:
+                return
+                
+            expert = expert_class(expert_instance.id)
+            
+            # Load execution schedule
+            schedule_config = expert.settings.get('execution_schedule')
+            if schedule_config:
+                self._load_schedule_config(schedule_config)
+            
+            # Load trading permissions
+            enable_buy = expert.settings.get('enable_buy', True)  # Default to True
+            enable_sell = expert.settings.get('enable_sell', False)  # Default to False
+            
+            if hasattr(self, 'enable_buy_checkbox'):
+                self.enable_buy_checkbox.value = enable_buy
+            if hasattr(self, 'enable_sell_checkbox'):
+                self.enable_sell_checkbox.value = enable_sell
+                
+            logger.debug(f'Loaded general settings for expert {expert_instance.id}: schedule={schedule_config}, buy={enable_buy}, sell={enable_sell}')
+            
+        except Exception as e:
+            logger.error(f'Error loading general settings for expert {expert_instance.id}: {e}', exc_info=True)
     
     def _on_expert_type_change_dialog(self, event, expert_instance):
         """Handle expert type change in the dialog."""
@@ -997,28 +1219,39 @@ class ExpertSettingsTab:
             ui.notify(f"Error saving expert: {e}", type='negative')
     
     def _save_expert_settings(self, expert_id):
-        """Save expert-specific settings."""
-        if not hasattr(self, 'expert_settings_inputs') or not self.expert_settings_inputs:
-            return
-        
+        """Save expert-specific settings and general settings."""
         expert_class = self._get_expert_class(self.expert_select.value)
         if not expert_class:
             return
         
         expert = expert_class(expert_id)
-        settings_def = expert.get_settings_definitions()
         
-        for key, inp in self.expert_settings_inputs.items():
-            meta = settings_def.get(key, {})
+        # Save general settings (schedule and trading permissions)
+        if hasattr(self, 'schedule_days') and hasattr(self, 'execution_times'):
+            schedule_config = self._get_schedule_config()
+            expert.save_setting('execution_schedule', schedule_config, setting_type="json")
+            logger.debug(f'Saved execution schedule: {schedule_config}')
+        
+        if hasattr(self, 'enable_buy_checkbox') and hasattr(self, 'enable_sell_checkbox'):
+            expert.save_setting('enable_buy', self.enable_buy_checkbox.value, setting_type="bool")
+            expert.save_setting('enable_sell', self.enable_sell_checkbox.value, setting_type="bool")
+            logger.debug(f'Saved trading permissions: buy={self.enable_buy_checkbox.value}, sell={self.enable_sell_checkbox.value}')
+        
+        # Save expert-specific settings
+        if hasattr(self, 'expert_settings_inputs') and self.expert_settings_inputs:
+            settings_def = expert.get_settings_definitions()
             
-            if meta.get("type") == "bool":
-                expert.save_setting(key, inp.value, setting_type="bool")
-            elif meta.get("type") == "float":
-                expert.save_setting(key, float(inp.value or 0), setting_type="float")
-            else:
-                expert.save_setting(key, inp.value, setting_type="str")
+            for key, inp in self.expert_settings_inputs.items():
+                meta = settings_def.get(key, {})
+                
+                if meta.get("type") == "bool":
+                    expert.save_setting(key, inp.value, setting_type="bool")
+                elif meta.get("type") == "float":
+                    expert.save_setting(key, float(inp.value or 0), setting_type="float")
+                else:
+                    expert.save_setting(key, inp.value, setting_type="str")
         
-        logger.debug(f'Saved expert settings for instance {expert_id}')
+        logger.debug(f'Saved all expert settings for instance {expert_id}')
     
     def _save_instrument_configuration(self, expert_id):
         """Save instrument selection and configuration."""

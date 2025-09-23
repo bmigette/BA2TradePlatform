@@ -29,6 +29,16 @@ def get_finnhub_api_key() -> Optional[str]:
     return get_api_key_from_database("finnhub_api_key")
 
 
+def get_fred_api_key() -> Optional[str]:
+    """Get FRED API key from database or environment."""
+    return get_api_key_from_database("fred_api_key")
+
+
+def get_api_key(key_name: str, env_fallback: str) -> Optional[str]:
+    """Generic API key getter with database fallback to environment."""
+    return get_api_key_from_database(key_name) or os.getenv(env_fallback)
+
+
 def set_environment_variables_from_database():
     """Set environment variables for API keys from database values for compatibility."""
     try:
@@ -39,6 +49,10 @@ def set_environment_variables_from_database():
         finnhub_key = get_finnhub_api_key()
         if finnhub_key:
             os.environ["FINNHUB_API_KEY"] = finnhub_key
+            
+        fred_key = get_fred_api_key()
+        if fred_key:
+            os.environ["FRED_API_KEY"] = fred_key
             
         print("API keys loaded from database and set as environment variables")
     except Exception as e:
@@ -66,7 +80,19 @@ def get_config() -> Dict:
     """Get the current configuration."""
     if _config is None:
         initialize_config()
-    return _config.copy()
+    
+    # Add logging configuration from main config
+    config = _config.copy()
+    try:
+        from ba2_trade_platform.config import get_env_var
+        config['console_logging'] = get_env_var('STDOUT_LOGGING', 'true').lower() in ('true', '1', 'yes', 'on')
+        config['file_logging'] = get_env_var('FILE_LOGGING', 'true').lower() in ('true', '1', 'yes', 'on')
+    except ImportError:
+        # Fallback to environment variables
+        config['console_logging'] = os.getenv('STDOUT_LOGGING', 'true').lower() in ('true', '1', 'yes', 'on')
+        config['file_logging'] = os.getenv('FILE_LOGGING', 'true').lower() in ('true', '1', 'yes', 'on')
+    
+    return config
 
 
 # Initialize with default config

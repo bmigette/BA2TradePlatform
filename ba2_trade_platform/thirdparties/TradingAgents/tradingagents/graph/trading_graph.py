@@ -28,15 +28,21 @@ from .propagation import Propagator
 from .reflection import Reflector
 from .signal_processing import SignalProcessor
 
+# Import our new modules
+from ..db_storage import DatabaseStorageMixin
+from .. import logger as ta_logger
+from .summarization import create_expert_recommendation_summary
 
-class TradingAgentsGraph:
+
+class TradingAgentsGraph(DatabaseStorageMixin):
     """Main class that orchestrates the trading agents framework."""
 
     def __init__(
         self,
-        selected_analysts=["market", "social", "news", "fundamentals"],
+        selected_analysts=["market", "social", "news", "fundamentals", "macro"],
         debug=False,
         config: Dict[str, Any] = None,
+        expert_instance_id: Optional[int] = None,
     ):
         """Initialize the trading agents graph and components.
 
@@ -44,9 +50,16 @@ class TradingAgentsGraph:
             selected_analysts: List of analyst types to include
             debug: Whether to run in debug mode
             config: Configuration dictionary. If None, uses default config
+            expert_instance_id: Expert instance ID for database storage and logging
         """
+        super().__init__()
         self.debug = debug
         self.config = config or DEFAULT_CONFIG
+        self.expert_instance_id = expert_instance_id
+
+        # Initialize logger
+        ta_logger.init_logger(expert_instance_id, self.config.get("log_dir", "."))
+        ta_logger.info(f"Initializing TradingAgentsGraph with expert_instance_id={expert_instance_id}")
 
         # Update the interface's config
         set_config(self.config)
@@ -154,12 +167,32 @@ class TradingAgentsGraph:
                     self.toolkit.get_simfin_income_stmt,
                 ]
             ),
+            "macro": ToolNode(
+                [
+                    # FRED economic data tools
+                    self.toolkit.get_fred_series_data,
+                    self.toolkit.get_economic_calendar,
+                    self.toolkit.get_treasury_yield_curve,
+                    self.toolkit.get_inflation_data,
+                    self.toolkit.get_employment_data,
+                ]
+            ),
         }
 
     def propagate(self, company_name, trade_date):
         """Run the trading agents graph for a company on a specific date."""
 
         self.ticker = company_name
+        
+        # Initialize database storage if expert_instance_id is provided
+        if self.expert_instance_id:
+            ta_logger.info(f"Starting analysis for {company_name} on {trade_date}")
+            market_analysis_id = self.initialize_market_analysis(company_name, self.expert_instance_id)
+            ta_logger.info(f"Created MarketAnalysis record with ID: {market_analysis_id}")
+        else:
+            # Running without database - use terminal output
+            ta_logger.info(f"Starting standalone analysis for {company_name} on {trade_date}")
+            ta_logger.info("No expert instance ID provided - results will be shown in terminal only")
 
         # Initialize state
         init_agent_state = self.propagator.create_initial_state(
@@ -167,29 +200,140 @@ class TradingAgentsGraph:
         )
         args = self.propagator.get_graph_args()
 
-        if self.debug:
-            # Debug mode with tracing
-            trace = []
-            for chunk in self.graph.stream(init_agent_state, **args):
-                if len(chunk["messages"]) == 0:
-                    pass
-                else:
-                    chunk["messages"][-1].pretty_print()
-                    trace.append(chunk)
+        try:
+            if self.debug:
+                # Debug mode with tracing
+                trace = []
+                for chunk in self.graph.stream(init_agent_state, **args):
+                    if len(chunk["messages"]) == 0:
+                        pass
+                    else:
+                        chunk["messages"][-1].pretty_print()
+                        trace.append(chunk)
 
-            final_state = trace[-1]
-        else:
-            # Standard mode without tracing
-            final_state = self.graph.invoke(init_agent_state, **args)
+                final_state = trace[-1]
+            else:
+                # Standard mode without tracing
+                final_state = self.graph.invoke(init_agent_state, **args)
 
-        # Store current state for reflection
-        self.curr_state = final_state
+            # Store current state for reflection
+            self.curr_state = final_state
 
-        # Log state
-        self._log_state(trade_date, final_state)
+            # Generate expert recommendation or print to terminal
+            if self.expert_instance_id:
+                self._generate_expert_recommendation(final_state, company_name)
+            else:
+                self._print_terminal_summary(final_state, company_name)
 
-        # Return decision and processed signal
-        return final_state, self.process_signal(final_state["final_trade_decision"])
+            # Log state
+            self._log_state(trade_date, final_state)
+
+            # Update analysis status to completed
+            if self.expert_instance_id:
+                self.update_analysis_status("completed", {"final_state": "success"})
+                ta_logger.info(f"Analysis for {company_name} completed successfully")
+            else:
+                ta_logger.info(f"Standalone analysis for {company_name} completed successfully")
+
+            # Return decision and processed signal
+            return final_state, self.process_signal(final_state["final_trade_decision"])
+            
+        except Exception as e:
+            ta_logger.error(f"Error during analysis for {company_name}: {str(e)}")
+            if self.expert_instance_id:
+                self.update_analysis_status("failed", {"error": str(e)})
+            raise
+
+    def _generate_expert_recommendation(self, final_state: Dict[str, Any], symbol: str):
+        """Generate and store expert recommendation in database"""
+        try:
+            # Get current price if available from the state
+            current_price = final_state.get("current_price", 0.0)
+            
+            # Generate recommendation summary
+            recommendation = create_expert_recommendation_summary(final_state, symbol, current_price)
+            
+            # Store recommendation in database
+            from ba2_trade_platform.core.db import add_instance
+            from ba2_trade_platform.core.models import ExpertRecommendation
+            from ba2_trade_platform.core.types import OrderDirection
+            
+            # Map recommendation action to OrderDirection enum
+            action_mapping = {
+                "BUY": OrderDirection.BUY,
+                "SELL": OrderDirection.SELL,
+                "HOLD": OrderDirection.HOLD
+            }
+            
+            expert_rec = ExpertRecommendation(
+                instance_id=self.expert_instance_id,
+                symbol=recommendation["symbol"],
+                recommended_action=action_mapping.get(recommendation["recommended_action"], OrderDirection.HOLD),
+                expected_profit_percent=recommendation["expected_profit_percent"],
+                price_at_date=recommendation["price_at_date"],
+                details=recommendation["details"],
+                confidence=recommendation["confidence"]
+            )
+            
+            rec_id = add_instance(expert_rec)
+            ta_logger.info(f"Created ExpertRecommendation record with ID: {rec_id}")
+            
+            # Also store as analysis output
+            if self.market_analysis_id:
+                import json
+                self.store_analysis_output(
+                    market_analysis_id=self.market_analysis_id,
+                    name="expert_recommendation",
+                    output_type="recommendation",
+                    text=json.dumps(recommendation, indent=2)
+                )
+                
+        except Exception as e:
+            ta_logger.error(f"Error generating expert recommendation: {str(e)}")
+
+    def _print_terminal_summary(self, final_state: Dict[str, Any], symbol: str):
+        """Print a formatted summary to terminal when running without database"""
+        try:
+            # Get current price if available from the state
+            current_price = final_state.get("current_price", 0.0)
+            
+            # Generate recommendation summary
+            from .summarization import create_expert_recommendation_summary
+            recommendation = create_expert_recommendation_summary(final_state, symbol, current_price)
+            
+            # Print formatted summary to terminal
+            ta_logger.info("="*70)
+            ta_logger.info(f"TRADING ANALYSIS SUMMARY FOR {symbol}")
+            ta_logger.info("="*70)
+            ta_logger.info(f"Recommended Action: {recommendation['recommended_action']}")
+            ta_logger.info(f"Expected Profit: {recommendation['expected_profit_percent']:.2f}%")
+            ta_logger.info(f"Price at Analysis: ${recommendation['price_at_date']:.2f}")
+            ta_logger.info(f"Confidence Level: {recommendation['confidence']:.1f}%")
+            ta_logger.info("Analysis Details:")
+            ta_logger.info(f"   {recommendation['details']}")
+            ta_logger.info("="*70)
+            
+            # Print key reports if available
+            if final_state.get("market_report"):
+                ta_logger.info("Market Analysis:")
+                ta_logger.info(f"   {final_state['market_report'][:200]}...")
+            
+            if final_state.get("news_report"):
+                ta_logger.info("News Analysis:")
+                ta_logger.info(f"   {final_state['news_report'][:200]}...")
+            
+            if final_state.get("fundamentals_report"):
+                ta_logger.info("Fundamentals Analysis:")
+                ta_logger.info(f"   {final_state['fundamentals_report'][:200]}...")
+                
+            if final_state.get("macro_report"):
+                ta_logger.info("Macro Economic Analysis:")
+                ta_logger.info(f"   {final_state['macro_report'][:200]}...")
+            
+            ta_logger.info("="*70)
+                
+        except Exception as e:
+            ta_logger.error(f"Error printing terminal summary: {str(e)}")
 
     def _log_state(self, trade_date, final_state):
         """Log the final state to a JSON file."""

@@ -235,7 +235,7 @@ class TradingAgents(MarketExpertInterface):
     
     def _generate_prediction(self, instrument: str, config: Dict) -> Dict[str, Any]:
         """
-        Generate a prediction for an instrument based on expert configuration.
+        Generate a prediction for an instrument using the TradingAgents framework.
         
         Args:
             instrument (str): Instrument symbol
@@ -244,40 +244,92 @@ class TradingAgents(MarketExpertInterface):
         Returns:
             Dict[str, Any]: Prediction result
         """
-        # This is a placeholder implementation
-        # In a real implementation, this would:
-        # 1. Fetch market data for the instrument
-        # 2. Apply the expert's AI/ML model
-        # 3. Consider the instrument's weight in the portfolio
-        # 4. Generate signal, confidence, and reasoning
+        logger.info(f"Generating TradingAgents prediction for {instrument}")
         
-        weight = config.get('weight', 100.0)
-        
-        # Placeholder logic - replace with actual AI prediction
-        import random
-        signals = ['BUY', 'SELL', 'HOLD']
-        signal = random.choice(signals)
-        confidence = random.uniform(0.3, 0.9)
-        
-        # Adjust confidence based on weight (higher weight = more careful analysis)
-        if weight > 150:
-            confidence *= 1.1  # Higher confidence for high-weight instruments
-        elif weight < 50:
-            confidence *= 0.8  # Lower confidence for low-weight instruments
-        
-        confidence = min(confidence, 1.0)  # Cap at 1.0
-        
-        return {
-            'instrument': instrument,
-            'signal': signal,
-            'confidence': round(confidence, 3),
-            'weight': weight,
-            'price_target': None,  # Could be calculated based on signal
-            'reasoning': f'AI prediction based on market analysis (weight: {weight})',
-            'timestamp': self._get_current_timestamp(),
-            'expert_id': self.id,
-            'expert_type': self.instance.expert if self.instance else 'unknown'
-        }
+        try:
+            from ...thirdparties.TradingAgents.tradingagents.graph.trading_graph import TradingAgentsGraph
+            from ...thirdparties.TradingAgents.tradingagents.default_config import DEFAULT_CONFIG
+            from datetime import datetime
+            
+            # Create custom config with our database settings
+            config_copy = DEFAULT_CONFIG.copy()
+            
+            # Update config with user settings from this expert instance
+            timeframe = self.settings.get('timeframe', '1h')
+            debates_new = self.settings.get('debates_new_positions', 3)
+            debates_existing = self.settings.get('debates_existing_positions', 3)
+            
+            config_copy.update({
+                'max_debate_rounds': int(debates_new),
+                'max_risk_discuss_rounds': int(debates_existing),
+                'news_lookback_days': 7,
+                'market_history_days': 90,
+                'economic_data_days': 90,
+                'social_sentiment_days': 3,
+                'log_dir': 'logs'  # Use same log directory as main platform
+            })
+            
+            # Initialize TradingAgents with our expert instance ID
+            ta_graph = TradingAgentsGraph(
+                debug=False,
+                config=config_copy,
+                expert_instance_id=self.id
+            )
+            
+            # Get current date for analysis
+            trade_date = datetime.now().strftime("%Y-%m-%d")
+            
+            # Run the analysis
+            logger.info(f"Running TradingAgents analysis for {instrument} on {trade_date}")
+            final_state, processed_signal = ta_graph.propagate(instrument, trade_date)
+            
+            # Extract recommendation from final state
+            expert_recommendation = final_state.get('expert_recommendation', {})
+            
+            if expert_recommendation:
+                # Use the generated recommendation
+                signal = expert_recommendation.get('recommended_action', 'HOLD')
+                confidence = expert_recommendation.get('confidence', 0.5)
+                expected_profit = expert_recommendation.get('expected_profit_percent', 0.0)
+                details = expert_recommendation.get('details', 'TradingAgents analysis completed')
+                price_at_date = expert_recommendation.get('price_at_date', 0.0)
+            else:
+                # Fallback to processed signal
+                signal = processed_signal if processed_signal in ['BUY', 'SELL', 'HOLD'] else 'HOLD'
+                confidence = 0.5
+                expected_profit = 0.0
+                details = f"TradingAgents analysis: {processed_signal}"
+                price_at_date = 0.0
+            
+            weight = config.get('weight', 100.0)
+            
+            # Adjust confidence based on weight
+            if weight > 150:
+                confidence *= 1.1
+            elif weight < 50:
+                confidence *= 0.8
+            confidence = min(confidence, 1.0)
+            
+            result = {
+                'instrument': instrument,
+                'signal': signal,
+                'confidence': round(confidence, 3),
+                'weight': weight,
+                'expected_profit_percent': expected_profit,
+                'price_target': price_at_date if price_at_date > 0 else None,
+                'reasoning': details[:500] if details else 'TradingAgents analysis completed',
+                'timestamp': self._get_current_timestamp(),
+                'expert_id': self.id,
+                'expert_type': 'TradingAgents',
+                'market_analysis_id': ta_graph.market_analysis_id
+            }
+            
+            logger.info(f"TradingAgents prediction for {instrument}: {signal} (confidence: {confidence:.3f})")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error running TradingAgents for {instrument}: {str(e)}")
+            return self._create_error_result(instrument, f"TradingAgents error: {str(e)}")
     
     def _create_no_prediction_result(self, instrument: str, reason: str) -> Dict[str, Any]:
         """Create a result for when no prediction can be made."""

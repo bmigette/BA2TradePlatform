@@ -9,7 +9,15 @@ class FinancialSituationMemory:
             self.embedding = "nomic-embed-text"
         else:
             self.embedding = "text-embedding-3-small"
-        self.client = OpenAI(base_url=config["backend_url"])
+            
+        # Get API key from config
+        try:
+            from ...dataflows.config import get_openai_api_key
+            api_key = get_openai_api_key()
+        except ImportError:
+            api_key = None
+            
+        self.client = OpenAI(base_url=config["backend_url"], api_key=api_key)
         self.chroma_client = chromadb.Client(Settings(allow_reset=True))
         self.situation_collection = self.chroma_client.create_collection(name=name)
 
