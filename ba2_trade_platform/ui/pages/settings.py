@@ -813,17 +813,33 @@ class ExpertSettingsTab:
                         with ui.row().classes('w-full gap-2 mb-4'):
                             self.schedule_days = {}
                             for day in ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']:
-                                self.schedule_days[day.lower()] = ui.checkbox(day, value=True).classes('mb-2')
+                                # Default weekdays to True, weekends to False
+                                default_value = day not in ['Saturday', 'Sunday']
+                                self.schedule_days[day.lower()] = ui.checkbox(day, value=default_value).classes('mb-2')
                         
                         ui.label('Execution times (24-hour format, e.g., 09:30, 15:00):').classes('text-body2 mb-2')
-                        self.execution_times_container = ui.column().classes('w-full mb-4')
+                        try:
+                            self.execution_times_container = ui.column().classes('w-full mb-4')
+                            if self.execution_times_container is None:
+                                logger.error("ui.column() returned None")
+                                self.execution_times_container = ui.column()  # Try again without classes
+                        except Exception as e:
+                            logger.error(f"Error creating execution_times_container: {e}")
+                            self.execution_times_container = None
+                        
                         self.execution_times = []
                         
-                        # Add initial time input
-                        self._add_time_input('09:30')
+                        # Verify container was created successfully
+                        if self.execution_times_container is None:
+                            logger.error("Failed to create execution_times_container, skipping time input setup")
+                        else:
+                            # Add initial time input
+                            self._add_time_input('09:30')
                         
-                        with ui.row().classes('w-full gap-2 mb-4'):
-                            ui.button('Add Time', on_click=self._add_time_input, icon='add_alarm').props('flat')
+                        # Only create the add time button if we have a valid container
+                        if self.execution_times_container is not None:
+                            with ui.row().classes('w-full gap-2 mb-4'):
+                                ui.button('Add Time', on_click=self._add_time_input, icon='add_alarm').props('flat')
                         
                         ui.separator().classes('my-4')
                         
@@ -932,53 +948,70 @@ class ExpertSettingsTab:
     
     def _add_time_input(self, initial_time=''):
         """Add a new time input field to the execution times container."""
-        with ui.row().classes('w-full gap-2').move(self.execution_times_container):
-            time_input = ui.input(
-                label='Time (HH:MM)', 
-                value=initial_time,
-                placeholder='09:30'
-            ).classes('flex-grow')
+        # Guard check to ensure container exists
+        logger.debug(f"_add_time_input called with initial_time={initial_time}")
+        
+        if not hasattr(self, 'execution_times_container'):
+            logger.warning("_add_time_input called but execution_times_container attribute doesn't exist")
+            return
+        
+        logger.debug(f"execution_times_container type: {type(self.execution_times_container)}")
+        logger.debug(f"execution_times_container value: {self.execution_times_container}")
+        
+        if self.execution_times_container is None:
+            logger.warning("_add_time_input called but execution_times_container is None")
+            return
+        
+        # Additional check - make sure it's a UI element that supports move()
+        if not hasattr(self.execution_times_container, '__enter__') or not hasattr(self.execution_times_container, '__exit__'):
+            logger.error(f"execution_times_container is not a context manager: {type(self.execution_times_container)}")
+            return
             
-            # Validate time format on change
-            def validate_time(e):
-                try:
-                    time_str = e.value
-                    if time_str and ':' in time_str:
-                        hours, minutes = time_str.split(':')
-                        hours_int = int(hours)
-                        minutes_int = int(minutes)
-                        if 0 <= hours_int <= 23 and 0 <= minutes_int <= 59:
-                            time_input.props('error=false')
-                        else:
-                            time_input.props('error=true error-message="Invalid time format"')
-                    elif time_str:
-                        time_input.props('error=true error-message="Use HH:MM format"')
-                    else:
-                        time_input.props('error=false')
-                except ValueError:
-                    time_input.props('error=true error-message="Invalid time format"')
+        try:
+            # Create the row and move it to the container
+            row = ui.row().classes('w-full gap-2')
+            if row is None:
+                logger.error("ui.row() returned None")
+                return
             
-            time_input.on('input', validate_time)
+            # Move the row to the container - move() modifies the row in place
+            row.move(self.execution_times_container)
             
-            remove_btn = ui.button(icon='remove', on_click=lambda: self._remove_time_input(time_input))
-            remove_btn.props('flat dense color=red size=sm')
-            
-            # Only show remove button if there's more than one time input
-            if len(self.execution_times) == 0:
-                remove_btn.set_visibility(False)
-            
-            self.execution_times.append(time_input)
-            
-            # Show remove buttons for all inputs if there's more than one
-            if len(self.execution_times) > 1:
-                for time_inp in self.execution_times:
-                    # Find the remove button for this input
-                    parent = time_inp.parent_slot.parent
-                    for child in parent._props.get('children', []):
-                        if hasattr(child, 'props') and 'remove' in str(child.props):
-                            child.set_visibility(True)
-                            break
-    
+            # Use the row directly as context manager
+            with row:
+                time_input = ui.input(
+                    label='Time (HH:MM)', 
+                    value=initial_time,
+                    placeholder='09:30'
+                ).classes('flex-grow')
+                
+                # Validate time format on change
+                def validate_time(e):
+                    try:
+                        time_str = e.value
+                        if time_str and ':' in time_str:
+                            hours, minutes = time_str.split(':')
+                            if len(hours) == 2 and len(minutes) == 2:
+                                int(hours), int(minutes)  # Validate they're numbers
+                                if 0 <= int(hours) <= 23 and 0 <= int(minutes) <= 59:
+                                    time_input.props('error=false')
+                                    return
+                        time_input.props('error=true error-message="Invalid time format (use HH:MM)"')
+                    except ValueError:
+                        time_input.props('error=true error-message="Invalid time format (use HH:MM)"')
+                
+                time_input.on('blur', validate_time)
+                
+                # Add remove button
+                ui.button(icon='remove', on_click=lambda: self._remove_time_input(time_input)).props('flat round').classes('ml-2')
+                
+                # Store reference for removal
+                if not hasattr(self, 'execution_times'):
+                    self.execution_times = []
+                self.execution_times.append(time_input)
+        except Exception as e:
+            logger.error(f"Error creating time input: {e}", exc_info=True)
+
     def _remove_time_input(self, time_input):
         """Remove a time input field."""
         if len(self.execution_times) <= 1:
@@ -1031,11 +1064,17 @@ class ExpertSettingsTab:
         """Load schedule configuration from a JSON dict."""
         if not schedule_config:
             return
+        
+        # Guard check to ensure UI components exist
+        if not hasattr(self, 'execution_times_container') or self.execution_times_container is None:
+            return
             
         # Load days
         days = schedule_config.get('days', {})
         for day, checkbox in self.schedule_days.items():
-            checkbox.value = days.get(day, True)  # Default to True if not specified
+            # Default weekdays to True, weekends to False if not specified
+            default_value = day not in ['saturday', 'sunday']
+            checkbox.value = days.get(day, default_value)
         
         # Load times
         times = schedule_config.get('times', ['09:30'])
@@ -1064,7 +1103,17 @@ class ExpertSettingsTab:
             # Load execution schedule
             schedule_config = expert.settings.get('execution_schedule')
             if schedule_config:
-                self._load_schedule_config(schedule_config)
+                # Handle both dict and JSON string formats
+                if isinstance(schedule_config, str):
+                    import json
+                    try:
+                        schedule_config = json.loads(schedule_config)
+                    except json.JSONDecodeError:
+                        logger.error(f"Invalid JSON in execution_schedule: {schedule_config}")
+                        schedule_config = None
+                
+                if schedule_config:
+                    self._load_schedule_config(schedule_config)
             
             # Load trading permissions
             enable_buy = expert.settings.get('enable_buy', True)  # Default to True
