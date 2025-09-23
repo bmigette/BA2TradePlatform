@@ -210,6 +210,22 @@ class DatabaseStorageMixin:
                 report_content=report_content
             )
     
+    def store_analysis_output(self, market_analysis_id: int, name: str, output_type: str, text: str = None, blob: bytes = None):
+        """
+        Store an analysis output in the database
+        
+        Args:
+            market_analysis_id: ID of the associated MarketAnalysis
+            name: Name/identifier for this output
+            output_type: Type of output (e.g., "tool_call", "agent_report", "news_data")
+            text: Text content
+            blob: Binary content
+            
+        Returns:
+            AnalysisOutput ID if successful, None if failed
+        """
+        return store_analysis_output(market_analysis_id, name, output_type, text, blob)
+    
     def update_analysis_status(self, status: str, state: Dict[str, Any] = None):
         """Update the analysis status"""
         if self.market_analysis_id:

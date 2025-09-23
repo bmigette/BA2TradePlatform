@@ -4,6 +4,7 @@ alpaca-py
 sqlmodel
 python-dotenv
 yahooquery
+APScheduler
 
 # TradingAgents Tools
 typing-extensions

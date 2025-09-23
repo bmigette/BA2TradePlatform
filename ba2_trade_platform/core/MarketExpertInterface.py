@@ -2,7 +2,7 @@ from abc import abstractmethod
 from typing import Any, Dict, Optional
 from unittest import result
 from ..logger import logger
-from ..core.models import ExpertSetting
+from ..core.models import ExpertSetting, MarketAnalysis
 from ..core.ExtendableSettingsInterface import ExtendableSettingsInterface
 
 
@@ -68,6 +68,18 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         Get a list of all enabled instruments for this expert instance.
         Returns:
             list: List of enabled instrument symbols/identifiers.
+        """
+        pass
+
+    @abstractmethod
+    def run_analysis(self, symbol: str, market_analysis: MarketAnalysis) -> None:
+        """
+        Run analysis for a specific symbol and market analysis instance.
+        This method should update the market_analysis object with results.
+        
+        Args:
+            symbol (str): The instrument symbol to analyze.
+            market_analysis (MarketAnalysis): The market analysis instance to update with results.
         """
         pass
 

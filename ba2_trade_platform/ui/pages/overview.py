@@ -47,20 +47,30 @@ class AccountOverviewTab:
             ui.label('Open Positions Across All Accounts')
             ui.table(columns=columns, rows=all_positions, row_key='account').classes('w-full')
 
-class TradeRecommendationHistoryTab:
+class TradeHistoryTab:
     def __init__(self):
         self.render()
     def render(self):
         with ui.card():
-            ui.label('Trade Recommendation History content goes here.')
+            ui.label('Trade History content goes here.')
+
+class PerformanceTab:
+    def __init__(self):
+        self.render()
+    def render(self):
+        with ui.card():
+            ui.label('Performance metrics and analytics will be displayed here.')
 
 def content() -> None:
     with ui.tabs() as tabs:
         ui.tab('Account Overview')
-        ui.tab('Trade Recommendation History')
+        ui.tab('Trade History')
+        ui.tab('Performance')
 
     with ui.tab_panels(tabs, value='Account Overview').classes('w-full'):
         with ui.tab_panel('Account Overview'):
             AccountOverviewTab()
-        with ui.tab_panel('Trade Recommendation History'):
-            TradeRecommendationHistoryTab()
+        with ui.tab_panel('Trade History'):
+            TradeHistoryTab()
+        with ui.tab_panel('Performance'):
+            PerformanceTab()

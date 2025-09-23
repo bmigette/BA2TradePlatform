@@ -192,7 +192,7 @@ class ExtendableSettingsInterface(ABC):
                         value_type = "float"
                     else:
                         value_type = "str"
-                    logger.debug(f"Setting '{setting.key}' found in DB but not in definitions, using type: {value_type}")
+                    #logger.debug(f"Setting '{setting.key}' found in DB but not in definitions, using type: {value_type}")
                 
                 if value_type == "json":
                     settings[setting.key] = setting.value_json
@@ -207,7 +207,7 @@ class ExtendableSettingsInterface(ABC):
                 else:
                     settings[setting.key] = setting.value_str
                     
-            logger.info(f"Loaded settings for {lk_field}={self.id}: {settings}")
+            #logger.debug(f"Loaded settings for {lk_field}={self.id}: {settings}")
             return settings
         except Exception as e:
             logger.error(f"Error loading account settings: {e}", exc_info=True)

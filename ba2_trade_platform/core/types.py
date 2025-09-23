@@ -55,12 +55,23 @@ class ExpertActionType(str, Enum):
     ADJUST_TAKE_PROFIT = "adjust_take_profit"
     ADJUST_STOP_LOSS = "adjust_stop_loss"
 
-
+class MarketAnalysisStatus(str, Enum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    RUNNING = "running"
+    CANCELLED = "cancelled"
 class ReferenceValue(str, Enum):
     ORDER_OPEN_PRICE = "order_open_price"
     CURRENT_PRICE = "current_price"
     EXPERT_TARGET_PRICE = "expert_target_price"
 
+class WorkerTaskStatus(Enum):
+    """Status of a worker task."""
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
 def get_reference_value_options():
     """Return list of reference value options with user-friendly labels."""

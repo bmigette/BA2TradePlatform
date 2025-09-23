@@ -360,13 +360,14 @@ class InstrumentSettingsTab:
 # --- AppSettingsTab for static settings ---
 class AppSettingsTab:
     """
-    UI tab for editing and saving static application settings (OpenAI API Key, Finnhub API Key).
+    UI tab for editing and saving static application settings (OpenAI API Key, Finnhub API Key, Worker Count).
     Uses the AppSetting model for persistence. Renders directly in the tab.
     """
     def __init__(self):
         self.openai_input = None
         self.finnhub_input = None
         self.fred_input = None
+        self.worker_count_input = None
         self.render()
 
     def render(self):
@@ -374,10 +375,19 @@ class AppSettingsTab:
         openai = session.exec(select(AppSetting).where(AppSetting.key == 'openai_api_key')).first()
         finnhub = session.exec(select(AppSetting).where(AppSetting.key == 'finnhub_api_key')).first()
         fred = session.exec(select(AppSetting).where(AppSetting.key == 'fred_api_key')).first()
+        worker_count = session.exec(select(AppSetting).where(AppSetting.key == 'worker_count')).first()
+        
         with ui.card().classes('w-full'):
             self.openai_input = ui.input(label='OpenAI API Key', value=openai.value_str if openai else '').classes('w-full')
             self.finnhub_input = ui.input(label='Finnhub API Key', value=finnhub.value_str if finnhub else '').classes('w-full')
             self.fred_input = ui.input(label='FRED API Key', value=fred.value_str if fred else '').classes('w-full')
+            self.worker_count_input = ui.number(
+                label='Worker Count', 
+                value=int(worker_count.value_str) if worker_count and worker_count.value_str else 4,
+                min=1,
+                max=20,
+                step=1
+            ).classes('w-full')
             ui.button('Save', on_click=self.save_settings)
 
     def save_settings(self):
@@ -410,8 +420,21 @@ class AppSettingsTab:
                 fred = AppSetting(key='fred_api_key', value_str=self.fred_input.value)
                 add_instance(fred, session)
             
+            # Worker Count
+            worker_count = session.exec(select(AppSetting).where(AppSetting.key == 'worker_count')).first()
+            if worker_count:
+                worker_count.value_str = str(int(self.worker_count_input.value))
+                update_instance(worker_count, session)
+            else:
+                worker_count = AppSetting(key='worker_count', value_str=str(int(self.worker_count_input.value)))
+                add_instance(worker_count, session)
+            
             session.commit()
             ui.notify('Settings saved successfully', type='positive')
+            
+            # Notify user that worker count changes require restart
+            ui.notify('Worker count changes will take effect after restart', type='info')
+            
         except Exception as e:
             logger.error(f"Error saving settings: {str(e)}", exc_info=True)
             ui.notify('Error saving settings', type='negative')
@@ -988,7 +1011,7 @@ class ExpertSettingsTab:
                 # Validate time format on change
                 def validate_time(e):
                     try:
-                        time_str = e.value
+                        time_str = time_input.value  # Get value from the input element directly
                         if time_str and ':' in time_str:
                             hours, minutes = time_str.split(':')
                             if len(hours) == 2 and len(minutes) == 2:
@@ -1301,6 +1324,15 @@ class ExpertSettingsTab:
                     expert.save_setting(key, inp.value, setting_type="str")
         
         logger.debug(f'Saved all expert settings for instance {expert_id}')
+        
+        # Refresh scheduled jobs for this expert
+        try:
+            from ...core.JobManager import get_job_manager
+            job_manager = get_job_manager()
+            job_manager.refresh_expert_schedules(expert_id)
+            logger.info(f'Refreshed scheduled analysis jobs for expert {expert_id}')
+        except Exception as e:
+            logger.error(f'Error refreshing scheduled jobs for expert {expert_id}: {e}')
     
     def _save_instrument_configuration(self, expert_id):
         """Save instrument selection and configuration."""

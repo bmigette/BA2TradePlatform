@@ -6,9 +6,14 @@ def sidemenu() -> None:
         ui.separator()
         with ui.item(on_click=lambda: ui.navigate.to('/')):
             with ui.item_section():
-                ui.icon('home')
+                ui.icon('dashboard')
             with ui.item_section():
-                ui.item_label('Home')
+                ui.item_label('Overview')
+        with ui.item(on_click=lambda: ui.navigate.to('/marketanalysis')):
+            with ui.item_section():
+                ui.icon('analytics')
+            with ui.item_section():
+                ui.item_label('Market Analysis')
         with ui.item(on_click=lambda: ui.navigate.to('/settings')).classes('w-full'):
             with ui.item_section():
                 ui.icon('settings')

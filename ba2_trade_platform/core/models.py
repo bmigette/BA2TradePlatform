@@ -1,7 +1,7 @@
 from sqlmodel import  Field, Session, SQLModel, create_engine, Column, Relationship
 from sqlalchemy import String, Float, JSON, UniqueConstraint, Table, Integer, ForeignKey
 from typing import Optional, Dict, Any, List
-from .types import InstrumentType, OrderStatus, OrderDirection, ExpertEventRuleType
+from .types import InstrumentType, MarketAnalysisStatus, OrderStatus, OrderDirection, ExpertEventRuleType
 from datetime import datetime as DateTime, timezone
 
 # Association table for many-to-many relationship between Ruleset and EventAction
@@ -94,7 +94,7 @@ class MarketAnalysis(SQLModel, table=True):
     date: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc))
     symbol: str
     source_expert_instance_id: int = Field(foreign_key="expertinstance.id", nullable=False, ondelete="CASCADE")
-    status: str
+    status: MarketAnalysisStatus = MarketAnalysisStatus.PENDING
     state: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict)
     created_at: DateTime | None = Field(default_factory=lambda: DateTime.now(timezone.utc))
     

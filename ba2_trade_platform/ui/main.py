@@ -1,5 +1,5 @@
 from nicegui import ui
-from .pages import home, settings
+from .pages import overview, settings, marketanalysis
 from .layout import layout_render
 from pathlib import Path
 
@@ -8,11 +8,16 @@ from pathlib import Path
 # Example 1: use a custom page decorator directly and putting the content creation into a separate function
 @ui.page('/')
 def index_page() -> None:
-    with layout_render('Homepage'):
-        home.content()
+    with layout_render('Overview'):
+        overview.content()
+
+@ui.page('/marketanalysis')
+def marketanalysis_page() -> None:
+    with layout_render('Market Analysis'):
+        marketanalysis.content()
 
 @ui.page('/settings')
-def index_page() -> None:
+def settings_page() -> None:
     with layout_render('Settings'):
         settings.content()
 

@@ -152,7 +152,7 @@ def get_instance(model_class, instance_id):
             if not instance:
                 logger.error(f"Instance with id {instance_id} not found.")
                 return None
-            logger.info(f"Retrieved instance: {instance}")
+            #logger.debug(f"Retrieved instance: {instance}")
             return instance
     except Exception as e:
         logger.error(f"Error retrieving instance: {e}", exc_info=True)
@@ -179,7 +179,7 @@ def get_all_instances(model_class, session: Session | None = None):
                 statement = select(model_class)
                 results = session.exec(statement)
                 instances = results.all()
-        logger.info(f"Retrieved {len(instances)} instances of {model_class.__name__}")
+        #logger.debug(f"Retrieved {len(instances)} instances of {model_class.__name__}")
         return [i[0] for i in instances]
     except Exception as e:
         logger.error(f"Error retrieving all instances: {e}", exc_info=True)

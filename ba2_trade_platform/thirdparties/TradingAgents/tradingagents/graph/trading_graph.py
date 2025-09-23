@@ -42,6 +42,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         debug=False,
         config: Dict[str, Any] = None,
         expert_instance_id: Optional[int] = None,
+        market_analysis_id: Optional[int] = None,
     ):
         """Initialize the trading agents graph and components.
 
@@ -50,11 +51,13 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             debug: Whether to run in debug mode
             config: Configuration dictionary. If None, uses default config
             expert_instance_id: Expert instance ID for database storage and logging
+            market_analysis_id: Existing MarketAnalysis ID to use (prevents creating a new one)
         """
         super().__init__()
         self.debug = debug
         self.config = config or DEFAULT_CONFIG
         self.expert_instance_id = expert_instance_id
+        self.market_analysis_id = market_analysis_id
 
         # Initialize logger
         # Use BA2 platform logs directory by default
@@ -190,10 +193,14 @@ class TradingAgentsGraph(DatabaseStorageMixin):
 
         self.ticker = company_name
         
-        # Initialize database storage if expert_instance_id is provided
-        if self.expert_instance_id:
+        # Use provided market_analysis_id or create new one if expert_instance_id is provided
+        if self.market_analysis_id:
+            ta_logger.info(f"Starting analysis for {company_name} on {trade_date}")
+            ta_logger.info(f"Using existing MarketAnalysis record with ID: {self.market_analysis_id}")
+        elif self.expert_instance_id:
             ta_logger.info(f"Starting analysis for {company_name} on {trade_date}")
             market_analysis_id = self.initialize_market_analysis(company_name, self.expert_instance_id)
+            self.market_analysis_id = market_analysis_id
             ta_logger.info(f"Created MarketAnalysis record with ID: {market_analysis_id}")
         else:
             # Running without database - use terminal output
@@ -380,8 +387,9 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             ta_logger.info("="*70)
 
     def _log_state(self, trade_date, final_state):
-        """Log the final state to a JSON file."""
-        self.log_states_dict[str(trade_date)] = {
+        """Store the final state in database if MarketAnalysis is available, otherwise just log it."""
+        # Prepare the state data
+        state_data = {
             "company_of_interest": final_state["company_of_interest"],
             "trade_date": final_state["trade_date"],
             "market_report": final_state["market_report"],
@@ -411,15 +419,28 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             "final_trade_decision": final_state["final_trade_decision"],
         }
 
-        # Save to file
-        directory = Path(f"eval_results/{self.ticker}/TradingAgentsStrategy_logs/")
-        directory.mkdir(parents=True, exist_ok=True)
-
-        with open(
-            f"eval_results/{self.ticker}/TradingAgentsStrategy_logs/full_states_log_{trade_date}.json",
-            "w",
-        ) as f:
-            json.dump(self.log_states_dict, f, indent=4)
+        if self.expert_instance_id and hasattr(self, 'market_analysis_id') and self.market_analysis_id:
+            # Store in database using final_state key
+            try:
+                import json
+                self.store_analysis_output(
+                    market_analysis_id=self.market_analysis_id,
+                    name="final_state",
+                    output_type="analysis_state",
+                    text=json.dumps(state_data, indent=2)
+                )
+                ta_logger.info(f"Stored final state in database for analysis ID: {self.market_analysis_id}")
+            except Exception as e:
+                ta_logger.error(f"Error storing final state in database: {str(e)}")
+                # Fallback to logging only
+                ta_logger.info(f"Final state data: {json.dumps(state_data, indent=2)}")
+        else:
+            # No MarketAnalysis - just log the state data
+            import json
+            ta_logger.info(f"Final state for {trade_date}: {json.dumps(state_data, indent=2)}")
+            
+        # Keep state in memory for potential reflection operations
+        self.log_states_dict[str(trade_date)] = state_data
 
     def reflect_and_remember(self, returns_losses):
         """Reflect on decisions and update memory based on returns."""
