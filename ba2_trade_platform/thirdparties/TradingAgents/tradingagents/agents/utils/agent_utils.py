@@ -453,9 +453,10 @@ class Toolkit:
         Returns:
             str: A formatted string containing economic calendar events and their impact.
         """
-        from ...dataflows.macro_utils import get_economic_calendar_data
+        from ...dataflows.macro_utils import get_fed_calendar_and_minutes
         
-        calendar_result = get_economic_calendar_data(start_date, end_date)
+        # Use the current date (end_date) for Fed calendar
+        calendar_result = get_fed_calendar_and_minutes(end_date)
         return str(calendar_result)
 
     @staticmethod
@@ -472,9 +473,10 @@ class Toolkit:
         Returns:
             str: A formatted string containing treasury yield curve data and analysis.
         """
-        from ...dataflows.macro_utils import get_treasury_yield_curve_data
+        from ...dataflows.macro_utils import get_treasury_yield_curve
         
-        yield_result = get_treasury_yield_curve_data(start_date, end_date)
+        # Use end_date as current date for yield curve
+        yield_result = get_treasury_yield_curve(end_date)
         return str(yield_result)
 
     @staticmethod
@@ -491,9 +493,12 @@ class Toolkit:
         Returns:
             str: A formatted string containing inflation data and trends.
         """
-        from ...dataflows.macro_utils import get_inflation_indicators
+        from ...dataflows.macro_utils import get_economic_indicators_report
+        from datetime import datetime
         
-        inflation_result = get_inflation_indicators(start_date, end_date)
+        # Get economic indicators report which includes inflation data
+        lookback_days = (datetime.strptime(end_date, "%Y-%m-%d") - datetime.strptime(start_date, "%Y-%m-%d")).days
+        inflation_result = get_economic_indicators_report(end_date, lookback_days)
         return str(inflation_result)
 
     @staticmethod
@@ -510,7 +515,10 @@ class Toolkit:
         Returns:
             str: A formatted string containing employment data and labor market indicators.
         """
-        from ...dataflows.macro_utils import get_employment_indicators
+        from ...dataflows.macro_utils import get_economic_indicators_report
+        from datetime import datetime
         
-        employment_result = get_employment_indicators(start_date, end_date)
+        # Get economic indicators report which includes employment data
+        lookback_days = (datetime.strptime(end_date, "%Y-%m-%d") - datetime.strptime(start_date, "%Y-%m-%d")).days
+        employment_result = get_economic_indicators_report(end_date, lookback_days)
         return str(employment_result)

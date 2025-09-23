@@ -202,7 +202,7 @@ def get_setting(key: str) -> str | None:
             statement = select(AppSetting).where(AppSetting.key == key)
             result = session.exec(statement).first()
             if result:
-                logger.info(f"Retrieved setting {key}: {result[0].value_str}")
+                #logger.info(f"Retrieved setting {key}: {result[0].value_str}")
                 return result[0].value_str
             else:
                 logger.warning(f"Setting {key} not found in database")

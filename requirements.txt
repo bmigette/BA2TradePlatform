@@ -9,6 +9,7 @@ yahooquery
 typing-extensions
 langchain-openai
 langchain-experimental
+langchain_core
 pandas
 yfinance
 praw

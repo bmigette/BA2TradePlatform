@@ -31,7 +31,6 @@ from .signal_processing import SignalProcessor
 # Import our new modules
 from ..db_storage import DatabaseStorageMixin
 from .. import logger as ta_logger
-from .summarization import create_expert_recommendation_summary
 
 
 class TradingAgentsGraph(DatabaseStorageMixin):
@@ -58,7 +57,14 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         self.expert_instance_id = expert_instance_id
 
         # Initialize logger
-        ta_logger.init_logger(expert_instance_id, self.config.get("log_dir", "."))
+        # Use BA2 platform logs directory by default
+        try:
+            from ba2_trade_platform import config as ba2_config
+            default_log_dir = os.path.join(ba2_config.HOME, "logs")
+        except ImportError:
+            default_log_dir = "."
+        
+        ta_logger.init_logger(expert_instance_id, self.config.get("log_dir", default_log_dir))
         ta_logger.info(f"Initializing TradingAgentsGraph with expert_instance_id={expert_instance_id}")
 
         # Update the interface's config
@@ -245,13 +251,20 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             raise
 
     def _generate_expert_recommendation(self, final_state: Dict[str, Any], symbol: str):
-        """Generate and store expert recommendation in database"""
+        """Generate and store expert recommendation in database using LLM-powered agent"""
         try:
             # Get current price if available from the state
             current_price = final_state.get("current_price", 0.0)
             
-            # Generate recommendation summary
-            recommendation = create_expert_recommendation_summary(final_state, symbol, current_price)
+            # Use the new recommendation agent to generate the summary
+            recommendation_agent_func = create_recommendation_agent(self.quick_thinking_llm)
+            
+            # Generate recommendation using the agent function
+            recommendation = recommendation_agent_func(final_state, symbol, current_price)
+            
+            # Log the complete JSON recommendation for debugging and audit trail
+            import json
+            ta_logger.info(f"AI-Generated Recommendation JSON for {symbol}: {json.dumps(recommendation, indent=2)}")
             
             # Store recommendation in database
             from ba2_trade_platform.core.db import add_instance
@@ -290,6 +303,23 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                 
         except Exception as e:
             ta_logger.error(f"Error generating expert recommendation: {str(e)}")
+            # Create fallback recommendation
+            from ba2_trade_platform.core.db import add_instance
+            from ba2_trade_platform.core.models import ExpertRecommendation
+            from ba2_trade_platform.core.types import OrderDirection
+            
+            expert_rec = ExpertRecommendation(
+                instance_id=self.expert_instance_id,
+                symbol=symbol,
+                recommended_action=OrderDirection.HOLD,
+                expected_profit_percent=0.0,
+                price_at_date=current_price if 'current_price' in locals() else 0.0,
+                details=f"Error generating recommendation: {str(e)}",
+                confidence=0.0
+            )
+            
+            rec_id = add_instance(expert_rec)
+            ta_logger.info(f"Created fallback ExpertRecommendation record with ID: {rec_id}")
 
     def _print_terminal_summary(self, final_state: Dict[str, Any], symbol: str):
         """Print a formatted summary to terminal when running without database"""
@@ -297,9 +327,15 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             # Get current price if available from the state
             current_price = final_state.get("current_price", 0.0)
             
-            # Generate recommendation summary
-            from .summarization import create_expert_recommendation_summary
-            recommendation = create_expert_recommendation_summary(final_state, symbol, current_price)
+            # Use the new recommendation agent to generate the summary
+            recommendation_agent_func = create_recommendation_agent(self.quick_thinking_llm)
+            
+            # Generate recommendation using the agent function
+            recommendation = recommendation_agent_func(final_state, symbol, current_price)
+            
+            # Log the complete JSON recommendation for debugging and audit trail
+            import json
+            ta_logger.info(f"AI-Generated Recommendation JSON for {symbol}: {json.dumps(recommendation, indent=2)}")
             
             # Print formatted summary to terminal
             ta_logger.info("="*70)
@@ -334,6 +370,14 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                 
         except Exception as e:
             ta_logger.error(f"Error printing terminal summary: {str(e)}")
+            
+            # Print basic summary on error
+            ta_logger.info("="*70)
+            ta_logger.info(f"TRADING ANALYSIS SUMMARY FOR {symbol} (Basic)")
+            ta_logger.info("="*70)
+            ta_logger.info("Error generating detailed recommendation")
+            ta_logger.info(f"Final Decision: {final_state.get('final_trade_decision', 'Unknown')}")
+            ta_logger.info("="*70)
 
     def _log_state(self, trade_date, final_state):
         """Log the final state to a JSON file."""
