@@ -1146,10 +1146,18 @@ class ExpertSettingsTab:
                 if schedule_config:
                     self._load_schedule_config(schedule_config)
             
-            # Load trading permissions
+            # Load trading permissions - convert to booleans if they're strings
             enable_buy = expert.settings.get('enable_buy', True)  # Default to True
             enable_sell = expert.settings.get('enable_sell', False)  # Default to False
             automatic_trading = expert.settings.get('automatic_trading', True)  # Default to True
+            
+            # Convert string values to booleans if needed
+            if isinstance(enable_buy, str):
+                enable_buy = enable_buy.lower() == 'true'
+            if isinstance(enable_sell, str):
+                enable_sell = enable_sell.lower() == 'true'
+            if isinstance(automatic_trading, str):
+                automatic_trading = automatic_trading.lower() == 'true'
             
             if hasattr(self, 'enable_buy_checkbox'):
                 self.enable_buy_checkbox.value = enable_buy

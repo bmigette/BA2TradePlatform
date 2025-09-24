@@ -6,6 +6,8 @@ from sqlmodel import select
 import json
 
 class ExtendableSettingsInterface(ABC):
+    # Hidden variable for builtin settings that all implementations share
+    _builtin_settings: Dict[str, Any] = {}
     
     def _determine_value_type(self, value: Any) -> str:
         """
@@ -42,6 +44,28 @@ class ExtendableSettingsInterface(ABC):
         """
         pass
 
+    @classmethod
+    def get_merged_settings_definitions(cls) -> Dict[str, Any]:
+        """
+        Return merged settings definitions including both builtin and implementation-specific settings.
+        
+        Returns:
+            Dict[str, Any]: Merged dictionary of all available settings
+        """
+        # Ensure builtin settings are initialized (for MarketExpertInterface subclasses)
+        if hasattr(cls, '_ensure_builtin_settings'):
+            cls._ensure_builtin_settings()
+        
+        # Start with builtin settings
+        merged = cls._builtin_settings.copy()
+        
+        # Add implementation-specific settings (these can override builtin ones if needed)
+        implementation_settings = cls.get_settings_definitions()
+        if implementation_settings:
+            merged.update(implementation_settings)
+            
+        return merged
+
     def save_setting(self, key: str, value: Any, setting_type: Optional[str] = None):
         """
         Save a single account setting to the database, converting bool to JSON for storage.
@@ -57,7 +81,7 @@ class ExtendableSettingsInterface(ABC):
         lk_field = type(self).SETTING_LOOKUP_FIELD
 
         session = get_db()
-        definitions = type(self).get_settings_definitions()
+        definitions = type(self).get_merged_settings_definitions()
         try:
             definition = definitions.get(key, {})
             value_type = definition.get("type", None)
@@ -114,7 +138,7 @@ class ExtendableSettingsInterface(ABC):
         lk_field = type(self).SETTING_LOOKUP_FIELD
 
         session = get_db()
-        definitions = type(self).get_settings_definitions()
+        definitions = type(self).get_merged_settings_definitions()
         try:
             for key, value in settings.items():
                 definition = definitions.get(key, {})
@@ -171,7 +195,7 @@ class ExtendableSettingsInterface(ABC):
         setting_model = type(self).SETTING_MODEL
         lk_field = type(self).SETTING_LOOKUP_FIELD
         try:
-            definitions = type(self).get_settings_definitions()
+            definitions = type(self).get_merged_settings_definitions()
             session = get_db()
             statement = select(setting_model).filter_by(**{lk_field: self.id})
             results = session.exec(statement)
@@ -197,10 +221,25 @@ class ExtendableSettingsInterface(ABC):
                 if value_type == "json":
                     settings[setting.key] = setting.value_json
                 elif value_type == "bool":
-                    # Convert JSON string to bool
+                    # Convert JSON string to bool with robust handling of corrupted values
                     try:
-                        settings[setting.key] = json.loads(setting.value_json)
-                    except Exception:
+                        value = setting.value_json
+                        # Handle corrupted/multiply-escaped JSON values
+                        while isinstance(value, str) and (value.startswith('"') and value.endswith('"')):
+                            try:
+                                value = json.loads(value)
+                            except json.JSONDecodeError:
+                                break
+                        
+                        # Convert to boolean
+                        if isinstance(value, bool):
+                            settings[setting.key] = value
+                        elif isinstance(value, str):
+                            settings[setting.key] = value.lower() == 'true'
+                        else:
+                            settings[setting.key] = bool(value)
+                    except Exception as e:
+                        logger.warning(f"Failed to parse boolean setting '{setting.key}': {e}, defaulting to False")
                         settings[setting.key] = False
                 elif value_type == "float":
                     settings[setting.key] = setting.value_float

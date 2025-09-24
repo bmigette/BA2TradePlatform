@@ -80,18 +80,12 @@ class JobMonitoringTab:
                            :disable="props.row.status === 'running'">
                         <q-tooltip>Cancel Analysis</q-tooltip>
                     </q-btn>
-                    <q-btn v-if="props.row.status === 'completed'" 
-                           flat dense icon="visibility" 
-                           color="secondary" 
-                           @click="$parent.$emit('view_results', props.row.id)">
-                        <q-tooltip>Quick View (Dialog)</q-tooltip>
-                    </q-btn>
+
                 </q-td>
             ''')
             
             # Handle events
             self.analysis_table.on('cancel_analysis', self.cancel_analysis)
-            self.analysis_table.on('view_results', self.view_analysis_results)
             self.analysis_table.on('view_details', self.view_analysis_details)
 
     def _create_queue_status(self):
@@ -211,66 +205,7 @@ class JobMonitoringTab:
             logger.error(f"Error cancelling analysis {analysis_id}: {e}")
             ui.notify(f"Error cancelling analysis: {str(e)}", type='negative')
 
-    def view_analysis_results(self, event_data):
-        """View analysis results in a dialog."""
-        analysis_id = None
-        try:
-            # Extract analysis_id from event data
-            # NiceGUI passes GenericEventArguments with args attribute
-            if hasattr(event_data, 'args') and hasattr(event_data.args, '__len__') and len(event_data.args) > 0:
-                analysis_id = int(event_data.args[0])
-            elif hasattr(event_data, 'args') and isinstance(event_data.args, int):
-                analysis_id = event_data.args
-            elif isinstance(event_data, int):
-                analysis_id = event_data
-            else:
-                logger.error(f"Invalid event data for view_analysis_results: {event_data}")
-                ui.notify("Invalid event data", type='negative')
-                return
-            
-            analysis = get_instance(MarketAnalysis, analysis_id)
-            if not analysis:
-                ui.notify("Analysis not found", type='negative')
-                return
-            
-            # Get analysis outputs
-            from sqlmodel import Session, select
-            from ...core.db import get_db
-            
-            session = get_db()
-            statement = select(AnalysisOutput).where(AnalysisOutput.market_analysis_id == analysis_id)
-            outputs = session.exec(statement).all()
-            session.close()
-            
-            # Create dialog
-            with ui.dialog() as dialog, ui.card().classes('w-96 max-w-full'):
-                ui.label(f'Analysis Results - {analysis.symbol}').classes('text-lg font-bold')
-                
-                with ui.scroll_area().classes('h-64 w-full'):
-                    if analysis.state:
-                        ui.label('Analysis State:').classes('font-bold mt-2')
-                        ui.json_editor({'content': {'json': analysis.state}}).classes('w-full').props('read-only')
-                    
-                    if outputs:
-                        ui.label('Analysis Outputs:').classes('font-bold mt-4')
-                        for output in outputs:
-                            with ui.expansion(output.name):
-                                if output.text:
-                                    ui.label(output.text).classes('whitespace-pre-wrap')
-                                else:
-                                    ui.label(f"Binary data ({len(output.blob)} bytes)" if output.blob else "No content")
-                    else:
-                        ui.label('No analysis outputs available')
-                
-                with ui.row().classes('w-full justify-end'):
-                    ui.button('Close', on_click=dialog.close)
-            
-            dialog.open()
-            
-        except Exception as e:
-            analysis_id_str = str(analysis_id) if analysis_id is not None else "unknown"
-            logger.error(f"Error viewing analysis results {analysis_id_str}: {e}")
-            ui.notify(f"Error loading results: {str(e)}", type='negative')
+
 
     def view_analysis_details(self, event_data):
         """Navigate to the detailed analysis page."""
@@ -419,11 +354,11 @@ class ScheduledJobsTab:
     def _create_scheduled_jobs_table(self):
         """Create the scheduled jobs table."""
         columns = [
-            {'name': 'weekday', 'label': 'Weekday', 'field': 'weekday', 'sortable': True},
-            {'name': 'times', 'label': 'Scheduled Times', 'field': 'times', 'sortable': True},
             {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True},
             {'name': 'expert', 'label': 'Expert', 'field': 'expert_name', 'sortable': True},
             {'name': 'instance_id', 'label': 'Instance ID', 'field': 'expert_instance_id', 'sortable': True},
+            {'name': 'weekdays', 'label': 'Days', 'field': 'weekdays', 'sortable': True},
+            {'name': 'times', 'label': 'Times', 'field': 'times', 'sortable': True},
             {'name': 'actions', 'label': 'Actions', 'field': 'actions', 'sortable': False}
         ]
         
@@ -453,7 +388,7 @@ class ScheduledJobsTab:
             self.scheduled_jobs_table.on('run_now', self.run_analysis_now)
 
     def _get_scheduled_jobs_data(self) -> List[dict]:
-        """Get scheduled jobs data for the current week."""
+        """Get scheduled jobs data for the current week - one line per instrument per expert instance."""
         try:
             from datetime import datetime, timedelta
             import json
@@ -461,7 +396,8 @@ class ScheduledJobsTab:
             # Get all enabled expert instances
             expert_instances = get_all_instances(ExpertInstance)
             
-            scheduled_jobs = []
+            # Group by (expert_instance_id, symbol) to create one line per combination
+            jobs_by_combination = {}
             
             for expert_instance in expert_instances:
                 if not expert_instance.enabled:
@@ -497,30 +433,36 @@ class ScheduledJobsTab:
                     # Get enabled instruments for this expert
                     enabled_instruments = expert.get_enabled_instruments()
                     
-                    # Create entries for each enabled day and instrument combination
+                    # Get enabled weekdays with short names
                     day_names = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
-                    weekday_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+                    short_weekday_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
                     
+                    enabled_weekdays = []
                     for i, day_name in enumerate(day_names):
                         if days.get(day_name, False):
-                            for symbol in enabled_instruments:
-                                scheduled_jobs.append({
-                                    'id': f"{expert_instance.id}_{day_name}_{symbol}",
-                                    'weekday': weekday_names[i],
-                                    'times': ', '.join(times) if times else 'Not specified',
-                                    'symbol': symbol,
-                                    'expert_name': f"{expert_instance.expert}",
-                                    'expert_instance_id': expert_instance.id,
-                                    'expert_disabled': False
-                                })
+                            enabled_weekdays.append(short_weekday_names[i])
+                    
+                    # Create one entry per instrument for this expert instance
+                    for symbol in enabled_instruments:
+                        combination_key = f"{expert_instance.id}_{symbol}"
+                        
+                        jobs_by_combination[combination_key] = {
+                            'id': combination_key,
+                            'symbol': symbol,
+                            'expert_name': f"{expert_instance.expert}",
+                            'expert_instance_id': expert_instance.id,
+                            'weekdays': ', '.join(enabled_weekdays) if enabled_weekdays else 'None',
+                            'times': ', '.join(times) if times else 'Not specified',
+                            'expert_disabled': False
+                        }
                 
                 except Exception as e:
                     logger.error(f"Error processing schedule for expert instance {expert_instance.id}: {e}")
                     continue
             
-            # Sort by weekday and time
-            day_order = {'Monday': 0, 'Tuesday': 1, 'Wednesday': 2, 'Thursday': 3, 'Friday': 4, 'Saturday': 5, 'Sunday': 6}
-            scheduled_jobs.sort(key=lambda x: (day_order.get(x['weekday'], 7), x['times'], x['symbol']))
+            # Convert to list and sort by expert name, then symbol
+            scheduled_jobs = list(jobs_by_combination.values())
+            scheduled_jobs.sort(key=lambda x: (x['expert_name'], x['symbol']))
             
             return scheduled_jobs
             

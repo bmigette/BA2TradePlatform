@@ -54,7 +54,7 @@ def set_environment_variables_from_database():
         if fred_key:
             os.environ["FRED_API_KEY"] = fred_key
             
-        print("API keys loaded from database and set as environment variables")
+        #print("API keys loaded from database and set as environment variables")
     except Exception as e:
         print(f"Warning: Could not set environment variables from database: {e}")
 

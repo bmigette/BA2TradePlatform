@@ -27,7 +27,7 @@ class TradingAgents(MarketExpertInterface):
     def __init__(self, id: int):
         """Initialize TradingAgents expert with database instance."""
         super().__init__(id)
-        logger.debug(f'Initializing TradingAgents expert with instance ID: {id}')
+        #logger.debug(f'Initializing TradingAgents expert with instance ID: {id}')
         
         self._setup_api_keys()
         self._load_expert_instance(id)
@@ -37,7 +37,7 @@ class TradingAgents(MarketExpertInterface):
         try:
             from ...thirdparties.TradingAgents.tradingagents.dataflows.config import set_environment_variables_from_database
             set_environment_variables_from_database()
-            logger.debug("API keys loaded from database")
+            #logger.debug("API keys loaded from database")
         except Exception as e:
             logger.warning(f"Could not load API keys from database: {e}")
     
@@ -273,7 +273,7 @@ Analysis completed at: {self._get_current_timestamp()}"""
             
             # Mark analysis as completed
             market_analysis.status = MarketAnalysisStatus.COMPLETED
-            market_analysis.state['trading_agent_graph'] = final_state
+            market_analysis.state['trading_agent_graph'] = self._clean_state_for_json_storage(final_state)
             # Explicitly mark the state field as modified for SQLAlchemy
             from sqlalchemy.orm import attributes
             attributes.flag_modified(market_analysis, "state")
@@ -945,3 +945,56 @@ Please check back in a few minutes for results."""
                                 break
         
         return agent_summaries
+
+    def _clean_state_for_json_storage(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Clean state data to make it JSON serializable by removing non-serializable objects."""
+        cleaned_state = {}
+        
+        for key, value in state.items():
+            if key == 'messages':
+                # Store message summary instead of full HumanMessage objects
+                if isinstance(value, list):
+                    cleaned_state['messages_summary'] = {
+                        'count': len(value),
+                        'types': [msg.__class__.__name__ for msg in value if hasattr(msg, '__class__')]
+                    }
+                else:
+                    cleaned_state['messages_summary'] = {'count': 0, 'types': []}
+            elif key in ['investment_debate_state', 'risk_debate_state']:
+                # Keep debate states as they are crucial for UI display
+                if isinstance(value, dict):
+                    cleaned_value = {}
+                    for debate_key, debate_value in value.items():
+                        # Ensure all values are JSON serializable
+                        if isinstance(debate_value, (str, int, float, bool, type(None))):
+                            cleaned_value[debate_key] = debate_value
+                        elif isinstance(debate_value, list):
+                            # Clean list items
+                            cleaned_list = []
+                            for item in debate_value:
+                                if isinstance(item, (str, int, float, bool, type(None))):
+                                    cleaned_list.append(item)
+                                else:
+                                    cleaned_list.append(str(item))
+                            cleaned_value[debate_key] = cleaned_list
+                        else:
+                            cleaned_value[debate_key] = str(debate_value)
+                    cleaned_state[key] = cleaned_value
+                else:
+                    cleaned_state[key] = str(value) if value is not None else ""
+            elif isinstance(value, (str, int, float, bool, type(None))):
+                # Keep simple types as-is
+                cleaned_state[key] = value
+            elif isinstance(value, (dict, list)):
+                # Try to keep dictionaries and lists, but convert complex objects to strings
+                try:
+                    json.dumps(value)  # Test if it's JSON serializable
+                    cleaned_state[key] = value
+                except (TypeError, ValueError):
+                    # If not serializable, convert to string representation
+                    cleaned_state[key] = str(value)
+            else:
+                # Convert everything else to string
+                cleaned_state[key] = str(value)
+        
+        return cleaned_state

@@ -182,8 +182,8 @@ class InstrumentSelector:
                 self.search_input = ui.input(
                     label='Search instruments', 
                     placeholder='Enter instrument name...'
-                ).bind_value(self, 'search_filter').classes('flex-1')
-                self.search_input.on('input', self._on_search_change)
+                )#.bind_value(self, 'filter').classes('flex-1')
+                #self.search_input.on('input', lambda: self._on_search_change())
                 
                 categories = ['All'] + self._get_unique_categories()
                 self.category_select = ui.select(
@@ -191,7 +191,7 @@ class InstrumentSelector:
                     label='Category',
                     value='All'
                 ).bind_value(self, 'category_filter').classes('w-48')
-                self.category_select.on('update:model-value', self._on_category_change)
+                self.category_select.on('update:model-value', lambda: self._on_category_change())
                 
                 labels = ['All'] + self._get_unique_labels()
                 self.label_select = ui.select(
@@ -199,7 +199,7 @@ class InstrumentSelector:
                     label='Label',
                     value='All'
                 ).bind_value(self, 'label_filter').classes('w-48')
-                self.label_select.on('update:model-value', self._on_label_change)
+                self.label_select.on('update:model-value', lambda: self._on_label_change())
             
             # Weight control row
             with ui.row().classes('w-full gap-4 mb-4'):
@@ -249,7 +249,7 @@ class InstrumentSelector:
             
             # Handle events from table slots
             self.table.on('weightChange', lambda e: self._on_weight_change(e.args[0], e.args[1]))
-        
+            self.search_input.bind_value(self.table, 'filter')
         logger.debug('InstrumentSelector component rendered')
     
     def get_selected_instruments(self) -> List[Dict]:

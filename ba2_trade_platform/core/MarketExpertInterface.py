@@ -22,6 +22,29 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             id (int): The unique identifier for the Expert Instance.
         """
         self.id = id
+        
+        # Ensure builtin settings are initialized
+        self._ensure_builtin_settings()
+    
+    @classmethod
+    def _ensure_builtin_settings(cls):
+        """Ensure builtin settings are initialized for the class."""
+        if not cls._builtin_settings:
+            cls._builtin_settings = {
+                # Trading Permissions (generic settings for all market experts)
+                "enable_buy": {
+                    "type": "bool", "required": False, "default": True,
+                    "description": "Allow buy orders for this expert"
+                },
+                "enable_sell": {
+                    "type": "bool", "required": False, "default": False,
+                    "description": "Allow sell orders for this expert"
+                },
+                "automatic_trading": {
+                    "type": "bool", "required": False, "default": True,
+                    "description": "Enable automatic trade execution"
+                }
+            }
 
     @classmethod
     @abstractmethod
