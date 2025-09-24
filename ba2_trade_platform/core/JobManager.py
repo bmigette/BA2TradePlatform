@@ -23,7 +23,7 @@ from .db import get_all_instances, get_instance, get_setting
 from .models import ExpertInstance, ExpertSetting, Instrument
 from .WorkerQueue import get_worker_queue, AnalysisTask
 from .types import WorkerTaskStatus
-
+from .types import AnalysisUseCase
 
 class JobManager:
     """
@@ -132,13 +132,14 @@ class JobManager:
         self._scheduler.shutdown()
         logger.info("JobManager shutdown complete")
         
-    def submit_manual_analysis(self, expert_instance_id: int, symbol: str, priority: int = 0) -> str:
+    def submit_manual_analysis(self, expert_instance_id: int, symbol: str, subtype: str = AnalysisUseCase.ENTER_MARKET, priority: int = 0) -> str:
         """
         Submit a manual analysis job to the worker queue.
         
         Args:
             expert_instance_id: The expert instance ID
             symbol: The symbol to analyze
+            subtype: Analysis use case (AnalysisUseCase.ENTER_MARKET or AnalysisUseCase.OPEN_POSITIONS)
             priority: Task priority (lower = higher priority)
             
         Returns:
@@ -148,6 +149,8 @@ class JobManager:
             ValueError: If expert instance not found or duplicate task exists
             RuntimeError: If worker queue is not running
         """
+        
+        
         # Validate expert instance exists
         expert_instance = get_instance(ExpertInstance, expert_instance_id)
         if not expert_instance:
@@ -155,16 +158,23 @@ class JobManager:
             
         if not expert_instance.enabled:
             raise ValueError(f"Expert instance {expert_instance_id} is disabled")
+        
+        # Validate subtype
+        try:
+            analysis_use_case = AnalysisUseCase(subtype)
+        except ValueError:
+            raise ValueError(f"Invalid subtype '{subtype}'. Must be one of: {[e.value for e in AnalysisUseCase]}")
             
-        # Submit to worker queue
+        # Submit to worker queue with subtype
         worker_queue = get_worker_queue()
         task_id = worker_queue.submit_analysis_task(
             expert_instance_id=expert_instance_id,
             symbol=symbol,
+            subtype=subtype,
             priority=priority
         )
         
-        logger.info(f"Manual analysis job submitted: expert={expert_instance_id}, symbol={symbol}, task_id={task_id}")
+        logger.info(f"Manual analysis job submitted: expert={expert_instance_id}, symbol={symbol}, subtype={subtype}, task_id={task_id}")
         return task_id
         
     def get_job_status(self, task_id: str) -> Optional[AnalysisTask]:
@@ -278,23 +288,29 @@ class JobManager:
     def _schedule_expert_jobs(self, expert_instance: ExpertInstance):
         """Schedule jobs for a specific expert instance."""
         try:
-            # Get schedule settings for this expert
-            schedule_setting = self._get_expert_setting(expert_instance.id, "execution_schedule")
-            if not schedule_setting:
-                logger.debug(f"No execution_schedule setting found for expert instance {expert_instance.id}")
-                return
-            
-            logger.debug(f"Found execution_schedule for expert {expert_instance.id}: {schedule_setting}")
-                
             # Get enabled instruments for this expert
             enabled_instruments = self._get_enabled_instruments(expert_instance.id)
             if not enabled_instruments:
                 logger.debug(f"No enabled instruments found for expert instance {expert_instance.id}")
                 return
-                
-            # Parse schedule and create jobs
-            for instrument in enabled_instruments:
-                self._create_scheduled_job(expert_instance, instrument, schedule_setting)
+            
+            # Schedule jobs for enter_market
+            enter_market_schedule = self._get_expert_setting(expert_instance.id, "execution_schedule_enter_market")
+            if enter_market_schedule:
+                logger.debug(f"Found execution_schedule_enter_market for expert {expert_instance.id}: {enter_market_schedule}")
+                for instrument in enabled_instruments:
+                    self._create_scheduled_job(expert_instance, instrument, enter_market_schedule, AnalysisUseCase.ENTER_MARKET)
+            else:
+                logger.debug(f"No execution_schedule_enter_market setting found for expert instance {expert_instance.id}")
+            
+            # Schedule jobs for open_positions
+            open_positions_schedule = self._get_expert_setting(expert_instance.id, "execution_schedule_open_positions")
+            if open_positions_schedule:
+                logger.debug(f"Found execution_schedule_open_positions for expert {expert_instance.id}: {open_positions_schedule}")
+                for instrument in enabled_instruments:
+                    self._create_scheduled_job(expert_instance, instrument, open_positions_schedule, AnalysisUseCase.OPEN_POSITIONS)
+            else:
+                logger.debug(f"No execution_schedule_open_positions setting found for expert instance {expert_instance.id}")
                 
         except Exception as e:
             logger.error(f"Error scheduling jobs for expert instance {expert_instance.id}: {e}", exc_info=True)
@@ -360,10 +376,10 @@ class JobManager:
             logger.error(f"Error getting enabled instruments for instance {instance_id}: {e}")
             return []
             
-    def _create_scheduled_job(self, expert_instance: ExpertInstance, symbol: str, schedule_setting: str):
+    def _create_scheduled_job(self, expert_instance: ExpertInstance, symbol: str, schedule_setting: str, subtype: str = AnalysisUseCase.ENTER_MARKET):
         """Create a scheduled job for an expert instance and symbol."""
         try:
-            job_id = f"expert_{expert_instance.id}_symbol_{symbol}"
+            job_id = f"expert_{expert_instance.id}_symbol_{symbol}_subtype_{subtype}"
             
             # Parse schedule setting (e.g., "daily_9:30", "hourly", "cron:0 9 * * 1-5")
             trigger = self._parse_schedule(schedule_setting)
@@ -374,17 +390,17 @@ class JobManager:
             # Create the scheduled job
             job = self._scheduler.add_job(
                 func=self._execute_scheduled_analysis,
-                args=[expert_instance.id, symbol],
+                args=[expert_instance.id, symbol, subtype],
                 trigger=trigger,
                 id=job_id,
-                name=f"Analysis: Expert {expert_instance.id}, Symbol {symbol}",
+                name=f"Analysis: Expert {expert_instance.id}, Symbol {symbol}, Subtype {subtype}",
                 replace_existing=True
             )
             
             with self._lock:
                 self._scheduled_jobs[job_id] = job
                 
-            logger.info(f"Scheduled job created: {job_id} with schedule '{schedule_setting}'")
+            logger.info(f"Scheduled job created: {job_id} with schedule '{schedule_setting}' for subtype '{subtype}'")
             
         except Exception as e:
             logger.error(f"Error creating scheduled job for expert {expert_instance.id}, symbol {symbol}: {e}", exc_info=True)
@@ -443,22 +459,23 @@ class JobManager:
             logger.error(f"Error parsing JSON schedule: {e}")
             return None
             
-    def _execute_scheduled_analysis(self, expert_instance_id: int, symbol: str):
+    def _execute_scheduled_analysis(self, expert_instance_id: int, symbol: str, subtype: str = AnalysisUseCase.ENTER_MARKET):
         """Execute a scheduled analysis job."""
         try:
-            logger.info(f"Executing scheduled analysis: expert={expert_instance_id}, symbol={symbol}")
+            logger.info(f"Executing scheduled analysis: expert={expert_instance_id}, symbol={symbol}, subtype={subtype}")
             
             # Submit to worker queue with low priority (higher number = lower priority)
             task_id = self.submit_manual_analysis(
                 expert_instance_id=expert_instance_id,
                 symbol=symbol,
+                subtype=subtype,
                 priority=10  # Lower priority for scheduled jobs
             )
             
             logger.debug(f"Scheduled analysis submitted with task_id: {task_id}")
             
         except Exception as e:
-            logger.error(f"Error executing scheduled analysis for expert {expert_instance_id}, symbol {symbol}: {e}", exc_info=True)
+            logger.error(f"Error executing scheduled analysis for expert {expert_instance_id}, symbol {symbol}, subtype {subtype}: {e}", exc_info=True)
             
     def _remove_scheduled_job(self, job_id: str):
         """Remove a scheduled job."""

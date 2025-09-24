@@ -5,7 +5,7 @@ import json
 from ...core.MarketExpertInterface import MarketExpertInterface
 from ...core.models import ExpertInstance, MarketAnalysis, AnalysisOutput, ExpertRecommendation
 from ...core.db import get_db, get_instance, update_instance, add_instance
-from ...core.types import MarketAnalysisStatus, OrderRecommendation, RiskLevel, TimeHorizon
+from ...core.types import MarketAnalysisStatus, OrderRecommendation, RiskLevel, TimeHorizon, AnalysisUseCase
 from ...logger import logger
 from ...thirdparties.TradingAgents.tradingagents.graph.trading_graph import TradingAgentsGraph
 from ...thirdparties.TradingAgents.tradingagents.default_config import DEFAULT_CONFIG
@@ -102,14 +102,28 @@ class TradingAgents(MarketExpertInterface):
         """Get current UTC timestamp in ISO format."""
         return datetime.now(timezone.utc).isoformat()
     
-    def _create_tradingagents_config(self) -> Dict[str, Any]:
+    def _create_tradingagents_config(self, subtype: str) -> Dict[str, Any]:
         """Create TradingAgents configuration from expert settings."""
         config = DEFAULT_CONFIG.copy()
         
+        # Choose debate settings based on analysis subtype
+        if subtype == AnalysisUseCase.ENTER_MARKET:
+            # For new position analysis, use debates_new_positions setting
+            max_debate_rounds = int(self.settings.get('debates_new_positions', 3))
+            max_risk_discuss_rounds = int(self.settings.get('debates_new_positions', 3))
+        elif subtype == AnalysisUseCase.OPEN_POSITIONS:
+            # For existing position analysis, use debates_existing_positions setting
+            max_debate_rounds = int(self.settings.get('debates_existing_positions', 3))
+            max_risk_discuss_rounds = int(self.settings.get('debates_existing_positions', 3))
+        else:
+            # Default fallback
+            max_debate_rounds = int(self.settings.get('debates_new_positions', 3))
+            max_risk_discuss_rounds = int(self.settings.get('debates_existing_positions', 3))
+        
         # Apply user settings
         config.update({
-            'max_debate_rounds': int(self.settings.get('debates_new_positions', 3)),
-            'max_risk_discuss_rounds': int(self.settings.get('debates_existing_positions', 3)),
+            'max_debate_rounds': max_debate_rounds,
+            'max_risk_discuss_rounds': max_risk_discuss_rounds,
             'deep_think_llm': self.settings.get('deep_think_llm', 'o4-mini'),
             'quick_think_llm': self.settings.get('quick_think_llm', 'gpt-5-mini'),
             'news_lookback_days': int(self.settings.get('news_lookback_days', 7)),
@@ -259,7 +273,7 @@ Analysis completed at: {self._get_current_timestamp()}"""
             update_instance(market_analysis)
             
             # Execute TradingAgents analysis
-            final_state, processed_signal = self._execute_tradingagents_analysis(symbol, market_analysis.id)
+            final_state, processed_signal = self._execute_tradingagents_analysis(symbol, market_analysis.id, market_analysis.subtype)
             
             # Extract recommendation data
             recommendation_data = self._extract_recommendation_data(final_state, processed_signal, symbol)
@@ -287,10 +301,10 @@ Analysis completed at: {self._get_current_timestamp()}"""
             self._handle_analysis_error(market_analysis, symbol, str(e))
             raise
     
-    def _execute_tradingagents_analysis(self, symbol: str, market_analysis_id: int) -> tuple:
+    def _execute_tradingagents_analysis(self, symbol: str, market_analysis_id: int, subtype: str) -> tuple:
         """Execute the core TradingAgents analysis."""
         # Create configuration
-        config = self._create_tradingagents_config()
+        config = self._create_tradingagents_config(subtype)
         
         # Initialize TradingAgents graph
         ta_graph = TradingAgentsGraph(

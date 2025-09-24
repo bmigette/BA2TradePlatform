@@ -634,7 +634,7 @@ class ExpertSettingsTab:
     This tab manages three main categories of settings:
     
     1. **General Settings** (saved as ExpertSetting records):
-       - execution_schedule (JSON): Schedule configuration containing:
+       - execution_schedule_enter_market (JSON): Schedule configuration for entering market containing:
          - days: Dict of weekday names (monday, tuesday, etc.) to boolean values
          - times: List of execution times in HH:MM format
        - enable_buy (bool): Whether the expert can place BUY orders (default: True)
@@ -1131,8 +1131,8 @@ class ExpertSettingsTab:
                 
             expert = expert_class(expert_instance.id)
             
-            # Load execution schedule
-            schedule_config = expert.settings.get('execution_schedule')
+            # Load execution schedule (entering market)
+            schedule_config = expert.settings.get('execution_schedule_enter_market')
             if schedule_config:
                 # Handle both dict and JSON string formats
                 if isinstance(schedule_config, str):
@@ -1140,7 +1140,7 @@ class ExpertSettingsTab:
                     try:
                         schedule_config = json.loads(schedule_config)
                     except json.JSONDecodeError:
-                        logger.error(f"Invalid JSON in execution_schedule: {schedule_config}")
+                        logger.error(f"Invalid JSON in execution_schedule_enter_market: {schedule_config}")
                         schedule_config = None
                 
                 if schedule_config:
@@ -1320,7 +1320,7 @@ class ExpertSettingsTab:
         # Save general settings (schedule and trading permissions)
         if hasattr(self, 'schedule_days') and hasattr(self, 'execution_times'):
             schedule_config = self._get_schedule_config()
-            expert.save_setting('execution_schedule', schedule_config, setting_type="json")
+            expert.save_setting('execution_schedule_enter_market', schedule_config, setting_type="json")
             logger.debug(f'Saved execution schedule: {schedule_config}')
         
         if hasattr(self, 'enable_buy_checkbox') and hasattr(self, 'enable_sell_checkbox') and hasattr(self, 'automatic_trading_checkbox'):

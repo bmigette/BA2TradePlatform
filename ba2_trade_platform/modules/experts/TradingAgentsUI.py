@@ -285,12 +285,12 @@ class TradingAgentsUI:
             if content and content.strip():
                 # Render the content in a scrollable container
                 with ui.scroll_area().classes('w-full h-96'):
-                    # Try to render as markdown if it looks like markdown, otherwise as plain text
+                    # Try to render as markdown if it looks like markdown, otherwise as pre-formatted text
                     if self._looks_like_markdown(content):
                         ui.markdown(content).classes('w-full')
                     else:
-                        with ui.element('pre').classes('whitespace-pre-wrap text-sm p-4 bg-grey-1 rounded'):
-                            ui.label(content)
+                        with ui.element('pre').classes('whitespace-pre-wrap text-sm p-4 bg-grey-1 rounded font-mono overflow-x-auto'):
+                            ui.html(content)  # Use html() to preserve formatting
             else:
                 # Show in-progress indicator
                 with ui.card().classes('w-full p-8 text-center bg-grey-1'):
@@ -422,8 +422,8 @@ class TradingAgentsUI:
                 if self._looks_like_markdown(content):
                     ui.markdown(content).classes('text-sm')
                 else:
-                    with ui.element('div').classes('whitespace-pre-wrap text-sm'):
-                        ui.label(content)
+                    with ui.element('pre').classes('whitespace-pre-wrap text-sm font-mono bg-white p-2 rounded border overflow-x-auto'):
+                        ui.html(content)  # Use html() to preserve formatting
     
     def _render_debate_panel_legacy(self, debate_state: dict, state_key: str) -> None:
         """Legacy debate panel rendering for backward compatibility."""
@@ -435,8 +435,8 @@ class TradingAgentsUI:
                 if self._looks_like_markdown(history):
                     ui.markdown(history).classes('w-full mb-4')
                 else:
-                    with ui.element('pre').classes('whitespace-pre-wrap text-sm p-4 bg-grey-1 rounded mb-4'):
-                        ui.label(history)
+                    with ui.element('pre').classes('whitespace-pre-wrap text-sm p-4 bg-grey-1 rounded mb-4 font-mono overflow-x-auto'):
+                        ui.html(history)  # Use html() to preserve formatting
             
             # Current responses
             current_response = debate_state.get('current_response', '')
@@ -445,8 +445,8 @@ class TradingAgentsUI:
                 if self._looks_like_markdown(current_response):
                     ui.markdown(current_response).classes('w-full mb-4')
                 else:
-                    with ui.element('pre').classes('whitespace-pre-wrap text-sm p-4 bg-grey-1 rounded mb-4'):
-                        ui.label(current_response)
+                    with ui.element('pre').classes('whitespace-pre-wrap text-sm p-4 bg-grey-1 rounded mb-4 font-mono overflow-x-auto'):
+                        ui.html(current_response)  # Use html() to preserve formatting
             
             # Risk-specific responses
             if state_key == 'risk_debate_state':
@@ -459,24 +459,24 @@ class TradingAgentsUI:
                     if self._looks_like_markdown(risk_response):
                         ui.markdown(risk_response).classes('w-full mb-4')
                     else:
-                        with ui.element('pre').classes('whitespace-pre-wrap text-sm p-4 bg-red-1 rounded mb-4'):
-                            ui.label(risk_response)
+                        with ui.element('pre').classes('whitespace-pre-wrap text-sm p-4 bg-red-1 rounded mb-4 font-mono overflow-x-auto'):
+                            ui.html(risk_response)  # Use html() to preserve formatting
                 
                 if safe_response:
                     ui.label('🛡️ Conservative Assessment').classes('text-h6 mb-2')
                     if self._looks_like_markdown(safe_response):
                         ui.markdown(safe_response).classes('w-full mb-4')
                     else:
-                        with ui.element('pre').classes('whitespace-pre-wrap text-sm p-4 bg-green-1 rounded mb-4'):
-                            ui.label(safe_response)
+                        with ui.element('pre').classes('whitespace-pre-wrap text-sm p-4 bg-green-1 rounded mb-4 font-mono overflow-x-auto'):
+                            ui.html(safe_response)  # Use html() to preserve formatting
                 
                 if neutral_response:
                     ui.label('⚖️ Balanced Assessment').classes('text-h6 mb-2')
                     if self._looks_like_markdown(neutral_response):
                         ui.markdown(neutral_response).classes('w-full mb-4')
                     else:
-                        with ui.element('pre').classes('whitespace-pre-wrap text-sm p-4 bg-blue-1 rounded mb-4'):
-                            ui.label(neutral_response)
+                        with ui.element('pre').classes('whitespace-pre-wrap text-sm p-4 bg-blue-1 rounded mb-4 font-mono overflow-x-auto'):
+                            ui.html(neutral_response)  # Use html() to preserve formatting
             
             # Debate count
             count = debate_state.get('count', 0)
@@ -503,7 +503,7 @@ class TradingAgentsUI:
                 if error_info:
                     ui.label('Error Details:').classes('text-h6 mb-2')
                     with ui.element('pre').classes('bg-red-50 p-3 rounded text-sm overflow-auto max-h-32 whitespace-pre-wrap font-mono text-red-900 border'):
-                        ui.label(str(error_info))
+                        ui.html(str(error_info))  # Use html() to preserve formatting
     
     def _render_error_ui(self, error_message: str) -> None:
         """Render UI for rendering errors."""
@@ -513,7 +513,7 @@ class TradingAgentsUI:
             ui.label('An error occurred while rendering the analysis results.').classes('text-grey-7 mb-4')
             
             with ui.element('pre').classes('bg-orange-50 p-3 rounded text-sm overflow-auto max-h-32 whitespace-pre-wrap font-mono text-orange-900 border'):
-                ui.label(error_message)
+                ui.html(error_message)  # Use html() to preserve formatting
     
     def _looks_like_markdown(self, content: str) -> bool:
         """Check if content appears to be markdown formatted."""
@@ -522,10 +522,22 @@ class TradingAgentsUI:
         
         markdown_indicators = [
             '##', '**', '*', '- ', '| ', '[', '](', '```', '---', 
-            '\n#', '\n*', '\n-', '\n1.', '\n2.'
+            '\n#', '\n*', '\n-', '\n1.', '\n2.', '\n3.', '\n4.', '\n5.',
+            '> ', '\n> ', '_', '__', '`', '~~~', '===', '***',
+            '![', '\n\n', '\r\n\r\n'  # Additional markdown patterns
         ]
         
-        return any(indicator in content for indicator in markdown_indicators)
+        # Check for markdown patterns
+        has_markdown = any(indicator in content for indicator in markdown_indicators)
+        
+        # Also check for structured text patterns that benefit from markdown
+        has_structure = (
+            content.count('\n') > 3 and  # Multi-line content
+            ('Analysis:' in content or 'Summary:' in content or 'Recommendation:' in content or
+             'Conclusion:' in content or 'Key Points:' in content or 'Risks:' in content)
+        )
+        
+        return has_markdown or has_structure
     
     def _render_expert_recommendation(self) -> None:
         """Render the expert recommendation if available."""
@@ -587,7 +599,12 @@ class TradingAgentsUI:
             if latest_recommendation.details:
                 with ui.card().classes('w-full p-4'):
                     ui.label('Analysis Summary').classes('text-subtitle2 mb-2')
-                    ui.label(latest_recommendation.details).classes('text-sm text-grey-8')
+                    # Check if details look like markdown or need pre-formatting
+                    if self._looks_like_markdown(latest_recommendation.details):
+                        ui.markdown(latest_recommendation.details).classes('text-sm text-grey-8')
+                    else:
+                        with ui.element('pre').classes('whitespace-pre-wrap text-sm text-grey-8 font-mono bg-grey-50 p-2 rounded overflow-x-auto'):
+                            ui.html(latest_recommendation.details)  # Use html() to preserve formatting
             
             # Risk and Time Horizon if available
             with ui.row().classes('w-full gap-4 mt-3'):

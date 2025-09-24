@@ -15,6 +15,44 @@ from ...prompts import get_prompt
 from ba2_trade_platform.core.types import OrderRecommendation, RiskLevel, TimeHorizon
 
 
+def _get_error_recommendation(symbol: str, current_price: float, error_message: str, update_market_analysis_state=None) -> Dict[str, Any]:
+    """
+    Create a standardized error recommendation and optionally update MarketAnalysis state.
+    
+    Args:
+        symbol: The trading symbol
+        current_price: Current price of the asset
+        error_message: The error message to include in details
+        update_market_analysis_state: Optional function to update MarketAnalysis state with error
+        
+    Returns:
+        Dict containing standardized error recommendation
+    """
+    error_recommendation = {
+        "symbol": symbol,
+        "recommended_action": OrderRecommendation.ERROR.value,
+        "expected_profit_percent": 0.0,
+        "price_at_date": current_price,
+        "confidence": 0.0,
+        "details": f"Error generating recommendation: {str(error_message)}",
+        "risk_level": RiskLevel.HIGH.value,
+        "time_horizon": TimeHorizon.SHORT_TERM.value,
+        "key_factors": ["Analysis error occurred"],
+        "stop_loss": 0.0,
+        "take_profit": 0.0
+    }
+    
+    # Update MarketAnalysis state with error if function provided
+    if update_market_analysis_state is not None:
+        try:
+            update_market_analysis_state({"error": str(error_message), "error_timestamp": datetime.now().isoformat()})
+        except Exception as state_error:
+            # Don't let state update errors interfere with returning the error recommendation
+            pass
+    
+    return error_recommendation
+
+
 def create_recommendation_agent(llm):
     """
     DEPRECATED: Use Final Summarization Agent in graph workflow instead.
@@ -168,19 +206,7 @@ Judge Decision: {context_data.get('judge_decision', 'None')}
         except Exception as e:
             # Return error recommendation
             ta_logger.error(f"Error generating recommendation for {symbol}: {e}")
-            return {
-                "symbol": symbol,
-                "recommended_action": OrderRecommendation.ERROR.value,
-                "expected_profit_percent": 0.0,
-                "price_at_date": current_price,
-                "confidence": 0.0,
-                "details": f"Error generating recommendation: {str(e)}",
-                "risk_level": RiskLevel.HIGH.value,
-                "time_horizon": TimeHorizon.SHORT_TERM.value,
-                "key_factors": ["Analysis error occurred"],
-                "stop_loss": 0.0,
-                "take_profit": 0.0
-            }
+            return _get_error_recommendation(symbol, current_price, str(e))
     
     return recommendation_agent_node
 
@@ -190,38 +216,15 @@ def _create_fallback_recommendation(response_text: str, symbol: str, current_pri
     
 
     
-    return {
-        "symbol": symbol,
-        "recommended_action": OrderRecommendation.ERROR.value,
-        "expected_profit_percent": 0,
-        "price_at_date": current_price,
-        "confidence": 0,
-        "details": response_text[:500] + "..." if len(response_text) > 500 else response_text,
-        "risk_level": RiskLevel.HIGH.value,
-        "time_horizon": TimeHorizon.SHORT_TERM.value,
-        "key_factors": ["AI analysis"],
-        "stop_loss": 0,
-        "take_profit": 0
-    }
+    fallback_details = response_text[:500] + "..." if len(response_text) > 500 else response_text
+    return _get_error_recommendation(symbol, current_price, f"JSON parsing failed: {fallback_details}")
 
 
 def _validate_and_complete_recommendation(recommendation: Dict[str, Any], symbol: str, current_price: float) -> Dict[str, Any]:
     """Ensure the recommendation has all required fields with valid values"""
     
-    # Required fields with defaults
-    defaults = {
-        "symbol": symbol,
-        "recommended_action": OrderRecommendation.ERROR.value,
-        "expected_profit_percent": 0.0,
-        "price_at_date": current_price,
-        "confidence": 0.0,
-        "details": "No detailed analysis available",
-        "risk_level": RiskLevel.HIGH.value,
-        "time_horizon": TimeHorizon.SHORT_TERM.value,
-        "key_factors": [],
-        "stop_loss": 0,
-        "take_profit": 0
-    }
+    # Use error recommendation as defaults
+    defaults = _get_error_recommendation(symbol, current_price, "No detailed analysis available")
     
     # Fill in missing fields
     for key, default_value in defaults.items():

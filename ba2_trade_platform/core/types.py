@@ -44,6 +44,10 @@ class TimeHorizon(str, Enum):
 
 class ExpertEventRuleType(str, Enum):
     TRADING_RECOMMENDATION_RULE = "trading_recommendation_rule"
+
+class AnalysisUseCase(str, Enum):
+    ENTER_MARKET = "enter_market"
+    OPEN_POSITIONS = "open_positions"
     
 class ExpertEventType(str, Enum):
     # F = Flag/Boolean

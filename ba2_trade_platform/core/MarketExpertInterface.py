@@ -43,6 +43,21 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 "automatic_trading": {
                     "type": "bool", "required": False, "default": True,
                     "description": "Enable automatic trade execution"
+                },
+                # Execution Schedule Settings
+                "execution_schedule_enter_market": {
+                    "type": "json", "required": False, "default": {
+                        "days": {"monday": True, "tuesday": True, "wednesday": True, "thursday": True, "friday": True, "saturday": False, "sunday": False},
+                        "times": ["09:30"]
+                    },
+                    "description": "Schedule configuration for entering new market positions"
+                },
+                "execution_schedule_open_positions": {
+                    "type": "json", "required": False, "default": {
+                        "days": {"monday": True, "tuesday": True, "wednesday": True, "thursday": True, "friday": True, "saturday": False, "sunday": False},
+                        "times": ["09:30", "10:30", "11:30", "12:30", "13:30", "14:30", "15:30"]
+                    },
+                    "description": "Schedule configuration for managing existing open positions"
                 }
             }
 

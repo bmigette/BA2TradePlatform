@@ -201,15 +201,18 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                     # Store simple types directly
                     state_snapshot[key] = value
                 elif isinstance(value, (dict, list)) and len(str(value)) < 1000:
-                    # Store small complex objects
-                    state_snapshot[key] = value
+                    # Store small complex objects, but clean them first
+                    state_snapshot[key] = self._clean_any_object(value)
+            
+            # Final pass: recursively clean the entire state snapshot to ensure no HumanMessage objects remain
+            cleaned_state_snapshot = self._clean_any_object(state_snapshot)
             
             # Update MarketAnalysis state using the proper merging function
             from ba2_trade_platform.core.types import MarketAnalysisStatus
             update_market_analysis_status(
                 analysis_id=self.market_analysis_id,
                 status=MarketAnalysisStatus.RUNNING,  # Keep status as running during execution
-                state=state_snapshot
+                state=cleaned_state_snapshot
             )
             
             ta_logger.debug(f"Synced graph state to MarketAnalysis {self.market_analysis_id} at step: {step_name}")
@@ -228,29 +231,56 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         """
         cleaned_messages = []
         for msg in messages:
-            if hasattr(msg, 'content') and hasattr(msg, '__class__'):
-                # This is likely a langchain message object
-                cleaned_messages.append({
-                    'type': msg.__class__.__name__,
-                    'content': str(msg.content) if msg.content else ''
-                })
-            elif isinstance(msg, dict):
-                # Already a dictionary, check if it's serializable
-                try:
-                    import json
-                    json.dumps(msg)
-                    cleaned_messages.append(msg)
-                except (TypeError, ValueError):
-                    # Convert to string if not serializable
-                    cleaned_messages.append({'content': str(msg), 'type': 'dict'})
-            elif isinstance(msg, (str, int, float, bool, type(None))):
-                # Simple types
-                cleaned_messages.append({'content': str(msg), 'type': 'simple'})
-            else:
-                # Convert everything else to string
-                cleaned_messages.append({'content': str(msg), 'type': 'unknown'})
+            cleaned_msg = self._clean_any_object(msg)
+            cleaned_messages.append(cleaned_msg)
         
         return cleaned_messages
+
+    def _clean_any_object(self, obj) -> Any:
+        """Recursively clean any object to make it JSON serializable.
+        
+        Args:
+            obj: Any object that might contain non-serializable elements
+            
+        Returns:
+            JSON-serializable representation of the object
+        """
+        if obj is None or isinstance(obj, (str, int, float, bool)):
+            # Simple types are already serializable
+            return obj
+        elif hasattr(obj, 'content') and hasattr(obj, '__class__'):
+            # This is likely a langchain message object
+            return {
+                'type': obj.__class__.__name__,
+                'content': str(obj.content) if obj.content else ''
+            }
+        elif isinstance(obj, dict):
+            # Recursively clean dictionary values
+            cleaned_dict = {}
+            for key, value in obj.items():
+                try:
+                    cleaned_dict[str(key)] = self._clean_any_object(value)
+                except Exception:
+                    cleaned_dict[str(key)] = str(value)
+            return cleaned_dict
+        elif isinstance(obj, (list, tuple)):
+            # Recursively clean list/tuple elements
+            cleaned_list = []
+            for item in obj:
+                try:
+                    cleaned_list.append(self._clean_any_object(item))
+                except Exception:
+                    cleaned_list.append(str(item))
+            return cleaned_list
+        else:
+            # Test if object is already JSON serializable
+            try:
+                import json
+                json.dumps(obj)
+                return obj
+            except (TypeError, ValueError):
+                # Convert to string if not serializable
+                return {'content': str(obj), 'type': obj.__class__.__name__}
 
     def _create_tool_nodes(self) -> Dict[str, ToolNode]:
         """Create tool nodes for different data sources."""

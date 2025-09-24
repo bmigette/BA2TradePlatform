@@ -1,7 +1,7 @@
 from sqlmodel import  Field, Session, SQLModel, create_engine, Column, Relationship
 from sqlalchemy import String, Float, JSON, UniqueConstraint, Table, Integer, ForeignKey
 from typing import Optional, Dict, Any, List
-from .types import InstrumentType, MarketAnalysisStatus, OrderRecommendation, OrderStatus, OrderDirection, ExpertEventRuleType, RiskLevel, TimeHorizon
+from .types import InstrumentType, MarketAnalysisStatus, OrderRecommendation, OrderStatus, OrderDirection, ExpertEventRuleType, AnalysisUseCase, RiskLevel, TimeHorizon
 from datetime import datetime as DateTime, timezone
 
 # Association table for many-to-many relationship between Ruleset and EventAction
@@ -55,6 +55,8 @@ class Ruleset(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     name: str
     description: str | None = Field(default=None)
+    type: ExpertEventRuleType = Field(default=ExpertEventRuleType.TRADING_RECOMMENDATION_RULE)
+    subtype: AnalysisUseCase | None = Field(default=None)
     # Many-to-many relationship with EventAction
     event_actions: List["EventAction"] = Relationship(
         back_populates="rulesets", 
@@ -65,7 +67,7 @@ class Ruleset(SQLModel, table=True):
 class EventAction(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     type: ExpertEventRuleType
-    subtype: str | None 
+    subtype: AnalysisUseCase | None = Field(default=None)
     name: str
     triggers: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict)
     actions: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict) 
@@ -100,6 +102,7 @@ class MarketAnalysis(SQLModel, table=True):
     symbol: str
     source_expert_instance_id: int = Field(foreign_key="expertinstance.id", nullable=False, ondelete="CASCADE")
     status: MarketAnalysisStatus = MarketAnalysisStatus.PENDING
+    subtype: AnalysisUseCase = Field(default=AnalysisUseCase.ENTER_MARKET)
     state: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict)
     created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc))
     

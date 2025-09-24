@@ -413,7 +413,7 @@ class ScheduledJobsTab:
                         continue
                     
                     expert = expert_class(expert_instance.id)
-                    schedule_setting = expert.settings.get('execution_schedule')
+                    schedule_setting = expert.settings.get('execution_schedule_enter_market')
                     
                     if not schedule_setting:
                         continue

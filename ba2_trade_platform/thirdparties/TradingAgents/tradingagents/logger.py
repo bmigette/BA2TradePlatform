@@ -9,14 +9,8 @@ from datetime import datetime
 from typing import Optional
 from logging.handlers import RotatingFileHandler
 
-try:
-    from ba2_trade_platform import config as ba2_config
-except ImportError:
-    # Fallback if BA2 config is not available
-    class MockConfig:
-        STDOUT_LOGGING = True
-        FILE_LOGGING = True
-    ba2_config = MockConfig()
+from .... import config as ba2_config
+
 
 
 class ColoredFormatter(logging.Formatter):
@@ -135,7 +129,8 @@ class TradingAgentsLogger:
             file_handler = RotatingFileHandler(
                 log_filepath,
                 maxBytes=10*1024*1024,  # 10MB
-                backupCount=5
+                backupCount=5,
+                encoding='utf-8'  # Explicitly set UTF-8 encoding to handle Unicode characters
             )
             file_handler.setLevel(logging.DEBUG)
             file_handler.setFormatter(file_formatter)

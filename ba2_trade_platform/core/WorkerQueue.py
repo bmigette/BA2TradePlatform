@@ -15,7 +15,7 @@ from enum import Enum
 from ..logger import logger
 from .db import get_setting, add_instance, update_instance
 from .models import AppSetting
-from .types import WorkerTaskStatus
+from .types import WorkerTaskStatus, AnalysisUseCase
 
 
 
@@ -27,6 +27,7 @@ class AnalysisTask:
     id: str
     expert_instance_id: int
     symbol: str
+    subtype: str = AnalysisUseCase.ENTER_MARKET  # Analysis use case
     priority: int = 0  # Lower numbers = higher priority
     status: WorkerTaskStatus = WorkerTaskStatus.PENDING
     result: Any = None
@@ -130,13 +131,14 @@ class WorkerQueue:
         self._worker_count = 0
         logger.info("WorkerQueue stopped")
         
-    def submit_analysis_task(self, expert_instance_id: int, symbol: str, priority: int = 0, task_id: Optional[str] = None) -> str:
+    def submit_analysis_task(self, expert_instance_id: int, symbol: str, subtype: str = AnalysisUseCase.ENTER_MARKET, priority: int = 0, task_id: Optional[str] = None) -> str:
         """
         Submit an analysis task to be processed by the worker queue.
         
         Args:
             expert_instance_id: The expert instance ID to run the analysis
             symbol: The symbol to analyze
+            subtype: Analysis use case (AnalysisUseCase.ENTER_MARKET or AnalysisUseCase.OPEN_POSITIONS)
             priority: Task priority (lower numbers = higher priority)
             task_id: Optional custom task ID
             
@@ -169,6 +171,7 @@ class WorkerQueue:
                 id=task_id,
                 expert_instance_id=expert_instance_id,
                 symbol=symbol,
+                subtype=subtype,
                 priority=priority
             )
             
@@ -375,11 +378,13 @@ class WorkerQueue:
                 
             expert = expert_class(task.expert_instance_id)
             
-            # Create MarketAnalysis record
+            # Create MarketAnalysis record with subtype
+            from .types import AnalysisUseCase
             market_analysis = MarketAnalysis(
                 symbol=task.symbol,
                 source_expert_instance_id=task.expert_instance_id,
-                status=MarketAnalysisStatus.PENDING
+                status=MarketAnalysisStatus.PENDING,
+                subtype=AnalysisUseCase(task.subtype)
             )
             market_analysis_id = add_instance(market_analysis)
             task.market_analysis_id = market_analysis_id
