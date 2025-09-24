@@ -238,7 +238,7 @@ class TradingAgentsUI:
                 recommendation_line = next((line for line in lines if 'Recommendation:' in line), '')
                 if recommendation_line:
                     recommendation = recommendation_line.replace('Recommendation:', '').strip()
-                    ui.label(f'**{recommendation}**').classes('text-lg font-bold text-primary')
+                    ui.label(f'{recommendation}').classes('text-lg font-bold text-primary')
     
     def _render_in_progress_summary(self) -> None:
         """Render summary for in-progress analysis."""
@@ -272,7 +272,7 @@ class TradingAgentsUI:
                 ui.label(f'{status_icon} {name}: {status_text}')
             
             ui.separator().classes('my-4')
-            ui.label('💡 **Tip:** This page will automatically update as the analysis progresses. Refresh to see the latest results.').classes('text-caption')
+            ui.label('💡 Tip: This page will automatically update as the analysis progresses. Refresh to see the latest results.').classes('text-caption')
     
     def _render_content_panel(self, state_key: str, title: str, description: str) -> None:
         """Render a content panel for text-based analysis results."""
@@ -577,14 +577,14 @@ class TradingAgentsUI:
                         'HOLD': 'text-orange-600', 
                         'ERROR': 'text-grey-600'
                     }.get(latest_recommendation.recommended_action, 'text-grey-600')
-                    ui.label(f'{action_icon} **{latest_recommendation.recommended_action}**').classes(f'text-xl font-bold {action_color}')
+                    ui.label(f'{action_icon} {latest_recommendation.recommended_action}').classes(f'text-xl font-bold {action_color}')
                 
                 # Confidence card
                 with ui.card().classes('p-4 flex-1'):
                     ui.label('Confidence').classes('text-subtitle2 mb-2')
                     confidence = (latest_recommendation.confidence or 0) * 100
                     confidence_color = 'text-green-600' if confidence >= 75 else 'text-orange-600' if confidence >= 50 else 'text-red-600'
-                    ui.label(f'🎯 **{confidence:.1f}%**').classes(f'text-xl font-bold {confidence_color}')
+                    ui.label(f'🎯 {confidence:.1f}%').classes(f'text-xl font-bold {confidence_color}')
                 
                 # Expected Profit card  
                 if latest_recommendation.expected_profit_percent:
@@ -593,7 +593,7 @@ class TradingAgentsUI:
                         profit = latest_recommendation.expected_profit_percent
                         profit_color = 'text-green-600' if profit > 0 else 'text-red-600' if profit < 0 else 'text-grey-600'
                         profit_icon = '📈' if profit > 0 else '📉' if profit < 0 else '➖'
-                        ui.label(f'{profit_icon} **{profit:+.1f}%**').classes(f'text-xl font-bold {profit_color}')
+                        ui.label(f'{profit_icon} {profit:+.1f}%').classes(f'text-xl font-bold {profit_color}')
             
             # Additional details
             if latest_recommendation.details:
@@ -610,15 +610,15 @@ class TradingAgentsUI:
             with ui.row().classes('w-full gap-4 mt-3'):
                 if latest_recommendation.risk_level:
                     risk_icon = {'LOW': '🟢', 'MEDIUM': '🟡', 'HIGH': '🔴'}.get(latest_recommendation.risk_level, '⚪')
-                    ui.label(f'{risk_icon} Risk: **{latest_recommendation.risk_level}**').classes('text-sm')
+                    ui.label(f'{risk_icon} Risk: {latest_recommendation.risk_level}').classes('text-sm')
                 
                 if latest_recommendation.time_horizon:
                     horizon_icon = {'SHORT_TERM': '⏱️', 'MEDIUM_TERM': '📅', 'LONG_TERM': '🗓️'}.get(latest_recommendation.time_horizon, '⏰')
                     horizon_text = latest_recommendation.time_horizon.replace('_', ' ').title()
-                    ui.label(f'{horizon_icon} Horizon: **{horizon_text}**').classes('text-sm')
+                    ui.label(f'{horizon_icon} Horizon: {horizon_text}').classes('text-sm')
                 
                 if latest_recommendation.created_at:
-                    ui.label(f'🕒 Generated: **{latest_recommendation.created_at.strftime("%Y-%m-%d %H:%M:%S")}**').classes('text-sm text-grey-7')
+                    ui.label(f'🕒 Generated: {latest_recommendation.created_at.strftime("%Y-%m-%d %H:%M:%S")}').classes('text-sm text-grey-7')
         
         except Exception as e:
             logger.error(f"Error rendering expert recommendation: {e}")

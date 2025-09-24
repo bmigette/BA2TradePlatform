@@ -46,7 +46,7 @@ class TradingAgents(MarketExpertInterface):
         self.instance = get_instance(ExpertInstance, id)
         if not self.instance:
             raise ValueError(f"ExpertInstance with ID {id} not found")
-        logger.debug(f'TradingAgents expert loaded: {self.instance.expert}')
+        #logger.debug(f'TradingAgents expert loaded: {self.instance.expert}')
     
     @classmethod
     def get_settings_definitions(cls) -> Dict[str, Any]:
@@ -106,31 +106,33 @@ class TradingAgents(MarketExpertInterface):
         """Create TradingAgents configuration from expert settings."""
         config = DEFAULT_CONFIG.copy()
         
+        # Get settings definitions for default values
+        settings_def = self.get_settings_definitions()
+        
         # Choose debate settings based on analysis subtype
         if subtype == AnalysisUseCase.ENTER_MARKET:
             # For new position analysis, use debates_new_positions setting
-            max_debate_rounds = int(self.settings.get('debates_new_positions', 3))
-            max_risk_discuss_rounds = int(self.settings.get('debates_new_positions', 3))
+            max_debate_rounds = int(self.settings.get('debates_new_positions', settings_def['debates_new_positions']['default']))
+            max_risk_discuss_rounds = int(self.settings.get('debates_new_positions', settings_def['debates_new_positions']['default']))
         elif subtype == AnalysisUseCase.OPEN_POSITIONS:
             # For existing position analysis, use debates_existing_positions setting
-            max_debate_rounds = int(self.settings.get('debates_existing_positions', 3))
-            max_risk_discuss_rounds = int(self.settings.get('debates_existing_positions', 3))
+            max_debate_rounds = int(self.settings.get('debates_existing_positions', settings_def['debates_existing_positions']['default']))
+            max_risk_discuss_rounds = int(self.settings.get('debates_existing_positions', settings_def['debates_existing_positions']['default']))
         else:
             # Default fallback
-            max_debate_rounds = int(self.settings.get('debates_new_positions', 3))
-            max_risk_discuss_rounds = int(self.settings.get('debates_existing_positions', 3))
+            max_debate_rounds = int(self.settings.get('debates_new_positions', settings_def['debates_new_positions']['default']))
+            max_risk_discuss_rounds = int(self.settings.get('debates_existing_positions', settings_def['debates_existing_positions']['default']))
         
-        # Apply user settings
+        # Apply user settings with defaults from settings definitions
         config.update({
             'max_debate_rounds': max_debate_rounds,
             'max_risk_discuss_rounds': max_risk_discuss_rounds,
-            'deep_think_llm': self.settings.get('deep_think_llm', 'o4-mini'),
-            'quick_think_llm': self.settings.get('quick_think_llm', 'gpt-5-mini'),
-            'news_lookback_days': int(self.settings.get('news_lookback_days', 7)),
-            'market_history_days': int(self.settings.get('market_history_days', 90)),
-            'economic_data_days': int(self.settings.get('economic_data_days', 90)),
-            'social_sentiment_days': int(self.settings.get('social_sentiment_days', 3)),
-            'log_dir': 'logs'
+            'deep_think_llm': self.settings.get('deep_think_llm', settings_def['deep_think_llm']['default']),
+            'quick_think_llm': self.settings.get('quick_think_llm', settings_def['quick_think_llm']['default']),
+            'news_lookback_days': int(self.settings.get('news_lookback_days', settings_def['news_lookback_days']['default'])),
+            'market_history_days': int(self.settings.get('market_history_days', settings_def['market_history_days']['default'])),
+            'economic_data_days': int(self.settings.get('economic_data_days', settings_def['economic_data_days']['default'])),
+            'social_sentiment_days': int(self.settings.get('social_sentiment_days', settings_def['social_sentiment_days']['default'])),
         })
         
         return config

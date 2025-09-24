@@ -357,6 +357,7 @@ class ScheduledJobsTab:
             {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True},
             {'name': 'expert', 'label': 'Expert', 'field': 'expert_name', 'sortable': True},
             {'name': 'instance_id', 'label': 'Instance ID', 'field': 'expert_instance_id', 'sortable': True},
+            {'name': 'job_type', 'label': 'Job Type', 'field': 'job_type', 'sortable': True},
             {'name': 'weekdays', 'label': 'Days', 'field': 'weekdays', 'sortable': True},
             {'name': 'times', 'label': 'Times', 'field': 'times', 'sortable': True},
             {'name': 'actions', 'label': 'Actions', 'field': 'actions', 'sortable': False}
@@ -377,7 +378,7 @@ class ScheduledJobsTab:
                 <q-td :props="props">
                     <q-btn flat dense icon="play_arrow" 
                            color="primary" 
-                           @click="$parent.$emit('run_now', props.row.expert_instance_id, props.row.symbol)"
+                           @click="$parent.$emit('run_now', props.row.expert_instance_id, props.row.symbol, props.row.subtype)"
                            :disable="props.row.expert_disabled">
                         <q-tooltip>Run Analysis Now</q-tooltip>
                     </q-btn>
@@ -388,22 +389,22 @@ class ScheduledJobsTab:
             self.scheduled_jobs_table.on('run_now', self.run_analysis_now)
 
     def _get_scheduled_jobs_data(self) -> List[dict]:
-        """Get scheduled jobs data for the current week - one line per instrument per expert instance."""
+        """Get scheduled jobs data for the current week - one line per instrument per expert instance per job type."""
         try:
             from datetime import datetime, timedelta
             import json
+            from ...core.types import AnalysisUseCase
             
             # Get all enabled expert instances
             expert_instances = get_all_instances(ExpertInstance)
             
-            # Group by (expert_instance_id, symbol) to create one line per combination
+            # Group by (expert_instance_id, symbol, job_type) to create one line per combination
             jobs_by_combination = {}
             
             for expert_instance in expert_instances:
                 if not expert_instance.enabled:
                     continue
                 
-                # Get the execution schedule setting
                 try:
                     from ...core.ExtendableSettingsInterface import ExtendableSettingsInterface
                     from ...modules.experts import get_expert_class
@@ -413,48 +414,62 @@ class ScheduledJobsTab:
                         continue
                     
                     expert = expert_class(expert_instance.id)
-                    schedule_setting = expert.settings.get('execution_schedule_enter_market')
-                    
-                    if not schedule_setting:
-                        continue
-                    
-                    # Parse schedule
-                    if isinstance(schedule_setting, str):
-                        schedule_config = json.loads(schedule_setting)
-                    else:
-                        schedule_config = schedule_setting
-                    
-                    if not isinstance(schedule_config, dict):
-                        continue
-                    
-                    days = schedule_config.get('days', {})
-                    times = schedule_config.get('times', [])
                     
                     # Get enabled instruments for this expert
                     enabled_instruments = expert.get_enabled_instruments()
                     
-                    # Get enabled weekdays with short names
-                    day_names = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
-                    short_weekday_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+                    # Process both schedule types
+                    schedule_configs = [
+                        ('execution_schedule_enter_market', 'Enter Market', AnalysisUseCase.ENTER_MARKET),
+                        ('execution_schedule_open_positions', 'Open Positions', AnalysisUseCase.OPEN_POSITIONS)
+                    ]
                     
-                    enabled_weekdays = []
-                    for i, day_name in enumerate(day_names):
-                        if days.get(day_name, False):
-                            enabled_weekdays.append(short_weekday_names[i])
-                    
-                    # Create one entry per instrument for this expert instance
-                    for symbol in enabled_instruments:
-                        combination_key = f"{expert_instance.id}_{symbol}"
+                    for schedule_key, job_type_display, subtype in schedule_configs:
+                        schedule_setting = expert.settings.get(schedule_key)
                         
-                        jobs_by_combination[combination_key] = {
-                            'id': combination_key,
-                            'symbol': symbol,
-                            'expert_name': f"{expert_instance.expert}",
-                            'expert_instance_id': expert_instance.id,
-                            'weekdays': ', '.join(enabled_weekdays) if enabled_weekdays else 'None',
-                            'times': ', '.join(times) if times else 'Not specified',
-                            'expert_disabled': False
-                        }
+                        if not schedule_setting:
+                            continue
+                        
+                        # Parse schedule
+                        if isinstance(schedule_setting, str):
+                            schedule_config = json.loads(schedule_setting)
+                        else:
+                            schedule_config = schedule_setting
+                        
+                        if not isinstance(schedule_config, dict):
+                            continue
+                        
+                        days = schedule_config.get('days', {})
+                        times = schedule_config.get('times', [])
+                        
+                        # Skip if no schedule is defined
+                        if not any(days.values()) or not times:
+                            continue
+                        
+                        # Get enabled weekdays with short names
+                        day_names = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+                        short_weekday_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+                        
+                        enabled_weekdays = []
+                        for i, day_name in enumerate(day_names):
+                            if days.get(day_name, False):
+                                enabled_weekdays.append(short_weekday_names[i])
+                        
+                        # Create one entry per instrument for this expert instance and job type
+                        for symbol in enabled_instruments:
+                            combination_key = f"{expert_instance.id}_{symbol}_{schedule_key}"
+                            
+                            jobs_by_combination[combination_key] = {
+                                'id': combination_key,
+                                'symbol': symbol,
+                                'expert_name': f"{expert_instance.expert}",
+                                'expert_instance_id': expert_instance.id,
+                                'job_type': job_type_display,
+                                'subtype': subtype.value,
+                                'weekdays': ', '.join(enabled_weekdays) if enabled_weekdays else 'None',
+                                'times': ', '.join(times) if times else 'Not specified',
+                                'expert_disabled': False
+                            }
                 
                 except Exception as e:
                     logger.error(f"Error processing schedule for expert instance {expert_instance.id}: {e}")
@@ -471,28 +486,30 @@ class ScheduledJobsTab:
             return []
 
     def run_analysis_now(self, event_data):
-        """Run analysis immediately for the selected expert and symbol."""
+        """Run analysis immediately for the selected expert and symbol with proper subtype."""
         try:
-            # Extract expert_instance_id and symbol from event data
+            # Extract expert_instance_id, symbol, and subtype from event data
             # NiceGUI passes GenericEventArguments with args attribute
-            if hasattr(event_data, 'args') and len(event_data.args) >= 2:
+            if hasattr(event_data, 'args') and len(event_data.args) >= 3:
                 expert_instance_id = int(event_data.args[0])
                 symbol = str(event_data.args[1])
-            elif isinstance(event_data, (list, tuple)) and len(event_data) >= 2:
+                subtype = str(event_data.args[2])
+            elif isinstance(event_data, (list, tuple)) and len(event_data) >= 3:
                 expert_instance_id = int(event_data[0])
                 symbol = str(event_data[1])
+                subtype = str(event_data[2])
             else:
                 logger.error(f"Invalid event data for run_analysis_now: {event_data}")
-                ui.notify("Invalid event data", type='negative')
+                ui.notify("Invalid event data - missing subtype", type='negative')
                 return
             
             from ...core.JobManager import get_job_manager
             job_manager = get_job_manager()
             
-            success = job_manager.submit_manual_analysis(expert_instance_id, symbol)
+            success = job_manager.submit_manual_analysis(expert_instance_id, symbol, subtype=subtype)
             
             if success:
-                ui.notify(f"Analysis started for {symbol} using expert instance {expert_instance_id}", type='positive')
+                ui.notify(f"Analysis started for {symbol} ({subtype}) using expert instance {expert_instance_id}", type='positive')
             else:
                 ui.notify("Analysis already pending for this symbol and expert", type='warning')
                 
