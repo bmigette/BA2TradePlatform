@@ -23,4 +23,4 @@ def settings_page() -> None:
 
 STATICPATH = Path(__file__).parent / 'static'
 FAVICO = (STATICPATH / 'favicon.ico')
-ui.run(title="BA2 Trade Platform", reload=True, favicon=FAVICO)
+ui.run(title="BA2 Trade Platform", reload=False, favicon=FAVICO)

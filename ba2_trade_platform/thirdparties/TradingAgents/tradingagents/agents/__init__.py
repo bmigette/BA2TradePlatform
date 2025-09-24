@@ -8,20 +8,7 @@ from .analysts.news_analyst import create_news_analyst
 from .analysts.social_media_analyst import create_social_media_analyst
 from .analysts.macro_analyst import create_macro_analyst
 
-# Try to import recommendation_agent, provide fallback if missing
-try:
-    from .analysts.recommendation_agent import create_recommendation_agent
-except ImportError:
-    # Create a fallback recommendation agent function
-    def create_recommendation_agent(*args, **kwargs):
-        """Fallback recommendation agent when module is missing"""
-        from .analysts.market_analyst import create_market_analyst
-        # Use market analyst as fallback since it's similar functionality
-        agent = create_market_analyst(*args, **kwargs)
-        # Modify the name to indicate it's a fallback
-        if hasattr(agent, 'name'):
-            agent.name = "Recommendation Agent (Fallback)"
-        return agent
+# NOTE: recommendation_agent.py is deprecated - Final Summarization Agent in graph handles this now
 
 from .researchers.bear_researcher import create_bear_researcher
 from .researchers.bull_researcher import create_bull_researcher
@@ -50,7 +37,6 @@ __all__ = [
     "create_macro_analyst",
     "create_neutral_debator",
     "create_news_analyst",
-    "create_recommendation_agent",
     "create_risky_debator",
     "create_risk_manager",
     "create_safe_debator",

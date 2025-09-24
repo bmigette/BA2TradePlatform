@@ -5,6 +5,7 @@ sqlmodel
 python-dotenv
 yahooquery
 APScheduler
+alembic
 
 # TradingAgents Tools
 typing-extensions

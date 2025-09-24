@@ -4,7 +4,7 @@ from openai import OpenAI
 
 
 class FinancialSituationMemory:
-    def __init__(self, name, config):
+    def __init__(self, name, config, symbol=None, market_analysis_id=None):
         if config["backend_url"] == "http://localhost:11434/v1":
             self.embedding = "nomic-embed-text"
         else:
@@ -19,7 +19,25 @@ class FinancialSituationMemory:
             
         self.client = OpenAI(base_url=config["backend_url"], api_key=api_key)
         self.chroma_client = chromadb.Client(Settings(allow_reset=True))
-        self.situation_collection = self.chroma_client.create_collection(name=name)
+        
+        # Create unique collection name to avoid collisions
+        if market_analysis_id and symbol:
+            collection_name = f"{name}_{symbol}_{market_analysis_id}"
+        elif symbol:
+            from datetime import datetime
+            date_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+            collection_name = f"{name}_{symbol}_{date_suffix}"
+        else:
+            # Fallback for backward compatibility
+            from datetime import datetime
+            date_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+            collection_name = f"{name}_{date_suffix}"
+        
+        # Try to get existing collection or create new one
+        try:
+            self.situation_collection = self.chroma_client.get_collection(name=collection_name)
+        except:
+            self.situation_collection = self.chroma_client.create_collection(name=collection_name)
 
     def get_embedding(self, text):
         """Get OpenAI embedding for a text"""

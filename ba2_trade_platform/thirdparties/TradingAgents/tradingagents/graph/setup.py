@@ -201,12 +201,19 @@ class GraphSetup:
             "Neutral Analyst",
             self.conditional_logic.should_continue_risk_analysis,
             {
-                "Risky Analyst": "Risky Analyst",
+                "Risky Analyst": "Risky Analyst",  
                 "Risk Judge": "Risk Judge",
             },
         )
 
-        workflow.add_edge("Risk Judge", END)
+        # Add Final Summarization Agent as the last step
+        from .summarization import create_final_summarization_agent
+        final_summarization_node = create_final_summarization_agent(self.quick_thinking_llm)
+        workflow.add_node("Final Summarization", final_summarization_node)
+        
+        # Connect Risk Judge to Final Summarization instead of END
+        workflow.add_edge("Risk Judge", "Final Summarization")
+        workflow.add_edge("Final Summarization", END)
 
         # Compile and return
         return workflow.compile()

@@ -14,7 +14,7 @@ from tqdm import tqdm
 import yfinance as yf
 from openai import OpenAI
 from .config import get_config, set_config, DATA_DIR
-
+from .. import logger as ta_logger
 
 def get_finnhub_news(
     ticker: Annotated[
@@ -736,7 +736,26 @@ def get_stock_news_openai(ticker, curr_date):
         store=True,
     )
 
-    return response.output[1].content[0].text
+    # Handle different response formats
+    try:
+        # Try accessing response content
+        if hasattr(response, 'output') and len(response.output) > 1:
+            if hasattr(response.output[1], 'content') and len(response.output[1].content) > 0:
+                return response.output[1].content[0].text
+        
+        # Try alternative response format
+        if hasattr(response, 'choices') and len(response.choices) > 0:
+            return response.choices[0].message.content
+        
+        # Try direct content access
+        if hasattr(response, 'content'):
+            return response.content
+        
+        # Fallback - convert response to string
+        return str(response)
+        
+    except Exception as e:
+        return f"Error parsing response: {str(e)} - Response: {str(response)}"
 
 
 def get_global_news_openai(curr_date):
@@ -773,7 +792,27 @@ def get_global_news_openai(curr_date):
         store=True,
     )
 
-    return response.output[1].content[0].text
+    # Handle different response formats
+    try:
+        ta_logger.debug(f"GLobal News OpenAI response: {response}")
+        # Try accessing response content
+        if hasattr(response, 'output') and len(response.output) > 1:
+            if hasattr(response.output[1], 'content') and len(response.output[1].content) > 0:
+                return response.output[1].content[0].text
+        
+        # Try alternative response format
+        if hasattr(response, 'choices') and len(response.choices) > 0:
+            return response.choices[0].message.content
+        
+        # Try direct content access
+        if hasattr(response, 'content'):
+            return response.content
+        
+        # Fallback - convert response to string
+        return str(response)
+        
+    except Exception as e:
+        return f"Error parsing response: {str(e)} - Response: {str(response)}"
 
 
 def get_fundamentals_openai(ticker, curr_date):
@@ -810,4 +849,24 @@ def get_fundamentals_openai(ticker, curr_date):
         store=True,
     )
 
-    return response.output[1].content[0].text
+    # Handle different response formats
+    try:
+        ta_logger.debug(f"Fundamentals OpenAI response: {response}")
+        # Try accessing response content
+        if hasattr(response, 'output') and len(response.output) > 1:
+            if hasattr(response.output[1], 'content') and len(response.output[1].content) > 0:
+                return response.output[1].content[0].text
+        
+        # Try alternative response format
+        if hasattr(response, 'choices') and len(response.choices) > 0:
+            return response.choices[0].message.content
+        
+        # Try direct content access
+        if hasattr(response, 'content'):
+            return response.content
+        
+        # Fallback - convert response to string
+        return str(response)
+        
+    except Exception as e:
+        return f"Error parsing response: {str(e)} - Response: {str(response)}"

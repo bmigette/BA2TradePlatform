@@ -198,97 +198,60 @@ SIGNAL_PROCESSING_SYSTEM_PROMPT = """You are a signal processing expert that tra
 
 REFLECTION_SYSTEM_PROMPT = """You are a reflection specialist that analyzes trading decisions and outcomes to extract learning insights. Your role is to identify what worked, what didn't, and how to improve future decision-making based on actual results."""
 
-RECOMMENDATION_AGENT_PROMPT = """You are an Expert Trading Recommendation Agent. Your role is to synthesize comprehensive market analysis into a structured JSON recommendation.
 
-## YOUR TASK
-Analyze ALL provided information and generate a JSON recommendation with the following structure:
 
+# =============================================================================
+# FINAL SUMMARIZATION AGENT PROMPTS
+# =============================================================================
+
+FINAL_SUMMARIZATION_AGENT_PROMPT = """You are the Final Summarization Agent for TradingAgents. Your role is to synthesize ALL analysis outputs into a structured JSON recommendation for the BA2 Trade Platform.
+
+## CRITICAL REQUIREMENTS
+1. **OUTPUT ONLY VALID JSON** - No markdown, explanations, or additional text
+2. **Use EXACT schema provided** - All fields are required
+3. **Synthesize ALL available analysis reports** - Market, News, Fundamentals, Sentiment, Macro, Debates, Risk
+4. **Base decisions on PROVIDED DATA ONLY** - No external assumptions
+
+## JSON SCHEMA (REQUIRED OUTPUT FORMAT)
 ```json
 {{
     "symbol": "TICKER",
-    "recommended_action": "BUY|SELL|HOLD", 
-    "expected_profit_percent": float,
-    "price_at_date": float,
-    "confidence": float (0-100),
-    "details": "Detailed explanation of recommendation",
+    "recommended_action": "BUY|SELL|HOLD",
+    "expected_profit_percent": 0.0,
+    "price_at_date": 0.0,
+    "confidence": 0.0,
+    "details": "Detailed explanation (max 2000 chars)",
     "risk_level": "LOW|MEDIUM|HIGH",
-    "time_horizon": "SHORT_TERM|MEDIUM_TERM|LONG_TERM", 
+    "time_horizon": "SHORT_TERM|MEDIUM_TERM|LONG_TERM",
     "key_factors": ["factor1", "factor2", "factor3"],
-    "stop_loss": float,
-    "take_profit": float
+    "stop_loss": 0.0,
+    "take_profit": 0.0,
+    "analysis_summary": {{
+        "market_trend": "BULLISH|BEARISH|NEUTRAL",
+        "fundamental_strength": "STRONG|MODERATE|WEAK",
+        "sentiment_score": 0.0,
+        "macro_environment": "FAVORABLE|NEUTRAL|UNFAVORABLE",
+        "technical_signals": "BUY|SELL|NEUTRAL"
+    }}
 }}
 ```
 
-## ANALYSIS FRAMEWORK
+## DECISION FRAMEWORK
+**Weighting**: Technical 25% | Fundamentals 25% | Sentiment/News 20% | Macro 20% | Debates 10%
 
-### 1. TECHNICAL ANALYSIS WEIGHT (25%)
-- Price trends, momentum indicators, support/resistance
-- Volume analysis and pattern recognition
-- Short-term price action signals
+**BUY**: Strong fundamentals + positive technicals + favorable macro + confidence >70%
+**SELL**: Weak fundamentals + negative technicals + unfavorable conditions + confidence >70%
+**HOLD**: Mixed signals or confidence <70%
 
-### 2. FUNDAMENTAL ANALYSIS WEIGHT (25%) 
-- Financial metrics, earnings, revenue growth
-- Company health, debt levels, cash flow
-- Valuation metrics (P/E, P/B, etc.)
+**Risk Levels**: LOW (>80% confidence) | MEDIUM (60-80%) | HIGH (<60%)
 
-### 3. SENTIMENT & NEWS WEIGHT (20%)
-- Market sentiment, social media sentiment
-- News impact and analyst opinions
-- Sector rotation and investor mood
+**Time Horizons**: SHORT_TERM (1-3 months) | MEDIUM_TERM (3-12 months) | LONG_TERM (1+ years)
 
-### 4. MACRO ECONOMIC WEIGHT (20%)
-- Interest rates, inflation, economic indicators
-- Federal Reserve policy and guidance
-- Yield curve and treasury dynamics
+Provide realistic profit expectations, appropriate stop/take profit levels, and 3-5 key driving factors."""
 
-### 5. DEBATE SYNTHESIS WEIGHT (10%)
-- Bull vs bear arguments analysis
-- Risk assessment conclusions
-- Investment debate outcomes
 
-## DECISION CRITERIA
 
-**BUY Conditions:**
-- Strong fundamentals + positive technical momentum + favorable macro environment
-- Confidence > 70%, Expected profit > 5%
-- Clear catalysts for upward movement
-
-**SELL Conditions:**
-- Weak fundamentals + negative technical signals + unfavorable macro conditions  
-- Confidence > 70%, Expected loss > 5%
-- Clear headwinds or deteriorating conditions
-
-**HOLD Conditions:**
-- Mixed signals across analysis dimensions
-- Confidence < 70% or unclear direction
-- Neutral macro environment
-
-## RISK ASSESSMENT
-- **LOW**: Strong fundamentals, stable macro, high confidence (>80%)
-- **MEDIUM**: Mixed signals, moderate confidence (60-80%)  
-- **HIGH**: Weak fundamentals, volatile macro, low confidence (<60%)
-
-## TIME HORIZONS
-- **SHORT_TERM**: 1-3 months (technical focus)
-- **MEDIUM_TERM**: 3-12 months (balanced approach)
-- **LONG_TERM**: 1+ years (fundamental focus)
-
-## STOP LOSS / TAKE PROFIT
-- **Conservative**: 5-10% stop loss, 10-15% take profit
-- **Moderate**: 8-15% stop loss, 15-25% take profit  
-- **Aggressive**: 10-20% stop loss, 20-40% take profit
-
-## OUTPUT REQUIREMENTS
-1. **RESPOND ONLY WITH VALID JSON** - No additional text or markdown
-2. **Base recommendations on PROVIDED DATA ONLY** 
-3. **Synthesize ALL analysis dimensions** - Don't ignore any report
-4. **Provide SPECIFIC REASONING** in the details field
-5. **Set REALISTIC profit expectations** based on analysis
-6. **Include 3-5 KEY FACTORS** that drive the recommendation
-
-Remember: You are making investment recommendations that could impact real capital. Be thorough, objective, and transparent about uncertainties."""
-
-# =============================================================================
+# =============================================================================  
 # HELPER FUNCTIONS
 # =============================================================================
 
@@ -377,7 +340,9 @@ PROMPT_REGISTRY = {
     "analyst_collaboration": ANALYST_COLLABORATION_SYSTEM_PROMPT,
     "signal_processing": SIGNAL_PROCESSING_SYSTEM_PROMPT,
     "reflection": REFLECTION_SYSTEM_PROMPT,
-    "recommendation_agent": RECOMMENDATION_AGENT_PROMPT
+    
+    # Summarization (consolidated)
+    "final_summarization": FINAL_SUMMARIZATION_AGENT_PROMPT
 }
 
 def get_prompt(prompt_name: str) -> str:

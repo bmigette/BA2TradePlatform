@@ -3,37 +3,10 @@ Database utilities for storing TradingAgents analysis outputs
 """
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone
+from . import logger as ta_logger
 
 
-def create_market_analysis(symbol: str, source_expert_instance_id: int, status: str = "started", state: Dict[str, Any] = None) -> Optional[int]:
-    """
-    Create a new MarketAnalysis record
-    
-    Args:
-        symbol: Stock symbol being analyzed
-        source_expert_instance_id: ID of the expert instance running the analysis
-        status: Current status of the analysis
-        state: Analysis state data
-        
-    Returns:
-        MarketAnalysis ID if successful, None if failed
-    """
-    try:
-        from ba2_trade_platform.core.db import add_instance
-        from ba2_trade_platform.core.models import MarketAnalysis
-        
-        analysis = MarketAnalysis(
-            symbol=symbol,
-            source_expert_instance_id=source_expert_instance_id,
-            status=status,
-            state=state or {}
-        )
-        
-        return add_instance(analysis)
-    except Exception as e:
-        from . import logger as ta_logger
-        ta_logger.error(f"Error creating MarketAnalysis: {e}")
-        return None
+
 
 
 def update_market_analysis_status(analysis_id: int, status: str, state: Dict[str, Any] = None):
@@ -56,7 +29,6 @@ def update_market_analysis_status(analysis_id: int, status: str, state: Dict[str
                 analysis.state.update(state)
             update_instance(analysis)
     except Exception as e:
-        from . import logger as ta_logger
         ta_logger.error(f"Error updating MarketAnalysis {analysis_id}: {e}")
 
 
@@ -88,7 +60,6 @@ def store_analysis_output(market_analysis_id: int, name: str, output_type: str, 
         
         return add_instance(output)
     except Exception as e:
-        from . import logger as ta_logger
         ta_logger.error(f"Error storing AnalysisOutput: {e}")
         return None
 
@@ -165,7 +136,6 @@ def get_market_analysis_outputs(analysis_id: int):
             statement = select(AnalysisOutput).where(AnalysisOutput.market_analysis_id == analysis_id)
             return session.exec(statement).all()
     except Exception as e:
-        from . import logger as ta_logger
         ta_logger.error(f"Error retrieving outputs for MarketAnalysis {analysis_id}: {e}")
         return []
 
@@ -178,17 +148,6 @@ class DatabaseStorageMixin:
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.market_analysis_id = None
-        self.expert_instance_id = None
-    
-    def initialize_market_analysis(self, symbol: str, expert_instance_id: int):
-        """Initialize a new MarketAnalysis for this run"""
-        self.expert_instance_id = expert_instance_id
-        self.market_analysis_id = create_market_analysis(
-            symbol=symbol,
-            source_expert_instance_id=expert_instance_id,
-            status="running"
-        )
-        return self.market_analysis_id
     
     def log_tool_call(self, tool_name: str, inputs: Dict[str, Any], output: str, agent_type: str = "unknown"):
         """Log a tool call to the database"""
@@ -200,6 +159,9 @@ class DatabaseStorageMixin:
                 output=str(output),
                 agent_type=agent_type
             )
+        else:
+            # Log to console if no market analysis available
+            ta_logger.info(f"[{agent_type}] Tool call: {tool_name}({inputs}) -> {output}")
     
     def log_agent_report(self, agent_type: str, report_content: str):
         """Log an agent report to the database"""
@@ -209,6 +171,9 @@ class DatabaseStorageMixin:
                 agent_type=agent_type,
                 report_content=report_content
             )
+        else:
+            # Log to console if no market analysis available
+            ta_logger.info(f"[{agent_type}] Report: {report_content}")
     
     def store_analysis_output(self, market_analysis_id: int, name: str, output_type: str, text: str = None, blob: bytes = None):
         """
@@ -230,7 +195,13 @@ class DatabaseStorageMixin:
         """Update the analysis status"""
         if self.market_analysis_id:
             update_market_analysis_status(self.market_analysis_id, status, state)
+        else:
+            # Log to console if no market analysis available
+            ta_logger.info(f"Analysis status: {status}" + (f" - {state}" if state else ""))
     
     def finalize_analysis(self, final_status: str = "completed"):
         """Mark the analysis as completed"""
-        self.update_analysis_status(final_status)
+        if self.market_analysis_id:
+            self.update_analysis_status(final_status)
+        else:
+            ta_logger.info(f"Analysis completed with status: {final_status}")

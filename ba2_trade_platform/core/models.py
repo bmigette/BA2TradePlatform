@@ -1,7 +1,7 @@
 from sqlmodel import  Field, Session, SQLModel, create_engine, Column, Relationship
 from sqlalchemy import String, Float, JSON, UniqueConstraint, Table, Integer, ForeignKey
 from typing import Optional, Dict, Any, List
-from .types import InstrumentType, MarketAnalysisStatus, OrderStatus, OrderDirection, ExpertEventRuleType
+from .types import InstrumentType, MarketAnalysisStatus, OrderRecommendation, OrderStatus, OrderDirection, ExpertEventRuleType, RiskLevel, TimeHorizon
 from datetime import datetime as DateTime, timezone
 
 # Association table for many-to-many relationship between Ruleset and EventAction
@@ -80,13 +80,19 @@ class EventAction(SQLModel, table=True):
 class ExpertRecommendation(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     instance_id: int = Field(foreign_key="expertinstance.id", nullable=False, ondelete="CASCADE")
+    market_analysis_id: int | None = Field(foreign_key="marketanalysis.id", nullable=True, ondelete="CASCADE")
     symbol: str
-    recommended_action: OrderDirection
+    recommended_action: OrderRecommendation
     expected_profit_percent: float
     price_at_date: float
     details: str | None
     confidence: float | None
+    risk_level: RiskLevel = Field(description="LOW|MEDIUM|HIGH")
+    time_horizon: TimeHorizon = Field(description="SHORT_TERM|MEDIUM_TERM|LONG_TERM")
     created_at: DateTime | None = Field(default_factory=lambda: DateTime.now(timezone.utc))
+    
+    # Relationship back to market analysis
+    market_analysis: Optional["MarketAnalysis"] = Relationship(back_populates="expert_recommendations")
 
 
 class MarketAnalysis(SQLModel, table=True):
@@ -98,8 +104,9 @@ class MarketAnalysis(SQLModel, table=True):
     state: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict)
     created_at: DateTime | None = Field(default_factory=lambda: DateTime.now(timezone.utc))
     
-    # Relationship to analysis outputs
+    # Relationships
     analysis_outputs: List["AnalysisOutput"] = Relationship(back_populates="market_analysis")
+    expert_recommendations: List["ExpertRecommendation"] = Relationship(back_populates="market_analysis")
 
 
 class AnalysisOutput(SQLModel, table=True):
@@ -129,7 +136,7 @@ class TradingOrder(SQLModel, table=True):
     status: OrderStatus = OrderStatus.UNKNOWN
     filled_qty: float | None
     client_order_id: str | None
-    created_at: DateTime | None = Field(default_factory=DateTime.utcnow)
+    created_at: DateTime | None = Field(default_factory=lambda: DateTime.now(timezone.utc))
 
     def as_string(self) -> str:
         return f"Order(id={self.id}, symbol={self.symbol}, quantity={self.quantity}, side={self.side}, type={self.order_type}, status={self.status})"

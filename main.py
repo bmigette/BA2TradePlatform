@@ -3,7 +3,10 @@ from ba2_trade_platform.core.WorkerQueue import initialize_worker_queue
 from ba2_trade_platform.core.JobManager import get_job_manager
 from ba2_trade_platform.logger import logger
 
-if __name__ in {"__main__", "__mp_main__"}:
+def initialize_system():
+    """Initialize the system components."""
+    logger.info("Initializing BA2 Trade Platform...")
+    
     # Initialize database
     init_db()
 
@@ -19,6 +22,11 @@ if __name__ in {"__main__", "__mp_main__"}:
     # Initialize worker queue system
     logger.info("Initializing worker queue system...")
     initialize_worker_queue()
+    
+    logger.info("BA2 Trade Platform initialization complete")
 
+if __name__ in {"__main__", "__mp_main__"}:
+    initialize_system()
+    
     # Start the UI
     import ba2_trade_platform.ui.main

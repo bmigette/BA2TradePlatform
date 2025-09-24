@@ -25,7 +25,23 @@ class OrderType(str, Enum):
 class OrderDirection(str, Enum):
     SELL = "sell"
     BUY = "buy"
-    
+
+class OrderRecommendation(str, Enum):
+    SELL = "SELL"
+    BUY = "BUY"
+    HOLD = "HOLD"
+    ERROR = "ERROR"
+
+class RiskLevel(str, Enum):
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+
+class TimeHorizon(str, Enum):
+    SHORT_TERM = "SHORT_TERM"
+    MEDIUM_TERM = "MEDIUM_TERM"
+    LONG_TERM = "LONG_TERM"
+
 class ExpertEventRuleType(str, Enum):
     TRADING_RECOMMENDATION_RULE = "trading_recommendation_rule"
     

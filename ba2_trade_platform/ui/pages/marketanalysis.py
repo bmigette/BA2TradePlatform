@@ -11,10 +11,16 @@ from ...logger import logger
 
 class JobMonitoringTab:
     def __init__(self):
-        self.worker_queue = get_worker_queue()
+        self.worker_queue = None  # Lazy initialization
         self.analysis_table = None
         self.refresh_timer = None
         self.render()
+    
+    def _get_worker_queue(self):
+        """Lazy initialization of worker queue."""
+        if self.worker_queue is None:
+            self.worker_queue = get_worker_queue()
+        return self.worker_queue
 
     def render(self):
         with ui.card().classes('w-full'):
@@ -136,10 +142,11 @@ class JobMonitoringTab:
     def _get_queue_info(self) -> dict:
         """Get worker queue information."""
         try:
-            worker_count = self.worker_queue.get_worker_count()
-            running_tasks = len([t for t in self.worker_queue.get_all_tasks() if t.status == WorkerTaskStatus.RUNNING])
-            pending_tasks = len([t for t in self.worker_queue.get_all_tasks() if t.status == WorkerTaskStatus.PENDING])
-            total_tasks = len(self.worker_queue.get_all_tasks())
+            worker_queue = self._get_worker_queue()
+            worker_count = worker_queue.get_worker_count()
+            running_tasks = len([t for t in worker_queue.get_all_tasks() if t.status == WorkerTaskStatus.RUNNING])
+            pending_tasks = len([t for t in worker_queue.get_all_tasks() if t.status == WorkerTaskStatus.PENDING])
+            total_tasks = len(worker_queue.get_all_tasks())
             
             return {
                 'worker_count': worker_count,
@@ -156,9 +163,20 @@ class JobMonitoringTab:
                 'total_tasks': 0
             }
 
-    def cancel_analysis(self, analysis_id: int):
+    def cancel_analysis(self, event_data):
         """Cancel an analysis job."""
         try:
+            # Extract analysis_id from event data
+            # NiceGUI passes GenericEventArguments with args attribute
+            if hasattr(event_data, 'args') and len(event_data.args) > 0:
+                analysis_id = int(event_data.args[0])
+            elif isinstance(event_data, int):
+                analysis_id = event_data
+            else:
+                logger.error(f"Invalid event data for cancel_analysis: {event_data}")
+                ui.notify("Invalid event data", type='negative')
+                return
+            
             # Get the market analysis
             analysis = get_instance(MarketAnalysis, analysis_id)
             if not analysis:
@@ -170,7 +188,7 @@ class JobMonitoringTab:
                 return
             
             # Try to cancel the task in the worker queue
-            success = self.worker_queue.cancel_analysis_task(analysis.source_expert_instance_id, analysis.symbol)
+            success = self._get_worker_queue().cancel_analysis_task(analysis.source_expert_instance_id, analysis.symbol)
             
             if success:
                 # Update the analysis status
@@ -187,9 +205,20 @@ class JobMonitoringTab:
             logger.error(f"Error cancelling analysis {analysis_id}: {e}")
             ui.notify(f"Error cancelling analysis: {str(e)}", type='negative')
 
-    def view_analysis_results(self, analysis_id: int):
+    def view_analysis_results(self, event_data):
         """View analysis results in a dialog."""
         try:
+            # Extract analysis_id from event data
+            # NiceGUI passes GenericEventArguments with args attribute
+            if hasattr(event_data, 'args') and len(event_data.args) > 0:
+                analysis_id = int(event_data.args[0])
+            elif isinstance(event_data, int):
+                analysis_id = event_data
+            else:
+                logger.error(f"Invalid event data for view_analysis_results: {event_data}")
+                ui.notify("Invalid event data", type='negative')
+                return
+            
             analysis = get_instance(MarketAnalysis, analysis_id)
             if not analysis:
                 ui.notify("Analysis not found", type='negative')
@@ -503,7 +532,7 @@ class ScheduledJobsTab:
                 self.scheduled_jobs_table.rows = self._get_scheduled_jobs_data()
                 self.scheduled_jobs_table.update()
             
-            logger.debug("Scheduled jobs data refreshed")
+            #logger.debug("Scheduled jobs data refreshed")
             
         except Exception as e:
             logger.error(f"Error refreshing scheduled jobs data: {e}")
