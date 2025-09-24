@@ -1,5 +1,5 @@
 from nicegui import ui
-from .pages import overview, settings, marketanalysis
+from .pages import overview, settings, marketanalysis, market_analysis_detail
 from .layout import layout_render
 from pathlib import Path
 
@@ -20,6 +20,11 @@ def marketanalysis_page() -> None:
 def settings_page() -> None:
     with layout_render('Settings'):
         settings.content()
+
+@ui.page('/market_analysis/{analysis_id}')
+def market_analysis_detail_page(analysis_id: int) -> None:
+    with layout_render(f'Market Analysis Detail'):
+        market_analysis_detail.content(analysis_id)
 
 STATICPATH = Path(__file__).parent / 'static'
 FAVICO = (STATICPATH / 'favicon.ico')

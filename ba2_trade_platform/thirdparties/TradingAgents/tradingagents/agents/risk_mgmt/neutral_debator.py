@@ -36,11 +36,18 @@ Engage actively by analyzing both sides critically, addressing weaknesses in the
 
         argument = f"Neutral Analyst: {response.content}"
 
+        # Store neutral messages as a list for proper conversation display
+        neutral_messages = risk_debate_state.get("neutral_messages", [])
+        neutral_messages.append(argument)
+
         new_risk_debate_state = {
             "history": history + "\n" + argument,
             "risky_history": risk_debate_state.get("risky_history", ""),
+            "risky_messages": risk_debate_state.get("risky_messages", []),
             "safe_history": risk_debate_state.get("safe_history", ""),
+            "safe_messages": risk_debate_state.get("safe_messages", []),
             "neutral_history": neutral_history + "\n" + argument,
+            "neutral_messages": neutral_messages,
             "latest_speaker": "Neutral",
             "current_risky_response": risk_debate_state.get(
                 "current_risky_response", ""
@@ -48,6 +55,7 @@ Engage actively by analyzing both sides critically, addressing weaknesses in the
             "current_safe_response": risk_debate_state.get("current_safe_response", ""),
             "current_neutral_response": argument,
             "count": risk_debate_state["count"] + 1,
+            "judge_decision": risk_debate_state.get("judge_decision", "")
         }
 
         return {"risk_debate_state": new_risk_debate_state}

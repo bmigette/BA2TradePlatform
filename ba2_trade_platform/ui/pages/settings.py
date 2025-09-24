@@ -873,6 +873,14 @@ class ExpertSettingsTab:
                         with ui.row().classes('w-full gap-4'):
                             self.enable_buy_checkbox = ui.checkbox('Enable BUY orders', value=True)
                             self.enable_sell_checkbox = ui.checkbox('Enable SELL orders', value=False)
+                        
+                        ui.separator().classes('my-4')
+                        
+                        # Automatic trading setting
+                        ui.label('Automatic Trading:').classes('text-subtitle2 mb-2')
+                        ui.label('Enable automatic order execution based on expert recommendations:').classes('text-body2 mb-2')
+                        
+                        self.automatic_trading_checkbox = ui.checkbox('Enable automatic trading', value=True)
                     
                     # Instruments tab
                     with ui.tab_panel('Instruments'):
@@ -1141,13 +1149,16 @@ class ExpertSettingsTab:
             # Load trading permissions
             enable_buy = expert.settings.get('enable_buy', True)  # Default to True
             enable_sell = expert.settings.get('enable_sell', False)  # Default to False
+            automatic_trading = expert.settings.get('automatic_trading', True)  # Default to True
             
             if hasattr(self, 'enable_buy_checkbox'):
                 self.enable_buy_checkbox.value = enable_buy
             if hasattr(self, 'enable_sell_checkbox'):
                 self.enable_sell_checkbox.value = enable_sell
+            if hasattr(self, 'automatic_trading_checkbox'):
+                self.automatic_trading_checkbox.value = automatic_trading
                 
-            logger.debug(f'Loaded general settings for expert {expert_instance.id}: schedule={schedule_config}, buy={enable_buy}, sell={enable_sell}')
+            logger.debug(f'Loaded general settings for expert {expert_instance.id}: schedule={schedule_config}, buy={enable_buy}, sell={enable_sell}, automatic={automatic_trading}')
             
         except Exception as e:
             logger.error(f'Error loading general settings for expert {expert_instance.id}: {e}', exc_info=True)
@@ -1304,10 +1315,11 @@ class ExpertSettingsTab:
             expert.save_setting('execution_schedule', schedule_config, setting_type="json")
             logger.debug(f'Saved execution schedule: {schedule_config}')
         
-        if hasattr(self, 'enable_buy_checkbox') and hasattr(self, 'enable_sell_checkbox'):
+        if hasattr(self, 'enable_buy_checkbox') and hasattr(self, 'enable_sell_checkbox') and hasattr(self, 'automatic_trading_checkbox'):
             expert.save_setting('enable_buy', self.enable_buy_checkbox.value, setting_type="bool")
             expert.save_setting('enable_sell', self.enable_sell_checkbox.value, setting_type="bool")
-            logger.debug(f'Saved trading permissions: buy={self.enable_buy_checkbox.value}, sell={self.enable_sell_checkbox.value}')
+            expert.save_setting('automatic_trading', self.automatic_trading_checkbox.value, setting_type="bool")
+            logger.debug(f'Saved trading permissions: buy={self.enable_buy_checkbox.value}, sell={self.enable_sell_checkbox.value}, automatic={self.automatic_trading_checkbox.value}')
         
         # Save expert-specific settings
         if hasattr(self, 'expert_settings_inputs') and self.expert_settings_inputs:

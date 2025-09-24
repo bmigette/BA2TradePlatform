@@ -42,12 +42,19 @@ def create_bear_researcher(llm, memory):
 
         argument = f"Bear Analyst: {response.content}"
 
+        # Store bear messages as a list for proper conversation display
+        bear_messages = investment_debate_state.get("bear_messages", [])
+        bear_messages.append(argument)
+
         new_investment_debate_state = {
             "history": history + "\n" + argument,
             "bear_history": bear_history + "\n" + argument,
+            "bear_messages": bear_messages,
             "bull_history": investment_debate_state.get("bull_history", ""),
+            "bull_messages": investment_debate_state.get("bull_messages", []),
             "current_response": argument,
             "count": investment_debate_state["count"] + 1,
+            "judge_decision": investment_debate_state.get("judge_decision", "")
         }
 
         return {"investment_debate_state": new_investment_debate_state}

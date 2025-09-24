@@ -3,7 +3,7 @@
 import os
 from pathlib import Path
 import json
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Dict, Any, Tuple, List, Optional
 
 from langchain_openai import ChatOpenAI
@@ -30,7 +30,7 @@ from .reflection import Reflector
 from .signal_processing import SignalProcessor
 
 # Import our new modules
-from ..db_storage import DatabaseStorageMixin
+from ..db_storage import DatabaseStorageMixin, update_market_analysis_status
 from .. import logger as ta_logger
 
 
@@ -138,10 +138,92 @@ class TradingAgentsGraph(DatabaseStorageMixin):
 
         ta_logger.info("TradingAgentsGraph initialization completed")
 
+    def _sync_state_to_market_analysis(self, graph_state: Dict[str, Any], step_name: str = None):
+        """Synchronize current graph state to MarketAnalysis database record.
+        
+        Args:
+            graph_state: Current state of the TradingAgents graph
+            step_name: Optional name of the current step/stage for context
+        """
+        if not self.market_analysis_id:
+            return
+            
+        try:
+            # Create a clean state snapshot for database storage
+            state_snapshot = {
+                'current_step': step_name or 'unknown',
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'messages_count': len(graph_state.get('messages', [])),
+                'ticker': getattr(self, 'ticker', None)
+            }
+            
+            # Add key state information (avoid storing large message content)
+            for key, value in graph_state.items():
+                if key == 'messages':
+                    # Store message count and types instead of full content
+                    state_snapshot['message_types'] = [msg.__class__.__name__ for msg in value] if value else []
+                elif key in ['expert_recommendation', 'final_trade_decision', 'risk_assessment']:
+                    # Store important decision states
+                    state_snapshot[key] = value
+                elif key in ['investment_debate_state', 'risk_debate_state']:
+                    # Always store debate states with their message lists - these are crucial for UI display
+                    if isinstance(value, dict):
+                        if key == 'investment_debate_state':
+                            state_snapshot[key] = {
+                                'bull_history': value.get('bull_history', ''),
+                                'bear_history': value.get('bear_history', ''),
+                                'bull_messages': value.get('bull_messages', []),
+                                'bear_messages': value.get('bear_messages', []),
+                                'history': value.get('history', ''),
+                                'current_response': value.get('current_response', ''),
+                                'judge_decision': value.get('judge_decision', ''),
+                                'count': value.get('count', 0)
+                            }
+                        elif key == 'risk_debate_state':
+                            state_snapshot[key] = {
+                                'risky_history': value.get('risky_history', ''),
+                                'safe_history': value.get('safe_history', ''),
+                                'neutral_history': value.get('neutral_history', ''),
+                                'risky_messages': value.get('risky_messages', []),
+                                'safe_messages': value.get('safe_messages', []),
+                                'neutral_messages': value.get('neutral_messages', []),
+                                'history': value.get('history', ''),
+                                'judge_decision': value.get('judge_decision', ''),
+                                'count': value.get('count', 0),
+                                'latest_speaker': value.get('latest_speaker', ''),
+                                'current_risky_response': value.get('current_risky_response', ''),
+                                'current_safe_response': value.get('current_safe_response', ''),
+                                'current_neutral_response': value.get('current_neutral_response', '')
+                            }
+                    else:
+                        state_snapshot[key] = value
+                elif isinstance(value, (str, int, float, bool, type(None))):
+                    # Store simple types directly
+                    state_snapshot[key] = value
+                elif isinstance(value, (dict, list)) and len(str(value)) < 1000:
+                    # Store small complex objects
+                    state_snapshot[key] = value
+            
+            # Update MarketAnalysis state using the proper merging function
+            from ba2_trade_platform.core.types import MarketAnalysisStatus
+            update_market_analysis_status(
+                analysis_id=self.market_analysis_id,
+                status=MarketAnalysisStatus.RUNNING,  # Keep status as running during execution
+                state=state_snapshot
+            )
+            
+            ta_logger.debug(f"Synced graph state to MarketAnalysis {self.market_analysis_id} at step: {step_name}")
+            
+        except Exception as e:
+            ta_logger.error(f"Failed to sync state to MarketAnalysis {self.market_analysis_id}: {e}")
+
     def _create_tool_nodes(self) -> Dict[str, ToolNode]:
         """Create tool nodes for different data sources."""
+        # Import LoggingToolNode for database logging
+        from ..db_storage import LoggingToolNode
+        
         return {
-            "market": ToolNode(
+            "market": LoggingToolNode(
                 [
                     # online tools
                     self.toolkit.get_YFin_data_online,
@@ -149,17 +231,19 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                     # offline tools
                     self.toolkit.get_YFin_data,
                     self.toolkit.get_stockstats_indicators_report,
-                ]
+                ],
+                self.market_analysis_id
             ),
-            "social": ToolNode(
+            "social": LoggingToolNode(
                 [
                     # online tools
                     self.toolkit.get_stock_news_openai,
                     # offline tools
                     self.toolkit.get_reddit_stock_info,
-                ]
+                ],
+                self.market_analysis_id
             ),
-            "news": ToolNode(
+            "news": LoggingToolNode(
                 [
                     # online tools
                     self.toolkit.get_global_news_openai,
@@ -167,9 +251,10 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                     # offline tools
                     self.toolkit.get_finnhub_news,
                     self.toolkit.get_reddit_news,
-                ]
+                ],
+                self.market_analysis_id
             ),
-            "fundamentals": ToolNode(
+            "fundamentals": LoggingToolNode(
                 [
                     # online tools
                     self.toolkit.get_fundamentals_openai,
@@ -179,9 +264,10 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                     self.toolkit.get_simfin_balance_sheet,
                     self.toolkit.get_simfin_cashflow,
                     self.toolkit.get_simfin_income_stmt,
-                ]
+                ],
+                self.market_analysis_id
             ),
-            "macro": ToolNode(
+            "macro": LoggingToolNode(
                 [
                     # FRED economic data tools
                     self.toolkit.get_fred_series_data,
@@ -189,7 +275,8 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                     self.toolkit.get_treasury_yield_curve,
                     self.toolkit.get_inflation_data,
                     self.toolkit.get_employment_data,
-                ]
+                ],
+                self.market_analysis_id
             ),
         }
 
@@ -244,17 +331,24 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             company_name, trade_date
         )
         args = self.propagator.get_graph_args()
+        
+        # Sync initial state to MarketAnalysis
+        self._sync_state_to_market_analysis(init_agent_state, "initialization")
 
         try:
             if self.debug:
                 # Debug mode with tracing
                 trace = []
+                step_count = 0
                 for chunk in self.graph.stream(init_agent_state, **args):
                     if len(chunk["messages"]) == 0:
                         pass
                     else:
                         chunk["messages"][-1].pretty_print()
                         trace.append(chunk)
+                        step_count += 1
+                        # Sync state after each step in debug mode
+                        self._sync_state_to_market_analysis(chunk, f"debug_step_{step_count}")
 
                 final_state = trace[-1]
             else:
@@ -263,6 +357,9 @@ class TradingAgentsGraph(DatabaseStorageMixin):
 
             # Store current state for reflection
             self.curr_state = final_state
+            
+            # Sync final state to MarketAnalysis
+            self._sync_state_to_market_analysis(final_state, "completion")
 
             # Handle expert recommendation - now generated by the Final Summarization agent in the graph
             if self.market_analysis_id:
@@ -286,6 +383,14 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         except Exception as e:
             ta_logger.error(f"Error during analysis for {company_name}: {str(e)}")
             if self.market_analysis_id:
+                # Sync error state to MarketAnalysis
+                error_state = {
+                    "error": str(e),
+                    "error_timestamp": datetime.now(timezone.utc).isoformat(),
+                    "failed_step": "execution",
+                    "ticker": company_name
+                }
+                self._sync_state_to_market_analysis(error_state, "error")
                 self.update_analysis_status("failed", {"error": str(e)})
             raise
 
@@ -463,6 +568,8 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             "investment_debate_state": {
                 "bull_history": final_state["investment_debate_state"]["bull_history"],
                 "bear_history": final_state["investment_debate_state"]["bear_history"],
+                "bull_messages": final_state["investment_debate_state"].get("bull_messages", []),
+                "bear_messages": final_state["investment_debate_state"].get("bear_messages", []),
                 "history": final_state["investment_debate_state"]["history"],
                 "current_response": final_state["investment_debate_state"][
                     "current_response"
@@ -470,14 +577,20 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                 "judge_decision": final_state["investment_debate_state"][
                     "judge_decision"
                 ],
+                "count": final_state["investment_debate_state"].get("count", 0),
             },
             "trader_investment_decision": final_state["trader_investment_plan"],
             "risk_debate_state": {
                 "risky_history": final_state["risk_debate_state"]["risky_history"],
                 "safe_history": final_state["risk_debate_state"]["safe_history"],
                 "neutral_history": final_state["risk_debate_state"]["neutral_history"],
+                "risky_messages": final_state["risk_debate_state"].get("risky_messages", []),
+                "safe_messages": final_state["risk_debate_state"].get("safe_messages", []),
+                "neutral_messages": final_state["risk_debate_state"].get("neutral_messages", []),
                 "history": final_state["risk_debate_state"]["history"],
                 "judge_decision": final_state["risk_debate_state"]["judge_decision"],
+                "count": final_state["risk_debate_state"].get("count", 0),
+                "latest_speaker": final_state["risk_debate_state"].get("latest_speaker", ""),
             },
             "investment_plan": final_state["investment_plan"],
             "final_trade_decision": final_state["final_trade_decision"],

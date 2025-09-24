@@ -229,6 +229,10 @@ class JobManager:
                             'cleanup_timestamp': datetime.now().isoformat()
                         })
                         
+                        # Explicitly mark the state field as modified for SQLAlchemy
+                        from sqlalchemy.orm import attributes
+                        attributes.flag_modified(analysis, "state")
+                        
                         session.add(analysis)
                         logger.debug(f"Marked analysis {analysis.id} (symbol: {analysis.symbol}) as failed")
                     

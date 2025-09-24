@@ -12,17 +12,34 @@ A sophisticated Python-based algorithmic trading platform featuring AI-driven ma
 - **Centralized Logging**: Comprehensive logging with file rotation and colored output
 
 ### AI Trading Agents
+- **Multiple Expert Support**: Extensible plugin architecture supporting multiple expert types (currently TradingAgents)
+- **Parallel Market Analysis**: Simultaneous analysis across multiple symbols for efficient processing
 - **Multi-Agent Analysis**: Market, news, fundamentals, social media, and macro-economic analysts
 - **TradingAgents Integration**: Advanced multi-agent LLM framework for financial trading
 - **FRED API Integration**: Real-time macroeconomic data analysis
 - **Debate-Based Decision Making**: Bull vs bear researcher debates with research manager oversight
 - **Risk Management**: Multi-layered risk analysis and management
 
+### Trading Modes & Risk Management
+- **Semi-Automatic Trading**: Human approval required for trade execution
+- **Full Automatic Trading**: Autonomous trading based on AI recommendations
+- **Virtual Equity Management**: Split account balance across multiple experts to limit individual risk
+- **Expert-Level Risk Controls**: Configurable risk limits per expert instance
+- **Portfolio Diversification**: Automatic allocation management across different strategies
+
 ### Market Data & APIs
 - **Multiple Data Sources**: Alpaca, Finnhub, SimFin, Yahoo Finance, FRED
 - **Real-Time & Historical Data**: Comprehensive market data coverage
 - **Economic Indicators**: Inflation, employment, treasury yields, economic calendar
 - **Social Sentiment**: Reddit and social media sentiment analysis
+
+### Trading Features
+- **Multi-Expert Support**: Run multiple AI experts simultaneously with individual risk management
+- **Parallel Symbol Analysis**: Analyze multiple instruments concurrently for faster decision-making
+- **Automated Trade Execution**: Semi-automatic (manual approval) or fully automatic trading modes
+- **Virtual Account Splitting**: Allocate portions of your account to different experts to limit exposure
+- **Risk-Based Position Sizing**: Dynamic position sizing based on expert confidence and risk assessment
+- **Expert Performance Tracking**: Monitor and compare performance across different expert strategies
 
 ### Account Providers
 - **Alpaca Integration**: Paper and live trading support
@@ -112,10 +129,12 @@ def get_settings_definitions(cls) -> Dict[str, Any]:
 
 **Core Models** (in `ba2_trade_platform/core/models.py`):
 - `AccountInstance`: Trading account configurations
-- `ExpertInstance`: AI expert configurations  
-- `ExpertRecommendation`: Trading recommendations
-- `MarketAnalysis`: Analysis sessions
+- `ExpertInstance`: AI expert configurations with virtual equity allocation
+- `ExpertRecommendation`: Trading recommendations with risk level and time horizon
+- `MarketAnalysis`: Analysis sessions with expert linking
 - `AnalysisOutput`: Detailed analysis outputs
+- `TradingOrder`: Order execution tracking
+- `Position`: Current positions and performance
 - `AppSetting`: Application configuration
 
 ### Directory Structure
@@ -191,6 +210,27 @@ ta = TradingAgentsGraph(
 
 # Analysis results automatically stored in database
 final_state, decision = ta.propagate("NVDA", "2025-01-15")
+```
+
+**Parallel Multi-Symbol Analysis**:
+```python
+# Analyze multiple symbols simultaneously
+symbols = ["AAPL", "GOOGL", "MSFT", "NVDA"]
+expert_instances = [1, 2, 3]  # Multiple experts
+
+# Platform automatically manages parallel analysis across symbols and experts
+# Results stored with risk levels, time horizons, and expert attribution
+```
+
+**Virtual Equity Management**:
+```python
+# Expert configuration with virtual equity allocation
+expert_config = {
+    "virtual_equity_percent": 25.0,  # 25% of total account
+    "max_position_percent": 5.0,    # Max 5% per position
+    "trading_mode": "semi_auto",     # Requires approval
+    "risk_tolerance": "MEDIUM"       # Risk level preference
+}
 ```
 
 ## 🎛️ Configuration

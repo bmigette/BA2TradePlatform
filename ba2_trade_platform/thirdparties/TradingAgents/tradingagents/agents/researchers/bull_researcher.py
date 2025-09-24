@@ -42,12 +42,19 @@ def create_bull_researcher(llm, memory):
 
         argument = f"Bull Analyst: {response.content}"
 
+        # Store bull messages as a list for proper conversation display
+        bull_messages = investment_debate_state.get("bull_messages", [])
+        bull_messages.append(argument)
+
         new_investment_debate_state = {
             "history": history + "\n" + argument,
             "bull_history": bull_history + "\n" + argument,
+            "bull_messages": bull_messages,
             "bear_history": investment_debate_state.get("bear_history", ""),
+            "bear_messages": investment_debate_state.get("bear_messages", []),
             "current_response": argument,
             "count": investment_debate_state["count"] + 1,
+            "judge_decision": investment_debate_state.get("judge_decision", "")
         }
 
         return {"investment_debate_state": new_investment_debate_state}

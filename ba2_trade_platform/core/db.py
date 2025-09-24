@@ -94,13 +94,11 @@ def update_instance(instance, session: Session | None = None):
             session.add(instance)
             session.commit()
             session.refresh(instance)
-            logger.info(f"Updated instance: {instance}")
         else:
             with Session(engine) as session:
                 session.add(instance)
                 session.commit()
                 session.refresh(instance)
-                logger.info(f"Updated instance: {instance}")
     except Exception as e:
         logger.error(f"Error updating instance: {e}", exc_info=True)
         raise

@@ -92,7 +92,7 @@ class TradingAgentsLogger:
         if log_dir is None:
             try:
                 # Try to use BA2 platform's logs directory
-                self.log_dir = os.path.join(ba2_config.HOME, "logs")
+                self.log_dir = os.path.join(ba2_config.HOME_PARENT, "logs")
             except (AttributeError, ImportError):
                 # Fallback to current directory if BA2 config not available
                 self.log_dir = "."

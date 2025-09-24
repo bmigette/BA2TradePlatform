@@ -68,18 +68,23 @@ class JobMonitoringTab:
             # Add action buttons
             self.analysis_table.add_slot('body-cell-actions', '''
                 <q-td :props="props">
+                    <q-btn flat dense icon="info" 
+                           color="primary" 
+                           @click="$parent.$emit('view_details', props.row.id)">
+                        <q-tooltip>View Analysis Details</q-tooltip>
+                    </q-btn>
                     <q-btn v-if="props.row.can_cancel" 
                            flat dense icon="cancel" 
                            color="negative" 
                            @click="$parent.$emit('cancel_analysis', props.row.id)"
-                           :disable="props.row.status === 'RUNNING'">
+                           :disable="props.row.status === 'running'">
                         <q-tooltip>Cancel Analysis</q-tooltip>
                     </q-btn>
-                    <q-btn v-if="props.row.status === 'COMPLETED'" 
+                    <q-btn v-if="props.row.status === 'completed'" 
                            flat dense icon="visibility" 
-                           color="primary" 
+                           color="secondary" 
                            @click="$parent.$emit('view_results', props.row.id)">
-                        <q-tooltip>View Results</q-tooltip>
+                        <q-tooltip>Quick View (Dialog)</q-tooltip>
                     </q-btn>
                 </q-td>
             ''')
@@ -87,6 +92,7 @@ class JobMonitoringTab:
             # Handle events
             self.analysis_table.on('cancel_analysis', self.cancel_analysis)
             self.analysis_table.on('view_results', self.view_analysis_results)
+            self.analysis_table.on('view_details', self.view_analysis_details)
 
     def _create_queue_status(self):
         """Create worker queue status display."""
@@ -207,11 +213,14 @@ class JobMonitoringTab:
 
     def view_analysis_results(self, event_data):
         """View analysis results in a dialog."""
+        analysis_id = None
         try:
             # Extract analysis_id from event data
             # NiceGUI passes GenericEventArguments with args attribute
-            if hasattr(event_data, 'args') and len(event_data.args) > 0:
+            if hasattr(event_data, 'args') and hasattr(event_data.args, '__len__') and len(event_data.args) > 0:
                 analysis_id = int(event_data.args[0])
+            elif hasattr(event_data, 'args') and isinstance(event_data.args, int):
+                analysis_id = event_data.args
             elif isinstance(event_data, int):
                 analysis_id = event_data
             else:
@@ -259,8 +268,32 @@ class JobMonitoringTab:
             dialog.open()
             
         except Exception as e:
-            logger.error(f"Error viewing analysis results {analysis_id}: {e}")
+            analysis_id_str = str(analysis_id) if analysis_id is not None else "unknown"
+            logger.error(f"Error viewing analysis results {analysis_id_str}: {e}")
             ui.notify(f"Error loading results: {str(e)}", type='negative')
+
+    def view_analysis_details(self, event_data):
+        """Navigate to the detailed analysis page."""
+        analysis_id = None
+        try:
+            # Extract analysis_id from event data
+            if hasattr(event_data, 'args') and hasattr(event_data.args, '__len__') and len(event_data.args) > 0:
+                analysis_id = int(event_data.args[0])
+            elif isinstance(event_data, int):
+                analysis_id = event_data
+            elif hasattr(event_data, 'args') and isinstance(event_data.args, int):
+                analysis_id = event_data.args
+            else:
+                logger.error(f"Invalid event data for view_analysis_details: {event_data}")
+                ui.notify("Invalid event data", type='negative')
+                return
+            
+            # Navigate to the detail page
+            ui.navigate.to(f'/market_analysis/{analysis_id}')
+            
+        except Exception as e:
+            logger.error(f"Error navigating to analysis details {analysis_id if analysis_id else 'unknown'}: {e}")
+            ui.notify(f"Error opening details: {str(e)}", type='negative')
 
     def refresh_data(self):
         """Refresh the data in all tables."""

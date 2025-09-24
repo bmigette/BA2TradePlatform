@@ -97,12 +97,11 @@ class ExpertRecommendation(SQLModel, table=True):
 
 class MarketAnalysis(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    date: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc))
     symbol: str
     source_expert_instance_id: int = Field(foreign_key="expertinstance.id", nullable=False, ondelete="CASCADE")
     status: MarketAnalysisStatus = MarketAnalysisStatus.PENDING
     state: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict)
-    created_at: DateTime | None = Field(default_factory=lambda: DateTime.now(timezone.utc))
+    created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc))
     
     # Relationships
     analysis_outputs: List["AnalysisOutput"] = Relationship(back_populates="market_analysis")
@@ -111,7 +110,7 @@ class MarketAnalysis(SQLModel, table=True):
 
 class AnalysisOutput(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    datetime_created: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc))
+    created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc))
     market_analysis_id: int = Field(foreign_key="marketanalysis.id", nullable=False, ondelete="CASCADE")
     name: str
     type: str

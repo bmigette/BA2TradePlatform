@@ -12,6 +12,7 @@ import json
 from datetime import datetime
 from typing import Dict, Any, Optional
 from ...prompts import get_prompt
+from ba2_trade_platform.core.types import OrderRecommendation, RiskLevel, TimeHorizon
 
 
 def create_recommendation_agent(llm):
@@ -169,13 +170,13 @@ Judge Decision: {context_data.get('judge_decision', 'None')}
             ta_logger.error(f"Error generating recommendation for {symbol}: {e}")
             return {
                 "symbol": symbol,
-                "recommended_action": "ERROR",
+                "recommended_action": OrderRecommendation.ERROR.value,
                 "expected_profit_percent": 0.0,
                 "price_at_date": current_price,
                 "confidence": 0.0,
                 "details": f"Error generating recommendation: {str(e)}",
-                "risk_level": "MEDIUM",
-                "time_horizon": "MEDIUM_TERM",
+                "risk_level": RiskLevel.HIGH.value,
+                "time_horizon": TimeHorizon.SHORT_TERM.value,
                 "key_factors": ["Analysis error occurred"],
                 "stop_loss": 0.0,
                 "take_profit": 0.0
@@ -187,39 +188,20 @@ Judge Decision: {context_data.get('judge_decision', 'None')}
 def _create_fallback_recommendation(response_text: str, symbol: str, current_price: float) -> Dict[str, Any]:
     """Create a fallback recommendation when JSON parsing fails"""
     
-    # Try to extract key information from text
-    text_lower = response_text.lower()
-    
-    # Determine action
-    if "buy" in text_lower or "bullish" in text_lower:
-        action = "BUY"
-        profit = 8.0
-    elif "sell" in text_lower or "bearish" in text_lower:
-        action = "SELL"
-        profit = -5.0
-    else:
-        action = "HOLD"
-        profit = 2.0
-    
-    # Try to extract confidence
-    confidence = 75.0
-    if "high confidence" in text_lower:
-        confidence = 85.0
-    elif "low confidence" in text_lower:
-        confidence = 60.0
+
     
     return {
         "symbol": symbol,
-        "recommended_action": action,
-        "expected_profit_percent": profit,
+        "recommended_action": OrderRecommendation.ERROR.value,
+        "expected_profit_percent": 0,
         "price_at_date": current_price,
-        "confidence": confidence,
+        "confidence": 0,
         "details": response_text[:500] + "..." if len(response_text) > 500 else response_text,
-        "risk_level": "MEDIUM",
-        "time_horizon": "MEDIUM_TERM",
+        "risk_level": RiskLevel.HIGH.value,
+        "time_horizon": TimeHorizon.SHORT_TERM.value,
         "key_factors": ["AI analysis"],
-        "stop_loss": current_price * 0.95 if current_price > 0 else 0.0,
-        "take_profit": current_price * 1.05 if current_price > 0 else 0.0
+        "stop_loss": 0,
+        "take_profit": 0
     }
 
 
@@ -229,16 +211,16 @@ def _validate_and_complete_recommendation(recommendation: Dict[str, Any], symbol
     # Required fields with defaults
     defaults = {
         "symbol": symbol,
-        "recommended_action": "HOLD",
+        "recommended_action": OrderRecommendation.ERROR.value,
         "expected_profit_percent": 0.0,
         "price_at_date": current_price,
-        "confidence": 50.0,
+        "confidence": 0.0,
         "details": "No detailed analysis available",
-        "risk_level": "MEDIUM",
-        "time_horizon": "MEDIUM_TERM",
+        "risk_level": RiskLevel.HIGH.value,
+        "time_horizon": TimeHorizon.SHORT_TERM.value,
         "key_factors": [],
-        "stop_loss": current_price * 0.95 if current_price > 0 else 0.0,
-        "take_profit": current_price * 1.05 if current_price > 0 else 0.0
+        "stop_loss": 0,
+        "take_profit": 0
     }
     
     # Fill in missing fields
@@ -247,9 +229,9 @@ def _validate_and_complete_recommendation(recommendation: Dict[str, Any], symbol
             recommendation[key] = default_value
     
     # Validate action
-    valid_actions = ["BUY", "SELL", "HOLD"]
+    valid_actions = [OrderRecommendation.BUY.value, OrderRecommendation.SELL.value, OrderRecommendation.HOLD.value]
     if recommendation["recommended_action"] not in valid_actions:
-        recommendation["recommended_action"] = "HOLD"
+        recommendation["recommended_action"] = OrderRecommendation.HOLD.value # use error
     
     # Validate confidence range
     confidence = recommendation["confidence"]
@@ -257,14 +239,14 @@ def _validate_and_complete_recommendation(recommendation: Dict[str, Any], symbol
         recommendation["confidence"] = 50.0
     
     # Validate risk level
-    valid_risk_levels = ["LOW", "MEDIUM", "HIGH"]
+    valid_risk_levels = [RiskLevel.LOW.value, RiskLevel.MEDIUM.value, RiskLevel.HIGH.value]
     if recommendation["risk_level"] not in valid_risk_levels:
-        recommendation["risk_level"] = "MEDIUM"
+        recommendation["risk_level"] = RiskLevel.MEDIUM.value
     
     # Validate time horizon
-    valid_time_horizons = ["SHORT_TERM", "MEDIUM_TERM", "LONG_TERM"]
+    valid_time_horizons = [TimeHorizon.SHORT_TERM.value, TimeHorizon.MEDIUM_TERM.value, TimeHorizon.LONG_TERM.value]
     if recommendation["time_horizon"] not in valid_time_horizons:
-        recommendation["time_horizon"] = "MEDIUM_TERM"
+        recommendation["time_horizon"] = TimeHorizon.MEDIUM_TERM.value
     
     # Ensure key_factors is a list
     if not isinstance(recommendation["key_factors"], list):
