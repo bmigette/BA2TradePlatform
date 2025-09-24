@@ -570,7 +570,7 @@ class TradingAgentsUI:
                 # Confidence card
                 with ui.card().classes('p-4 flex-1'):
                     ui.label('Confidence').classes('text-subtitle2 mb-2')
-                    confidence = latest_recommendation.confidence_score or 0
+                    confidence = (latest_recommendation.confidence or 0) * 100
                     confidence_color = 'text-green-600' if confidence >= 75 else 'text-orange-600' if confidence >= 50 else 'text-red-600'
                     ui.label(f'🎯 **{confidence:.1f}%**').classes(f'text-xl font-bold {confidence_color}')
                 
@@ -584,10 +584,10 @@ class TradingAgentsUI:
                         ui.label(f'{profit_icon} **{profit:+.1f}%**').classes(f'text-xl font-bold {profit_color}')
             
             # Additional details
-            if latest_recommendation.reasoning:
+            if latest_recommendation.details:
                 with ui.card().classes('w-full p-4'):
                     ui.label('Analysis Summary').classes('text-subtitle2 mb-2')
-                    ui.label(latest_recommendation.reasoning).classes('text-sm text-grey-8')
+                    ui.label(latest_recommendation.details).classes('text-sm text-grey-8')
             
             # Risk and Time Horizon if available
             with ui.row().classes('w-full gap-4 mt-3'):

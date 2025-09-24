@@ -172,8 +172,8 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                             state_snapshot[key] = {
                                 'bull_history': value.get('bull_history', ''),
                                 'bear_history': value.get('bear_history', ''),
-                                'bull_messages': value.get('bull_messages', []),
-                                'bear_messages': value.get('bear_messages', []),
+                                'bull_messages': self._clean_message_list(value.get('bull_messages', [])),
+                                'bear_messages': self._clean_message_list(value.get('bear_messages', [])),
                                 'history': value.get('history', ''),
                                 'current_response': value.get('current_response', ''),
                                 'judge_decision': value.get('judge_decision', ''),
@@ -184,9 +184,9 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                                 'risky_history': value.get('risky_history', ''),
                                 'safe_history': value.get('safe_history', ''),
                                 'neutral_history': value.get('neutral_history', ''),
-                                'risky_messages': value.get('risky_messages', []),
-                                'safe_messages': value.get('safe_messages', []),
-                                'neutral_messages': value.get('neutral_messages', []),
+                                'risky_messages': self._clean_message_list(value.get('risky_messages', [])),
+                                'safe_messages': self._clean_message_list(value.get('safe_messages', [])),
+                                'neutral_messages': self._clean_message_list(value.get('neutral_messages', [])),
                                 'history': value.get('history', ''),
                                 'judge_decision': value.get('judge_decision', ''),
                                 'count': value.get('count', 0),
@@ -216,6 +216,41 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             
         except Exception as e:
             ta_logger.error(f"Failed to sync state to MarketAnalysis {self.market_analysis_id}: {e}")
+
+    def _clean_message_list(self, messages: list) -> list:
+        """Clean a list of messages to make them JSON serializable.
+        
+        Args:
+            messages: List that may contain HumanMessage or other non-serializable objects
+            
+        Returns:
+            List of JSON-serializable message representations
+        """
+        cleaned_messages = []
+        for msg in messages:
+            if hasattr(msg, 'content') and hasattr(msg, '__class__'):
+                # This is likely a langchain message object
+                cleaned_messages.append({
+                    'type': msg.__class__.__name__,
+                    'content': str(msg.content) if msg.content else ''
+                })
+            elif isinstance(msg, dict):
+                # Already a dictionary, check if it's serializable
+                try:
+                    import json
+                    json.dumps(msg)
+                    cleaned_messages.append(msg)
+                except (TypeError, ValueError):
+                    # Convert to string if not serializable
+                    cleaned_messages.append({'content': str(msg), 'type': 'dict'})
+            elif isinstance(msg, (str, int, float, bool, type(None))):
+                # Simple types
+                cleaned_messages.append({'content': str(msg), 'type': 'simple'})
+            else:
+                # Convert everything else to string
+                cleaned_messages.append({'content': str(msg), 'type': 'unknown'})
+        
+        return cleaned_messages
 
     def _create_tool_nodes(self) -> Dict[str, ToolNode]:
         """Create tool nodes for different data sources."""
