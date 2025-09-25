@@ -364,19 +364,12 @@ class WorkerQueue:
             from .db import get_instance, add_instance
             from .models import ExpertInstance, MarketAnalysis
             from .types import MarketAnalysisStatus
-            from ..modules.experts import get_expert_class
+            from .utils import get_expert_instance_from_id
             
-            # Get the expert instance
-            expert_instance = get_instance(ExpertInstance, task.expert_instance_id)
-            if not expert_instance:
-                raise ValueError(f"Expert instance {task.expert_instance_id} not found")
-                
-            # Get the expert class and create instance
-            expert_class = get_expert_class(expert_instance.expert)
-            if not expert_class:
-                raise ValueError(f"Expert class {expert_instance.expert} not found")
-                
-            expert = expert_class(task.expert_instance_id)
+            # Get the expert instance with appropriate class
+            expert = get_expert_instance_from_id(task.expert_instance_id)
+            if not expert:
+                raise ValueError(f"Expert instance {task.expert_instance_id} not found or invalid expert type")
             
             # Create MarketAnalysis record with subtype
             from .types import AnalysisUseCase

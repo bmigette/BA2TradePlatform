@@ -66,6 +66,75 @@ class ExtendableSettingsInterface(ABC):
             
         return merged
 
+    def _save_single_setting(self, session, key: str, value: Any, setting_type: Optional[str] = None):
+        """
+        Helper method to save a single setting to the database.
+        
+        Args:
+            session: Database session
+            key: The setting key
+            value: The setting value
+            setting_type: Optional type override when no definitions exist
+        """
+        setting_model = type(self).SETTING_MODEL
+        lk_field = type(self).SETTING_LOOKUP_FIELD
+        definitions = type(self).get_merged_settings_definitions()
+        
+        definition = definitions.get(key, {})
+        value_type = definition.get("type", None)
+        
+        # If no definition exists, use setting_type or determine type from the value itself
+        if value_type is None:
+            if setting_type is not None:
+                value_type = setting_type
+                logger.debug(f"No definition found for setting '{key}', using provided type: {value_type}")
+            else:
+                value_type = self._determine_value_type(value)
+                logger.debug(f"No definition found for setting '{key}', determined type: {value_type}")
+        
+        # Find existing setting
+        where_kwargs = {lk_field: self.id, "key": key}
+        stmt = select(setting_model).filter_by(**where_kwargs)
+        setting = session.exec(stmt).first()
+        
+        # Handle different value types
+        if value_type == "json":
+            # Validate that JSON values are dict or list objects
+            if not isinstance(value, (dict, list)):
+                raise ValueError(f"JSON setting '{key}' must be a dict or list, got {type(value).__name__}: {repr(value)}")
+            
+            if setting:
+                setting.value_json = value
+                update_instance(setting, session)
+            else:
+                setting = setting_model(**{lk_field: self.id, "key": key, "value_json": value})
+                add_instance(setting, session)
+                
+        elif value_type == "bool":
+            json_value = json.dumps(value)
+            if setting:
+                setting.value_json = json_value
+                update_instance(setting, session)
+            else:
+                setting = setting_model(**{lk_field: self.id, "key": key, "value_json": json_value})
+                add_instance(setting, session)
+                
+        elif value_type == "float":
+            if setting:
+                setting.value_float = float(value)
+                update_instance(setting, session)
+            else:
+                setting = setting_model(**{lk_field: self.id, "key": key, "value_float": float(value)})
+                add_instance(setting, session)
+        else:
+            # Default to string
+            if setting:
+                setting.value_str = str(value)
+                update_instance(setting, session)
+            else:
+                setting = setting_model(**{lk_field: self.id, "key": key, "value_str": str(value)})
+                add_instance(setting, session)
+
     def save_setting(self, key: str, value: Any, setting_type: Optional[str] = None):
         """
         Save a single account setting to the database, converting bool to JSON for storage.
@@ -77,49 +146,11 @@ class ExtendableSettingsInterface(ABC):
                          Should not be used to override existing definitions.
                          If not provided and no definition exists, will use _determine_value_type.
         """
-        setting_model = type(self).SETTING_MODEL
         lk_field = type(self).SETTING_LOOKUP_FIELD
-
         session = get_db()
-        definitions = type(self).get_merged_settings_definitions()
+        
         try:
-            definition = definitions.get(key, {})
-            value_type = definition.get("type", None)
-            
-            # If no definition exists, use setting_type or determine type from the value itself
-            if value_type is None:
-                if setting_type is not None:
-                    value_type = setting_type
-                    logger.debug(f"No definition found for setting '{key}', using provided type: {value_type}")
-                else:
-                    value_type = self._determine_value_type(value)
-                    logger.debug(f"No definition found for setting '{key}', determined type: {value_type}")
-            
-            where_kwargs = {lk_field: self.id, "key": key}
-            stmt = select(setting_model).filter_by(**where_kwargs)
-            setting = session.exec(stmt).first()
-            if value_type == "json" or value_type == "bool":
-                json_value = json.dumps(value)
-                if setting:
-                    setting.value_json = json_value
-                    update_instance(setting, session)
-                else:
-                    setting = setting_model(**{lk_field: self.id, "key": key, "value_json": json_value})
-                    add_instance(setting, session)
-            elif value_type == "float":
-                if setting:
-                    setting.value_float = float(value)
-                    update_instance(setting, session)
-                else:
-                    setting = setting_model(**{lk_field: self.id, "key": key, "value_float": float(value)})
-                    add_instance(setting, session)
-            else:
-                if setting:
-                    setting.value_str = str(value)
-                    update_instance(setting, session)
-                else:
-                    setting = setting_model(**{lk_field: self.id, "key": key, "value_str": str(value)})
-                    add_instance(setting, session)
+            self._save_single_setting(session, key, value, setting_type)
             session.commit()
             logger.info(f"Saved setting '{key}' for {lk_field}={self.id}: {value}")
         except Exception as e:
@@ -133,42 +164,12 @@ class ExtendableSettingsInterface(ABC):
         """
         Save account settings to the database, converting bool to JSON for storage.
         """
-
-        setting_model = type(self).SETTING_MODEL
         lk_field = type(self).SETTING_LOOKUP_FIELD
-
         session = get_db()
-        definitions = type(self).get_merged_settings_definitions()
+        
         try:
-            for key, value in settings.items():
-                definition = definitions.get(key, {})
-                value_type = definition.get("type", "str")
-                # Build dynamic where clause
-                where_kwargs = {lk_field: self.id, "key": key}
-                stmt = select(setting_model).filter_by(**where_kwargs)
-                setting = session.exec(stmt).first()
-                if value_type == "json" or value_type == "bool":
-                    json_value = json.dumps(value)
-                    if setting:
-                        setting.value_json = json_value
-                        update_instance(setting, session)
-                    else:
-                        setting = setting_model(**{lk_field: self.id, "key": key, "value_json": json_value})
-                        add_instance(setting, session)
-                elif value_type == "float":
-                    if setting:
-                        setting.value_float = float(value)
-                        update_instance(setting, session)
-                    else:
-                        setting = setting_model(**{lk_field: self.id, "key": key, "value_float": float(value)})
-                        add_instance(setting, session)
-                else:
-                    if setting:
-                        setting.value_str = str(value)
-                        update_instance(setting, session)
-                    else:
-                        setting = setting_model(**{lk_field: self.id, "key": key, "value_str": str(value)})
-                        add_instance(setting, session)
+            for key, (value, setting_type) in settings.items():
+                self._save_single_setting(session, key, value, setting_type)
             session.commit()
             logger.info(f"Saved settings for {lk_field}={self.id}: {settings}")
         except Exception as e:
@@ -210,7 +211,7 @@ class ExtendableSettingsInterface(ABC):
                 
                 # If no definition exists, determine type from the stored data
                 if value_type is None:
-                    if setting.value_json is not None:
+                    if setting.value_json is not None and setting.value_json:  # Non-empty JSON
                         value_type = "json"
                     elif setting.value_float is not None:
                         value_type = "float"
@@ -219,6 +220,7 @@ class ExtendableSettingsInterface(ABC):
                     #logger.debug(f"Setting '{setting.key}' found in DB but not in definitions, using type: {value_type}")
                 
                 if value_type == "json":
+                    # All JSON values are now stored as Dict objects in the database
                     settings[setting.key] = setting.value_json
                 elif value_type == "bool":
                     # Convert JSON string to bool with robust handling of corrupted values

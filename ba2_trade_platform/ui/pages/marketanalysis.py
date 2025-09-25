@@ -289,9 +289,9 @@ class ManualAnalysisTab:
                     ).classes('w-full')
                     
                 with ui.column():
-                    ui.button('Submit Analysis', on_click=self.submit_manual_analysis, icon='play_arrow').classes('mt-6')
+                    ui.button('Submit Analysis', on_click=self.submit_market_analysis, icon='play_arrow').classes('mt-6')
 
-    def submit_manual_analysis(self):
+    def submit_market_analysis(self):
         """Submit a manual analysis job."""
         try:
             symbol = self.symbol_input.value.strip().upper()
@@ -309,7 +309,7 @@ class ManualAnalysisTab:
             from ...core.JobManager import get_job_manager
             job_manager = get_job_manager()
             
-            success = job_manager.submit_manual_analysis(int(expert_instance_id), symbol)
+            success = job_manager.submit_market_analysis(int(expert_instance_id), symbol)
             
             if success:
                 ui.notify(f"Manual analysis submitted for {symbol}", type='positive')
@@ -406,14 +406,11 @@ class ScheduledJobsTab:
                     continue
                 
                 try:
-                    from ...core.ExtendableSettingsInterface import ExtendableSettingsInterface
-                    from ...modules.experts import get_expert_class
+                    from ...core.utils import get_expert_instance_from_id
                     
-                    expert_class = get_expert_class(expert_instance.expert)
-                    if not expert_class:
+                    expert = get_expert_instance_from_id(expert_instance.id)
+                    if not expert:
                         continue
-                    
-                    expert = expert_class(expert_instance.id)
                     
                     # Get enabled instruments for this expert
                     enabled_instruments = expert.get_enabled_instruments()
@@ -506,7 +503,7 @@ class ScheduledJobsTab:
             from ...core.JobManager import get_job_manager
             job_manager = get_job_manager()
             
-            success = job_manager.submit_manual_analysis(expert_instance_id, symbol, subtype=subtype)
+            success = job_manager.submit_market_analysis(expert_instance_id, symbol, subtype=subtype)
             
             if success:
                 ui.notify(f"Analysis started for {symbol} ({subtype}) using expert instance {expert_instance_id}", type='positive')

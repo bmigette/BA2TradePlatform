@@ -11,19 +11,38 @@ It handles:
 import threading
 import time
 import json
+import queue
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timedelta
+from dataclasses import dataclass
+from enum import Enum
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.job import Job
 
+from ..core.utils import get_expert_instance_from_id
 from ..logger import logger
 from .db import get_all_instances, get_instance, get_setting
 from .models import ExpertInstance, ExpertSetting, Instrument
 from .WorkerQueue import get_worker_queue, AnalysisTask
 from .types import WorkerTaskStatus
 from .types import AnalysisUseCase
+
+
+class ControlMessageType(Enum):
+    """Types of control messages for JobManager."""
+    REFRESH_EXPERT_SCHEDULES = "refresh_expert_schedules"
+    SHUTDOWN = "shutdown"
+
+
+@dataclass
+class ControlMessage:
+    """Control message for JobManager operations."""
+    message_type: ControlMessageType
+    expert_instance_id: Optional[int] = None
+    data: Optional[Dict[str, Any]] = None
+
 
 class JobManager:
     """
@@ -38,6 +57,11 @@ class JobManager:
         self._scheduled_jobs: Dict[str, Job] = {}  # Maps job_id to APScheduler Job
         self._lock = threading.Lock()
         
+        # Control queue for asynchronous operations
+        self._control_queue = queue.Queue()
+        self._control_thread = None
+        self._control_thread_running = False
+        
         logger.info("JobManager initialized")
         
     def start(self):
@@ -50,6 +74,11 @@ class JobManager:
             self._running = True
             
         logger.info("Starting JobManager...")
+        
+        # Start control thread for asynchronous operations
+        self._start_control_thread()
+        
+        # Schedule all expert jobs
         self._schedule_all_expert_jobs()
         logger.info("JobManager started successfully")
         
@@ -60,6 +89,9 @@ class JobManager:
             return
             
         logger.info("Stopping JobManager...")
+        
+        # Stop control thread
+        self._stop_control_thread()
         
         with self._lock:
             self._running = False
@@ -72,7 +104,8 @@ class JobManager:
     
     def refresh_expert_schedules(self, expert_instance_id: int = None):
         """
-        Refresh scheduled jobs for a specific expert or all experts.
+        Request refresh of scheduled jobs for a specific expert or all experts.
+        This method is non-blocking and queues the request for asynchronous processing.
         
         Args:
             expert_instance_id: If provided, only refresh this expert's schedule.
@@ -82,13 +115,38 @@ class JobManager:
             logger.warning("JobManager is not running - cannot refresh schedules")
             return
             
+        logger.info(f"Queuing schedule refresh request for expert {expert_instance_id or 'all experts'}")
+        
+        # Queue the refresh request for asynchronous processing
+        control_message = ControlMessage(
+            message_type=ControlMessageType.REFRESH_EXPERT_SCHEDULES,
+            expert_instance_id=expert_instance_id
+        )
+        
+        try:
+            self._control_queue.put_nowait(control_message)
+            logger.debug(f"Schedule refresh request queued for expert {expert_instance_id or 'all experts'}")
+        except queue.Full:
+            logger.error("Control queue is full - cannot queue schedule refresh request")
+    
+    def _refresh_expert_schedules_sync(self, expert_instance_id: int = None):
+        """
+        Internal method to synchronously refresh scheduled jobs.
+        This runs on the control thread to avoid blocking the UI.
+        
+        Args:
+            expert_instance_id: If provided, only refresh this expert's schedule.
+                              If None, refresh all expert schedules.
+        """
         logger.info(f"Refreshing expert schedules for expert {expert_instance_id or 'all experts'}")
         
         with self._lock:
             if expert_instance_id:
-                # Remove existing jobs for this expert
-                jobs_to_remove = [job_id for job_id, expert_id in self._scheduled_jobs.items() 
-                                if expert_id == expert_instance_id]
+                # Remove existing jobs for this expert by checking job_id pattern
+                logger.debug(f"Current _scheduled_jobs before removal: {list(self._scheduled_jobs.keys())}")
+                jobs_to_remove = [job_id for job_id in self._scheduled_jobs.keys() 
+                                if job_id.startswith(f"expert_{expert_instance_id}_")]
+                logger.debug(f"Jobs to remove for expert {expert_instance_id}: {jobs_to_remove}")
                 
                 for job_id in jobs_to_remove:
                     try:
@@ -98,9 +156,12 @@ class JobManager:
                     except Exception as e:
                         logger.warning(f"Error removing job {job_id}: {e}")
                 
+                logger.debug(f"_scheduled_jobs after removal: {list(self._scheduled_jobs.keys())}")
+
                 # Re-schedule this expert's jobs
+                logger.debug(f"Re-scheduling jobs for expert {expert_instance_id}")
                 self._schedule_expert_analysis(expert_instance_id)
-                
+                logger.debug(f"_scheduled_jobs after re-scheduling: {list(self._scheduled_jobs.keys())}")
             else:
                 # Refresh all schedules
                 self._scheduler.remove_all_jobs()
@@ -132,7 +193,7 @@ class JobManager:
         self._scheduler.shutdown()
         logger.info("JobManager shutdown complete")
         
-    def submit_manual_analysis(self, expert_instance_id: int, symbol: str, subtype: str = AnalysisUseCase.ENTER_MARKET, priority: int = 0) -> str:
+    def submit_market_analysis(self, expert_instance_id: int, symbol: str, subtype: str = AnalysisUseCase.ENTER_MARKET, priority: int = 0) -> str:
         """
         Submit a manual analysis job to the worker queue.
         
@@ -318,30 +379,11 @@ class JobManager:
     def _get_expert_setting(self, instance_id: int, key: str) -> Optional[str]:
         """Get a specific setting for an expert instance."""
         try:
-            from sqlmodel import select, Session
-            from .db import get_db
-            import json
-
-            with Session(get_db().bind) as session:
-                statement = select(ExpertSetting).where(
-                    ExpertSetting.instance_id == instance_id,
-                    ExpertSetting.key == key
-                )
-                setting = session.exec(statement).first()
-                if not setting:
-                    return None
-                
-                # Return the appropriate value based on what's populated
-                if setting.value_json:
-                    # For JSON settings, return the JSON string directly
-                    return setting.value_json
-                elif setting.value_str:
-                    return setting.value_str
-                elif setting.value_float is not None:
-                    return str(setting.value_float)
-                else:
-                    return None
-                
+            expert = get_expert_instance_from_id(instance_id)
+            if key in expert.settings:
+                return expert.settings[key]
+            else:
+                return None                
         except Exception as e:
             logger.error(f"Error getting expert setting {key} for instance {instance_id}: {e}")
             return None
@@ -350,28 +392,10 @@ class JobManager:
         """Get list of enabled instruments for an expert instance."""
         try:
             # Look for instrument settings (assuming pattern like "instrument_{symbol}_enabled")
-            from sqlmodel import select, Session
-            from .db import get_db
             
-            enabled_symbols = []
-            
-            with Session(get_db().bind) as session:
-                statement = select(ExpertSetting).where(
-                    ExpertSetting.instance_id == instance_id,
-                    ExpertSetting.key.like("instrument_%_enabled")
-                )
-                settings = session.exec(statement).all()
-                
-                for setting in settings:
-                    if setting.value_str and setting.value_str.lower() == "true":
-                        # Extract symbol from key like "instrument_AAPL_enabled"
-                        parts = setting.key.split("_")
-                        if len(parts) >= 3:
-                            symbol = parts[1]
-                            enabled_symbols.append(symbol)
-                            
+            enabled_symbols = self._get_expert_setting(instance_id, "enabled_instruments")
+            enabled_symbols = list(enabled_symbols.keys()) if enabled_symbols else []                            
             return enabled_symbols
-            
         except Exception as e:
             logger.error(f"Error getting enabled instruments for instance {instance_id}: {e}")
             return []
@@ -409,9 +433,8 @@ class JobManager:
         """Parse schedule setting into APScheduler trigger."""
         try:     
 
-            schedule_config = json.loads(schedule_setting)
-            if isinstance(schedule_config, dict) and 'days' in schedule_config and 'times' in schedule_config:
-                return self._parse_json_schedule(schedule_config)
+            if isinstance(schedule_setting, dict) and 'days' in schedule_setting and 'times' in schedule_setting:
+                return self._parse_json_schedule(schedule_setting)
             
         except Exception as e:
             logger.error(f"Error parsing schedule '{schedule_setting}': {e}")
@@ -465,7 +488,7 @@ class JobManager:
             logger.info(f"Executing scheduled analysis: expert={expert_instance_id}, symbol={symbol}, subtype={subtype}")
             
             # Submit to worker queue with low priority (higher number = lower priority)
-            task_id = self.submit_manual_analysis(
+            task_id = self.submit_market_analysis(
                 expert_instance_id=expert_instance_id,
                 symbol=symbol,
                 subtype=subtype,
@@ -486,6 +509,75 @@ class JobManager:
                 logger.debug(f"Removed scheduled job: {job_id}")
         except Exception as e:
             logger.error(f"Error removing scheduled job {job_id}: {e}")
+    
+    def _start_control_thread(self):
+        """Start the control thread for processing asynchronous operations."""
+        if self._control_thread and self._control_thread.is_alive():
+            logger.warning("Control thread is already running")
+            return
+            
+        self._control_thread_running = True
+        self._control_thread = threading.Thread(
+            target=self._control_thread_worker,
+            name="JobManager-Control",
+            daemon=True
+        )
+        self._control_thread.start()
+        logger.info("JobManager control thread started")
+    
+    def _stop_control_thread(self):
+        """Stop the control thread."""
+        if not self._control_thread_running:
+            return
+            
+        logger.info("Stopping JobManager control thread...")
+        
+        # Signal shutdown to control thread
+        shutdown_message = ControlMessage(message_type=ControlMessageType.SHUTDOWN)
+        try:
+            self._control_queue.put_nowait(shutdown_message)
+        except queue.Full:
+            logger.warning("Control queue full during shutdown - forcing stop")
+            
+        self._control_thread_running = False
+        
+        # Wait for control thread to finish
+        if self._control_thread and self._control_thread.is_alive():
+            self._control_thread.join(timeout=5.0)
+            if self._control_thread.is_alive():
+                logger.warning("Control thread did not stop within timeout")
+            else:
+                logger.info("JobManager control thread stopped")
+    
+    def _control_thread_worker(self):
+        """Worker method for the control thread that processes control messages."""
+        logger.info("JobManager control thread worker started")
+        
+        while self._control_thread_running:
+            try:
+                # Get control message with timeout
+                try:
+                    message = self._control_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                
+                # Process the control message
+                if message.message_type == ControlMessageType.SHUTDOWN:
+                    logger.debug("Control thread received shutdown signal")
+                    break
+                elif message.message_type == ControlMessageType.REFRESH_EXPERT_SCHEDULES:
+                    logger.debug(f"Processing schedule refresh for expert {message.expert_instance_id}")
+                    self._refresh_expert_schedules_sync(message.expert_instance_id)
+                else:
+                    logger.warning(f"Unknown control message type: {message.message_type}")
+                
+                # Mark task as done
+                self._control_queue.task_done()
+                
+            except Exception as e:
+                logger.error(f"Error in control thread worker: {e}", exc_info=True)
+        
+        logger.info("JobManager control thread worker stopped")
 
 
 # Global job manager instance

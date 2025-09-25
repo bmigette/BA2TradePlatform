@@ -365,6 +365,7 @@ class AppSettingsTab:
     """
     def __init__(self):
         self.openai_input = None
+        self.openai_admin_input = None
         self.finnhub_input = None
         self.fred_input = None
         self.worker_count_input = None
@@ -373,12 +374,16 @@ class AppSettingsTab:
     def render(self):
         session = get_db()
         openai = session.exec(select(AppSetting).where(AppSetting.key == 'openai_api_key')).first()
+        openai_admin = session.exec(select(AppSetting).where(AppSetting.key == 'openai_admin_api_key')).first()
         finnhub = session.exec(select(AppSetting).where(AppSetting.key == 'finnhub_api_key')).first()
         fred = session.exec(select(AppSetting).where(AppSetting.key == 'fred_api_key')).first()
         worker_count = session.exec(select(AppSetting).where(AppSetting.key == 'worker_count')).first()
         
         with ui.card().classes('w-full'):
             self.openai_input = ui.input(label='OpenAI API Key', value=openai.value_str if openai else '').classes('w-full')
+            with ui.row().classes('w-full items-center gap-2 mt-2 mb-2'):
+                self.openai_admin_input = ui.input(label='OpenAI Admin API Key (for usage data)', value=openai_admin.value_str if openai_admin else '').classes('flex-1')
+                ui.link('Get Admin Key', 'https://platform.openai.com/settings/organization/admin-keys', new_tab=True).classes('text-sm text-blue-600 underline')
             self.finnhub_input = ui.input(label='Finnhub API Key', value=finnhub.value_str if finnhub else '').classes('w-full')
             self.fred_input = ui.input(label='FRED API Key', value=fred.value_str if fred else '').classes('w-full')
             self.worker_count_input = ui.number(
@@ -393,7 +398,7 @@ class AppSettingsTab:
     def save_settings(self):
         try:
             session = get_db()
-            # OpenAI
+            # OpenAI Regular Key
             openai = session.exec(select(AppSetting).where(AppSetting.key == 'openai_api_key')).first()
             if openai:
                 openai.value_str = self.openai_input.value
@@ -401,6 +406,21 @@ class AppSettingsTab:
             else:
                 openai = AppSetting(key='openai_api_key', value_str=self.openai_input.value)
                 add_instance(openai, session)
+
+            # OpenAI Admin Key
+            if self.openai_admin_input.value.strip():
+                # Validate admin key format
+                if not self.openai_admin_input.value.strip().startswith("sk-admin"):
+                    ui.notify('Invalid admin key format. Admin keys should start with "sk-admin".', type='negative')
+                    return
+            
+            openai_admin = session.exec(select(AppSetting).where(AppSetting.key == 'openai_admin_api_key')).first()
+            if openai_admin:
+                openai_admin.value_str = self.openai_admin_input.value
+                update_instance(openai_admin, session)
+            else:
+                openai_admin = AppSetting(key='openai_admin_api_key', value_str=self.openai_admin_input.value)
+                add_instance(openai_admin, session)
 
             # Finnhub
             finnhub = session.exec(select(AppSetting).where(AppSetting.key == 'finnhub_api_key')).first()
@@ -829,18 +849,15 @@ class ExpertSettingsTab:
                     with ui.tab_panel('General Settings'):
                         ui.label('General Expert Configuration:').classes('text-subtitle1 mb-4')
                         
-                        # Schedule settings with tabs for both types
+                        # Schedule settings with expandable cards for both types
                         ui.label('Execution Schedules:').classes('text-subtitle2 mb-2')
                         ui.label('Configure when the expert should run for different analysis types:').classes('text-body2 mb-2')
                         
-                        with ui.tabs().classes('w-full') as schedule_tabs:
-                            enter_market_tab = ui.tab('📈 Enter Market Analysis')
-                            open_positions_tab = ui.tab('💼 Open Positions Analysis')
-                        
-                        with ui.tab_panels(schedule_tabs, value='📈 Enter Market Analysis').classes('w-full'):
-                            with ui.tab_panel('📈 Enter Market Analysis'):
+                        # Enter Market Analysis Schedule
+                        with ui.expansion('📈 Enter Market Analysis Schedule', value=True).classes('w-full mb-4'):
+                            with ui.card().classes('w-full'):
                                 ui.label('Schedule for analyzing new market entry opportunities:').classes('text-body2 mb-2')
-                                
+                            
                                 ui.label('Select days when the expert should analyze for new positions:').classes('text-body2 mb-2')
                                 with ui.row().classes('w-full gap-2 mb-4'):
                                     self.enter_market_schedule_days = {}
@@ -872,10 +889,11 @@ class ExpertSettingsTab:
                                 if self.enter_market_times_container is not None:
                                     with ui.row().classes('w-full gap-2 mb-4'):
                                         ui.button('Add Time', on_click=self._add_time_input_enter_market, icon='add_alarm').props('flat')
-                            
-                            with ui.tab_panel('💼 Open Positions Analysis'):
+                        
+                        # Open Positions Analysis Schedule
+                        with ui.expansion('💼 Open Positions Analysis Schedule', value=False).classes('w-full mb-4'):
+                            with ui.card().classes('w-full'):
                                 ui.label('Schedule for analyzing existing open positions:').classes('text-body2 mb-2')
-                                
                                 ui.label('Select days when the expert should analyze open positions:').classes('text-body2 mb-2')
                                 with ui.row().classes('w-full gap-2 mb-4'):
                                     self.open_positions_schedule_days = {}
@@ -967,10 +985,10 @@ class ExpertSettingsTab:
     def _load_expert_instrument_config(self, expert_instance):
         """Load instrument configuration for an existing expert."""
         try:
-            # Get the expert class and create an instance
-            expert_class = self._get_expert_class(expert_instance.expert)
-            if expert_class:
-                expert = expert_class(expert_instance.id)
+            # Get the expert instance with appropriate class
+            from ...core.utils import get_expert_instance_from_id
+            expert = get_expert_instance_from_id(expert_instance.id)
+            if expert:
                 
                 # Get enabled instruments configuration
                 enabled_config = expert._get_enabled_instruments_config()
@@ -999,10 +1017,8 @@ class ExpertSettingsTab:
     
     def _get_expert_class(self, expert_type):
         """Get the expert class by type name."""
-        for expert_class in experts:
-            if expert_class.__name__ == expert_type:
-                return expert_class
-        return None
+        from ...modules.experts import get_expert_class
+        return get_expert_class(expert_type)
     
     def _update_expert_description(self):
         """Update the description display based on selected expert type."""
@@ -1136,6 +1152,62 @@ class ExpertSettingsTab:
         
         return schedule
     
+    def _get_enter_market_schedule_config(self):
+        """Get the current enter market schedule configuration as a JSON-serializable dict."""
+        schedule = {
+            'days': {},
+            'times': []
+        }
+        
+        # Get selected days
+        if hasattr(self, 'enter_market_schedule_days'):
+            for day, checkbox in self.enter_market_schedule_days.items():
+                schedule['days'][day] = checkbox.value
+        
+        # Get execution times
+        if hasattr(self, 'enter_market_execution_times'):
+            for time_input in self.enter_market_execution_times:
+                time_value = time_input.value.strip()
+                if time_value and ':' in time_value:
+                    try:
+                        hours, minutes = time_value.split(':')
+                        hours_int = int(hours)
+                        minutes_int = int(minutes)
+                        if 0 <= hours_int <= 23 and 0 <= minutes_int <= 59:
+                            schedule['times'].append(time_value)
+                    except ValueError:
+                        pass  # Skip invalid times
+        
+        return schedule
+    
+    def _get_open_positions_schedule_config(self):
+        """Get the current open positions schedule configuration as a JSON-serializable dict."""
+        schedule = {
+            'days': {},
+            'times': []
+        }
+        
+        # Get selected days
+        if hasattr(self, 'open_positions_schedule_days'):
+            for day, checkbox in self.open_positions_schedule_days.items():
+                schedule['days'][day] = checkbox.value
+        
+        # Get execution times
+        if hasattr(self, 'open_positions_execution_times'):
+            for time_input in self.open_positions_execution_times:
+                time_value = time_input.value.strip()
+                if time_value and ':' in time_value:
+                    try:
+                        hours, minutes = time_value.split(':')
+                        hours_int = int(hours)
+                        minutes_int = int(minutes)
+                        if 0 <= hours_int <= 23 and 0 <= minutes_int <= 59:
+                            schedule['times'].append(time_value)
+                    except ValueError:
+                        pass  # Skip invalid times
+        
+        return schedule
+    
     def _load_schedule_config(self, schedule_config):
         """Load schedule configuration from a JSON dict."""
         if not schedule_config:
@@ -1170,11 +1242,10 @@ class ExpertSettingsTab:
     def _load_general_settings(self, expert_instance):
         """Load general settings (schedule and trading permissions) for an existing expert."""
         try:
-            expert_class = self._get_expert_class(expert_instance.expert)
-            if not expert_class:
+            from ...core.utils import get_expert_instance_from_id
+            expert = get_expert_instance_from_id(expert_instance.id)
+            if not expert:
                 return
-                
-            expert = expert_class(expert_instance.id)
             
             # Load execution schedule (entering market)
             enter_market_schedule = expert.settings.get('execution_schedule_enter_market')
@@ -1378,7 +1449,7 @@ class ExpertSettingsTab:
                 checkbox.value = days.get(day, default_value)
         
         # Load times
-        times = schedule_config.get('times', ['09:30', '10:30', '11:30', '12:30', '13:30', '14:30', '15:30'])
+        times = schedule_config.get('times', ['15:00'])
         
         # Clear existing time inputs
         if hasattr(self, 'open_positions_execution_times'):
@@ -1434,6 +1505,7 @@ class ExpertSettingsTab:
                     
                     # Check if setting has valid_values (dropdown)
                     valid_values = meta.get("valid_values")
+                    help_text = meta.get("help")
                     
                     if meta["type"] == "str":
                         value = current_value if current_value is not None else default_value or ""
@@ -1466,6 +1538,10 @@ class ExpertSettingsTab:
                     
                     inp.move(self.expert_settings_container)
                     self.expert_settings_inputs[key] = inp
+                    
+                    # Add help text if available
+                    if help_text:
+                        ui.markdown(help_text).classes('text-sm text-gray-600 mt-1 mb-3').move(self.expert_settings_container)
             else:
                 ui.label("No expert-specific settings available.").move(self.expert_settings_container)
                 
@@ -1541,13 +1617,13 @@ class ExpertSettingsTab:
         expert = expert_class(expert_id)
         
         # Save general settings (schedules and trading permissions)
-        if hasattr(self, 'schedule_days') and hasattr(self, 'execution_times'):
-            schedule_config = self._get_schedule_config()
+        if hasattr(self, 'enter_market_schedule_days') and hasattr(self, 'enter_market_execution_times'):
+            schedule_config = self._get_enter_market_schedule_config()
             expert.save_setting('execution_schedule_enter_market', schedule_config, setting_type="json")
             logger.debug(f'Saved execution_schedule_enter_market: {schedule_config}')
         
-        if hasattr(self, 'schedule_days_open') and hasattr(self, 'execution_times_open'):
-            schedule_config_open = self._get_schedule_config_open()
+        if hasattr(self, 'open_positions_schedule_days') and hasattr(self, 'open_positions_execution_times'):
+            schedule_config_open = self._get_open_positions_schedule_config()
             expert.save_setting('execution_schedule_open_positions', schedule_config_open, setting_type="json")
             logger.debug(f'Saved execution_schedule_open_positions: {schedule_config_open}')
         

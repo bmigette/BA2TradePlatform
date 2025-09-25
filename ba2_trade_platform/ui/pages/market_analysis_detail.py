@@ -6,7 +6,6 @@ from datetime import datetime
 from ...core.db import get_instance, get_db
 from ...core.models import MarketAnalysis, ExpertInstance, AnalysisOutput, Instrument
 from ...core.types import MarketAnalysisStatus
-from ...modules.experts import get_expert_class
 from ...logger import logger
 from sqlmodel import select
 
@@ -51,15 +50,14 @@ def content(analysis_id: int) -> None:
                 ui.button('Back to Market Analysis', on_click=lambda: ui.navigate.to('/marketanalysis')).classes('mt-4')
             return
         
-        # Get expert class and create instance
-        expert_class = get_expert_class(expert_instance.expert)
-        if not expert_class:
+        # Get expert instance with appropriate class
+        from ...core.utils import get_expert_instance_from_id
+        expert = get_expert_instance_from_id(expert_instance.id)
+        if not expert:
             with ui.card().classes('w-full p-8 text-center'):
                 ui.label(f'Expert class {expert_instance.expert} not found').classes('text-h5 text-negative')
                 ui.button('Back to Market Analysis', on_click=lambda: ui.navigate.to('/marketanalysis')).classes('mt-4')
             return
-        
-        expert = expert_class(expert_instance.id)
         
         # Load analysis outputs
         session = get_db()

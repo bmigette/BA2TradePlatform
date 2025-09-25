@@ -69,14 +69,15 @@ class TradingAgents(MarketExpertInterface):
             
             # LLM Models
             "deep_think_llm": {
-                "type": "str", "required": True, "default": "o4-mini",
+                "type": "str", "required": True, "default": "gpt-5-mini",
                 "description": "LLM model for complex reasoning and deep analysis",
                 "valid_values": ["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "o4-mini"]
             },
             "quick_think_llm": {
                 "type": "str", "required": True, "default": "gpt-5-mini",
                 "description": "LLM model for quick analysis and real-time decisions",
-                "valid_values": ["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "o4-mini"]
+                "valid_values": ["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "o4-mini", "o4-mini-deep-research"],
+                "help": "For more information on available models, see [OpenAI Models Documentation](https://platform.openai.com/docs/models)"
             },
             
             # Data Lookback Periods
@@ -95,6 +96,10 @@ class TradingAgents(MarketExpertInterface):
             "social_sentiment_days": {
                 "type": "int", "required": True, "default": 3,
                 "description": "Days of social sentiment data to analyze"
+            },
+            "debug_mode": {
+                "type": "bool", "required": True, "default": True,
+                "description": "Enable debug mode with detailed console output"
             }
         }
 
@@ -309,8 +314,11 @@ Analysis completed at: {self._get_current_timestamp()}"""
         config = self._create_tradingagents_config(subtype)
         
         # Initialize TradingAgents graph
+        # Get debug mode from settings (defaults to True for detailed logging)
+        debug_mode = self.settings.get('debug_mode', True)
+        
         ta_graph = TradingAgentsGraph(
-            debug=True,
+            debug=debug_mode,
             config=config,
             market_analysis_id=market_analysis_id
         )

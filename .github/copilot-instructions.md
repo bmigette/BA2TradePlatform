@@ -111,13 +111,17 @@ logger.error("Error conditions")
 ## Development Workflow
 
 ### Setup
-1. Install dependencies: `pip install -r requirements.txt`
-2. Database auto-initializes on first run via `main.py`
-3. Set environment variables in `.env` file (API keys, etc.)
+1. Create and activate virtual environment: `python -m venv .venv` then `.venv\Scripts\Activate.ps1` (Windows) or `source .venv/bin/activate` (Unix)
+2. Install dependencies: `.venv\Scripts\python.exe -m pip install -r requirements.txt` (Windows) or `.venv/bin/python -m pip install -r requirements.txt` (Unix)
+3. Database auto-initializes on first run via `main.py`
+4. Set environment variables in `.env` file (API keys, etc.)
+
+**Important**: Always use the virtual environment's Python executable (`.venv\Scripts\python.exe` on Windows, `.venv/bin/python` on Unix) for all Python commands to ensure proper dependency isolation.
 
 ### Running
-- **Main Application**: `python main.py` (starts NiceGUI web interface)
+- **Main Application**: Use virtual environment Python: `.venv\Scripts\python.exe main.py` (Windows) or `.venv/bin/python main.py` (Unix) (starts NiceGUI web interface)
 - **Configuration**: Environment variables loaded from `.env` via `config.load_config_from_env()`
+- **Virtual Environment**: Always use the project's virtual environment Python executable located at `.venv\Scripts\python.exe` (Windows) or `.venv/bin/python` (Unix)
 
 ### Testing
 - Manual testing through web UI at http://localhost:8080

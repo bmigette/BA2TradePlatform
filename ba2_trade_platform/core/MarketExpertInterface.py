@@ -58,7 +58,12 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         "times": ["09:30", "10:30", "11:30", "12:30", "13:30", "14:30", "15:30"]
                     },
                     "description": "Schedule configuration for managing existing open positions"
+                },
+                "enabled_instruments": {
+                    "type": "json", "required": False, "default": {},
+                    "description": "Configuration of enabled instruments for this expert instance"
                 }
+                
             }
 
     @classmethod
