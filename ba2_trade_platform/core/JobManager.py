@@ -349,18 +349,26 @@ class JobManager:
     def _schedule_expert_jobs(self, expert_instance: ExpertInstance):
         """Schedule jobs for a specific expert instance."""
         try:
+            logger.debug(f"Starting job scheduling for expert instance {expert_instance.id}")
+            
             # Get enabled instruments for this expert
             enabled_instruments = self._get_enabled_instruments(expert_instance.id)
             if not enabled_instruments:
                 logger.debug(f"No enabled instruments found for expert instance {expert_instance.id}")
                 return
             
+            logger.debug(f"Found {len(enabled_instruments)} enabled instruments for expert {expert_instance.id}: {enabled_instruments}")
+            
             # Schedule jobs for enter_market
             enter_market_schedule = self._get_expert_setting(expert_instance.id, "execution_schedule_enter_market")
             if enter_market_schedule:
                 logger.debug(f"Found execution_schedule_enter_market for expert {expert_instance.id}: {enter_market_schedule}")
-                for instrument in enabled_instruments:
+                logger.debug(f"Creating {len(enabled_instruments)} enter_market jobs...")
+                
+                for i, instrument in enumerate(enabled_instruments):
+                    logger.debug(f"Creating enter_market job {i+1}/{len(enabled_instruments)} for instrument {instrument}")
                     self._create_scheduled_job(expert_instance, instrument, enter_market_schedule, AnalysisUseCase.ENTER_MARKET)
+                    logger.debug(f"Completed enter_market job creation for instrument {instrument}")
             else:
                 logger.debug(f"No execution_schedule_enter_market setting found for expert instance {expert_instance.id}")
             
@@ -368,10 +376,16 @@ class JobManager:
             open_positions_schedule = self._get_expert_setting(expert_instance.id, "execution_schedule_open_positions")
             if open_positions_schedule:
                 logger.debug(f"Found execution_schedule_open_positions for expert {expert_instance.id}: {open_positions_schedule}")
-                for instrument in enabled_instruments:
+                logger.debug(f"Creating {len(enabled_instruments)} open_positions jobs...")
+                
+                for i, instrument in enumerate(enabled_instruments):
+                    logger.debug(f"Creating open_positions job {i+1}/{len(enabled_instruments)} for instrument {instrument}")
                     self._create_scheduled_job(expert_instance, instrument, open_positions_schedule, AnalysisUseCase.OPEN_POSITIONS)
+                    logger.debug(f"Completed open_positions job creation for instrument {instrument}")
             else:
                 logger.debug(f"No execution_schedule_open_positions setting found for expert instance {expert_instance.id}")
+            
+            logger.debug(f"Completed job scheduling for expert instance {expert_instance.id}")
                 
         except Exception as e:
             logger.error(f"Error scheduling jobs for expert instance {expert_instance.id}: {e}", exc_info=True)
@@ -405,81 +419,90 @@ class JobManager:
         try:
             job_id = f"expert_{expert_instance.id}_symbol_{symbol}_subtype_{subtype}"
             
+            logger.debug(f"Creating scheduled job: {job_id} with schedule: {schedule_setting}")
+            
             # Parse schedule setting (e.g., "daily_9:30", "hourly", "cron:0 9 * * 1-5")
             trigger = self._parse_schedule(schedule_setting)
             if not trigger:
                 logger.warning(f"Invalid schedule setting '{schedule_setting}' for expert {expert_instance.id}")
                 return
                 
-            # Create the scheduled job
-            job = self._scheduler.add_job(
-                func=self._execute_scheduled_analysis,
-                args=[expert_instance.id, symbol, subtype],
-                trigger=trigger,
-                id=job_id,
-                name=f"Analysis: Expert {expert_instance.id}, Symbol {symbol}, Subtype {subtype}",
-                replace_existing=True
-            )
+            logger.debug(f"Parsed trigger for {job_id}: {trigger}")
             
-            with self._lock:
-                self._scheduled_jobs[job_id] = job
+            # Create the scheduled job with error handling
+            try:
+                job = self._scheduler.add_job(
+                    func=self._execute_scheduled_analysis,
+                    args=[expert_instance.id, symbol, subtype],
+                    trigger=trigger,
+                    id=job_id,
+                    name=f"Analysis: Expert {expert_instance.id}, Symbol {symbol}, Subtype {subtype}",
+                    replace_existing=True,
+                    max_instances=1,  # Prevent job overlap
+                    coalesce=True     # Coalesce multiple missed executions
+                )
                 
-            logger.info(f"Scheduled job created: {job_id} with schedule '{schedule_setting}' for subtype '{subtype}'")
+                # Note: No lock needed here since caller already holds the lock
+                self._scheduled_jobs[job_id] = job
+                    
+                logger.info(f"Scheduled job created: {job_id} with schedule '{schedule_setting}' for subtype '{subtype}'")
+                
+            except Exception as scheduler_error:
+                logger.error(f"APScheduler error creating job {job_id}: {scheduler_error}", exc_info=True)
+                return
             
         except Exception as e:
             logger.error(f"Error creating scheduled job for expert {expert_instance.id}, symbol {symbol}: {e}", exc_info=True)
             
     def _parse_schedule(self, schedule_setting: str) -> Optional[Any]:
         """Parse schedule setting into APScheduler trigger."""
-        try:     
-
-            if isinstance(schedule_setting, dict) and 'days' in schedule_setting and 'times' in schedule_setting:
-                return self._parse_json_schedule(schedule_setting)
-            
-        except Exception as e:
-            logger.error(f"Error parsing schedule '{schedule_setting}': {e}")
-            return None
-    
-    def _parse_json_schedule(self, schedule_config: dict) -> Optional[Any]:
-        """Parse JSON schedule configuration into APScheduler trigger."""
         try:
-            days = schedule_config.get('days', {})
-            times = schedule_config.get('times', ['09:30'])
+            # Handle dict schedule configuration (JSON format)
+            if isinstance(schedule_setting, dict) and 'days' in schedule_setting and 'times' in schedule_setting:
+                logger.debug(f"Parsing JSON schedule: {schedule_setting}")
+                
+                days = schedule_setting.get('days', {})
+                times = schedule_setting.get('times', ['09:30'])
+                
+                # Convert day names to numbers (Monday=0, Sunday=6)
+                day_mapping = {
+                    'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
+                    'friday': 4, 'saturday': 5, 'sunday': 6
+                }
+                
+                # Get enabled days
+                enabled_days = []
+                for day_name, enabled in days.items():
+                    if enabled and day_name.lower() in day_mapping:
+                        enabled_days.append(day_mapping[day_name.lower()])
+                
+                if not enabled_days:
+                    logger.warning("No days enabled in schedule")
+                    return None
+                
+                if not times:
+                    logger.warning("No times specified in schedule")
+                    return None
+                
+                # Create triggers for each time on enabled days
+                # For multiple times, we'll use the first time for now
+                # TODO: In the future, we could create multiple jobs for different times
+                first_time = times[0]
+                hour, minute = map(int, first_time.split(':'))
+                
+                # Create day_of_week string for APScheduler
+                day_of_week = ','.join(map(str, sorted(enabled_days)))
+                
+                logger.info(f"Creating cron trigger: hour={hour}, minute={minute}, day_of_week={day_of_week}")
+                return CronTrigger(hour=hour, minute=minute, day_of_week=day_of_week)
             
-            # Convert day names to numbers (Monday=0, Sunday=6)
-            day_mapping = {
-                'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
-                'friday': 4, 'saturday': 5, 'sunday': 6
-            }
-            
-            # Get enabled days
-            enabled_days = []
-            for day_name, enabled in days.items():
-                if enabled and day_name.lower() in day_mapping:
-                    enabled_days.append(day_mapping[day_name.lower()])
-            
-            if not enabled_days:
-                logger.warning("No days enabled in schedule")
+            # Handle other schedule formats (string-based) - can be extended as needed
+            else:
+                logger.warning(f"Unsupported schedule format: {type(schedule_setting)} - {schedule_setting}")
                 return None
-            
-            if not times:
-                logger.warning("No times specified in schedule")
-                return None
-            
-            # Create triggers for each time on enabled days
-            # For multiple times, we'll use the first time for now
-            # TODO: In the future, we could create multiple jobs for different times
-            first_time = times[0]
-            hour, minute = map(int, first_time.split(':'))
-            
-            # Create day_of_week string for APScheduler
-            day_of_week = ','.join(map(str, sorted(enabled_days)))
-            
-            logger.info(f"Creating cron trigger: hour={hour}, minute={minute}, day_of_week={day_of_week}")
-            return CronTrigger(hour=hour, minute=minute, day_of_week=day_of_week)
             
         except Exception as e:
-            logger.error(f"Error parsing JSON schedule: {e}")
+            logger.error(f"Error parsing schedule '{schedule_setting}': {e}", exc_info=True)
             return None
             
     def _execute_scheduled_analysis(self, expert_instance_id: int, symbol: str, subtype: str = AnalysisUseCase.ENTER_MARKET):

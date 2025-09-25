@@ -297,7 +297,7 @@ class OverviewTab:
             
             try:
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(costs_url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    async with session.get(costs_url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=60)) as response:
                         if response.status == 200:
                             costs_data = await response.json()
                             
