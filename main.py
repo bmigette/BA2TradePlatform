@@ -1,11 +1,16 @@
+import os
 from ba2_trade_platform.core.db import init_db, get_db
 from ba2_trade_platform.core.WorkerQueue import initialize_worker_queue
 from ba2_trade_platform.core.JobManager import get_job_manager
 from ba2_trade_platform.logger import logger
+from ba2_trade_platform.config import LOG_FOLDER
 
 def initialize_system():
     """Initialize the system components."""
     logger.info("Initializing BA2 Trade Platform...")
+    
+    # Create log folder if not exists
+    os.makedirs(LOG_FOLDER, exist_ok=True)
     
     # Initialize database
     init_db()

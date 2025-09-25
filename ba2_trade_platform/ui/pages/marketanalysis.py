@@ -1,12 +1,14 @@
 from nicegui import ui
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
+import math
 
 from ...core.WorkerQueue import get_worker_queue
-from ...core.db import get_all_instances, get_instance
+from ...core.db import get_all_instances, get_instance, get_db
 from ...core.models import MarketAnalysis, ExpertInstance, AnalysisOutput
 from ...core.types import MarketAnalysisStatus, WorkerTaskStatus
 from ...logger import logger
+from sqlmodel import select, func, Session
 
 
 class JobMonitoringTab:
@@ -14,6 +16,13 @@ class JobMonitoringTab:
         self.worker_queue = None  # Lazy initialization
         self.analysis_table = None
         self.refresh_timer = None
+        # Pagination and filtering state
+        self.current_page = 1
+        self.page_size = 25
+        self.total_pages = 1
+        self.total_records = 0
+        self.status_filter = 'all'
+        self.symbol_filter = ''
         self.render()
     
     def _get_worker_queue(self):
@@ -26,13 +35,43 @@ class JobMonitoringTab:
         with ui.card().classes('w-full'):
             ui.label('Market Analysis Job Monitoring').classes('text-lg font-bold')
             
+            # Filters and controls
             with ui.row().classes('w-full justify-between items-center mb-4'):
-                ui.button('Refresh', on_click=self.refresh_data, icon='refresh')
-                with ui.switch('Auto-refresh', value=True) as auto_refresh:
-                    auto_refresh.on_value_change(self.toggle_auto_refresh)
+                with ui.row().classes('gap-4'):
+                    # Status filter
+                    status_options = {
+                        'all': 'All Status',
+                        'pending': '⏳ Pending',
+                        'running': '🔄 Running', 
+                        'completed': '✅ Completed',
+                        'failed': '❌ Failed',
+                        'cancelled': '🚫 Cancelled'
+                    }
+                    self.status_select = ui.select(
+                        options=status_options,
+                        value='all',
+                        label='Status Filter'
+                    ).classes('w-40')
+                    self.status_select.on_value_change(self._on_status_filter_change)
+                    
+                    # Symbol filter
+                    self.symbol_input = ui.input(
+                        'Symbol Filter',
+                        placeholder='e.g., AAPL, MSFT'
+                    ).classes('w-40')
+                    self.symbol_input.on_value_change(self._on_symbol_filter_change)
+                
+                with ui.row().classes('gap-2'):
+                    ui.button('Clear Filters', on_click=self._clear_filters, icon='clear')
+                    ui.button('Refresh', on_click=self.refresh_data, icon='refresh')
+                    with ui.switch('Auto-refresh', value=True) as auto_refresh:
+                        auto_refresh.on_value_change(self.toggle_auto_refresh)
             
             # Analysis jobs table
             self._create_analysis_table()
+            
+            # Pagination controls
+            self._create_pagination_controls()
             
             ui.separator().classes('my-4')
             
@@ -47,23 +86,37 @@ class JobMonitoringTab:
     def _create_analysis_table(self):
         """Create the analysis jobs table."""
         columns = [
-            {'name': 'id', 'label': 'ID', 'field': 'id', 'sortable': True},
-            {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True},
-            {'name': 'expert', 'label': 'Expert', 'field': 'expert_name', 'sortable': True},
-            {'name': 'status', 'label': 'Status', 'field': 'status', 'sortable': True},
-            {'name': 'created_at', 'label': 'Created', 'field': 'created_at_str', 'sortable': True},
-            {'name': 'actions', 'label': 'Actions', 'field': 'actions', 'sortable': False}
+            {'name': 'id', 'label': 'ID', 'field': 'id', 'sortable': True, 'style': 'width: 80px'},
+            {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'style': 'width: 100px'},
+            {'name': 'expert', 'label': 'Expert', 'field': 'expert_name', 'sortable': True, 'style': 'width: 150px'},
+            {'name': 'status', 'label': 'Status', 'field': 'status_display', 'sortable': True, 'style': 'width: 120px'},
+            {'name': 'created_at', 'label': 'Created', 'field': 'created_at_local', 'sortable': True, 'style': 'width: 160px'},
+            {'name': 'subtype', 'label': 'Type', 'field': 'subtype', 'sortable': True, 'style': 'width: 120px'},
+            {'name': 'actions', 'label': 'Actions', 'field': 'actions', 'sortable': False, 'style': 'width: 100px'}
         ]
         
-        analysis_data = self._get_analysis_data()
+        analysis_data, self.total_records = self._get_analysis_data()
+        self.total_pages = max(1, math.ceil(self.total_records / self.page_size))
         
         with ui.card().classes('w-full'):
-            ui.label('Analysis Jobs').classes('text-md font-bold mb-2')
+            with ui.row().classes('w-full justify-between items-center mb-2'):
+                ui.label('Analysis Jobs').classes('text-md font-bold')
+                ui.label(f'Showing {len(analysis_data)} of {self.total_records} records').classes('text-sm text-gray-600')
+            
             self.analysis_table = ui.table(
                 columns=columns, 
                 rows=analysis_data, 
                 row_key='id'
             ).classes('w-full')
+            
+            # Add status icon slot
+            self.analysis_table.add_slot('body-cell-status', '''
+                <q-td :props="props">
+                    <div class="row items-center no-wrap">
+                        <span v-html="props.row.status_display"></span>
+                    </div>
+                </q-td>
+            ''')
             
             # Add action buttons
             self.analysis_table.add_slot('body-cell-actions', '''
@@ -80,7 +133,6 @@ class JobMonitoringTab:
                            :disable="props.row.status === 'running'">
                         <q-tooltip>Cancel Analysis</q-tooltip>
                     </q-btn>
-
                 </q-td>
             ''')
             
@@ -103,50 +155,173 @@ class JobMonitoringTab:
                 ui.label(f"Pending: {queue_info['pending_tasks']}")
                 ui.label(f"Total Tasks: {queue_info['total_tasks']}")
 
-    def _get_analysis_data(self) -> List[dict]:
-        """Get analysis jobs data for the table."""
+    def _get_analysis_data(self) -> tuple[List[dict], int]:
+        """Get analysis jobs data for the table with pagination and filtering."""
         try:
-            # Get all market analysis records
-            market_analyses = get_all_instances(MarketAnalysis)
-            
-            analysis_data = []
-            for analysis in market_analyses:
-                # Get expert instance info
-                expert_instance = get_instance(ExpertInstance, analysis.source_expert_instance_id)
-                expert_name = expert_instance.expert if expert_instance else "Unknown"
+            with Session(get_db().bind) as session:
+                # Build base query
+                statement = select(MarketAnalysis)
                 
-                # Format created timestamp
-                created_str = analysis.created_at.strftime("%Y-%m-%d %H:%M:%S") if analysis.created_at else "Unknown"
+                # Apply status filter
+                if self.status_filter != 'all':
+                    statement = statement.where(MarketAnalysis.status == MarketAnalysisStatus(self.status_filter))
                 
-                # Determine if can cancel
-                can_cancel = analysis.status in [MarketAnalysisStatus.PENDING]
+                # Apply symbol filter
+                if self.symbol_filter.strip():
+                    # Support multiple symbols separated by comma
+                    symbols = [s.strip().upper() for s in self.symbol_filter.split(',') if s.strip()]
+                    if symbols:
+                        statement = statement.where(MarketAnalysis.symbol.in_(symbols))
                 
-                analysis_data.append({
-                    'id': analysis.id,
-                    'symbol': analysis.symbol,
-                    'expert_name': expert_name,
-                    'status': analysis.status.value if analysis.status else 'UNKNOWN',
-                    'created_at_str': created_str,
-                    'can_cancel': can_cancel,
-                    'expert_instance_id': analysis.source_expert_instance_id
-                })
-            
-            # Sort by created date, newest first
-            analysis_data.sort(key=lambda x: x['created_at_str'], reverse=True)
-            return analysis_data
-            
+                # Get total count for pagination
+                count_statement = select(func.count(MarketAnalysis.id))
+                if self.status_filter != 'all':
+                    count_statement = count_statement.where(MarketAnalysis.status == MarketAnalysisStatus(self.status_filter))
+                if self.symbol_filter.strip():
+                    symbols = [s.strip().upper() for s in self.symbol_filter.split(',') if s.strip()]
+                    if symbols:
+                        count_statement = count_statement.where(MarketAnalysis.symbol.in_(symbols))
+                
+                total_count = session.exec(count_statement).first() or 0
+                
+                # Apply ordering and pagination
+                statement = statement.order_by(MarketAnalysis.created_at.desc())
+                offset = (self.current_page - 1) * self.page_size
+                statement = statement.offset(offset).limit(self.page_size)
+                
+                market_analyses = session.exec(statement).all()
+                
+                analysis_data = []
+                for analysis in market_analyses:
+                    # Get expert instance info
+                    expert_instance = get_instance(ExpertInstance, analysis.source_expert_instance_id)
+                    expert_name = expert_instance.expert if expert_instance else "Unknown"
+                    
+                    # Convert UTC to local time for display
+                    local_time = analysis.created_at.replace(tzinfo=timezone.utc).astimezone() if analysis.created_at else None
+                    created_local = local_time.strftime("%Y-%m-%d %H:%M:%S") if local_time else "Unknown"
+                    
+                    # Status with icon
+                    status_icons = {
+                        'pending': '⏳',
+                        'running': '🔄', 
+                        'completed': '✅',
+                        'failed': '❌',
+                        'cancelled': '🚫'
+                    }
+                    status_value = analysis.status.value if analysis.status else 'unknown'
+                    status_icon = status_icons.get(status_value, '❓')
+                    status_display = f'{status_icon} {status_value.title()}'
+                    
+                    # Determine if can cancel
+                    can_cancel = analysis.status in [MarketAnalysisStatus.PENDING]
+                    
+                    # Get subtype display
+                    subtype_display = analysis.subtype.value.replace('_', ' ').title() if analysis.subtype else 'Unknown'
+                    
+                    analysis_data.append({
+                        'id': analysis.id,
+                        'symbol': analysis.symbol,
+                        'expert_name': expert_name,
+                        'status': status_value,
+                        'status_display': status_display,
+                        'created_at_local': created_local,
+                        'subtype': subtype_display,
+                        'can_cancel': can_cancel,
+                        'expert_instance_id': analysis.source_expert_instance_id
+                    })
+                
+                return analysis_data, total_count
+                
         except Exception as e:
-            logger.error(f"Error getting analysis data: {e}")
-            return []
+            logger.error(f"Error getting analysis data: {e}", exc_info=True)
+            return [], 0
+
+    def _create_pagination_controls(self):
+        """Create pagination controls."""
+        if self.total_pages <= 1:
+            return
+            
+        with ui.row().classes('w-full justify-center items-center mt-4 gap-2'):
+            # Previous button
+            prev_btn = ui.button('Previous', 
+                               on_click=lambda: self._change_page(self.current_page - 1),
+                               icon='chevron_left')
+            prev_btn.props('flat')
+            if self.current_page <= 1:
+                prev_btn.props('disable')
+            
+            # Page info
+            ui.label(f'Page {self.current_page} of {self.total_pages}').classes('mx-4')
+            
+            # Next button  
+            next_btn = ui.button('Next',
+                               on_click=lambda: self._change_page(self.current_page + 1),
+                               icon='chevron_right')
+            next_btn.props('flat')
+            if self.current_page >= self.total_pages:
+                next_btn.props('disable')
+            
+            # Page size selector
+            ui.separator().props('vertical').classes('mx-4')
+            page_size_options = {'10': '10 per page', '25': '25 per page', '50': '50 per page', '100': '100 per page'}
+            page_size_select = ui.select(
+                options=page_size_options,
+                value=str(self.page_size),
+                label='Page Size'
+            ).classes('w-32')
+            page_size_select.on_value_change(self._on_page_size_change)
+    
+    def _change_page(self, new_page: int):
+        """Change to a specific page."""
+        if 1 <= new_page <= self.total_pages:
+            self.current_page = new_page
+            self.refresh_data()
+    
+    def _on_page_size_change(self, event):
+        """Handle page size change."""
+        try:
+            new_size = int(event.value)
+            self.page_size = new_size
+            self.current_page = 1  # Reset to first page
+            self.refresh_data()
+        except ValueError:
+            pass
+    
+    def _on_status_filter_change(self, event):
+        """Handle status filter change."""
+        self.status_filter = event.value
+        self.current_page = 1  # Reset to first page when filtering
+        self.refresh_data()
+    
+    def _on_symbol_filter_change(self, event):
+        """Handle symbol filter change."""
+        self.symbol_filter = event.value
+        self.current_page = 1  # Reset to first page when filtering
+        self.refresh_data()
+    
+    def _clear_filters(self):
+        """Clear all filters."""
+        self.status_filter = 'all'
+        self.symbol_filter = ''
+        self.current_page = 1
+        if hasattr(self, 'status_select'):
+            self.status_select.value = 'all'
+        if hasattr(self, 'symbol_input'):
+            self.symbol_input.value = ''
+        self.refresh_data()
 
     def _get_queue_info(self) -> dict:
         """Get worker queue information."""
         try:
             worker_queue = self._get_worker_queue()
             worker_count = worker_queue.get_worker_count()
-            running_tasks = len([t for t in worker_queue.get_all_tasks() if t.status == WorkerTaskStatus.RUNNING])
-            pending_tasks = len([t for t in worker_queue.get_all_tasks() if t.status == WorkerTaskStatus.PENDING])
-            total_tasks = len(worker_queue.get_all_tasks())
+            all_tasks = worker_queue.get_all_tasks()
+            
+            # Filter tasks safely, checking if they have status attribute
+            running_tasks = len([t for t in all_tasks if hasattr(t, 'status') and t.status == WorkerTaskStatus.RUNNING])
+            pending_tasks = len([t for t in all_tasks if hasattr(t, 'status') and t.status == WorkerTaskStatus.PENDING])
+            total_tasks = len(all_tasks)
             
             return {
                 'worker_count': worker_count,
@@ -155,7 +330,7 @@ class JobMonitoringTab:
                 'total_tasks': total_tasks
             }
         except Exception as e:
-            logger.error(f"Error getting queue info: {e}")
+            logger.error(f"Error getting queue info: {e}", exc_info=True)
             return {
                 'worker_count': 0,
                 'running_tasks': 0,
@@ -165,15 +340,23 @@ class JobMonitoringTab:
 
     def cancel_analysis(self, event_data):
         """Cancel an analysis job."""
+        analysis_id = None
         try:
             # Extract analysis_id from event data
             # NiceGUI passes GenericEventArguments with args attribute
-            if hasattr(event_data, 'args') and len(event_data.args) > 0:
-                analysis_id = int(event_data.args[0])
+            if hasattr(event_data, 'args'):
+                if hasattr(event_data.args, '__len__') and len(event_data.args) > 0:
+                    analysis_id = int(event_data.args[0])
+                elif isinstance(event_data.args, int):
+                    analysis_id = event_data.args
+                else:
+                    logger.error(f"Invalid event data args for cancel_analysis: {event_data.args}", exc_info=True)
+                    ui.notify("Invalid event data", type='negative')
+                    return
             elif isinstance(event_data, int):
                 analysis_id = event_data
             else:
-                logger.error(f"Invalid event data for cancel_analysis: {event_data}")
+                logger.error(f"Invalid event data for cancel_analysis: {event_data}", exc_info=True)
                 ui.notify("Invalid event data", type='negative')
                 return
             
@@ -202,7 +385,7 @@ class JobMonitoringTab:
                 ui.notify("Failed to cancel analysis - task may already be running", type='warning')
                 
         except Exception as e:
-            logger.error(f"Error cancelling analysis {analysis_id}: {e}")
+            logger.error(f"Error cancelling analysis {analysis_id if analysis_id else 'unknown'}: {e}", exc_info=True)
             ui.notify(f"Error cancelling analysis: {str(e)}", type='negative')
 
 
@@ -219,7 +402,7 @@ class JobMonitoringTab:
             elif hasattr(event_data, 'args') and isinstance(event_data.args, int):
                 analysis_id = event_data.args
             else:
-                logger.error(f"Invalid event data for view_analysis_details: {event_data}")
+                logger.error(f"Invalid event data for view_analysis_details: {event_data}", exc_info=True)
                 ui.notify("Invalid event data", type='negative')
                 return
             
@@ -227,21 +410,31 @@ class JobMonitoringTab:
             ui.navigate.to(f'/market_analysis/{analysis_id}')
             
         except Exception as e:
-            logger.error(f"Error navigating to analysis details {analysis_id if analysis_id else 'unknown'}: {e}")
+            logger.error(f"Error navigating to analysis details {analysis_id if analysis_id else 'unknown'}: {e}", exc_info=True)
             ui.notify(f"Error opening details: {str(e)}", type='negative')
 
     def refresh_data(self):
         """Refresh the data in all tables."""
         try:
-            # Update analysis table
+            # Update analysis table with pagination
             if self.analysis_table:
-                self.analysis_table.rows = self._get_analysis_data()
+                analysis_data, self.total_records = self._get_analysis_data()
+                self.total_pages = max(1, math.ceil(self.total_records / self.page_size))
+                
+                # Ensure current page is valid
+                if self.current_page > self.total_pages:
+                    self.current_page = max(1, self.total_pages)
+                
+                self.analysis_table.rows = analysis_data
                 self.analysis_table.update()
+                
+                # Re-create pagination controls to update button states
+                # Note: In a real app, you'd want to update controls more efficiently
             
             #logger.debug("Job monitoring data refreshed")
             
         except Exception as e:
-            logger.error(f"Error refreshing job monitoring data: {e}")
+            logger.error(f"Error refreshing job monitoring data: {e}", exc_info=True)
 
     def toggle_auto_refresh(self, enabled: bool):
         """Toggle auto-refresh on/off."""
@@ -320,7 +513,7 @@ class ManualAnalysisTab:
                 ui.notify("Analysis already pending for this symbol and expert", type='warning')
                 
         except Exception as e:
-            logger.error(f"Error submitting manual analysis: {e}")
+            logger.error(f"Error submitting manual analysis: {e}", exc_info=True)
             ui.notify(f"Error submitting analysis: {str(e)}", type='negative')
 
 
@@ -469,7 +662,7 @@ class ScheduledJobsTab:
                             }
                 
                 except Exception as e:
-                    logger.error(f"Error processing schedule for expert instance {expert_instance.id}: {e}")
+                    logger.error(f"Error processing schedule for expert instance {expert_instance.id}: {e}", exc_info=True)
                     continue
             
             # Convert to list and sort by expert name, then symbol
@@ -479,7 +672,7 @@ class ScheduledJobsTab:
             return scheduled_jobs
             
         except Exception as e:
-            logger.error(f"Error getting scheduled jobs data: {e}")
+            logger.error(f"Error getting scheduled jobs data: {e}", exc_info=True)
             return []
 
     def run_analysis_now(self, event_data):
@@ -496,7 +689,7 @@ class ScheduledJobsTab:
                 symbol = str(event_data[1])
                 subtype = str(event_data[2])
             else:
-                logger.error(f"Invalid event data for run_analysis_now: {event_data}")
+                logger.error(f"Invalid event data for run_analysis_now: {event_data}", exc_info=True)
                 ui.notify("Invalid event data - missing subtype", type='negative')
                 return
             
@@ -511,7 +704,7 @@ class ScheduledJobsTab:
                 ui.notify("Analysis already pending for this symbol and expert", type='warning')
                 
         except Exception as e:
-            logger.error(f"Error running analysis now: {e}")
+            logger.error(f"Error running analysis now: {e}", exc_info=True)
             ui.notify(f"Error starting analysis: {str(e)}", type='negative')
 
     def refresh_data(self):
@@ -524,7 +717,7 @@ class ScheduledJobsTab:
             #logger.debug("Scheduled jobs data refreshed")
             
         except Exception as e:
-            logger.error(f"Error refreshing scheduled jobs data: {e}")
+            logger.error(f"Error refreshing scheduled jobs data: {e}", exc_info=True)
 
     def toggle_auto_refresh(self, enabled: bool):
         """Toggle auto-refresh on/off."""

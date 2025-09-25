@@ -207,7 +207,7 @@ class GraphSetup:
         )
 
         # Add Final Summarization Agent as the last step
-        from .summarization import create_final_summarization_agent
+        from ..agents.summarization import create_final_summarization_agent
         final_summarization_node = create_final_summarization_agent(self.quick_thinking_llm)
         workflow.add_node("Final Summarization", final_summarization_node)
         

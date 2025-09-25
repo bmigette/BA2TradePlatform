@@ -1,6 +1,7 @@
 import chromadb
 from chromadb.config import Settings
 from openai import OpenAI
+from ... import logger as ta_logger
 
 
 class FinancialSituationMemory:
@@ -30,6 +31,7 @@ class FinancialSituationMemory:
         else:
             # Fallback for backward compatibility
             from datetime import datetime
+
             date_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
             collection_name = f"{name}_{date_suffix}"
         
@@ -41,12 +43,21 @@ class FinancialSituationMemory:
 
     def get_embedding(self, text):
         """Get OpenAI embedding for a text"""
+        # Truncate text if it exceeds the model's token limit
+        # text-embedding-ada-002 has a max context length of 8192 tokens
+        # Conservative estimate: ~3 characters per token for safety margin
+        #EmbeddingModel: TypeAlias = Literal["text-embedding-ada-002", "text-embedding-3-small", "text-embedding-3-large"]
+        max_chars = 24000  # ~8000 tokens * 3 chars/token
+        if len(text) > max_chars:
+            # Take first part and last part to preserve both beginning and end context
+            half_chars = max_chars // 2
+            text = text[:half_chars] + "\n...[TRUNCATED]...\n" + text[-half_chars:]
+            ta_logger.warning(f"Text truncated to ~{max_chars} characters for embedding")
         
         response = self.client.embeddings.create(
-            model=self.embedding, input=text
+            model="text-embedding-3-small", input=text
         )
         return response.data[0].embedding
-
     def add_situations(self, situations_and_advice):
         """Add financial situations and their corresponding advice. Parameter is a list of tuples (situation, rec)"""
 

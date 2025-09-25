@@ -9,6 +9,7 @@ from ...core.types import MarketAnalysisStatus, OrderRecommendation, RiskLevel, 
 from ...logger import logger
 from ...thirdparties.TradingAgents.tradingagents.graph.trading_graph import TradingAgentsGraph
 from ...thirdparties.TradingAgents.tradingagents.default_config import DEFAULT_CONFIG
+from ...thirdparties.TradingAgents.tradingagents.db_storage import update_market_analysis_status
 
 
 class TradingAgents(MarketExpertInterface):
@@ -336,7 +337,6 @@ Analysis completed at: {self._get_current_timestamp()}"""
                              final_state: Dict, processed_signal: str, recommendation_id: int) -> None:
         """Store analysis results in MarketAnalysis state using proper state merging."""
         # Import database update function
-        from ...thirdparties.TradingAgents.tradingagents.db_storage import update_market_analysis_status
         
         prediction_result = {
             'instrument': market_analysis.symbol,
@@ -358,7 +358,7 @@ Analysis completed at: {self._get_current_timestamp()}"""
             'prediction_result': prediction_result,
             'analysis_timestamp': self._get_current_timestamp(),
             'expert_settings': self.settings,
-            'final_state': final_state,
+            'final_state': self._clean_state_for_json_storage(final_state),
             'processed_signal': processed_signal,
             'tradingagents_mode': True
         }

@@ -58,12 +58,8 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         self.market_analysis_id = market_analysis_id
 
         # Initialize logger
-        # Use BA2 platform logs directory by default
-        try:
-            from ba2_trade_platform import config as ba2_config
-            default_log_dir = os.path.join(ba2_config.HOME, "logs")
-        except ImportError:
-            default_log_dir = "."
+        # Use LOG_FOLDER from BA2 platform config
+        from ba2_trade_platform import config as ba2_config
         
         # Get expert_instance_id from market_analysis if available (for logging)
         expert_instance_id_for_logging = None
@@ -77,7 +73,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             except Exception as e:
                 ta_logger.warning(f"Could not get expert_instance_id from market_analysis: {e}")
         
-        ta_logger.init_logger(expert_instance_id_for_logging, self.config.get("log_dir", default_log_dir))
+        ta_logger.init_logger(expert_instance_id_for_logging, ba2_config.LOG_FOLDER)
         ta_logger.info(f"Initializing TradingAgentsGraph with market_analysis_id={market_analysis_id}, expert_instance_id={expert_instance_id_for_logging}")
 
         # Update the interface's config
@@ -446,7 +442,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             return final_state, self.process_signal(final_state["final_trade_decision"])
             
         except Exception as e:
-            ta_logger.error(f"Error during analysis for {company_name}: {str(e)}")
+            ta_logger.error(f"Error during analysis for {company_name}: {str(e)}", exc_info=True)
             if self.market_analysis_id:
                 # Sync error state to MarketAnalysis
                 error_state = {

@@ -3,6 +3,7 @@ import os
 from dotenv import load_dotenv
 HOME = os.path.abspath(os.path.join(os.path.dirname(__file__))) 
 HOME_PARENT = os.path.abspath(os.path.join(HOME, "..")) 
+LOG_FOLDER = os.path.join(HOME_PARENT, 'logs')
 #https://alpaca.markets/learn/connect-to-alpaca-api
 
 STDOUT_LOGGING = True

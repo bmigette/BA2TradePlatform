@@ -1,7 +1,7 @@
 from nicegui import ui
 from typing import Optional, Dict, Any, List
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 from ...core.db import get_instance, get_db
 from ...core.models import MarketAnalysis, ExpertInstance, AnalysisOutput, Instrument
@@ -92,7 +92,14 @@ def content(analysis_id: int) -> None:
                     # Analysis details
                     ui.label(f'Expert: {expert_instance.expert} (ID: {expert_instance.id})').classes('text-subtitle1 text-grey-7 mt-2')
                     ui.label(f'Status: {market_analysis.status.value if market_analysis.status else "Unknown"}').classes('text-subtitle2')
-                    ui.label(f'Created: {market_analysis.created_at.strftime("%Y-%m-%d %H:%M:%S") if market_analysis.created_at else "Unknown"}').classes('text-subtitle2')
+                    
+                    # Convert UTC to local time for display
+                    if market_analysis.created_at:
+                        local_time = market_analysis.created_at.replace(tzinfo=timezone.utc).astimezone()
+                        created_display = local_time.strftime("%Y-%m-%d %H:%M:%S %Z")
+                    else:
+                        created_display = "Unknown"
+                    ui.label(f'Created: {created_display}').classes('text-subtitle2')
                 
                 ui.button('Back to Market Analysis', on_click=lambda: ui.navigate.to('/marketanalysis'), icon='arrow_back')
         

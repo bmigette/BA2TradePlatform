@@ -78,18 +78,13 @@ class TradingAgentsLogger:
         
         Args:
             expert_id: Expert instance ID for log file naming
-            log_dir: Directory to store log files (defaults to BA2 platform logs directory)
+            log_dir: Directory to store log files (uses LOG_FOLDER from config.py)
         """
         self.expert_id = expert_id
         
-        # Use BA2 platform logs directory by default
+        # Use LOG_FOLDER from BA2 platform config
         if log_dir is None:
-            try:
-                # Try to use BA2 platform's logs directory
-                self.log_dir = os.path.join(ba2_config.HOME_PARENT, "logs")
-            except (AttributeError, ImportError):
-                # Fallback to current directory if BA2 config not available
-                self.log_dir = "."
+            self.log_dir = ba2_config.LOG_FOLDER
         else:
             self.log_dir = log_dir
         
