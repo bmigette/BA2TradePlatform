@@ -208,3 +208,179 @@ def get_setting(key: str) -> str | None:
     except Exception as e:
         logger.error(f"Error retrieving setting {key}: {e}", exc_info=True)
         return None
+
+
+def reorder_ruleset_rules(ruleset_id: int, rule_order: list[int]) -> bool:
+    """
+    Reorder the rules in a ruleset by updating the order_index field.
+    
+    Args:
+        ruleset_id: The ID of the ruleset to reorder
+        rule_order: List of eventaction_ids in the desired order
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        from .models import RulesetEventActionLink
+        with Session(engine) as session:
+            # Update each link with its new order index
+            for index, eventaction_id in enumerate(rule_order):
+                # Use SQLAlchemy Core update for better performance and compatibility
+                from sqlalchemy import update
+                stmt = update(RulesetEventActionLink).where(
+                    RulesetEventActionLink.ruleset_id == ruleset_id,
+                    RulesetEventActionLink.eventaction_id == eventaction_id
+                ).values(order_index=index)
+                
+                result = session.execute(stmt)
+                if result.rowcount == 0:
+                    logger.error(f"Link not found for ruleset {ruleset_id}, eventaction {eventaction_id}")
+                    return False
+            
+            session.commit()
+            logger.info(f"Reordered rules for ruleset {ruleset_id}")
+            return True
+            
+    except Exception as e:
+        logger.error(f"Error reordering ruleset rules: {e}", exc_info=True)
+        return False
+
+
+def move_rule_up(ruleset_id: int, eventaction_id: int) -> bool:
+    """
+    Move a rule up one position in the ruleset order.
+    
+    Args:
+        ruleset_id: The ID of the ruleset
+        eventaction_id: The ID of the eventaction to move up
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        from .models import RulesetEventActionLink
+        from sqlalchemy import update
+        with Session(engine) as session:
+            # Get the current order index
+            current_result = session.exec(
+                select(RulesetEventActionLink.order_index).where(
+                    RulesetEventActionLink.ruleset_id == ruleset_id,
+                    RulesetEventActionLink.eventaction_id == eventaction_id
+                )
+            ).first()
+            
+            if not current_result or current_result == 0:
+                return False  # Already at top or not found
+            
+            current_order = current_result
+            target_order = current_order - 1
+            
+            # Get the eventaction_id that's currently at the target position
+            above_result = session.exec(
+                select(RulesetEventActionLink.eventaction_id).where(
+                    RulesetEventActionLink.ruleset_id == ruleset_id,
+                    RulesetEventActionLink.order_index == target_order
+                )
+            ).first()
+            
+            if above_result:
+                # Swap the order indexes using SQLAlchemy Core updates
+                # Move current rule to target position
+                stmt1 = update(RulesetEventActionLink).where(
+                    RulesetEventActionLink.ruleset_id == ruleset_id,
+                    RulesetEventActionLink.eventaction_id == eventaction_id
+                ).values(order_index=target_order)
+                
+                # Move above rule to current position
+                stmt2 = update(RulesetEventActionLink).where(
+                    RulesetEventActionLink.ruleset_id == ruleset_id,
+                    RulesetEventActionLink.eventaction_id == above_result
+                ).values(order_index=current_order)
+                
+                session.execute(stmt1)
+                session.execute(stmt2)
+                session.commit()
+                logger.info(f"Moved rule {eventaction_id} up in ruleset {ruleset_id}")
+                return True
+            
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error moving rule up: {e}", exc_info=True)
+        return False
+
+
+def move_rule_down(ruleset_id: int, eventaction_id: int) -> bool:
+    """
+    Move a rule down one position in the ruleset order.
+    
+    Args:
+        ruleset_id: The ID of the ruleset
+        eventaction_id: The ID of the eventaction to move down
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        from .models import RulesetEventActionLink
+        from sqlalchemy import update
+        with Session(engine) as session:
+            # Get the current order index
+            current_result = session.exec(
+                select(RulesetEventActionLink.order_index).where(
+                    RulesetEventActionLink.ruleset_id == ruleset_id,
+                    RulesetEventActionLink.eventaction_id == eventaction_id
+                )
+            ).first()
+            
+            if not current_result:
+                return False  # Not found
+            
+            current_order = current_result
+            
+            # Get the max order index for this ruleset
+            max_order = session.exec(
+                select(RulesetEventActionLink.order_index).where(
+                    RulesetEventActionLink.ruleset_id == ruleset_id
+                ).order_by(RulesetEventActionLink.order_index.desc())
+            ).first()
+            
+            if not max_order or current_order >= max_order:
+                return False  # Already at bottom
+            
+            target_order = current_order + 1
+            
+            # Get the eventaction_id that's currently at the target position
+            below_result = session.exec(
+                select(RulesetEventActionLink.eventaction_id).where(
+                    RulesetEventActionLink.ruleset_id == ruleset_id,
+                    RulesetEventActionLink.order_index == target_order
+                )
+            ).first()
+            
+            if below_result:
+                # Swap the order indexes using SQLAlchemy Core updates
+                # Move current rule to target position
+                stmt1 = update(RulesetEventActionLink).where(
+                    RulesetEventActionLink.ruleset_id == ruleset_id,
+                    RulesetEventActionLink.eventaction_id == eventaction_id
+                ).values(order_index=target_order)
+                
+                # Move below rule to current position
+                stmt2 = update(RulesetEventActionLink).where(
+                    RulesetEventActionLink.ruleset_id == ruleset_id,
+                    RulesetEventActionLink.eventaction_id == below_result
+                ).values(order_index=current_order)
+                
+                session.execute(stmt1)
+                session.execute(stmt2)
+                session.commit()
+                logger.info(f"Moved rule {eventaction_id} down in ruleset {ruleset_id}")
+                return True
+            
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error moving rule down: {e}", exc_info=True)
+        return False

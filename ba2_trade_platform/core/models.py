@@ -11,6 +11,7 @@ class RulesetEventActionLink(SQLModel, table=True):
     
     ruleset_id: int = Field(foreign_key="ruleset.id", primary_key=True)
     eventaction_id: int = Field(foreign_key="eventaction.id", primary_key=True)
+    order_index: int = Field(default=0, description="Order of the rule in the ruleset (0-based)")
 
 class AppSetting(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
@@ -58,10 +59,11 @@ class Ruleset(SQLModel, table=True):
     description: str | None = Field(default=None)
     type: ExpertEventRuleType = Field(default=ExpertEventRuleType.TRADING_RECOMMENDATION_RULE)
     subtype: AnalysisUseCase | None = Field(default=None)
-    # Many-to-many relationship with EventAction
+    # Many-to-many relationship with EventAction (ordered by order_index)
     event_actions: List["EventAction"] = Relationship(
         back_populates="rulesets", 
-        link_model=RulesetEventActionLink
+        link_model=RulesetEventActionLink,
+        sa_relationship_kwargs={"order_by": "RulesetEventActionLink.order_index"}
     )
 
 

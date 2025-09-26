@@ -1757,6 +1757,7 @@ class TradeSettingsTab:
         logger.debug('Initializing TradeSettingsTab')
         self.rules_dialog = ui.dialog()
         self.rulesets_dialog = ui.dialog()
+        self.reorder_dialog = ui.dialog()
         self.rules_table = None
         self.rulesets_table = None
         self.triggers = {}
@@ -1831,14 +1832,14 @@ class TradeSettingsTab:
                     
                     self.rulesets_table.add_slot('body-cell-actions', """
                         <q-td :props="props">
-                            <q-btn @click="$parent.$emit('test', props)" icon="science" flat dense color='green' title="Test Ruleset"/>
                             <q-btn @click="$parent.$emit('edit', props)" icon="edit" flat dense color='blue' title="Edit Ruleset"/>
+                            <q-btn @click="$parent.$emit('reorder', props)" icon="reorder" flat dense color='purple' title="Reorder Rules"/>
                             <q-btn @click="$parent.$emit('del', props)" icon="delete" flat dense color='red' title="Delete Ruleset"/>
                         </q-td>
                     """)
                     
-                    self.rulesets_table.on('test', self._on_ruleset_test_click)
                     self.rulesets_table.on('edit', self._on_ruleset_edit_click)
+                    self.rulesets_table.on('reorder', self._on_ruleset_reorder_click)
                     self.rulesets_table.on('del', self._on_ruleset_del_click)
         
         logger.debug('TradeSettingsTab UI rendered')
@@ -2241,12 +2242,22 @@ class TradeSettingsTab:
                 else:
                     self.selected_rules = {}
                     
+                    # Get currently selected rule IDs if editing
+                    selected_rule_ids = set()
+                    if is_edit:
+                        session = get_db()
+                        from sqlmodel import select
+                        from ...core.models import RulesetEventActionLink
+                        stmt = select(RulesetEventActionLink).where(RulesetEventActionLink.ruleset_id == ruleset.id)
+                        links = session.exec(stmt).all()
+                        selected_rule_ids = {link.eventaction_id for link in links}
+                        logger.debug(f'Loaded selected rule IDs for ruleset {ruleset.id}: {selected_rule_ids}')
+                        session.close()
+                    
                     with ui.column().classes('w-full').style('max-height: 400px; overflow-y: auto') as rules_container:
                         for rule in available_rules:
                             # Check if rule is currently associated with this ruleset
-                            is_selected = False
-                            if is_edit and ruleset.event_actions:
-                                is_selected = rule.id in [r.id for r in ruleset.event_actions]
+                            is_selected = rule.id in selected_rule_ids
                             
                             with ui.card().classes('w-full p-4 mb-2'):
                                 with ui.row().classes('w-full items-center'):
@@ -2302,9 +2313,9 @@ class TradeSettingsTab:
                 stmt = delete(RulesetEventActionLink).where(RulesetEventActionLink.ruleset_id == ruleset.id)
                 session.exec(stmt)
                 
-                # Add new associations
-                for rule_id in selected_rule_ids:
-                    link = RulesetEventActionLink(ruleset_id=ruleset.id, eventaction_id=rule_id)
+                # Add new associations with proper ordering
+                for order_index, rule_id in enumerate(selected_rule_ids):
+                    link = RulesetEventActionLink(ruleset_id=ruleset.id, eventaction_id=rule_id, order_index=order_index)
                     session.add(link)
                 
                 session.commit()
@@ -2320,12 +2331,12 @@ class TradeSettingsTab:
                 
                 ruleset_id = add_instance(new_ruleset)
                 
-                # Add rule associations
+                # Add rule associations with proper ordering
                 if selected_rule_ids:
                     session = get_db()
-                    for rule_id in selected_rule_ids:
+                    for order_index, rule_id in enumerate(selected_rule_ids):
                         from ...core.models import RulesetEventActionLink
-                        link = RulesetEventActionLink(ruleset_id=ruleset_id, eventaction_id=rule_id)
+                        link = RulesetEventActionLink(ruleset_id=ruleset_id, eventaction_id=rule_id, order_index=order_index)
                         session.add(link)
                     session.commit()
                     session.close()
@@ -2374,17 +2385,6 @@ class TradeSettingsTab:
             logger.warning(f'Rule with id {rule_id} not found')
             ui.notify('Rule not found', type='error')
     
-    def _on_ruleset_test_click(self, msg):
-        """Handle test button click for rulesets."""
-        logger.debug(f'Test ruleset table click: {msg}')
-        row = msg.args['row']
-        ruleset_id = row['id']
-        ruleset_name = row['name']
-        
-        # Navigate to ruleset test page with the selected ruleset
-        logger.info(f'Navigating to ruleset test page for ruleset: {ruleset_name} (ID: {ruleset_id})')
-        ui.navigate.to(f'/rulesettest?ruleset_id={ruleset_id}')
-    
     def _on_ruleset_edit_click(self, msg):
         """Handle edit button click for rulesets."""
         logger.debug(f'Edit ruleset table click: {msg}')
@@ -2426,6 +2426,118 @@ class TradeSettingsTab:
         else:
             logger.warning(f'Ruleset with id {ruleset_id} not found')
             ui.notify('Ruleset not found', type='error')
+    
+    def _on_ruleset_reorder_click(self, msg):
+        """Handle reorder button click for rulesets."""
+        logger.debug(f'Reorder ruleset table click: {msg}')
+        row = msg.args['row']
+        ruleset_id = row['id']
+        self.show_reorder_dialog(ruleset_id)
+    
+    def show_reorder_dialog(self, ruleset_id):
+        """Show the ruleset reorder dialog."""
+        logger.debug(f'Showing reorder dialog for ruleset: {ruleset_id}')
+        
+        # Get the ruleset and its rules with ordering
+        ruleset = get_instance(Ruleset, ruleset_id)
+        if not ruleset:
+            ui.notify('Ruleset not found', type='error')
+            return
+        
+        # Get rules ordered by order_index
+        session = get_db()
+        from sqlmodel import select
+        from sqlalchemy.orm import selectinload
+        from ...core.models import RulesetEventActionLink
+        
+        # Get the link table entries with their order
+        links_stmt = select(RulesetEventActionLink).where(
+            RulesetEventActionLink.ruleset_id == ruleset_id
+        ).order_by(RulesetEventActionLink.order_index)
+        links = session.exec(links_stmt).all()
+        
+        # Get the corresponding EventActions
+        rules = []
+        for link in links:
+            rule = get_instance(EventAction, link.eventaction_id)
+            if rule:
+                rules.append({
+                    'id': rule.id,
+                    'name': rule.name,
+                    'description': f"{rule.type.value} - {rule.subtype}" if rule.type else rule.subtype,
+                    'order_index': link.order_index
+                })
+        
+        session.close()
+        
+        with self.reorder_dialog:
+            self.reorder_dialog.clear()
+            
+            with ui.card().classes('w-96'):
+                ui.label(f'Reorder Rules for: {ruleset.name}').classes('text-h6 mb-4')
+                ui.label('Use the up/down arrows to reorder the rules.').classes('text-grey-7 mb-4')
+                
+                # Create a container for the rule list
+                rule_list_container = ui.column().classes('w-full')
+                
+                def update_rule_list():
+                    """Update the rule list display."""
+                    rule_list_container.clear()
+                    
+                    for i, rule in enumerate(rules):
+                        with rule_list_container:
+                            with ui.row().classes('w-full items-center mb-2'):
+                                with ui.column().classes('flex-grow'):
+                                    ui.label(rule['name']).classes('font-bold')
+                                    ui.label(rule['description']).classes('text-sm text-grey-7')
+                                
+                                with ui.row().classes('gap-1'):
+                                    ui.button('↑', on_click=lambda idx=i: move_rule_up(idx)).props('dense flat').classes('w-8 h-8').set_enabled(i > 0)
+                                    ui.button('↓', on_click=lambda idx=i: move_rule_down(idx)).props('dense flat').classes('w-8 h-8').set_enabled(i < len(rules) - 1)
+                
+                def move_rule_up(index):
+                    """Move rule up in the list."""
+                    if index > 0:
+                        rules[index], rules[index - 1] = rules[index - 1], rules[index]
+                        update_rule_list()
+                
+                def move_rule_down(index):
+                    """Move rule down in the list."""
+                    if index < len(rules) - 1:
+                        rules[index], rules[index + 1] = rules[index + 1], rules[index]
+                        update_rule_list()
+                
+                def save_order():
+                    """Save the new rule order to the database."""
+                    try:
+                        # Create the new order list (just the rule IDs)
+                        new_order = [rule['id'] for rule in rules]
+                        
+                        # Import and use the reordering function
+                        from ...core.db import reorder_ruleset_rules
+                        success = reorder_ruleset_rules(ruleset_id, new_order)
+                        
+                        if success:
+                            ui.notify('Rule order updated successfully', type='positive')
+                            self.reorder_dialog.close()
+                            # Refresh the rulesets table (rules count might change display)
+                            self._update_rulesets_table()
+                        else:
+                            ui.notify('Failed to update rule order', type='negative')
+                            
+                    except Exception as e:
+                        logger.error(f'Error saving rule order: {e}', exc_info=True)
+                        ui.notify(f'Error saving order: {e}', type='negative')
+                
+                # Initial population of the list
+                update_rule_list()
+                
+                # Dialog buttons
+                with ui.row().classes('justify-end gap-2 mt-4'):
+                    ui.button('Cancel', on_click=self.reorder_dialog.close).props('flat')
+                    ui.button('Save Order', on_click=save_order, color='primary')
+        
+        self.reorder_dialog.open()
 
 
 def content() -> None:
