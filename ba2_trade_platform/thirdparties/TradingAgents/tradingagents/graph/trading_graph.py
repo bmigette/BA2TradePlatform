@@ -476,19 +476,11 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             ta_logger.info(f"Graph-Generated Recommendation JSON for {symbol}: {json.dumps(recommendation, indent=2)}")
             
             # Store recommendation in database
-            from ba2_trade_platform.core.db import add_instance
-            from ba2_trade_platform.core.models import ExpertRecommendation
-            from ba2_trade_platform.core.types import OrderRecommendation, RiskLevel, TimeHorizon
+            # Note: ExpertRecommendation creation is handled by the higher-level TradingAgents.py
+            # to avoid duplicate database entries. The recommendation data is returned via the final_state
+            # and processed by TradingAgents._create_expert_recommendation()
             
-            # Map recommendation action to OrderRecommendation enum
-            action_mapping = {
-                "BUY": OrderRecommendation.BUY,
-                "SELL": OrderRecommendation.SELL,
-                "HOLD": OrderRecommendation.HOLD,
-                "ERROR": OrderRecommendation.ERROR
-            }
-            
-            # Get expert_instance_id from market_analysis
+            # Get expert_instance_id from market_analysis for logging purposes
             expert_instance_id = None
             if self.market_analysis_id:
                 try:
@@ -501,35 +493,9 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                     ta_logger.warning(f"Could not get expert_instance_id from market_analysis: {e}")
             
             if expert_instance_id:
-                # Map risk level and time horizon from recommendation
-                risk_level_mapping = {
-                    "LOW": RiskLevel.LOW,
-                    "MEDIUM": RiskLevel.MEDIUM,
-                    "HIGH": RiskLevel.HIGH
-                }
-                time_horizon_mapping = {
-                    "SHORT_TERM": TimeHorizon.SHORT_TERM,
-                    "MEDIUM_TERM": TimeHorizon.MEDIUM_TERM,
-                    "LONG_TERM": TimeHorizon.LONG_TERM
-                }
-                
-                expert_rec = ExpertRecommendation(
-                    instance_id=expert_instance_id,
-                    market_analysis_id=self.market_analysis_id,
-                    symbol=recommendation["symbol"],
-                    recommended_action=action_mapping.get(recommendation["recommended_action"], OrderRecommendation.HOLD),
-                    expected_profit_percent=recommendation["expected_profit_percent"],
-                    price_at_date=recommendation["price_at_date"],
-                    details=recommendation["details"],
-                    confidence=recommendation["confidence"],
-                    risk_level=risk_level_mapping.get(recommendation.get("risk_level", "MEDIUM"), RiskLevel.MEDIUM),
-                    time_horizon=time_horizon_mapping.get(recommendation.get("time_horizon", "MEDIUM_TERM"), TimeHorizon.MEDIUM_TERM)
-                )
-                
-                rec_id = add_instance(expert_rec)
-                ta_logger.info(f"Created ExpertRecommendation record with ID: {rec_id}")
+                ta_logger.info(f"Expert recommendation data will be processed by TradingAgents.py for expert_instance_id: {expert_instance_id}")
             else:
-                ta_logger.warning("No expert_instance_id available, skipping ExpertRecommendation creation")
+                ta_logger.warning("No expert_instance_id available, ExpertRecommendation creation will be handled by TradingAgents.py")
                 
             # Also store as analysis output
             if self.market_analysis_id:

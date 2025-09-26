@@ -522,6 +522,12 @@ class JobManager:
         try:
             logger.info(f"Executing scheduled analysis: expert={expert_instance_id}, symbol={symbol}, subtype={subtype}")
             
+            # For OPEN_POSITIONS analysis, only proceed if there are actual open positions for this symbol
+            if subtype == AnalysisUseCase.OPEN_POSITIONS:
+                if not self._has_open_positions_for_symbol(expert_instance_id, symbol):
+                    logger.debug(f"Skipping OPEN_POSITIONS analysis for expert {expert_instance_id}, symbol {symbol}: no open positions found")
+                    return
+            
             # Submit to worker queue with low priority (higher number = lower priority)
             task_id = self.submit_market_analysis(
                 expert_instance_id=expert_instance_id,
@@ -540,6 +546,49 @@ class JobManager:
                 logger.error(f"ValueError in scheduled analysis for expert {expert_instance_id}, symbol {symbol}, subtype {subtype}: {e}", exc_info=True)
         except Exception as e:
             logger.error(f"Error executing scheduled analysis for expert {expert_instance_id}, symbol {symbol}, subtype {subtype}: {e}", exc_info=True)
+    
+    def _has_open_positions_for_symbol(self, expert_instance_id: int, symbol: str) -> bool:
+        """Check if there are open positions for a specific expert and symbol."""
+        try:
+            from sqlmodel import select, Session
+            from .db import get_db
+            from .models import TradingOrder, ExpertInstance
+            from .types import OrderStatus
+            
+            # Get the expert instance to find its account
+            expert_instance = get_instance(ExpertInstance, expert_instance_id)
+            if not expert_instance:
+                logger.warning(f"Expert instance {expert_instance_id} not found")
+                return False
+            
+            with Session(get_db().bind) as session:
+                # Check for open orders that indicate positions for this symbol and account
+                statement = select(TradingOrder).where(
+                    TradingOrder.symbol == symbol,
+                    TradingOrder.comment.contains(f"expert_{expert_instance.expert}-{expert_instance_id}_"),
+                    TradingOrder.status.in_([OrderStatus.FULFILLED, OrderStatus.OPEN])
+                )
+                orders = session.exec(statement).all()
+                
+                # Calculate net position from fulfilled orders
+                net_position = 0
+                for order in orders:
+                    if order.status == OrderStatus.FULFILLED:
+                        if order.side == "buy":
+                            net_position += order.quantity
+                        elif order.side == "sell":
+                            net_position -= order.quantity
+                
+                # Consider there's an open position if net position is not zero or there are open orders
+                has_open_orders = any(order.status == OrderStatus.OPEN for order in orders)
+                has_position = net_position != 0 or has_open_orders
+                
+                logger.debug(f"Position check for expert {expert_instance_id}, symbol {symbol}: net_position={net_position}, has_open_orders={has_open_orders}, has_position={has_position}")
+                return has_position
+                
+        except Exception as e:
+            logger.error(f"Error checking open positions for expert {expert_instance_id}, symbol {symbol}: {e}", exc_info=True)
+            return False
             
     def _remove_scheduled_job(self, job_id: str):
         """Remove a scheduled job."""

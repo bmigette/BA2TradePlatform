@@ -375,7 +375,7 @@ class WorkerQueue:
             from .types import AnalysisUseCase
             market_analysis = MarketAnalysis(
                 symbol=task.symbol,
-                source_expert_instance_id=task.expert_instance_id,
+                expert_instance_id=task.expert_instance_id,
                 status=MarketAnalysisStatus.PENDING,
                 subtype=AnalysisUseCase(task.subtype)
             )

@@ -43,10 +43,10 @@ def content(analysis_id: int) -> None:
             return
         
         # Load the expert instance
-        expert_instance = get_instance(ExpertInstance, market_analysis.source_expert_instance_id)
+        expert_instance = get_instance(ExpertInstance, market_analysis.expert_instance_id)
         if not expert_instance:
             with ui.card().classes('w-full p-8 text-center'):
-                ui.label(f'Expert Instance {market_analysis.source_expert_instance_id} not found').classes('text-h5 text-negative')
+                ui.label(f'Expert Instance {market_analysis.expert_instance_id} not found').classes('text-h5 text-negative')
                 ui.button('Back to Market Analysis', on_click=lambda: ui.navigate.to('/marketanalysis')).classes('mt-4')
             return
         
@@ -119,18 +119,8 @@ def content(analysis_id: int) -> None:
         if has_error:
             _render_error_banner(market_analysis)
         
-        # Main content with tabs
-        with ui.tabs() as tabs:
-            analysis_tab = ui.tab('Analysis Results', icon='analytics')
-            orders_tab = ui.tab('Order Recommendations', icon='shopping_cart')
-        
-        with ui.tab_panels(tabs, value=analysis_tab).classes('w-full'):
-            with ui.tab_panel(analysis_tab):
-                # Render the expert-specific analysis using the expert's render_market_analysis method
-                _render_expert_analysis(market_analysis, expert)
-            
-            with ui.tab_panel(orders_tab):
-                _render_order_recommendations_tab(market_analysis)
+        # Main content - just show the analysis results directly
+        _render_expert_analysis(market_analysis, expert)
         
     except Exception as e:
         logger.error(f"Error loading market analysis detail {analysis_id}: {e}", exc_info=True)

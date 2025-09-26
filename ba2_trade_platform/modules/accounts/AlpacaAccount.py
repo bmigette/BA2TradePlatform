@@ -124,33 +124,40 @@ class AlpacaAccount(AccountInterface):
             )
             alpaca_orders = self.client.get_orders(filter)
             orders = [self.alpaca_order_to_tradingorder(order) for order in alpaca_orders]
-            logger.debug(f"Listed {len(orders)} Alpaca.")
+            logger.debug(f"Listed {len(orders)} Alpaca Orders.")
             return orders
         except Exception as e:
             logger.error(f"Error listing Alpaca orders: {e}", exc_info=True)
             return []
 
-    def submit_order(self, symbol: str, qty: float, side: str, type: str, time_in_force: str, comment: str, **kwargs) -> TradingOrder:
+    def submit_order(self, trading_order) -> TradingOrder:
         """
         Submit a new order to Alpaca.
         
         Args:
-            trading_order (TradingOrder): The order details to submit.
+            trading_order: A TradingOrder object containing all order details
             
         Returns:
             TradingOrder: The created order if successful, None if an error occurs.
         """
         try:
-            client_order_id = comment
-            order = self.client.submit_order(
-                symbol=symbol,
-                qty=qty,
-                side=side,
-                type=type,
-                time_in_force=time_in_force,
-                client_order_id=client_order_id,
-                **kwargs
-            )
+            # Prepare order parameters from TradingOrder object
+            order_params = {
+                'symbol': trading_order.symbol,
+                'qty': trading_order.quantity,
+                'side': trading_order.side,
+                'type': trading_order.order_type,
+                'time_in_force': trading_order.good_for or 'day',
+                'client_order_id': trading_order.comment
+            }
+            
+            # Add optional parameters if they exist
+            if hasattr(trading_order, 'limit_price') and trading_order.limit_price is not None:
+                order_params['limit_price'] = trading_order.limit_price
+            if hasattr(trading_order, 'stop_price') and trading_order.stop_price is not None:
+                order_params['stop_price'] = trading_order.stop_price
+            
+            order = self.client.submit_order(**order_params)
             logger.info(f"Submitted Alpaca order: {order.id}")
             return self.alpaca_order_to_tradingorder(order)
         except Exception as e:
@@ -246,4 +253,50 @@ class AlpacaAccount(AccountInterface):
             return account
         except Exception as e:
             logger.error(f"Error fetching Alpaca account info: {e}", exc_info=True)
+            return None
+
+    def get_instrument_current_price(self, symbol: str) -> Optional[float]:
+        """
+        Get the current market price for a given instrument/symbol.
+        
+        Args:
+            symbol (str): The asset symbol to get the price for
+        
+        Returns:
+            Optional[float]: The current price if available, None if not found or error occurred
+        """
+        try:
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockLatestQuoteRequest
+            
+            # Create data client for market data
+            data_client = StockHistoricalDataClient(
+                api_key=self.settings["api_key"],
+                secret_key=self.settings["api_secret"]
+            )
+            
+            # Get latest quote
+            request = StockLatestQuoteRequest(symbol_or_symbols=[symbol])
+            quotes = data_client.get_stock_latest_quote(request)
+            
+            if symbol in quotes:
+                quote = quotes[symbol]
+                # Use bid-ask midpoint as current price
+                if quote.bid_price and quote.ask_price:
+                    current_price = (float(quote.bid_price) + float(quote.ask_price)) / 2
+                elif quote.bid_price:
+                    current_price = float(quote.bid_price)
+                elif quote.ask_price:
+                    current_price = float(quote.ask_price)
+                else:
+                    current_price = None
+                
+                logger.debug(f"Current price for {symbol}: {current_price}")
+                return current_price
+            else:
+                logger.warning(f"No quote data found for symbol {symbol}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error getting current price for {symbol}: {e}", exc_info=True)
             return None

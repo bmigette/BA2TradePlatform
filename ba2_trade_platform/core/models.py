@@ -101,7 +101,7 @@ class ExpertRecommendation(SQLModel, table=True):
 class MarketAnalysis(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     symbol: str
-    source_expert_instance_id: int = Field(foreign_key="expertinstance.id", nullable=False, ondelete="CASCADE")
+    expert_instance_id: int = Field(foreign_key="expertinstance.id", nullable=False, ondelete="CASCADE")
     status: MarketAnalysisStatus = MarketAnalysisStatus.PENDING
     subtype: AnalysisUseCase = Field(default=AnalysisUseCase.ENTER_MARKET)
     state: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict)

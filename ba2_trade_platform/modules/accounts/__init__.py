@@ -1,7 +1,7 @@
 from .AlpacaAccount import AlpacaAccount
 
 # Registry of account provider classes
-providers = {"Alpaca": AlpacaAccount}  # Fixed typo: "Alcapa" -> "Alpaca"
+providers = {"Alpaca": AlpacaAccount}  # Fixed typo: "Alpaca" -> "Alpaca"
 
 def get_account_class(provider_name):
     """

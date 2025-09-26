@@ -220,7 +220,7 @@ FINAL_SUMMARIZATION_AGENT_PROMPT = """You are the Final Summarization Agent for 
     "recommended_action": "BUY|SELL|HOLD",
     "expected_profit_percent": 0.0,
     "price_at_date": 0.0,
-    "confidence": 0.0,
+    "confidence": 0.0,  // Confidence level (0-100 scale)
     "details": "Detailed explanation (max 2000 chars)",
     "risk_level": "LOW|MEDIUM|HIGH",
     "time_horizon": "SHORT_TERM|MEDIUM_TERM|LONG_TERM",
@@ -252,7 +252,7 @@ FINAL_SUMMARIZATION_AGENT_PROMPT = """You are the Final Summarization Agent for 
 
 **Supporting Data Usage**:
 - Use technical/fundamental/sentiment data to EXPLAIN why the final_trade_decision makes sense
-- Extract confidence levels from the decision-making process
+- Extract confidence levels from the decision-making process (0-100 scale, where 100 = completely certain)
 - Derive risk levels from the certainty and market conditions described
 - Use supporting analysis to set realistic profit expectations and stop/take profit levels
 

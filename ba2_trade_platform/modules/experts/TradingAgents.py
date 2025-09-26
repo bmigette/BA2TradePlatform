@@ -885,7 +885,7 @@ Please check back in a few minutes for results."""
             pred_result = trading_state['prediction_result']
             if isinstance(pred_result, dict):
                 recommendation_data['action'] = pred_result.get('signal', 'N/A')
-                recommendation_data['confidence'] = f"{pred_result.get('confidence', 0)*100:.1f}%" if pred_result.get('confidence') else 'N/A'
+                recommendation_data['confidence'] = f"{pred_result.get('confidence', 0):.1f}%" if pred_result.get('confidence') else 'N/A'
                 recommendation_data['reasoning'] = pred_result.get('reasoning', '')
                 return recommendation_data
         
@@ -897,7 +897,7 @@ Please check back in a few minutes for results."""
                     recommendation_data['action'] = rec.get('action', rec.get('signal', 'N/A'))
                     confidence = rec.get('confidence', 0)
                     if isinstance(confidence, (int, float)):
-                        recommendation_data['confidence'] = f"{confidence*100:.1f}%"
+                        recommendation_data['confidence'] = f"{confidence:.1f}%"
                     else:
                         recommendation_data['confidence'] = str(confidence)
                     recommendation_data['reasoning'] = rec.get('reasoning', rec.get('details', ''))

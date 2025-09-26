@@ -183,7 +183,7 @@ class JobMonitoringTab:
                 analysis_data = []
                 for analysis in market_analyses:
                     # Get expert instance info
-                    expert_instance = get_instance(ExpertInstance, analysis.source_expert_instance_id)
+                    expert_instance = get_instance(ExpertInstance, analysis.expert_instance_id)
                     expert_name = expert_instance.expert if expert_instance else "Unknown"
                     
                     # Convert UTC to local time for display
@@ -217,7 +217,7 @@ class JobMonitoringTab:
                         'created_at_local': created_local,
                         'subtype': subtype_display,
                         'can_cancel': can_cancel,
-                        'expert_instance_id': analysis.source_expert_instance_id
+                        'expert_instance_id': analysis.expert_instance_id
                     })
                 
                 return analysis_data, total_count
@@ -354,7 +354,7 @@ class JobMonitoringTab:
                 return
             
             # Try to cancel the task in the worker queue
-            success = self._get_worker_queue().cancel_analysis_task(analysis.source_expert_instance_id, analysis.symbol)
+            success = self._get_worker_queue().cancel_analysis_task(analysis.expert_instance_id, analysis.symbol)
             
             if success:
                 # Update the analysis status
@@ -725,21 +725,27 @@ class ScheduledJobsTab:
 
 class OrderRecommendationsTab:
     def __init__(self):
-        self.orders_table = None
+        self.selected_symbol = None
+        self.recommendations_container = None
+        self.summary_table = None
+        self.detail_container = None
         self.refresh_timer = None
         self.render()
 
     def render(self):
         with ui.card().classes('w-full'):
             ui.label('Order Recommendations').classes('text-lg font-bold')
-            ui.label('Pending orders from expert recommendations').classes('text-sm text-gray-600 mb-4')
+            ui.label('Expert recommendations and generated orders').classes('text-sm text-gray-600 mb-4')
             
             # Controls
             with ui.row().classes('w-full justify-between items-center mb-4'):
                 ui.button('Refresh', on_click=self.refresh_data).props('color=primary outline')
             
-            # Orders table container
-            self.orders_container = ui.element('div').classes('w-full')
+            # Summary table container
+            self.summary_container = ui.element('div').classes('w-full mb-4')
+            
+            # Detail container for selected recommendations
+            self.detail_container = ui.element('div').classes('w-full')
             
             # Initial load
             self.refresh_data()
@@ -748,108 +754,388 @@ class OrderRecommendationsTab:
             self.refresh_timer = ui.timer(30.0, self.refresh_data)
 
     def refresh_data(self):
-        """Refresh the orders table."""
+        """Refresh the recommendations data."""
         try:
-            self.orders_container.clear()
+            self.summary_container.clear()
             
-            with self.orders_container:
-                # Get pending orders with their linked recommendations and analysis
-                pending_orders = self._get_pending_orders()
+            with self.summary_container:
+                # Get summary of recommendations by symbol
+                recommendations_summary = self._get_recommendations_summary()
                 
-                if not pending_orders:
-                    ui.label('No pending orders found').classes('text-gray-500 text-center py-8')
+                if not recommendations_summary:
+                    ui.label('No recommendations found').classes('text-gray-500 text-center py-8')
                     return
                 
-                # Create table
-                columns = [
-                    {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left'},
-                    {'name': 'side', 'label': 'Side', 'field': 'side', 'align': 'center'},
-                    {'name': 'quantity', 'label': 'Quantity', 'field': 'quantity', 'align': 'right'},
-                    {'name': 'order_type', 'label': 'Type', 'field': 'order_type', 'align': 'center'},
-                    {'name': 'expert', 'label': 'Expert', 'field': 'expert_name', 'align': 'left'},
-                    {'name': 'created_at', 'label': 'Created', 'field': 'created_at', 'align': 'center'},
-                    {'name': 'analysis', 'label': 'Analysis', 'field': 'analysis_id', 'align': 'center'},
-                ]
-                
-                rows = []
-                for order_data in pending_orders:
-                    order, recommendation, expert_instance, analysis = order_data
+                with ui.card().classes('w-full'):
+                    ui.label('📊 Recommendations Summary by Symbol').classes('text-h6 mb-4')
                     
-                    # Format the row data
-                    row = {
-                        'id': order.id,
-                        'symbol': order.symbol,
-                        'side': order.side.upper() if order.side else 'N/A',
-                        'quantity': f"{order.quantity:.2f}" if order.quantity else '0',
-                        'order_type': order.order_type.value if order.order_type else 'N/A',
-                        'expert_name': expert_instance.user_description or expert_instance.expert if expert_instance else 'Unknown',
-                        'created_at': order.created_at.strftime('%Y-%m-%d %H:%M') if order.created_at else 'N/A',
-                        'analysis_id': analysis.id if analysis else None,
-                        'analysis_symbol': analysis.symbol if analysis else None,
-                    }
-                    rows.append(row)
-                
-                self.orders_table = ui.table(
-                    columns=columns,
-                    rows=rows,
-                    row_key='id',
-                    pagination=10
-                ).classes('w-full')
-                
-                # Add click handler for analysis link
-                self.orders_table.add_slot('body-cell-analysis', '''
-                    <q-td :props="props">
-                        <q-btn v-if="props.value" 
-                               icon="visibility" 
-                               flat 
-                               dense 
-                               color="primary" 
-                               :title="'View Analysis ' + props.value"
-                               @click="$parent.$emit('view_analysis', props.value)" />
-                        <span v-else class="text-gray-400">N/A</span>
-                    </q-td>
-                ''')
-                
-                # Handle analysis view clicks
-                self.orders_table.on('view_analysis', self._handle_view_analysis)
+                    # Create summary table
+                    summary_columns = [
+                        {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left'},
+                        {'name': 'total_recommendations', 'label': 'Total Recs', 'field': 'total_recommendations', 'align': 'right'},
+                        {'name': 'buy_count', 'label': 'BUY', 'field': 'buy_count', 'align': 'right'},
+                        {'name': 'sell_count', 'label': 'SELL', 'field': 'sell_count', 'align': 'right'},
+                        {'name': 'hold_count', 'label': 'HOLD', 'field': 'hold_count', 'align': 'right'},
+                        {'name': 'avg_confidence', 'label': 'Avg Confidence', 'field': 'avg_confidence', 'align': 'right'},
+                        {'name': 'orders_created', 'label': 'Orders Created', 'field': 'orders_created', 'align': 'right'},
+                        {'name': 'latest', 'label': 'Latest', 'field': 'latest', 'align': 'center'},
+                        {'name': 'actions', 'label': 'Actions', 'field': 'actions', 'align': 'center'}
+                    ]
+                    
+                    self.summary_table = ui.table(
+                        columns=summary_columns,
+                        rows=recommendations_summary,
+                        row_key='symbol',
+                        pagination=10
+                    ).classes('w-full')
+                    
+                    # Add action buttons
+                    self.summary_table.add_slot('body-cell-actions', '''
+                        <q-td :props="props">
+                            <q-btn icon="visibility" 
+                                   flat 
+                                   dense 
+                                   color="primary" 
+                                   title="View Details"
+                                   @click="$parent.$emit('view_details', props.row.symbol)" />
+                            <q-btn icon="add_shopping_cart" 
+                                   flat 
+                                   dense 
+                                   color="green" 
+                                   title="Place Order"
+                                   @click="$parent.$emit('place_order', props.row.symbol)" />
+                        </q-td>
+                    ''')
+                    
+                    # Handle events
+                    self.summary_table.on('view_details', self._handle_view_details)
+                    self.summary_table.on('place_order', self._handle_place_order)
+            
+            # Clear detail container if no symbol selected
+            if not self.selected_symbol:
+                self.detail_container.clear()
                 
         except Exception as e:
             logger.error(f"Error refreshing order recommendations data: {e}", exc_info=True)
 
-    def _get_pending_orders(self):
-        """Get pending orders with their linked recommendations and analysis data."""
+    def _get_recommendations_summary(self):
+        """Get summary of recommendations grouped by symbol."""
         try:
-            from ...core.models import TradingOrder, ExpertRecommendation, ExpertInstance, MarketAnalysis
-            from ...core.types import OrderStatus
+            from ...core.models import ExpertRecommendation, TradingOrder, ExpertInstance
+            from ...core.types import OrderRecommendation
+            from sqlmodel import func
             
             with get_db() as session:
-                # Query pending orders with joins to get related data
+                # Get recommendations with counts by symbol
+                from sqlalchemy import case
+                
                 statement = (
-                    select(TradingOrder, ExpertRecommendation, ExpertInstance, MarketAnalysis)
-                    .outerjoin(ExpertRecommendation, TradingOrder.order_recommendation_id == ExpertRecommendation.id)
-                    .outerjoin(ExpertInstance, ExpertRecommendation.instance_id == ExpertInstance.id)
-                    .outerjoin(MarketAnalysis, ExpertRecommendation.market_analysis_id == MarketAnalysis.id)
-                    .where(TradingOrder.status == OrderStatus.PENDING)
-                    .order_by(TradingOrder.created_at.desc())
+                    select(
+                        ExpertRecommendation.symbol,
+                        func.count(ExpertRecommendation.id).label('total_recommendations'),
+                        func.sum(case((ExpertRecommendation.recommended_action == OrderRecommendation.BUY, 1), else_=0)).label('buy_count'),
+                        func.sum(case((ExpertRecommendation.recommended_action == OrderRecommendation.SELL, 1), else_=0)).label('sell_count'),
+                        func.sum(case((ExpertRecommendation.recommended_action == OrderRecommendation.HOLD, 1), else_=0)).label('hold_count'),
+                        func.avg(ExpertRecommendation.confidence).label('avg_confidence'),
+                        func.max(ExpertRecommendation.created_at).label('latest_created_at')
+                    )
+                    .group_by(ExpertRecommendation.symbol)
+                    .order_by(func.max(ExpertRecommendation.created_at).desc())
                 )
                 
                 results = session.exec(statement).all()
-                return results
+                
+                summary_data = []
+                for result in results:
+                    symbol = result.symbol
+                    
+                    # Count orders created for this symbol
+                    orders_statement = select(func.count(TradingOrder.id)).where(
+                        TradingOrder.symbol == symbol,
+                        TradingOrder.order_recommendation_id.is_not(None)
+                    )
+                    orders_count = session.exec(orders_statement).first() or 0
+                    
+                    summary_data.append({
+                        'symbol': symbol,
+                        'total_recommendations': result.total_recommendations,
+                        'buy_count': result.buy_count or 0,
+                        'sell_count': result.sell_count or 0,
+                        'hold_count': result.hold_count or 0,
+                        'avg_confidence': f"{result.avg_confidence:.1f}%" if result.avg_confidence else 'N/A',
+                        'orders_created': orders_count,
+                        'latest': result.latest_created_at.strftime('%Y-%m-%d %H:%M') if result.latest_created_at else 'N/A'
+                    })
+                
+                return summary_data
                 
         except Exception as e:
-            logger.error(f"Error getting pending orders: {e}", exc_info=True)
+            logger.error(f"Error getting recommendations summary: {e}", exc_info=True)
             return []
 
+    def _handle_view_details(self, event_data):
+        """Handle view details for a symbol."""
+        try:
+            symbol = event_data.args if hasattr(event_data, 'args') else event_data
+            self.selected_symbol = symbol
+            self._load_symbol_details(symbol)
+        except Exception as e:
+            logger.error(f"Error viewing details for symbol: {e}", exc_info=True)
+
+    def _handle_place_order(self, event_data):
+        """Handle place order for a symbol."""
+        try:
+            symbol = event_data.args if hasattr(event_data, 'args') else event_data
+            self._show_place_order_dialog(symbol)
+        except Exception as e:
+            logger.error(f"Error showing place order dialog: {e}", exc_info=True)
+
+    def _load_symbol_details(self, symbol):
+        """Load detailed recommendations for a specific symbol."""
+        try:
+            self.detail_container.clear()
+            
+            with self.detail_container:
+                with ui.card().classes('w-full'):
+                    ui.label(f'📋 Detailed Recommendations for {symbol}').classes('text-h6 mb-4')
+                    
+                    # Get detailed recommendations for this symbol
+                    recommendations = self._get_symbol_recommendations(symbol)
+                    
+                    if not recommendations:
+                        ui.label('No recommendations found for this symbol').classes('text-gray-500')
+                        return
+                    
+                    # Recommendations table
+                    rec_columns = [
+                        {'name': 'action', 'label': 'Action', 'field': 'action', 'align': 'center'},
+                        {'name': 'confidence', 'label': 'Confidence', 'field': 'confidence', 'align': 'right'},
+                        {'name': 'expected_profit', 'label': 'Expected Profit %', 'field': 'expected_profit', 'align': 'right'},
+                        {'name': 'price_at_date', 'label': 'Price at Analysis', 'field': 'price_at_date', 'align': 'right'},
+                        {'name': 'risk_level', 'label': 'Risk Level', 'field': 'risk_level', 'align': 'center'},
+                        {'name': 'time_horizon', 'label': 'Time Horizon', 'field': 'time_horizon', 'align': 'center'},
+                        {'name': 'expert', 'label': 'Expert', 'field': 'expert_name', 'align': 'left'},
+                        {'name': 'created_at', 'label': 'Created', 'field': 'created_at', 'align': 'left'},
+                        {'name': 'actions', 'label': 'Actions', 'field': 'actions', 'align': 'center'}
+                    ]
+                    
+                    rec_table = ui.table(columns=rec_columns, rows=recommendations, row_key='id').classes('w-full')
+                    
+                    # Add colored action badges
+                    rec_table.add_slot('body-cell-action', '''
+                        <q-td :props="props">
+                            <q-badge :color="props.row.action_color" :label="props.row.action" />
+                        </q-td>
+                    ''')
+                    
+                    # Add action buttons for individual recommendations
+                    rec_table.add_slot('body-cell-actions', '''
+                        <q-td :props="props">
+                            <q-btn icon="add_shopping_cart" 
+                                   flat 
+                                   dense 
+                                   color="green" 
+                                   title="Place Order for this Recommendation"
+                                   @click="$parent.$emit('place_order_rec', props.row.id)" />
+                            <q-btn v-if="props.row.analysis_id" 
+                                   icon="visibility" 
+                                   flat 
+                                   dense 
+                                   color="primary" 
+                                   title="View Analysis"
+                                   @click="$parent.$emit('view_analysis', props.row.analysis_id)" />
+                        </q-td>
+                    ''')
+                    
+                    rec_table.on('place_order_rec', self._handle_place_order_recommendation)
+                    rec_table.on('view_analysis', self._handle_view_analysis)
+                    
+        except Exception as e:
+            logger.error(f"Error loading symbol details: {e}", exc_info=True)
+
+    def _get_symbol_recommendations(self, symbol):
+        """Get detailed recommendations for a specific symbol."""
+        try:
+            from ...core.models import ExpertRecommendation, ExpertInstance, MarketAnalysis
+            
+            with get_db() as session:
+                statement = (
+                    select(ExpertRecommendation, ExpertInstance, MarketAnalysis)
+                    .join(ExpertInstance, ExpertRecommendation.instance_id == ExpertInstance.id)
+                    .outerjoin(MarketAnalysis, ExpertRecommendation.market_analysis_id == MarketAnalysis.id)
+                    .where(ExpertRecommendation.symbol == symbol)
+                    .order_by(ExpertRecommendation.created_at.desc())
+                )
+                
+                results = session.exec(statement).all()
+                
+                recommendations = []
+                for recommendation, expert_instance, analysis in results:
+                    action_raw = recommendation.recommended_action.value if hasattr(recommendation.recommended_action, 'value') else str(recommendation.recommended_action)
+                    # Convert enum values to readable text
+                    action = {'BUY': 'Buy', 'SELL': 'Sell', 'HOLD': 'Hold'}.get(action_raw, action_raw)
+                    created_at = recommendation.created_at.strftime('%Y-%m-%d %H:%M:%S') if recommendation.created_at else ''
+                    
+                    recommendations.append({
+                        'id': recommendation.id,
+                        'symbol': recommendation.symbol,
+                        'action': action,
+                        'action_color': {'Buy': 'green', 'Sell': 'red', 'Hold': 'orange'}.get(action, 'grey'),
+                        'confidence': f"{recommendation.confidence:.1f}%" if recommendation.confidence is not None else 'N/A',
+                        'expected_profit': f"{recommendation.expected_profit_percent:.2f}%" if recommendation.expected_profit_percent else 'N/A',
+                        'price_at_date': f"${recommendation.price_at_date:.2f}" if recommendation.price_at_date else 'N/A',
+                        'risk_level': recommendation.risk_level.value if hasattr(recommendation.risk_level, 'value') else str(recommendation.risk_level),
+                        'time_horizon': recommendation.time_horizon.value.replace('_', ' ').title() if hasattr(recommendation.time_horizon, 'value') else str(recommendation.time_horizon),
+                        'expert_name': expert_instance.user_description or expert_instance.expert,
+                        'created_at': created_at,
+                        'analysis_id': analysis.id if analysis else None
+                    })
+                
+                return recommendations
+                
+        except Exception as e:
+            logger.error(f"Error getting symbol recommendations: {e}", exc_info=True)
+            return []
+
+    def _show_place_order_dialog(self, symbol):
+        """Show place order dialog for a symbol."""
+        try:
+            with ui.dialog() as order_dialog:
+                with ui.card().classes('w-96'):
+                    ui.label(f'Place Order for {symbol}').classes('text-h6 mb-4')
+                    
+                    # Get current price
+                    current_price = self._get_current_price(symbol)
+                    if current_price:
+                        ui.label(f'Current Price: ${current_price:.2f}').classes('text-subtitle1 mb-4')
+                    else:
+                        ui.label('Current Price: N/A').classes('text-subtitle1 mb-4')
+                    
+                    # Order form
+                    side_select = ui.select(['buy', 'sell'], value='buy', label='Side').classes('w-full mb-2')
+                    quantity_input = ui.number('Quantity', value=1, min=0.01, step=0.01).classes('w-full mb-2')
+                    order_type_select = ui.select(['market', 'limit'], value='market', label='Order Type').classes('w-full mb-2')
+                    
+                    # Limit price input (conditional)
+                    limit_price_input = ui.number('Limit Price', value=current_price if current_price else 0, min=0.01, step=0.01).classes('w-full mb-4')
+                    limit_price_input.visible = False
+                    
+                    def on_order_type_change():
+                        limit_price_input.visible = order_type_select.value == 'limit'
+                    
+                    order_type_select.on_value_change(on_order_type_change)
+                    
+                    with ui.row().classes('w-full justify-end gap-2'):
+                        ui.button('Cancel', on_click=order_dialog.close).props('flat')
+                        ui.button('Place Order', on_click=lambda: self._place_order(
+                            symbol=symbol,
+                            side=side_select.value,
+                            quantity=quantity_input.value,
+                            order_type=order_type_select.value,
+                            limit_price=limit_price_input.value if order_type_select.value == 'limit' else None,
+                            dialog=order_dialog
+                        )).props('color=primary')
+            
+            order_dialog.open()
+            
+        except Exception as e:
+            logger.error(f"Error showing place order dialog: {e}", exc_info=True)
+
+    def _handle_place_order_recommendation(self, event_data):
+        """Handle place order for a specific recommendation."""
+        try:
+            recommendation_id = event_data.args if hasattr(event_data, 'args') else event_data
+            # For now, we'll just show a basic order dialog
+            # In the future, this could pre-fill based on the recommendation
+            recommendation = self._get_recommendation_details(recommendation_id)
+            if recommendation:
+                self._show_place_order_dialog(recommendation['symbol'])
+        except Exception as e:
+            logger.error(f"Error placing order for recommendation: {e}", exc_info=True)
+
     def _handle_view_analysis(self, event_data):
-        """Handle click on analysis view button."""
+        """Handle view analysis click."""
         try:
             analysis_id = event_data.args if hasattr(event_data, 'args') else event_data
             if analysis_id:
-                # Navigate to analysis detail page
                 ui.navigate(f'/market_analysis_detail/{analysis_id}')
-                
         except Exception as e:
             logger.error(f"Error navigating to analysis detail: {e}", exc_info=True)
+
+    def _get_current_price(self, symbol):
+        """Get current price for a symbol."""
+        try:
+            # This is a placeholder - in production you'd get this from market data
+            # For now, we'll try to get it from recent recommendations
+            from ...core.models import ExpertRecommendation
+            
+            with get_db() as session:
+                statement = (
+                    select(ExpertRecommendation.price_at_date)
+                    .where(ExpertRecommendation.symbol == symbol)
+                    .order_by(ExpertRecommendation.created_at.desc())
+                    .limit(1)
+                )
+                
+                result = session.exec(statement).first()
+                return result if result else None
+                
+        except Exception as e:
+            logger.error(f"Error getting current price for {symbol}: {e}", exc_info=True)
+            return None
+
+    def _get_recommendation_details(self, recommendation_id):
+        """Get details for a specific recommendation."""
+        try:
+            from ...core.models import ExpertRecommendation
+            
+            with get_db() as session:
+                recommendation = session.get(ExpertRecommendation, recommendation_id)
+                if recommendation:
+                    action_raw = recommendation.recommended_action.value if hasattr(recommendation.recommended_action, 'value') else str(recommendation.recommended_action)
+                    action = {'BUY': 'Buy', 'SELL': 'Sell', 'HOLD': 'Hold'}.get(action_raw, action_raw)
+                    return {
+                        'id': recommendation.id,
+                        'symbol': recommendation.symbol,
+                        'action': action
+                    }
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error getting recommendation details: {e}", exc_info=True)
+            return None
+
+    def _place_order(self, symbol, side, quantity, order_type, limit_price, dialog):
+        """Place an order."""
+        try:
+            from ...core.models import TradingOrder
+            from ...core.types import OrderStatus
+            from ...core.db import add_instance
+            
+            # Create order object
+            order = TradingOrder(
+                symbol=symbol,
+                quantity=quantity,
+                side=side,
+                order_type=order_type,
+                status=OrderStatus.PENDING,
+                limit_price=limit_price,
+                comment=f"Manual order from Order Recommendations - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+            
+            # Add to database
+            order_id = add_instance(order)
+            
+            if order_id:
+                ui.notify(f'Order {order_id} placed successfully for {symbol}', type='positive')
+                dialog.close()
+                self.refresh_data()  # Refresh the data
+            else:
+                ui.notify('Failed to place order', type='negative')
+                
+        except Exception as e:
+            logger.error(f"Error placing order: {e}", exc_info=True)
+            ui.notify(f'Error placing order: {str(e)}', type='negative')
 
     def stop_auto_refresh(self):
         """Stop auto-refresh timer."""

@@ -582,7 +582,7 @@ class TradingAgentsUI:
                 # Confidence card
                 with ui.card().classes('p-4 flex-1'):
                     ui.label('Confidence').classes('text-subtitle2 mb-2')
-                    confidence = (latest_recommendation.confidence or 0) * 100
+                    confidence = latest_recommendation.confidence or 0
                     confidence_color = 'text-green-600' if confidence >= 75 else 'text-orange-600' if confidence >= 50 else 'text-red-600'
                     ui.label(f'🎯 {confidence:.1f}%').classes(f'text-xl font-bold {confidence_color}')
                 

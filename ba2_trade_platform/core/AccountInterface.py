@@ -78,21 +78,12 @@ class AccountInterface(ExtendableSettingsInterface):
         pass
 
     @abstractmethod
-    def submit_order(self, symbol: str, qty: float, side: str, type: str, time_in_force: str, comment: str, **kwargs) -> Any:
+    def submit_order(self, trading_order) -> Any:
         """
         Submit a new order to the account.
         
         Args:
-            symbol (str): The asset symbol to trade
-            qty (float): The quantity to trade
-            side (str): Order side ('buy' or 'sell')
-            type (str): Order type ('market', 'limit', 'stop', etc.)
-            time_in_force (str): Time in force policy ('day', 'gtc', 'ioc', etc.)
-            comment (str): Optional comment or note for the order
-            **kwargs: Additional order parameters such as:
-                     - limit_price: Price for limit orders
-                     - stop_price: Price for stop orders
-                     - client_order_id: Custom order identifier
+            trading_order: A TradingOrder object containing all order details
         
         Returns:
             Any: The created order object if successful, None or raises exception if failed
@@ -129,5 +120,108 @@ class AccountInterface(ExtendableSettingsInterface):
                 - status: Current order status
                 - filled_quantity: Amount filled
                 - created_at: Order creation timestamp
+        """
+        pass
+
+    def submit_order_with_db_update(self, trading_order):
+        """
+        Wrapper for submit_order that handles database updates and comment formatting.
+        
+        Args:
+            trading_order: A TradingOrder object containing all order details
+            
+        Returns:
+            TradingOrder: The created order if successful, None if failed
+        """
+        try:
+            from .db import add_instance, update_instance
+            from .models import TradingOrder as TradingOrderModel
+            from .types import OrderStatus
+            
+            # Prepend [ORDERID:XX] to comment if not already present
+            if trading_order.comment and not trading_order.comment.startswith('[ORDERID:'):
+                trading_order.comment = f"[ORDERID:{trading_order.id or 'PENDING'}] {trading_order.comment}"
+            
+            # Submit the order to the account provider
+            submitted_order = self.submit_order(trading_order)
+            
+            if submitted_order:
+                # Update the database record with the submitted order details
+                if trading_order.id:
+                    # Update existing record
+                    db_order = TradingOrderModel.from_orm(submitted_order) if hasattr(TradingOrderModel, 'from_orm') else submitted_order
+                    db_order.id = trading_order.id
+                    update_instance(db_order)
+                    logger.info(f"Updated database order {trading_order.id} with submitted order details")
+                else:
+                    # Create new database record
+                    db_order = TradingOrderModel.from_orm(submitted_order) if hasattr(TradingOrderModel, 'from_orm') else submitted_order
+                    order_id = add_instance(db_order)
+                    submitted_order.id = order_id
+                    logger.info(f"Created new database order {order_id}")
+                
+                # Update comment with actual order ID if it was pending
+                if submitted_order.order_id and '[ORDERID:PENDING]' in submitted_order.comment:
+                    submitted_order.comment = submitted_order.comment.replace('[ORDERID:PENDING]', f'[ORDERID:{submitted_order.order_id}]')
+                    if trading_order.id:
+                        update_instance(submitted_order)
+            
+            return submitted_order
+            
+        except Exception as e:
+            logger.error(f"Error in submit_order_with_db_update: {e}", exc_info=True)
+            return None
+    
+    def cancel_order_with_db_update(self, order_id: str):
+        """
+        Wrapper for cancel_order that handles database updates.
+        
+        Args:
+            order_id (str): The unique identifier of the order to cancel
+            
+        Returns:
+            bool: True if cancellation was successful, False otherwise
+        """
+        try:
+            from .db import get_instance, update_instance
+            from .models import TradingOrder as TradingOrderModel  
+            from .types import OrderStatus
+            from sqlmodel import select, Session
+            from .db import get_db
+            
+            # Cancel the order with the account provider
+            success = self.cancel_order(order_id)
+            
+            if success:
+                # Update database record to reflect cancellation
+                with Session(get_db().bind) as session:
+                    # Find the order in the database by order_id
+                    statement = select(TradingOrderModel).where(TradingOrderModel.order_id == order_id)
+                    db_order = session.exec(statement).first()
+                    
+                    if db_order:
+                        db_order.status = OrderStatus.CANCELED
+                        session.add(db_order)
+                        session.commit()
+                        logger.info(f"Updated database order {db_order.id} status to CANCELED")
+                    else:
+                        logger.warning(f"Could not find database order with order_id {order_id} to update status")
+                        
+            return success
+            
+        except Exception as e:
+            logger.error(f"Error in cancel_order_with_db_update: {e}", exc_info=True)
+            return False
+
+    @abstractmethod
+    def get_instrument_current_price(self, symbol: str) -> Optional[float]:
+        """
+        Get the current market price for a given instrument/symbol.
+        
+        Args:
+            symbol (str): The asset symbol to get the price for
+        
+        Returns:
+            Optional[float]: The current price if available, None if not found or error occurred
         """
         pass

@@ -11,7 +11,7 @@ import logging
 from ..logger import logger
 from .models import ExpertRecommendation, ExpertInstance, TradingOrder, Ruleset
 from .types import OrderRecommendation, OrderStatus, OrderDirection, OrderOpenType
-from .db import get_instance, get_instances, add_instance, update_instance
+from .db import get_instance, get_all_instances, add_instance, update_instance
 
 
 class TradeManager:
@@ -319,12 +319,14 @@ class TradeManager:
             # Get all recent recommendations that haven't been processed
             # This is a simplified query - in production you'd want to track processing status
             from datetime import timedelta
+            from sqlmodel import select, Session
+            from .db import engine
+            
             cutoff_time = datetime.now(timezone.utc) - timedelta(hours=1)  # Process recommendations from last hour
             
-            recent_recommendations = get_instances(
-                ExpertRecommendation,
-                filters={"created_at__gte": cutoff_time}
-            )
+            with Session(engine) as session:
+                statement = select(ExpertRecommendation).where(ExpertRecommendation.created_at >= cutoff_time)
+                recent_recommendations = session.exec(statement).all()
             
             for recommendation in recent_recommendations:
                 if recommendation.recommended_action != OrderRecommendation.HOLD:
