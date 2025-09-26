@@ -97,10 +97,18 @@ class TradeManager:
                 self.logger.error(f"Expert instance {expert_instance.id} not found or invalid expert type {expert_instance.expert}", exc_info=True)
                 return {}
             
+            # Check for legacy automatic_trading setting and new settings
+            legacy_automatic_trading = expert.settings.get('automatic_trading', False)
+            allow_automated_trade_opening = expert.settings.get('allow_automated_trade_opening', legacy_automatic_trading)
+            allow_automated_trade_modification = expert.settings.get('allow_automated_trade_modification', legacy_automatic_trading)
+            
             return {
                 'enable_buy': expert.settings.get('enable_buy', True),
                 'enable_sell': expert.settings.get('enable_sell', False),
-                'automatic_trading': expert.settings.get('automatic_trading', False)
+                'allow_automated_trade_opening': allow_automated_trade_opening,
+                'allow_automated_trade_modification': allow_automated_trade_modification,
+                # Keep legacy setting for backward compatibility
+                'automatic_trading': legacy_automatic_trading
             }
             
         except Exception as e:

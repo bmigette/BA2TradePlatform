@@ -442,62 +442,176 @@ class JobMonitoringTab:
 
 class ManualAnalysisTab:
     def __init__(self):
+        self.expert_instance_id = None
+        self.analysis_type = None
+        self.instrument_selector = None
         self.render()
 
     def render(self):
         with ui.card().classes('w-full'):
             ui.label('Manual Analysis Jobs').classes('text-lg font-bold')
-            ui.label('Submit manual analysis jobs for specific symbols and experts').classes('text-sm text-gray-600 mb-4')
+            ui.label('Submit analysis jobs for multiple instruments with selected expert and analysis type').classes('text-sm text-gray-600 mb-4')
             
-            # Manual analysis form
-            with ui.row().classes('w-full gap-4'):
+            # Configuration row
+            with ui.row().classes('w-full gap-4 mb-4'):
                 with ui.column().classes('flex-1'):
-                    self.symbol_input = ui.input('Symbol', placeholder='e.g., AAPL').classes('w-full')
-                    
-                with ui.column().classes('flex-1'):
-                    # Expert selection
+                    # Expert instance selection
                     expert_instances = get_all_instances(ExpertInstance)
                     expert_options = {f"{exp.id}": f"{exp.expert} (ID: {exp.id})" for exp in expert_instances if exp.enabled}
                     
                     self.expert_select = ui.select(
                         options=expert_options,
-                        label='Expert Instance'
+                        label='Expert Instance',
+                        on_change=self.on_expert_change
+                    ).classes('w-full')
+                    
+                with ui.column().classes('flex-1'):
+                    # Analysis type selection
+                    from ...core.types import AnalysisUseCase
+                    analysis_options = {
+                        AnalysisUseCase.ENTER_MARKET.value: 'Enter Market Analysis',
+                        AnalysisUseCase.OPEN_POSITIONS.value: 'Open Positions Analysis'
+                    }
+                    
+                    self.analysis_type_select = ui.select(
+                        options=analysis_options,
+                        label='Analysis Type',
+                        value=AnalysisUseCase.ENTER_MARKET.value,
+                        on_change=self.on_analysis_type_change
                     ).classes('w-full')
                     
                 with ui.column():
-                    ui.button('Submit Analysis', on_click=self.submit_market_analysis, icon='play_arrow').classes('mt-6')
-
-    def submit_market_analysis(self):
-        """Submit a manual analysis job."""
+                    ui.button(
+                        'Run Analysis for Selected', 
+                        on_click=self.submit_bulk_analysis, 
+                        icon='play_arrow'
+                    ).classes('mt-6').props('color=primary size=md')
+            
+            # Instrument selector (will be populated when expert is selected)
+            self.instrument_selector_container = ui.column().classes('w-full')
+            
+            # Initially disable the analysis type and button
+            self.analysis_type_select.disable()
+            
+    def on_expert_change(self):
+        """Handle expert instance selection change."""
+        self.expert_instance_id = self.expert_select.value
+        
+        if not self.expert_instance_id:
+            # Clear instrument selector
+            self.instrument_selector_container.clear()
+            self.analysis_type_select.disable()
+            return
+            
         try:
-            symbol = self.symbol_input.value.strip().upper()
-            expert_instance_id = self.expert_select.value
+            # Get the expert instance and its enabled instruments
+            from ...core.utils import get_expert_instance_from_id
+            expert = get_expert_instance_from_id(int(self.expert_instance_id))
             
-            if not symbol:
-                ui.notify("Please enter a symbol", type='negative')
-                return
+            if expert:
+                enabled_instruments = expert.get_enabled_instruments()
+                logger.debug(f"Expert {self.expert_instance_id} has {len(enabled_instruments)} enabled instruments")
                 
-            if not expert_instance_id:
-                ui.notify("Please select an expert instance", type='negative')
-                return
-            
-            # Submit to job manager
-            from ...core.JobManager import get_job_manager
-            job_manager = get_job_manager()
-            
-            success = job_manager.submit_market_analysis(int(expert_instance_id), symbol)
-            
-            if success:
-                ui.notify(f"Manual analysis submitted for {symbol}", type='positive')
-                # Clear form
-                self.symbol_input.value = ''
-                self.expert_select.value = None
+                # Clear and recreate instrument selector with filtered instruments
+                self.instrument_selector_container.clear()
+                
+                with self.instrument_selector_container:
+                    from ..components.InstrumentSelector import InstrumentSelector
+                    self.instrument_selector = InstrumentSelector(
+                        on_selection_change=self.on_instrument_selection_change,
+                        instrument_list=enabled_instruments if enabled_instruments else None,
+                        hide_weights=True
+                    )
+                    self.instrument_selector.render()
+                
+                # Enable analysis type selection
+                self.analysis_type_select.enable()
             else:
-                ui.notify("Analysis already pending for this symbol and expert", type='warning')
+                ui.notify("Failed to load expert instance", type='negative')
                 
         except Exception as e:
-            logger.error(f"Error submitting manual analysis: {e}", exc_info=True)
-            ui.notify(f"Error submitting analysis: {str(e)}", type='negative')
+            logger.error(f"Error loading expert instruments: {e}", exc_info=True)
+            ui.notify(f"Error loading expert: {str(e)}", type='negative')
+    
+    def on_analysis_type_change(self):
+        """Handle analysis type selection change."""
+        self.analysis_type = self.analysis_type_select.value
+        logger.debug(f"Analysis type changed to: {self.analysis_type}")
+    
+    def on_instrument_selection_change(self, selected_instruments):
+        """Handle instrument selection change."""
+        logger.debug(f"Selected {len(selected_instruments)} instruments for analysis")
+    
+    def submit_bulk_analysis(self):
+        """Submit analysis jobs for all selected instruments."""
+        try:
+            if not self.expert_instance_id:
+                ui.notify("Please select an expert instance", type='negative')
+                return
+                
+            if not self.analysis_type:
+                ui.notify("Please select an analysis type", type='negative')
+                return
+                
+            if not self.instrument_selector:
+                ui.notify("No instruments available for selection", type='negative')
+                return
+            
+            selected_instruments = self.instrument_selector.get_selected_instruments()
+            
+            if not selected_instruments:
+                ui.notify("Please select at least one instrument", type='negative')
+                return
+            
+            # Submit analysis jobs for all selected instruments
+            from ...core.JobManager import get_job_manager
+            from ...core.types import AnalysisUseCase
+            job_manager = get_job_manager()
+            
+            # Convert analysis type string to enum
+            subtype = AnalysisUseCase.ENTER_MARKET if self.analysis_type == AnalysisUseCase.ENTER_MARKET.value else AnalysisUseCase.OPEN_POSITIONS
+            
+            successful_submissions = 0
+            failed_submissions = 0
+            duplicate_submissions = 0
+            
+            for instrument in selected_instruments:
+                symbol = instrument['name']
+                
+                try:
+                    success = job_manager.submit_market_analysis(
+                        int(self.expert_instance_id), 
+                        symbol, 
+                        subtype=subtype
+                    )
+                    
+                    if success:
+                        successful_submissions += 1
+                        logger.debug(f"Successfully submitted analysis for {symbol}")
+                    else:
+                        duplicate_submissions += 1
+                        logger.debug(f"Analysis already pending for {symbol}")
+                        
+                except Exception as e:
+                    failed_submissions += 1
+                    logger.error(f"Failed to submit analysis for {symbol}: {e}", exc_info=True)
+            
+            # Show summary notification
+            if successful_submissions > 0:
+                message = f"Successfully submitted {successful_submissions} analysis jobs"
+                if duplicate_submissions > 0:
+                    message += f" ({duplicate_submissions} already pending)"
+                if failed_submissions > 0:
+                    message += f" ({failed_submissions} failed)"
+                ui.notify(message, type='positive')
+            elif duplicate_submissions > 0:
+                ui.notify(f"All {duplicate_submissions} analyses are already pending", type='warning')
+            else:
+                ui.notify(f"Failed to submit any analyses ({failed_submissions} failed)", type='negative')
+                
+        except Exception as e:
+            logger.error(f"Error submitting bulk analysis: {e}", exc_info=True)
+            ui.notify(f"Error submitting analyses: {str(e)}", type='negative')
 
 
 class ScheduledJobsTab:

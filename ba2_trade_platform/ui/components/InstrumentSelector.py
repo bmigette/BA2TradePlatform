@@ -18,15 +18,19 @@ class InstrumentSelector:
     - Meant to be imported and used from other pages/components
     """
     
-    def __init__(self, on_selection_change: Optional[Callable] = None):
+    def __init__(self, on_selection_change: Optional[Callable] = None, instrument_list: Optional[List[str]] = None, hide_weights: bool = False):
         """
         Initialize the InstrumentSelector component.
         
         Args:
             on_selection_change: Optional callback function called when selection changes
+            instrument_list: Optional list of instrument names to display. If None, displays all instruments.
+            hide_weights: If True, hides weight-related controls and columns. Default is False.
         """
         logger.debug('Initializing InstrumentSelector component')
         self.on_selection_change = on_selection_change
+        self.instrument_list = instrument_list
+        self.hide_weights = hide_weights
         
         # Filter state
         self.search_filter = ''
@@ -46,17 +50,24 @@ class InstrumentSelector:
         self._load_instruments()
         
     def _load_instruments(self):
-        """Load all instruments from database and initialize configuration."""
+        """Load instruments from database and initialize configuration."""
         logger.debug('Loading instruments for selector')
         try:
-            self.instruments = get_all_instances(Instrument)
+            all_instruments = get_all_instances(Instrument)
+            
+            # Filter instruments if instrument_list is provided
+            if self.instrument_list is not None:
+                self.instruments = [inst for inst in all_instruments if inst.name in self.instrument_list]
+                logger.debug(f'Filtered to {len(self.instruments)} instruments from provided list of {len(self.instrument_list)}')
+            else:
+                self.instruments = all_instruments
+                logger.debug(f'Loaded all {len(self.instruments)} instruments')
             
             # Initialize weights for all instruments
             for instrument in self.instruments:
                 if instrument.id not in self.instrument_weights:
                     self.instrument_weights[instrument.id] = 100.0
             
-            logger.debug(f'Loaded {len(self.instruments)} instruments')
         except Exception as e:
             logger.error(f'Error loading instruments: {e}', exc_info=True)
             self.instruments = []
@@ -201,31 +212,38 @@ class InstrumentSelector:
                 ).bind_value(self, 'label_filter').classes('w-48')
                 self.label_select.on('update:model-value', lambda: self._on_label_change())
             
-            # Weight control row
-            with ui.row().classes('w-full gap-4 mb-4'):
-                ui.label('Set weight for all displayed instruments:').classes('self-center')
-                self.bulk_weight_input = ui.input(
-                    label='Weight',
-                    value='100',
-                    placeholder='Enter weight...'
-                ).classes('w-32')
-                ui.button(
-                    'Apply to All Displayed',
-                    on_click=lambda: self._set_weight_to_all_displayed(
-                        float(self.bulk_weight_input.value) if self.bulk_weight_input.value else 100.0
-                    )
-                ).props('color=primary size=sm')
+            # Weight control row (only show if weights are not hidden)
+            if not self.hide_weights:
+                with ui.row().classes('w-full gap-4 mb-4'):
+                    ui.label('Set weight for all displayed instruments:').classes('self-center')
+                    self.bulk_weight_input = ui.input(
+                        label='Weight',
+                        value='100',
+                        placeholder='Enter weight...'
+                    ).classes('w-32')
+                    ui.button(
+                        'Apply to All Displayed',
+                        on_click=lambda: self._set_weight_to_all_displayed(
+                            float(self.bulk_weight_input.value) if self.bulk_weight_input.value else 100.0
+                        )
+                    ).props('color=primary size=sm')
             
             # Table with scrollbar
+            # Define base columns
+            columns = [
+                {'name': 'name', 'label': 'Symbol', 'field': 'name', 'sortable': True},
+                {'name': 'company_name', 'label': 'Company', 'field': 'company_name', 'sortable': True},
+                {'name': 'instrument_type', 'label': 'Type', 'field': 'instrument_type', 'sortable': True},
+                {'name': 'categories', 'label': 'Categories', 'field': 'categories'},
+                {'name': 'labels', 'label': 'Labels', 'field': 'labels'},
+            ]
+            
+            # Add weight column only if weights are not hidden
+            if not self.hide_weights:
+                columns.append({'name': 'weight', 'label': 'Weight', 'field': 'weight', 'align': 'center'})
+            
             self.table = ui.table(
-                columns=[
-                    {'name': 'name', 'label': 'Symbol', 'field': 'name', 'sortable': True},
-                    {'name': 'company_name', 'label': 'Company', 'field': 'company_name', 'sortable': True},
-                    {'name': 'instrument_type', 'label': 'Type', 'field': 'instrument_type', 'sortable': True},
-                    {'name': 'categories', 'label': 'Categories', 'field': 'categories'},
-                    {'name': 'labels', 'label': 'Labels', 'field': 'labels'},
-                    {'name': 'weight', 'label': 'Weight', 'field': 'weight', 'align': 'center'},
-                ],
+                columns=columns,
                 rows=self._get_filtered_instruments(),
                 row_key='id',
                 selection='multiple',
@@ -233,22 +251,24 @@ class InstrumentSelector:
             ).classes('w-full').style('max-height: 300px; overflow-y: auto')
             
             
-            self.table.add_slot('body-cell-weight', '''
-                <q-td :props="props">
-                    <q-input 
-                        :model-value="props.value" 
-                        @update:model-value="(val) => $parent.$emit('weightChange', props.row.id, parseFloat(val) || 100)"
-                        type="number" 
-                        min="0" 
-                        step="10"
-                        dense
-                        style="width: 80px"
-                    />
-                </q-td>
-            ''')
-            
-            # Handle events from table slots
-            self.table.on('weightChange', lambda e: self._on_weight_change(e.args[0], e.args[1]))
+            # Add weight slot and event handler only if weights are not hidden
+            if not self.hide_weights:
+                self.table.add_slot('body-cell-weight', '''
+                    <q-td :props="props">
+                        <q-input 
+                            :model-value="props.value" 
+                            @update:model-value="(val) => $parent.$emit('weightChange', props.row.id, parseFloat(val) || 100)"
+                            type="number" 
+                            min="0" 
+                            step="10"
+                            dense
+                            style="width: 80px"
+                        />
+                    </q-td>
+                ''')
+                
+                # Handle events from table slots
+                self.table.on('weightChange', lambda e: self._on_weight_change(e.args[0], e.args[1]))
             self.search_input.bind_value(self.table, 'filter')
         logger.debug('InstrumentSelector component rendered')
     

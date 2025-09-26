@@ -63,6 +63,7 @@ class WorkerQueue:
         self._task_lock = threading.Lock()
         self._tasks: Dict[str, AnalysisTask] = {}
         self._task_keys: Dict[str, str] = {}  # Maps task_key to task_id for duplicate checking
+        self._queue_counter = 0  # Counter for tiebreaking in priority queue
         
         logger.info("WorkerQueue system initialized")
         
@@ -111,7 +112,7 @@ class WorkerQueue:
         
         # Signal all workers to stop by adding sentinel values
         for _ in self._workers:
-            self._queue.put((0, None))
+            self._queue.put((0, 0, None))  # (priority, counter, task)
             
         # Wait for workers to finish
         start_time = time.time()
@@ -178,8 +179,13 @@ class WorkerQueue:
             self._tasks[task_id] = task
             self._task_keys[task_key] = task_id
             
-        # Add to priority queue (priority, task)
-        self._queue.put((priority, task))
+        # Add to priority queue with tiebreaker (priority, counter, task)
+        # The counter ensures unique ordering when priorities are equal
+        with self._task_lock:
+            self._queue_counter += 1
+            queue_entry = (priority, self._queue_counter, task)
+        
+        self._queue.put(queue_entry)
         
         logger.debug(f"Analysis task '{task_id}' submitted for expert {expert_instance_id}, symbol {symbol}, priority {priority}")
         return task_id
@@ -328,23 +334,25 @@ class WorkerQueue:
         
         while self._running and not self._shutdown_event.is_set():
             try:
-                # Get task from queue with timeout
+                # Get task from queue with timeout (priority, counter, task)
+                priority, counter, task = self._queue.get(timeout=1.0)
+                
+                # Check for sentinel value (shutdown signal)
+                if task is None:
+                    self._queue.task_done()  # Mark sentinel task as done
+                    break
+                
+                # Execute the task (with error handling inside)
                 try:
-                    priority, task = self._queue.get(timeout=1.0)
+                    self._execute_task(task, worker_name)
+                except Exception as e:
+                    logger.error(f"Error executing task in worker {worker_name}: {e}", exc_info=True)
+                finally:
+                    # Always mark task as done after getting it from queue
+                    self._queue.task_done()
                     
-                    # Check for sentinel value (shutdown signal)
-                    if task is None:
-                        break
-                        
-                except queue.Empty:
-                    continue
-                    
-                # Execute the task
-                self._execute_task(task, worker_name)
-                
-                # Mark task as done
-                self._queue.task_done()
-                
+            except queue.Empty:
+                continue
             except Exception as e:
                 logger.error(f"Unexpected error in worker {worker_name}: {e}", exc_info=True)
                 

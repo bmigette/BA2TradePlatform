@@ -1035,10 +1035,13 @@ Please check back in a few minutes for results."""
             symbol: The trading symbol
         """
         try:
-            # Check if automatic trading is enabled for this expert
-            automatic_trading = self.settings.get('automatic_trading', False)
-            if not automatic_trading:
-                logger.debug(f"[TRADE MANAGER] Automatic trading disabled for expert {self.id}, skipping order creation for {symbol}")
+            # Check if automatic trade opening is enabled for this expert
+            allow_automated_trade_opening = self.settings.get('allow_automated_trade_opening', False)
+            # Also check legacy setting for backward compatibility
+            legacy_automatic_trading = self.settings.get('automatic_trading', False)
+            
+            if not allow_automated_trade_opening and not legacy_automatic_trading:
+                logger.debug(f"[TRADE MANAGER] Automatic trade opening disabled for expert {self.id}, skipping order creation for {symbol}")
                 return
             
             # Get the recommendation from database

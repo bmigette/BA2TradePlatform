@@ -52,9 +52,13 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "type": "bool", "required": False, "default": False,
                     "description": "Allow sell orders for this expert"
                 },
-                "automatic_trading": {
+                "allow_automated_trade_opening": {
                     "type": "bool", "required": False, "default": False,
-                    "description": "Enable automatic trade execution"
+                    "description": "Allow automatic opening of new trading positions"
+                },
+                "allow_automated_trade_modification": {
+                    "type": "bool", "required": False, "default": False,
+                    "description": "Allow automatic modification and closing of existing positions"
                 },
                 # Execution Schedule Settings
                 "execution_schedule_enter_market": {

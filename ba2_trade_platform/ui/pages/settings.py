@@ -942,11 +942,22 @@ class ExpertSettingsTab:
                         
                         ui.separator().classes('my-4')
                         
-                        # Automatic trading setting
+                        # Automatic trading settings
                         ui.label('Automatic Trading:').classes('text-subtitle2 mb-2')
-                        ui.label('Enable automatic order execution based on expert recommendations:').classes('text-body2 mb-2')
+                        ui.label('Configure automatic trading permissions for this expert:').classes('text-body2 mb-2')
                         
-                        self.automatic_trading_checkbox = ui.checkbox('Enable automatic trading', value=True)
+                        with ui.column().classes('w-full gap-2'):
+                            self.allow_automated_trade_opening_checkbox = ui.checkbox(
+                                'Allow automated trade opening', 
+                                value=False
+                            )
+                            ui.label('Allows the expert to automatically open new trading positions').classes('text-body2 text-grey-7 ml-6')
+                            
+                            self.allow_automated_trade_modification_checkbox = ui.checkbox(
+                                'Allow automated trade modification/closing', 
+                                value=False
+                            )
+                            ui.label('Allows the expert to automatically modify or close existing positions').classes('text-body2 text-grey-7 ml-6')
                     
                     # Instruments tab
                     with ui.tab_panel('Instruments'):
@@ -1281,24 +1292,41 @@ class ExpertSettingsTab:
             # Load trading permissions - convert to booleans if they're strings
             enable_buy = expert.settings.get('enable_buy', True)  # Default to True
             enable_sell = expert.settings.get('enable_sell', False)  # Default to False
-            automatic_trading = expert.settings.get('automatic_trading', True)  # Default to True
+            
+            # Handle legacy automatic_trading setting by splitting it into new settings
+            legacy_automatic_trading = expert.settings.get('automatic_trading', None)
+            allow_automated_trade_opening = expert.settings.get('allow_automated_trade_opening', False)
+            allow_automated_trade_modification = expert.settings.get('allow_automated_trade_modification', False)
+            
+            # If legacy setting exists and new settings don't, migrate the legacy setting
+            if legacy_automatic_trading is not None and 'allow_automated_trade_opening' not in expert.settings and 'allow_automated_trade_modification' not in expert.settings:
+                if isinstance(legacy_automatic_trading, str):
+                    legacy_value = legacy_automatic_trading.lower() == 'true'
+                else:
+                    legacy_value = bool(legacy_automatic_trading)
+                allow_automated_trade_opening = legacy_value
+                allow_automated_trade_modification = legacy_value
             
             # Convert string values to booleans if needed
             if isinstance(enable_buy, str):
                 enable_buy = enable_buy.lower() == 'true'
             if isinstance(enable_sell, str):
                 enable_sell = enable_sell.lower() == 'true'
-            if isinstance(automatic_trading, str):
-                automatic_trading = automatic_trading.lower() == 'true'
+            if isinstance(allow_automated_trade_opening, str):
+                allow_automated_trade_opening = allow_automated_trade_opening.lower() == 'true'
+            if isinstance(allow_automated_trade_modification, str):
+                allow_automated_trade_modification = allow_automated_trade_modification.lower() == 'true'
             
             if hasattr(self, 'enable_buy_checkbox'):
                 self.enable_buy_checkbox.value = enable_buy
             if hasattr(self, 'enable_sell_checkbox'):
                 self.enable_sell_checkbox.value = enable_sell
-            if hasattr(self, 'automatic_trading_checkbox'):
-                self.automatic_trading_checkbox.value = automatic_trading
+            if hasattr(self, 'allow_automated_trade_opening_checkbox'):
+                self.allow_automated_trade_opening_checkbox.value = allow_automated_trade_opening
+            if hasattr(self, 'allow_automated_trade_modification_checkbox'):
+                self.allow_automated_trade_modification_checkbox.value = allow_automated_trade_modification
                 
-            logger.debug(f'Loaded general settings for expert {expert_instance.id}: enter_market_schedule={enter_market_schedule}, open_positions_schedule={open_positions_schedule}, buy={enable_buy}, sell={enable_sell}, automatic={automatic_trading}')
+            logger.debug(f'Loaded general settings for expert {expert_instance.id}: enter_market_schedule={enter_market_schedule}, open_positions_schedule={open_positions_schedule}, buy={enable_buy}, sell={enable_sell}, auto_open={allow_automated_trade_opening}, auto_modify={allow_automated_trade_modification}')
             
         except Exception as e:
             logger.error(f'Error loading general settings for expert {expert_instance.id}: {e}', exc_info=True)
@@ -1630,11 +1658,13 @@ class ExpertSettingsTab:
             expert.save_setting('execution_schedule_open_positions', schedule_config_open, setting_type="json")
             logger.debug(f'Saved execution_schedule_open_positions: {schedule_config_open}')
         
-        if hasattr(self, 'enable_buy_checkbox') and hasattr(self, 'enable_sell_checkbox') and hasattr(self, 'automatic_trading_checkbox'):
+        if (hasattr(self, 'enable_buy_checkbox') and hasattr(self, 'enable_sell_checkbox') and 
+            hasattr(self, 'allow_automated_trade_opening_checkbox') and hasattr(self, 'allow_automated_trade_modification_checkbox')):
             expert.save_setting('enable_buy', self.enable_buy_checkbox.value, setting_type="bool")
             expert.save_setting('enable_sell', self.enable_sell_checkbox.value, setting_type="bool")
-            expert.save_setting('automatic_trading', self.automatic_trading_checkbox.value, setting_type="bool")
-            logger.debug(f'Saved trading permissions: buy={self.enable_buy_checkbox.value}, sell={self.enable_sell_checkbox.value}, automatic={self.automatic_trading_checkbox.value}')
+            expert.save_setting('allow_automated_trade_opening', self.allow_automated_trade_opening_checkbox.value, setting_type="bool")
+            expert.save_setting('allow_automated_trade_modification', self.allow_automated_trade_modification_checkbox.value, setting_type="bool")
+            logger.debug(f'Saved trading permissions: buy={self.enable_buy_checkbox.value}, sell={self.enable_sell_checkbox.value}, auto_open={self.allow_automated_trade_opening_checkbox.value}, auto_modify={self.allow_automated_trade_modification_checkbox.value}')
         
         # Save expert-specific settings
         if hasattr(self, 'expert_settings_inputs') and self.expert_settings_inputs:
