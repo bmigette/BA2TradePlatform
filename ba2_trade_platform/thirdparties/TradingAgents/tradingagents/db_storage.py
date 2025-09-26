@@ -54,8 +54,18 @@ def update_market_analysis_status(analysis_id: int, status: Union[str, 'MarketAn
                 if 'trading_agent_graph' not in analysis.state:
                     analysis.state['trading_agent_graph'] = {}
                 
-                # Update the trading_agent_graph section with new state
-                analysis.state['trading_agent_graph'].update(state)
+                # Preserve existing keys in trading_agent_graph - merge intelligently
+                existing_graph_state = analysis.state['trading_agent_graph']
+                
+                # Create a merged state that preserves existing keys
+                merged_state = existing_graph_state.copy()  # Start with existing state
+                
+                # Update with new state - this will override existing keys with same names
+                # but preserve keys that exist in database but not in new state
+                merged_state.update(state)
+                
+                # Replace the trading_agent_graph with merged state
+                analysis.state['trading_agent_graph'] = merged_state
                 
                 # Explicitly mark the state field as modified for SQLAlchemy
                 from sqlalchemy.orm import attributes
@@ -64,7 +74,7 @@ def update_market_analysis_status(analysis_id: int, status: Union[str, 'MarketAn
             update_instance(analysis)
             ta_logger.debug(f"Updated MarketAnalysis {analysis_id} status to {status}")
     except Exception as e:
-        ta_logger.error(f"Error updating MarketAnalysis {analysis_id}: {e}")
+        ta_logger.error(f"Error updating MarketAnalysis {analysis_id}: {e}", exc_info=True)
 
 
 def store_analysis_output(market_analysis_id: int, name: str, output_type: str, text: str = None, blob: bytes = None):
@@ -95,7 +105,7 @@ def store_analysis_output(market_analysis_id: int, name: str, output_type: str, 
         
         return add_instance(output)
     except Exception as e:
-        ta_logger.error(f"Error storing AnalysisOutput: {e}")
+        ta_logger.error(f"Error storing AnalysisOutput: {e}", exc_info=True)
         return None
 
 
@@ -203,7 +213,7 @@ def get_market_analysis_outputs(analysis_id: int):
             statement = select(AnalysisOutput).where(AnalysisOutput.market_analysis_id == analysis_id)
             return session.exec(statement).all()
     except Exception as e:
-        ta_logger.error(f"Error retrieving outputs for MarketAnalysis {analysis_id}: {e}")
+        ta_logger.error(f"Error retrieving outputs for MarketAnalysis {analysis_id}: {e}", exc_info=True)
         return []
 
 

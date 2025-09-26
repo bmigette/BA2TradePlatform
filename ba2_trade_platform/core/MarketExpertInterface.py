@@ -26,6 +26,18 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         # Ensure builtin settings are initialized
         self._ensure_builtin_settings()
     
+    @property
+    def shortname(self) -> str:
+        """
+        Return a short identifier combining class name and instance ID.
+        Used as order comment to identify which expert created the order.
+        
+        Returns:
+            str: Short name in format "classname-instanceid" (e.g., "tradingagents-1")
+        """
+        class_name = self.__class__.__name__.lower()
+        return f"{class_name}-{self.id}"
+    
     @classmethod
     def _ensure_builtin_settings(cls):
         """Ensure builtin settings are initialized for the class."""
@@ -41,7 +53,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "description": "Allow sell orders for this expert"
                 },
                 "automatic_trading": {
-                    "type": "bool", "required": False, "default": True,
+                    "type": "bool", "required": False, "default": False,
                     "description": "Enable automatic trade execution"
                 },
                 # Execution Schedule Settings
@@ -145,7 +157,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             return enabled_instruments
             
         except Exception as e:
-            logger.error(f'Error getting enabled instruments: {e}')
+            logger.error(f'Error getting enabled instruments: {e}', exc_info=True)
             return []
     
     def _get_enabled_instruments_config(self) -> Dict[str, Dict]:

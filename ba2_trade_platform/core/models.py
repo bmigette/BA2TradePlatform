@@ -1,7 +1,8 @@
 from sqlmodel import  Field, Session, SQLModel, create_engine, Column, Relationship
 from sqlalchemy import String, Float, JSON, UniqueConstraint, Table, Integer, ForeignKey
+from sqlalchemy.orm import relationship
 from typing import Optional, Dict, Any, List
-from .types import InstrumentType, MarketAnalysisStatus, OrderRecommendation, OrderStatus, OrderDirection, ExpertEventRuleType, AnalysisUseCase, RiskLevel, TimeHorizon
+from .types import InstrumentType, MarketAnalysisStatus, OrderType, OrderRecommendation, OrderStatus, OrderDirection, OrderOpenType, ExpertEventRuleType, AnalysisUseCase, RiskLevel, TimeHorizon
 from datetime import datetime as DateTime, timezone
 
 # Association table for many-to-many relationship between Ruleset and EventAction
@@ -131,14 +132,22 @@ class TradingOrder(SQLModel, table=True):
     symbol: str
     quantity: float
     side: str 
-    order_type: str
+    order_type: OrderType
     good_for: str | None
-    limit_price: float | None
-    stop_price: float | None
     status: OrderStatus = OrderStatus.UNKNOWN
     filled_qty: float | None
-    client_order_id: str | None
+    comment: str | None
     created_at: DateTime | None = Field(default_factory=lambda: DateTime.now(timezone.utc))
+    
+    # New fields
+    order_recommendation_id: int | None = Field(foreign_key="expertrecommendation.id", nullable=True, ondelete="SET NULL")
+    open_type: OrderOpenType = Field(default=OrderOpenType.MANUAL)
+    
+    # Self-referential relationship for parent-child orders
+    parent_order_id: int | None = Field(foreign_key="tradingorder.id", nullable=True, ondelete="CASCADE")
+    
+    # Relationships
+    order_recommendation: Optional["ExpertRecommendation"] = Relationship()
 
     def as_string(self) -> str:
         return f"Order(id={self.id}, symbol={self.symbol}, quantity={self.quantity}, side={self.side}, type={self.order_type}, status={self.status})"

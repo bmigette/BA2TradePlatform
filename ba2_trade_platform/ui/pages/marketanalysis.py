@@ -8,7 +8,7 @@ from ...core.db import get_all_instances, get_instance, get_db
 from ...core.models import MarketAnalysis, ExpertInstance, AnalysisOutput
 from ...core.types import MarketAnalysisStatus, WorkerTaskStatus
 from ...logger import logger
-from sqlmodel import select, func, Session
+from sqlmodel import select, func
 
 
 class JobMonitoringTab:
@@ -22,7 +22,6 @@ class JobMonitoringTab:
         self.total_pages = 1
         self.total_records = 0
         self.status_filter = 'all'
-        self.symbol_filter = ''
         self.render()
     
     def _get_worker_queue(self):
@@ -59,7 +58,7 @@ class JobMonitoringTab:
                         'Symbol Filter',
                         placeholder='e.g., AAPL, MSFT'
                     ).classes('w-40')
-                    self.symbol_input.on_value_change(self._on_symbol_filter_change)
+                    
                 
                 with ui.row().classes('gap-2'):
                     ui.button('Clear Filters', on_click=self._clear_filters, icon='clear')
@@ -69,7 +68,7 @@ class JobMonitoringTab:
             
             # Analysis jobs table
             self._create_analysis_table()
-            
+            self.symbol_input.bind_value(self.analysis_table, "filter")
             # Pagination controls
             self._create_pagination_controls()
             
@@ -158,7 +157,7 @@ class JobMonitoringTab:
     def _get_analysis_data(self) -> tuple[List[dict], int]:
         """Get analysis jobs data for the table with pagination and filtering."""
         try:
-            with Session(get_db().bind) as session:
+            with get_db() as session:
                 # Build base query
                 statement = select(MarketAnalysis)
                 
@@ -166,22 +165,12 @@ class JobMonitoringTab:
                 if self.status_filter != 'all':
                     statement = statement.where(MarketAnalysis.status == MarketAnalysisStatus(self.status_filter))
                 
-                # Apply symbol filter
-                if self.symbol_filter.strip():
-                    # Support multiple symbols separated by comma
-                    symbols = [s.strip().upper() for s in self.symbol_filter.split(',') if s.strip()]
-                    if symbols:
-                        statement = statement.where(MarketAnalysis.symbol.in_(symbols))
-                
+          
                 # Get total count for pagination
                 count_statement = select(func.count(MarketAnalysis.id))
                 if self.status_filter != 'all':
                     count_statement = count_statement.where(MarketAnalysis.status == MarketAnalysisStatus(self.status_filter))
-                if self.symbol_filter.strip():
-                    symbols = [s.strip().upper() for s in self.symbol_filter.split(',') if s.strip()]
-                    if symbols:
-                        count_statement = count_statement.where(MarketAnalysis.symbol.in_(symbols))
-                
+ 
                 total_count = session.exec(count_statement).first() or 0
                 
                 # Apply ordering and pagination
@@ -294,16 +283,10 @@ class JobMonitoringTab:
         self.current_page = 1  # Reset to first page when filtering
         self.refresh_data()
     
-    def _on_symbol_filter_change(self, event):
-        """Handle symbol filter change."""
-        self.symbol_filter = event.value
-        self.current_page = 1  # Reset to first page when filtering
-        self.refresh_data()
-    
+
     def _clear_filters(self):
         """Clear all filters."""
         self.status_filter = 'all'
-        self.symbol_filter = ''
         self.current_page = 1
         if hasattr(self, 'status_select'):
             self.status_select.value = 'all'
@@ -740,11 +723,147 @@ class ScheduledJobsTab:
             self.refresh_timer = None
 
 
+class OrderRecommendationsTab:
+    def __init__(self):
+        self.orders_table = None
+        self.refresh_timer = None
+        self.render()
+
+    def render(self):
+        with ui.card().classes('w-full'):
+            ui.label('Order Recommendations').classes('text-lg font-bold')
+            ui.label('Pending orders from expert recommendations').classes('text-sm text-gray-600 mb-4')
+            
+            # Controls
+            with ui.row().classes('w-full justify-between items-center mb-4'):
+                ui.button('Refresh', on_click=self.refresh_data).props('color=primary outline')
+            
+            # Orders table container
+            self.orders_container = ui.element('div').classes('w-full')
+            
+            # Initial load
+            self.refresh_data()
+            
+            # Auto-refresh every 30 seconds
+            self.refresh_timer = ui.timer(30.0, self.refresh_data)
+
+    def refresh_data(self):
+        """Refresh the orders table."""
+        try:
+            self.orders_container.clear()
+            
+            with self.orders_container:
+                # Get pending orders with their linked recommendations and analysis
+                pending_orders = self._get_pending_orders()
+                
+                if not pending_orders:
+                    ui.label('No pending orders found').classes('text-gray-500 text-center py-8')
+                    return
+                
+                # Create table
+                columns = [
+                    {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left'},
+                    {'name': 'side', 'label': 'Side', 'field': 'side', 'align': 'center'},
+                    {'name': 'quantity', 'label': 'Quantity', 'field': 'quantity', 'align': 'right'},
+                    {'name': 'order_type', 'label': 'Type', 'field': 'order_type', 'align': 'center'},
+                    {'name': 'expert', 'label': 'Expert', 'field': 'expert_name', 'align': 'left'},
+                    {'name': 'created_at', 'label': 'Created', 'field': 'created_at', 'align': 'center'},
+                    {'name': 'analysis', 'label': 'Analysis', 'field': 'analysis_id', 'align': 'center'},
+                ]
+                
+                rows = []
+                for order_data in pending_orders:
+                    order, recommendation, expert_instance, analysis = order_data
+                    
+                    # Format the row data
+                    row = {
+                        'id': order.id,
+                        'symbol': order.symbol,
+                        'side': order.side.upper() if order.side else 'N/A',
+                        'quantity': f"{order.quantity:.2f}" if order.quantity else '0',
+                        'order_type': order.order_type.value if order.order_type else 'N/A',
+                        'expert_name': expert_instance.user_description or expert_instance.expert if expert_instance else 'Unknown',
+                        'created_at': order.created_at.strftime('%Y-%m-%d %H:%M') if order.created_at else 'N/A',
+                        'analysis_id': analysis.id if analysis else None,
+                        'analysis_symbol': analysis.symbol if analysis else None,
+                    }
+                    rows.append(row)
+                
+                self.orders_table = ui.table(
+                    columns=columns,
+                    rows=rows,
+                    row_key='id',
+                    pagination=10
+                ).classes('w-full')
+                
+                # Add click handler for analysis link
+                self.orders_table.add_slot('body-cell-analysis', '''
+                    <q-td :props="props">
+                        <q-btn v-if="props.value" 
+                               icon="visibility" 
+                               flat 
+                               dense 
+                               color="primary" 
+                               :title="'View Analysis ' + props.value"
+                               @click="$parent.$emit('view_analysis', props.value)" />
+                        <span v-else class="text-gray-400">N/A</span>
+                    </q-td>
+                ''')
+                
+                # Handle analysis view clicks
+                self.orders_table.on('view_analysis', self._handle_view_analysis)
+                
+        except Exception as e:
+            logger.error(f"Error refreshing order recommendations data: {e}", exc_info=True)
+
+    def _get_pending_orders(self):
+        """Get pending orders with their linked recommendations and analysis data."""
+        try:
+            from ...core.models import TradingOrder, ExpertRecommendation, ExpertInstance, MarketAnalysis
+            from ...core.types import OrderStatus
+            
+            with get_db() as session:
+                # Query pending orders with joins to get related data
+                statement = (
+                    select(TradingOrder, ExpertRecommendation, ExpertInstance, MarketAnalysis)
+                    .outerjoin(ExpertRecommendation, TradingOrder.order_recommendation_id == ExpertRecommendation.id)
+                    .outerjoin(ExpertInstance, ExpertRecommendation.instance_id == ExpertInstance.id)
+                    .outerjoin(MarketAnalysis, ExpertRecommendation.market_analysis_id == MarketAnalysis.id)
+                    .where(TradingOrder.status == OrderStatus.PENDING)
+                    .order_by(TradingOrder.created_at.desc())
+                )
+                
+                results = session.exec(statement).all()
+                return results
+                
+        except Exception as e:
+            logger.error(f"Error getting pending orders: {e}", exc_info=True)
+            return []
+
+    def _handle_view_analysis(self, event_data):
+        """Handle click on analysis view button."""
+        try:
+            analysis_id = event_data.args if hasattr(event_data, 'args') else event_data
+            if analysis_id:
+                # Navigate to analysis detail page
+                ui.navigate(f'/market_analysis_detail/{analysis_id}')
+                
+        except Exception as e:
+            logger.error(f"Error navigating to analysis detail: {e}", exc_info=True)
+
+    def stop_auto_refresh(self):
+        """Stop auto-refresh timer."""
+        if self.refresh_timer:
+            self.refresh_timer.cancel()
+            self.refresh_timer = None
+
+
 def content() -> None:
     with ui.tabs() as tabs:
         ui.tab('Job Monitoring')
         ui.tab('Manual Analysis')
         ui.tab('Scheduled Jobs')
+        ui.tab('Order Recommendations')
 
     with ui.tab_panels(tabs, value='Job Monitoring').classes('w-full'):
         with ui.tab_panel('Job Monitoring'):
@@ -753,3 +872,5 @@ def content() -> None:
             ManualAnalysisTab()
         with ui.tab_panel('Scheduled Jobs'):
             ScheduledJobsTab()
+        with ui.tab_panel('Order Recommendations'):
+            OrderRecommendationsTab()

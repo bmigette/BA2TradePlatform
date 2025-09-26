@@ -870,17 +870,17 @@ class ExpertSettingsTab:
                                 try:
                                     self.enter_market_times_container = ui.column().classes('w-full mb-4')
                                     if self.enter_market_times_container is None:
-                                        logger.error("ui.column() returned None for enter_market_times_container")
+                                        logger.error("ui.column() returned None for enter_market_times_container", exc_info=True)
                                         self.enter_market_times_container = ui.column()  # Try again without classes
                                 except Exception as e:
-                                    logger.error(f"Error creating enter_market_times_container: {e}")
+                                    logger.error(f"Error creating enter_market_times_container: {e}", exc_info=True)
                                     self.enter_market_times_container = None
                                 
                                 self.enter_market_execution_times = []
                                 
                                 # Verify container was created successfully
                                 if self.enter_market_times_container is None:
-                                    logger.error("Failed to create enter_market_times_container, skipping time input setup")
+                                    logger.error("Failed to create enter_market_times_container, skipping time input setup", exc_info=True)
                                 else:
                                     # Add initial time input
                                     self._add_time_input_enter_market('09:30')
@@ -906,17 +906,17 @@ class ExpertSettingsTab:
                                 try:
                                     self.open_positions_times_container = ui.column().classes('w-full mb-4')
                                     if self.open_positions_times_container is None:
-                                        logger.error("ui.column() returned None for open_positions_times_container")
+                                        logger.error("ui.column() returned None for open_positions_times_container", exc_info=True)
                                         self.open_positions_times_container = ui.column()  # Try again without classes
                                 except Exception as e:
-                                    logger.error(f"Error creating open_positions_times_container: {e}")
+                                    logger.error(f"Error creating open_positions_times_container: {e}", exc_info=True)
                                     self.open_positions_times_container = None
                                 
                                 self.open_positions_execution_times = []
                                 
                                 # Verify container was created successfully
                                 if self.open_positions_times_container is None:
-                                    logger.error("Failed to create open_positions_times_container, skipping time input setup")
+                                    logger.error("Failed to create open_positions_times_container, skipping time input setup", exc_info=True)
                                 else:
                                     # Add initial time inputs (more frequent for position monitoring)
                                     for time in ['09:30', '10:30', '11:30', '12:30', '13:30', '14:30', '15:30']:
@@ -1056,14 +1056,14 @@ class ExpertSettingsTab:
         
         # Additional check - make sure it's a UI element that supports move()
         if not hasattr(self.execution_times_container, '__enter__') or not hasattr(self.execution_times_container, '__exit__'):
-            logger.error(f"execution_times_container is not a context manager: {type(self.execution_times_container)}")
+            logger.error(f"execution_times_container is not a context manager: {type(self.execution_times_container)}", exc_info=True)
             return
             
         try:
             # Create the row and move it to the container
             row = ui.row().classes('w-full gap-2')
             if row is None:
-                logger.error("ui.row() returned None")
+                logger.error("ui.row() returned None", exc_info=True)
                 return
             
             # Move the row to the container - move() modifies the row in place
@@ -1255,7 +1255,7 @@ class ExpertSettingsTab:
                     try:
                         enter_market_schedule = json.loads(enter_market_schedule)
                     except json.JSONDecodeError:
-                        logger.error(f"Invalid JSON in execution_schedule_enter_market: {enter_market_schedule}")
+                        logger.error(f"Invalid JSON in execution_schedule_enter_market: {enter_market_schedule}", exc_info=True)
                         enter_market_schedule = None
                 
                 if enter_market_schedule:
@@ -1269,7 +1269,7 @@ class ExpertSettingsTab:
                     try:
                         open_positions_schedule = json.loads(open_positions_schedule)
                     except json.JSONDecodeError:
-                        logger.error(f"Invalid JSON in execution_schedule_open_positions: {open_positions_schedule}")
+                        logger.error(f"Invalid JSON in execution_schedule_open_positions: {open_positions_schedule}", exc_info=True)
                         open_positions_schedule = None
                 
                 if open_positions_schedule:
@@ -1656,7 +1656,7 @@ class ExpertSettingsTab:
             job_manager.refresh_expert_schedules(expert_id)
             logger.info(f'Refreshed scheduled analysis jobs for expert {expert_id}')
         except Exception as e:
-            logger.error(f'Error refreshing scheduled jobs for expert {expert_id}: {e}')
+            logger.error(f'Error refreshing scheduled jobs for expert {expert_id}: {e}', exc_info=True)
     
     def _save_instrument_configuration(self, expert_id):
         """Save instrument selection and configuration."""
@@ -1945,7 +1945,7 @@ class TradeSettingsTab:
     def _add_trigger_row(self, trigger_key=None, trigger_config=None):
         """Add a trigger configuration row."""
         if not hasattr(self, 'triggers_container') or self.triggers_container is None:
-            logger.error("Triggers container not initialized")
+            logger.error("Triggers container not initialized", exc_info=True)
             return
             
         trigger_id = trigger_key or f"trigger_{len(self.triggers)}"
@@ -2013,7 +2013,7 @@ class TradeSettingsTab:
     def _add_action_row(self, action_key=None, action_config=None):
         """Add an action configuration row."""
         if not hasattr(self, 'actions_container') or self.actions_container is None:
-            logger.error("Actions container not initialized")
+            logger.error("Actions container not initialized", exc_info=True)
             return
             
         action_id = action_key or f"action_{len(self.actions)}"

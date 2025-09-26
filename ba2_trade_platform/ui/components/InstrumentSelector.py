@@ -58,7 +58,7 @@ class InstrumentSelector:
             
             logger.debug(f'Loaded {len(self.instruments)} instruments')
         except Exception as e:
-            logger.error(f'Error loading instruments: {e}')
+            logger.error(f'Error loading instruments: {e}', exc_info=True)
             self.instruments = []
     
     def _get_unique_categories(self) -> List[str]:

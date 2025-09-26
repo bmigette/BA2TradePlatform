@@ -36,7 +36,7 @@ class AlpacaAccount(AccountInterface):
             )
             logger.info("Alpaca TradingClient initialized.")
         except Exception as e:
-            logger.error(f"Failed to initialize Alpaca TradingClient: {e}")
+            logger.error(f"Failed to initialize Alpaca TradingClient: {e}", exc_info=True)
             raise
         
     def get_settings_definitions() -> Dict[str, Any]:
@@ -154,7 +154,7 @@ class AlpacaAccount(AccountInterface):
             logger.info(f"Submitted Alpaca order: {order.id}")
             return self.alpaca_order_to_tradingorder(order)
         except Exception as e:
-            logger.error(f"Error creating Alpaca order: {e}")
+            logger.error(f"Error creating Alpaca order: {e}", exc_info=True)
             return None
 
     def modify_order(self, order_id: str, trading_order: TradingOrder):
@@ -179,7 +179,7 @@ class AlpacaAccount(AccountInterface):
             logger.info(f"Modified Alpaca order: {order.id}")
             return self.alpaca_order_to_tradingorder(order)
         except Exception as e:
-            logger.error(f"Error modifying Alpaca order {order_id}: {e}")
+            logger.error(f"Error modifying Alpaca order {order_id}: {e}", exc_info=True)
             return None
 
     def get_order(self, order_id: str):
@@ -197,7 +197,7 @@ class AlpacaAccount(AccountInterface):
             logger.debug(f"Fetched Alpaca order: {order.id}")
             return self.alpaca_order_to_tradingorder(order)
         except Exception as e:
-            logger.error(f"Error fetching Alpaca order {order_id}: {e}")
+            logger.error(f"Error fetching Alpaca order {order_id}: {e}", exc_info=True)
             return None
         
     def cancel_order(self, order_id: str):
@@ -215,7 +215,7 @@ class AlpacaAccount(AccountInterface):
             logger.info(f"Cancelled Alpaca order: {order_id}")
             return True
         except Exception as e:
-            logger.error(f"Error cancelling Alpaca order {order_id}: {e}")
+            logger.error(f"Error cancelling Alpaca order {order_id}: {e}", exc_info=True)
             return False
 
     def get_positions(self):
@@ -230,7 +230,7 @@ class AlpacaAccount(AccountInterface):
             logger.debug(f"Listed {len(positions)} Alpaca positions.")
             return [self.alpaca_position_to_position(position) for position in positions]
         except Exception as e:
-            logger.error(f"Error listing Alpaca positions: {e}")
+            logger.error(f"Error listing Alpaca positions: {e}", exc_info=True)
             return []
 
     def get_account_info(self):
@@ -245,5 +245,5 @@ class AlpacaAccount(AccountInterface):
             logger.debug("Fetched Alpaca account info.")
             return account
         except Exception as e:
-            logger.error(f"Error fetching Alpaca account info: {e}")
+            logger.error(f"Error fetching Alpaca account info: {e}", exc_info=True)
             return None

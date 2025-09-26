@@ -1,6 +1,7 @@
 import chromadb
 from chromadb.config import Settings
 from openai import OpenAI
+import numpy as np
 from ... import logger as ta_logger
 
 
@@ -42,22 +43,62 @@ class FinancialSituationMemory:
             self.situation_collection = self.chroma_client.create_collection(name=collection_name)
 
     def get_embedding(self, text):
-        """Get OpenAI embedding for a text"""
-        # Truncate text if it exceeds the model's token limit
-        # text-embedding-ada-002 has a max context length of 8192 tokens
+        """Get OpenAI embedding for a text, handling long texts by splitting and averaging embeddings"""
+        # text-embedding-3-small has a max context length of 8192 tokens
         # Conservative estimate: ~3 characters per token for safety margin
-        #EmbeddingModel: TypeAlias = Literal["text-embedding-ada-002", "text-embedding-3-small", "text-embedding-3-large"]
         max_chars = 24000  # ~8000 tokens * 3 chars/token
-        if len(text) > max_chars:
-            # Take first part and last part to preserve both beginning and end context
-            half_chars = max_chars // 2
-            text = text[:half_chars] + "\n...[TRUNCATED]...\n" + text[-half_chars:]
-            ta_logger.warning(f"Text truncated to ~{max_chars} characters for embedding")
         
-        response = self.client.embeddings.create(
-            model="text-embedding-3-small", input=text
-        )
-        return response.data[0].embedding
+        if len(text) <= max_chars:
+            # Text is short enough, get embedding directly
+            response = self.client.embeddings.create(
+                model=self.embedding, input=text
+            )
+            return response.data[0].embedding
+        
+        # Text is too long, split into chunks and average embeddings
+        ta_logger.info(f"Text length {len(text)} exceeds limit, splitting into chunks for embedding")
+        
+        # Split text into overlapping chunks to preserve context
+        chunk_size = max_chars - 1000  # Leave some buffer
+        overlap = 500  # Overlap between chunks to preserve context
+        chunks = []
+        
+        start = 0
+        while start < len(text):
+            end = min(start + chunk_size, len(text))
+            
+            # Try to break at sentence boundaries to preserve meaning
+            if end < len(text):
+                # Look for sentence ending within last 200 chars
+                sentence_break = text.rfind('.', end - 200, end)
+                if sentence_break > start:
+                    end = sentence_break + 1
+            
+            chunks.append(text[start:end])
+            start = max(start + chunk_size - overlap, end)
+        
+        ta_logger.info(f"Split text into {len(chunks)} chunks for embedding")
+        
+        # Get embeddings for all chunks
+        chunk_embeddings = []
+        for i, chunk in enumerate(chunks):
+            try:
+                response = self.client.embeddings.create(
+                    model=self.embedding, input=chunk
+                )
+                chunk_embeddings.append(response.data[0].embedding)
+            except Exception as e:
+                ta_logger.error(f"Failed to get embedding for chunk {i}: {e}", exc_info=True)
+                continue
+        
+        if not chunk_embeddings:
+            raise ValueError("Failed to get embeddings for any chunks")
+        
+        # Average the embeddings (simple approach)
+        averaged_embedding = np.mean(chunk_embeddings, axis=0).tolist()
+        
+        return averaged_embedding
+    
     def add_situations(self, situations_and_advice):
         """Add financial situations and their corresponding advice. Parameter is a list of tuples (situation, rec)"""
 

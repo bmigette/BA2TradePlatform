@@ -7,9 +7,10 @@ import aiohttp
 import asyncio
 import json
 
-from ...core.db import get_all_instances, get_db
-from ...core.models import AccountDefinition, MarketAnalysis, ExpertRecommendation, AppSetting
-from ...core.types import MarketAnalysisStatus, OrderRecommendation
+from ...core.db import get_all_instances, get_db, get_instance
+from ...core.models import AccountDefinition, MarketAnalysis, ExpertRecommendation, AppSetting, TradingOrder
+from ...core.types import MarketAnalysisStatus, OrderRecommendation, OrderStatus
+from ...core.utils import get_expert_instance_from_id, get_market_analysis_id_from_order_id
 from ...modules.accounts import providers
 from ...logger import logger
 
@@ -170,69 +171,86 @@ class OverviewTab:
         try:
             usage_data = await self._get_openai_usage_data_async()
             
-            # Clear loading message
-            loading_label.delete()
+            # Clear loading message - check if client still exists
+            try:
+                loading_label.delete()
+            except RuntimeError:
+                # Client has been deleted (user navigated away), stop processing
+                return
             
-            # Populate content
-            with content_container:
-                if usage_data.get('error'):
-                    ui.label('⚠️ Error fetching usage data').classes('text-sm text-red-600 mb-2')
-                    error_message = usage_data['error']
-                    
-                    # Check if this is an admin key requirement error
-                    if 'admin-keys' in error_message:
-                        # Split the error message at the URL
-                        parts = error_message.split('https://platform.openai.com/settings/organization/admin-keys')
-                        if len(parts) == 2:
-                            ui.label(parts[0]).classes('text-xs text-gray-500')
-                            ui.link('Get OpenAI Admin Key', 'https://platform.openai.com/settings/organization/admin-keys', new_tab=True).classes('text-xs text-blue-600 underline mb-2')
+            # Populate content - check if client still exists
+            try:
+                with content_container:
+                    if usage_data.get('error'):
+                        ui.label('⚠️ Error fetching usage data').classes('text-sm text-red-600 mb-2')
+                        error_message = usage_data['error']
+                        
+                        # Check if this is an admin key requirement error
+                        if 'admin-keys' in error_message:
+                            # Split the error message at the URL
+                            parts = error_message.split('https://platform.openai.com/settings/organization/admin-keys')
+                            if len(parts) == 2:
+                                ui.label(parts[0]).classes('text-xs text-gray-500')
+                                ui.link('Get OpenAI Admin Key', 'https://platform.openai.com/settings/organization/admin-keys', new_tab=True).classes('text-xs text-blue-600 underline mb-2')
+                            else:
+                                ui.label(error_message).classes('text-xs text-gray-500')
                         else:
                             ui.label(error_message).classes('text-xs text-gray-500')
                     else:
-                        ui.label(error_message).classes('text-xs text-gray-500')
-                else:
-                    with ui.row().classes('w-full justify-between items-center mb-2'):
-                        ui.label('Last Week:').classes('text-sm')
-                        week_cost = usage_data.get('week_cost', 0)
-                        ui.label(f'${week_cost:.2f}').classes('text-sm font-bold text-orange-600')
-                    
-                    with ui.row().classes('w-full justify-between items-center mb-2'):
-                        ui.label('Last Month:').classes('text-sm')
-                        month_cost = usage_data.get('month_cost', 0)
-                        ui.label(f'${month_cost:.2f}').classes('text-sm font-bold text-red-600')
-                    
-                    # Show remaining credit only if available
-                    remaining = usage_data.get('remaining_credit')
-                    if remaining is not None:
                         with ui.row().classes('w-full justify-between items-center mb-2'):
-                            ui.label('Remaining Credit:').classes('text-sm')
-                            ui.label(f'${remaining:.2f}').classes('text-sm font-bold text-green-600')
-                    else:
+                            ui.label('Last Week:').classes('text-sm')
+                            week_cost = usage_data.get('week_cost', 0)
+                            ui.label(f'${week_cost:.2f}').classes('text-sm font-bold text-orange-600')
+                        
                         with ui.row().classes('w-full justify-between items-center mb-2'):
-                            ui.label('Remaining Credit:').classes('text-sm')
-                            ui.label('Not available').classes('text-sm text-gray-500')
-                    
-                    # Show hard limit if available
-                    hard_limit = usage_data.get('hard_limit')
-                    if hard_limit:
-                        with ui.row().classes('w-full justify-between items-center mb-2'):
-                            ui.label('Credit Limit:').classes('text-sm')
-                            ui.label(f'${hard_limit:.2f}').classes('text-sm text-gray-600')
-                    
-                    ui.separator().classes('my-2')
-                    last_updated = usage_data.get('last_updated', 'Unknown')
-                    ui.label(f'Last updated: {last_updated}').classes('text-xs text-gray-500')
-                    
-                    # Show note if using simulated data
-                    note = usage_data.get('note')
-                    if note:
-                        ui.label(f'📝 {note}').classes('text-xs text-blue-600')
+                            ui.label('Last Month:').classes('text-sm')
+                            month_cost = usage_data.get('month_cost', 0)
+                            ui.label(f'${month_cost:.2f}').classes('text-sm font-bold text-red-600')
+                        
+                        # Show remaining credit only if available
+                        remaining = usage_data.get('remaining_credit')
+                        if remaining is not None:
+                            with ui.row().classes('w-full justify-between items-center mb-2'):
+                                ui.label('Remaining Credit:').classes('text-sm')
+                                ui.label(f'${remaining:.2f}').classes('text-sm font-bold text-green-600')
+                        else:
+                            with ui.row().classes('w-full justify-between items-center mb-2'):
+                                ui.label('Remaining Credit:').classes('text-sm')
+                                ui.label('Not available').classes('text-sm text-gray-500')
+                        
+                        # Show hard limit if available
+                        hard_limit = usage_data.get('hard_limit')
+                        if hard_limit:
+                            with ui.row().classes('w-full justify-between items-center mb-2'):
+                                ui.label('Credit Limit:').classes('text-sm')
+                                ui.label(f'${hard_limit:.2f}').classes('text-sm text-gray-600')
+                        
+                        ui.separator().classes('my-2')
+                        last_updated = usage_data.get('last_updated', 'Unknown')
+                        ui.label(f'Last updated: {last_updated}').classes('text-xs text-gray-500')
+                        
+                        # Show note if using simulated data
+                        note = usage_data.get('note')
+                        if note:
+                            ui.label(f'📝 {note}').classes('text-xs text-blue-600')
+            except RuntimeError:
+                # Client has been deleted (user navigated away), stop processing
+                return
         except Exception as e:
-            # Clear loading message and show error
-            loading_label.delete()
-            with content_container:
-                ui.label('❌ Failed to load usage data').classes('text-sm text-red-600')
-                ui.label(f'Error: {str(e)}').classes('text-xs text-gray-500')
+            # Clear loading message and show error - check if client still exists
+            try:
+                loading_label.delete()
+            except RuntimeError:
+                # Client has been deleted (user navigated away), stop processing
+                return
+            
+            try:
+                with content_container:
+                    ui.label('❌ Failed to load usage data').classes('text-sm text-red-600')
+                    ui.label(f'Error: {str(e)}').classes('text-xs text-gray-500')
+            except RuntimeError:
+                # Client has been deleted (user navigated away), ignore the error
+                pass
     
     async def _get_openai_usage_data_async(self) -> Dict[str, Any]:
         """Fetch real OpenAI usage data from the API asynchronously."""
@@ -359,11 +377,11 @@ class OverviewTab:
                             return {'error': 'OpenAI API rate limit exceeded - try again later'}
                         else:
                             error_text = await response.text()
-                            logger.error(f'OpenAI API error {response.status}: {error_text}')
+                            logger.error(f'OpenAI API error {response.status}: {error_text}', exc_info=True)
                             return {'error': f'OpenAI API error ({response.status}): {error_text[:100]}...'}
                             
             except aiohttp.ClientError as e:
-                logger.error(f'Network error calling OpenAI costs API: {e}')
+                logger.error(f'Network error calling OpenAI costs API: {e}', exc_info=True)
                 return {'error': f'Network error: {str(e)}'}
             
             # If we get here, something went wrong but we didn't catch it above
@@ -378,10 +396,10 @@ class OverviewTab:
         except asyncio.TimeoutError:
             return {'error': 'Request timeout - OpenAI API not responding'}
         except aiohttp.ClientError as e:
-            logger.error(f'Error fetching OpenAI usage data: {e}')
+            logger.error(f'Error fetching OpenAI usage data: {e}', exc_info=True)
             return {'error': f'Network error: {str(e)}'}
         except Exception as e:
-            logger.error(f'Unexpected error fetching OpenAI usage data: {e}')
+            logger.error(f'Unexpected error fetching OpenAI usage data: {e}', exc_info=True)
             return {'error': f'Unexpected error: {str(e)}'}
     
     def _get_openai_usage_data(self) -> Dict[str, Any]:
@@ -510,11 +528,11 @@ class OverviewTab:
                     return {'error': 'OpenAI API rate limit exceeded - try again later'}
                 else:
                     error_text = response.text
-                    logger.error(f'OpenAI API error {response.status_code}: {error_text}')
+                    logger.error(f'OpenAI API error {response.status_code}: {error_text}', exc_info=True)
                     return {'error': f'OpenAI API error ({response.status_code}): {error_text[:100]}...'}
                     
             except requests.exceptions.RequestException as e:
-                logger.error(f'Network error calling OpenAI costs API: {e}')
+                logger.error(f'Network error calling OpenAI costs API: {e}', exc_info=True)
                 return {'error': f'Network error: {str(e)}'}
             
             # If we get here, something went wrong but we didn't catch it above
@@ -529,10 +547,10 @@ class OverviewTab:
         except requests.exceptions.Timeout:
             return {'error': 'Request timeout - OpenAI API not responding'}
         except requests.exceptions.RequestException as e:
-            logger.error(f'Error fetching OpenAI usage data: {e}')
+            logger.error(f'Error fetching OpenAI usage data: {e}', exc_info=True)
             return {'error': f'Network error: {str(e)}'}
         except Exception as e:
-            logger.error(f'Unexpected error fetching OpenAI usage data: {e}')
+            logger.error(f'Unexpected error fetching OpenAI usage data: {e}', exc_info=True)
             return {'error': f'Unexpected error: {str(e)}'}
 
 class AccountOverviewTab:
@@ -700,9 +718,134 @@ class AccountOverviewTab:
 class TradeHistoryTab:
     def __init__(self):
         self.render()
+    
     def render(self):
+        """Render the trade history tab with orders in OPEN, CLOSED, or FULFILLED states."""
         with ui.card():
-            ui.label('Trade History content goes here.')
+            ui.label('📋 Trade History').classes('text-h6 mb-4')
+            self._render_orders_table()
+    
+    def _render_orders_table(self):
+        """Render table with orders in OPEN, CLOSED, or FULFILLED states."""
+        session = get_db()
+        try:
+            # Get orders with the relevant statuses
+            relevant_statuses = [OrderStatus.OPEN, OrderStatus.CLOSED, OrderStatus.FULFILLED]
+            statement = (
+                select(TradingOrder)
+                .where(TradingOrder.status.in_(relevant_statuses))
+                .order_by(TradingOrder.created_at.desc())
+            )
+            orders = list(session.exec(statement).all())
+            
+            if not orders:
+                ui.label('No orders found with OPEN, CLOSED, or FULFILLED status.').classes('text-gray-500')
+                return
+            
+            # Prepare data for table
+            rows = []
+            for order in orders:
+                # Get expert information if order has linked recommendation
+                expert_name = ""
+                analysis_link = ""
+                
+                if order.order_recommendation_id:
+                    # Get market analysis ID for navigation
+                    analysis_id = get_market_analysis_id_from_order_id(order.id)
+                    if analysis_id:
+                        analysis_link = f"/market-analysis/{analysis_id}"
+                    
+                    # Get expert shortname
+                    try:
+                        expert_recommendation = get_instance(ExpertRecommendation, order.order_recommendation_id)
+                        if expert_recommendation:
+                            expert_instance = get_expert_instance_from_id(expert_recommendation.instance_id)
+                            if expert_instance and hasattr(expert_instance, 'shortname'):
+                                expert_name = expert_instance.shortname
+                    except Exception:
+                        pass
+                
+                # Format dates
+                created_at_str = order.created_at.strftime('%Y-%m-%d %H:%M:%S') if order.created_at else ''
+                
+                # Status badge color
+                status_color = {
+                    OrderStatus.OPEN: 'orange',
+                    OrderStatus.CLOSED: 'gray', 
+                    OrderStatus.FULFILLED: 'green'
+                }.get(order.status, 'gray')
+                
+                row = {
+                    'id': order.id,
+                    'symbol': order.symbol,
+                    'side': order.side,
+                    'quantity': f"{order.quantity:.2f}" if order.quantity else '',
+                    'order_type': order.order_type,
+                    'status': order.status,
+                    'status_color': status_color,
+                    'limit_price': f"${order.limit_price:.2f}" if order.limit_price else '',
+                    'filled_qty': f"{order.filled_qty:.2f}" if order.filled_qty else '',
+                    'expert_name': expert_name,
+                    'created_at': created_at_str,
+                    'analysis_link': analysis_link,
+                    'has_analysis': bool(analysis_link)
+                }
+                rows.append(row)
+            
+            # Define table columns
+            columns = [
+                {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left'},
+                {'name': 'side', 'label': 'Side', 'field': 'side', 'align': 'left'},
+                {'name': 'quantity', 'label': 'Quantity', 'field': 'quantity', 'align': 'right'},
+                {'name': 'order_type', 'label': 'Type', 'field': 'order_type', 'align': 'left'},
+                {'name': 'status', 'label': 'Status', 'field': 'status', 'align': 'center'},
+                {'name': 'limit_price', 'label': 'Limit Price', 'field': 'limit_price', 'align': 'right'},
+                {'name': 'filled_qty', 'label': 'Filled', 'field': 'filled_qty', 'align': 'right'},
+                {'name': 'expert_name', 'label': 'Expert', 'field': 'expert_name', 'align': 'left'},
+                {'name': 'created_at', 'label': 'Created', 'field': 'created_at', 'align': 'left'},
+                {'name': 'actions', 'label': 'Actions', 'field': 'actions', 'align': 'center'}
+            ]
+            
+            # Create table with custom cell rendering
+            table = ui.table(columns=columns, rows=rows, row_key='id').classes('w-full')
+            
+            # Add custom cell rendering for status badges and action buttons
+            table.add_slot('body-cell-status', '''
+                <q-td :props="props">
+                    <q-badge :color="props.row.status_color" :label="props.row.status" />
+                </q-td>
+            ''')
+            
+            table.add_slot('body-cell-actions', '''
+                <q-td :props="props">
+                    <q-btn v-if="props.row.has_analysis" 
+                           icon="analytics" 
+                           size="sm" 
+                           flat 
+                           round 
+                           color="primary"
+                           @click="$parent.$emit('navigate_to_analysis', props.row.analysis_link)"
+                           :title="'View Market Analysis'"
+                    />
+                    <span v-else class="text-grey-5">—</span>
+                </q-td>
+            ''')
+            
+            # Handle navigation events
+            def handle_navigation(e):
+                analysis_link = e.args
+                if analysis_link:
+                    # For now, just show a notification since we don't have routing set up
+                    ui.notify(f'Navigate to: {analysis_link}', type='info')
+                    # TODO: Implement proper navigation to market analysis page
+            
+            table.on('navigate_to_analysis', handle_navigation)
+            
+        except Exception as e:
+            logger.error(f"Error rendering orders table: {e}", exc_info=True)
+            ui.label(f'Error loading orders: {str(e)}').classes('text-red-500')
+        finally:
+            session.close()
 
 class PerformanceTab:
     def __init__(self):

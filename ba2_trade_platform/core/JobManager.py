@@ -127,7 +127,7 @@ class JobManager:
             self._control_queue.put_nowait(control_message)
             logger.debug(f"Schedule refresh request queued for expert {expert_instance_id or 'all experts'}")
         except queue.Full:
-            logger.error("Control queue is full - cannot queue schedule refresh request")
+            logger.error("Control queue is full - cannot queue schedule refresh request", exc_info=True)
     
     def _refresh_expert_schedules_sync(self, expert_instance_id: int = None):
         """
@@ -225,6 +225,18 @@ class JobManager:
             analysis_use_case = AnalysisUseCase(subtype)
         except ValueError:
             raise ValueError(f"Invalid subtype '{subtype}'. Must be one of: {[e.value for e in AnalysisUseCase]}")
+        
+        # For ENTER_MARKET analysis, check if existing orders exist for this expert and symbol
+        if analysis_use_case == AnalysisUseCase.ENTER_MARKET:
+            from .utils import has_existing_orders_for_expert_and_symbol
+            from .types import OrderStatus
+            
+            # Check for orders in states that indicate the expert has already entered the market
+            relevant_statuses = [OrderStatus.PENDING, OrderStatus.OPEN, OrderStatus.FULFILLED]
+            
+            if has_existing_orders_for_expert_and_symbol(expert_instance_id, symbol, relevant_statuses):
+                logger.info(f"Skipping ENTER_MARKET analysis for expert {expert_instance_id}, symbol {symbol}: existing orders found in states {[s.value for s in relevant_statuses]}")
+                return None
             
         # Submit to worker queue with subtype
         worker_queue = get_worker_queue()
@@ -399,7 +411,7 @@ class JobManager:
             else:
                 return None                
         except Exception as e:
-            logger.error(f"Error getting expert setting {key} for instance {instance_id}: {e}")
+            logger.error(f"Error getting expert setting {key} for instance {instance_id}: {e}", exc_info=True)
             return None
             
     def _get_enabled_instruments(self, instance_id: int) -> List[str]:
@@ -411,7 +423,7 @@ class JobManager:
             enabled_symbols = list(enabled_symbols.keys()) if enabled_symbols else []                            
             return enabled_symbols
         except Exception as e:
-            logger.error(f"Error getting enabled instruments for instance {instance_id}: {e}")
+            logger.error(f"Error getting enabled instruments for instance {instance_id}: {e}", exc_info=True)
             return []
             
     def _create_scheduled_job(self, expert_instance: ExpertInstance, symbol: str, schedule_setting: str, subtype: str = AnalysisUseCase.ENTER_MARKET):
@@ -520,6 +532,12 @@ class JobManager:
             
             logger.debug(f"Scheduled analysis submitted with task_id: {task_id}")
             
+        except ValueError as e:
+            # Handle the case where ENTER_MARKET analysis is skipped due to existing orders
+            if "existing orders found" in str(e):
+                logger.info(f"Scheduled analysis skipped: {e}")
+            else:
+                logger.error(f"ValueError in scheduled analysis for expert {expert_instance_id}, symbol {symbol}, subtype {subtype}: {e}", exc_info=True)
         except Exception as e:
             logger.error(f"Error executing scheduled analysis for expert {expert_instance_id}, symbol {symbol}, subtype {subtype}: {e}", exc_info=True)
             
@@ -531,7 +549,7 @@ class JobManager:
                 del self._scheduled_jobs[job_id]
                 logger.debug(f"Removed scheduled job: {job_id}")
         except Exception as e:
-            logger.error(f"Error removing scheduled job {job_id}: {e}")
+            logger.error(f"Error removing scheduled job {job_id}: {e}", exc_info=True)
     
     def _start_control_thread(self):
         """Start the control thread for processing asynchronous operations."""

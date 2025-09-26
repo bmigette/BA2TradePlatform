@@ -319,7 +319,7 @@ class WorkerQueue:
                 add_instance(setting)
                 logger.info(f"Created worker_count AppSetting with default value: {default_value}")
         except Exception as e:
-            logger.error(f"Error ensuring worker_count setting: {e}")
+            logger.error(f"Error ensuring worker_count setting: {e}", exc_info=True)
             
     def _worker_loop(self):
         """Main loop for worker threads."""

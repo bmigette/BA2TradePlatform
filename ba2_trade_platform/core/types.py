@@ -4,10 +4,12 @@ from sqlmodel import  Field, Session, SQLModel, create_engine
 class OrderStatus(str, Enum):
     OPEN = "open"
     CLOSED = "closed"
+    FULFILLED = "fulfilled"
     ALL = "all"
     NEW = "new"
     UNKNOWN = "unknown"
     CANCELED = "canceled"
+    PENDING = "pending"
 
 
 class InstrumentType(str, Enum):
@@ -25,6 +27,12 @@ class OrderType(str, Enum):
 class OrderDirection(str, Enum):
     SELL = "sell"
     BUY = "buy"
+
+class OrderOpenType(str, Enum):
+    MANUAL = "manual"
+    AUTOMATIC = "automatic"
+    EXTERNAL = "external"
+    NOTOPENED = "notopened"
 
 class OrderRecommendation(str, Enum):
     SELL = "SELL"

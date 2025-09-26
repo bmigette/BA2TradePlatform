@@ -192,7 +192,7 @@ class TradingAgents(MarketExpertInterface):
             return recommendation_id
             
         except Exception as e:
-            logger.error(f"[ERROR] Failed to create ExpertRecommendation for {symbol}: {e}")
+            logger.error(f"[ERROR] Failed to create ExpertRecommendation for {symbol}: {e}", exc_info=True)
             raise
     
     def _store_analysis_outputs(self, market_analysis_id: int, symbol: str, 
@@ -236,7 +236,7 @@ class TradingAgents(MarketExpertInterface):
             
         except Exception as e:
             session.rollback()
-            logger.error(f"Failed to store analysis outputs: {e}")
+            logger.error(f"Failed to store analysis outputs: {e}", exc_info=True)
             raise
         finally:
             session.close()
@@ -300,12 +300,15 @@ Analysis completed at: {self._get_current_timestamp()}"""
             from sqlalchemy.orm import attributes
             attributes.flag_modified(market_analysis, "state")
             update_instance(market_analysis)
-            
+
             logger.info(f"[COMPLETE] TradingAgents analysis completed for {symbol}: "
                        f"{recommendation_data['signal']} ({recommendation_data['confidence']:.1%} confidence)")
             
+            # Trigger Trade Manager to process the recommendation (if automatic trading is enabled)
+            self._notify_trade_manager(recommendation_id, symbol)
+
         except Exception as e:
-            logger.error(f"[FAILED] TradingAgents analysis failed for {symbol}: {e}")
+            logger.error(f"[FAILED] TradingAgents analysis failed for {symbol}: {e}", exc_info=True)
             self._handle_analysis_error(market_analysis, symbol, str(e))
             raise
     
@@ -395,7 +398,7 @@ Analysis completed at: {self._get_current_timestamp()}"""
             session.commit()
             session.close()
         except Exception as db_error:
-            logger.error(f"Failed to store error output: {db_error}")
+            logger.error(f"Failed to store error output: {db_error}", exc_info=True)
     
     def render_market_analysis(self, market_analysis: MarketAnalysis) -> None:
         """
@@ -1022,3 +1025,47 @@ Please check back in a few minutes for results."""
                 cleaned_state[key] = str(value)
         
         return cleaned_state
+    
+    def _notify_trade_manager(self, recommendation_id: int, symbol: str) -> None:
+        """
+        Notify the Trade Manager about a new recommendation and trigger order creation if enabled.
+        
+        Args:
+            recommendation_id: The ID of the created ExpertRecommendation
+            symbol: The trading symbol
+        """
+        try:
+            # Check if automatic trading is enabled for this expert
+            automatic_trading = self.settings.get('automatic_trading', False)
+            if not automatic_trading:
+                logger.debug(f"[TRADE MANAGER] Automatic trading disabled for expert {self.id}, skipping order creation for {symbol}")
+                return
+            
+            # Get the recommendation from database
+            from ...core.models import ExpertRecommendation
+            from ...core.db import get_instance
+            from ...core.TradeManager import get_trade_manager
+            
+            recommendation = get_instance(ExpertRecommendation, recommendation_id)
+            if not recommendation:
+                logger.error(f"[TRADE MANAGER] ExpertRecommendation {recommendation_id} not found", exc_info=True)
+                return
+            
+            # Skip HOLD recommendations as they don't require orders
+            if recommendation.recommended_action == OrderRecommendation.HOLD:
+                logger.debug(f"[TRADE MANAGER] HOLD recommendation for {symbol}, no order needed")
+                return
+            
+            # Get the trade manager and process the recommendation
+            trade_manager = get_trade_manager()
+            placed_order = trade_manager.process_recommendation(recommendation)
+            
+            if placed_order:
+                logger.info(f"[TRADE MANAGER] Successfully created order {placed_order.id} for {symbol} "
+                           f"({recommendation.recommended_action.value}) based on recommendation {recommendation_id}")
+            else:
+                logger.info(f"[TRADE MANAGER] No order created for {symbol} recommendation {recommendation_id} "
+                           f"(may be filtered by rules or permissions)")
+                
+        except Exception as e:
+            logger.error(f"[TRADE MANAGER] Error notifying trade manager for recommendation {recommendation_id}, symbol {symbol}: {e}", exc_info=True)

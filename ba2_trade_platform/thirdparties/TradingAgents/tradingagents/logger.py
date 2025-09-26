@@ -163,7 +163,7 @@ class TradingAgentsLogger:
     
     def error(self, message: str, *args, **kwargs):
         """Log error message"""
-        self.logger.error(message, *args, **kwargs)
+        self.logger.error(message, *args, **kwargs, exc_info=True)
     
     def critical(self, message: str, *args, **kwargs):
         """Log critical message"""
@@ -339,7 +339,7 @@ def warning(message: str, *args, **kwargs):
 def error(message: str, *args, **kwargs):
     """Log error message using global logger"""
     if _global_logger:
-        _global_logger.error(message, *args, **kwargs)
+        _global_logger.error(message, *args, **kwargs, exc_info=True)
 
 
 def critical(message: str, *args, **kwargs):

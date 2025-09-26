@@ -4,8 +4,8 @@ import json
 from datetime import datetime, timezone
 
 from ...core.db import get_instance, get_db
-from ...core.models import MarketAnalysis, ExpertInstance, AnalysisOutput, Instrument
-from ...core.types import MarketAnalysisStatus
+from ...core.models import MarketAnalysis, ExpertInstance, AnalysisOutput, Instrument, TradingOrder, ExpertRecommendation
+from ...core.types import MarketAnalysisStatus, OrderStatus
 from ...logger import logger
 from sqlmodel import select
 
@@ -19,7 +19,7 @@ def _get_instrument_details(symbol: str) -> Optional[Instrument]:
         session.close()
         return instrument
     except Exception as e:
-        logger.error(f"Error loading instrument details for {symbol}: {e}")
+        logger.error(f"Error loading instrument details for {symbol}: {e}", exc_info=True)
         return None
 
 
@@ -119,8 +119,18 @@ def content(analysis_id: int) -> None:
         if has_error:
             _render_error_banner(market_analysis)
         
-        # Render the expert-specific analysis using the expert's render_market_analysis method
-        _render_expert_analysis(market_analysis, expert)
+        # Main content with tabs
+        with ui.tabs() as tabs:
+            analysis_tab = ui.tab('Analysis Results', icon='analytics')
+            orders_tab = ui.tab('Order Recommendations', icon='shopping_cart')
+        
+        with ui.tab_panels(tabs, value=analysis_tab).classes('w-full'):
+            with ui.tab_panel(analysis_tab):
+                # Render the expert-specific analysis using the expert's render_market_analysis method
+                _render_expert_analysis(market_analysis, expert)
+            
+            with ui.tab_panel(orders_tab):
+                _render_order_recommendations_tab(market_analysis)
         
     except Exception as e:
         logger.error(f"Error loading market analysis detail {analysis_id}: {e}", exc_info=True)
@@ -244,6 +254,193 @@ def _render_error_banner(market_analysis: MarketAnalysis) -> None:
                         ui.label(error_message)
                 else:
                     ui.label('The analysis encountered an error during execution.').classes('text-red-700')
+
+
+def _render_order_recommendations_tab(market_analysis: MarketAnalysis) -> None:
+    """Render the Order Recommendations tab showing orders linked to this analysis."""
+    try:
+        session = get_db()
+        
+        # Get expert recommendations from this analysis
+        statement = select(ExpertRecommendation).where(
+            ExpertRecommendation.market_analysis_id == market_analysis.id
+        )
+        recommendations = list(session.exec(statement).all())
+        
+        if not recommendations:
+            with ui.card().classes('w-full p-8 text-center'):
+                ui.icon('info', size='2rem', color='grey').classes('mb-4')
+                ui.label('No recommendations generated from this analysis').classes('text-h6 text-grey-6')
+                ui.label('This analysis may still be processing or may not have generated actionable recommendations.').classes('text-grey-7')
+            session.close()
+            return
+        
+        # Get orders linked to these recommendations
+        recommendation_ids = [rec.id for rec in recommendations]
+        orders_statement = select(TradingOrder).where(
+            TradingOrder.order_recommendation_id.in_(recommendation_ids)
+        ).order_by(TradingOrder.created_at.desc())
+        orders = list(session.exec(orders_statement).all())
+        
+        session.close()
+        
+        # Summary section
+        with ui.card().classes('w-full mb-4'):
+            ui.label('📋 Order Summary').classes('text-h6 mb-4')
+            
+            with ui.row().classes('w-full gap-8'):
+                # Recommendations stats
+                with ui.column().classes('flex-1'):
+                    ui.label('Expert Recommendations').classes('text-subtitle1 font-bold mb-2')
+                    
+                    rec_counts = {'BUY': 0, 'SELL': 0, 'HOLD': 0}
+                    for rec in recommendations:
+                        if hasattr(rec.recommended_action, 'value'):
+                            action = rec.recommended_action.value
+                        else:
+                            action = str(rec.recommended_action)
+                        rec_counts[action] = rec_counts.get(action, 0) + 1
+                    
+                    for action, count in rec_counts.items():
+                        if count > 0:
+                            color = {'BUY': 'green', 'SELL': 'red', 'HOLD': 'orange'}.get(action, 'grey')
+                            with ui.row().classes('items-center mb-1'):
+                                ui.icon('circle', color=color, size='sm').classes('mr-2')
+                                ui.label(f'{action}: {count}').classes('text-sm')
+                
+                # Orders stats
+                with ui.column().classes('flex-1'):
+                    ui.label('Created Orders').classes('text-subtitle1 font-bold mb-2')
+                    
+                    if orders:
+                        order_counts = {}
+                        for order in orders:
+                            status = order.status.value if hasattr(order.status, 'value') else str(order.status)
+                            order_counts[status] = order_counts.get(status, 0) + 1
+                        
+                        for status, count in order_counts.items():
+                            color = {
+                                'open': 'orange', 
+                                'closed': 'grey', 
+                                'fulfilled': 'green',
+                                'pending': 'blue',
+                                'canceled': 'red'
+                            }.get(status.lower(), 'grey')
+                            with ui.row().classes('items-center mb-1'):
+                                ui.icon('circle', color=color, size='sm').classes('mr-2')
+                                ui.label(f'{status.title()}: {count}').classes('text-sm')
+                    else:
+                        ui.label('No orders created yet').classes('text-sm text-grey-6')
+        
+        # Recommendations table
+        with ui.card().classes('w-full mb-4'):
+            ui.label('💡 Expert Recommendations').classes('text-h6 mb-4')
+            
+            if recommendations:
+                rec_columns = [
+                    {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left'},
+                    {'name': 'action', 'label': 'Action', 'field': 'action', 'align': 'center'},
+                    {'name': 'confidence', 'label': 'Confidence', 'field': 'confidence', 'align': 'right'},
+                    {'name': 'expected_profit', 'label': 'Expected Profit %', 'field': 'expected_profit', 'align': 'right'},
+                    {'name': 'price_at_date', 'label': 'Price at Analysis', 'field': 'price_at_date', 'align': 'right'},
+                    {'name': 'risk_level', 'label': 'Risk Level', 'field': 'risk_level', 'align': 'center'},
+                    {'name': 'time_horizon', 'label': 'Time Horizon', 'field': 'time_horizon', 'align': 'center'},
+                    {'name': 'created_at', 'label': 'Created', 'field': 'created_at', 'align': 'left'}
+                ]
+                
+                rec_rows = []
+                for rec in recommendations:
+                    action = rec.recommended_action.value if hasattr(rec.recommended_action, 'value') else str(rec.recommended_action)
+                    created_at = rec.created_at.strftime('%Y-%m-%d %H:%M:%S') if rec.created_at else ''
+                    
+                    rec_rows.append({
+                        'id': rec.id,
+                        'symbol': rec.symbol,
+                        'action': action,
+                        'action_color': {'BUY': 'green', 'SELL': 'red', 'HOLD': 'orange'}.get(action, 'grey'),
+                        'confidence': f"{rec.confidence:.1%}" if rec.confidence is not None else 'N/A',
+                        'expected_profit': f"{rec.expected_profit_percent:.2f}%" if rec.expected_profit_percent else 'N/A',
+                        'price_at_date': f"${rec.price_at_date:.2f}" if rec.price_at_date else 'N/A',
+                        'risk_level': rec.risk_level.value if hasattr(rec.risk_level, 'value') else str(rec.risk_level),
+                        'time_horizon': rec.time_horizon.value.replace('_', ' ').title() if hasattr(rec.time_horizon, 'value') else str(rec.time_horizon),
+                        'created_at': created_at
+                    })
+                
+                rec_table = ui.table(columns=rec_columns, rows=rec_rows, row_key='id').classes('w-full')
+                
+                # Add colored action badges
+                rec_table.add_slot('body-cell-action', '''
+                    <q-td :props="props">
+                        <q-badge :color="props.row.action_color" :label="props.row.action" />
+                    </q-td>
+                ''')
+            
+            else:
+                ui.label('No recommendations generated from this analysis.').classes('text-grey-6')
+        
+        # Orders table (if any orders exist)
+        if orders:
+            with ui.card().classes('w-full'):
+                ui.label('📦 Created Orders').classes('text-h6 mb-4')
+                
+                order_columns = [
+                    {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left'},
+                    {'name': 'side', 'label': 'Side', 'field': 'side', 'align': 'left'},
+                    {'name': 'quantity', 'label': 'Quantity', 'field': 'quantity', 'align': 'right'},
+                    {'name': 'order_type', 'label': 'Type', 'field': 'order_type', 'align': 'left'},
+                    {'name': 'status', 'label': 'Status', 'field': 'status', 'align': 'center'},
+                    {'name': 'limit_price', 'label': 'Limit Price', 'field': 'limit_price', 'align': 'right'},
+                    {'name': 'filled_qty', 'label': 'Filled', 'field': 'filled_qty', 'align': 'right'},
+                    {'name': 'open_type', 'label': 'Open Type', 'field': 'open_type', 'align': 'center'},
+                    {'name': 'created_at', 'label': 'Created', 'field': 'created_at', 'align': 'left'}
+                ]
+                
+                order_rows = []
+                for order in orders:
+                    status = order.status.value if hasattr(order.status, 'value') else str(order.status)
+                    open_type = order.open_type.value if hasattr(order.open_type, 'value') else str(order.open_type)
+                    created_at = order.created_at.strftime('%Y-%m-%d %H:%M:%S') if order.created_at else ''
+                    
+                    order_rows.append({
+                        'id': order.id,
+                        'symbol': order.symbol,
+                        'side': order.side,
+                        'quantity': f"{order.quantity:.2f}" if order.quantity else '',
+                        'order_type': order.order_type,
+                        'status': status,
+                        'status_color': {
+                            'open': 'orange', 
+                            'closed': 'grey', 
+                            'fulfilled': 'green',
+                            'pending': 'blue',
+                            'canceled': 'red'
+                        }.get(status.lower(), 'grey'),
+                        'limit_price': f"${order.limit_price:.2f}" if order.limit_price else '',
+                        'filled_qty': f"{order.filled_qty:.2f}" if order.filled_qty else '',
+                        'open_type': open_type.replace('_', ' ').title(),
+                        'created_at': created_at
+                    })
+                
+                order_table = ui.table(columns=order_columns, rows=order_rows, row_key='id').classes('w-full')
+                
+                # Add colored status badges
+                order_table.add_slot('body-cell-status', '''
+                    <q-td :props="props">
+                        <q-badge :color="props.row.status_color" :label="props.row.status" />
+                    </q-td>
+                ''')
+        
+        else:
+            with ui.card().classes('w-full'):
+                ui.label('📦 Created Orders').classes('text-h6 mb-4')
+                ui.label('No orders have been created from the recommendations yet.').classes('text-grey-6')
+                ui.label('Orders may be created manually or automatically by the Trade Manager when enabled.').classes('text-sm text-grey-7')
+    
+    except Exception as e:
+        logger.error(f"Error rendering order recommendations tab: {e}", exc_info=True)
+        with ui.card().classes('w-full'):
+            ui.label('Error loading order recommendations').classes('text-h5 text-negative')
+            ui.label(str(e)).classes('text-grey-7')
 
 
 def _render_expert_analysis(market_analysis: MarketAnalysis, expert) -> None:

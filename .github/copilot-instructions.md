@@ -81,8 +81,10 @@ from ba2_trade_platform.logger import logger
 
 logger.debug("Detailed debug info")  # Goes to app.debug.log
 logger.info("General execution info")  # Goes to both logs
-logger.error("Error conditions")
+logger.error("Error conditions", exc_info=True)  # ALWAYS include exc_info=True for error logs
 ```
+
+**Critical Logging Rule**: Always include `exc_info=True` parameter in all `logger.error()` calls to capture full stack traces for debugging. This is mandatory for all error logging throughout the codebase.
 
 ## Dependencies
 - **Trading**: `alpaca-py` (primary broker), `yfinance`, `backtrader`

@@ -90,3 +90,7 @@ class AgentState(MessagesState):
         RiskDebateState, "Current state of the debate on evaluating risk"
     ]
     final_trade_decision: Annotated[str, "Final decision made by the Risk Analysts"]
+    
+    # final summarization step
+    expert_recommendation: Annotated[dict, "Structured expert recommendation from Final Summarization Agent"]
+    final_analysis_summary: Annotated[dict, "Summary of analysis components from Final Summarization Agent"]

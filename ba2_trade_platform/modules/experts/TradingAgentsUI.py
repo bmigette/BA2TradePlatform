@@ -621,5 +621,5 @@ class TradingAgentsUI:
                     ui.label(f'🕒 Generated: {latest_recommendation.created_at.strftime("%Y-%m-%d %H:%M:%S")}').classes('text-sm text-grey-7')
         
         except Exception as e:
-            logger.error(f"Error rendering expert recommendation: {e}")
+            logger.error(f"Error rendering expert recommendation: {e}", exc_info=True)
             # Fail silently to not break the UI

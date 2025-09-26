@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 import logging
 from ..logger import logger
 from .models import ExpertRecommendation, ExpertInstance, TradingOrder, Ruleset
-from .types import OrderRecommendation, OrderStatus, OrderDirection
+from .types import OrderRecommendation, OrderStatus, OrderDirection, OrderOpenType
 from .db import get_instance, get_instances, add_instance, update_instance
 
 
@@ -44,7 +44,7 @@ class TradeManager:
             # Get the expert instance
             expert_instance = get_instance(ExpertInstance, recommendation.instance_id)
             if not expert_instance:
-                self.logger.error(f"Expert instance {recommendation.instance_id} not found")
+                self.logger.error(f"Expert instance {recommendation.instance_id} not found", exc_info=True)
                 return None
                 
             # Check if expert is enabled
@@ -70,13 +70,9 @@ class TradeManager:
                 self.logger.info(f"Recommendation rejected by rulesets for expert {expert_instance.id}")
                 return None
                 
-            # Create and place the order
+            # Create the order. Do npt place it yet.
             order = self._create_order_from_recommendation(recommendation, expert_instance)
-            if order:
-                placed_order = self._place_order(order, expert_instance)
-                if placed_order:
-                    self.logger.info(f"Successfully placed order {placed_order.id} for {recommendation.symbol}")
-                    return placed_order
+
                     
         except Exception as e:
             self.logger.error(f"Error processing recommendation {recommendation.id}: {e}", exc_info=True)
@@ -98,17 +94,17 @@ class TradeManager:
             from .utils import get_expert_instance_from_id
             expert = get_expert_instance_from_id(expert_instance.id)
             if not expert:
-                self.logger.error(f"Expert instance {expert_instance.id} not found or invalid expert type {expert_instance.expert}")
+                self.logger.error(f"Expert instance {expert_instance.id} not found or invalid expert type {expert_instance.expert}", exc_info=True)
                 return {}
             
             return {
                 'enable_buy': expert.settings.get('enable_buy', True),
                 'enable_sell': expert.settings.get('enable_sell', False),
-                'automatic_trading': expert.settings.get('automatic_trading', True)
+                'automatic_trading': expert.settings.get('automatic_trading', False)
             }
             
         except Exception as e:
-            self.logger.error(f"Error getting trading permissions for expert {expert_instance.id}: {e}")
+            self.logger.error(f"Error getting trading permissions for expert {expert_instance.id}: {e}", exc_info=True)
             return {}
             
     def _is_action_allowed(self, action: OrderRecommendation, permissions: Dict[str, Any]) -> bool:
@@ -170,7 +166,7 @@ class TradeManager:
             return True
             
         except Exception as e:
-            self.logger.error(f"Error applying rulesets: {e}")
+            self.logger.error(f"Error applying rulesets: {e}", exc_info=True)
             return True  # Allow by default if error
             
     def _evaluate_ruleset(self, ruleset: Ruleset, recommendation: ExpertRecommendation, expert_instance: ExpertInstance) -> bool:
@@ -218,7 +214,7 @@ class TradeManager:
             return True
             
         except Exception as e:
-            self.logger.error(f"Error evaluating ruleset {ruleset.id}: {e}")
+            self.logger.error(f"Error evaluating ruleset {ruleset.id}: {e}", exc_info=True)
             return True  # Allow by default if error
             
     def _create_order_from_recommendation(self, recommendation: ExpertRecommendation, expert_instance: ExpertInstance) -> Optional[TradingOrder]:
@@ -243,18 +239,8 @@ class TradeManager:
                 side = "sell"
             else:
                 return None
-                
-            # Calculate quantity based on expert's virtual equity and recommendation
-            # This is a simplified calculation - can be made more sophisticated
-            virtual_equity = expert_instance.virtual_equity or 100.0
-            risk_factor = 0.1  # Risk 10% of virtual equity per trade
-            if recommendation.risk_level.value == 'HIGH':
-                risk_factor = 0.05  # Risk only 5% for high-risk trades
-            elif recommendation.risk_level.value == 'LOW':
-                risk_factor = 0.15  # Risk up to 15% for low-risk trades
-                
-            trade_amount = virtual_equity * risk_factor
-            quantity = trade_amount / recommendation.price_at_date if recommendation.price_at_date > 0 else 1.0
+
+            quantity = 0
             
             # Create the order
             order = TradingOrder(
@@ -262,16 +248,19 @@ class TradeManager:
                 quantity=abs(quantity),  # Ensure positive quantity
                 side=side,
                 order_type="market",  # Default to market order
-                status=OrderStatus.NEW,
+                status=OrderStatus.PENDING,
                 limit_price=None,  # Market order
                 stop_price=None,
-                client_order_id=f"expert_{expert_instance.id}_{recommendation.id}_{int(datetime.now().timestamp())}"
+                comment=f"expert_{expert_instance.expert}-{expert_instance.id}_{recommendation.id}",
+                # Link to the recommendation and mark as automatic
+                order_recommendation_id=recommendation.id,
+                open_type=OrderOpenType.AUTOMATIC
             )
             
             return order
             
         except Exception as e:
-            self.logger.error(f"Error creating order from recommendation {recommendation.id}: {e}")
+            self.logger.error(f"Error creating order from recommendation {recommendation.id}: {e}", exc_info=True)
             return None
             
     def _place_order(self, order: TradingOrder, expert_instance: ExpertInstance) -> Optional[TradingOrder]:
@@ -292,12 +281,12 @@ class TradeManager:
             
             account_def = get_instance(AccountDefinition, expert_instance.account_id)
             if not account_def:
-                self.logger.error(f"Account definition {expert_instance.account_id} not found")
+                self.logger.error(f"Account definition {expert_instance.account_id} not found", exc_info=True)
                 return None
                 
             account_class = get_account_class(account_def.provider)
             if not account_class:
-                self.logger.error(f"Account provider {account_def.provider} not found")
+                self.logger.error(f"Account provider {account_def.provider} not found", exc_info=True)
                 return None
                 
             account = account_class(account_def.id)
