@@ -57,6 +57,16 @@ class TradeAction(ABC):
         """
         pass
     
+    @abstractmethod
+    def get_description(self) -> str:
+        """
+        Get a human-readable description of what this action does.
+        
+        Returns:
+            str: Description of the action
+        """
+        pass
+    
     def get_current_price(self) -> Optional[float]:
         """
         Get current market price for the instrument.
@@ -198,6 +208,10 @@ class SellAction(TradeAction):
                 "message": f"Error executing sell action: {str(e)}",
                 "data": None
             }
+    
+    def get_description(self) -> str:
+        """Get description of sell action."""
+        return f"Sell entire position of {self.instrument_name} at market price"
 
 
 class BuyAction(TradeAction):
@@ -278,6 +292,10 @@ class BuyAction(TradeAction):
                 "message": f"Error executing buy action: {str(e)}",
                 "data": None
             }
+    
+    def get_description(self) -> str:
+        """Get description of buy action."""
+        return f"Buy {self.instrument_name} at market price"
 
 
 class CloseAction(TradeAction):
@@ -356,6 +374,10 @@ class CloseAction(TradeAction):
                 "message": f"Error executing close action: {str(e)}",
                 "data": None
             }
+    
+    def get_description(self) -> str:
+        """Get description of close action."""
+        return f"Close existing position for {self.instrument_name} (sell long or buy to cover short)"
 
 
 class AdjustTakeProfitAction(TradeAction):
@@ -460,6 +482,11 @@ class AdjustTakeProfitAction(TradeAction):
                 "message": f"Error executing adjust take profit action: {str(e)}",
                 "data": None
             }
+    
+    def get_description(self) -> str:
+        """Get description of adjust take profit action."""
+        price_desc = f" at ${self.take_profit_price}" if self.take_profit_price else " (auto-calculated)"
+        return f"Set or adjust take profit order for {self.instrument_name}{price_desc}"
 
 
 class AdjustStopLossAction(TradeAction):
@@ -564,6 +591,11 @@ class AdjustStopLossAction(TradeAction):
                 "message": f"Error executing adjust stop loss action: {str(e)}",
                 "data": None
             }
+    
+    def get_description(self) -> str:
+        """Get description of adjust stop loss action."""
+        price_desc = f" at ${self.stop_loss_price}" if self.stop_loss_price else " (auto-calculated)"
+        return f"Set or adjust stop loss order for {self.instrument_name}{price_desc}"
 
 
 # Factory function to create actions based on action type

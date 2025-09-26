@@ -1,5 +1,5 @@
 from nicegui import ui
-from .pages import overview, settings, marketanalysis, market_analysis_detail
+from .pages import overview, settings, marketanalysis, market_analysis_detail, rulesettest
 from .layout import layout_render
 from pathlib import Path
 
@@ -25,6 +25,19 @@ def settings_page() -> None:
 def market_analysis_detail_page(analysis_id: int) -> None:
     with layout_render(f'Market Analysis Detail'):
         market_analysis_detail.content(analysis_id)
+
+@ui.page('/rulesettest')
+def rulesettest_page(request) -> None:
+    # Get ruleset_id from query parameters
+    ruleset_id = None
+    try:
+        if hasattr(request, 'query_params') and 'ruleset_id' in request.query_params:
+            ruleset_id = int(request.query_params['ruleset_id'])
+    except (ValueError, TypeError, AttributeError):
+        ruleset_id = None
+    
+    with layout_render('Ruleset Test'):
+        rulesettest.content(ruleset_id)
 
 STATICPATH = Path(__file__).parent / 'static'
 FAVICO = (STATICPATH / 'favicon.ico')

@@ -55,6 +55,16 @@ class TradeCondition(ABC):
         """
         pass
     
+    @abstractmethod
+    def get_description(self) -> str:
+        """
+        Get a human-readable description of what this condition checks.
+        
+        Returns:
+            str: Description of the condition
+        """
+        pass
+    
     def get_previous_recommendations(self, expert_instance_id: int, limit: int = 10) -> List[ExpertRecommendation]:
         """
         Get previous recommendations for this expert and instrument.
@@ -191,6 +201,10 @@ class BearishCondition(FlagCondition):
         except Exception as e:
             logger.error(f"Error evaluating bearish condition: {e}", exc_info=True)
             return False
+    
+    def get_description(self) -> str:
+        """Get description of bearish condition."""
+        return f"Check if market sentiment is bearish for {self.instrument_name} (60% or more recent recommendations are SELL)"
 
 
 class BullishCondition(FlagCondition):
@@ -209,6 +223,10 @@ class BullishCondition(FlagCondition):
         except Exception as e:
             logger.error(f"Error evaluating bullish condition: {e}", exc_info=True)
             return False
+    
+    def get_description(self) -> str:
+        """Get description of bullish condition."""
+        return f"Check if market sentiment is bullish for {self.instrument_name} (60% or more recent recommendations are BUY)"
 
 
 class HasNoPositionCondition(FlagCondition):
@@ -216,6 +234,10 @@ class HasNoPositionCondition(FlagCondition):
     
     def evaluate(self) -> bool:
         return not self.has_position()
+    
+    def get_description(self) -> str:
+        """Get description of no position condition."""
+        return f"Check if there is no open position for {self.instrument_name}"
 
 
 class HasPositionCondition(FlagCondition):
@@ -223,6 +245,10 @@ class HasPositionCondition(FlagCondition):
     
     def evaluate(self) -> bool:
         return self.has_position()
+    
+    def get_description(self) -> str:
+        """Get description of has position condition."""
+        return f"Check if there is an open position for {self.instrument_name}"
 
 
 class RatingChangeCondition(FlagCondition):
@@ -261,6 +287,10 @@ class RatingChangeCondition(FlagCondition):
         except Exception as e:
             logger.error(f"Error evaluating rating change condition ({self.from_rating} -> {self.to_rating}): {e}", exc_info=True)
             return False
+    
+    def get_description(self) -> str:
+        """Get description of rating change condition."""
+        return f"Check if rating changed from {self.from_rating.value} to {self.to_rating.value} for {self.instrument_name}"
 
 
 # Convenience classes for specific rating changes (optional - can be removed if not needed)
@@ -332,6 +362,10 @@ class ExpectedProfitTargetPercentCondition(CompareCondition):
         except Exception as e:
             logger.error(f"Error evaluating expected profit target condition: {e}", exc_info=True)
             return False
+    
+    def get_description(self) -> str:
+        """Get description of expected profit target condition."""
+        return f"Check if expected profit target percent for {self.instrument_name} is {self.operator_str} {self.value}%"
 
 
 class PercentToTargetCondition(CompareCondition):
@@ -355,6 +389,10 @@ class PercentToTargetCondition(CompareCondition):
         except Exception as e:
             logger.error(f"Error evaluating percent to target condition: {e}", exc_info=True)
             return False
+    
+    def get_description(self) -> str:
+        """Get description of percent to target condition."""
+        return f"Check if percent to target price for {self.instrument_name} is {self.operator_str} {self.value}%"
 
 
 class ProfitLossAmountCondition(CompareCondition):
@@ -383,6 +421,10 @@ class ProfitLossAmountCondition(CompareCondition):
         except Exception as e:
             logger.error(f"Error evaluating profit loss amount condition: {e}", exc_info=True)
             return False
+    
+    def get_description(self) -> str:
+        """Get description of profit/loss amount condition."""
+        return f"Check if profit/loss amount for {self.instrument_name} is {self.operator_str} ${self.value}"
 
 
 class ProfitLossPercentCondition(CompareCondition):
@@ -410,6 +452,10 @@ class ProfitLossPercentCondition(CompareCondition):
         except Exception as e:
             logger.error(f"Error evaluating profit loss percent condition: {e}", exc_info=True)
             return False
+    
+    def get_description(self) -> str:
+        """Get description of profit/loss percent condition."""
+        return f"Check if profit/loss percentage for {self.instrument_name} is {self.operator_str} {self.value}%"
 
 
 class TimeOpenedCondition(CompareCondition):
@@ -434,6 +480,10 @@ class TimeOpenedCondition(CompareCondition):
         except Exception as e:
             logger.error(f"Error evaluating time opened condition: {e}", exc_info=True)
             return False
+    
+    def get_description(self) -> str:
+        """Get description of time opened condition."""
+        return f"Check if time since {self.instrument_name} order was opened is {self.operator_str} {self.value} hours"
 
 
 # Factory function to create conditions based on event type

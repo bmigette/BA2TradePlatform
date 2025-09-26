@@ -1085,16 +1085,28 @@ class OrderRecommendationsTab:
                 
                 recommendations = []
                 for recommendation, expert_instance, analysis in results:
-                    action_raw = recommendation.recommended_action.value if hasattr(recommendation.recommended_action, 'value') else str(recommendation.recommended_action)
+                    # Always get the enum value, not the string representation
+                    if hasattr(recommendation.recommended_action, 'value'):
+                        action_raw = recommendation.recommended_action.value
+                    else:
+                        # Fallback for non-enum values
+                        action_raw = str(recommendation.recommended_action)
+                        
                     # Convert enum values to readable text
-                    action = {'BUY': 'Buy', 'SELL': 'Sell', 'HOLD': 'Hold'}.get(action_raw, action_raw)
+                    action_mapping = {
+                        'BUY': 'Buy', 
+                        'SELL': 'Sell', 
+                        'HOLD': 'Hold',
+                        'ERROR': 'Error'
+                    }
+                    action = action_mapping.get(action_raw, action_raw)
                     created_at = recommendation.created_at.strftime('%Y-%m-%d %H:%M:%S') if recommendation.created_at else ''
                     
                     recommendations.append({
                         'id': recommendation.id,
                         'symbol': recommendation.symbol,
                         'action': action,
-                        'action_color': {'Buy': 'green', 'Sell': 'red', 'Hold': 'orange'}.get(action, 'grey'),
+                        'action_color': {'Buy': 'green', 'Sell': 'red', 'Hold': 'orange', 'Error': 'red'}.get(action, 'grey'),
                         'confidence': f"{recommendation.confidence:.1f}%" if recommendation.confidence is not None else 'N/A',
                         'expected_profit': f"{recommendation.expected_profit_percent:.2f}%" if recommendation.expected_profit_percent else 'N/A',
                         'price_at_date': f"${recommendation.price_at_date:.2f}" if recommendation.price_at_date else 'N/A',
@@ -1206,8 +1218,21 @@ class OrderRecommendationsTab:
             with get_db() as session:
                 recommendation = session.get(ExpertRecommendation, recommendation_id)
                 if recommendation:
-                    action_raw = recommendation.recommended_action.value if hasattr(recommendation.recommended_action, 'value') else str(recommendation.recommended_action)
-                    action = {'BUY': 'Buy', 'SELL': 'Sell', 'HOLD': 'Hold'}.get(action_raw, action_raw)
+                    # Always get the enum value, not the string representation
+                    if hasattr(recommendation.recommended_action, 'value'):
+                        action_raw = recommendation.recommended_action.value
+                    else:
+                        # Fallback for non-enum values
+                        action_raw = str(recommendation.recommended_action)
+                        
+                    # Convert enum values to readable text
+                    action_mapping = {
+                        'BUY': 'Buy', 
+                        'SELL': 'Sell', 
+                        'HOLD': 'Hold',
+                        'ERROR': 'Error'
+                    }
+                    action = action_mapping.get(action_raw, action_raw)
                     return {
                         'id': recommendation.id,
                         'symbol': recommendation.symbol,
