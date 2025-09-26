@@ -226,17 +226,20 @@ class InstrumentSettingsTab:
                                     existing_labels = instrument.labels or []
                                     
                                     # Add new labels that don't already exist
-                                    labels_added = False
+                                    new_labels = []
                                     for label in labels:
                                         if label not in existing_labels:
-                                            existing_labels.append(label)
-                                            labels_added = True
+                                            new_labels.append(label)
                                     
-                                    if labels_added:
-                                        instrument.labels = existing_labels
+                                    if new_labels:
+                                        # Create a new list to force SQLAlchemy to detect the change
+                                        instrument.labels = existing_labels + new_labels
+                                        # Mark the field as modified for SQLAlchemy
+                                        from sqlalchemy.orm import attributes
+                                        attributes.flag_modified(instrument, 'labels')
                                         update_instance(instrument, session)
                                         updated += 1
-                                        logger.debug(f'Added labels {labels} to existing instrument {name}')
+                                        logger.debug(f'Added labels {new_labels} to existing instrument {name} (total labels: {instrument.labels})')
                             else:
                                 # Create new instrument
                                 inst = Instrument(
