@@ -27,17 +27,9 @@ def market_analysis_detail_page(analysis_id: int) -> None:
         market_analysis_detail.content(analysis_id)
 
 @ui.page('/rulesettest')
-def rulesettest_page(request) -> None:
-    # Get ruleset_id from query parameters
-    ruleset_id = None
-    try:
-        if hasattr(request, 'query_params') and 'ruleset_id' in request.query_params:
-            ruleset_id = int(request.query_params['ruleset_id'])
-    except (ValueError, TypeError, AttributeError):
-        ruleset_id = None
-    
+def rulesettest_page() -> None:
     with layout_render('Ruleset Test'):
-        rulesettest.content(ruleset_id)
+        rulesettest.content()
 
 STATICPATH = Path(__file__).parent / 'static'
 FAVICO = (STATICPATH / 'favicon.ico')

@@ -1832,12 +1832,14 @@ class TradeSettingsTab:
                     
                     self.rulesets_table.add_slot('body-cell-actions', """
                         <q-td :props="props">
+                            <q-btn @click="$parent.$emit('test', props)" icon="science" flat dense color='green' title="Test Ruleset"/>
                             <q-btn @click="$parent.$emit('edit', props)" icon="edit" flat dense color='blue' title="Edit Ruleset"/>
                             <q-btn @click="$parent.$emit('reorder', props)" icon="reorder" flat dense color='purple' title="Reorder Rules"/>
                             <q-btn @click="$parent.$emit('del', props)" icon="delete" flat dense color='red' title="Delete Ruleset"/>
                         </q-td>
                     """)
                     
+                    self.rulesets_table.on('test', self._on_ruleset_test_click)
                     self.rulesets_table.on('edit', self._on_ruleset_edit_click)
                     self.rulesets_table.on('reorder', self._on_ruleset_reorder_click)
                     self.rulesets_table.on('del', self._on_ruleset_del_click)
@@ -2384,6 +2386,17 @@ class TradeSettingsTab:
         else:
             logger.warning(f'Rule with id {rule_id} not found')
             ui.notify('Rule not found', type='error')
+    
+    def _on_ruleset_test_click(self, msg):
+        """Handle test button click for rulesets."""
+        logger.debug(f'Test ruleset table click: {msg}')
+        row = msg.args['row']
+        ruleset_id = row['id']
+        ruleset_name = row['name']
+        
+        # Navigate to ruleset test page with the selected ruleset
+        logger.info(f'Navigating to ruleset test page for ruleset: {ruleset_name} (ID: {ruleset_id})')
+        ui.navigate.to(f'/rulesettest?ruleset_id={ruleset_id}')
     
     def _on_ruleset_edit_click(self, msg):
         """Handle edit button click for rulesets."""
