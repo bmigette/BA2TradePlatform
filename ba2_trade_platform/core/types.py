@@ -74,12 +74,24 @@ class ExpertEventType(str, Enum):
     F_RATING_NEUTRAL_TO_POSITIVE = "rating_neutral_to_positive"
     F_RATING_POSITIVE_TO_NEGATIVE = "rating_positive_to_negative"
     F_RATING_POSITIVE_TO_NEUTRAL = "rating_positive_to_neutral"
+    F_CURRENT_RATING_POSITIVE = "current_rating_positive"
+    F_CURRENT_RATING_NEUTRAL = "current_rating_neutral"
+    F_CURRENT_RATING_NEGATIVE = "current_rating_negative"
+    F_SHORT_TERM = "short_term"
+    F_MEDIUM_TERM = "medium_term"
+    F_LONG_TERM = "long_term"
+    F_HIGHRISK = "highrisk"
+    F_MEDIUMRISK = "mediumrisk"
+    F_LOWRISK = "lowrisk"
+    
     # N = Number/Count
     N_EXPECTED_PROFIT_TARGET_PERCENT = "expected_profit_target_percent"
     N_PERCENT_TO_TARGET = "percent_to_target"
     N_PROFIT_LOSS_AMOUNT = "profit_loss_amount"
     N_PROFIT_LOSS_PERCENT = "profit_loss_percent"
     N_TIME_OPENED = "time_opened"
+    N_CONFIDENCE = "confidence"
+    
 
 class ExpertActionType(str, Enum):
     SELL = "sell"
@@ -123,7 +135,8 @@ def get_numeric_event_values():
         ExpertEventType.N_PERCENT_TO_TARGET.value,
         ExpertEventType.N_PROFIT_LOSS_AMOUNT.value,
         ExpertEventType.N_PROFIT_LOSS_PERCENT.value,
-        ExpertEventType.N_TIME_OPENED.value
+        ExpertEventType.N_TIME_OPENED.value,
+        ExpertEventType.N_CONFIDENCE.value
     ]
 
 

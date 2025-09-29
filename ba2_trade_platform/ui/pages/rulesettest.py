@@ -480,7 +480,7 @@ class RulesetTestTab:
                 
                 # Individual action definitions
                 if results:
-                    ui.label('🎯 Action Definitions').classes('text-h6 mb-3')
+                    ui.label('🎯 Action Results').classes('text-h6 mb-3')
                     
                     for i, result in enumerate(results, 1):
                         # Check if this is an error result

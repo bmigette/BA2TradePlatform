@@ -73,12 +73,14 @@ class TradeActionEvaluator:
             
             # Get all event actions for this ruleset
             with get_db() as session:
-                statement = (
-                    select(EventAction)
-                    .join(EventAction.rulesets)
-                    .where(Ruleset.id == ruleset_id)
-                )
-                event_actions = session.exec(statement).all()
+                    from .models import RulesetEventActionLink
+                    statement = (
+                        select(EventAction)
+                        .join(RulesetEventActionLink, EventAction.id == RulesetEventActionLink.eventaction_id)
+                        .where(RulesetEventActionLink.ruleset_id == ruleset_id)
+                        .order_by(RulesetEventActionLink.order_index)
+                    )
+                    event_actions = session.exec(statement).all()
             
             if not event_actions:
                 logger.info(f"No event actions found for ruleset {ruleset_id}")
@@ -370,13 +372,9 @@ class TradeActionEvaluator:
                 return action_summaries
             
             # Create order recommendation from expert recommendation
-            order_recommendation = OrderRecommendation(
-                direction=expert_recommendation.recommendation,
-                confidence=expert_recommendation.confidence,
-                price_target=getattr(expert_recommendation, 'price_target', None),
-                stop_loss=getattr(expert_recommendation, 'stop_loss', None),
-                take_profit=getattr(expert_recommendation, 'take_profit', None)
-            )
+            # Use recommended_action which is the correct attribute name in ExpertRecommendation model
+            # The recommended_action is already an OrderRecommendation enum, so use it directly
+            order_recommendation = expert_recommendation.recommended_action
             
             # Process each action
             for action_key, action_config in actions.items():
@@ -516,12 +514,14 @@ class TradeActionEvaluator:
             if ruleset.description:
                 description_parts.append(f"Description: {ruleset.description}")
             
-            # Get event actions and their descriptions
+            # Get event actions and their descriptions (custom order)
             with get_db() as session:
+                from .models import RulesetEventActionLink
                 statement = (
                     select(EventAction)
-                    .join(EventAction.rulesets)
-                    .where(Ruleset.id == ruleset_id)
+                    .join(RulesetEventActionLink, EventAction.id == RulesetEventActionLink.eventaction_id)
+                    .where(RulesetEventActionLink.ruleset_id == ruleset_id)
+                    .order_by(RulesetEventActionLink.order_index)
                 )
                 event_actions = session.exec(statement).all()
             

@@ -229,15 +229,121 @@ class HasNoPositionCondition(FlagCondition):
         return f"Check if there is no open position for {self.instrument_name}"
 
 
+
 class HasPositionCondition(FlagCondition):
     """Check if there's an open position for the instrument."""
-    
     def evaluate(self) -> bool:
         return self.has_position()
-    
     def get_description(self) -> str:
-        """Get description of has position condition."""
         return f"Check if there is an open position for {self.instrument_name}"
+
+# Time Horizon Flag Conditions
+class LongTermCondition(FlagCondition):
+    """Check if expert recommendation is long term."""
+    def evaluate(self) -> bool:
+        try:
+            return getattr(self.expert_recommendation, 'time_horizon', None) == getattr(type(self.expert_recommendation), 'time_horizon', None).LONG_TERM
+        except Exception as e:
+            logger.error(f"Error evaluating long term condition: {e}", exc_info=True)
+            return False
+    def get_description(self) -> str:
+        return f"Check if expert recommendation for {self.instrument_name} is LONG_TERM"
+
+class MediumTermCondition(FlagCondition):
+    """Check if expert recommendation is medium term."""
+    def evaluate(self) -> bool:
+        try:
+            return getattr(self.expert_recommendation, 'time_horizon', None) == getattr(type(self.expert_recommendation), 'time_horizon', None).MEDIUM_TERM
+        except Exception as e:
+            logger.error(f"Error evaluating medium term condition: {e}", exc_info=True)
+            return False
+    def get_description(self) -> str:
+        return f"Check if expert recommendation for {self.instrument_name} is MEDIUM_TERM"
+
+class ShortTermCondition(FlagCondition):
+    """Check if expert recommendation is short term."""
+    def evaluate(self) -> bool:
+        try:
+            return getattr(self.expert_recommendation, 'time_horizon', None) == getattr(type(self.expert_recommendation), 'time_horizon', None).SHORT_TERM
+        except Exception as e:
+            logger.error(f"Error evaluating short term condition: {e}", exc_info=True)
+            return False
+    def get_description(self) -> str:
+        return f"Check if expert recommendation for {self.instrument_name} is SHORT_TERM"
+
+
+# Current Rating Flag Conditions
+class CurrentRatingPositiveCondition(FlagCondition):
+    """Check if current recommendation is positive (BUY)."""
+    def evaluate(self) -> bool:
+        try:
+            return self.expert_recommendation.recommended_action == OrderRecommendation.BUY
+        except Exception as e:
+            logger.error(f"Error evaluating current rating positive condition: {e}", exc_info=True)
+            return False
+    def get_description(self) -> str:
+        return f"Check if current recommendation for {self.instrument_name} is BUY (positive)"
+
+
+class CurrentRatingNeutralCondition(FlagCondition):
+    """Check if current recommendation is neutral (HOLD)."""
+    def evaluate(self) -> bool:
+        try:
+            return self.expert_recommendation.recommended_action == OrderRecommendation.HOLD
+        except Exception as e:
+            logger.error(f"Error evaluating current rating neutral condition: {e}", exc_info=True)
+            return False
+    def get_description(self) -> str:
+        return f"Check if current recommendation for {self.instrument_name} is HOLD (neutral)"
+
+
+class CurrentRatingNegativeCondition(FlagCondition):
+    """Check if current recommendation is negative (SELL)."""
+    def evaluate(self) -> bool:
+        try:
+            return self.expert_recommendation.recommended_action == OrderRecommendation.SELL
+        except Exception as e:
+            logger.error(f"Error evaluating current rating negative condition: {e}", exc_info=True)
+            return False
+    def get_description(self) -> str:
+        return f"Check if current recommendation for {self.instrument_name} is SELL (negative)"
+
+
+# Risk Level Flag Conditions
+class HighRiskCondition(FlagCondition):
+    """Check if expert recommendation has high risk."""
+    def evaluate(self) -> bool:
+        try:
+            return getattr(self.expert_recommendation, 'risk_level', None) == RiskLevel.HIGH
+        except Exception as e:
+            logger.error(f"Error evaluating high risk condition: {e}", exc_info=True)
+            return False
+    def get_description(self) -> str:
+        return f"Check if expert recommendation for {self.instrument_name} has HIGH risk"
+
+
+class MediumRiskCondition(FlagCondition):
+    """Check if expert recommendation has medium risk."""
+    def evaluate(self) -> bool:
+        try:
+            return getattr(self.expert_recommendation, 'risk_level', None) == RiskLevel.MEDIUM
+        except Exception as e:
+            logger.error(f"Error evaluating medium risk condition: {e}", exc_info=True)
+            return False
+    def get_description(self) -> str:
+        return f"Check if expert recommendation for {self.instrument_name} has MEDIUM risk"
+
+
+class LowRiskCondition(FlagCondition):
+    """Check if expert recommendation has low risk."""
+    def evaluate(self) -> bool:
+        try:
+            return getattr(self.expert_recommendation, 'risk_level', None) == RiskLevel.LOW
+        except Exception as e:
+            logger.error(f"Error evaluating low risk condition: {e}", exc_info=True)
+            return False
+    def get_description(self) -> str:
+        return f"Check if expert recommendation for {self.instrument_name} has LOW risk"
 
 
 class RatingChangeCondition(FlagCondition):
@@ -415,35 +521,44 @@ class ProfitLossAmountCondition(CompareCondition):
         return f"Check if profit/loss amount for {self.instrument_name} is {self.operator_str} ${self.value}"
 
 
+
 class ProfitLossPercentCondition(CompareCondition):
     """Compare profit/loss percentage."""
-    
     def evaluate(self) -> bool:
         try:
             if not self.existing_order:
                 return False
-                
             current_price = self.get_current_price()
             if current_price is None or not hasattr(self.existing_order, 'limit_price') or self.existing_order.limit_price is None:
                 return False
-                
             # Calculate P&L percentage
             entry_price = self.existing_order.limit_price
             pl_percent = ((current_price - entry_price) / entry_price) * 100
-            
             # Adjust for short positions
             if self.existing_order.side == "sell":
                 pl_percent = -pl_percent
-                
             return self.operator_func(pl_percent, self.value)
-            
         except Exception as e:
             logger.error(f"Error evaluating profit loss percent condition: {e}", exc_info=True)
             return False
-    
     def get_description(self) -> str:
-        """Get description of profit/loss percent condition."""
         return f"Check if profit/loss percentage for {self.instrument_name} is {self.operator_str} {self.value}%"
+
+# Confidence Condition Implementation
+class ConfidenceCondition(CompareCondition):
+    """Compare expert confidence value."""
+    def evaluate(self) -> bool:
+        try:
+            confidence = getattr(self.expert_recommendation, 'confidence', None)
+            if confidence is None:
+                logger.debug(f"No confidence value available for {self.instrument_name}")
+                return False
+            return self.operator_func(confidence, self.value)
+        except Exception as e:
+            logger.error(f"Error evaluating confidence condition: {e}", exc_info=True)
+            return False
+    def get_description(self) -> str:
+        return f"Check if expert confidence for {self.instrument_name} is {self.operator_str} {self.value}"
 
 
 class TimeOpenedCondition(CompareCondition):
@@ -475,24 +590,14 @@ class TimeOpenedCondition(CompareCondition):
 
 
 # Factory function to create conditions based on event type
+
+
 def create_condition(event_type: ExpertEventType, account: AccountInterface, 
                     instrument_name: str, expert_recommendation: ExpertRecommendation,
                     existing_order: Optional[TradingOrder] = None,
                     operator_str: Optional[str] = None, value: Optional[float] = None) -> TradeCondition:
     """
     Factory function to create appropriate condition based on event type.
-    
-    Args:
-        event_type: Type of event/condition to create
-        account: Account interface
-        instrument_name: Instrument name
-        expert_recommendation: Expert recommendation with all needed data
-        existing_order: Optional existing order
-        operator_str: Operator for numeric conditions
-        value: Value for numeric conditions
-        
-    Returns:
-        Appropriate TradeCondition instance
     """
     # Define rating change mappings
     rating_changes = {
@@ -503,39 +608,40 @@ def create_condition(event_type: ExpertEventType, account: AccountInterface,
         ExpertEventType.F_RATING_POSITIVE_TO_NEGATIVE: (OrderRecommendation.BUY, OrderRecommendation.SELL),
         ExpertEventType.F_RATING_POSITIVE_TO_NEUTRAL: (OrderRecommendation.BUY, OrderRecommendation.HOLD),
     }
-    
-    # Handle rating change conditions
     if event_type in rating_changes:
         from_rating, to_rating = rating_changes[event_type]
         return RatingChangeCondition(account, instrument_name, expert_recommendation, 
                                    from_rating, to_rating, existing_order)
-    
+    # Add time horizon flags and N_CONFIDENCE to condition_map
     condition_map = {
         ExpertEventType.F_BEARISH: BearishCondition,
         ExpertEventType.F_BULLISH: BullishCondition,
         ExpertEventType.F_HAS_NO_POSITION: HasNoPositionCondition,
         ExpertEventType.F_HAS_POSITION: HasPositionCondition,
+        ExpertEventType.F_LONG_TERM: LongTermCondition,
+        ExpertEventType.F_MEDIUM_TERM: MediumTermCondition,
+        ExpertEventType.F_SHORT_TERM: ShortTermCondition,
+        ExpertEventType.F_CURRENT_RATING_POSITIVE: CurrentRatingPositiveCondition,
+        ExpertEventType.F_CURRENT_RATING_NEUTRAL: CurrentRatingNeutralCondition,
+        ExpertEventType.F_CURRENT_RATING_NEGATIVE: CurrentRatingNegativeCondition,
+        ExpertEventType.F_HIGHRISK: HighRiskCondition,
+        ExpertEventType.F_MEDIUMRISK: MediumRiskCondition,
+        ExpertEventType.F_LOWRISK: LowRiskCondition,
         ExpertEventType.N_EXPECTED_PROFIT_TARGET_PERCENT: ExpectedProfitTargetPercentCondition,
         ExpertEventType.N_PERCENT_TO_TARGET: PercentToTargetCondition,
         ExpertEventType.N_PROFIT_LOSS_AMOUNT: ProfitLossAmountCondition,
         ExpertEventType.N_PROFIT_LOSS_PERCENT: ProfitLossPercentCondition,
         ExpertEventType.N_TIME_OPENED: TimeOpenedCondition,
+        ExpertEventType.N_CONFIDENCE: ConfidenceCondition,
     }
-    
     condition_class = condition_map.get(event_type)
     if not condition_class:
         raise ValueError(f"Unknown event type: {event_type}")
-    
-    # Create flag conditions (no operator or value needed)
     if issubclass(condition_class, FlagCondition):
         return condition_class(account, instrument_name, expert_recommendation, existing_order)
-    
-    # Create comparison conditions (require operator and value)
     elif issubclass(condition_class, CompareCondition):
         if operator_str is None or value is None:
             raise ValueError(f"Operator and value required for numeric condition: {event_type}")
-        
         return condition_class(account, instrument_name, expert_recommendation, operator_str, value, existing_order)
-    
     else:
         raise ValueError(f"Unknown condition class type for: {event_type}")
