@@ -966,7 +966,7 @@ class OrderRecommendationsTab:
                     # Count orders created for this symbol
                     orders_statement = select(func.count(TradingOrder.id)).where(
                         TradingOrder.symbol == symbol,
-                        TradingOrder.order_recommendation_id.is_not(None)
+                        TradingOrder.transaction_id.is_not(None)
                     )
                     orders_count = session.exec(orders_statement).first() or 0
                     

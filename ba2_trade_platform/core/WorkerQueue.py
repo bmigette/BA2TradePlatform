@@ -342,6 +342,23 @@ class WorkerQueue:
                     self._queue.task_done()  # Mark sentinel task as done
                     break
                 
+                # Check if we should skip this task based on existing transactions
+                should_skip = self._should_skip_task(task)
+                if should_skip:
+                    # Mark task as completed since we're skipping it
+                    with self._task_lock:
+                        task.status = WorkerTaskStatus.COMPLETED
+                        task.result = {"status": "skipped", "reason": should_skip}
+                        task.completed_at = time.time()
+                        
+                        # Clean up task key mapping
+                        task_key = task.get_task_key()
+                        if task_key in self._task_keys and self._task_keys[task_key] == task.id:
+                            del self._task_keys[task_key]
+                    
+                    self._queue.task_done()
+                    continue
+                
                 # Execute the task (with error handling inside)
                 try:
                     self._execute_task(task, worker_name)
@@ -422,6 +439,73 @@ class WorkerQueue:
                     task_key = task.get_task_key()
                     if task_key in self._task_keys and self._task_keys[task_key] == task.id:
                         del self._task_keys[task_key]
+    
+    def has_existing_transactions(self, expert_id: int, symbol: str) -> bool:
+        """
+        Check if there are existing transactions for the given expert_id and symbol.
+        
+        Args:
+            expert_id: The expert instance ID
+            symbol: The trading symbol
+            
+        Returns:
+            True if existing transactions are found, False otherwise
+        """
+        try:
+            from sqlmodel import select, Session
+            from .db import get_db
+            from .models import Transaction
+            from .types import TransactionStatus
+            
+            with Session(get_db().bind) as session:
+                # Check for transactions with this expert_id and symbol
+                # that are not closed or failed
+                statement = select(Transaction).where(
+                    Transaction.expert_id == expert_id,
+                    Transaction.symbol == symbol,
+                    Transaction.status.in_([
+                        TransactionStatus.WAITING,
+                        TransactionStatus.OPENED
+                    ])
+                )
+                
+                transaction = session.exec(statement).first()
+                has_transactions = transaction is not None
+                
+                logger.debug(f"Transaction check for expert {expert_id}, symbol {symbol}: {'found' if has_transactions else 'not found'}")
+                return has_transactions
+                
+        except Exception as e:
+            logger.error(f"Error checking for existing transactions for expert {expert_id}, symbol {symbol}: {e}", exc_info=True)
+            return False  # Default to False if error occurs
+    
+    def _should_skip_task(self, task: AnalysisTask) -> Optional[str]:
+        """
+        Determine if a task should be skipped based on existing transactions and analysis type.
+        
+        Args:
+            task: The analysis task to check
+            
+        Returns:
+            String explaining why task should be skipped, or None if task should proceed
+        """
+        try:
+            has_transactions = self.has_existing_transactions(task.expert_instance_id, task.symbol)
+            
+            if task.subtype == AnalysisUseCase.ENTER_MARKET:
+                if has_transactions:
+                    logger.info(f"Skipping ENTER_MARKET analysis for expert {task.expert_instance_id}, symbol {task.symbol}: existing transactions found")
+                    return "existing transactions found for enter_market analysis"
+            elif task.subtype == AnalysisUseCase.OPEN_POSITIONS:
+                if not has_transactions:
+                    logger.info(f"Skipping OPEN_POSITIONS analysis for expert {task.expert_instance_id}, symbol {task.symbol}: no existing transactions found")
+                    return "no existing transactions found for open_positions analysis"
+            
+            return None  # Task should proceed
+            
+        except Exception as e:
+            logger.error(f"Error checking if task should be skipped: {e}", exc_info=True)
+            return None  # Default to proceeding if error occurs
 
 
 # Global worker queue instance

@@ -102,6 +102,19 @@ class AccountInterface(ExtendableSettingsInterface):
             Any: True if cancellation was successful, False or raises exception if failed
         """
         pass
+    
+    @abstractmethod
+    def modify_order(self, order_id: str) -> Any:
+        """
+        Modify an existing order by order ID.
+        
+        Args:
+            order_id (str): The unique identifier of the order to cancel
+        
+        Returns:
+            Any: True if modification was successful, False or raises exception if failed
+        """
+        pass
 
     @abstractmethod
     def get_order(self, order_id: str) -> Any:
@@ -223,5 +236,28 @@ class AccountInterface(ExtendableSettingsInterface):
         
         Returns:
             Optional[float]: The current price if available, None if not found or error occurred
+        """
+        pass
+
+    @abstractmethod
+    def refresh_positions(self) -> bool:
+        """
+        Refresh/synchronize account positions from the broker.
+        This method should update any cached position data with fresh data from the broker.
+        
+        Returns:
+            bool: True if refresh was successful, False otherwise
+        """
+        pass
+
+    @abstractmethod
+    def refresh_orders(self) -> bool:
+        """
+        Refresh/synchronize account orders from the broker.
+        This method should update any cached order data and sync database records
+        with the current state of orders at the broker.
+        
+        Returns:
+            bool: True if refresh was successful, False otherwise
         """
         pass

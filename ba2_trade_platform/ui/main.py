@@ -28,8 +28,19 @@ def market_analysis_detail_page(analysis_id: int) -> None:
 
 @ui.page('/rulesettest')
 def rulesettest_page() -> None:
+    # Get query parameters from the request
+    from nicegui import app
+    ruleset_id = None
+    try:
+        if hasattr(app, 'storage') and hasattr(app.storage, 'user'):
+            # Try to get from query params - this depends on how NiceGUI exposes them
+            pass
+        # For now, we'll let the component handle URL extraction
+    except:
+        pass
+    
     with layout_render('Ruleset Test'):
-        rulesettest.content()
+        rulesettest.content(ruleset_id)
 
 STATICPATH = Path(__file__).parent / 'static'
 FAVICO = (STATICPATH / 'favicon.ico')

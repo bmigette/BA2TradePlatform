@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 import uuid
 
 from .AccountInterface import AccountInterface
-from .models import TradingOrder, ExpertRecommendation
+from .models import TradingOrder, ExpertRecommendation, TradeActionResult
 from .types import OrderRecommendation, ExpertActionType, OrderDirection, OrderType, OrderStatus
 from .db import get_db, add_instance, update_instance
 from ..logger import logger
@@ -45,15 +45,17 @@ class TradeAction(ABC):
         self.existing_order = existing_order
         
     @abstractmethod
-    def execute(self) -> Dict[str, Any]:
+    def execute(self) -> "TradeActionResult":
         """
         Execute the trading action.
         
         Returns:
-            Dict containing execution results including:
+            TradeActionResult object containing execution results including:
             - success: bool indicating if action was successful
             - message: str with status message
-            - data: Any additional data (order ID, etc.)
+            - data: dict with additional data (order ID, etc.)
+            - action_type: str indicating the type of action executed
+            - timestamps and relationships
         """
         pass
     
@@ -139,27 +141,62 @@ class TradeAction(ABC):
         except Exception as e:
             logger.error(f"Error creating order record: {e}", exc_info=True)
             return None
+    
+    def create_action_result(self, action_type: str, success: bool, message: str, 
+                           data: Optional[Dict[str, Any]] = None,
+                           transaction_id: Optional[int] = None,
+                           expert_recommendation_id: Optional[int] = None) -> "TradeActionResult":
+        """
+        Create a TradeActionResult instance for this action.
+        
+        Args:
+            action_type: Type of action (buy, sell, close, etc.)
+            success: Whether the action was successful
+            message: Human-readable message about the result
+            data: Additional data from the action
+            transaction_id: Optional transaction ID to link
+            expert_recommendation_id: Optional expert recommendation ID to link
+            
+        Returns:
+            TradeActionResult instance (not yet saved to database)
+        """
+        if data is None:
+            data = {}
+            
+        result = TradeActionResult(
+            action_type=action_type,
+            success=success,
+            message=message,
+            data=data,
+            transaction_id=transaction_id,
+            expert_recommendation_id=expert_recommendation_id
+        )
+        
+        return result
 
 
 class SellAction(TradeAction):
     """Execute a sell order."""
     
-    def execute(self) -> Dict[str, Any]:
+    def execute(self) -> "TradeActionResult":
         """
         Execute a sell order for the instrument.
         
         Returns:
-            Execution result with success status and details
+            TradeActionResult object containing execution results
         """
         try:
             # Get current position to determine quantity
             current_position = self.get_current_position()
             if current_position is None or current_position <= 0:
-                return {
-                    "success": False,
-                    "message": f"No long position to sell for {self.instrument_name}",
-                    "data": None
-                }
+                result = self.create_action_result(
+                    action_type=ExpertActionType.SELL.value,
+                    success=False,
+                    message=f"No long position to sell for {self.instrument_name}",
+                    data={}
+                )
+                add_instance(result)
+                return result
             
             # Create order record
             order_record = self.create_order_record(
@@ -169,45 +206,57 @@ class SellAction(TradeAction):
             )
             
             if not order_record:
-                return {
-                    "success": False,
-                    "message": "Failed to create order record",
-                    "data": None
-                }
+                result = self.create_action_result(
+                    action_type=ExpertActionType.SELL.value,
+                    success=False,
+                    message="Failed to create order record",
+                    data={}
+                )
+                add_instance(result)
+                return result
             
             # Submit order through account interface
-            result = self.account.submit_order(order_record)
+            submit_result = self.account.submit_order(order_record)
             
-            if result.get("success", False):
+            if submit_result is not None:
                 # Update order record with broker order ID
-                if "order_id" in result:
-                    order_record.broker_order_id = str(result["order_id"])
+                if hasattr(submit_result, 'account_order_id') and submit_result.account_order_id:
+                    order_record.broker_order_id = str(submit_result.account_order_id)
                     order_record.status = OrderStatus.OPEN.value
                     update_instance(order_record)
                 
-                return {
-                    "success": True,
-                    "message": f"Sell order submitted for {self.instrument_name}",
-                    "data": {"order_id": order_record.id, "broker_order_id": result.get("order_id")}
-                }
+                result = self.create_action_result(
+                    action_type=ExpertActionType.SELL.value,
+                    success=True,
+                    message=f"Sell order submitted for {self.instrument_name}",
+                    data={"order_id": order_record.id, "broker_order_id": submit_result.account_order_id}
+                )
+                add_instance(result)
+                return result
             else:
                 # Update order status to failed
                 order_record.status = OrderStatus.CANCELED.value
                 update_instance(order_record)
                 
-                return {
-                    "success": False,
-                    "message": f"Failed to submit sell order: {result.get('message', 'Unknown error')}",
-                    "data": None
-                }
+                result = self.create_action_result(
+                    action_type=ExpertActionType.SELL.value,
+                    success=False,
+                    message=f"Failed to submit sell order",
+                    data={}
+                )
+                add_instance(result)
+                return result
                 
         except Exception as e:
             logger.error(f"Error executing sell action for {self.instrument_name}: {e}", exc_info=True)
-            return {
-                "success": False,
-                "message": f"Error executing sell action: {str(e)}",
-                "data": None
-            }
+            result = self.create_action_result(
+                action_type=ExpertActionType.SELL.value,
+                success=False,
+                message=f"Error executing sell action: {str(e)}",
+                data={}
+            )
+            add_instance(result)
+            return result
     
     def get_description(self) -> str:
         """Get description of sell action."""
@@ -217,7 +266,7 @@ class SellAction(TradeAction):
 class BuyAction(TradeAction):
     """Execute a buy order."""
     
-    def execute(self, quantity: Optional[float] = None) -> Dict[str, Any]:
+    def execute(self, quantity: Optional[float] = None) -> "TradeActionResult":
         """
         Execute a buy order for the instrument.
         
@@ -225,7 +274,7 @@ class BuyAction(TradeAction):
             quantity: Optional quantity to buy. If not provided, will calculate based on account balance
             
         Returns:
-            Execution result with success status and details
+            TradeActionResult object containing execution results
         """
         try:
             # If quantity not provided, calculate based on available buying power
@@ -239,11 +288,14 @@ class BuyAction(TradeAction):
             
             current_price = self.get_current_price()
             if current_price is None:
-                return {
-                    "success": False,
-                    "message": f"Cannot get current price for {self.instrument_name}",
-                    "data": None
-                }
+                result = self.create_action_result(
+                    action_type=ExpertActionType.BUY.value,
+                    success=False,
+                    message=f"Cannot get current price for {self.instrument_name}",
+                    data={}
+                )
+                add_instance(result)
+                return result
             
             # Create order record
             order_record = self.create_order_record(
@@ -253,45 +305,53 @@ class BuyAction(TradeAction):
             )
             
             if not order_record:
-                return {
-                    "success": False,
-                    "message": "Failed to create order record",
-                    "data": None
-                }
+                result = self.create_action_result(
+                    action_type=ExpertActionType.BUY.value,
+                    success=False,
+                    message="Failed to create order record",
+                    data={}
+                )
+                add_instance(result)
+                return result
             
             # Submit order through account interface
-            result = self.account.submit_order(order_record)
+            submit_result = self.account.submit_order(order_record)
             
-            if result.get("success", False):
-                # Update order record with broker order ID
-                if "order_id" in result:
-                    order_record.broker_order_id = str(result["order_id"])
-                    order_record.status = OrderStatus.OPEN.value
-                    update_instance(order_record)
+            if submit_result is not None:
+
                 
-                return {
-                    "success": True,
-                    "message": f"Buy order submitted for {self.instrument_name}",
-                    "data": {"order_id": order_record.id, "broker_order_id": result.get("order_id")}
-                }
+                result = self.create_action_result(
+                    action_type=ExpertActionType.BUY.value,
+                    success=True,
+                    message=f"Buy order submitted for {self.instrument_name}",
+                    data={"order_id": order_record.id, "broker_order_id": submit_result.account_order_id}
+                )
+                add_instance(result)
+                return result
             else:
                 # Update order status to failed
                 order_record.status = OrderStatus.CANCELED.value
                 update_instance(order_record)
                 
-                return {
-                    "success": False,
-                    "message": f"Failed to submit buy order: {result.get('message', 'Unknown error')}",
-                    "data": None
-                }
+                result = self.create_action_result(
+                    action_type=ExpertActionType.BUY.value,
+                    success=False,
+                    message=f"Failed to submit buy order",
+                    data={}
+                )
+                add_instance(result)
+                return result
                 
         except Exception as e:
             logger.error(f"Error executing buy action for {self.instrument_name}: {e}", exc_info=True)
-            return {
-                "success": False,
-                "message": f"Error executing buy action: {str(e)}",
-                "data": None
-            }
+            result = self.create_action_result(
+                action_type=ExpertActionType.BUY.value,
+                success=False,
+                message=f"Error executing buy action: {str(e)}",
+                data={}
+            )
+            add_instance(result)
+            return result
     
     def get_description(self) -> str:
         """Get description of buy action."""
@@ -301,21 +361,24 @@ class BuyAction(TradeAction):
 class CloseAction(TradeAction):
     """Close existing position (buy to cover short or sell long position)."""
     
-    def execute(self) -> Dict[str, Any]:
+    def execute(self) -> "TradeActionResult":
         """
         Close the existing position for the instrument.
         
         Returns:
-            Execution result with success status and details
+            TradeActionResult object containing execution results
         """
         try:
             current_position = self.get_current_position()
             if current_position is None or current_position == 0:
-                return {
-                    "success": False,
-                    "message": f"No position to close for {self.instrument_name}",
-                    "data": None
-                }
+                result = self.create_action_result(
+                    action_type=ExpertActionType.CLOSE.value,
+                    success=False,
+                    message=f"No position to close for {self.instrument_name}",
+                    data={}
+                )
+                add_instance(result)
+                return result
             
             # Determine order side based on current position
             if current_position > 0:
@@ -335,45 +398,57 @@ class CloseAction(TradeAction):
             )
             
             if not order_record:
-                return {
-                    "success": False,
-                    "message": "Failed to create order record",
-                    "data": None
-                }
+                result = self.create_action_result(
+                    action_type=ExpertActionType.CLOSE.value,
+                    success=False,
+                    message="Failed to create order record",
+                    data={}
+                )
+                add_instance(result)
+                return result
             
             # Submit order through account interface
-            result = self.account.submit_order(order_record)
+            submit_result = self.account.submit_order(order_record)
             
-            if result.get("success", False):
+            if submit_result is not None:
                 # Update order record with broker order ID
-                if "order_id" in result:
-                    order_record.broker_order_id = str(result["order_id"])
+                if hasattr(submit_result, 'account_order_id') and submit_result.account_order_id:
+                    order_record.broker_order_id = str(submit_result.account_order_id)
                     order_record.status = OrderStatus.OPEN.value
                     update_instance(order_record)
                 
-                return {
-                    "success": True,
-                    "message": f"Close order submitted for {self.instrument_name}",
-                    "data": {"order_id": order_record.id, "broker_order_id": result.get("order_id")}
-                }
+                result = self.create_action_result(
+                    action_type=ExpertActionType.CLOSE.value,
+                    success=True,
+                    message=f"Close order submitted for {self.instrument_name}",
+                    data={"order_id": order_record.id, "broker_order_id": submit_result.account_order_id}
+                )
+                add_instance(result)
+                return result
             else:
                 # Update order status to failed
                 order_record.status = OrderStatus.CANCELED.value
                 update_instance(order_record)
                 
-                return {
-                    "success": False,
-                    "message": f"Failed to submit close order: {result.get('message', 'Unknown error')}",
-                    "data": None
-                }
+                result = self.create_action_result(
+                    action_type=ExpertActionType.CLOSE.value,
+                    success=False,
+                    message=f"Failed to submit close order",
+                    data={}
+                )
+                add_instance(result)
+                return result
                 
         except Exception as e:
             logger.error(f"Error executing close action for {self.instrument_name}: {e}", exc_info=True)
-            return {
-                "success": False,
-                "message": f"Error executing close action: {str(e)}",
-                "data": None
-            }
+            result = self.create_action_result(
+                action_type=ExpertActionType.CLOSE.value,
+                success=False,
+                message=f"Error executing close action: {str(e)}",
+                data={}
+            )
+            add_instance(result)
+            return result
     
     def get_description(self) -> str:
         """Get description of close action."""
@@ -399,30 +474,36 @@ class AdjustTakeProfitAction(TradeAction):
         super().__init__(instrument_name, account, order_recommendation, existing_order)
         self.take_profit_price = take_profit_price
     
-    def execute(self) -> Dict[str, Any]:
+    def execute(self) -> "TradeActionResult":
         """
         Create or adjust take profit order linked to existing order.
         
         Returns:
-            Execution result with success status and details
+            TradeActionResult object containing execution results
         """
         try:
             if not self.existing_order:
-                return {
-                    "success": False,
-                    "message": "No existing order provided for take profit adjustment",
-                    "data": None
-                }
+                result = self.create_action_result(
+                    action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
+                    success=False,
+                    message="No existing order provided for take profit adjustment",
+                    data={}
+                )
+                add_instance(result)
+                return result
             
             # If no take profit price provided, calculate based on current price and some percentage
             if self.take_profit_price is None:
                 current_price = self.get_current_price()
                 if current_price is None:
-                    return {
-                        "success": False,
-                        "message": f"Cannot get current price for {self.instrument_name}",
-                        "data": None
-                    }
+                    result = self.create_action_result(
+                        action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
+                        success=False,
+                        message=f"Cannot get current price for {self.instrument_name}",
+                        data={}
+                    )
+                    add_instance(result)
+                    return result
                 
                 # Default to 5% profit target
                 if self.existing_order.side == "buy":
@@ -443,45 +524,57 @@ class AdjustTakeProfitAction(TradeAction):
             )
             
             if not tp_order_record:
-                return {
-                    "success": False,
-                    "message": "Failed to create take profit order record",
-                    "data": None
-                }
+                result = self.create_action_result(
+                    action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
+                    success=False,
+                    message="Failed to create take profit order record",
+                    data={}
+                )
+                add_instance(result)
+                return result
             
             # Submit TP order through account interface
-            result = self.account.submit_order(tp_order_record)
+            submit_result = self.account.submit_order(tp_order_record)
             
-            if result.get("success", False):
+            if submit_result is not None:
                 # Update TP order record with broker order ID
-                if "order_id" in result:
-                    tp_order_record.broker_order_id = str(result["order_id"])
+                if hasattr(submit_result, 'account_order_id') and submit_result.account_order_id:
+                    tp_order_record.broker_order_id = str(submit_result.account_order_id)
                     tp_order_record.status = OrderStatus.OPEN.value
                     update_instance(tp_order_record)
                 
-                return {
-                    "success": True,
-                    "message": f"Take profit order created for {self.instrument_name} at ${self.take_profit_price}",
-                    "data": {"order_id": tp_order_record.id, "broker_order_id": result.get("order_id")}
-                }
+                result = self.create_action_result(
+                    action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
+                    success=True,
+                    message=f"Take profit order created for {self.instrument_name} at ${self.take_profit_price}",
+                    data={"order_id": tp_order_record.id, "broker_order_id": submit_result.account_order_id}
+                )
+                add_instance(result)
+                return result
             else:
                 # Update TP order status to failed
                 tp_order_record.status = OrderStatus.CANCELED.value
                 update_instance(tp_order_record)
                 
-                return {
-                    "success": False,
-                    "message": f"Failed to submit take profit order: {result.get('message', 'Unknown error')}",
-                    "data": None
-                }
+                result = self.create_action_result(
+                    action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
+                    success=False,
+                    message=f"Failed to submit take profit order",
+                    data={}
+                )
+                add_instance(result)
+                return result
                 
         except Exception as e:
             logger.error(f"Error executing adjust take profit action for {self.instrument_name}: {e}", exc_info=True)
-            return {
-                "success": False,
-                "message": f"Error executing adjust take profit action: {str(e)}",
-                "data": None
-            }
+            result = self.create_action_result(
+                action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
+                success=False,
+                message=f"Error executing adjust take profit action: {str(e)}",
+                data={}
+            )
+            add_instance(result)
+            return result
     
     def get_description(self) -> str:
         """Get description of adjust take profit action."""
@@ -508,30 +601,36 @@ class AdjustStopLossAction(TradeAction):
         super().__init__(instrument_name, account, order_recommendation, existing_order)
         self.stop_loss_price = stop_loss_price
     
-    def execute(self) -> Dict[str, Any]:
+    def execute(self) -> "TradeActionResult":
         """
         Create or adjust stop loss order linked to existing order.
         
         Returns:
-            Execution result with success status and details
+            TradeActionResult object containing execution results
         """
         try:
             if not self.existing_order:
-                return {
-                    "success": False,
-                    "message": "No existing order provided for stop loss adjustment",
-                    "data": None
-                }
+                result = self.create_action_result(
+                    action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
+                    success=False,
+                    message="No existing order provided for stop loss adjustment",
+                    data={}
+                )
+                add_instance(result)
+                return result
             
             # If no stop loss price provided, calculate based on current price and some percentage
             if self.stop_loss_price is None:
                 current_price = self.get_current_price()
                 if current_price is None:
-                    return {
-                        "success": False,
-                        "message": f"Cannot get current price for {self.instrument_name}",
-                        "data": None
-                    }
+                    result = self.create_action_result(
+                        action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
+                        success=False,
+                        message=f"Cannot get current price for {self.instrument_name}",
+                        data={}
+                    )
+                    add_instance(result)
+                    return result
                 
                 # Default to 3% stop loss
                 if self.existing_order.side == "buy":
@@ -552,45 +651,57 @@ class AdjustStopLossAction(TradeAction):
             )
             
             if not sl_order_record:
-                return {
-                    "success": False,
-                    "message": "Failed to create stop loss order record",
-                    "data": None
-                }
+                result = self.create_action_result(
+                    action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
+                    success=False,
+                    message="Failed to create stop loss order record",
+                    data={}
+                )
+                add_instance(result)
+                return result
             
             # Submit SL order through account interface
-            result = self.account.submit_order(sl_order_record)
+            submit_result = self.account.submit_order(sl_order_record)
             
-            if result.get("success", False):
+            if submit_result is not None:
                 # Update SL order record with broker order ID
-                if "order_id" in result:
-                    sl_order_record.broker_order_id = str(result["order_id"])
+                if hasattr(submit_result, 'account_order_id') and submit_result.account_order_id:
+                    sl_order_record.broker_order_id = str(submit_result.account_order_id)
                     sl_order_record.status = OrderStatus.OPEN.value
                     update_instance(sl_order_record)
                 
-                return {
-                    "success": True,
-                    "message": f"Stop loss order created for {self.instrument_name} at ${self.stop_loss_price}",
-                    "data": {"order_id": sl_order_record.id, "broker_order_id": result.get("order_id")}
-                }
+                result = self.create_action_result(
+                    action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
+                    success=True,
+                    message=f"Stop loss order created for {self.instrument_name} at ${self.stop_loss_price}",
+                    data={"order_id": sl_order_record.id, "broker_order_id": submit_result.account_order_id}
+                )
+                add_instance(result)
+                return result
             else:
                 # Update SL order status to failed
                 sl_order_record.status = OrderStatus.CANCELED.value
                 update_instance(sl_order_record)
                 
-                return {
-                    "success": False,
-                    "message": f"Failed to submit stop loss order: {result.get('message', 'Unknown error')}",
-                    "data": None
-                }
+                result = self.create_action_result(
+                    action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
+                    success=False,
+                    message=f"Failed to submit stop loss order",
+                    data={}
+                )
+                add_instance(result)
+                return result
                 
         except Exception as e:
             logger.error(f"Error executing adjust stop loss action for {self.instrument_name}: {e}", exc_info=True)
-            return {
-                "success": False,
-                "message": f"Error executing adjust stop loss action: {str(e)}",
-                "data": None
-            }
+            result = self.create_action_result(
+                action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
+                success=False,
+                message=f"Error executing adjust stop loss action: {str(e)}",
+                data={}
+            )
+            add_instance(result)
+            return result
     
     def get_description(self) -> str:
         """Get description of adjust stop loss action."""

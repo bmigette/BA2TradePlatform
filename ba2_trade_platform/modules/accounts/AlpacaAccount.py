@@ -1,5 +1,6 @@
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import GetOrdersRequest
+from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, LimitOrderRequest, StopOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
 from typing import Any, Dict, Optional
 
 from ...logger import logger
@@ -63,6 +64,7 @@ class AlpacaAccount(AccountInterface):
         """
         return TradingOrder(
             order_id=getattr(order, "id", None),
+            broker_order_id=str(getattr(order, "id", None)) if getattr(order, "id", None) else None,  # Set Alpaca order ID as broker_order_id
             symbol=getattr(order, "symbol", None),
             quantity=getattr(order, "qty", None),
             side=getattr(order, "side", None),
@@ -141,25 +143,49 @@ class AlpacaAccount(AccountInterface):
             TradingOrder: The created order if successful, None if an error occurs.
         """
         try:
-            # Prepare order parameters from TradingOrder object
-            order_params = {
-                'symbol': trading_order.symbol,
-                'qty': trading_order.quantity,
-                'side': trading_order.side,
-                'type': trading_order.order_type,
-                'time_in_force': trading_order.good_for or 'day',
-                'client_order_id': trading_order.comment
-            }
+            # Convert string values to enums
+            side = OrderSide.BUY if trading_order.side.upper() == 'BUY' else OrderSide.SELL
+            time_in_force = TimeInForce.DAY if trading_order.good_for == 'day' else TimeInForce.GTC
             
-            # Add optional parameters if they exist
-            if hasattr(trading_order, 'limit_price') and trading_order.limit_price is not None:
-                order_params['limit_price'] = trading_order.limit_price
-            if hasattr(trading_order, 'stop_price') and trading_order.stop_price is not None:
-                order_params['stop_price'] = trading_order.stop_price
+            # Create the appropriate order request based on order type
+            if trading_order.order_type.lower() == 'market':
+                order_request = MarketOrderRequest(
+                    symbol=trading_order.symbol,
+                    qty=trading_order.quantity,
+                    side=side,
+                    time_in_force=time_in_force,
+                    client_order_id=trading_order.comment
+                )
+            elif trading_order.order_type.lower() == 'limit':
+                order_request = LimitOrderRequest(
+                    symbol=trading_order.symbol,
+                    qty=trading_order.quantity,
+                    side=side,
+                    time_in_force=time_in_force,
+                    limit_price=trading_order.limit_price,
+                    client_order_id=trading_order.comment
+                )
+            elif trading_order.order_type.lower() == 'stop':
+                order_request = StopOrderRequest(
+                    symbol=trading_order.symbol,
+                    qty=trading_order.quantity,
+                    side=side,
+                    time_in_force=time_in_force,
+                    stop_price=trading_order.stop_price,
+                    client_order_id=trading_order.comment
+                )
+            else:
+                logger.error(f"Unsupported order type: {trading_order.order_type}")
+                return None
             
-            order = self.client.submit_order(**order_params)
+            order = self.client.submit_order(order_request)
             logger.info(f"Submitted Alpaca order: {order.id}")
-            return self.alpaca_order_to_tradingorder(order)
+            
+            # Convert to TradingOrder and set the broker_order_id
+            result_order = self.alpaca_order_to_tradingorder(order)
+            result_order.broker_order_id = str(order.id)  # Set the Alpaca order ID
+            
+            return result_order
         except Exception as e:
             logger.error(f"Error creating Alpaca order: {e}", exc_info=True)
             return None
@@ -300,3 +326,78 @@ class AlpacaAccount(AccountInterface):
         except Exception as e:
             logger.error(f"Error getting current price for {symbol}: {e}", exc_info=True)
             return None
+        
+        
+    def refresh_positions(self) -> bool:
+        """
+        Refresh/synchronize account positions from Alpaca broker.
+        This method updates any cached position data with fresh data from the broker.
+        
+        Returns:
+            bool: True if refresh was successful, False otherwise
+        """
+        try:
+            positions = self.get_positions()
+            logger.info(f"Successfully refreshed {len(positions)} positions from Alpaca")
+            return True
+        except Exception as e:
+            logger.error(f"Error refreshing positions from Alpaca: {e}", exc_info=True)
+            return False
+
+    def refresh_orders(self) -> bool:
+        """
+        Refresh/synchronize account orders from Alpaca broker.
+        This method updates database records with current order states from the broker.
+        
+        Returns:
+            bool: True if refresh was successful, False otherwise
+        """
+        try:
+            from ...core.db import get_db, update_instance
+            from ...core.models import TradingOrder as TradingOrderModel
+            from sqlmodel import Session, select
+            
+            # Get all orders from Alpaca
+            alpaca_orders = self.get_orders(OrderStatus.ALL)
+            
+            if not alpaca_orders:
+                logger.warning("No orders returned from Alpaca during refresh")
+                return True
+            
+            updated_count = 0
+            
+            # Update database records with current Alpaca order states
+            with Session(get_db().bind) as session:
+                for alpaca_order in alpaca_orders:
+                    if not alpaca_order.order_id:
+                        continue
+                        
+                    # Find corresponding database record
+                    # Convert UUID to string for SQLite compatibility
+                    order_id_str = str(alpaca_order.order_id)
+                    statement = select(TradingOrderModel).where(
+                        TradingOrderModel.broker_order_id == order_id_str
+                    )
+                    db_order = session.exec(statement).first()
+                    
+                    if db_order:
+                        # Update database order with current Alpaca state
+                        db_order.status = alpaca_order.status
+                        db_order.filled_qty = alpaca_order.filled_qty
+                        
+                        # Update broker_order_id if it wasn't set before
+                        if not db_order.broker_order_id:
+                            db_order.broker_order_id = str(alpaca_order.order_id)
+                        
+                        session.add(db_order)
+                        updated_count += 1
+                        logger.debug(f"Updated database order {db_order.id} with Alpaca order {alpaca_order.order_id}")
+                
+                session.commit()
+            
+            logger.info(f"Successfully refreshed orders from Alpaca: {updated_count} database records updated")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error refreshing orders from Alpaca: {e}", exc_info=True)
+            return False

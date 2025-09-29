@@ -40,6 +40,11 @@ class OrderRecommendation(str, Enum):
     HOLD = "HOLD"
     ERROR = "ERROR"
 
+class TransactionStatus(str, Enum):
+    WAITING = "WAITING"
+    OPENED = "OPENED"
+    CLOSED = "CLOSED"
+
 class RiskLevel(str, Enum):
     LOW = "LOW"
     MEDIUM = "MEDIUM"
@@ -102,12 +107,12 @@ class WorkerTaskStatus(Enum):
     FAILED = "failed"
 
 def get_reference_value_options():
-    """Return list of reference value options with user-friendly labels."""
-    return [
-        {'value': ReferenceValue.ORDER_OPEN_PRICE.value, 'label': 'Order Open Price'},
-        {'value': ReferenceValue.CURRENT_PRICE.value, 'label': 'Current Market Price'},
-        {'value': ReferenceValue.EXPERT_TARGET_PRICE.value, 'label': 'Expert Target Price'}
-    ]
+    """Return dictionary of reference value options with user-friendly labels."""
+    return {
+        ReferenceValue.ORDER_OPEN_PRICE.value: 'Order Open Price',
+        ReferenceValue.CURRENT_PRICE.value: 'Current Market Price',
+        ReferenceValue.EXPERT_TARGET_PRICE.value: 'Expert Target Price'
+    }
 
 
 # Helper functions for UI logic

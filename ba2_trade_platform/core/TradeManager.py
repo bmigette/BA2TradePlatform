@@ -29,7 +29,52 @@ class TradeManager:
     def __init__(self):
         """Initialize the trade manager."""
         self.logger = logger.getChild("TradeManager")
+    
+    def refresh_accounts(self):
+        """
+        Refresh account information for all registered accounts.
         
+        This method iterates through all account definitions and calls their
+        refresh methods to update account information, positions, and orders.
+        """
+        try:
+            from .models import AccountDefinition
+            from ..modules.accounts import get_account_class
+            
+            # Get all account definitions
+            account_definitions = get_all_instances(AccountDefinition)
+            
+            self.logger.info(f"Starting account refresh for {len(account_definitions)} accounts")
+            
+            for account_def in account_definitions:
+                try:
+                    # Get the account class for this provider
+                    account_class = get_account_class(account_def.provider)
+                    if not account_class:
+                        self.logger.warning(f"No account class found for provider {account_def.provider}")
+                        continue
+                    
+                    # Create account instance
+                    account = account_class(account_def.id)
+                    
+                    # Refresh account data if the method exists
+                    if hasattr(account, 'refresh_positions'):
+                        account.refresh_positions()
+                        self.logger.debug(f"Refreshed positions for {account_def.name}")
+                    
+                    if hasattr(account, 'refresh_orders'):
+                        account.refresh_orders()
+                        self.logger.debug(f"Refreshed orders for {account_def.name}")
+                        
+                except Exception as e:
+                    self.logger.error(f"Error refreshing account {account_def.name} (ID: {account_def.id}): {e}", exc_info=True)
+                    continue
+            
+            self.logger.info("Account refresh completed")
+            
+        except Exception as e:
+            self.logger.error(f"Error during account refresh: {e}", exc_info=True)
+    
     def process_recommendation(self, recommendation: ExpertRecommendation) -> Optional[TradingOrder]:
         """
         Process a single expert recommendation and potentially place an order.

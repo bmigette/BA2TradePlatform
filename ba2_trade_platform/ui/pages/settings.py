@@ -10,7 +10,7 @@ from ...logger import logger
 from ...core.db import get_db, get_all_instances, delete_instance, add_instance, update_instance, get_instance
 from ...modules.accounts import providers
 from ...core.AccountInterface import AccountInterface
-from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action
+from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, AnalysisUseCase
 from yahooquery import Ticker, search as yq_search
 from nicegui.events import UploadEventArguments
 from ...modules.experts import experts
@@ -372,6 +372,7 @@ class AppSettingsTab:
         self.finnhub_input = None
         self.fred_input = None
         self.worker_count_input = None
+        self.account_refresh_interval_input = None
         self.render()
 
     def render(self):
@@ -381,6 +382,7 @@ class AppSettingsTab:
         finnhub = session.exec(select(AppSetting).where(AppSetting.key == 'finnhub_api_key')).first()
         fred = session.exec(select(AppSetting).where(AppSetting.key == 'fred_api_key')).first()
         worker_count = session.exec(select(AppSetting).where(AppSetting.key == 'worker_count')).first()
+        account_refresh_interval = session.exec(select(AppSetting).where(AppSetting.key == 'account_refresh_interval')).first()
         
         with ui.card().classes('w-full'):
             self.openai_input = ui.input(label='OpenAI API Key', value=openai.value_str if openai else '').classes('w-full')
@@ -394,6 +396,13 @@ class AppSettingsTab:
                 value=int(worker_count.value_str) if worker_count and worker_count.value_str else 4,
                 min=1,
                 max=20,
+                step=1
+            ).classes('w-full')
+            self.account_refresh_interval_input = ui.number(
+                label='Account Refresh Interval (minutes)', 
+                value=int(account_refresh_interval.value_str) if account_refresh_interval and account_refresh_interval.value_str else 5,
+                min=1,
+                max=1440,  # Maximum 24 hours
                 step=1
             ).classes('w-full')
             ui.button('Save', on_click=self.save_settings)
@@ -452,11 +461,22 @@ class AppSettingsTab:
                 worker_count = AppSetting(key='worker_count', value_str=str(int(self.worker_count_input.value)))
                 add_instance(worker_count, session)
             
+            # Account Refresh Interval
+            account_refresh_interval = session.exec(select(AppSetting).where(AppSetting.key == 'account_refresh_interval')).first()
+            if account_refresh_interval:
+                account_refresh_interval.value_str = str(int(self.account_refresh_interval_input.value))
+                update_instance(account_refresh_interval, session)
+            else:
+                account_refresh_interval = AppSetting(key='account_refresh_interval', value_str=str(int(self.account_refresh_interval_input.value)))
+                add_instance(account_refresh_interval, session)
+            
             session.commit()
             ui.notify('Settings saved successfully', type='positive')
             
             # Notify user that worker count changes require restart
             ui.notify('Worker count changes will take effect after restart', type='info')
+            # Notify user that account refresh interval changes require restart
+            ui.notify('Account refresh interval changes will take effect after restart', type='info')
             
         except Exception as e:
             logger.error(f"Error saving settings: {str(e)}", exc_info=True)
@@ -1786,6 +1806,7 @@ class TradeSettingsTab:
                     self.rules_table = ui.table(
                         columns=[
                             {'name': 'name', 'label': 'Name', 'field': 'name', 'sortable': True},
+                            {'name': 'subtype', 'label': 'Subtype', 'field': 'subtype', 'sortable': True},
                             {'name': 'triggers_count', 'label': 'Triggers', 'field': 'triggers_count', 'align': 'center'},
                             {'name': 'actions_count', 'label': 'Actions', 'field': 'actions_count', 'align': 'center'},
                             {'name': 'continue_processing', 'label': 'Continue Processing', 'field': 'continue_processing', 'align': 'center'},
@@ -1823,6 +1844,7 @@ class TradeSettingsTab:
                         columns=[
                             {'name': 'name', 'label': 'Name', 'field': 'name', 'sortable': True},
                             {'name': 'description', 'label': 'Description', 'field': 'description'},
+                            {'name': 'subtype', 'label': 'Subtype', 'field': 'subtype', 'sortable': True},
                             {'name': 'rules_count', 'label': 'Rules Count', 'field': 'rules_count', 'align': 'center'},
                             {'name': 'actions', 'label': 'Actions', 'field': 'actions'}
                         ],
@@ -1858,7 +1880,7 @@ class TradeSettingsTab:
                     'id': rule.id,
                     'name': rule.name,
                     'type': rule.type.value if rule.type else None,  # Convert enum to string
-                    'subtype': rule.subtype,
+                    'subtype': rule.subtype.value if rule.subtype else 'Not set',
                     'continue_processing': rule.continue_processing,
                     'triggers_count': len(rule.triggers) if rule.triggers else 0,
                     'actions_count': len(rule.actions) if rule.actions else 0
@@ -1890,6 +1912,7 @@ class TradeSettingsTab:
                     'id': ruleset.id,
                     'name': ruleset.name,
                     'description': ruleset.description[:47] + '...' if ruleset.description and len(ruleset.description) > 50 else ruleset.description,
+                    'subtype': ruleset.subtype.value if ruleset.subtype else 'Not set',
                     'rules_count': len(ruleset.event_actions) if ruleset.event_actions else 0
                 }
                 rows.append(row)
@@ -1930,6 +1953,13 @@ class TradeSettingsTab:
                     self.rule_name_input = ui.input(
                         label='Rule Name',
                         value=rule.name if is_edit else ''
+                    ).classes('w-full')
+                    
+                    # Subtype selection
+                    self.rule_subtype_select = ui.select(
+                        options={subtype.value: subtype.value.replace('_', ' ').title() for subtype in AnalysisUseCase},
+                        label='Subtype (Analysis Use Case)',
+                        value=rule.subtype.value if is_edit and rule.subtype else AnalysisUseCase.ENTER_MARKET.value
                     ).classes('w-full')
                     
                     self.continue_processing_checkbox = ui.checkbox(
@@ -1995,7 +2025,7 @@ class TradeSettingsTab:
                     trigger_select = ui.select(
                         options=[t.value for t in ExpertEventType],
                         label='Trigger Type',
-                        value=trigger_config.get('type') if trigger_config else ExpertEventType.F_HAS_POSITION.value
+                        value=trigger_config.get('event_type', trigger_config.get('type', ExpertEventType.F_HAS_POSITION.value)) if trigger_config else ExpertEventType.F_HAS_POSITION.value
                     ).classes('flex-1')
                     
                     # Remove button
@@ -2063,7 +2093,7 @@ class TradeSettingsTab:
                     action_select = ui.select(
                         options=[a.value for a in ExpertActionType],
                         label='Action Type',
-                        value=action_config.get('type') if action_config else ExpertActionType.BUY.value
+                        value=action_config.get('action_type', action_config.get('type', ExpertActionType.BUY.value)) if action_config else ExpertActionType.BUY.value
                     ).classes('flex-1')
                     
                     # Remove button
@@ -2093,15 +2123,11 @@ class TradeSettingsTab:
                                 ).classes('w-full')
                                 
                                 # Reference value selector
-                                reference_options = {
-                                    ReferenceValue.ORDER_OPEN_PRICE.value: 'Order Open Price',
-                                    ReferenceValue.CURRENT_PRICE.value: 'Current Market Price',
-                                    ReferenceValue.EXPERT_TARGET_PRICE.value: 'Expert Target Price'
-                                }
+                                from ...core.types import get_reference_value_options
                                 reference_select = ui.select(
-                                    options=reference_options,
+                                    options=get_reference_value_options(),
                                     label='Reference Value',
-                                    value=action_config.get('reference_value', ReferenceValue.CURRENT_PRICE.value) if action_config else ReferenceValue.CURRENT_PRICE.value
+                                    value=action_config.get('reference_value', 'current_price') if action_config else 'current_price'
                                 ).classes('w-full')
                     else:
                         # Simple action - no additional inputs needed
@@ -2135,7 +2161,7 @@ class TradeSettingsTab:
             triggers_data = {}
             for trigger_id, trigger_refs in self.triggers.items():
                 trigger_type = trigger_refs['type_select'].value
-                trigger_config = {'type': trigger_type}
+                trigger_config = {'event_type': trigger_type}  # Use 'event_type' instead of 'type'
                 
                 if is_numeric_event(trigger_type):
                     # Numeric trigger
@@ -2155,7 +2181,7 @@ class TradeSettingsTab:
             actions_data = {}
             for action_id, action_refs in self.actions.items():
                 action_type = action_refs['type_select'].value
-                action_config = {'type': action_type}
+                action_config = {'action_type': action_type}  # Use 'action_type' instead of 'type'
                 
                 if is_adjustment_action(action_type):
                     # Adjustment action
@@ -2179,7 +2205,7 @@ class TradeSettingsTab:
                 # Update existing rule
                 rule.name = self.rule_name_input.value
                 rule.type = ExpertEventRuleType.TRADING_RECOMMENDATION_RULE
-                rule.subtype = None  # Not used, always set to None
+                rule.subtype = AnalysisUseCase(self.rule_subtype_select.value) if self.rule_subtype_select.value else None
                 rule.triggers = triggers_data
                 rule.actions = actions_data
                 rule.continue_processing = self.continue_processing_checkbox.value
@@ -2191,7 +2217,7 @@ class TradeSettingsTab:
                 new_rule = EventAction(
                     name=self.rule_name_input.value,
                     type=ExpertEventRuleType.TRADING_RECOMMENDATION_RULE,
-                    subtype=None,  # Not used, always set to None
+                    subtype=AnalysisUseCase(self.rule_subtype_select.value) if self.rule_subtype_select.value else None,
                     triggers=triggers_data,
                     actions=actions_data,
                     extra_parameters={},
@@ -2228,6 +2254,13 @@ class TradeSettingsTab:
                         value=ruleset.name if is_edit else ''
                     ).classes('w-full')
                     
+                    # Subtype selection
+                    self.ruleset_subtype_select = ui.select(
+                        options={subtype.value: subtype.value.replace('_', ' ').title() for subtype in AnalysisUseCase},
+                        label='Subtype (Analysis Use Case)',
+                        value=ruleset.subtype.value if is_edit and ruleset.subtype else AnalysisUseCase.ENTER_MARKET.value
+                    ).classes('w-full')
+                    
                     self.ruleset_description_input = ui.textarea(
                         label='Description',
                         value=ruleset.description if is_edit and ruleset.description else ''
@@ -2235,14 +2268,30 @@ class TradeSettingsTab:
                 
                 # Rules selection section
                 ui.label('Select Rules for this Ruleset').classes('text-subtitle1 mt-4 mb-2')
-                ui.label('Choose which rules should be part of this ruleset.').classes('text-grey-7 mb-4')
+                ui.label('Choose which rules should be part of this ruleset. Only rules with matching subtype are shown.').classes('text-grey-7 mb-4')
                 
-                # Get all available rules
-                available_rules = get_all_instances(EventAction)
-                if not available_rules:
-                    ui.label('No rules available. Create some rules first.').classes('text-orange')
-                else:
-                    self.selected_rules = {}
+                # Container for rules that will be updated when subtype changes
+                self.rules_selection_container = ui.column().classes('w-full')
+                
+                # Function to update available rules based on selected subtype
+                def update_available_rules():
+                    self.rules_selection_container.clear()
+                    
+                    # Get selected subtype
+                    selected_subtype = self.ruleset_subtype_select.value
+                    if not selected_subtype:
+                        with self.rules_selection_container:
+                            ui.label('Please select a subtype first.').classes('text-orange')
+                        return
+                    
+                    # Get all available rules that match the subtype
+                    available_rules = [rule for rule in get_all_instances(EventAction) 
+                                     if rule.subtype and rule.subtype.value == selected_subtype]
+                    
+                    if not available_rules:
+                        with self.rules_selection_container:
+                            ui.label(f'No rules available for subtype "{selected_subtype.replace("_", " ").title()}". Create some rules with this subtype first.').classes('text-orange')
+                        return
                     
                     # Get currently selected rule IDs if editing
                     selected_rule_ids = set()
@@ -2256,31 +2305,42 @@ class TradeSettingsTab:
                         logger.debug(f'Loaded selected rule IDs for ruleset {ruleset.id}: {selected_rule_ids}')
                         session.close()
                     
-                    with ui.column().classes('w-full').style('max-height: 400px; overflow-y: auto') as rules_container:
-                        for rule in available_rules:
-                            # Check if rule is currently associated with this ruleset
-                            is_selected = rule.id in selected_rule_ids
-                            
-                            with ui.card().classes('w-full p-4 mb-2'):
-                                with ui.row().classes('w-full items-center'):
-                                    # Checkbox for selection
-                                    rule_checkbox = ui.checkbox(
-                                        text='',
-                                        value=is_selected
-                                    )
-                                    
-                                    # Rule information
-                                    with ui.column().classes('flex-1'):
-                                        ui.label(f'{rule.name}').classes('font-medium')
-                                        ui.label(f'Continue Processing: {"Yes" if rule.continue_processing else "No"}').classes('text-sm text-grey-6')
-                                        if rule.triggers:
-                                            trigger_summary = ', '.join([f"{k}: {v.get('type', 'unknown')}" for k, v in rule.triggers.items()])
-                                            ui.label(f'Triggers: {trigger_summary}').classes('text-sm text-grey-6')
-                                        if rule.actions:
-                                            action_summary = ', '.join([f"{k}: {v.get('type', 'unknown')}" for k, v in rule.actions.items()])
-                                            ui.label(f'Actions: {action_summary}').classes('text-sm text-grey-6')
-                            
-                            self.selected_rules[rule.id] = rule_checkbox
+                    # Clear and recreate selected_rules dict
+                    self.selected_rules = {}
+                    
+                    with self.rules_selection_container:
+                        with ui.column().classes('w-full').style('max-height: 400px; overflow-y: auto') as rules_container:
+                            for rule in available_rules:
+                                # Check if rule is currently associated with this ruleset
+                                is_selected = rule.id in selected_rule_ids
+                                
+                                with ui.card().classes('w-full p-4 mb-2'):
+                                    with ui.row().classes('w-full items-center'):
+                                        # Checkbox for selection
+                                        rule_checkbox = ui.checkbox(
+                                            text='',
+                                            value=is_selected
+                                        )
+                                        
+                                        # Rule information
+                                        with ui.column().classes('flex-1'):
+                                            ui.label(f'{rule.name}').classes('font-medium')
+                                            ui.label(f'Subtype: {rule.subtype.value.replace("_", " ").title()}').classes('text-sm text-grey-6')
+                                            ui.label(f'Continue Processing: {"Yes" if rule.continue_processing else "No"}').classes('text-sm text-grey-6')
+                                            if rule.triggers:
+                                                trigger_summary = ', '.join([f"{k}: {v.get('event_type', v.get('type', 'unknown'))}" for k, v in rule.triggers.items()])
+                                                ui.label(f'Triggers: {trigger_summary}').classes('text-sm text-grey-6')
+                                            if rule.actions:
+                                                action_summary = ', '.join([f"{k}: {v.get('action_type', v.get('type', 'unknown'))}" for k, v in rule.actions.items()])
+                                                ui.label(f'Actions: {action_summary}').classes('text-sm text-grey-6')
+                                
+                                self.selected_rules[rule.id] = rule_checkbox
+                
+                # Initial load of rules
+                update_available_rules()
+                
+                # Update rules when subtype changes
+                self.ruleset_subtype_select.on('update:model-value', lambda: update_available_rules())
                 
                 # Save button
                 with ui.row().classes('w-full justify-end mt-4'):
@@ -2304,6 +2364,7 @@ class TradeSettingsTab:
                 # Update existing ruleset
                 ruleset.name = self.ruleset_name_input.value
                 ruleset.description = self.ruleset_description_input.value or None
+                ruleset.subtype = AnalysisUseCase(self.ruleset_subtype_select.value) if self.ruleset_subtype_select.value else None
                 
                 update_instance(ruleset)
                 
@@ -2328,7 +2389,8 @@ class TradeSettingsTab:
                 # Create new ruleset
                 new_ruleset = Ruleset(
                     name=self.ruleset_name_input.value,
-                    description=self.ruleset_description_input.value or None
+                    description=self.ruleset_description_input.value or None,
+                    subtype=AnalysisUseCase(self.ruleset_subtype_select.value) if self.ruleset_subtype_select.value else None
                 )
                 
                 ruleset_id = add_instance(new_ruleset)

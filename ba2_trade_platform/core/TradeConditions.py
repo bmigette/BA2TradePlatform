@@ -30,19 +30,19 @@ class TradeCondition(ABC):
     """
     
     def __init__(self, account: AccountInterface, instrument_name: str, 
-                 order_recommendation: OrderRecommendation, existing_order: Optional[TradingOrder] = None):
+                 expert_recommendation: ExpertRecommendation, existing_order: Optional[TradingOrder] = None):
         """
         Initialize the trade condition.
         
         Args:
             account: Account interface for accessing account data
             instrument_name: Name of the instrument being evaluated
-            order_recommendation: The recommendation being evaluated
+            expert_recommendation: The expert recommendation being evaluated
             existing_order: Optional existing order related to this evaluation
         """
         self.account = account
         self.instrument_name = instrument_name
-        self.order_recommendation = order_recommendation
+        self.expert_recommendation = expert_recommendation
         self.existing_order = existing_order
         
     @abstractmethod
@@ -149,7 +149,7 @@ class CompareCondition(TradeCondition):
     """
     
     def __init__(self, account: AccountInterface, instrument_name: str,
-                 order_recommendation: OrderRecommendation, operator_str: str, value: float,
+                 expert_recommendation: ExpertRecommendation, operator_str: str, value: float,
                  existing_order: Optional[TradingOrder] = None):
         """
         Initialize comparison condition.
@@ -157,12 +157,12 @@ class CompareCondition(TradeCondition):
         Args:
             account: Account interface
             instrument_name: Instrument name
-            order_recommendation: Order recommendation
+            expert_recommendation: Expert recommendation
             operator_str: Comparison operator ('>', '<', '>=', '<=', '==', '!=')
             value: Value to compare against
             existing_order: Optional existing order
         """
-        super().__init__(account, instrument_name, order_recommendation, existing_order)
+        super().__init__(account, instrument_name, expert_recommendation, existing_order)
         self.operator_str = operator_str
         self.value = value
         
@@ -189,14 +189,8 @@ class BearishCondition(FlagCondition):
     
     def evaluate(self) -> bool:
         try:
-            # Get recent recommendations to assess bearish sentiment
-            # For now, check if recent recommendations are predominantly SELL
-            recommendations = self.get_previous_recommendations(self.account.id, limit=5)
-            if not recommendations:
-                return False
-                
-            sell_count = sum(1 for rec in recommendations if rec.recommended_action == OrderRecommendation.SELL)
-            return sell_count >= len(recommendations) * 0.6  # 60% or more SELL recommendations
+            # Check if current recommendation is bearish (SELL)
+            return self.expert_recommendation.recommended_action == OrderRecommendation.SELL
             
         except Exception as e:
             logger.error(f"Error evaluating bearish condition: {e}", exc_info=True)
@@ -204,7 +198,7 @@ class BearishCondition(FlagCondition):
     
     def get_description(self) -> str:
         """Get description of bearish condition."""
-        return f"Check if market sentiment is bearish for {self.instrument_name} (60% or more recent recommendations are SELL)"
+        return f"Check if current recommendation is bearish (SELL) for {self.instrument_name}"
 
 
 class BullishCondition(FlagCondition):
@@ -212,13 +206,8 @@ class BullishCondition(FlagCondition):
     
     def evaluate(self) -> bool:
         try:
-            # Get recent recommendations to assess bullish sentiment
-            recommendations = self.get_previous_recommendations(self.account.id, limit=5)
-            if not recommendations:
-                return False
-                
-            buy_count = sum(1 for rec in recommendations if rec.recommended_action == OrderRecommendation.BUY)
-            return buy_count >= len(recommendations) * 0.6  # 60% or more BUY recommendations
+            # Check if current recommendation is bullish (BUY)
+            return self.expert_recommendation.recommended_action == OrderRecommendation.BUY
             
         except Exception as e:
             logger.error(f"Error evaluating bullish condition: {e}", exc_info=True)
@@ -226,7 +215,7 @@ class BullishCondition(FlagCondition):
     
     def get_description(self) -> str:
         """Get description of bullish condition."""
-        return f"Check if market sentiment is bullish for {self.instrument_name} (60% or more recent recommendations are BUY)"
+        return f"Check if current recommendation is bullish (BUY) for {self.instrument_name}"
 
 
 class HasNoPositionCondition(FlagCondition):
@@ -255,7 +244,7 @@ class RatingChangeCondition(FlagCondition):
     """Check if rating changed from one recommendation type to another."""
     
     def __init__(self, account: AccountInterface, instrument_name: str,
-                 order_recommendation: OrderRecommendation, from_rating: OrderRecommendation,
+                 expert_recommendation: ExpertRecommendation, from_rating: OrderRecommendation,
                  to_rating: OrderRecommendation, existing_order: Optional[TradingOrder] = None):
         """
         Initialize rating change condition.
@@ -263,12 +252,12 @@ class RatingChangeCondition(FlagCondition):
         Args:
             account: Account interface
             instrument_name: Instrument name
-            order_recommendation: Current order recommendation
+            expert_recommendation: Current expert recommendation
             from_rating: Expected previous rating
             to_rating: Expected current rating
             existing_order: Optional existing order
         """
-        super().__init__(account, instrument_name, order_recommendation, existing_order)
+        super().__init__(account, instrument_name, expert_recommendation, existing_order)
         self.from_rating = from_rating
         self.to_rating = to_rating
     
@@ -297,48 +286,48 @@ class RatingChangeCondition(FlagCondition):
 class RatingNegativeToNeutralCondition(RatingChangeCondition):
     """Check if rating changed from negative to neutral."""
     def __init__(self, account: AccountInterface, instrument_name: str,
-                 order_recommendation: OrderRecommendation, existing_order: Optional[TradingOrder] = None):
-        super().__init__(account, instrument_name, order_recommendation, 
+                 expert_recommendation: ExpertRecommendation, existing_order: Optional[TradingOrder] = None):
+        super().__init__(account, instrument_name, expert_recommendation, 
                         OrderRecommendation.SELL, OrderRecommendation.HOLD, existing_order)
 
 
 class RatingNegativeToPositiveCondition(RatingChangeCondition):
     """Check if rating changed from negative to positive."""
     def __init__(self, account: AccountInterface, instrument_name: str,
-                 order_recommendation: OrderRecommendation, existing_order: Optional[TradingOrder] = None):
-        super().__init__(account, instrument_name, order_recommendation, 
+                 expert_recommendation: ExpertRecommendation, existing_order: Optional[TradingOrder] = None):
+        super().__init__(account, instrument_name, expert_recommendation, 
                         OrderRecommendation.SELL, OrderRecommendation.BUY, existing_order)
 
 
 class RatingNeutralToNegativeCondition(RatingChangeCondition):
     """Check if rating changed from neutral to negative."""
     def __init__(self, account: AccountInterface, instrument_name: str,
-                 order_recommendation: OrderRecommendation, existing_order: Optional[TradingOrder] = None):
-        super().__init__(account, instrument_name, order_recommendation, 
+                 expert_recommendation: ExpertRecommendation, existing_order: Optional[TradingOrder] = None):
+        super().__init__(account, instrument_name, expert_recommendation, 
                         OrderRecommendation.HOLD, OrderRecommendation.SELL, existing_order)
 
 
 class RatingNeutralToPositiveCondition(RatingChangeCondition):
     """Check if rating changed from neutral to positive."""
     def __init__(self, account: AccountInterface, instrument_name: str,
-                 order_recommendation: OrderRecommendation, existing_order: Optional[TradingOrder] = None):
-        super().__init__(account, instrument_name, order_recommendation, 
+                 expert_recommendation: ExpertRecommendation, existing_order: Optional[TradingOrder] = None):
+        super().__init__(account, instrument_name, expert_recommendation, 
                         OrderRecommendation.HOLD, OrderRecommendation.BUY, existing_order)
 
 
 class RatingPositiveToNegativeCondition(RatingChangeCondition):
     """Check if rating changed from positive to negative."""
     def __init__(self, account: AccountInterface, instrument_name: str,
-                 order_recommendation: OrderRecommendation, existing_order: Optional[TradingOrder] = None):
-        super().__init__(account, instrument_name, order_recommendation, 
+                 expert_recommendation: ExpertRecommendation, existing_order: Optional[TradingOrder] = None):
+        super().__init__(account, instrument_name, expert_recommendation, 
                         OrderRecommendation.BUY, OrderRecommendation.SELL, existing_order)
 
 
 class RatingPositiveToNeutralCondition(RatingChangeCondition):
     """Check if rating changed from positive to neutral."""
     def __init__(self, account: AccountInterface, instrument_name: str,
-                 order_recommendation: OrderRecommendation, existing_order: Optional[TradingOrder] = None):
-        super().__init__(account, instrument_name, order_recommendation, 
+                 expert_recommendation: ExpertRecommendation, existing_order: Optional[TradingOrder] = None):
+        super().__init__(account, instrument_name, expert_recommendation, 
                         OrderRecommendation.BUY, OrderRecommendation.HOLD, existing_order)
 
 
@@ -349,12 +338,11 @@ class ExpectedProfitTargetPercentCondition(CompareCondition):
     
     def evaluate(self) -> bool:
         try:
-            recommendations = self.get_previous_recommendations(self.account.id, limit=1)
-            if not recommendations:
-                return False
-                
-            expected_profit = recommendations[0].expected_profit_percent
+            expected_profit = self.expert_recommendation.expected_profit_percent
+            
+            # If no expected profit data, we cannot evaluate
             if expected_profit is None:
+                logger.debug(f"No expected profit data available for {self.instrument_name}")
                 return False
                 
             return self.operator_func(expected_profit, self.value)
@@ -488,7 +476,7 @@ class TimeOpenedCondition(CompareCondition):
 
 # Factory function to create conditions based on event type
 def create_condition(event_type: ExpertEventType, account: AccountInterface, 
-                    instrument_name: str, order_recommendation: OrderRecommendation,
+                    instrument_name: str, expert_recommendation: ExpertRecommendation,
                     existing_order: Optional[TradingOrder] = None,
                     operator_str: Optional[str] = None, value: Optional[float] = None) -> TradeCondition:
     """
@@ -498,7 +486,7 @@ def create_condition(event_type: ExpertEventType, account: AccountInterface,
         event_type: Type of event/condition to create
         account: Account interface
         instrument_name: Instrument name
-        order_recommendation: Order recommendation
+        expert_recommendation: Expert recommendation with all needed data
         existing_order: Optional existing order
         operator_str: Operator for numeric conditions
         value: Value for numeric conditions
@@ -519,7 +507,7 @@ def create_condition(event_type: ExpertEventType, account: AccountInterface,
     # Handle rating change conditions
     if event_type in rating_changes:
         from_rating, to_rating = rating_changes[event_type]
-        return RatingChangeCondition(account, instrument_name, order_recommendation, 
+        return RatingChangeCondition(account, instrument_name, expert_recommendation, 
                                    from_rating, to_rating, existing_order)
     
     condition_map = {
@@ -540,13 +528,14 @@ def create_condition(event_type: ExpertEventType, account: AccountInterface,
     
     # Create flag conditions (no operator or value needed)
     if issubclass(condition_class, FlagCondition):
-        return condition_class(account, instrument_name, order_recommendation, existing_order)
+        return condition_class(account, instrument_name, expert_recommendation, existing_order)
     
     # Create comparison conditions (require operator and value)
     elif issubclass(condition_class, CompareCondition):
         if operator_str is None or value is None:
             raise ValueError(f"Operator and value required for numeric condition: {event_type}")
-        return condition_class(account, instrument_name, order_recommendation, operator_str, value, existing_order)
+        
+        return condition_class(account, instrument_name, expert_recommendation, operator_str, value, existing_order)
     
     else:
         raise ValueError(f"Unknown condition class type for: {event_type}")

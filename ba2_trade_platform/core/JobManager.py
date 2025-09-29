@@ -80,6 +80,10 @@ class JobManager:
         
         # Schedule all expert jobs
         self._schedule_all_expert_jobs()
+        
+        # Schedule account refresh job
+        self._schedule_account_refresh_job()
+        
         logger.info("JobManager started successfully")
         
     def stop(self):
@@ -357,6 +361,67 @@ class JobManager:
                 
         except Exception as e:
             logger.error(f"Error scheduling expert jobs: {e}", exc_info=True)
+    
+    def _schedule_account_refresh_job(self):
+        """Schedule the account refresh job based on the app setting."""
+        try:
+            # Get the account refresh interval from AppSettings (in minutes)
+            refresh_interval_str = get_setting("account_refresh_interval")
+            refresh_interval_minutes = 5  # Default to 5 minutes
+            
+            if refresh_interval_str:
+                try:
+                    refresh_interval_minutes = int(refresh_interval_str)
+                except ValueError:
+                    logger.warning(f"Invalid account_refresh_interval setting: {refresh_interval_str}, using default of 5 minutes")
+            else:
+                # Create the setting with default value if it doesn't exist
+                from .models import AppSetting
+                from .db import add_instance
+                setting = AppSetting(
+                    key="account_refresh_interval",
+                    value_str="5"
+                )
+                add_instance(setting)
+                logger.info("Created account_refresh_interval AppSetting with default value: 5 minutes")
+            
+            # Create interval trigger
+            trigger = IntervalTrigger(minutes=refresh_interval_minutes)
+            
+            # Schedule the job
+            job_id = "account_refresh_job"
+            job = self._scheduler.add_job(
+                func=self._execute_account_refresh,
+                trigger=trigger,
+                id=job_id,
+                name="Account Refresh Job",
+                replace_existing=True,
+                max_instances=1,  # Prevent job overlap
+                coalesce=True     # Coalesce multiple missed executions
+            )
+            
+            self._scheduled_jobs[job_id] = job
+            logger.info(f"Account refresh job scheduled to run every {refresh_interval_minutes} minutes")
+            
+        except Exception as e:
+            logger.error(f"Error scheduling account refresh job: {e}", exc_info=True)
+    
+    def _execute_account_refresh(self):
+        """Execute the account refresh job."""
+        try:
+            logger.info("Executing scheduled account refresh")
+            
+            # Import here to avoid circular imports
+            from .TradeManager import get_trade_manager
+            
+            # Get the trade manager and call refresh_accounts
+            trade_manager = get_trade_manager()
+            trade_manager.refresh_accounts()
+            
+            logger.info("Scheduled account refresh completed")
+            
+        except Exception as e:
+            logger.error(f"Error executing account refresh: {e}", exc_info=True)
             
     def _schedule_expert_jobs(self, expert_instance: ExpertInstance):
         """Schedule jobs for a specific expert instance."""
@@ -522,10 +587,10 @@ class JobManager:
         try:
             logger.info(f"Executing scheduled analysis: expert={expert_instance_id}, symbol={symbol}, subtype={subtype}")
             
-            # For OPEN_POSITIONS analysis, only proceed if there are actual open positions for this symbol
+            # For OPEN_POSITIONS analysis, only proceed if there are actual open transactions for this symbol
             if subtype == AnalysisUseCase.OPEN_POSITIONS:
-                if not self._has_open_positions_for_symbol(expert_instance_id, symbol):
-                    logger.debug(f"Skipping OPEN_POSITIONS analysis for expert {expert_instance_id}, symbol {symbol}: no open positions found")
+                if not self._has_open_transactions_for_symbol(expert_instance_id, symbol):
+                    logger.debug(f"Skipping OPEN_POSITIONS analysis for expert {expert_instance_id}, symbol {symbol}: no open transactions found")
                     return
             
             # Submit to worker queue with low priority (higher number = lower priority)
@@ -547,47 +612,30 @@ class JobManager:
         except Exception as e:
             logger.error(f"Error executing scheduled analysis for expert {expert_instance_id}, symbol {symbol}, subtype {subtype}: {e}", exc_info=True)
     
-    def _has_open_positions_for_symbol(self, expert_instance_id: int, symbol: str) -> bool:
-        """Check if there are open positions for a specific expert and symbol."""
+    def _has_open_transactions_for_symbol(self, expert_instance_id: int, symbol: str) -> bool:
+        """Check if there are open transactions for a specific expert and symbol."""
         try:
             from sqlmodel import select, Session
             from .db import get_db
-            from .models import TradingOrder, ExpertInstance
-            from .types import OrderStatus
-            
-            # Get the expert instance to find its account
-            expert_instance = get_instance(ExpertInstance, expert_instance_id)
-            if not expert_instance:
-                logger.warning(f"Expert instance {expert_instance_id} not found")
-                return False
-            
+            from .models import Transaction
+            from .types import TransactionStatus
+            logger.debug(f"Checking for open transactions for expert {expert_instance_id}, symbol {symbol}")
             with Session(get_db().bind) as session:
-                # Check for open orders that indicate positions for this symbol and account
-                statement = select(TradingOrder).where(
-                    TradingOrder.symbol == symbol,
-                    TradingOrder.comment.contains(f"expert_{expert_instance.expert}-{expert_instance_id}_"),
-                    TradingOrder.status.in_([OrderStatus.FULFILLED, OrderStatus.OPEN])
+                # Check for transactions in WAITING or OPENED state for this expert and symbol
+                statement = select(Transaction).where(
+                    Transaction.symbol == symbol,
+                    Transaction.expert_id == expert_instance_id,
+                    Transaction.status.in_([TransactionStatus.WAITING, TransactionStatus.OPENED])
                 )
-                orders = session.exec(statement).all()
+                transactions = session.exec(statement).all()
                 
-                # Calculate net position from fulfilled orders
-                net_position = 0
-                for order in orders:
-                    if order.status == OrderStatus.FULFILLED:
-                        if order.side == "buy":
-                            net_position += order.quantity
-                        elif order.side == "sell":
-                            net_position -= order.quantity
+                has_open_transactions = len(transactions) > 0
                 
-                # Consider there's an open position if net position is not zero or there are open orders
-                has_open_orders = any(order.status == OrderStatus.OPEN for order in orders)
-                has_position = net_position != 0 or has_open_orders
-                
-                logger.debug(f"Position check for expert {expert_instance_id}, symbol {symbol}: net_position={net_position}, has_open_orders={has_open_orders}, has_position={has_position}")
-                return has_position
+                logger.debug(f"Transaction check for expert {expert_instance_id}, symbol {symbol}: found {len(transactions)} open transactions")
+                return has_open_transactions
                 
         except Exception as e:
-            logger.error(f"Error checking open positions for expert {expert_instance_id}, symbol {symbol}: {e}", exc_info=True)
+            logger.error(f"Error checking open transactions for expert {expert_instance_id}, symbol {symbol}: {e}", exc_info=True)
             return False
             
     def _remove_scheduled_job(self, job_id: str):

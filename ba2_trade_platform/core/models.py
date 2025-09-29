@@ -2,7 +2,7 @@ from sqlmodel import  Field, Session, SQLModel, create_engine, Column, Relations
 from sqlalchemy import String, Float, JSON, UniqueConstraint, Table, Integer, ForeignKey
 from sqlalchemy.orm import relationship
 from typing import Optional, Dict, Any, List
-from .types import InstrumentType, MarketAnalysisStatus, OrderType, OrderRecommendation, OrderStatus, OrderDirection, OrderOpenType, ExpertEventRuleType, AnalysisUseCase, RiskLevel, TimeHorizon
+from .types import InstrumentType, MarketAnalysisStatus, OrderType, OrderRecommendation, OrderStatus, OrderDirection, OrderOpenType, ExpertEventRuleType, AnalysisUseCase, RiskLevel, TimeHorizon, TransactionStatus
 from datetime import datetime as DateTime, timezone
 
 # Association table for many-to-many relationship between Ruleset and EventAction
@@ -26,7 +26,7 @@ class ExpertInstance(SQLModel, table=True):
     expert: str     
     enabled: bool = Field(default=True)
     user_description: str | None = Field(default=None)
-    virtual_equity: float = Field(default=100.0)
+    virtual_equity_pct: float = Field(default=100.0)
 
 class ExpertSetting(SQLModel, table=True):
     __table_args__ = (UniqueConstraint('instance_id', 'key', name='uix_expertsetting_instanceid_key'),)
@@ -98,6 +98,12 @@ class ExpertRecommendation(SQLModel, table=True):
     
     # Relationship back to market analysis
     market_analysis: Optional["MarketAnalysis"] = Relationship(back_populates="expert_recommendations")
+    
+    # Relationship to transactions
+    transactions: List["Transaction"] = Relationship(back_populates="expert_recommendation")
+    
+    # Relationship to trade action results
+    trade_action_results: List["TradeActionResult"] = Relationship(back_populates="expert_recommendation")
 
 
 class MarketAnalysis(SQLModel, table=True):
@@ -128,6 +134,42 @@ class AnalysisOutput(SQLModel, table=True):
 
 
 
+class Transaction(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    symbol: str
+    quantity: float
+    open_price: float | None = Field(default=None)
+    close_price: float | None = Field(default=None)
+    stop_loss: float | None = Field(default=None)
+    take_profit: float | None = Field(default=None)
+    open_date: DateTime | None = Field(default=None)
+    close_date: DateTime | None = Field(default=None)
+    status: TransactionStatus = Field(default=TransactionStatus.WAITING)
+    created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc))
+    
+    # Optional reference to expert instance for tracking which expert initiated this transaction
+    expert_id: int | None = Field(foreign_key="expertinstance.id", nullable=True, ondelete="SET NULL")
+    
+    # Relationship to expert recommendation
+    expert_recommendation_id: int | None = Field(foreign_key="expertrecommendation.id", nullable=True, ondelete="SET NULL")
+    expert_recommendation: Optional["ExpertRecommendation"] = Relationship(back_populates="transactions")
+    
+    # Relationship to trading orders (1:many - one transaction can have multiple orders)
+    trading_orders: List["TradingOrder"] = Relationship(back_populates="transaction")
+    
+    # Relationship to trade action results (1:many - one transaction can have multiple action results)
+    trade_action_results: List["TradeActionResult"] = Relationship(back_populates="transaction")
+
+    def as_string(self) -> str:
+        return f"Transaction(id={self.id}, symbol={self.symbol}, quantity={self.quantity}, status={self.status}, open_price={self.open_price}, close_price={self.close_price})"
+    
+    def __repr__(self) -> str:
+        return self.as_string()
+    
+    def __str__(self) -> str:
+        return self.as_string()
+
+
 class TradingOrder(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     order_id: str | None
@@ -142,14 +184,14 @@ class TradingOrder(SQLModel, table=True):
     created_at: DateTime | None = Field(default_factory=lambda: DateTime.now(timezone.utc))
     
     # New fields
-    order_recommendation_id: int | None = Field(foreign_key="expertrecommendation.id", nullable=True, ondelete="SET NULL")
     open_type: OrderOpenType = Field(default=OrderOpenType.MANUAL)
+    broker_order_id: str | None = Field(default=None, description="Broker-specific order ID for tracking")
+    order_recommendation_id: int | None = Field(default=None, foreign_key="expertrecommendation.id", description="Expert recommendation that generated this order")
+    limit_price: float | None = Field(default=None, description="Limit price for limit orders")
     
-    # Self-referential relationship for parent-child orders
-    parent_order_id: int | None = Field(foreign_key="tradingorder.id", nullable=True, ondelete="CASCADE")
-    
-    # Relationships
-    order_recommendation: Optional["ExpertRecommendation"] = Relationship()
+    # Many:1 relationship with Transaction (many orders can belong to one transaction)
+    transaction_id: int | None = Field(foreign_key="transaction.id", nullable=True, ondelete="CASCADE")
+    transaction: Optional["Transaction"] = Relationship(back_populates="trading_orders")
 
     def as_string(self) -> str:
         return f"Order(id={self.id}, symbol={self.symbol}, quantity={self.quantity}, side={self.side}, type={self.order_type}, status={self.status})"
@@ -218,3 +260,27 @@ class Position(SQLModel, table=True):
     unrealized_intraday_plpc: float
     unrealized_pl: float
     unrealized_plpc: float
+
+
+class TradeActionResult(SQLModel, table=True):
+    """Model to store the results of TradeAction executions."""
+    __tablename__ = "trade_action_result"
+    
+    id: int | None = Field(default=None, primary_key=True)
+    
+    # Action details
+    action_type: str = Field(description="Type of action executed (buy, sell, close, etc.)")
+    success: bool = Field(description="Whether the action was successful")
+    message: str = Field(description="Human-readable message about the action result")
+    data: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict, description="Additional data from the action")
+    
+    # Timestamps
+    created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), description="When the action was executed")
+    
+    # Foreign key relationships
+    transaction_id: int | None = Field(default=None, foreign_key="transaction.id")
+    expert_recommendation_id: int | None = Field(default=None, foreign_key="expertrecommendation.id")
+    
+    # Relationships
+    transaction: Optional["Transaction"] = Relationship(back_populates="trade_action_results")
+    expert_recommendation: Optional["ExpertRecommendation"] = Relationship(back_populates="trade_action_results")

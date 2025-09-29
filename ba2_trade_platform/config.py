@@ -13,11 +13,20 @@ OPENAI_API_KEY=None
 
 DB_FILE = os.path.join(os.path.expanduser("~"), "Documents", "ba2_trade_platform", "db.sqlite")
 
+# Default account refresh interval in minutes
+account_refresh_interval = 60  # Default to 60 minutes
+
 def load_config_from_env() -> None:
-    global FINNHUB_API_KEY, OPENAI_API_KEY, FILE_LOGGING
+    global FINNHUB_API_KEY, OPENAI_API_KEY, FILE_LOGGING, account_refresh_interval
     """Loads configuration from environment variables."""
 
     env_file = os.path.join(HOME_PARENT, '.env')
     load_dotenv(env_file)
     FINNHUB_API_KEY = os.getenv('FINNHUB_API_KEY', FINNHUB_API_KEY)
-    OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', OPENAI_API_KEY)    
+    OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', OPENAI_API_KEY)
+    
+    # Load account refresh interval from environment, default to 60 minutes
+    try:
+        account_refresh_interval = int(os.getenv('ACCOUNT_REFRESH_INTERVAL', account_refresh_interval))
+    except ValueError:
+        account_refresh_interval = 60    
