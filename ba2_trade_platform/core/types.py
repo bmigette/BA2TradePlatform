@@ -10,6 +10,7 @@ class OrderStatus(str, Enum):
     UNKNOWN = "unknown"
     CANCELED = "canceled"
     PENDING = "pending"
+    WAITING_TRIGGER = "waiting_trigger"
 
 
 class InstrumentType(str, Enum):

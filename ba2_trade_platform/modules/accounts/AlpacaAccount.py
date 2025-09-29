@@ -55,15 +55,8 @@ class AlpacaAccount(AccountInterface):
     def alpaca_order_to_tradingorder(self, order):
         """
         Convert an Alpaca order object to a TradingOrder object.
-        
-        Args:
-            order: An Alpaca order object containing order details.
-            
-        Returns:
-            TradingOrder: A TradingOrder object containing the order information.
         """
         return TradingOrder(
-            order_id=getattr(order, "id", None),
             broker_order_id=str(getattr(order, "id", None)) if getattr(order, "id", None) else None,  # Set Alpaca order ID as broker_order_id
             symbol=getattr(order, "symbol", None),
             quantity=getattr(order, "qty", None),
@@ -132,17 +125,23 @@ class AlpacaAccount(AccountInterface):
             logger.error(f"Error listing Alpaca orders: {e}", exc_info=True)
             return []
 
-    def submit_order(self, trading_order) -> TradingOrder:
+    def submit_order(self, trading_order, depends_on_order_id: Optional[int] = None, depends_on_status: Optional[str] = None) -> TradingOrder:
         """
         Submit a new order to Alpaca.
         
         Args:
             trading_order: A TradingOrder object containing all order details
+            depends_on_order_id (Optional[int]): ID of the order this order depends on (for conditional orders)
+            depends_on_status (Optional[str]): Status that the depends_on_order must reach to trigger this order
             
         Returns:
             TradingOrder: The created order if successful, None if an error occurs.
         """
         try:
+            # Log dependency information if provided
+            if depends_on_order_id is not None:
+                logger.info(f"Submitting order with dependency: depends on order {depends_on_order_id} reaching status {depends_on_status}")
+            
             # Convert string values to enums
             side = OrderSide.BUY if trading_order.side.upper() == 'BUY' else OrderSide.SELL
             time_in_force = TimeInForce.DAY if trading_order.good_for == 'day' else TimeInForce.GTC
@@ -183,7 +182,7 @@ class AlpacaAccount(AccountInterface):
             
             # Convert to TradingOrder and set the broker_order_id
             result_order = self.alpaca_order_to_tradingorder(order)
-            result_order.broker_order_id = str(order.id)  # Set the Alpaca order ID
+            # result_order.broker_order_id = str(order.id)  # Set the Alpaca order ID, done in the alcapa to order function
             
             return result_order
         except Exception as e:
@@ -369,29 +368,23 @@ class AlpacaAccount(AccountInterface):
             # Update database records with current Alpaca order states
             with Session(get_db().bind) as session:
                 for alpaca_order in alpaca_orders:
-                    if not alpaca_order.order_id:
+                    if not alpaca_order.broker_order_id:
                         continue
-                        
                     # Find corresponding database record
-                    # Convert UUID to string for SQLite compatibility
-                    order_id_str = str(alpaca_order.order_id)
                     statement = select(TradingOrderModel).where(
-                        TradingOrderModel.broker_order_id == order_id_str
+                        TradingOrderModel.broker_order_id == alpaca_order.broker_order_id
                     )
                     db_order = session.exec(statement).first()
-                    
                     if db_order:
                         # Update database order with current Alpaca state
                         db_order.status = alpaca_order.status
                         db_order.filled_qty = alpaca_order.filled_qty
-                        
                         # Update broker_order_id if it wasn't set before
                         if not db_order.broker_order_id:
-                            db_order.broker_order_id = str(alpaca_order.order_id)
-                        
+                            db_order.broker_order_id = alpaca_order.broker_order_id
                         session.add(db_order)
                         updated_count += 1
-                        logger.debug(f"Updated database order {db_order.id} with Alpaca order {alpaca_order.order_id}")
+                        logger.debug(f"Updated database order {db_order.id} with Alpaca order {alpaca_order.broker_order_id}")
                 
                 session.commit()
             

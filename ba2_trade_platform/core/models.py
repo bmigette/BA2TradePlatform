@@ -172,10 +172,10 @@ class Transaction(SQLModel, table=True):
 
 class TradingOrder(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    order_id: str | None
+    # REMOVED order_id: str | None
     symbol: str
     quantity: float
-    side: str 
+    side: OrderDirection 
     order_type: OrderType
     good_for: str | None
     status: OrderStatus = OrderStatus.UNKNOWN
@@ -189,9 +189,22 @@ class TradingOrder(SQLModel, table=True):
     order_recommendation_id: int | None = Field(default=None, foreign_key="expertrecommendation.id", description="Expert recommendation that generated this order")
     limit_price: float | None = Field(default=None, description="Limit price for limit orders")
     
+    # Dependency fields for order chaining
+    depends_on_order: int | None = Field(default=None, foreign_key="tradingorder.id", description="ID of another order this order depends on")
+    depends_order_status_trigger: OrderStatus | None = Field(default=None, description="Status that the depends_on_order must reach to trigger this order")
+    
     # Many:1 relationship with Transaction (many orders can belong to one transaction)
     transaction_id: int | None = Field(foreign_key="transaction.id", nullable=True, ondelete="CASCADE")
     transaction: Optional["Transaction"] = Relationship(back_populates="trading_orders")
+    
+    # Self-referencing relationship for order dependencies
+    dependent_orders: List["TradingOrder"] = Relationship(
+        back_populates="depends_on_order_rel",
+        sa_relationship_kwargs={"remote_side": "TradingOrder.id"}
+    )
+    depends_on_order_rel: Optional["TradingOrder"] = Relationship(
+        back_populates="dependent_orders"
+    )
 
     def as_string(self) -> str:
         return f"Order(id={self.id}, symbol={self.symbol}, quantity={self.quantity}, side={self.side}, type={self.order_type}, status={self.status})"

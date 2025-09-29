@@ -15,6 +15,7 @@ from .db import get_instance, get_all_instances, add_instance, update_instance
 
 
 class TradeManager:
+
     """
     Manages the execution of trade recommendations from market experts.
     
@@ -30,6 +31,26 @@ class TradeManager:
         """Initialize the trade manager."""
         self.logger = logger.getChild("TradeManager")
     
+    def trigger_and_place_order(self, account, order: TradingOrder, parent_status: OrderStatus, trigger_status: OrderStatus):
+        """
+        Place the order using the account's submit_order if the parent_status matches the trigger_status.
+        If successful, set the order status to OPEN and update in the database.
+        """
+        from .db import update_instance
+        if parent_status == trigger_status:
+            submitted_order = account.submit_order(order)
+            if submitted_order:
+                order.status = OrderStatus.OPEN
+                update_instance(order)
+                self.logger.info(f"Order {order.id} placed and status set to OPEN.")
+                return order
+            else:
+                self.logger.error(f"Order {order.id} failed to place.")
+                return None
+        else:
+            self.logger.info(f"Order {order.id} not triggered. Parent status: {parent_status}, trigger: {trigger_status}")
+            return None
+        
     def refresh_accounts(self):
         """
         Refresh account information for all registered accounts.
@@ -40,12 +61,26 @@ class TradeManager:
         try:
             from .models import AccountDefinition
             from ..modules.accounts import get_account_class
+            from sqlmodel import select
+            from .db import get_db
             
             # Get all account definitions
             account_definitions = get_all_instances(AccountDefinition)
             
             self.logger.info(f"Starting account refresh for {len(account_definitions)} accounts")
             
+            # Step 1: Capture order statuses before refresh
+            pre_refresh_order_statuses = {}
+            with get_db() as session:
+                statement = select(TradingOrder)
+                orders = session.exec(statement).all()
+                for order in orders:
+                    pre_refresh_order_statuses[order.id] = order.status
+                session.close()
+            
+            self.logger.debug(f"Captured {len(pre_refresh_order_statuses)} order statuses before refresh")
+            
+            # Step 2: Perform account refresh
             for account_def in account_definitions:
                 try:
                     # Get the account class for this provider
@@ -70,10 +105,102 @@ class TradeManager:
                     self.logger.error(f"Error refreshing account {account_def.name} (ID: {account_def.id}): {e}", exc_info=True)
                     continue
             
+            # Step 3: Check for order status changes and trigger dependent orders
+            self._check_order_status_changes_and_trigger_dependents(pre_refresh_order_statuses)
+            
             self.logger.info("Account refresh completed")
             
         except Exception as e:
             self.logger.error(f"Error during account refresh: {e}", exc_info=True)
+    
+    def _check_order_status_changes_and_trigger_dependents(self, pre_refresh_statuses: Dict[int, OrderStatus]):
+        """
+        Check for order status changes and trigger dependent orders that are in WAITING_TRIGGER state.
+        
+        Args:
+            pre_refresh_statuses: Dictionary mapping order IDs to their status before refresh
+        """
+        try:
+            from sqlmodel import select
+            from .db import get_db
+            
+            with get_db() as session:
+                # Get all orders that have dependencies (depends_on_order is not None)
+                statement = select(TradingOrder).where(TradingOrder.depends_on_order.isnot(None))
+                dependent_orders = session.exec(statement).all()
+                
+                triggered_orders = []
+                
+                for dependent_order in dependent_orders:
+                    if dependent_order.status != OrderStatus.WAITING_TRIGGER:
+                        continue  # Only process orders waiting for triggers
+                        
+                    parent_order_id = dependent_order.depends_on_order
+                    trigger_status = dependent_order.depends_order_status_trigger
+                    
+                    if not trigger_status:
+                        continue  # No trigger status defined
+                        
+                    # Check if parent order status changed to the trigger status
+                    pre_status = pre_refresh_statuses.get(parent_order_id)
+                    
+                    # Get current parent order status
+                    parent_order = session.get(TradingOrder, parent_order_id)
+                    if not parent_order:
+                        continue
+                        
+                    current_status = parent_order.status
+                    
+                    # Check if status changed to the trigger status
+                    if pre_status != trigger_status and current_status == trigger_status:
+                        self.logger.info(f"Order {parent_order_id} status changed to {trigger_status}, triggering dependent order {dependent_order.id}")
+                        
+                        # Get the account for this dependent order's expert
+                        from ..modules.accounts import get_account_class
+                        from .models import AccountDefinition, ExpertInstance
+                        
+                        # Find the expert instance for this dependent order
+                        dependent_expert = session.get(ExpertInstance, dependent_order.expert_instance_id)
+                        if not dependent_expert:
+                            self.logger.error(f"Expert instance {dependent_order.expert_instance_id} not found for dependent order {dependent_order.id}")
+                            continue
+                            
+                        account_def = session.get(AccountDefinition, dependent_expert.account_id)
+                        if not account_def:
+                            self.logger.error(f"Account definition {dependent_expert.account_id} not found for dependent order {dependent_order.id}")
+                            continue
+                            
+                        account_class = get_account_class(account_def.provider)
+                        if not account_class:
+                            self.logger.error(f"Account provider {account_def.provider} not found for dependent order {dependent_order.id}")
+                            continue
+                            
+                        account = account_class(account_def.id)
+                        
+                        # Submit the dependent order with dependency information
+                        submitted_order = account.submit_order_with_db_update(
+                            dependent_order, 
+                            depends_on_order_id=parent_order_id, 
+                            depends_on_status=trigger_status
+                        )
+                        
+                        if submitted_order:
+                            self.logger.info(f"Successfully submitted dependent order {dependent_order.id} triggered by parent order {parent_order_id}")
+                            triggered_orders.append(dependent_order.id)
+                        else:
+                            self.logger.error(f"Failed to submit dependent order {dependent_order.id}")
+                            # Keep the order in WAITING_TRIGGER status so it can be retried
+                        
+                if triggered_orders:
+                    session.commit()
+                    self.logger.info(f"Triggered {len(triggered_orders)} dependent orders: {triggered_orders}")
+                else:
+                    self.logger.debug("No dependent orders were triggered")
+                    
+                session.close()
+                
+        except Exception as e:
+            self.logger.error(f"Error checking order status changes: {e}", exc_info=True)
     
     def process_recommendation(self, recommendation: ExpertRecommendation) -> Optional[TradingOrder]:
         """
@@ -348,10 +475,10 @@ class TradeManager:
             submitted_order = account.submit_order(order)
             if submitted_order:
                 # Save the order to database
-                order_id = add_instance(submitted_order)
-                if order_id:
-                    submitted_order.id = order_id
-                    self.logger.info(f"Order {order_id} successfully placed for {order.symbol}")
+                db_id = add_instance(submitted_order)
+                if db_id:
+                    submitted_order.id = db_id
+                    self.logger.info(f"Order {db_id} successfully placed for {order.symbol}")
                     return submitted_order
                     
         except Exception as e:

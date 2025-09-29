@@ -16,6 +16,7 @@ from nicegui.events import UploadEventArguments
 from ...modules.experts import experts
 from ..components.InstrumentSelector import InstrumentSelector
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from ...core.rules_export_import import RulesExportImportUI
 
 # --- InstrumentSettingsTab ---
 class InstrumentSettingsTab:
@@ -1782,6 +1783,7 @@ class TradeSettingsTab:
         self.rulesets_table = None
         self.triggers = {}
         self.actions = {}
+        self.rules_export_import_ui = RulesExportImportUI()
         self.render()
     
     def render(self):
@@ -1800,6 +1802,10 @@ class TradeSettingsTab:
                 with ui.tab_panel('Rules'):
                     ui.label('Trading Rules (EventAction)').classes('text-h6 mb-2')
                     ui.label('Rules define triggers and actions for automated trading decisions.').classes('text-grey-7 mb-4')
+                    
+                    with ui.row().classes('w-full justify-end gap-2 mb-4'):
+                        ui.button('Import Rules', on_click=self.rules_export_import_ui.show_import_dialog, icon='upload_file').props('flat')
+                        ui.button('Export Rules', on_click=self.rules_export_import_ui.show_export_rules_dialog, icon='download').props('flat')
                     
                     ui.button('Add Rule', on_click=lambda: self.show_rule_dialog(), icon='add').classes('mb-4')
                     
@@ -1837,6 +1843,10 @@ class TradeSettingsTab:
                 with ui.tab_panel('Rulesets'):
                     ui.label('Trading Rulesets').classes('text-h6 mb-2')
                     ui.label('Rulesets are collections of rules that work together for specific trading strategies.').classes('text-grey-7 mb-4')
+                    
+                    with ui.row().classes('w-full justify-end gap-2 mb-4'):
+                        ui.button('Import Rulesets', on_click=self.rules_export_import_ui.show_import_dialog, icon='upload_file').props('flat')
+                        ui.button('Export Rulesets', on_click=self.rules_export_import_ui.show_export_rulesets_dialog, icon='download').props('flat')
                     
                     ui.button('Add Ruleset', on_click=lambda: self.show_ruleset_dialog(), icon='add').classes('mb-4')
                     
