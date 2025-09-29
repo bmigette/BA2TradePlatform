@@ -328,8 +328,11 @@ class RulesetTestTab:
                 existing_order=existing_order
             )
             
+            # Get detailed evaluation results
+            evaluation_details = evaluator.get_evaluation_details()
+            
             # Display results
-            self._display_results(recommendation, results, existing_order)
+            self._display_results(recommendation, results, existing_order, evaluation_details)
             
             ui.notify(f"Test completed! Found {len(results)} action(s)", type='positive')
             
@@ -353,8 +356,8 @@ class RulesetTestTab:
             logger.error(f"Error getting existing order: {e}", exc_info=True)
             return None
     
-    def _display_results(self, recommendation: ExpertRecommendation, results: List[Dict[str, Any]], existing_order: Optional[TradingOrder]):
-        """Display the test results."""
+    def _display_results(self, recommendation: ExpertRecommendation, results: List[Dict[str, Any]], existing_order: Optional[TradingOrder], evaluation_details: Dict[str, Any]):
+        """Display the test results including detailed condition evaluation."""
         try:
             self.results_container.clear()
             
@@ -379,6 +382,101 @@ class RulesetTestTab:
                             error_results = sum(1 for r in results if 'error' in r)
                             ui.label(f'Errors: {error_results}').classes('text-sm')
                             ui.label(f'Existing Order: {"Yes" if existing_order else "No"}').classes('text-sm')
+                        
+                        with ui.column():
+                            ui.label('Condition Analysis:').classes('text-sm font-medium mb-2')
+                            summary = evaluation_details.get('summary', {})
+                            ui.label(f'Total Rules: {summary.get("total_rules", 0)}').classes('text-sm')
+                            ui.label(f'Rules Executed: {summary.get("executed_rules", 0)}').classes('text-sm')
+                            ui.label(f'Total Conditions: {summary.get("total_conditions", 0)}').classes('text-sm')
+                            ui.label(f'Conditions Passed: {summary.get("passed_conditions", 0)}').classes('text-sm')
+                            ui.label(f'Conditions Failed: {summary.get("failed_conditions", 0)}').classes('text-sm')
+                
+                # Rule and Condition Evaluation Details
+                ui.separator().classes('my-4')
+                ui.label('📋 Rule and Condition Evaluation Details').classes('text-h6 mb-3')
+                
+                rule_evaluations = evaluation_details.get('rule_evaluations', [])
+                
+                if rule_evaluations:
+                    for rule_eval in rule_evaluations:
+                        rule_name = rule_eval.get('rule_name', 'Unknown Rule')
+                        all_conditions_met = rule_eval.get('all_conditions_met', False)
+                        executed = rule_eval.get('executed', False)
+                        conditions = rule_eval.get('conditions', [])
+                        rule_error = rule_eval.get('error')
+                        
+                        # Color coding based on rule status
+                        if rule_error:
+                            card_color = 'bg-red-100 border-red-300'
+                            status_color = 'bg-red-500'
+                            status_text = 'ERROR'
+                        elif executed:
+                            card_color = 'bg-green-100 border-green-300'
+                            status_color = 'bg-green-500'
+                            status_text = 'EXECUTED'
+                        elif all_conditions_met:
+                            card_color = 'bg-blue-100 border-blue-300'
+                            status_color = 'bg-blue-500'
+                            status_text = 'CONDITIONS MET'
+                        else:
+                            card_color = 'bg-orange-100 border-orange-300'
+                            status_color = 'bg-orange-500'
+                            status_text = 'CONDITIONS NOT MET'
+                        
+                        with ui.card().classes(f'w-full mb-3 border {card_color}'):
+                            with ui.row().classes('w-full items-center justify-between p-2'):
+                                with ui.column().classes('flex-1'):
+                                    ui.label(f'Rule: {rule_name}').classes('font-medium')
+                                    if rule_error:
+                                        ui.label(f'Error: {rule_error}').classes('text-sm text-red-600')
+                                    else:
+                                        ui.label(f'Conditions: {len(conditions)} total').classes('text-sm text-grey-7')
+                                
+                                ui.badge(status_text).classes(f'{status_color} text-white px-2 py-1')
+                            
+                            # Show individual conditions
+                            if conditions:
+                                with ui.expansion('Condition Details', icon='list').classes('w-full'):
+                                    for condition in conditions:
+                                        trigger_key = condition.get('trigger_key', 'Unknown')
+                                        event_type = condition.get('event_type', 'Unknown')
+                                        operator = condition.get('operator', '')
+                                        value = condition.get('value', '')
+                                        result = condition.get('condition_result', False)
+                                        description = condition.get('condition_description', 'No description')
+                                        cond_error = condition.get('error')
+                                        
+                                        # Condition status styling
+                                        if cond_error:
+                                            cond_class = 'text-red-600'
+                                            result_icon = '❌'
+                                            result_text = 'ERROR'
+                                        elif result:
+                                            cond_class = 'text-green-600'
+                                            result_icon = '✅'
+                                            result_text = 'PASSED'
+                                        else:
+                                            cond_class = 'text-orange-600'
+                                            result_icon = '❌'
+                                            result_text = 'FAILED'
+                                        
+                                        with ui.row().classes('w-full items-center p-2 border-b border-grey-200'):
+                                            ui.label(result_icon).classes('text-lg mr-2')
+                                            with ui.column().classes('flex-1'):
+                                                condition_label = f'{trigger_key}: {event_type}'
+                                                if operator and value is not None:
+                                                    condition_label += f' {operator} {value}'
+                                                ui.label(condition_label).classes(f'font-medium {cond_class}')
+                                                ui.label(description).classes('text-sm text-grey-6')
+                                                if cond_error:
+                                                    ui.label(f'Error: {cond_error}').classes('text-sm text-red-500')
+                                            ui.badge(result_text).classes(f'text-white px-2 py-1 {"bg-green-500" if result else "bg-red-500" if cond_error else "bg-orange-500"}')
+                else:
+                    with ui.card().classes('w-full p-4 text-center bg-grey-50 border border-grey-200'):
+                        ui.label('No rule evaluation data available').classes('text-grey-600')
+                
+                ui.separator().classes('my-4')
                 
                 # Individual action definitions
                 if results:
@@ -428,34 +526,18 @@ class RulesetTestTab:
                         ui.icon('info', size='2em').classes('text-yellow-600 mb-2')
                         ui.label('No actions were triggered by this ruleset').classes('text-lg font-medium text-yellow-800')
                         ui.label('This could mean the conditions were not met or the ruleset has no applicable rules for this scenario').classes('text-sm text-yellow-700')
-                
-                # Save results button
-                with ui.row().classes('w-full justify-end mt-4'):
-                    ui.button(
-                        'Save Results',
-                        on_click=lambda: self._save_results(recommendation, results),
-                        icon='save'
-                    ).classes('bg-secondary text-white')
+                        
+                        # Show summary even when no actions triggered
+                        summary = evaluation_details.get('summary', {})
+                        if summary.get('total_rules', 0) > 0:
+                            total_rules = summary.get('total_rules', 0)
+                            total_conditions = summary.get('total_conditions', 0)
+                            ui.label(f'Rules evaluated: {total_rules}, Conditions checked: {total_conditions}').classes('text-sm text-yellow-600 mt-2')
             
         except Exception as e:
             logger.error(f"Error displaying results: {e}", exc_info=True)
             with self.results_container:
                 ui.label(f'Error displaying results: {str(e)}').classes('text-red-500')
-    
-    def _save_results(self, recommendation: ExpertRecommendation, results: List[Dict[str, Any]]):
-        """Save test results (placeholder for future implementation)."""
-        try:
-            # For now, just show a notification
-            # In the future, this could save to a test results table
-            ui.notify("Results saved successfully! (Feature coming soon)", type='positive')
-            
-            # Log the results for debugging
-            logger.info(f"Test results for {recommendation.symbol}: {len(results)} actions")
-            for result in results:
-                logger.info(f"  - {result.get('action_type')}: {result['success']} - {result['message']}")
-        except Exception as e:
-            logger.error(f"Error saving results: {e}", exc_info=True)
-            ui.notify(f"Error saving results: {str(e)}", type='negative')
 
 
 def content(ruleset_id: Optional[int] = None):
