@@ -309,7 +309,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             with Session(get_db().bind) as session:
                 statement = select(Transaction).where(
                     Transaction.expert_id == self.id,
-                    Transaction.status.in_([TransactionStatus.WAITING, TransactionStatus.OPEN])
+                    Transaction.status.in_([TransactionStatus.WAITING, TransactionStatus.OPENED])
                 )
                 transactions = session.exec(statement).all()
             
