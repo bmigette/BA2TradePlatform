@@ -36,6 +36,7 @@ class AnalysisTask:
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
     market_analysis_id: Optional[int] = None  # Reference to MarketAnalysis record
+    bypass_balance_check: bool = False  # If True, skip balance verification for this task
     
     def __post_init__(self):
         if self.created_at is None:
@@ -132,7 +133,10 @@ class WorkerQueue:
         self._worker_count = 0
         logger.info("WorkerQueue stopped")
         
-    def submit_analysis_task(self, expert_instance_id: int, symbol: str, subtype: str = AnalysisUseCase.ENTER_MARKET, priority: int = 0, task_id: Optional[str] = None) -> str:
+    def submit_analysis_task(self, expert_instance_id: int, symbol: str, 
+                           subtype: str = AnalysisUseCase.ENTER_MARKET, 
+                           priority: int = 0, task_id: Optional[str] = None,
+                           bypass_balance_check: bool = False) -> str:
         """
         Submit an analysis task to be processed by the worker queue.
         
@@ -173,7 +177,8 @@ class WorkerQueue:
                 expert_instance_id=expert_instance_id,
                 symbol=symbol,
                 subtype=subtype,
-                priority=priority
+                priority=priority,
+                bypass_balance_check=bypass_balance_check
             )
             
             self._tasks[task_id] = task
@@ -396,9 +401,9 @@ class WorkerQueue:
             if not expert:
                 raise ValueError(f"Expert instance {task.expert_instance_id} not found or invalid expert type")
             
-            # Check available balance for ENTER_MARKET analysis before proceeding
+            # Check available balance for ENTER_MARKET analysis before proceeding (unless bypassed)
             from .types import AnalysisUseCase
-            if task.subtype == AnalysisUseCase.ENTER_MARKET.value:
+            if task.subtype == AnalysisUseCase.ENTER_MARKET.value and not task.bypass_balance_check:
                 if not expert.has_sufficient_balance_for_entry():
                     # Skip analysis due to insufficient balance
                     logger.info(f"Skipping ENTER_MARKET analysis for expert {task.expert_instance_id}, symbol {task.symbol}: "

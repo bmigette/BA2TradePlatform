@@ -587,7 +587,8 @@ class ManualAnalysisTab:
                     success = job_manager.submit_market_analysis(
                         int(self.expert_instance_id), 
                         symbol, 
-                        subtype=subtype
+                        subtype=subtype,
+                        bypass_balance_check=True  # Manual analysis bypasses balance check
                     )
                     
                     if success:
@@ -798,7 +799,12 @@ class ScheduledJobsTab:
             from ...core.JobManager import get_job_manager
             job_manager = get_job_manager()
             
-            success = job_manager.submit_market_analysis(expert_instance_id, symbol, subtype=subtype)
+            success = job_manager.submit_market_analysis(
+                expert_instance_id, 
+                symbol, 
+                subtype=subtype,
+                bypass_balance_check=True  # Manual analysis bypasses balance check
+            )
             
             if success:
                 ui.notify(f"Analysis started for {symbol} ({subtype}) using expert instance {expert_instance_id}", type='positive')

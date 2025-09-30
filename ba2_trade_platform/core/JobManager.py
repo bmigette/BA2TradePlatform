@@ -197,7 +197,7 @@ class JobManager:
         self._scheduler.shutdown()
         logger.info("JobManager shutdown complete")
         
-    def submit_market_analysis(self, expert_instance_id: int, symbol: str, subtype: str = AnalysisUseCase.ENTER_MARKET, priority: int = 0) -> str:
+    def submit_market_analysis(self, expert_instance_id: int, symbol: str, subtype: str = AnalysisUseCase.ENTER_MARKET, priority: int = 0, bypass_balance_check: bool = False) -> str:
         """
         Submit a manual analysis job to the worker queue.
         
@@ -206,6 +206,7 @@ class JobManager:
             symbol: The symbol to analyze
             subtype: Analysis use case (AnalysisUseCase.ENTER_MARKET or AnalysisUseCase.OPEN_POSITIONS)
             priority: Task priority (lower = higher priority)
+            bypass_balance_check: If True, skip balance verification (used for manual analysis)
             
         Returns:
             Task ID for tracking
@@ -248,10 +249,11 @@ class JobManager:
             expert_instance_id=expert_instance_id,
             symbol=symbol,
             subtype=subtype,
-            priority=priority
+            priority=priority,
+            bypass_balance_check=bypass_balance_check
         )
         
-        logger.info(f"Manual analysis job submitted: expert={expert_instance_id}, symbol={symbol}, subtype={subtype}, task_id={task_id}")
+        logger.info(f"Manual analysis job submitted: expert={expert_instance_id}, symbol={symbol}, subtype={subtype}, bypass_balance_check={bypass_balance_check}, task_id={task_id}")
         return task_id
         
     def get_job_status(self, task_id: str) -> Optional[AnalysisTask]:
