@@ -77,7 +77,7 @@ def create_triggered_order_test(submit_orders=False):
         comment=f"Test sell order for {symbol} - triggered when buy order {buy_order_id} is fulfilled",
         open_type="manual",
         depends_on_order=buy_order_id,
-        depends_order_status_trigger=OrderStatus.FULFILLED,
+        depends_order_status_trigger=OrderStatus.FILLED,
         created_at=datetime.now(timezone.utc)
     )
 
@@ -88,7 +88,7 @@ def create_triggered_order_test(submit_orders=False):
         return
 
     print(f"Created dependent sell order with ID: {sell_order_id}")
-    print(f"Sell order will trigger when buy order {buy_order_id} reaches status: {OrderStatus.FULFILLED}")
+    print(f"Sell order will trigger when buy order {buy_order_id} reaches status: {OrderStatus.FILLED}")
     print(f"Sell limit price: ${limit_price:.2f}")
 
     # Submit the buy order to the broker if requested
@@ -106,7 +106,7 @@ def create_triggered_order_test(submit_orders=False):
         print("\nBuy order NOT submitted to broker (use submit_orders=True to actually submit)")
         print("To test manually:")
         print("1. Submit the buy order manually through the UI or another script")
-        print("2. Update the buy order status to FULFILLED in the database")
+        print("2. Update the buy order status to FILLED in the database")
         print("3. Run the TradeManager refresh to trigger the dependent sell order")
 
     return buy_order_id, sell_order_id

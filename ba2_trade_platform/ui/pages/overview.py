@@ -607,7 +607,7 @@ class AccountOverviewTab:
         ]
         # Open Positions Table
         with ui.card():
-            ui.label('Open Positions Across All Accounts')
+            ui.label('Open Positions Across All Accounts').classes('text-h6 mb-4')
             ui.table(columns=columns, rows=all_positions, row_key='account').classes('w-full')
         
         # All Orders Table
@@ -892,17 +892,17 @@ class TradeHistoryTab:
         self.render()
     
     def render(self):
-        """Render the trade history tab with orders in OPEN, CLOSED, or FULFILLED states."""
+        """Render the trade history tab with orders in OPEN, CLOSED, or FILLED states."""
         with ui.card():
             ui.label('📋 Trade History').classes('text-h6 mb-4')
             self._render_orders_table()
     
     def _render_orders_table(self):
-        """Render table with orders in OPEN, CLOSED, or FULFILLED states."""
+        """Render table with orders in OPEN, CLOSED, or FILLED states."""
         session = get_db()
         try:
             # Get orders with the relevant statuses
-            relevant_statuses = [OrderStatus.OPEN, OrderStatus.CLOSED, OrderStatus.FULFILLED]
+            relevant_statuses = [OrderStatus.OPEN, OrderStatus.CLOSED, OrderStatus.FILLED]
             statement = (
                 select(TradingOrder)
                 .where(TradingOrder.status.in_(relevant_statuses))
@@ -911,7 +911,7 @@ class TradeHistoryTab:
             orders = list(session.exec(statement).all())
             
             if not orders:
-                ui.label('No orders found with OPEN, CLOSED, or FULFILLED status.').classes('text-gray-500')
+                ui.label('No orders found with OPEN, CLOSED, or FILLED status.').classes('text-gray-500')
                 return
             
             # Prepare data for table
@@ -944,7 +944,7 @@ class TradeHistoryTab:
                 status_color = {
                     OrderStatus.OPEN: 'orange',
                     OrderStatus.CLOSED: 'gray', 
-                    OrderStatus.FULFILLED: 'green'
+                    OrderStatus.FILLED: 'green'
                 }.get(order.status, 'gray')
                 
                 row = {

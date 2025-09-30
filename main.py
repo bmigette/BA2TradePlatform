@@ -1,9 +1,14 @@
 import os
+import warnings
 from ba2_trade_platform.core.db import init_db, get_db
 from ba2_trade_platform.core.WorkerQueue import initialize_worker_queue
 from ba2_trade_platform.core.JobManager import get_job_manager
 from ba2_trade_platform.logger import logger
 from ba2_trade_platform.config import LOG_FOLDER
+
+# Suppress NiceGUI RuntimeWarning for unawaited coroutines in input.py
+# This is expected behavior in NiceGUI when synchronously updating input values
+warnings.filterwarnings('ignore', message='coroutine.*was never awaited', category=RuntimeWarning, module='nicegui.elements.input')
 
 def initialize_system():
     """Initialize the system components."""

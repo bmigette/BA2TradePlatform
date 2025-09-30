@@ -4,7 +4,6 @@ from sqlmodel import  Field, Session, SQLModel, create_engine
 class OrderStatus(str, Enum):
     OPEN = "open"
     CLOSED = "closed"
-    FULFILLED = "fulfilled"
     ALL = "all"
     NEW = "new"
     UNKNOWN = "unknown"

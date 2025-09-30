@@ -2,9 +2,10 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, LimitOrderRequest, StopOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
 from typing import Any, Dict, Optional
+from datetime import datetime, timezone
 
 from ...logger import logger
-from ...core.models import TradingOrder, Position
+from ...core.models import TradingOrder, Position, Transaction
 from ...core.types import OrderDirection, OrderStatus, OrderOpenType
 from ...core.AccountInterface import AccountInterface
 from ...core.db import get_db, update_instance
@@ -239,9 +240,18 @@ class AlpacaAccount(AccountInterface):
                 'cls': TimeInForce.CLS,
             }
             time_in_force = tif_map.get(good_for_value, TimeInForce.GTC)
+            
+            # Get order type value - handle both enum and string
+            if hasattr(trading_order.order_type, 'value'):
+                order_type_value = trading_order.order_type.value.lower()
+            else:
+                order_type_value = str(trading_order.order_type).lower()
+            
+            # Import OrderType enum from core.types to compare values
+            from ...core.types import OrderType as CoreOrderType
+            
             # Create the appropriate order request based on order type
-            order_type = trading_order.order_type.lower() if trading_order.order_type else 'market'
-            if order_type == 'market':
+            if order_type_value == CoreOrderType.MARKET.value.lower():
                 order_request = MarketOrderRequest(
                     symbol=trading_order.symbol,
                     qty=trading_order.quantity,
@@ -249,7 +259,13 @@ class AlpacaAccount(AccountInterface):
                     time_in_force=time_in_force,
                     client_order_id=trading_order.comment
                 )
-            elif order_type == 'limit':
+            elif order_type_value in [CoreOrderType.LIMIT.value.lower(), 
+                                      CoreOrderType.BUY_LIMIT.value.lower(), 
+                                      CoreOrderType.SELL_LIMIT.value.lower()]:
+                if not trading_order.limit_price:
+                    logger.error(f"Limit price is required for limit orders")
+                    return None
+                    
                 order_request = LimitOrderRequest(
                     symbol=trading_order.symbol,
                     qty=trading_order.quantity,
@@ -258,7 +274,13 @@ class AlpacaAccount(AccountInterface):
                     limit_price=trading_order.limit_price,
                     client_order_id=trading_order.comment
                 )
-            elif order_type == 'stop':
+            elif order_type_value in [CoreOrderType.STOP.value.lower(), 
+                                      CoreOrderType.BUY_STOP.value.lower(), 
+                                      CoreOrderType.SELL_STOP.value.lower()]:
+                if not trading_order.stop_price:
+                    logger.error(f"Stop price is required for stop orders")
+                    return None
+                    
                 order_request = StopOrderRequest(
                     symbol=trading_order.symbol,
                     qty=trading_order.quantity,
@@ -268,7 +290,7 @@ class AlpacaAccount(AccountInterface):
                     client_order_id=trading_order.comment
                 )
             else:
-                logger.error(f"Unsupported order type: {trading_order.order_type}")
+                logger.error(f"Unsupported order type: {trading_order.order_type} (value: {order_type_value})")
                 return None
 
             order = self.client.submit_order(order_request)
@@ -360,6 +382,26 @@ class AlpacaAccount(AccountInterface):
         except Exception as e:
             logger.error(f"Error listing Alpaca positions: {e}", exc_info=True)
             return []
+
+    def get_balance(self) -> Optional[float]:
+        """
+        Get the current account balance/equity from Alpaca.
+        
+        Returns:
+            Optional[float]: The current account equity if available, None if error occurred
+        """
+        try:
+            account = self.client.get_account()
+            if account and hasattr(account, 'equity'):
+                balance = float(account.equity)
+                logger.debug(f"Alpaca account balance: ${balance}")
+                return balance
+            else:
+                logger.warning("No equity field found in Alpaca account info")
+                return None
+        except Exception as e:
+            logger.error(f"Error getting Alpaca account balance: {e}", exc_info=True)
+            return None
 
     def get_account_info(self):
         """
@@ -489,3 +531,136 @@ class AlpacaAccount(AccountInterface):
         except Exception as e:
             logger.error(f"Error refreshing orders from Alpaca: {e}", exc_info=True)
             return False
+
+    def _set_order_tp_impl(self, trading_order: TradingOrder, tp_price: float) -> TradingOrder:
+        """
+        Set take profit for an order by creating/modifying a take profit order at Alpaca.
+        
+        Logic:
+        - Check if there's already a take profit order linked to the same transaction
+        - If exists, modify the existing order with new price
+        - If not, create a new take profit order (opposite side, same quantity)
+        
+        Args:
+            trading_order: The original TradingOrder object
+            tp_price: The take profit price
+            
+        Returns:
+            TradingOrder: The created/modified take profit order
+        """
+        try:
+            from ...core.db import add_instance, get_instance
+            
+            # Check if there's already a take profit order for this transaction
+            existing_tp_order = self._find_existing_tp_order(trading_order.transaction_id)
+            
+            if existing_tp_order:
+                # Modify existing take profit order
+                logger.info(f"Modifying existing take profit order {existing_tp_order.broker_order_id} to price ${tp_price}")
+                
+                # Use Alpaca's modify order functionality
+                try:
+                    modified_order = self.modify_order(existing_tp_order.broker_order_id, 
+                                                      self._create_tp_order_object(trading_order, tp_price))
+                    if modified_order:
+                        # Update database record
+                        existing_tp_order.limit_price = tp_price
+                        from ...core.db import update_instance
+                        update_instance(existing_tp_order)
+                        logger.info(f"Successfully modified take profit order to ${tp_price}")
+                        return existing_tp_order
+                    else:
+                        raise Exception("Failed to modify take profit order at broker")
+                        
+                except Exception as modify_error:
+                    logger.warning(f"Failed to modify existing TP order, will create new one: {modify_error}")
+                    # Cancel the old order and create a new one
+                    self.cancel_order(existing_tp_order.broker_order_id)
+                    # Continue to create new order below
+            
+            # Create new take profit order
+            tp_order = self._create_tp_order_object(trading_order, tp_price)
+            
+            # Submit the take profit order
+            submitted_order = self._submit_order_impl(tp_order)
+            
+            if submitted_order:
+                logger.info(f"Successfully created take profit order at ${tp_price} for transaction {trading_order.transaction_id}")
+                return submitted_order
+            else:
+                raise Exception("Failed to submit take profit order")
+                
+        except Exception as e:
+            logger.error(f"Error setting take profit for order {trading_order.id}: {e}", exc_info=True)
+            raise
+    
+    def _find_existing_tp_order(self, transaction_id: int) -> Optional[TradingOrder]:
+        """
+        Find existing take profit order for a transaction.
+        
+        Args:
+            transaction_id: The transaction ID to search for
+            
+        Returns:
+            Optional[TradingOrder]: Existing TP order if found, None otherwise
+        """
+        try:
+            with Session(get_db().bind) as session:
+                # Import OrderType enum from core.types
+                from ...core.types import OrderType as CoreOrderType
+                
+                # Look for limit orders linked to the same transaction
+                # Take profit orders are typically limit orders on the opposite side
+                statement = select(TradingOrder).where(
+                    TradingOrder.transaction_id == transaction_id,
+                    TradingOrder.order_type.in_([CoreOrderType.LIMIT, CoreOrderType.BUY_LIMIT, CoreOrderType.SELL_LIMIT]),
+                    TradingOrder.status.in_([OrderStatus.OPEN, OrderStatus.PENDING])
+                )
+                orders = session.exec(statement).all()
+                
+                # Return the first active limit order (assuming it's the TP order)
+                for order in orders:
+                    if order.limit_price is not None:
+                        return order
+                        
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error finding existing TP order for transaction {transaction_id}: {e}", exc_info=True)
+            return None
+    
+    def _create_tp_order_object(self, original_order: TradingOrder, tp_price: float) -> TradingOrder:
+        """
+        Create a take profit order object based on the original order.
+        
+        Args:
+            original_order: The original trading order
+            tp_price: The take profit price
+            
+        Returns:
+            TradingOrder: The take profit order object
+        """
+        # Determine opposite side for take profit
+        if original_order.side == OrderDirection.BUY:
+            tp_side = OrderDirection.SELL
+        else:
+            tp_side = OrderDirection.BUY
+        
+        # Import OrderType enum from core.types
+        from ...core.types import OrderType as CoreOrderType
+        
+        # Create take profit order
+        tp_order = TradingOrder(
+            account_id=self.id,
+            symbol=original_order.symbol,
+            quantity=original_order.quantity,  # Same quantity as original
+            side=tp_side,  # Opposite side
+            order_type=CoreOrderType.LIMIT,  # Take profit is a limit order
+            limit_price=tp_price,
+            transaction_id=original_order.transaction_id,  # Link to same transaction
+            status=OrderStatus.PENDING,
+            comment=f"TP for order {original_order.id}",
+            created_at=datetime.now(timezone.utc)
+        )
+        
+        return tp_order

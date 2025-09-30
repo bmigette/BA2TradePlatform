@@ -9,11 +9,8 @@ try:
     # Try to set javascript timeout on Client class
     if hasattr(Client, 'javascript_timeout'):
         Client.javascript_timeout = 5.0
+        print("Set Client.javascript_timeout to 5.0 seconds")
     
-    # Also try to configure it via app settings
-    if hasattr(app, 'config'):
-        app.config['javascript_timeout'] = 5.0
-        
 except Exception as e:
     print(f"Warning: Could not set JavaScript timeout: {e}")
 

@@ -1,10 +1,12 @@
 from abc import abstractmethod
 from typing import Any, Dict, Optional
 from unittest import result
+from datetime import datetime, timezone
 from ..logger import logger
-from ..core.models import AccountSetting
-from ..core.types import OrderOpenType, OrderDirection, OrderType, OrderStatus
+from ..core.models import AccountSetting, TradingOrder, Transaction
+from ..core.types import OrderOpenType, OrderDirection, OrderType, OrderStatus, TransactionStatus
 from ..core.ExtendableSettingsInterface import ExtendableSettingsInterface
+from ..core.db import add_instance, get_instance, update_instance
 
 
 class AccountInterface(ExtendableSettingsInterface):
@@ -30,6 +32,16 @@ class AccountInterface(ExtendableSettingsInterface):
 
 
 
+
+    @abstractmethod
+    def get_balance(self) -> Optional[float]:
+        """
+        Get the current account balance/equity.
+        
+        Returns:
+            Optional[float]: The current account balance if available, None if error occurred
+        """
+        pass
 
     @abstractmethod
     def get_account_info(self) -> Dict[str, Any]:
@@ -96,9 +108,12 @@ class AccountInterface(ExtendableSettingsInterface):
         """
         pass
 
-    def submit_order(self, trading_order) -> Any:
+    def submit_order(self, trading_order: TradingOrder) -> Any:
         """
-        Submit a new order to the account with validation.
+        Submit a new order to the account with validation and transaction handling.
+
+        For market orders without transaction_id: automatically creates a new Transaction
+        For all other order types: requires existing transaction_id or raises exception
 
         Args:
             trading_order: A TradingOrder object containing all order details.
@@ -113,13 +128,80 @@ class AccountInterface(ExtendableSettingsInterface):
             logger.error(f"Order validation failed for order: {error_msg}", exc_info=True)
             raise ValueError(error_msg)
         
+        # Handle transaction requirements based on order type
+        self._handle_transaction_requirements(trading_order)
+        
         # Log successful validation
         logger.info(f"Order validation passed for {trading_order.symbol} - {trading_order.side.value} {trading_order.quantity} @ {trading_order.order_type.value}")
         trading_order.account_id = self.id  # Ensure the order's account_id matches this account
         # Call the child class implementation
         return self._submit_order_impl(trading_order)
+    
+    def _handle_transaction_requirements(self, trading_order: TradingOrder) -> None:
+        """
+        Handle transaction creation/validation requirements based on order type.
+        
+        Args:
+            trading_order: The TradingOrder object to process
+            
+        Raises:
+            ValueError: If order requirements are not met
+        """
+        # Check if order type is market
+        is_market_order = (hasattr(trading_order, 'order_type') and 
+                          trading_order.order_type == OrderType.MARKET)
+        
+        # Check if transaction_id is provided
+        has_transaction = (hasattr(trading_order, 'transaction_id') and 
+                          trading_order.transaction_id is not None)
+        
+        if is_market_order and not has_transaction:
+            # Automatically create Transaction for market orders without transaction_id
+            self._create_transaction_for_order(trading_order)
+            logger.info(f"Automatically created transaction {trading_order.transaction_id} for market order")
+            
+        elif not is_market_order and not has_transaction:
+            # All non-market orders must have an existing transaction
+            raise ValueError(f"Non-market orders ({trading_order.order_type.value if trading_order.order_type else 'unknown'}) must be attached to an existing transaction. No transaction_id provided.")
+        
+        elif has_transaction:
+            # Validate that the transaction exists
+            transaction = get_instance(Transaction, trading_order.transaction_id)
+            if not transaction:
+                raise ValueError(f"Transaction {trading_order.transaction_id} not found")
+            logger.debug(f"Order linked to existing transaction {trading_order.transaction_id}")
+    
+    def _create_transaction_for_order(self, trading_order: TradingOrder) -> None:
+        """
+        Create a new Transaction for the given trading order.
+        
+        Args:
+            trading_order: The TradingOrder object to create a transaction for
+        """
+        try:
+            # Get current price for the symbol (this will be the open_price estimate)
+            current_price = self.get_instrument_current_price(trading_order.symbol)
+            
+            # Create new transaction
+            transaction = Transaction(
+                symbol=trading_order.symbol,
+                quantity=trading_order.quantity if trading_order.side == OrderDirection.BUY else -trading_order.quantity,
+                open_price=current_price,  # Estimated open price
+                status=TransactionStatus.WAITING,
+                created_at=datetime.now(timezone.utc)
+            )
+            
+            # Save transaction to database
+            transaction_id = add_instance(transaction)
+            trading_order.transaction_id = transaction_id
+            
+            logger.info(f"Created transaction {transaction_id} for order: {trading_order.symbol} {trading_order.side.value} {trading_order.quantity}")
+            
+        except Exception as e:
+            logger.error(f"Error creating transaction for order: {e}", exc_info=True)
+            raise ValueError(f"Failed to create transaction for order: {e}")
 
-    def _validate_trading_order(self, trading_order) -> Dict[str, Any]:
+    def _validate_trading_order(self, trading_order: TradingOrder) -> Dict[str, Any]:
         """
         Validate a trading order before submission.
         
@@ -291,6 +373,64 @@ class AccountInterface(ExtendableSettingsInterface):
         pass
 
     @abstractmethod
+    def _set_order_tp_impl(self, trading_order: TradingOrder, tp_price: float) -> Any:
+        """
+        Internal implementation of take profit order setting. This method should be implemented by child classes.
+        The public set_order_tp method will call this after updating the transaction.
+
+        Args:
+            trading_order: The original TradingOrder object
+            tp_price: The take profit price
+
+        Returns:
+            Any: The created/modified take profit order object if successful. Returns None or raises an exception if failed.
+        """
+        pass
+
+    def set_order_tp(self, trading_order: TradingOrder, tp_price: float) -> Any:
+        """
+        Set take profit for an existing order.
+        
+        This method:
+        1. Updates the linked transaction's take_profit value
+        2. Calls the implementation to create/modify the take profit order at the broker
+        
+        Args:
+            trading_order: The original TradingOrder object
+            tp_price: The take profit price
+            
+        Returns:
+            Any: The created/modified take profit order object if successful. Returns None or raises an exception if failed.
+        """
+        try:
+            # Validate inputs
+            if not trading_order:
+                raise ValueError("trading_order cannot be None")
+            if not isinstance(tp_price, (int, float)) or tp_price <= 0:
+                raise ValueError("tp_price must be a positive number")
+            
+            # Get the linked transaction
+            if not trading_order.transaction_id:
+                raise ValueError("Order must have a linked transaction to set take profit")
+            
+            transaction = get_instance(Transaction, trading_order.transaction_id)
+            if not transaction:
+                raise ValueError(f"Transaction {trading_order.transaction_id} not found")
+            
+            # Update transaction's take_profit value
+            transaction.take_profit = tp_price
+            update_instance(transaction)
+            
+            logger.info(f"Updated transaction {transaction.id} take_profit to ${tp_price}")
+            
+            # Call implementation to handle broker-side take profit order
+            return self._set_order_tp_impl(trading_order, tp_price)
+            
+        except Exception as e:
+            logger.error(f"Error setting take profit for order {trading_order.id if trading_order else 'None'}: {e}", exc_info=True)
+            raise
+
+    @abstractmethod
     def refresh_positions(self) -> bool:
         """
         Refresh/synchronize account positions from the broker.
@@ -312,3 +452,104 @@ class AccountInterface(ExtendableSettingsInterface):
             bool: True if refresh was successful, False otherwise
         """
         pass
+
+    def refresh_transactions(self) -> bool:
+        """
+        Refresh/synchronize transaction states based on linked order and position states.
+        
+        This method ensures transaction states are in sync with their linked orders:
+        - If all market orders for a transaction are in a final state (filled, canceled, expired, etc.),
+          the transaction should be marked as CLOSED
+        - If any market order is filled and position exists, transaction should be OPENED
+        - Otherwise, transaction remains in WAITING state
+        
+        Returns:
+            bool: True if refresh was successful, False otherwise
+        """
+        try:
+            from sqlmodel import select, Session
+            from .db import get_db
+            
+            # Define final order states that indicate completion
+            final_order_states = {
+                OrderStatus.FILLED,
+                OrderStatus.CLOSED,
+                OrderStatus.CANCELED,
+                OrderStatus.EXPIRED,
+                OrderStatus.REJECTED,
+                OrderStatus.DONE_FOR_DAY,
+                OrderStatus.STOPPED,
+            }
+            
+            # Define order states that indicate the order was executed (position opened)
+            executed_states = {
+                OrderStatus.FILLED,
+                OrderStatus.PARTIALLY_FILLED,
+            }
+            
+            updated_count = 0
+            
+            with Session(get_db().bind) as session:
+                # Get all transactions for this account
+                statement = select(Transaction).join(TradingOrder).where(
+                    TradingOrder.account_id == self.id
+                ).distinct()
+                
+                transactions = session.exec(statement).all()
+                
+                for transaction in transactions:
+                    original_status = transaction.status
+                    
+                    # Get all orders for this transaction
+                    orders_statement = select(TradingOrder).where(
+                        TradingOrder.transaction_id == transaction.id,
+                        TradingOrder.account_id == self.id
+                    )
+                    orders = session.exec(orders_statement).all()
+                    
+                    if not orders:
+                        continue
+                    
+                    # Check order states to determine transaction status
+                    has_executed_order = any(order.status in executed_states for order in orders)
+                    all_final = all(order.status in final_order_states for order in orders)
+                    
+                    # Determine new transaction status
+                    new_status = None
+                    
+                    if has_executed_order and transaction.status == TransactionStatus.WAITING:
+                        # At least one order was filled, mark transaction as OPENED
+                        new_status = TransactionStatus.OPENED
+                        if not transaction.open_date:
+                            transaction.open_date = datetime.now(timezone.utc)
+                        logger.debug(f"Transaction {transaction.id} has executed orders, marking as OPENED")
+                    
+                    if all_final and transaction.status != TransactionStatus.CLOSED:
+                        # All orders are in final state, check if we should close the transaction
+                        # Close transaction if:
+                        # 1. Transaction was OPENED and all orders are now final (position closed)
+                        # 2. Transaction was WAITING and orders were canceled/rejected (never opened)
+                        if transaction.status == TransactionStatus.OPENED:
+                            new_status = TransactionStatus.CLOSED
+                            transaction.close_date = datetime.now(timezone.utc)
+                            logger.debug(f"Transaction {transaction.id} all orders final after opening, marking as CLOSED")
+                        elif transaction.status == TransactionStatus.WAITING and not has_executed_order:
+                            # Transaction never opened (orders were canceled/rejected before execution)
+                            new_status = TransactionStatus.CLOSED
+                            logger.debug(f"Transaction {transaction.id} orders finalized without execution, marking as CLOSED")
+                    
+                    # Update transaction status if changed
+                    if new_status and new_status != original_status:
+                        transaction.status = new_status
+                        session.add(transaction)
+                        updated_count += 1
+                        logger.info(f"Updated transaction {transaction.id} status: {original_status.value} -> {new_status.value}")
+                
+                session.commit()
+            
+            logger.info(f"Successfully refreshed transactions for account {self.id}: {updated_count} transactions updated")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error refreshing transactions for account {self.id}: {e}", exc_info=True)
+            return False

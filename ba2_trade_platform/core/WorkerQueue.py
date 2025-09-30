@@ -396,8 +396,36 @@ class WorkerQueue:
             if not expert:
                 raise ValueError(f"Expert instance {task.expert_instance_id} not found or invalid expert type")
             
-            # Create MarketAnalysis record with subtype
+            # Check available balance for ENTER_MARKET analysis before proceeding
             from .types import AnalysisUseCase
+            if task.subtype == AnalysisUseCase.ENTER_MARKET.value:
+                if not expert.has_sufficient_balance_for_entry():
+                    # Skip analysis due to insufficient balance
+                    logger.info(f"Skipping ENTER_MARKET analysis for expert {task.expert_instance_id}, symbol {task.symbol}: "
+                              f"Insufficient available balance below threshold")
+                    
+                    # Create analysis record marked as skipped
+                    market_analysis = MarketAnalysis(
+                        symbol=task.symbol,
+                        expert_instance_id=task.expert_instance_id,
+                        status=MarketAnalysisStatus.CANCELLED,
+                        subtype=AnalysisUseCase(task.subtype),
+                        state={"reason": "insufficient_balance", "message": "Skipped due to insufficient available balance"}
+                    )
+                    market_analysis_id = add_instance(market_analysis)
+                    task.market_analysis_id = market_analysis_id
+                    
+                    # Update task as completed (but skipped)
+                    with self._task_lock:
+                        task.status = WorkerTaskStatus.COMPLETED
+                        task.result = {"market_analysis_id": market_analysis_id, "status": "skipped", "reason": "insufficient_balance"}
+                        task.completed_at = time.time()
+                    
+                    execution_time = task.completed_at - task.started_at
+                    logger.debug(f"Analysis task '{task.id}' skipped due to insufficient balance in {execution_time:.2f}s")
+                    return
+
+            # Create MarketAnalysis record with subtype
             market_analysis = MarketAnalysis(
                 symbol=task.symbol,
                 expert_instance_id=task.expert_instance_id,

@@ -97,6 +97,10 @@ class TradeManager:
                     if hasattr(account, 'refresh_orders'):
                         account.refresh_orders()
                         self.logger.debug(f"Refreshed orders for {account_def.name}")
+                    
+                    if hasattr(account, 'refresh_transactions'):
+                        account.refresh_transactions()
+                        self.logger.debug(f"Refreshed transactions for {account_def.name}")
                         
                 except Exception as e:
                     self.logger.error(f"Error refreshing account {account_def.name} (ID: {account_def.id}): {e}", exc_info=True)
@@ -126,45 +130,46 @@ class TradeManager:
                 statement = select(TradingOrder).where(TradingOrder.depends_on_order.isnot(None))
                 dependent_orders = session.exec(statement).all()
                 
+                self.logger.debug(f"Checking {len(dependent_orders)} orders with dependencies for triggering")
+                
                 triggered_orders = []
                 
                 for dependent_order in dependent_orders:
                     if dependent_order.status != OrderStatus.WAITING_TRIGGER:
+                        self.logger.debug(f"Skipping order {dependent_order.id} - status is {dependent_order.status}, not WAITING_TRIGGER")
                         continue  # Only process orders waiting for triggers
                         
                     parent_order_id = dependent_order.depends_on_order
                     trigger_status = dependent_order.depends_order_status_trigger
                     
                     if not trigger_status:
+                        self.logger.debug(f"Skipping order {dependent_order.id} - no trigger status defined")
                         continue  # No trigger status defined
                         
-                    # Check if parent order status changed to the trigger status
-                    pre_status = pre_refresh_statuses.get(parent_order_id)
-                    
                     # Get current parent order status
                     parent_order = session.get(TradingOrder, parent_order_id)
                     if not parent_order:
+                        self.logger.warning(f"Parent order {parent_order_id} not found for dependent order {dependent_order.id}")
                         continue
                         
                     current_status = parent_order.status
                     
-                    # Check if status changed to the trigger status
-                    if pre_status != trigger_status and current_status == trigger_status:
-                        self.logger.info(f"Order {parent_order_id} status changed to {trigger_status}, triggering dependent order {dependent_order.id}")
+                    self.logger.debug(f"Checking dependent order {dependent_order.id}: parent order {parent_order_id} status is {current_status}, trigger status is {trigger_status}")
+                    
+                    # Check if parent order has reached the trigger status
+                    # We don't check pre_status because the order might have already been in this status,
+                    # or it might have transitioned through multiple states in a single refresh
+                    if current_status == trigger_status:
+                        self.logger.info(f"Order {parent_order_id} is in status {trigger_status}, triggering dependent order {dependent_order.id}")
                         
-                        # Get the account for this dependent order's expert
+                        # Get the account for this dependent order using its account_id
                         from ..modules.accounts import get_account_class
-                        from .models import AccountDefinition, ExpertInstance
+                        from .models import AccountDefinition
                         
-                        # Find the expert instance for this dependent order
-                        dependent_expert = session.get(ExpertInstance, dependent_order.expert_instance_id)
-                        if not dependent_expert:
-                            self.logger.error(f"Expert instance {dependent_order.expert_instance_id} not found for dependent order {dependent_order.id}")
-                            continue
-                            
-                        account_def = session.get(AccountDefinition, dependent_expert.account_id)
+                        # Get the account definition for this order
+                        account_def = session.get(AccountDefinition, dependent_order.account_id)
                         if not account_def:
-                            self.logger.error(f"Account definition {dependent_expert.account_id} not found for dependent order {dependent_order.id}")
+                            self.logger.error(f"Account definition {dependent_order.account_id} not found for dependent order {dependent_order.id}")
                             continue
                             
                         account_class = get_account_class(account_def.provider)
@@ -174,14 +179,13 @@ class TradeManager:
                             
                         account = account_class(account_def.id)
                         
-                        # Submit the dependent order with dependency information
-                        submitted_order = account.submit_order_with_db_update(
-                            dependent_order, 
-                            depends_on_order_id=parent_order_id, 
-                            depends_on_status=trigger_status
-                        )
+                        # Submit the dependent order
+                        submitted_order = account.submit_order(dependent_order)
                         
                         if submitted_order:
+                            # Update dependent order status to OPEN
+                            dependent_order.status = OrderStatus.OPEN
+                            session.add(dependent_order)
                             self.logger.info(f"Successfully submitted dependent order {dependent_order.id} triggered by parent order {parent_order_id}")
                             triggered_orders.append(dependent_order.id)
                         else:

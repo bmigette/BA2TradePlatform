@@ -236,7 +236,7 @@ class JobManager:
             from .types import OrderStatus
             
             # Check for orders in states that indicate the expert has already entered the market
-            relevant_statuses = [OrderStatus.PENDING, OrderStatus.OPEN, OrderStatus.FULFILLED]
+            relevant_statuses = [OrderStatus.PENDING, OrderStatus.OPEN, OrderStatus.FILLED]
             
             if has_existing_orders_for_expert_and_symbol(expert_instance_id, symbol, relevant_statuses):
                 logger.info(f"Skipping ENTER_MARKET analysis for expert {expert_instance_id}, symbol {symbol}: existing orders found in states {[s.value for s in relevant_statuses]}")

@@ -1,4 +1,4 @@
-from nicegui import ui
+from nicegui import ui, run
 from typing import Optional, Dict, Any, List
 import json
 from datetime import datetime, timezone
@@ -35,34 +35,40 @@ def content(analysis_id: int) -> None:
         analysis_id: The ID of the MarketAnalysis to display
     """
     
-    def export_to_pdf() -> None:
+    async def export_to_pdf() -> None:
         """Export the market analysis to PDF and trigger download."""
         try:
             logger.info(f"PDF export button clicked for analysis {analysis_id}")
             
             # Show loading notification
-            notification = ui.notification('Generating PDF...', type='ongoing')
+            notification = ui.notification('Generating PDF...', type='ongoing', timeout=None)
             
-            # Generate PDF
-            pdf_path = export_market_analysis_pdf(analysis_id)
-            
-            # Close loading notification
-            notification.dismiss()
-            
-            # Show success notification and trigger download
-            ui.notification(f'PDF generated successfully!', type='positive')
-            
-            # Trigger file download
-            ui.download(pdf_path)
-            
-            logger.info(f"PDF export completed for analysis {analysis_id}: {pdf_path}")
+            try:
+                # Generate PDF asynchronously using run.cpu_bound to avoid blocking UI
+                pdf_path = await run.cpu_bound(export_market_analysis_pdf, analysis_id)
+                
+                # Close loading notification
+                notification.dismiss()
+                
+                # Show success notification and trigger download
+                ui.notification(f'PDF generated successfully!', type='positive')
+                
+                # Trigger file download
+                ui.download(pdf_path)
+                
+                logger.info(f"PDF export completed for analysis {analysis_id}: {pdf_path}")
+                
+            except Exception as e:
+                notification.dismiss()
+                ui.notification(f'Error generating PDF: {str(e)}', type='negative')
+                logger.error(f"Error exporting analysis {analysis_id} to PDF: {e}", exc_info=True)
             
         except ImportError as e:
             ui.notification('PDF export requires reportlab package. Please install it.', type='negative')
             logger.error(f"Missing reportlab dependency for PDF export: {e}", exc_info=True)
         except Exception as e:
-            ui.notification(f'Error generating PDF: {str(e)}', type='negative')
-            logger.error(f"Error exporting analysis {analysis_id} to PDF: {e}", exc_info=True)
+            ui.notification(f'Error starting PDF export: {str(e)}', type='negative')
+            logger.error(f"Error starting PDF export for analysis {analysis_id}: {e}", exc_info=True)
     
     try:
         # Load the market analysis
@@ -345,7 +351,7 @@ def _render_order_recommendations_tab(market_analysis: MarketAnalysis) -> None:
                             color = {
                                 'open': 'orange', 
                                 'closed': 'grey', 
-                                'fulfilled': 'green',
+                                'filled': 'green',
                                 'pending': 'blue',
                                 'canceled': 'red'
                             }.get(status.lower(), 'grey')
@@ -434,7 +440,7 @@ def _render_order_recommendations_tab(market_analysis: MarketAnalysis) -> None:
                         'status_color': {
                             'open': 'orange', 
                             'closed': 'grey', 
-                            'fulfilled': 'green',
+                            'filled': 'green',
                             'pending': 'blue',
                             'canceled': 'red'
                         }.get(status.lower(), 'grey'),

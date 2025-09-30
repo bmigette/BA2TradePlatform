@@ -759,7 +759,7 @@ def create_action(action_type: ExpertActionType, instrument_name: str, account: 
 # 2. **Order Status Monitoring**: Implement order status tracking
 #    - Periodically check order status from broker
 #    - Update database records with current status
-#    - Trigger next action in sequence when order is fulfilled
+#    - Trigger next action in sequence when order is filled
 #    - Handle timeout scenarios for unfilled orders
 # 
 # 3. **Bracket Order Support**: Handle complex order types

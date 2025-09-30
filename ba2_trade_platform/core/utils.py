@@ -123,13 +123,13 @@ def has_existing_orders_for_expert_and_symbol(expert_instance_id: int, symbol: s
         expert_instance_id (int): The expert instance ID
         symbol (str): The trading symbol
         statuses (List[OrderStatus], optional): List of order statuses to check. 
-                                              Defaults to [PENDING, OPEN, FULFILLED]
+                                              Defaults to [PENDING, OPEN, FILLED]
         
     Returns:
         bool: True if orders exist, False otherwise
     """
     if statuses is None:
-        statuses = [OrderStatus.PENDING, OrderStatus.OPEN, OrderStatus.FULFILLED]
+        statuses = [OrderStatus.PENDING, OrderStatus.OPEN, OrderStatus.FILLED]
     
     try:
         with Session(get_db().bind) as session:

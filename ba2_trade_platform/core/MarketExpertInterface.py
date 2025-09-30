@@ -1,9 +1,13 @@
 from abc import abstractmethod
 from typing import Any, Dict, List, Optional
 from unittest import result
+from sqlmodel import Session, select
 from ..logger import logger
-from ..core.models import ExpertSetting, MarketAnalysis
+from ..core.models import ExpertSetting, MarketAnalysis, Transaction, ExpertInstance
+from ..core.types import TransactionStatus, OrderDirection
+from ..core.db import get_instance, get_db
 from ..core.ExtendableSettingsInterface import ExtendableSettingsInterface
+from ..core.AccountInterface import AccountInterface
 
 
 class MarketExpertInterface(ExtendableSettingsInterface):
@@ -78,6 +82,11 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 "enabled_instruments": {
                     "type": "json", "required": False, "default": {},
                     "description": "Configuration of enabled instruments for this expert instance"
+                },
+                # Balance Management Settings
+                "min_available_balance_pct": {
+                    "type": "float", "required": False, "default": 20.0,
+                    "description": "Minimum available balance percentage required to enter new market positions (default 20%)"
                 }
                 
             }
@@ -189,6 +198,200 @@ class MarketExpertInterface(ExtendableSettingsInterface):
 
         # Return empty dict if no enabled instruments configured
         return {}
+
+    def get_virtual_balance(self) -> Optional[float]:
+        """
+        Get the virtual balance for this expert based on account balance and virtual_equity_pct.
+        
+        For example, if account balance is $10,000 and virtual_equity_pct is 10,
+        the virtual balance would be $1,000 (10% of account balance).
+        
+        Returns:
+            Optional[float]: The virtual balance amount, None if error occurred
+        """
+        try:
+            # Lazy import to avoid circular dependency
+            from ..core.utils import get_account_instance_from_id
+            
+            # Get the expert instance to access virtual_equity_pct
+            expert_instance = get_instance(ExpertInstance, self.id)
+            if not expert_instance:
+                logger.error(f"Expert instance {self.id} not found")
+                return None
+            
+            # Get the account instance for this expert
+            account = get_account_instance_from_id(expert_instance.account_id)
+            if not account:
+                logger.error(f"Account {expert_instance.account_id} not found for expert {self.id}")
+                return None
+            
+            # Get account balance
+            account_balance = account.get_balance()
+            if account_balance is None:
+                logger.error(f"Could not get balance for account {expert_instance.account_id}")
+                return None
+            
+            # Calculate virtual balance based on virtual_equity_pct
+            virtual_equity_pct = expert_instance.virtual_equity_pct or 100.0
+            virtual_balance = account_balance * (virtual_equity_pct / 100.0)
+            
+            logger.debug(f"Expert {self.id}: Account balance=${account_balance}, "
+                        f"Virtual equity %={virtual_equity_pct}, Virtual balance=${virtual_balance}")
+            
+            return virtual_balance
+            
+        except Exception as e:
+            logger.error(f"Error calculating virtual balance for expert {self.id}: {e}", exc_info=True)
+            return None
+    
+    def get_available_balance(self) -> Optional[float]:
+        """
+        Get the available balance for this expert by calculating virtual balance minus used balance.
+        
+        The used balance calculation logic:
+        - For profitable transactions: use open_price * quantity
+        - For losing transactions: use (open_price + loss_amount) * quantity
+        - This ensures we account for the maximum potential loss
+        
+        Returns:
+            Optional[float]: The available balance amount, None if error occurred
+        """
+        try:
+            # Get virtual balance first
+            virtual_balance = self.get_virtual_balance()
+            if virtual_balance is None:
+                return None
+            
+            # Get expert instance and account instance to fetch current prices
+            # Lazy import to avoid circular dependency
+            from ..core.utils import get_account_instance_from_id
+            
+            expert_instance = get_instance(ExpertInstance, self.id)
+            if not expert_instance:
+                logger.error(f"Expert instance {self.id} not found")
+                return None
+                
+            account = get_account_instance_from_id(expert_instance.account_id)
+            if not account:
+                logger.error(f"Account {expert_instance.account_id} not found for expert {self.id}")
+                return None
+            
+            # Calculate used balance from open transactions
+            used_balance = self._calculate_used_balance(account)
+            if used_balance is None:
+                return None
+            
+            available_balance = virtual_balance - used_balance
+            
+            logger.debug(f"Expert {self.id}: Virtual balance=${virtual_balance}, "
+                        f"Used balance=${used_balance}, Available balance=${available_balance}")
+            
+            return available_balance
+            
+        except Exception as e:
+            logger.error(f"Error calculating available balance for expert {self.id}: {e}", exc_info=True)
+            return None
+    
+    def _calculate_used_balance(self, account: AccountInterface) -> Optional[float]:
+        """
+        Calculate the used balance from all open transactions for this expert.
+        
+        Args:
+            account: The account instance to get current prices
+            
+        Returns:
+            Optional[float]: The total used balance, None if error occurred
+        """
+        try:
+            used_balance = 0.0
+            
+            # Get all open transactions for this expert
+            with Session(get_db().bind) as session:
+                statement = select(Transaction).where(
+                    Transaction.expert_id == self.id,
+                    Transaction.status.in_([TransactionStatus.WAITING, TransactionStatus.OPEN])
+                )
+                transactions = session.exec(statement).all()
+            
+            for transaction in transactions:
+                if transaction.open_price is None or transaction.quantity is None:
+                    logger.warning(f"Transaction {transaction.id} missing open_price or quantity, skipping")
+                    continue
+                
+                # Get current price for the symbol
+                current_price = account.get_instrument_current_price(transaction.symbol)
+                if current_price is None:
+                    logger.warning(f"Could not get current price for {transaction.symbol}, using open_price")
+                    current_price = transaction.open_price
+                
+                # Calculate profit/loss
+                if transaction.quantity > 0:  # Long position
+                    profit_loss = (current_price - transaction.open_price) * transaction.quantity
+                else:  # Short position  
+                    profit_loss = (transaction.open_price - current_price) * abs(transaction.quantity)
+                
+                # Calculate used balance for this transaction
+                if profit_loss >= 0:
+                    # Transaction is profitable, use open_price
+                    transaction_used = transaction.open_price * abs(transaction.quantity)
+                else:
+                    # Transaction is losing money, use open_price + loss
+                    loss_amount = abs(profit_loss)
+                    transaction_used = (transaction.open_price * abs(transaction.quantity)) + loss_amount
+                
+                used_balance += transaction_used
+                
+                logger.debug(f"Transaction {transaction.id} ({transaction.symbol}): "
+                           f"Open=${transaction.open_price}, Current=${current_price}, "
+                           f"P/L=${profit_loss:.2f}, Used=${transaction_used:.2f}")
+            
+            return used_balance
+            
+        except Exception as e:
+            logger.error(f"Error calculating used balance for expert {self.id}: {e}", exc_info=True)
+            return None
+
+    def has_sufficient_balance_for_entry(self) -> bool:
+        """
+        Check if the expert has sufficient available balance to enter new market positions.
+        
+        Uses the min_available_balance_pct setting to determine if available balance
+        meets the minimum threshold for new position entry.
+        
+        Returns:
+            bool: True if sufficient balance available, False otherwise
+        """
+        try:
+            # Get the minimum balance threshold from settings
+            min_balance_pct = self.settings.get('min_available_balance_pct', 20.0)
+            
+            # Get virtual and available balances using direct methods
+            virtual_balance = self.get_virtual_balance()
+            available_balance = self.get_available_balance()
+            
+            if virtual_balance is None or available_balance is None:
+                logger.warning(f"Could not get balance information for expert {self.id}")
+                return False
+            
+            # Calculate available balance percentage
+            if virtual_balance <= 0:
+                logger.warning(f"Expert {self.id} has zero or negative virtual balance")
+                return False
+            
+            available_balance_pct = (available_balance / virtual_balance) * 100.0
+            
+            # Check if available balance meets minimum threshold
+            has_sufficient = available_balance_pct >= min_balance_pct
+            
+            logger.debug(f"Expert {self.id} balance check: Available={available_balance:.2f} "
+                        f"({available_balance_pct:.1f}%), Virtual={virtual_balance:.2f}, "
+                        f"Threshold={min_balance_pct:.1f}%, Sufficient={has_sufficient}")
+            
+            return has_sufficient
+            
+        except Exception as e:
+            logger.error(f"Error checking balance for expert {self.id}: {e}", exc_info=True)
+            return False
 
     @abstractmethod
     def run_analysis(self, symbol: str, market_analysis: MarketAnalysis) -> None:
