@@ -6,7 +6,12 @@ import math
 from ...core.WorkerQueue import get_worker_queue
 from ...core.db import get_all_instances, get_instance, get_db
 from ...core.models import MarketAnalysis, ExpertInstance, AnalysisOutput
-from ...core.types import MarketAnalysisStatus, WorkerTaskStatus
+from ...core.types import MarketAnalysisStatus, WorkerTaskStatus, OrderDirection, OrderRecommendation, OrderOpenType
+from ...core.models import TradingOrder
+from ...core.types import OrderStatus
+from ...core.models import AccountDefinition
+from ...modules.accounts import get_account_class
+from ...core.db import add_instance
 from ...logger import logger
 from sqlmodel import select, func
 
@@ -912,7 +917,7 @@ class OrderRecommendationsTab:
                                    color="primary" 
                                    title="View Details"
                                    @click="$parent.$emit('view_details', props.row.symbol)" />
-                            <q-btn icon="add_shopping_cart" 
+                            <q-btn icon="send" 
                                    flat 
                                    dense 
                                    color="green" 
@@ -1045,12 +1050,14 @@ class OrderRecommendationsTab:
                     # Add action buttons for individual recommendations
                     rec_table.add_slot('body-cell-actions', '''
                         <q-td :props="props">
-                            <q-btn icon="add_shopping_cart" 
+                            <q-btn v-if="props.row.can_place_order" 
+                                   icon="send" 
                                    flat 
                                    dense 
                                    color="green" 
                                    title="Place Order for this Recommendation"
                                    @click="$parent.$emit('place_order_rec', props.row.id)" />
+                            <span v-else class="text-grey-5">Order exists</span>
                             <q-btn v-if="props.row.analysis_id" 
                                    icon="visibility" 
                                    flat 
@@ -1085,6 +1092,17 @@ class OrderRecommendationsTab:
                 
                 recommendations = []
                 for recommendation, expert_instance, analysis in results:
+                    # Check for existing orders linked to this recommendation
+                    order_statement = select(TradingOrder).where(
+                        TradingOrder.order_recommendation_id == recommendation.id
+                    )
+                    existing_orders = session.exec(order_statement).all()
+                    
+                    # Determine order status for this recommendation
+                    has_non_pending_order = any(order.status != OrderStatus.PENDING for order in existing_orders)
+                    has_pending_order = any(order.status == OrderStatus.PENDING for order in existing_orders)
+                    can_place_order = not has_non_pending_order  # Can place if no non-pending orders exist
+                    
                     # Always get the enum value, not the string representation
                     if hasattr(recommendation.recommended_action, 'value'):
                         action_raw = recommendation.recommended_action.value
@@ -1094,10 +1112,10 @@ class OrderRecommendationsTab:
                         
                     # Convert enum values to readable text
                     action_mapping = {
-                        'BUY': 'Buy', 
-                        'SELL': 'Sell', 
-                        'HOLD': 'Hold',
-                        'ERROR': 'Error'
+                        OrderRecommendation.BUY.value: 'Buy', 
+                        OrderRecommendation.SELL.value: 'Sell', 
+                        OrderRecommendation.HOLD.value: 'Hold',
+                        OrderRecommendation.ERROR.value: 'Error'
                     }
                     action = action_mapping.get(action_raw, action_raw)
                     created_at = recommendation.created_at.strftime('%Y-%m-%d %H:%M:%S') if recommendation.created_at else ''
@@ -1114,7 +1132,10 @@ class OrderRecommendationsTab:
                         'time_horizon': recommendation.time_horizon.value.replace('_', ' ').title() if hasattr(recommendation.time_horizon, 'value') else str(recommendation.time_horizon),
                         'expert_name': expert_instance.user_description or expert_instance.expert,
                         'created_at': created_at,
-                        'analysis_id': analysis.id if analysis else None
+                        'analysis_id': analysis.id if analysis else None,
+                        'can_place_order': can_place_order,
+                        'has_pending_order': has_pending_order,
+                        'existing_orders_count': len(existing_orders)
                     })
                 
                 return recommendations
@@ -1123,7 +1144,7 @@ class OrderRecommendationsTab:
             logger.error(f"Error getting symbol recommendations: {e}", exc_info=True)
             return []
 
-    def _show_place_order_dialog(self, symbol):
+    def _show_place_order_dialog(self, symbol, recommendation_id=None):
         """Show place order dialog for a symbol."""
         try:
             with ui.dialog() as order_dialog:
@@ -1138,7 +1159,7 @@ class OrderRecommendationsTab:
                         ui.label('Current Price: N/A').classes('text-subtitle1 mb-4')
                     
                     # Order form
-                    side_select = ui.select(['buy', 'sell'], value='buy', label='Side').classes('w-full mb-2')
+                    side_select = ui.select([OrderDirection.BUY.value, OrderDirection.SELL.value], value=OrderDirection.BUY.value, label='Side').classes('w-full mb-2')
                     quantity_input = ui.number('Quantity', value=1, min=0.01, step=0.01).classes('w-full mb-2')
                     order_type_select = ui.select(['market', 'limit'], value='market', label='Order Type').classes('w-full mb-2')
                     
@@ -1159,7 +1180,8 @@ class OrderRecommendationsTab:
                             quantity=quantity_input.value,
                             order_type=order_type_select.value,
                             limit_price=limit_price_input.value if order_type_select.value == 'limit' else None,
-                            dialog=order_dialog
+                            dialog=order_dialog,
+                            recommendation_id=recommendation_id
                         )).props('color=primary')
             
             order_dialog.open()
@@ -1171,11 +1193,54 @@ class OrderRecommendationsTab:
         """Handle place order for a specific recommendation."""
         try:
             recommendation_id = event_data.args if hasattr(event_data, 'args') else event_data
-            # For now, we'll just show a basic order dialog
-            # In the future, this could pre-fill based on the recommendation
+            
+            # Check for existing orders linked to this recommendation
+            with get_db() as session:
+                order_statement = select(TradingOrder).where(
+                    TradingOrder.order_recommendation_id == recommendation_id
+                )
+                existing_orders = session.exec(order_statement).all()
+                
+                # Check if there's a non-pending order
+                has_non_pending_order = any(order.status != OrderStatus.PENDING for order in existing_orders)
+                if has_non_pending_order:
+                    ui.notify('Order already exists for this recommendation and is no longer pending', type='warning')
+                    return
+                
+                # Check if there's a pending order
+                pending_order = next((order for order in existing_orders if order.status == OrderStatus.PENDING), None)
+                if pending_order:
+                    # Submit the existing pending order
+                    try:
+                        account = get_instance(AccountDefinition, pending_order.account_id)
+                        if not account:
+                            ui.notify('Account not found for existing order', type='negative')
+                            return
+                        
+                        # Submit the order through the account provider
+                        from ...modules.accounts import providers
+                        provider_cls = providers.get(account.provider)
+                        if not provider_cls:
+                            ui.notify(f'No provider found for {account.provider}', type='negative')
+                            return
+                        
+                        provider_obj = provider_cls(account.id)
+                        submitted_order = provider_obj.submit_order(pending_order)
+                        
+                        if submitted_order:
+                            ui.notify(f'Existing order {pending_order.id} submitted successfully to {account.provider}', type='positive')
+                            self.refresh_data()
+                        else:
+                            ui.notify(f'Failed to submit existing order {pending_order.id} to broker', type='negative')
+                    except Exception as e:
+                        logger.error(f"Error submitting existing order {pending_order.id}: {e}", exc_info=True)
+                        ui.notify(f'Error submitting existing order: {str(e)}', type='negative')
+                    return
+            
+            # No existing orders, show dialog to create new one
             recommendation = self._get_recommendation_details(recommendation_id)
             if recommendation:
-                self._show_place_order_dialog(recommendation['symbol'])
+                self._show_place_order_dialog(recommendation['symbol'], recommendation_id)
         except Exception as e:
             logger.error(f"Error placing order for recommendation: {e}", exc_info=True)
 
@@ -1227,10 +1292,10 @@ class OrderRecommendationsTab:
                         
                     # Convert enum values to readable text
                     action_mapping = {
-                        'BUY': 'Buy', 
-                        'SELL': 'Sell', 
-                        'HOLD': 'Hold',
-                        'ERROR': 'Error'
+                        OrderRecommendation.BUY.value: 'Buy', 
+                        OrderRecommendation.SELL.value: 'Sell', 
+                        OrderRecommendation.HOLD.value: 'Hold',
+                        OrderRecommendation.ERROR.value: 'Error'
                     }
                     action = action_mapping.get(action_raw, action_raw)
                     return {
@@ -1244,26 +1309,57 @@ class OrderRecommendationsTab:
             logger.error(f"Error getting recommendation details: {e}", exc_info=True)
             return None
 
-    def _place_order(self, symbol, side, quantity, order_type, limit_price, dialog):
+    def _place_order(self, symbol, side, quantity, order_type, limit_price, dialog, recommendation_id=None):
         """Place an order."""
         try:
-            from ...core.models import TradingOrder
-            from ...core.types import OrderStatus
-            from ...core.db import add_instance
+            # Get the first available account for order submission
+            accounts = get_all_instances(AccountDefinition)
+            if not accounts:
+                ui.notify('No trading accounts configured', type='negative')
+                return
+                
+            account = accounts[0]  # Use first available account
             
-            # Create order object
+            # Create order object with account_id
             order = TradingOrder(
+                account_id=account.id,
                 symbol=symbol,
                 quantity=quantity,
                 side=side,
                 order_type=order_type,
                 status=OrderStatus.PENDING,
                 limit_price=limit_price,
+                open_type=OrderOpenType.MANUAL,
+                order_recommendation_id=recommendation_id,
                 comment=f"Manual order from Order Recommendations - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             )
             
-            # Add to database
+            # Add to database first
             order_id = add_instance(order)
+            
+            if order_id:
+                # Get the order back from database to get the complete object
+                from ...core.db import get_instance
+                order = get_instance(TradingOrder, order_id)
+                
+                # Submit the order through the account provider
+                provider_cls = get_account_class(account.provider)
+                if provider_cls:
+                    try:
+                        provider_obj = provider_cls(account.id)
+                        submitted_order = provider_obj.submit_order(order)
+                        if submitted_order:
+                            ui.notify(f'Order {order_id} submitted successfully to {account.provider}', type='positive')
+                        else:
+                            ui.notify(f'Order {order_id} created but failed to submit to broker', type='warning')
+                    except Exception as e:
+                        logger.error(f"Error submitting order {order_id}: {e}", exc_info=True)
+                        ui.notify(f'Order {order_id} created but submission failed: {str(e)}', type='warning')
+                else:
+                    ui.notify(f'Order {order_id} created but no provider found for {account.provider}', type='warning')
+            else:
+                ui.notify('Failed to create order', type='negative')
+                return
             
             if order_id:
                 ui.notify(f'Order {order_id} placed successfully for {symbol}', type='positive')

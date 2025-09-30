@@ -3,7 +3,7 @@ from typing import Any, Dict, Optional
 from unittest import result
 from ..logger import logger
 from ..core.models import AccountSetting
-from ..core.types import OrderOpenType
+from ..core.types import OrderOpenType, OrderDirection, OrderType, OrderStatus
 from ..core.ExtendableSettingsInterface import ExtendableSettingsInterface
 
 
@@ -83,21 +83,152 @@ class AccountInterface(ExtendableSettingsInterface):
         pass
 
     @abstractmethod
-    def submit_order(self, trading_order, depends_on_order_id: Optional[int] = None, depends_on_status: Optional[str] = None, good_for = "gtc", open_type = OrderOpenType.AUTOMATIC) -> Any:
+    def _submit_order_impl(self, trading_order) -> Any:
         """
-        Submit a new order to the account.
+        Internal implementation of order submission. This method should be implemented by child classes.
+        The public submit_order method will call this after validation.
 
         Args:
-            trading_order: A TradingOrder object containing all order details.
-            depends_on_order_id (Optional[int]): ID of the order this order depends on (for conditional/triggered orders).
-            depends_on_status (Optional[str]): Status that the depends_on_order must reach to trigger this order.
-            good_for (str): Time in force for the order (e.g., "gtc", "day").
-            open_type (OrderOpenType): Specifies how the order should be opened (automatic/manual).
+            trading_order: A validated TradingOrder object containing all order details.
 
         Returns:
             Any: The created order object if successful. Returns None or raises an exception if failed.
         """
         pass
+
+    def submit_order(self, trading_order) -> Any:
+        """
+        Submit a new order to the account with validation.
+
+        Args:
+            trading_order: A TradingOrder object containing all order details.
+
+        Returns:
+            Any: The created order object if successful. Returns None or raises an exception if failed.
+        """
+        # Validate the trading order before submission
+        validation_result = self._validate_trading_order(trading_order)
+        if not validation_result['is_valid']:
+            error_msg = f"Order validation failed: {', '.join(validation_result['errors'])}"
+            logger.error(f"Order validation failed for order: {error_msg}", exc_info=True)
+            raise ValueError(error_msg)
+        
+        # Log successful validation
+        logger.info(f"Order validation passed for {trading_order.symbol} - {trading_order.side.value} {trading_order.quantity} @ {trading_order.order_type.value}")
+        trading_order.account_id = self.id  # Ensure the order's account_id matches this account
+        # Call the child class implementation
+        return self._submit_order_impl(trading_order)
+
+    def _validate_trading_order(self, trading_order) -> Dict[str, Any]:
+        """
+        Validate a trading order before submission.
+        
+        Args:
+            trading_order: The TradingOrder object to validate
+            
+        Returns:
+            Dict[str, Any]: Validation result with 'is_valid' (bool) and 'errors' (list) keys
+        """
+        errors = []
+        
+        # Check if trading_order exists
+        if trading_order is None:
+            errors.append("trading_order cannot be None")
+            return {'is_valid': False, 'errors': errors}
+        
+        # Validate required fields
+        if not hasattr(trading_order, 'symbol') or not trading_order.symbol:
+            errors.append("symbol is required and cannot be empty")
+        elif not isinstance(trading_order.symbol, str):
+            errors.append("symbol must be a string")
+        elif len(trading_order.symbol.strip()) == 0:
+            errors.append("symbol cannot be empty or whitespace only")
+            
+        if not hasattr(trading_order, 'quantity') or trading_order.quantity is None:
+            errors.append("quantity is required")
+        elif not isinstance(trading_order.quantity, (int, float)):
+            errors.append("quantity must be a number")
+        elif trading_order.quantity <= 0:
+            errors.append("quantity must be greater than 0")
+            
+        if not hasattr(trading_order, 'side') or trading_order.side is None:
+            errors.append("side is required")
+        elif not isinstance(trading_order.side, OrderDirection):
+            errors.append(f"side must be an OrderDirection enum, got {type(trading_order.side)}")
+            
+        if not hasattr(trading_order, 'order_type') or trading_order.order_type is None:
+            errors.append("order_type is required")
+        elif not isinstance(trading_order.order_type, OrderType):
+            errors.append(f"order_type must be an OrderType enum, got {type(trading_order.order_type)}")
+            
+        if not hasattr(trading_order, 'account_id') or trading_order.account_id is None:
+            errors.append("account_id is required")
+        elif not isinstance(trading_order.account_id, int):
+            errors.append("account_id must be an integer")
+        elif trading_order.account_id != self.id:
+            errors.append(f"order account_id ({trading_order.account_id}) does not match this account ({self.id})")
+            
+        # Validate limit orders have limit_price
+        if (hasattr(trading_order, 'order_type') and 
+            trading_order.order_type in [OrderType.BUY_LIMIT, OrderType.SELL_LIMIT]):
+            if not hasattr(trading_order, 'limit_price') or trading_order.limit_price is None:
+                errors.append(f"limit_price is required for {trading_order.order_type.value} orders")
+            elif not isinstance(trading_order.limit_price, (int, float)):
+                errors.append("limit_price must be a number")
+            elif trading_order.limit_price <= 0:
+                errors.append("limit_price must be greater than 0")
+                
+        # Validate stop orders have stop_price
+        if (hasattr(trading_order, 'order_type') and 
+            trading_order.order_type in [OrderType.BUY_STOP, OrderType.SELL_STOP]):
+            if not hasattr(trading_order, 'stop_price') or trading_order.stop_price is None:
+                errors.append(f"stop_price is required for {trading_order.order_type.value} orders")
+            elif not isinstance(trading_order.stop_price, (int, float)):
+                errors.append("stop_price must be a number")
+            elif trading_order.stop_price <= 0:
+                errors.append("stop_price must be greater than 0")
+                
+        # Validate status if present
+        if hasattr(trading_order, 'status') and trading_order.status is not None:
+            if not isinstance(trading_order.status, OrderStatus):
+                errors.append(f"status must be an OrderStatus enum, got {type(trading_order.status)}")
+                
+        # Validate open_type if present
+        if hasattr(trading_order, 'open_type') and trading_order.open_type is not None:
+            if not isinstance(trading_order.open_type, OrderOpenType):
+                errors.append(f"open_type must be an OrderOpenType enum, got {type(trading_order.open_type)}")
+                
+        # Validate dependency fields
+        if (hasattr(trading_order, 'depends_on_order') and trading_order.depends_on_order is not None):
+            if not isinstance(trading_order.depends_on_order, int):
+                errors.append("depends_on_order must be an integer")
+            elif trading_order.depends_on_order <= 0:
+                errors.append("depends_on_order must be a positive integer")
+                
+            # If depends_on_order is set, depends_order_status_trigger should also be set
+            if (not hasattr(trading_order, 'depends_order_status_trigger') or 
+                trading_order.depends_order_status_trigger is None):
+                errors.append("depends_order_status_trigger is required when depends_on_order is set")
+            elif not isinstance(trading_order.depends_order_status_trigger, OrderStatus):
+                errors.append("depends_order_status_trigger must be an OrderStatus enum")
+                
+        # Validate string fields for length and content
+        if hasattr(trading_order, 'comment') and trading_order.comment is not None:
+            if not isinstance(trading_order.comment, str):
+                errors.append("comment must be a string")
+            elif len(trading_order.comment) > 1000:  # Reasonable limit
+                errors.append("comment is too long (max 1000 characters)")
+                
+        if hasattr(trading_order, 'good_for') and trading_order.good_for is not None:
+            if not isinstance(trading_order.good_for, str):
+                errors.append("good_for must be a string")
+            elif trading_order.good_for.lower() not in ['gtc', 'day', 'ioc', 'fok']:
+                errors.append("good_for must be one of: 'gtc', 'day', 'ioc', 'fok'")
+                
+        return {
+            'is_valid': len(errors) == 0,
+            'errors': errors
+        }
 
     @abstractmethod
     def cancel_order(self, order_id: str) -> Any:

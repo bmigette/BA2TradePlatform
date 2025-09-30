@@ -148,8 +148,8 @@ def get_instance(model_class, instance_id):
         with Session(engine) as session:
             instance = session.get(model_class, instance_id)
             if not instance:
-                logger.error(f"Instance with id {instance_id} not found.", exc_info=True)
-                return None
+                logger.error(f"Instance with id {instance_id}/{model_class} not found.")
+                raise Exception(f"Instance with id {instance_id}/{model_class} not found.")
             #logger.debug(f"Retrieved instance: {instance}")
             return instance
     except Exception as e:

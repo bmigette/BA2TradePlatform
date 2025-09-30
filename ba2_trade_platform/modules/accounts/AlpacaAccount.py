@@ -57,16 +57,96 @@ class AlpacaAccount(AccountInterface):
         """
         Convert an Alpaca order object to a TradingOrder object.
         """
+        # Helper function to sanitize enum fields
+        def sanitize_enum_field(value, enum_class, field_name, nullable=True, default_value=None):
+            """
+            Sanitize enum values with proper logging and error handling.
+            
+            Args:
+                value: The value to sanitize
+                enum_class: The enum class to validate against
+                field_name: Name of the field for logging
+                nullable: Whether the field can be None
+                default_value: Default value if sanitization fails (only for non-nullable fields)
+            
+            Returns:
+                Sanitized enum value or None/default_value
+            
+            Raises:
+                ValueError: If field is not nullable and sanitization fails
+            """
+            if value is None:
+                if nullable:
+                    return None
+                elif default_value is not None:
+                    return default_value
+                else:
+                    raise ValueError(f"Required enum field '{field_name}' cannot be None")
+            
+            # Handle Alpaca enum objects - extract the .value attribute
+            if hasattr(value, 'value'):
+                str_value = str(value.value).lower()
+            else:
+                # Convert value to string for comparison
+                str_value = str(value).lower()
+            
+            # Try to find matching enum value (case-insensitive)
+            for enum_item in enum_class:
+                if enum_item.value.lower() == str_value:
+                    return enum_item
+            
+            # Special handling for OrderStatus
+            if enum_class == OrderStatus:
+                if str_value in ['unknown', 'invalid', '']:
+                    return OrderStatus.UNKNOWN
+                else:
+                    logger.warning(f"Unknown Alpaca order status '{value}' for field '{field_name}', setting to UNKNOWN")
+                    return OrderStatus.UNKNOWN
+            
+            # For other enums, log warning and handle based on nullability
+            if nullable:
+                logger.warning(f"Unknown value '{value}' for enum field '{field_name}', setting to None")
+                return None
+            elif default_value is not None:
+                logger.warning(f"Unknown value '{value}' for required enum field '{field_name}', using default value")
+                return default_value
+            else:
+                raise ValueError(f"Unknown value '{value}' for required enum field '{field_name}' and no default provided")
+        
+        # Sanitize enum fields
+        side = sanitize_enum_field(
+            getattr(order, "side", None), 
+            OrderDirection, 
+            "side", 
+            nullable=False
+        )
+        
+        order_type = sanitize_enum_field(
+            getattr(order, "type", None), 
+            OrderType, 
+            "order_type", 
+            nullable=False, 
+            default_value=OrderType.MARKET
+        )
+        
+        status = sanitize_enum_field(
+            getattr(order, "status", None), 
+            OrderStatus, 
+            "status", 
+            nullable=False, 
+            default_value=OrderStatus.UNKNOWN
+        )
+        
         return TradingOrder(
             broker_order_id=str(getattr(order, "id", None)) if getattr(order, "id", None) else None,  # Set Alpaca order ID as broker_order_id
             symbol=getattr(order, "symbol", None),
             quantity=getattr(order, "qty", None),
-            side=getattr(order, "side", None),
-            order_type=getattr(order, "type", None),
+            side=side,
+            order_type=order_type,
             good_for=getattr(order, "time_in_force", None),
             limit_price=getattr(order, "limit_price", None),
             stop_price=getattr(order, "stop_price", None),
-            status=getattr(order, "status", None),
+            status=status,
             filled_qty=getattr(order, "filled_qty", None),
             comment=getattr(order, "client_order_id", None),
             created_at=getattr(order, "created_at", None),
@@ -126,7 +206,7 @@ class AlpacaAccount(AccountInterface):
             logger.error(f"Error listing Alpaca orders: {e}", exc_info=True)
             return []
 
-    def submit_order(self, trading_order: TradingOrder) -> TradingOrder:
+    def _submit_order_impl(self, trading_order: TradingOrder) -> TradingOrder:
         """
         Submit a new order to Alpaca.
         
@@ -143,11 +223,11 @@ class AlpacaAccount(AccountInterface):
         try:
             # Log dependency information if provided
             if trading_order.depends_on_order is not None:
-                logger.info(f"Submitting order with dependency: depends on order {trading_order.depends_on_order} reaching status {depends_on_status}")
+                logger.info(f"Submitting order with dependency: depends on order {trading_order.depends_on_order} reaching status {trading_order.depends_order_status_trigger}")
             
 
             # Convert string values to enums
-            side = OrderSide.BUY if trading_order.side.upper() == 'BUY' else OrderSide.SELL
+            side = OrderSide.BUY if trading_order.side == OrderDirection.BUY else OrderSide.SELL
             # Map good_for to TimeInForce enum
             good_for_value = (trading_order.good_for or '').lower()
             tif_map = {
@@ -195,10 +275,10 @@ class AlpacaAccount(AccountInterface):
             logger.info(f"Submitted Alpaca order: {order.id}")
 
             # Convert to TradingOrder and set the broker_order_id
-            # result_order = self.alpaca_order_to_tradingorder(order)
+            result_order = self.alpaca_order_to_tradingorder(order)
             
             trading_order.broker_order_id = str(order.id) if order.id else None
-            trading_order.status = order.status if order.status else None
+            trading_order.status = result_order.status if result_order.status else None
             update_instance(trading_order)
             return trading_order
         except Exception as e:
@@ -390,14 +470,9 @@ class AlpacaAccount(AccountInterface):
                     )
                     db_order = session.exec(statement).first()
                     if db_order:
-                        # Update database order with current Alpaca state
-                        # Validate status against OrderStatus enum
-                        valid_statuses = set(item.value for item in OrderStatus)
-                        if alpaca_order.status not in valid_statuses:
-                            logger.error(f"Invalid Alpaca order status '{alpaca_order.status}' for order {alpaca_order.broker_order_id}. Setting status to 'unknown'.", exc_info=True)
-                            db_order.status = OrderStatus.UNKNOWN.value
-                        else:
-                            db_order.status = alpaca_order.status
+                        # Update database order with current Alpaca state using sanitized enum conversion
+                        # The alpaca_order already has sanitized enum values from alpaca_order_to_tradingorder
+                        db_order.status = alpaca_order.status
                         db_order.filled_qty = alpaca_order.filled_qty
                         # Update broker_order_id if it wasn't set before
                         if not db_order.broker_order_id:

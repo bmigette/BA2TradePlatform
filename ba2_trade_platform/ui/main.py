@@ -1,7 +1,53 @@
-from nicegui import ui
+from nicegui import ui, Client, app
 from .pages import overview, settings, marketanalysis, market_analysis_detail, rulesettest
 from .layout import layout_render
 from pathlib import Path
+
+# Configure NiceGUI JavaScript timeout globally
+# This affects all JavaScript requests throughout the application
+try:
+    # Try to set javascript timeout on Client class
+    if hasattr(Client, 'javascript_timeout'):
+        Client.javascript_timeout = 5.0
+    
+    # Also try to configure it via app settings
+    if hasattr(app, 'config'):
+        app.config['javascript_timeout'] = 5.0
+        
+except Exception as e:
+    print(f"Warning: Could not set JavaScript timeout: {e}")
+
+# Patch the JavaScriptRequest class to use a longer default timeout
+try:
+    from nicegui.javascript_request import JavaScriptRequest
+    
+    # Store the original __init__ method
+    original_init = JavaScriptRequest.__init__
+    
+    # Create a new __init__ that defaults to 5 second timeout
+    def new_init(self, request_id, *, timeout=5.0):
+        return original_init(self, request_id, timeout=timeout)
+    
+    # Replace the __init__ method
+    JavaScriptRequest.__init__ = new_init
+    print("Successfully patched JavaScriptRequest timeout to 5.0 seconds")
+    
+except Exception as e:
+    print(f"Warning: Could not patch JavaScript request timeout: {e}")
+
+# Also patch the client's run_javascript method to use higher timeout by default
+try:
+    from nicegui.client import Client
+    original_run_javascript = Client.run_javascript
+    
+    async def new_run_javascript(self, code, *, timeout=5.0):
+        return await original_run_javascript(self, code, timeout=timeout)
+    
+    Client.run_javascript = new_run_javascript
+    print("Successfully patched Client.run_javascript timeout to 5.0 seconds")
+    
+except Exception as e:
+    print(f"Warning: Could not patch Client.run_javascript timeout: {e}")
 
 
 
@@ -44,4 +90,14 @@ def rulesettest_page() -> None:
 
 STATICPATH = Path(__file__).parent / 'static'
 FAVICO = (STATICPATH / 'favicon.ico')
-ui.run(title="BA2 Trade Platform", reload=False, favicon=FAVICO)
+
+# Configure NiceGUI with increased timeouts
+ui.run(
+    title="BA2 Trade Platform", 
+    reload=False, 
+    favicon=FAVICO,
+    # Increase reconnect timeout (this is the supported parameter in NiceGUI 2.24.1)
+    reconnect_timeout=5.0,
+    # Increase binding refresh interval to reduce pressure
+    binding_refresh_interval=0.5,
+)

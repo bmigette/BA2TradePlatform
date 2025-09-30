@@ -13,6 +13,22 @@ class OrderStatus(str, Enum):
     WAITING_TRIGGER = "waiting_trigger"
     ACCEPTED = "accepted"
     REJECTED = "rejected"
+    PENDING_NEW = "pending_new"
+    # Additional Alpaca order statuses
+    PARTIALLY_FILLED = "partially_filled"
+    FILLED = "filled"
+    DONE_FOR_DAY = "done_for_day"
+    EXPIRED = "expired"
+    REPLACED = "replaced"
+    PENDING_CANCEL = "pending_cancel"
+    PENDING_REPLACE = "pending_replace"
+    PENDING_REVIEW = "pending_review"
+    ACCEPTED_FOR_BIDDING = "accepted_for_bidding"
+    STOPPED = "stopped"
+    SUSPENDED = "suspended"
+    CALCULATED = "calculated"
+    HELD = "held"
+
 
 
 class InstrumentType(str, Enum):
@@ -25,7 +41,7 @@ class OrderType(str, Enum):
     SELL_LIMIT = "sell_limit"
     BUY_STOP = "buy_stop"
     SELL_STOP = "sell_stop"
-
+    TRAILING_STOP = "trailing_stop"
 
 class OrderDirection(str, Enum):
     SELL = "SELL"

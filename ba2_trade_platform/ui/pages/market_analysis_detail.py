@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from ...core.db import get_instance, get_db
 from ...core.models import MarketAnalysis, ExpertInstance, AnalysisOutput, Instrument, TradingOrder, ExpertRecommendation
 from ...core.types import MarketAnalysisStatus, OrderStatus
+from ...core.MarketAnalysisPDFExport import export_market_analysis_pdf
 from ...logger import logger
 from sqlmodel import select
 
@@ -101,7 +102,9 @@ def content(analysis_id: int) -> None:
                         created_display = "Unknown"
                     ui.label(f'Created: {created_display}').classes('text-subtitle2')
                 
-                ui.button('Back to Market Analysis', on_click=lambda: ui.navigate.to('/marketanalysis'), icon='arrow_back')
+                with ui.column().classes('gap-2'):
+                    ui.button('Export PDF', on_click=lambda: _export_to_pdf(analysis_id), icon='picture_as_pdf').classes('bg-blue-600')
+                    ui.button('Back to Market Analysis', on_click=lambda: ui.navigate.to('/marketanalysis'), icon='arrow_back')
         
         # Handle different states based on analysis status
         if market_analysis.status == MarketAnalysisStatus.PENDING:
@@ -227,6 +230,32 @@ def _extract_error_message(state: Optional[Dict]) -> Optional[str]:
                             return f"[{agent_name}] {str(error_value)}"
     
     return None
+
+
+def _export_to_pdf(analysis_id: int) -> None:
+    """Export the market analysis to PDF and trigger download."""
+    try:
+        # Show loading notification
+        notification = ui.notification('Generating PDF...', type='ongoing')
+        
+        # Generate PDF
+        pdf_path = export_market_analysis_pdf(analysis_id)
+        
+        # Close loading notification
+        notification.dismiss()
+        
+        # Show success notification and trigger download
+        ui.notification(f'PDF generated successfully!', type='positive')
+        
+        # Trigger file download
+        ui.download(pdf_path)
+        
+    except ImportError as e:
+        ui.notification('PDF export requires reportlab package. Please install it.', type='negative')
+        logger.error(f"Missing reportlab dependency for PDF export: {e}", exc_info=True)
+    except Exception as e:
+        ui.notification(f'Error generating PDF: {str(e)}', type='negative')
+        logger.error(f"Error exporting analysis {analysis_id} to PDF: {e}", exc_info=True)
 
 
 def _render_error_banner(market_analysis: MarketAnalysis) -> None:

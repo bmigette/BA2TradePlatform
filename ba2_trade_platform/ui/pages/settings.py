@@ -717,7 +717,7 @@ class ExpertSettingsTab:
                     {'name': 'expert', 'label': 'Expert Type', 'field': 'expert', 'sortable': True},
                     {'name': 'user_description', 'label': 'User Notes', 'field': 'user_description'},
                     {'name': 'enabled', 'label': 'Enabled', 'field': 'enabled', 'align': 'center'},
-                    {'name': 'virtual_equity', 'label': 'Virtual Equity', 'field': 'virtual_equity', 'align': 'right'},
+                    {'name': 'virtual_equity_pct', 'label': 'Virtual Equity %', 'field': 'virtual_equity_pct', 'align': 'right'},
                     {'name': 'account_id', 'label': 'Account ID', 'field': 'account_id'},
                     {'name': 'actions', 'label': 'Actions', 'field': 'actions'}
                 ],
@@ -843,7 +843,7 @@ class ExpertSettingsTab:
                     self.expert_select.value = expert_instance.expert
                     self.user_description_textarea.value = expert_instance.user_description or ''
                     self.enabled_checkbox.value = expert_instance.enabled
-                    self.virtual_equity_input.value = str(expert_instance.virtual_equity)
+                    self.virtual_equity_input.value = str(expert_instance.virtual_equity_pct)
                     
                     # Find and set the account display string
                     account_instance = get_instance(AccountDefinition, expert_instance.account_id)
@@ -1626,7 +1626,7 @@ class ExpertSettingsTab:
                 expert_instance.expert = self.expert_select.value
                 expert_instance.user_description = self.user_description_textarea.value or None
                 expert_instance.enabled = self.enabled_checkbox.value
-                expert_instance.virtual_equity = float(self.virtual_equity_input.value)
+                expert_instance.virtual_equity_pct = float(self.virtual_equity_input.value)
                 expert_instance.account_id = account_id
                 
                 update_instance(expert_instance)
@@ -1639,7 +1639,7 @@ class ExpertSettingsTab:
                     expert=self.expert_select.value,
                     user_description=self.user_description_textarea.value or None,
                     enabled=self.enabled_checkbox.value,
-                    virtual_equity=float(self.virtual_equity_input.value),
+                    virtual_equity_pct=float(self.virtual_equity_input.value),
                     account_id=account_id
                 )
                 

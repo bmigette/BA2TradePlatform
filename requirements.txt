@@ -6,6 +6,7 @@ python-dotenv
 yahooquery
 APScheduler
 alembic
+reportlab
 
 # TradingAgents Tools
 typing-extensions

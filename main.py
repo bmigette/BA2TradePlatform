@@ -21,7 +21,9 @@ def initialize_system():
     
     # Clear any running analysis from previous session
     job_manager.clear_running_analysis_on_startup()
-    job_manager._execute_account_refresh()
+    
+    # Execute account refresh as an immediate background job (non-blocking)
+    job_manager.execute_account_refresh_immediately()
     
     job_manager.start()
 

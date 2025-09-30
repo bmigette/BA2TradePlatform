@@ -9,7 +9,7 @@ import json
 
 from ...core.db import get_all_instances, get_db, get_instance
 from ...core.models import AccountDefinition, MarketAnalysis, ExpertRecommendation, AppSetting, TradingOrder
-from ...core.types import MarketAnalysisStatus, OrderRecommendation, OrderStatus
+from ...core.types import MarketAnalysisStatus, OrderRecommendation, OrderStatus, OrderOpenType
 from ...core.utils import get_expert_instance_from_id, get_market_analysis_id_from_order_id
 from ...modules.accounts import providers
 from ...logger import logger
@@ -19,7 +19,20 @@ class OverviewTab:
         self.render()
     
     def render(self):
-        """Render the overview tab with widgets."""
+        """Render the overview tab                row = {
+                    'order_id': order.id,
+                    'account': account_name,
+                    'symbol': order.symbol,
+                    'side': order.side,
+                    'quantity': f"{order.quantity:.2f}" if order.quantity else '',
+                    'order_type': order.order_type,
+                    'status': order.status.value,
+                    'limit_price': f"${order.limit_price:.2f}" if order.limit_price else '',
+                    'comment': order.comment or '',
+                    'created_at': created_at_str,
+                    'waited_status': 'Waiting for trigger' if order.status == OrderStatus.WAITING_TRIGGER else '',
+                    'can_submit': order.status == OrderStatus.PENDING and not order.broker_order_id
+                }."""
         with ui.grid(columns=2).classes('w-full gap-4'):
             # Row 1: OpenAI Spending and Analysis Jobs
             self._render_openai_spending_widget()
@@ -769,7 +782,8 @@ class AccountOverviewTab:
                     'limit_price': f"${order.limit_price:.2f}" if order.limit_price else '',
                     'comment': order.comment or '',
                     'created_at': created_at_str,
-                    'waited_status': order.depends_order_status_trigger if order.status == OrderStatus.WAITING_TRIGGER else ''
+                    'waited_status': order.depends_order_status_trigger if order.status == OrderStatus.WAITING_TRIGGER else '',
+                    'can_submit': order.status == OrderStatus.PENDING and not order.broker_order_id
                 }
                 rows.append(row)
             
@@ -785,16 +799,93 @@ class AccountOverviewTab:
                 {'name': 'limit_price', 'label': 'Limit Price', 'field': 'limit_price'},
                 {'name': 'comment', 'label': 'Comment', 'field': 'comment'},
                 {'name': 'created_at', 'label': 'Created', 'field': 'created_at'},
-                {'name': 'waited_status', 'label': 'Waited Status', 'field': 'waited_status'}
+                {'name': 'waited_status', 'label': 'Waited Status', 'field': 'waited_status'},
+                {'name': 'actions', 'label': 'Actions', 'field': 'actions'}
             ]
             
-            ui.table(columns=columns, rows=rows, row_key='order_id').classes('w-full')
+            table = ui.table(columns=columns, rows=rows, row_key='order_id').classes('w-full')
+            
+            # Add submit button slot for pending orders
+            table.add_slot('body-cell-actions', '''
+                <q-td :props="props">
+                    <q-btn v-if="props.row.can_submit" 
+                           icon="send" 
+                           flat 
+                           dense 
+                           color="primary" 
+                           @click="$parent.$emit('submit_order', props.row.order_id)"
+                           title="Submit Order to Broker">
+                        <q-tooltip>Submit Order</q-tooltip>
+                    </q-btn>
+                    <span v-else class="text-grey-5">—</span>
+                </q-td>
+            ''')
+            
+            # Handle submit order event
+            table.on('submit_order', self._handle_submit_order)
             
         except Exception as e:
             logger.error(f"Error rendering pending orders table: {e}", exc_info=True)
             ui.label(f'Error loading pending orders: {str(e)}').classes('text-red-500')
         finally:
             session.close()
+    
+    def _handle_submit_order(self, event_data):
+        """Handle submit order button click."""
+        try:
+            order_id = event_data.args if hasattr(event_data, 'args') else event_data
+            
+            # Get the order
+            order = get_instance(TradingOrder, order_id)
+            if not order:
+                ui.notify('Order not found', type='negative')
+                return
+                
+            if order.status != OrderStatus.PENDING:
+                ui.notify('Can only submit orders with PENDING status', type='negative')
+                return
+                
+            if order.broker_order_id:
+                ui.notify('Order already submitted to broker', type='warning')
+                return
+            
+            # Mark this order as manually submitted
+            if order.open_type != OrderOpenType.MANUAL:
+                from ...core.db import update_instance
+                order.open_type = OrderOpenType.MANUAL
+                update_instance(order)
+            
+            # Get the account
+            account = get_instance(AccountDefinition, order.account_id)
+            if not account:
+                ui.notify('Account not found', type='negative')
+                return
+            
+            # Submit the order through the account provider
+            from ...modules.accounts import providers
+            provider_cls = providers.get(account.provider)
+            if not provider_cls:
+                ui.notify(f'No provider found for {account.provider}', type='negative')
+                return
+                
+            try:
+                provider_obj = provider_cls(account.id)
+                submitted_order = provider_obj.submit_order(order)
+                
+                if submitted_order:
+                    ui.notify(f'Order {order_id} submitted successfully to {account.provider}', type='positive')
+                    # Refresh the table
+                    self.render()
+                else:
+                    ui.notify(f'Failed to submit order {order_id} to broker', type='negative')
+                    
+            except Exception as e:
+                logger.error(f"Error submitting order {order_id}: {e}", exc_info=True)
+                ui.notify(f'Error submitting order: {str(e)}', type='negative')
+                
+        except Exception as e:
+            logger.error(f"Error handling submit order: {e}", exc_info=True)
+            ui.notify(f'Error: {str(e)}', type='negative')
 
 class TradeHistoryTab:
     def __init__(self):

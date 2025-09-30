@@ -406,6 +406,35 @@ class JobManager:
         except Exception as e:
             logger.error(f"Error scheduling account refresh job: {e}", exc_info=True)
     
+    def execute_account_refresh_immediately(self):
+        """
+        Execute account refresh as an immediate job without blocking the main thread.
+        This submits the account refresh to run asynchronously in the background.
+        """
+        try:
+            logger.info("Scheduling immediate account refresh job")
+            
+            # Add a one-time job that runs immediately
+            job_id = f"account_refresh_immediate_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+            
+            job = self._scheduler.add_job(
+                func=self._execute_account_refresh,
+                trigger='date',  # Run once at the specified time
+                run_date=datetime.now(),  # Run immediately
+                id=job_id,
+                name="Immediate Account Refresh Job",
+                replace_existing=False,
+                max_instances=1,  # Prevent job overlap
+                coalesce=True     # Coalesce multiple missed executions
+            )
+            
+            logger.info(f"Immediate account refresh job scheduled with ID: {job_id}")
+            return job_id
+            
+        except Exception as e:
+            logger.error(f"Error scheduling immediate account refresh job: {e}", exc_info=True)
+            return None
+    
     def _execute_account_refresh(self):
         """Execute the account refresh job."""
         try:
