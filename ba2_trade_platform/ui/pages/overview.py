@@ -15,8 +15,83 @@ from ...modules.accounts import providers
 from ...logger import logger
 
 class OverviewTab:
-    def __init__(self):
+    def __init__(self, tabs_ref=None):
+        self.tabs_ref = tabs_ref
         self.render()
+    
+    def _check_and_display_error_orders(self):
+        """Check for orders with ERROR status and display alert banner."""
+        session = get_db()
+        try:
+            # Query for ERROR orders
+            error_orders = session.exec(
+                select(TradingOrder)
+                .where(TradingOrder.status == OrderStatus.ERROR)
+            ).all()
+            
+            if error_orders:
+                error_count = len(error_orders)
+                
+                # Create alert banner
+                with ui.card().classes('w-full bg-red-50 border-l-4 border-red-500 p-4 mb-4'):
+                    with ui.row().classes('w-full items-center gap-4'):
+                        ui.icon('error', size='lg').classes('text-red-600')
+                        with ui.column().classes('flex-1'):
+                            ui.label(f'⚠️ {error_count} Order{"s" if error_count > 1 else ""} Failed').classes('text-lg font-bold text-red-800')
+                            ui.label(f'There {"are" if error_count > 1 else "is"} {error_count} order{"s" if error_count > 1 else ""} with ERROR status that need{"" if error_count > 1 else "s"} attention.').classes('text-sm text-red-700')
+                        
+                        # View details button
+                        ui.button('View Orders', on_click=lambda: ui.navigate.to('/trading')).props('outline color=red')
+                
+                # Log the error orders for debugging
+                logger.warning(f"Found {error_count} orders with ERROR status on overview page")
+                for order in error_orders:
+                    logger.debug(f"ERROR Order {order.id}: {order.symbol} - {order.comment}")
+        
+        except Exception as e:
+            logger.error(f"Error checking for ERROR orders: {e}", exc_info=True)
+        finally:
+            session.close()
+    
+    def _check_and_display_pending_orders(self, tabs_ref=None):
+        """Check for pending orders and display notification banner."""
+        session = get_db()
+        try:
+            # Query for PENDING orders that haven't been submitted to broker yet
+            pending_orders = session.exec(
+                select(TradingOrder)
+                .where(TradingOrder.status == OrderStatus.PENDING)
+                .where(TradingOrder.broker_order_id == None)
+            ).all()
+            
+            if pending_orders:
+                pending_count = len(pending_orders)
+                
+                # Function to switch to Account Overview tab
+                def switch_to_account_overview():
+                    if tabs_ref:
+                        tabs_ref.set_value('Account Overview')
+                
+                # Create notification banner
+                with ui.card().classes('w-full bg-blue-50 border-l-4 border-blue-500 p-4 mb-4'):
+                    with ui.row().classes('w-full items-center gap-4'):
+                        ui.icon('pending_actions', size='lg').classes('text-blue-600')
+                        with ui.column().classes('flex-1'):
+                            ui.label(f'📋 {pending_count} Pending Order{"s" if pending_count > 1 else ""} to Review').classes('text-lg font-bold text-blue-800')
+                            ui.label(f'There {"are" if pending_count > 1 else "is"} {pending_count} order{"s" if pending_count > 1 else ""} awaiting review and submission.').classes('text-sm text-blue-700')
+                        
+                        # View details button
+                        ui.button('Review Orders', on_click=switch_to_account_overview).props('outline color=blue')
+                
+                # Log the pending orders
+                logger.info(f"Found {pending_count} pending orders on overview page")
+                for order in pending_orders:
+                    logger.debug(f"PENDING Order {order.id}: {order.symbol} - {order.comment}")
+        
+        except Exception as e:
+            logger.error(f"Error checking for pending orders: {e}", exc_info=True)
+        finally:
+            session.close()
     
     def render(self):
         """Render the overview tab                row = {
@@ -33,13 +108,21 @@ class OverviewTab:
                     'waited_status': 'Waiting for trigger' if order.status == OrderStatus.WAITING_TRIGGER else '',
                     'can_submit': order.status == OrderStatus.PENDING and not order.broker_order_id
                 }."""
+        
+        # Check for ERROR orders and display alert
+        self._check_and_display_error_orders()
+        
+        # Check for PENDING orders and display notification
+        self._check_and_display_pending_orders(self.tabs_ref)
+        
         with ui.grid(columns=2).classes('w-full gap-4'):
             # Row 1: OpenAI Spending and Analysis Jobs
             self._render_openai_spending_widget()
             self._render_analysis_jobs_widget()
             
-            # Row 2: Order Recommendations (spanning both columns)
-            with ui.column().classes('col-span-2'):
+            # Row 2: Order Statistics per Account and Order Recommendations
+            self._render_order_statistics_widget()
+            with ui.column().classes(''):
                 self._render_order_recommendations_widget()
     
     def _render_openai_spending_widget(self):
@@ -94,6 +177,69 @@ class OverviewTab:
             with ui.row().classes('w-full justify-between items-center mb-2'):
                 ui.label('⏳ Running:').classes('text-sm')
                 ui.label(str(running_count)).classes('text-sm font-bold text-orange-600')
+    
+    def _render_order_statistics_widget(self):
+        """Widget showing order statistics per account."""
+        with ui.card().classes('p-4'):
+            ui.label('📋 Orders by Account').classes('text-h6 mb-4')
+            
+            # Get all accounts
+            accounts = get_all_instances(AccountDefinition)
+            
+            if not accounts:
+                ui.label('No accounts configured').classes('text-sm text-gray-500')
+                return
+            
+            session = get_db()
+            try:
+                for account in accounts:
+                    # Count orders by status for this account
+                    # Open orders = FILLED, NEW, OPEN, ACCEPTED
+                    open_count = session.exec(
+                        select(func.count(TradingOrder.id))
+                        .where(TradingOrder.account_id == account.id)
+                        .where(TradingOrder.status.in_([
+                            OrderStatus.FILLED, 
+                            OrderStatus.NEW, 
+                            OrderStatus.OPEN, 
+                            OrderStatus.ACCEPTED
+                        ]))
+                    ).first() or 0
+                    
+                    pending_count = session.exec(
+                        select(func.count(TradingOrder.id))
+                        .where(TradingOrder.account_id == account.id)
+                        .where(TradingOrder.status.in_([OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER]))
+                    ).first() or 0
+                    
+                    error_count = session.exec(
+                        select(func.count(TradingOrder.id))
+                        .where(TradingOrder.account_id == account.id)
+                        .where(TradingOrder.status == OrderStatus.ERROR)
+                    ).first() or 0
+                    
+                    # Display account section
+                    with ui.column().classes('w-full mb-4'):
+                        ui.label(f'🏦 {account.name}').classes('text-sm font-bold mb-2')
+                        
+                        with ui.row().classes('w-full justify-between items-center mb-1'):
+                            ui.label('📂 Open:').classes('text-xs')
+                            ui.label(str(open_count)).classes('text-xs font-bold text-blue-600')
+                        
+                        with ui.row().classes('w-full justify-between items-center mb-1'):
+                            ui.label('⏳ Pending:').classes('text-xs')
+                            ui.label(str(pending_count)).classes('text-xs font-bold text-orange-600')
+                        
+                        with ui.row().classes('w-full justify-between items-center mb-1'):
+                            ui.label('❌ Error:').classes('text-xs')
+                            ui.label(str(error_count)).classes('text-xs font-bold text-red-600')
+                        
+                        # Add separator between accounts (except for last one)
+                        if account != accounts[-1]:
+                            ui.separator().classes('my-2')
+                            
+            finally:
+                session.close()
     
     def _render_order_recommendations_widget(self):
         """Widget showing order recommendation statistics."""
@@ -1035,7 +1181,7 @@ def content() -> None:
 
     with ui.tab_panels(tabs, value=overview_tab).classes('w-full'):
         with ui.tab_panel(overview_tab):
-            OverviewTab()
+            OverviewTab(tabs_ref=tabs)
         with ui.tab_panel('Account Overview'):
             AccountOverviewTab()
         with ui.tab_panel('Trade History'):

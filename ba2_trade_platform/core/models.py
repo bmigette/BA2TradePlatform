@@ -27,6 +27,8 @@ class ExpertInstance(SQLModel, table=True):
     enabled: bool = Field(default=True)
     user_description: str | None = Field(default=None)
     virtual_equity_pct: float = Field(default=100.0)
+    enter_market_ruleset_id: int | None = Field(default=None, foreign_key="ruleset.id", nullable=True, ondelete="SET NULL")
+    open_positions_ruleset_id: int | None = Field(default=None, foreign_key="ruleset.id", nullable=True, ondelete="SET NULL")
 
 class ExpertSetting(SQLModel, table=True):
     __table_args__ = (UniqueConstraint('instance_id', 'key', name='uix_expertsetting_instanceid_key'),)

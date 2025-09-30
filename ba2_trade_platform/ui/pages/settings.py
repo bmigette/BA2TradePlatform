@@ -719,6 +719,8 @@ class ExpertSettingsTab:
                     {'name': 'enabled', 'label': 'Enabled', 'field': 'enabled', 'align': 'center'},
                     {'name': 'virtual_equity_pct', 'label': 'Virtual Equity %', 'field': 'virtual_equity_pct', 'align': 'right'},
                     {'name': 'account_id', 'label': 'Account ID', 'field': 'account_id'},
+                    {'name': 'enter_market_ruleset_name', 'label': 'Enter Market Ruleset', 'field': 'enter_market_ruleset_name'},
+                    {'name': 'open_positions_ruleset_name', 'label': 'Open Positions Ruleset', 'field': 'open_positions_ruleset_name'},
                     {'name': 'actions', 'label': 'Actions', 'field': 'actions'}
                 ],
                 rows=self._get_all_expert_instances(),
@@ -760,6 +762,19 @@ class ExpertSettingsTab:
                 else:
                     row['user_description'] = user_desc
                 
+                # Fetch and add ruleset names
+                if instance.enter_market_ruleset_id:
+                    enter_market_ruleset = get_instance(Ruleset, instance.enter_market_ruleset_id)
+                    row['enter_market_ruleset_name'] = enter_market_ruleset.name if enter_market_ruleset else '(Not found)'
+                else:
+                    row['enter_market_ruleset_name'] = '(None)'
+                
+                if instance.open_positions_ruleset_id:
+                    open_positions_ruleset = get_instance(Ruleset, instance.open_positions_ruleset_id)
+                    row['open_positions_ruleset_name'] = open_positions_ruleset.name if open_positions_ruleset else '(Not found)'
+                else:
+                    row['open_positions_ruleset_name'] = '(None)'
+                
                 rows.append(row)
             logger.debug(f'Fetched {len(rows)} expert instances')
             return rows
@@ -795,6 +810,85 @@ class ExpertSettingsTab:
             if f"{acc.name} ({acc.provider})" == display_string:
                 return acc.id
         return None
+    
+    def _get_rulesets_by_use_case(self, use_case):
+        """Get rulesets filtered by AnalysisUseCase subtype.
+        
+        Args:
+            use_case: 'enter_market' or 'open_positions'
+            
+        Returns:
+            Dictionary mapping ruleset display names to IDs, plus None option
+        """
+        from ...core.types import AnalysisUseCase
+        from sqlmodel import select
+        
+        # Map string to enum
+        if use_case == 'enter_market':
+            subtype = AnalysisUseCase.ENTER_MARKET
+        elif use_case == 'open_positions':
+            subtype = AnalysisUseCase.OPEN_POSITIONS
+        else:
+            return {'(None)': None}
+        
+        # Get all rulesets with matching subtype or no subtype
+        session = get_db()
+        statement = select(Ruleset).where(
+            (Ruleset.subtype == subtype) | (Ruleset.subtype == None)
+        )
+        rulesets = session.exec(statement).all()
+        session.close()
+        
+        # Create display dictionary
+        result = {'(None)': None}
+        for ruleset in rulesets:
+            display_name = ruleset.name
+            if ruleset.description:
+                display_name += f" - {ruleset.description[:50]}"
+            result[display_name] = ruleset.id
+        
+        return result
+    
+    def _get_rulesets_list_by_use_case(self, use_case):
+        """Get rulesets filtered by AnalysisUseCase subtype as a list and mapping.
+        
+        Args:
+            use_case: 'enter_market' or 'open_positions'
+            
+        Returns:
+            Tuple of (list of display names, dict mapping display names to IDs)
+        """
+        from ...core.types import AnalysisUseCase
+        from sqlmodel import select
+        
+        # Map string to enum
+        if use_case == 'enter_market':
+            subtype = AnalysisUseCase.ENTER_MARKET
+        elif use_case == 'open_positions':
+            subtype = AnalysisUseCase.OPEN_POSITIONS
+        else:
+            return ['(None)'], {'(None)': None}
+        
+        # Get all rulesets with matching subtype or no subtype
+        session = get_db()
+        statement = select(Ruleset).where(
+            (Ruleset.subtype == subtype) | (Ruleset.subtype == None)
+        )
+        rulesets = session.exec(statement).all()
+        session.close()
+        
+        # Create display list and mapping
+        display_list = ['(None)']
+        name_to_id_map = {'(None)': None}
+        
+        for ruleset in rulesets:
+            display_name = ruleset.name
+            if ruleset.description:
+                display_name += f" - {ruleset.description[:50]}"
+            display_list.append(display_name)
+            name_to_id_map[display_name] = ruleset.id
+        
+        return display_list, name_to_id_map
     
     def show_dialog(self, expert_instance=None):
         """Show the add/edit expert dialog."""
@@ -979,6 +1073,33 @@ class ExpertSettingsTab:
                                 value=False
                             )
                             ui.label('Allows the expert to automatically modify or close existing positions').classes('text-body2 text-grey-7 ml-6')
+                        
+                        ui.separator().classes('my-4')
+                        
+                        # Ruleset assignment settings
+                        ui.label('Automation Rulesets:').classes('text-subtitle2 mb-2')
+                        ui.label('Assign rulesets to control automated trading behavior:').classes('text-body2 mb-2')
+                        
+                        with ui.column().classes('w-full gap-2'):
+                            # Enter Market Ruleset
+                            enter_market_rulesets_list, self.enter_market_ruleset_map = self._get_rulesets_list_by_use_case('enter_market')
+                            self.enter_market_ruleset_select = ui.select(
+                                options=enter_market_rulesets_list,
+                                label='Enter Market Ruleset',
+                                with_input=True,
+                                clearable=True
+                            ).classes('w-full')
+                            ui.label('Ruleset to evaluate when creating new positions from expert recommendations').classes('text-body2 text-grey-7 ml-2')
+                            
+                            # Open Positions Ruleset
+                            open_positions_rulesets_list, self.open_positions_ruleset_map = self._get_rulesets_list_by_use_case('open_positions')
+                            self.open_positions_ruleset_select = ui.select(
+                                options=open_positions_rulesets_list,
+                                label='Open Positions Ruleset',
+                                with_input=True,
+                                clearable=True
+                            ).classes('w-full')
+                            ui.label('Ruleset to evaluate when managing existing open positions').classes('text-body2 text-grey-7 ml-2')
                     
                     # Instruments tab
                     with ui.tab_panel('Instruments'):
@@ -1346,8 +1467,29 @@ class ExpertSettingsTab:
                 self.allow_automated_trade_opening_checkbox.value = allow_automated_trade_opening
             if hasattr(self, 'allow_automated_trade_modification_checkbox'):
                 self.allow_automated_trade_modification_checkbox.value = allow_automated_trade_modification
+            
+            # Load ruleset assignments from ExpertInstance model
+            if hasattr(self, 'enter_market_ruleset_select') and hasattr(self, 'enter_market_ruleset_map'):
+                if expert_instance.enter_market_ruleset_id:
+                    # Find the display name for this ruleset ID
+                    for display_name, ruleset_id in self.enter_market_ruleset_map.items():
+                        if ruleset_id == expert_instance.enter_market_ruleset_id:
+                            self.enter_market_ruleset_select.value = display_name
+                            break
+                else:
+                    self.enter_market_ruleset_select.value = '(None)'
+            
+            if hasattr(self, 'open_positions_ruleset_select') and hasattr(self, 'open_positions_ruleset_map'):
+                if expert_instance.open_positions_ruleset_id:
+                    # Find the display name for this ruleset ID
+                    for display_name, ruleset_id in self.open_positions_ruleset_map.items():
+                        if ruleset_id == expert_instance.open_positions_ruleset_id:
+                            self.open_positions_ruleset_select.value = display_name
+                            break
+                else:
+                    self.open_positions_ruleset_select.value = '(None)'
                 
-            logger.debug(f'Loaded general settings for expert {expert_instance.id}: enter_market_schedule={enter_market_schedule}, open_positions_schedule={open_positions_schedule}, buy={enable_buy}, sell={enable_sell}, auto_open={allow_automated_trade_opening}, auto_modify={allow_automated_trade_modification}')
+            logger.debug(f'Loaded general settings for expert {expert_instance.id}: enter_market_schedule={enter_market_schedule}, open_positions_schedule={open_positions_schedule}, buy={enable_buy}, sell={enable_sell}, auto_open={allow_automated_trade_opening}, auto_modify={allow_automated_trade_modification}, enter_market_ruleset_id={expert_instance.enter_market_ruleset_id}, open_positions_ruleset_id={expert_instance.open_positions_ruleset_id}')
             
         except Exception as e:
             logger.error(f'Error loading general settings for expert {expert_instance.id}: {e}', exc_info=True)
@@ -1629,18 +1771,37 @@ class ExpertSettingsTab:
                 expert_instance.virtual_equity_pct = float(self.virtual_equity_input.value)
                 expert_instance.account_id = account_id
                 
+                # Update ruleset assignments - convert display name to ID
+                if hasattr(self, 'enter_market_ruleset_select') and hasattr(self, 'enter_market_ruleset_map'):
+                    selected_display_name = self.enter_market_ruleset_select.value
+                    expert_instance.enter_market_ruleset_id = self.enter_market_ruleset_map.get(selected_display_name)
+                if hasattr(self, 'open_positions_ruleset_select') and hasattr(self, 'open_positions_ruleset_map'):
+                    selected_display_name = self.open_positions_ruleset_select.value
+                    expert_instance.open_positions_ruleset_id = self.open_positions_ruleset_map.get(selected_display_name)
+                
                 update_instance(expert_instance)
                 logger.info(f"Updated expert instance: {expert_instance.id}")
                 
                 expert_id = expert_instance.id
             else:
                 # Create new instance
+                enter_market_id = None
+                open_positions_id = None
+                if hasattr(self, 'enter_market_ruleset_select') and hasattr(self, 'enter_market_ruleset_map'):
+                    selected_display_name = self.enter_market_ruleset_select.value
+                    enter_market_id = self.enter_market_ruleset_map.get(selected_display_name)
+                if hasattr(self, 'open_positions_ruleset_select') and hasattr(self, 'open_positions_ruleset_map'):
+                    selected_display_name = self.open_positions_ruleset_select.value
+                    open_positions_id = self.open_positions_ruleset_map.get(selected_display_name)
+                
                 new_instance = ExpertInstance(
                     expert=self.expert_select.value,
                     user_description=self.user_description_textarea.value or None,
                     enabled=self.enabled_checkbox.value,
                     virtual_equity_pct=float(self.virtual_equity_input.value),
-                    account_id=account_id
+                    account_id=account_id,
+                    enter_market_ruleset_id=enter_market_id,
+                    open_positions_ruleset_id=open_positions_id
                 )
                 
                 expert_id = add_instance(new_instance)
@@ -1831,12 +1992,14 @@ class TradeSettingsTab:
                     
                     self.rules_table.add_slot('body-cell-actions', """
                         <q-td :props="props">
-                            <q-btn @click="$parent.$emit('edit', props)" icon="edit" flat dense color='blue'/>
-                            <q-btn @click="$parent.$emit('del', props)" icon="delete" flat dense color='red'/>
+                            <q-btn @click="$parent.$emit('edit', props)" icon="edit" flat dense color='blue' title="Edit Rule"/>
+                            <q-btn @click="$parent.$emit('duplicate', props)" icon="content_copy" flat dense color='green' title="Duplicate Rule"/>
+                            <q-btn @click="$parent.$emit('del', props)" icon="delete" flat dense color='red' title="Delete Rule"/>
                         </q-td>
                     """)
                     
                     self.rules_table.on('edit', self._on_rule_edit_click)
+                    self.rules_table.on('duplicate', self._on_rule_duplicate_click)
                     self.rules_table.on('del', self._on_rule_del_click)
                 
                 # Rulesets tab
@@ -1866,6 +2029,7 @@ class TradeSettingsTab:
                         <q-td :props="props">
                             <q-btn @click="$parent.$emit('test', props)" icon="science" flat dense color='green' title="Test Ruleset"/>
                             <q-btn @click="$parent.$emit('edit', props)" icon="edit" flat dense color='blue' title="Edit Ruleset"/>
+                            <q-btn @click="$parent.$emit('duplicate', props)" icon="content_copy" flat dense color='orange' title="Duplicate Ruleset"/>
                             <q-btn @click="$parent.$emit('reorder', props)" icon="reorder" flat dense color='purple' title="Reorder Rules"/>
                             <q-btn @click="$parent.$emit('del', props)" icon="delete" flat dense color='red' title="Delete Ruleset"/>
                         </q-td>
@@ -1873,6 +2037,7 @@ class TradeSettingsTab:
                     
                     self.rulesets_table.on('test', self._on_ruleset_test_click)
                     self.rulesets_table.on('edit', self._on_ruleset_edit_click)
+                    self.rulesets_table.on('duplicate', self._on_ruleset_duplicate_click)
                     self.rulesets_table.on('reorder', self._on_ruleset_reorder_click)
                     self.rulesets_table.on('del', self._on_ruleset_del_click)
         
@@ -2459,6 +2624,37 @@ class TradeSettingsTab:
             logger.warning(f'Rule with id {rule_id} not found')
             ui.notify('Rule not found', type='error')
     
+    def _on_rule_duplicate_click(self, msg):
+        """Handle duplicate button click for rules."""
+        logger.debug(f'Duplicate rule table click: {msg}')
+        row = msg.args['row']
+        rule_id = row['id']
+        rule = get_instance(EventAction, rule_id)
+        if rule:
+            try:
+                logger.debug(f'Duplicating rule {rule_id}')
+                
+                # Create a new rule with copied data
+                new_rule = EventAction(
+                    name=f"{rule.name} (Copy)",
+                    type=rule.type,
+                    subtype=rule.subtype,
+                    continue_processing=rule.continue_processing,
+                    triggers=rule.triggers.copy() if rule.triggers else {},
+                    actions=rule.actions.copy() if rule.actions else {}
+                )
+                
+                new_rule_id = add_instance(new_rule)
+                logger.info(f'Rule {rule_id} duplicated as {new_rule_id}')
+                ui.notify(f'Rule duplicated successfully as "{new_rule.name}"', type='positive')
+                self._update_rules_table()
+            except Exception as e:
+                logger.error(f'Error duplicating rule {rule_id}: {e}', exc_info=True)
+                ui.notify(f'Error duplicating rule: {e}', type='negative')
+        else:
+            logger.warning(f'Rule with id {rule_id} not found')
+            ui.notify('Rule not found', type='error')
+    
     def _on_ruleset_test_click(self, msg):
         """Handle test button click for rulesets."""
         logger.debug(f'Test ruleset table click: {msg}')
@@ -2511,6 +2707,66 @@ class TradeSettingsTab:
         else:
             logger.warning(f'Ruleset with id {ruleset_id} not found')
             ui.notify('Ruleset not found', type='error')
+    
+    def _on_ruleset_duplicate_click(self, msg):
+        """Handle duplicate button click for rulesets."""
+        logger.debug(f'Duplicate ruleset table click: {msg}')
+        row = msg.args['row']
+        ruleset_id = row['id']
+        
+        session = get_db()
+        try:
+            # Get the original ruleset with relationships loaded
+            from sqlmodel import select
+            from sqlalchemy.orm import selectinload
+            from ...core.models import RulesetEventActionLink
+            
+            statement = select(Ruleset).where(Ruleset.id == ruleset_id).options(selectinload(Ruleset.event_actions))
+            ruleset = session.exec(statement).first()
+            
+            if ruleset:
+                logger.debug(f'Duplicating ruleset {ruleset_id}')
+                
+                # Create a new ruleset with copied data
+                new_ruleset = Ruleset(
+                    name=f"{ruleset.name} (Copy)",
+                    description=ruleset.description,
+                    subtype=ruleset.subtype
+                )
+                
+                new_ruleset_id = add_instance(new_ruleset, session)
+                session.commit()
+                
+                # Copy the rule associations with their order
+                if ruleset.event_actions:
+                    # Get the link records to preserve order
+                    links_statement = select(RulesetEventActionLink).where(
+                        RulesetEventActionLink.ruleset_id == ruleset_id
+                    ).order_by(RulesetEventActionLink.order)
+                    links = session.exec(links_statement).all()
+                    
+                    for link in links:
+                        new_link = RulesetEventActionLink(
+                            ruleset_id=new_ruleset_id,
+                            event_action_id=link.event_action_id,
+                            order=link.order
+                        )
+                        session.add(new_link)
+                    
+                    session.commit()
+                
+                logger.info(f'Ruleset {ruleset_id} duplicated as {new_ruleset_id} with {len(ruleset.event_actions) if ruleset.event_actions else 0} rules')
+                ui.notify(f'Ruleset duplicated successfully as "{new_ruleset.name}"', type='positive')
+                self._update_rulesets_table()
+            else:
+                logger.warning(f'Ruleset with id {ruleset_id} not found')
+                ui.notify('Ruleset not found', type='error')
+                
+        except Exception as e:
+            logger.error(f'Error duplicating ruleset {ruleset_id}: {e}', exc_info=True)
+            ui.notify(f'Error duplicating ruleset: {e}', type='negative')
+        finally:
+            session.close()
     
     def _on_ruleset_reorder_click(self, msg):
         """Handle reorder button click for rulesets."""

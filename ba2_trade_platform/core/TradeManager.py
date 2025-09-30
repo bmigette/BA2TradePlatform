@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 import logging
 from ..logger import logger
 from .models import ExpertRecommendation, ExpertInstance, TradingOrder, Ruleset
-from .types import OrderRecommendation, OrderStatus, OrderDirection, OrderOpenType
+from .types import OrderRecommendation, OrderStatus, OrderDirection, OrderOpenType, OrderType
 from .db import get_instance, get_all_instances, add_instance, update_instance
 
 
@@ -320,25 +320,17 @@ class TradeManager:
             True if recommendation passes all rulesets, False otherwise
         """
         try:
-            # Load expert instance with appropriate class
-            from .utils import get_expert_instance_from_id
-            expert = get_expert_instance_from_id(expert_instance.id)
-            if not expert:
-                return True  # If no expert instance, allow by default
-            
-            # Get enter market ruleset (for new positions)
-            enter_market_ruleset_id = expert.settings.get('enter_market_ruleset')
-            if enter_market_ruleset_id:
-                ruleset = get_instance(Ruleset, enter_market_ruleset_id)
+            # Get enter market ruleset (for new positions) from the model field
+            if expert_instance.enter_market_ruleset_id:
+                ruleset = self._get_ruleset_with_relations(expert_instance.enter_market_ruleset_id)
                 if ruleset:
                     if not self._evaluate_ruleset(ruleset, recommendation, expert_instance):
                         self.logger.info(f"Recommendation rejected by enter market ruleset {ruleset.name}")
                         return False
                         
-            # Get open positions ruleset (for managing existing positions)
-            open_positions_ruleset_id = expert.settings.get('open_positions_ruleset')
-            if open_positions_ruleset_id:
-                ruleset = get_instance(Ruleset, open_positions_ruleset_id)
+            # Get open positions ruleset (for managing existing positions) from the model field
+            if expert_instance.open_positions_ruleset_id:
+                ruleset = self._get_ruleset_with_relations(expert_instance.open_positions_ruleset_id)
                 if ruleset:
                     if not self._evaluate_ruleset(ruleset, recommendation, expert_instance):
                         self.logger.info(f"Recommendation rejected by open positions ruleset {ruleset.name}")
@@ -349,6 +341,42 @@ class TradeManager:
         except Exception as e:
             self.logger.error(f"Error applying rulesets: {e}", exc_info=True)
             return True  # Allow by default if error
+    
+    def _get_ruleset_with_relations(self, ruleset_id: int) -> Optional[Ruleset]:
+        """
+        Get a ruleset with its event_actions relationship eagerly loaded.
+        
+        Args:
+            ruleset_id: The ID of the ruleset to fetch
+            
+        Returns:
+            Ruleset with event_actions loaded, or None if not found
+        """
+        try:
+            from sqlmodel import select
+            from sqlalchemy.orm import selectinload
+            from .db import get_db
+            
+            with get_db() as session:
+                # Use selectinload to eagerly load the event_actions relationship
+                statement = select(Ruleset).where(Ruleset.id == ruleset_id).options(
+                    selectinload(Ruleset.event_actions)
+                )
+                ruleset = session.exec(statement).first()
+                
+                if not ruleset:
+                    self.logger.warning(f"Ruleset {ruleset_id} not found")
+                    return None
+                
+                # Make the ruleset persistent by expunging it from the session
+                # This allows it to be used outside the session context
+                session.expunge(ruleset)
+                
+                return ruleset
+                
+        except Exception as e:
+            self.logger.error(f"Error fetching ruleset {ruleset_id}: {e}", exc_info=True)
+            return None
             
     def _evaluate_ruleset(self, ruleset: Ruleset, recommendation: ExpertRecommendation, expert_instance: ExpertInstance) -> bool:
         """
@@ -519,6 +547,162 @@ class TradeManager:
             self.logger.error(f"Error processing pending recommendations: {e}", exc_info=True)
             
         return placed_orders
+    
+    def process_expert_recommendations_after_analysis(self, expert_instance_id: int) -> List[TradingOrder]:
+        """
+        Process expert recommendations after all market analysis jobs for enter_market are completed.
+        
+        This function is called when there are no more pending analysis jobs for a given expert.
+        It evaluates recommendations through the enter_market ruleset and creates pending orders
+        for those that pass all rules (if automated trading is enabled).
+        
+        Args:
+            expert_instance_id: The expert instance ID to process recommendations for
+            
+        Returns:
+            List of TradingOrder objects that were created (in PENDING state)
+        """
+        created_orders = []
+        
+        try:
+            from sqlmodel import select, Session
+            from .db import get_db
+            from .models import Transaction, AccountDefinition
+            from .types import AnalysisUseCase, TransactionStatus
+            from .utils import get_expert_instance_from_id
+            from datetime import timedelta
+            
+            # Get the expert instance (with loaded settings)
+            expert = get_expert_instance_from_id(expert_instance_id)
+            if not expert:
+                self.logger.error(f"Expert instance {expert_instance_id} not found", exc_info=True)
+                return created_orders
+            
+            # Get the expert instance model (for ruleset IDs)
+            expert_instance = get_instance(ExpertInstance, expert_instance_id)
+            if not expert_instance:
+                self.logger.error(f"Expert instance model {expert_instance_id} not found", exc_info=True)
+                return created_orders
+            
+            # Check if "Allow automated trade opening" is enabled
+            allow_automated_trade_opening = expert.settings.get('allow_automated_trade_opening', False)
+            if not allow_automated_trade_opening:
+                self.logger.debug(f"Automated trade opening disabled for expert {expert_instance_id}, skipping recommendation processing")
+                return created_orders
+            
+            # Check if there's an enter_market ruleset configured
+            if not expert_instance.enter_market_ruleset_id:
+                self.logger.debug(f"No enter_market ruleset configured for expert {expert_instance_id}, skipping automated order creation")
+                return created_orders
+            
+            # Get the enter_market ruleset with relationships eagerly loaded
+            enter_market_ruleset = self._get_ruleset_with_relations(expert_instance.enter_market_ruleset_id)
+            if not enter_market_ruleset:
+                self.logger.warning(f"Enter market ruleset {expert_instance.enter_market_ruleset_id} not found for expert {expert_instance_id}")
+                return created_orders
+            
+            # Check if there are still pending analysis jobs for this expert
+            if self._has_pending_analysis_jobs(expert_instance_id):
+                self.logger.debug(f"Still has pending analysis jobs for expert {expert_instance_id}, skipping automated order creation")
+                return created_orders
+            
+            # Get recent recommendations (less than 24 hours old) for this expert
+            cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
+            
+            with Session(get_db().bind) as session:
+                statement = select(ExpertRecommendation).where(
+                    ExpertRecommendation.instance_id == expert_instance_id,
+                    ExpertRecommendation.created_at >= cutoff_time,
+                    ExpertRecommendation.recommended_action != OrderRecommendation.HOLD
+                ).order_by(ExpertRecommendation.expected_profit_percent.desc())  # Order by profit potential
+                
+                recommendations = session.exec(statement).all()
+                
+                if not recommendations:
+                    self.logger.info(f"No actionable recommendations found for expert {expert_instance_id}")
+                    return created_orders
+                
+                self.logger.info(f"Found {len(recommendations)} actionable recommendations for expert {expert_instance_id}")
+                self.logger.info(f"Evaluating recommendations through enter_market ruleset: {enter_market_ruleset.name}")
+                
+                # Process recommendations through the ruleset
+                for recommendation in recommendations:
+                    # Evaluate recommendation through the enter_market ruleset
+                    if not self._evaluate_ruleset(enter_market_ruleset, recommendation, expert_instance):
+                        self.logger.debug(f"Recommendation {recommendation.id} for {recommendation.symbol} rejected by ruleset")
+                        continue
+                    
+                    # If recommendation passes the ruleset, check if there are actions to execute
+                    # For now, we'll create a pending order for approved recommendations
+                    # The order will be reviewed and prioritized once all analysis is complete
+                    
+                    # Map recommendation action to order direction
+                    if recommendation.recommended_action == OrderRecommendation.BUY:
+                        side = OrderDirection.BUY
+                    elif recommendation.recommended_action == OrderRecommendation.SELL:
+                        side = OrderDirection.SELL
+                    else:
+                        continue
+                    
+                    # Create a pending order (quantity will be determined later during review)
+                    order = TradingOrder(
+                        account_id=expert.account_id,
+                        symbol=recommendation.symbol,
+                        quantity=0,  # To be determined during review/prioritization
+                        side=side,
+                        order_type=OrderType.MARKET,
+                        status=OrderStatus.PENDING,  # Keep as PENDING for review
+                        limit_price=None,
+                        stop_price=None,
+                        comment=f"Auto-created from recommendation {recommendation.id} (awaiting review)",
+                        expert_recommendation_id=recommendation.id,
+                        open_type=OrderOpenType.AUTOMATIC,
+                        created_at=datetime.now(timezone.utc)
+                    )
+                    
+                    # Add order to database
+                    order_id = add_instance(order)
+                    if order_id:
+                        order.id = order_id
+                        created_orders.append(order)
+                        self.logger.info(f"Created pending order {order_id} for {recommendation.symbol} (recommendation {recommendation.id} passed ruleset)")
+                
+                self.logger.info(f"Created {len(created_orders)} pending orders for expert {expert_instance_id} awaiting review and prioritization")
+                
+        except Exception as e:
+            self.logger.error(f"Error processing expert recommendations after analysis for expert {expert_instance_id}: {e}", exc_info=True)
+        
+        return created_orders
+    
+    def _has_pending_analysis_jobs(self, expert_instance_id: int) -> bool:
+        """
+        Check if there are pending market analysis jobs for a given expert instance.
+        
+        Args:
+            expert_instance_id: The expert instance ID to check
+            
+        Returns:
+            True if there are pending jobs, False otherwise
+        """
+        try:
+            from .WorkerQueue import get_worker_queue
+            from .types import AnalysisUseCase, WorkerTaskStatus
+            
+            worker_queue = get_worker_queue()
+            all_tasks = worker_queue.get_all_tasks()
+            
+            # Check for pending enter_market tasks for this expert
+            for task in all_tasks:
+                if (task.expert_instance_id == expert_instance_id and
+                    task.subtype == AnalysisUseCase.ENTER_MARKET and
+                    task.status in [WorkerTaskStatus.PENDING, WorkerTaskStatus.RUNNING]):
+                    return True
+            
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"Error checking for pending analysis jobs for expert {expert_instance_id}: {e}", exc_info=True)
+            return True  # Assume there are pending jobs if we can't check
 
 
 # Global trade manager instance

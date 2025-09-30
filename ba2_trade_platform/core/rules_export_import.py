@@ -45,20 +45,32 @@ class RulesExporter:
                     }
                 }
 
-                # Get rules in order
-                for link in sorted(ruleset.event_actions, key=lambda x: x.order_index):
-                    rule = link.eventaction
-                    rule_data = {
-                        "name": rule.name,
-                        "type": rule.type.value if rule.type else None,
-                        "subtype": rule.subtype.value if rule.subtype else None,
-                        "triggers": rule.triggers,
-                        "actions": rule.actions,
-                        "extra_parameters": rule.extra_parameters,
-                        "continue_processing": rule.continue_processing,
-                        "order_index": link.order_index
-                    }
-                    ruleset_data["ruleset"]["rules"].append(rule_data)
+                # Get rules in order by querying the link table
+                from .models import RulesetEventActionLink, EventAction
+                
+                with get_db() as session:
+                    # Query link table to get ordered associations
+                    statement = (
+                        select(RulesetEventActionLink, EventAction)
+                        .join(EventAction, RulesetEventActionLink.eventaction_id == EventAction.id)
+                        .where(RulesetEventActionLink.ruleset_id == ruleset_id)
+                        .order_by(RulesetEventActionLink.order_index)
+                    )
+                    
+                    results = session.exec(statement).all()
+                    
+                    for link, rule in results:
+                        rule_data = {
+                            "name": rule.name,
+                            "type": rule.type.value if rule.type else None,
+                            "subtype": rule.subtype.value if rule.subtype else None,
+                            "triggers": rule.triggers,
+                            "actions": rule.actions,
+                            "extra_parameters": rule.extra_parameters,
+                            "continue_processing": rule.continue_processing,
+                            "order_index": link.order_index
+                        }
+                        ruleset_data["ruleset"]["rules"].append(rule_data)
 
                 return ruleset_data
 
@@ -452,7 +464,9 @@ class RulesExportImportUI:
 
             # Download file
             json_str = json.dumps(data, indent=2)
-            self.ui.download(json_str, filename=filename)
+            # Use ui.download directly from the nicegui module
+            from nicegui import ui
+            ui.download(json_str.encode('utf-8'), filename=filename)
 
             self.export_dialog.close()
             self.ui.notify(f'Exported {len(selected_ids)} {item_type}(s) successfully', type='positive')

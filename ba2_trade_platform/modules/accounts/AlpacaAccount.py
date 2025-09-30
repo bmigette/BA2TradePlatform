@@ -54,6 +54,38 @@ class AlpacaAccount(AccountInterface):
             "api_secret": {"type": 'str', "required": True, "description": "Alpaca API Secret Key"},
             "paper_account": {"type": 'bool', "required": True, "description": "Is this a paper trading account?"}
         }
+    
+    @staticmethod
+    def _round_price(price: float, symbol: str = None) -> float:
+        """
+        Round price to comply with Alpaca's pricing requirements.
+        
+        Alpaca pricing rules:
+        - Stocks >= $1: Round to 2 decimal places (penny increments only)
+        - Stocks < $1: Round to 4 decimal places (sub-penny allowed)
+        
+        Args:
+            price: The price to round
+            symbol: Optional symbol for logging
+            
+        Returns:
+            float: Rounded price
+        """
+        if price is None:
+            return None
+        
+        # For stocks >= $1, round to 2 decimal places (penny increments)
+        # For stocks < $1, round to 4 decimal places (sub-penny allowed)
+        if price >= 1.0:
+            rounded = round(price, 2)
+        else:
+            rounded = round(price, 4)
+        
+        if rounded != price:
+            logger.debug(f"Rounded price from {price} to {rounded}" + (f" for {symbol}" if symbol else ""))
+        
+        return rounded
+    
     def alpaca_order_to_tradingorder(self, order):
         """
         Convert an Alpaca order object to a TradingOrder object.
@@ -226,6 +258,12 @@ class AlpacaAccount(AccountInterface):
             if trading_order.depends_on_order is not None:
                 logger.info(f"Submitting order with dependency: depends on order {trading_order.depends_on_order} reaching status {trading_order.depends_order_status_trigger}")
             
+            # Round all price fields to 4 decimal places to comply with Alpaca pricing requirements
+            # This prevents sub-penny increment errors from floating-point arithmetic
+            if trading_order.limit_price is not None:
+                trading_order.limit_price = self._round_price(trading_order.limit_price, trading_order.symbol)
+            if trading_order.stop_price is not None:
+                trading_order.stop_price = self._round_price(trading_order.stop_price, trading_order.symbol)
 
             # Convert string values to enums
             side = OrderSide.BUY if trading_order.side == OrderDirection.BUY else OrderSide.SELL
@@ -297,12 +335,54 @@ class AlpacaAccount(AccountInterface):
             # Convert to TradingOrder and set the broker_order_id
             result_order = self.alpaca_order_to_tradingorder(order)
             
-            trading_order.broker_order_id = str(order.id) if order.id else None
-            trading_order.status = result_order.status if result_order.status else None
-            update_instance(trading_order)
-            return trading_order
+            # Update the order in the database using a fresh session
+            from sqlmodel import Session
+            with Session(get_db().bind) as session:
+                # Re-fetch the order from the database to get a fresh instance
+                if trading_order.id:
+                    fresh_order = session.get(TradingOrder, trading_order.id)
+                    if fresh_order:
+                        fresh_order.broker_order_id = str(order.id) if order.id else None
+                        fresh_order.status = result_order.status if result_order.status else None
+                        session.add(fresh_order)
+                        session.commit()
+                        session.refresh(fresh_order)
+                        return fresh_order
+                    else:
+                        logger.warning(f"Could not find order {trading_order.id} to update")
+                        return trading_order
+                else:
+                    logger.warning(f"Order has no ID to update in database")
+                    return trading_order
         except Exception as e:
             logger.error(f"Error creating Alpaca order: {e}", exc_info=True)
+            
+            # Mark the order as ERROR in the database using a fresh session
+            try:
+                from sqlmodel import Session
+                
+                # Use a fresh session to avoid session conflicts
+                with Session(get_db().bind) as session:
+                    # Re-fetch the order from the database to get a fresh instance
+                    if trading_order.id:
+                        fresh_order = session.get(TradingOrder, trading_order.id)
+                        if fresh_order:
+                            fresh_order.status = OrderStatus.ERROR
+                            # Store error details in comment field
+                            if not fresh_order.comment:
+                                fresh_order.comment = f"Error: {str(e)[:200]}"
+                            else:
+                                fresh_order.comment = f"{fresh_order.comment} | Error: {str(e)[:150]}"
+                            session.add(fresh_order)
+                            session.commit()
+                            logger.info(f"Marked order {trading_order.id} as ERROR in database")
+                        else:
+                            logger.warning(f"Could not find order {trading_order.id} to mark as ERROR")
+                    else:
+                        logger.warning(f"Cannot mark order as ERROR - order has no ID yet")
+            except Exception as update_error:
+                logger.error(f"Failed to update order status to ERROR: {update_error}", exc_info=True)
+            
             return None
 
     def modify_order(self, order_id: str, trading_order: TradingOrder):
@@ -317,12 +397,16 @@ class AlpacaAccount(AccountInterface):
             TradingOrder: The modified order if successful, None if an error occurs.
         """
         try:
+            # Round all price fields to 4 decimal places to comply with Alpaca pricing requirements
+            limit_price = self._round_price(trading_order.limit_price, trading_order.symbol) if trading_order.limit_price is not None else None
+            stop_price = self._round_price(trading_order.stop_price, trading_order.symbol) if trading_order.stop_price is not None else None
+            
             order = self.client.replace_order(
                 order_id=order_id,
                 qty=trading_order.quantity,
-                time_in_force=trading_order.time_in_force,
-                limit_price=trading_order.limit_price,
-                stop_price=trading_order.stop_price
+                time_in_force=trading_order.good_for,
+                limit_price=limit_price,
+                stop_price=stop_price
             )
             logger.info(f"Modified Alpaca order: {order.id}")
             return self.alpaca_order_to_tradingorder(order)
@@ -510,16 +594,31 @@ class AlpacaAccount(AccountInterface):
                     )
                     db_order = session.exec(statement).first()
                     if db_order:
-                        # Update database order with current Alpaca state using sanitized enum conversion
-                        # The alpaca_order already has sanitized enum values from alpaca_order_to_tradingorder
-                        db_order.status = alpaca_order.status
-                        db_order.filled_qty = alpaca_order.filled_qty
+                        # Track if any changes were made
+                        has_changes = False
+                        
+                        # Update database order with current Alpaca state only if values differ
+                        if db_order.status != alpaca_order.status:
+                            logger.debug(f"Order {db_order.id} status changed: {db_order.status} -> {alpaca_order.status}")
+                            db_order.status = alpaca_order.status
+                            has_changes = True
+                        
+                        if db_order.filled_qty != alpaca_order.filled_qty:
+                            logger.debug(f"Order {db_order.id} filled_qty changed: {db_order.filled_qty} -> {alpaca_order.filled_qty}")
+                            db_order.filled_qty = alpaca_order.filled_qty
+                            has_changes = True
+                        
                         # Update broker_order_id if it wasn't set before
                         if not db_order.broker_order_id:
+                            logger.debug(f"Order {db_order.id} broker_order_id set to: {alpaca_order.broker_order_id}")
                             db_order.broker_order_id = alpaca_order.broker_order_id
-                        session.add(db_order)
-                        updated_count += 1
-                        logger.debug(f"Updated database order {db_order.id} with Alpaca order {alpaca_order.broker_order_id}")
+                            has_changes = True
+                        
+                        # Only add to session and increment counter if there were actual changes
+                        if has_changes:
+                            session.add(db_order)
+                            updated_count += 1
+                            logger.debug(f"Updated database order {db_order.id} with changes from Alpaca order {alpaca_order.broker_order_id}")
                 
                 session.commit()
             
@@ -548,6 +647,9 @@ class AlpacaAccount(AccountInterface):
         """
         try:
             from ...core.db import add_instance, get_instance
+            
+            # Round take profit price to 4 decimal places
+            tp_price = self._round_price(tp_price, trading_order.symbol)
             
             # Check if there's already a take profit order for this transaction
             existing_tp_order = self._find_existing_tp_order(trading_order.transaction_id)

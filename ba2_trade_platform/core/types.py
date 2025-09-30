@@ -27,6 +27,7 @@ class OrderStatus(str, Enum):
     SUSPENDED = "suspended"
     CALCULATED = "calculated"
     HELD = "held"
+    ERROR = "ERROR"
 
 
 
@@ -107,7 +108,7 @@ class ExpertEventType(str, Enum):
     N_PERCENT_TO_TARGET = "percent_to_target"
     N_PROFIT_LOSS_AMOUNT = "profit_loss_amount"
     N_PROFIT_LOSS_PERCENT = "profit_loss_percent"
-    N_TIME_OPENED = "time_opened"
+    N_DAYS_OPENED = "days_opened"
     N_CONFIDENCE = "confidence"
     
 
@@ -153,7 +154,7 @@ def get_numeric_event_values():
         ExpertEventType.N_PERCENT_TO_TARGET.value,
         ExpertEventType.N_PROFIT_LOSS_AMOUNT.value,
         ExpertEventType.N_PROFIT_LOSS_PERCENT.value,
-        ExpertEventType.N_TIME_OPENED.value,
+        ExpertEventType.N_DAYS_OPENED.value,
         ExpertEventType.N_CONFIDENCE.value
     ]
 

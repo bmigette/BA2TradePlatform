@@ -3,7 +3,7 @@ from typing import Any, Dict, Optional
 from unittest import result
 from datetime import datetime, timezone
 from ..logger import logger
-from ..core.models import AccountSetting, TradingOrder, Transaction
+from ..core.models import AccountSetting, TradingOrder, Transaction, ExpertRecommendation, ExpertInstance
 from ..core.types import OrderOpenType, OrderDirection, OrderType, OrderStatus, TransactionStatus
 from ..core.ExtendableSettingsInterface import ExtendableSettingsInterface
 from ..core.db import add_instance, get_instance, update_instance
@@ -108,6 +108,65 @@ class AccountInterface(ExtendableSettingsInterface):
         """
         pass
 
+    def _generate_tracking_comment(self, trading_order: TradingOrder) -> str:
+        """
+        Generate a tracking comment for the order with metadata prefix.
+        Format: [ACC:X/EXP:Y/TR:Z/ORD:W] original_comment
+        
+        Args:
+            trading_order: The TradingOrder object
+            
+        Returns:
+            str: The formatted comment with tracking metadata, truncated to 128 characters if needed
+        """
+        # Get account_id
+        account_id = trading_order.account_id or self.id
+        
+        # Get expert_id if available through recommendation
+        expert_id = None
+        if trading_order.order_recommendation_id:
+            try:
+                recommendation = get_instance(ExpertRecommendation, trading_order.order_recommendation_id)
+                if recommendation:
+                    expert_instance = get_instance(ExpertInstance, recommendation.instance_id)
+                    if expert_instance:
+                        expert_id = expert_instance.id
+            except Exception as e:
+                logger.debug(f"Could not retrieve expert_id for order: {e}")
+        
+        # Get transaction_id
+        transaction_id = trading_order.transaction_id or "NONE"
+        
+        # Get order_id (will be None for new orders)
+        order_id = trading_order.id or "NEW"
+        
+        # Build tracking prefix
+        exp_part = f"/EXP:{expert_id}" if expert_id else ""
+        tracking_prefix = f"[ACC:{account_id}{exp_part}/TR:{transaction_id}/ORD:{order_id}]"
+        
+        # Get original comment
+        original_comment = trading_order.comment or ""
+        
+        # Combine prefix with original comment
+        if original_comment:
+            full_comment = f"{tracking_prefix} {original_comment}"
+        else:
+            full_comment = tracking_prefix
+        
+        # Truncate to 128 characters if needed
+        max_length = 128
+        if len(full_comment) > max_length:
+            # Try to preserve the tracking prefix and truncate the original comment
+            available_space = max_length - len(tracking_prefix) - 1  # -1 for space
+            if available_space > 0:
+                truncated_comment = original_comment[:available_space - 3] + "..."
+                full_comment = f"{tracking_prefix} {truncated_comment}"
+            else:
+                # If tracking prefix itself is too long, just truncate everything
+                full_comment = full_comment[:max_length]
+        
+        return full_comment
+
     def submit_order(self, trading_order: TradingOrder) -> Any:
         """
         Submit a new order to the account with validation and transaction handling.
@@ -130,6 +189,9 @@ class AccountInterface(ExtendableSettingsInterface):
         
         # Handle transaction requirements based on order type
         self._handle_transaction_requirements(trading_order)
+        
+        # Override the comment with tracking metadata
+        trading_order.comment = self._generate_tracking_comment(trading_order)
         
         # Log successful validation
         logger.info(f"Order validation passed for {trading_order.symbol} - {trading_order.side.value} {trading_order.quantity} @ {trading_order.order_type.value}")

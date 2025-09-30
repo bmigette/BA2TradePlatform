@@ -561,32 +561,32 @@ class ConfidenceCondition(CompareCondition):
         return f"Check if expert confidence for {self.instrument_name} is {self.operator_str} {self.value}"
 
 
-class TimeOpenedCondition(CompareCondition):
-    """Compare time since order was opened (in hours)."""
+class DaysOpenedCondition(CompareCondition):
+    """Compare time since order was opened (in days)."""
     
     def evaluate(self) -> bool:
         try:
             if not self.existing_order or not self.existing_order.created_at:
                 return False
                 
-            # Calculate hours since order was opened
+            # Calculate days since order was opened
             now = datetime.now(timezone.utc)
             created_at = self.existing_order.created_at
             if created_at.tzinfo is None:
                 created_at = created_at.replace(tzinfo=timezone.utc)
                 
             time_diff = now - created_at
-            hours_opened = time_diff.total_seconds() / 3600
+            days_opened = time_diff.total_seconds() / 86400  # 86400 seconds in a day
             
-            return self.operator_func(hours_opened, self.value)
+            return self.operator_func(days_opened, self.value)
             
         except Exception as e:
-            logger.error(f"Error evaluating time opened condition: {e}", exc_info=True)
+            logger.error(f"Error evaluating days opened condition: {e}", exc_info=True)
             return False
     
     def get_description(self) -> str:
-        """Get description of time opened condition."""
-        return f"Check if time since {self.instrument_name} order was opened is {self.operator_str} {self.value} hours"
+        """Get description of days opened condition."""
+        return f"Check if days since {self.instrument_name} order was opened is {self.operator_str} {self.value} days"
 
 
 # Factory function to create conditions based on event type
@@ -631,7 +631,7 @@ def create_condition(event_type: ExpertEventType, account: AccountInterface,
         ExpertEventType.N_PERCENT_TO_TARGET: PercentToTargetCondition,
         ExpertEventType.N_PROFIT_LOSS_AMOUNT: ProfitLossAmountCondition,
         ExpertEventType.N_PROFIT_LOSS_PERCENT: ProfitLossPercentCondition,
-        ExpertEventType.N_TIME_OPENED: TimeOpenedCondition,
+        ExpertEventType.N_DAYS_OPENED: DaysOpenedCondition,
         ExpertEventType.N_CONFIDENCE: ConfidenceCondition,
     }
     condition_class = condition_map.get(event_type)

@@ -450,6 +450,11 @@ class WorkerQueue:
             execution_time = task.completed_at - task.started_at
             logger.debug(f"Analysis task '{task.id}' completed successfully in {execution_time:.2f}s")
             
+            # Check if this was the last ENTER_MARKET analysis task for this expert
+            # If so, trigger automated order processing
+            if task.subtype == AnalysisUseCase.ENTER_MARKET:
+                self._check_and_process_expert_recommendations(task.expert_instance_id)
+            
         except Exception as e:
             # Update task with failure
             with self._task_lock:
@@ -467,6 +472,43 @@ class WorkerQueue:
                     task_key = task.get_task_key()
                     if task_key in self._task_keys and self._task_keys[task_key] == task.id:
                         del self._task_keys[task_key]
+    
+    def _check_and_process_expert_recommendations(self, expert_instance_id: int) -> None:
+        """
+        Check if there are any pending ENTER_MARKET analysis tasks for an expert.
+        If not, trigger automated order processing via TradeManager.
+        
+        Args:
+            expert_instance_id: The expert instance ID to check
+        """
+        try:
+            # Check if there are still pending ENTER_MARKET tasks for this expert
+            has_pending = False
+            with self._task_lock:
+                for task in self._tasks.values():
+                    if (task.expert_instance_id == expert_instance_id and
+                        task.subtype == AnalysisUseCase.ENTER_MARKET and
+                        task.status in [WorkerTaskStatus.PENDING, WorkerTaskStatus.RUNNING]):
+                        has_pending = True
+                        break
+            
+            if not has_pending:
+                logger.info(f"All ENTER_MARKET analysis tasks completed for expert {expert_instance_id}, triggering automated order processing")
+                
+                # Import TradeManager and process recommendations
+                from .TradeManager import get_trade_manager
+                trade_manager = get_trade_manager()
+                created_orders = trade_manager.process_expert_recommendations_after_analysis(expert_instance_id)
+                
+                if created_orders:
+                    logger.info(f"Automated order processing created {len(created_orders)} orders for expert {expert_instance_id}")
+                else:
+                    logger.debug(f"No orders created by automated processing for expert {expert_instance_id}")
+            else:
+                logger.debug(f"Still has pending ENTER_MARKET tasks for expert {expert_instance_id}, skipping automated order processing")
+                
+        except Exception as e:
+            logger.error(f"Error checking and processing expert recommendations for expert {expert_instance_id}: {e}", exc_info=True)
     
     def has_existing_transactions(self, expert_id: int, symbol: str) -> bool:
         """
