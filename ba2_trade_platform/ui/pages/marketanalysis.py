@@ -1184,7 +1184,7 @@ class OrderRecommendationsTab:
         try:
             analysis_id = event_data.args if hasattr(event_data, 'args') else event_data
             if analysis_id:
-                ui.navigate(f'/market_analysis_detail/{analysis_id}')
+                ui.navigate.to(f'/market_analysis_detail/{analysis_id}')
         except Exception as e:
             logger.error(f"Error navigating to analysis detail: {e}", exc_info=True)
 

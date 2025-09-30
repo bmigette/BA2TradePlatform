@@ -11,6 +11,8 @@ class OrderStatus(str, Enum):
     CANCELED = "canceled"
     PENDING = "pending"
     WAITING_TRIGGER = "waiting_trigger"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
 
 
 class InstrumentType(str, Enum):
@@ -26,8 +28,8 @@ class OrderType(str, Enum):
 
 
 class OrderDirection(str, Enum):
-    SELL = "sell"
-    BUY = "buy"
+    SELL = "SELL"
+    BUY = "BUY"
 
 class OrderOpenType(str, Enum):
     MANUAL = "manual"

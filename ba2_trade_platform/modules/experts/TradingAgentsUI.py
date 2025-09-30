@@ -6,7 +6,11 @@ from datetime import datetime
 from ...core.models import MarketAnalysis
 from ...core.types import MarketAnalysisStatus
 from ...logger import logger
-
+# Load expert recommendations using a proper database session
+from ...core.db import get_db
+from ...core.models import ExpertRecommendation
+from sqlmodel import select
+            
 
 class TradingAgentsUI:
     """
@@ -542,16 +546,13 @@ class TradingAgentsUI:
     def _render_expert_recommendation(self) -> None:
         """Render the expert recommendation if available."""
         try:
-            # Load expert recommendations using a proper database session
-            from ...core.db import get_db
-            from ...core.models import TransactionRecommendation
-            from sqlmodel import select
+
             
             session = get_db()
             try:
-                statement = select(TransactionRecommendation).where(
-                    TransactionRecommendation.market_analysis_id == self.market_analysis.id
-                ).order_by(TransactionRecommendation.created_at.desc())
+                statement = select(ExpertRecommendation).where(
+                    ExpertRecommendation.market_analysis_id == self.market_analysis.id
+                ).order_by(ExpertRecommendation.created_at.desc())
                 
                 expert_recommendations = session.exec(statement).all()
                 

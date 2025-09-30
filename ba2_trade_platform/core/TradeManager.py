@@ -71,12 +71,9 @@ class TradeManager:
             
             # Step 1: Capture order statuses before refresh
             pre_refresh_order_statuses = {}
-            with get_db() as session:
-                statement = select(TradingOrder)
-                orders = session.exec(statement).all()
-                for order in orders:
-                    pre_refresh_order_statuses[order.id] = order.status
-                session.close()
+            orders = get_all_instances(TradingOrder)
+            for order in orders:
+                pre_refresh_order_statuses[order.id] = order.status
             
             self.logger.debug(f"Captured {len(pre_refresh_order_statuses)} order statuses before refresh")
             

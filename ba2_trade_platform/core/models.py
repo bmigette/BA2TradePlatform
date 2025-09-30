@@ -173,6 +173,7 @@ class Transaction(SQLModel, table=True):
 class TradingOrder(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     # REMOVED order_id: str | None
+    account_id: int = Field(foreign_key="accountdefinition.id", nullable=False, ondelete="CASCADE")
     symbol: str
     quantity: float
     side: OrderDirection 
@@ -184,11 +185,12 @@ class TradingOrder(SQLModel, table=True):
     created_at: DateTime | None = Field(default_factory=lambda: DateTime.now(timezone.utc))
     
     # New fields
-    open_type: OrderOpenType = Field(default=OrderOpenType.MANUAL)
+    open_type: OrderOpenType = Field(default=OrderOpenType.AUTOMATIC)
     broker_order_id: str | None = Field(default=None, description="Broker-specific order ID for tracking")
     order_recommendation_id: int | None = Field(default=None, foreign_key="expertrecommendation.id", description="Expert recommendation that generated this order")
     limit_price: float | None = Field(default=None, description="Limit price for limit orders")
-    
+    stop_price: float | None = Field(default=None, description="Stop price for stop orders")
+
     # Dependency fields for order chaining
     depends_on_order: int | None = Field(default=None, foreign_key="tradingorder.id", description="ID of another order this order depends on")
     depends_order_status_trigger: OrderStatus | None = Field(default=None, description="Status that the depends_on_order must reach to trigger this order")

@@ -3,6 +3,7 @@ from typing import Any, Dict, Optional
 from unittest import result
 from ..logger import logger
 from ..core.models import AccountSetting
+from ..core.types import OrderOpenType
 from ..core.ExtendableSettingsInterface import ExtendableSettingsInterface
 
 
@@ -12,7 +13,11 @@ class AccountInterface(ExtendableSettingsInterface):
     
     """
     Abstract base class for trading account interfaces.
-    Defines the required methods for account implementations.
+    
+    This class defines the required interface for all account provider implementations in the BA2 Trade Platform.
+    Subclasses must implement all abstract methods to support account info retrieval, order management, position tracking,
+    and broker synchronization. All account plugins should inherit from this class and provide concrete implementations
+    for the required methods.
     """
     def __init__(self, id: int):
         """
@@ -78,17 +83,19 @@ class AccountInterface(ExtendableSettingsInterface):
         pass
 
     @abstractmethod
-    def submit_order(self, trading_order, depends_on_order_id: Optional[int] = None, depends_on_status: Optional[str] = None) -> Any:
+    def submit_order(self, trading_order, depends_on_order_id: Optional[int] = None, depends_on_status: Optional[str] = None, good_for = "gtc", open_type = OrderOpenType.AUTOMATIC) -> Any:
         """
         Submit a new order to the account.
-        
+
         Args:
-            trading_order: A TradingOrder object containing all order details
-            depends_on_order_id (Optional[int]): ID of the order this order depends on (for conditional orders)
-            depends_on_status (Optional[str]): Status that the depends_on_order must reach to trigger this order
-            
+            trading_order: A TradingOrder object containing all order details.
+            depends_on_order_id (Optional[int]): ID of the order this order depends on (for conditional/triggered orders).
+            depends_on_status (Optional[str]): Status that the depends_on_order must reach to trigger this order.
+            good_for (str): Time in force for the order (e.g., "gtc", "day").
+            open_type (OrderOpenType): Specifies how the order should be opened (automatic/manual).
+
         Returns:
-            Any: The created order object if successful, None or raises exception if failed
+            Any: The created order object if successful. Returns None or raises an exception if failed.
         """
         pass
 

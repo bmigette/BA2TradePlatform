@@ -5,9 +5,10 @@ from typing import Any, Dict, Optional
 
 from ...logger import logger
 from ...core.models import TradingOrder, Position
-from ...core.types import OrderDirection, OrderStatus
-
+from ...core.types import OrderDirection, OrderStatus, OrderOpenType
 from ...core.AccountInterface import AccountInterface
+from ...core.db import get_db, update_instance
+from sqlmodel import Session, select
 
 class AlpacaAccount(AccountInterface):
     """
@@ -67,7 +68,7 @@ class AlpacaAccount(AccountInterface):
             stop_price=getattr(order, "stop_price", None),
             status=getattr(order, "status", None),
             filled_qty=getattr(order, "filled_qty", None),
-            client_order_id=getattr(order, "client_order_id", None),
+            comment=getattr(order, "client_order_id", None),
             created_at=getattr(order, "created_at", None),
         )
     
@@ -125,7 +126,7 @@ class AlpacaAccount(AccountInterface):
             logger.error(f"Error listing Alpaca orders: {e}", exc_info=True)
             return []
 
-    def submit_order(self, trading_order, depends_on_order_id: Optional[int] = None, depends_on_status: Optional[str] = None) -> TradingOrder:
+    def submit_order(self, trading_order: TradingOrder) -> TradingOrder:
         """
         Submit a new order to Alpaca.
         
@@ -133,21 +134,34 @@ class AlpacaAccount(AccountInterface):
             trading_order: A TradingOrder object containing all order details
             depends_on_order_id (Optional[int]): ID of the order this order depends on (for conditional orders)
             depends_on_status (Optional[str]): Status that the depends_on_order must reach to trigger this order
+            good_for (str): Time in force for the order (e.g., "gtc", "day").
+            open_type (OrderOpenType): Specifies how the order should be opened (automatic/manual).
             
         Returns:
             TradingOrder: The created order if successful, None if an error occurs.
         """
         try:
             # Log dependency information if provided
-            if depends_on_order_id is not None:
-                logger.info(f"Submitting order with dependency: depends on order {depends_on_order_id} reaching status {depends_on_status}")
+            if trading_order.depends_on_order is not None:
+                logger.info(f"Submitting order with dependency: depends on order {trading_order.depends_on_order} reaching status {depends_on_status}")
             
+
             # Convert string values to enums
             side = OrderSide.BUY if trading_order.side.upper() == 'BUY' else OrderSide.SELL
-            time_in_force = TimeInForce.DAY if trading_order.good_for == 'day' else TimeInForce.GTC
-            
+            # Map good_for to TimeInForce enum
+            good_for_value = (trading_order.good_for or '').lower()
+            tif_map = {
+                'day': TimeInForce.DAY,
+                'gtc': TimeInForce.GTC,
+                'opg': TimeInForce.OPG,
+                'ioc': TimeInForce.IOC,
+                'fok': TimeInForce.FOK,
+                'cls': TimeInForce.CLS,
+            }
+            time_in_force = tif_map.get(good_for_value, TimeInForce.GTC)
             # Create the appropriate order request based on order type
-            if trading_order.order_type.lower() == 'market':
+            order_type = trading_order.order_type.lower() if trading_order.order_type else 'market'
+            if order_type == 'market':
                 order_request = MarketOrderRequest(
                     symbol=trading_order.symbol,
                     qty=trading_order.quantity,
@@ -155,7 +169,7 @@ class AlpacaAccount(AccountInterface):
                     time_in_force=time_in_force,
                     client_order_id=trading_order.comment
                 )
-            elif trading_order.order_type.lower() == 'limit':
+            elif order_type == 'limit':
                 order_request = LimitOrderRequest(
                     symbol=trading_order.symbol,
                     qty=trading_order.quantity,
@@ -164,7 +178,7 @@ class AlpacaAccount(AccountInterface):
                     limit_price=trading_order.limit_price,
                     client_order_id=trading_order.comment
                 )
-            elif trading_order.order_type.lower() == 'stop':
+            elif order_type == 'stop':
                 order_request = StopOrderRequest(
                     symbol=trading_order.symbol,
                     qty=trading_order.quantity,
@@ -176,15 +190,17 @@ class AlpacaAccount(AccountInterface):
             else:
                 logger.error(f"Unsupported order type: {trading_order.order_type}")
                 return None
-            
+
             order = self.client.submit_order(order_request)
             logger.info(f"Submitted Alpaca order: {order.id}")
-            
+
             # Convert to TradingOrder and set the broker_order_id
-            result_order = self.alpaca_order_to_tradingorder(order)
-            # result_order.broker_order_id = str(order.id)  # Set the Alpaca order ID, done in the alcapa to order function
+            # result_order = self.alpaca_order_to_tradingorder(order)
             
-            return result_order
+            trading_order.broker_order_id = str(order.id) if order.id else None
+            trading_order.status = order.status if order.status else None
+            update_instance(trading_order)
+            return trading_order
         except Exception as e:
             logger.error(f"Error creating Alpaca order: {e}", exc_info=True)
             return None
@@ -352,9 +368,7 @@ class AlpacaAccount(AccountInterface):
             bool: True if refresh was successful, False otherwise
         """
         try:
-            from ...core.db import get_db, update_instance
-            from ...core.models import TradingOrder as TradingOrderModel
-            from sqlmodel import Session, select
+
             
             # Get all orders from Alpaca
             alpaca_orders = self.get_orders(OrderStatus.ALL)
@@ -371,13 +385,19 @@ class AlpacaAccount(AccountInterface):
                     if not alpaca_order.broker_order_id:
                         continue
                     # Find corresponding database record
-                    statement = select(TradingOrderModel).where(
-                        TradingOrderModel.broker_order_id == alpaca_order.broker_order_id
+                    statement = select(TradingOrder).where(
+                        TradingOrder.broker_order_id == alpaca_order.broker_order_id
                     )
                     db_order = session.exec(statement).first()
                     if db_order:
                         # Update database order with current Alpaca state
-                        db_order.status = alpaca_order.status
+                        # Validate status against OrderStatus enum
+                        valid_statuses = set(item.value for item in OrderStatus)
+                        if alpaca_order.status not in valid_statuses:
+                            logger.error(f"Invalid Alpaca order status '{alpaca_order.status}' for order {alpaca_order.broker_order_id}. Setting status to 'unknown'.", exc_info=True)
+                            db_order.status = OrderStatus.UNKNOWN.value
+                        else:
+                            db_order.status = alpaca_order.status
                         db_order.filled_qty = alpaca_order.filled_qty
                         # Update broker_order_id if it wasn't set before
                         if not db_order.broker_order_id:

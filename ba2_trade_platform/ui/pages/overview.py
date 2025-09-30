@@ -600,10 +600,15 @@ class AccountOverviewTab:
         # All Orders Table
         with ui.card().classes('mt-4'):
             ui.label('Recent Orders from All Accounts (Past 15 Days)').classes('text-h6 mb-4')
-            self._render_account_orders_table()
+            self._render_live_orders_table()
+        
+        # Pending Orders Table
+        with ui.card().classes('mt-4'):
+            ui.label('Pending Orders (PENDING or WAITING_TRIGGER)').classes('text-h6 mb-4')
+            self._render_pending_orders_table()
     
-    def _render_account_orders_table(self):
-        """Render table with recent orders from all accounts (past 15 days)."""
+    def _render_live_orders_table(self):
+        """Render table with recent orders from account providers (past 15 days)."""
         accounts = get_all_instances(AccountDefinition)
         all_orders = []
         
@@ -666,6 +671,9 @@ class AccountOverviewTab:
                                 if isinstance(v, float):
                                     order_dict[k] = f"{v:.2f}"
                             
+                            # Add comment field for all orders
+                            order_dict['comment'] = order_dict.get('comment', '')
+                            
                             all_orders.append(order_dict)
                     else:
                         # Provider doesn't support orders - add info row
@@ -678,7 +686,8 @@ class AccountOverviewTab:
                             'order_type': '',
                             'status': '',
                             'submitted_at': '',
-                            'filled_at': ''
+                            'filled_at': '',
+                            'comment': ''
                         })
                 except Exception as e:
                     # Add error row if can't fetch orders
@@ -692,7 +701,8 @@ class AccountOverviewTab:
                         'order_type': '',
                         'status': '',
                         'submitted_at': '',
-                        'filled_at': ''
+                        'filled_at': '',
+                        'comment': ''
                     })
         
         # Define columns for orders table
@@ -707,13 +717,84 @@ class AccountOverviewTab:
             {'name': 'limit_price', 'label': 'Limit Price', 'field': 'limit_price'},
             {'name': 'filled_price', 'label': 'Filled Price', 'field': 'filled_price'},
             {'name': 'submitted_at', 'label': 'Submitted', 'field': 'submitted_at'},
-            {'name': 'filled_at', 'label': 'Filled', 'field': 'filled_at'}
+            {'name': 'filled_at', 'label': 'Filled', 'field': 'filled_at'},
+            {'name': 'comment', 'label': 'Comment', 'field': 'comment'}
         ]
         
         if all_orders:
             ui.table(columns=order_columns, rows=all_orders, row_key='account').classes('w-full')
         else:
             ui.label('No orders found or no accounts configured.').classes('text-gray-500')
+    
+    def _render_pending_orders_table(self):
+        """Render table with pending orders from database (PENDING or WAITING_TRIGGER)."""
+        session = get_db()
+        try:
+            # Get orders with PENDING or WAITING_TRIGGER status
+            pending_statuses = [OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER]
+            statement = (
+                select(TradingOrder)
+                .where(TradingOrder.status.in_(pending_statuses))
+                .order_by(TradingOrder.created_at.desc())
+            )
+            orders = list(session.exec(statement).all())
+            
+            if not orders:
+                ui.label('No pending orders found.').classes('text-gray-500')
+                return
+            
+            # Prepare data for table
+            rows = []
+            for order in orders:
+                # Get account name
+                account_name = ""
+                try:
+                    account = get_instance(AccountDefinition, order.account_id)
+                    if account:
+                        account_name = account.name
+                except Exception:
+                    account_name = f"Account {order.account_id}"
+                
+                # Format dates
+                created_at_str = order.created_at.strftime('%Y-%m-%d %H:%M:%S') if order.created_at else ''
+                
+                row = {
+                    'order_id': order.id,
+                    'account': account_name,
+                    'symbol': order.symbol,
+                    'side': order.side,
+                    'quantity': f"{order.quantity:.2f}" if order.quantity else '',
+                    'order_type': order.order_type,
+                    'status': order.status.value,
+                    'limit_price': f"${order.limit_price:.2f}" if order.limit_price else '',
+                    'comment': order.comment or '',
+                    'created_at': created_at_str,
+                    'waited_status': order.depends_order_status_trigger if order.status == OrderStatus.WAITING_TRIGGER else ''
+                }
+                rows.append(row)
+            
+            # Define table columns
+            columns = [
+                {'name': 'order_id', 'label': 'Order ID', 'field': 'order_id'},
+                {'name': 'account', 'label': 'Account', 'field': 'account'},
+                {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol'},
+                {'name': 'side', 'label': 'Side', 'field': 'side'},
+                {'name': 'quantity', 'label': 'Quantity', 'field': 'quantity'},
+                {'name': 'order_type', 'label': 'Order Type', 'field': 'order_type'},
+                {'name': 'status', 'label': 'Status', 'field': 'status'},
+                {'name': 'limit_price', 'label': 'Limit Price', 'field': 'limit_price'},
+                {'name': 'comment', 'label': 'Comment', 'field': 'comment'},
+                {'name': 'created_at', 'label': 'Created', 'field': 'created_at'},
+                {'name': 'waited_status', 'label': 'Waited Status', 'field': 'waited_status'}
+            ]
+            
+            ui.table(columns=columns, rows=rows, row_key='order_id').classes('w-full')
+            
+        except Exception as e:
+            logger.error(f"Error rendering pending orders table: {e}", exc_info=True)
+            ui.label(f'Error loading pending orders: {str(e)}').classes('text-red-500')
+        finally:
+            session.close()
 
 class TradeHistoryTab:
     def __init__(self):

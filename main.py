@@ -21,6 +21,7 @@ def initialize_system():
     
     # Clear any running analysis from previous session
     job_manager.clear_running_analysis_on_startup()
+    job_manager._execute_account_refresh()
     
     job_manager.start()
 
