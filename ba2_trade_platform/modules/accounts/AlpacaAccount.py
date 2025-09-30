@@ -259,8 +259,7 @@ class AlpacaAccount(AccountInterface):
                     time_in_force=time_in_force,
                     client_order_id=trading_order.comment
                 )
-            elif order_type_value in [CoreOrderType.LIMIT.value.lower(), 
-                                      CoreOrderType.BUY_LIMIT.value.lower(), 
+            elif order_type_value in [CoreOrderType.BUY_LIMIT.value.lower(), 
                                       CoreOrderType.SELL_LIMIT.value.lower()]:
                 if not trading_order.limit_price:
                     logger.error(f"Limit price is required for limit orders")
@@ -274,8 +273,7 @@ class AlpacaAccount(AccountInterface):
                     limit_price=trading_order.limit_price,
                     client_order_id=trading_order.comment
                 )
-            elif order_type_value in [CoreOrderType.STOP.value.lower(), 
-                                      CoreOrderType.BUY_STOP.value.lower(), 
+            elif order_type_value in [CoreOrderType.BUY_STOP.value.lower(), 
                                       CoreOrderType.SELL_STOP.value.lower()]:
                 if not trading_order.stop_price:
                     logger.error(f"Stop price is required for stop orders")
@@ -613,7 +611,7 @@ class AlpacaAccount(AccountInterface):
                 # Take profit orders are typically limit orders on the opposite side
                 statement = select(TradingOrder).where(
                     TradingOrder.transaction_id == transaction_id,
-                    TradingOrder.order_type.in_([CoreOrderType.LIMIT, CoreOrderType.BUY_LIMIT, CoreOrderType.SELL_LIMIT]),
+                    TradingOrder.order_type.in_([CoreOrderType.BUY_LIMIT, CoreOrderType.SELL_LIMIT]),
                     TradingOrder.status.in_([OrderStatus.OPEN, OrderStatus.PENDING])
                 )
                 orders = session.exec(statement).all()
@@ -640,14 +638,16 @@ class AlpacaAccount(AccountInterface):
         Returns:
             TradingOrder: The take profit order object
         """
-        # Determine opposite side for take profit
-        if original_order.side == OrderDirection.BUY:
-            tp_side = OrderDirection.SELL
-        else:
-            tp_side = OrderDirection.BUY
-        
         # Import OrderType enum from core.types
         from ...core.types import OrderType as CoreOrderType
+        
+        # Determine opposite side and appropriate order type for take profit
+        if original_order.side == OrderDirection.BUY:
+            tp_side = OrderDirection.SELL
+            tp_order_type = CoreOrderType.SELL_LIMIT
+        else:
+            tp_side = OrderDirection.BUY
+            tp_order_type = CoreOrderType.BUY_LIMIT
         
         # Create take profit order
         tp_order = TradingOrder(
@@ -655,7 +655,7 @@ class AlpacaAccount(AccountInterface):
             symbol=original_order.symbol,
             quantity=original_order.quantity,  # Same quantity as original
             side=tp_side,  # Opposite side
-            order_type=CoreOrderType.LIMIT,  # Take profit is a limit order
+            order_type=tp_order_type,  # BUY_LIMIT or SELL_LIMIT based on side
             limit_price=tp_price,
             transaction_id=original_order.transaction_id,  # Link to same transaction
             status=OrderStatus.PENDING,
