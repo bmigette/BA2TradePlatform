@@ -816,11 +816,11 @@ class AccountOverviewTab:
                     for pos in positions:
                         pos_dict = pos if isinstance(pos, dict) else dict(pos)
                         pos_dict['account'] = acc.name
-                    # Format all float values to 2 decimal places
-                    for k, v in pos_dict.items():
-                        if isinstance(v, float):
-                            pos_dict[k] = f"{v:.2f}"
-                    all_positions.append(pos_dict)
+                        # Format all float values to 2 decimal places
+                        for k, v in pos_dict.items():
+                            if isinstance(v, float):
+                                pos_dict[k] = f"{v:.2f}"
+                        all_positions.append(pos_dict)
                 except Exception as e:
                     all_positions.append({'account': acc.name, 'error': str(e)})
         
