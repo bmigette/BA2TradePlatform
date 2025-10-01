@@ -37,6 +37,7 @@ class AnalysisTask:
     completed_at: Optional[float] = None
     market_analysis_id: Optional[int] = None  # Reference to MarketAnalysis record
     bypass_balance_check: bool = False  # If True, skip balance verification for this task
+    bypass_transaction_check: bool = False  # If True, skip existing transaction checks for this task
     
     def __post_init__(self):
         if self.created_at is None:
@@ -136,7 +137,8 @@ class WorkerQueue:
     def submit_analysis_task(self, expert_instance_id: int, symbol: str, 
                            subtype: str = AnalysisUseCase.ENTER_MARKET, 
                            priority: int = 0, task_id: Optional[str] = None,
-                           bypass_balance_check: bool = False) -> str:
+                           bypass_balance_check: bool = False,
+                           bypass_transaction_check: bool = False) -> str:
         """
         Submit an analysis task to be processed by the worker queue.
         
@@ -146,6 +148,8 @@ class WorkerQueue:
             subtype: Analysis use case (AnalysisUseCase.ENTER_MARKET or AnalysisUseCase.OPEN_POSITIONS)
             priority: Task priority (lower numbers = higher priority)
             task_id: Optional custom task ID
+            bypass_balance_check: If True, skip balance verification for this task
+            bypass_transaction_check: If True, skip existing transaction checks for this task
             
         Returns:
             Task ID that can be used to track the task
@@ -178,7 +182,8 @@ class WorkerQueue:
                 symbol=symbol,
                 subtype=subtype,
                 priority=priority,
-                bypass_balance_check=bypass_balance_check
+                bypass_balance_check=bypass_balance_check,
+                bypass_transaction_check=bypass_transaction_check
             )
             
             self._tasks[task_id] = task
@@ -565,6 +570,11 @@ class WorkerQueue:
             String explaining why task should be skipped, or None if task should proceed
         """
         try:
+            # If bypass_transaction_check is True, skip transaction validation
+            if task.bypass_transaction_check:
+                logger.debug(f"Bypassing transaction check for expert {task.expert_instance_id}, symbol {task.symbol} (manual analysis)")
+                return None
+            
             has_transactions = self.has_existing_transactions(task.expert_instance_id, task.symbol)
             
             if task.subtype == AnalysisUseCase.ENTER_MARKET:

@@ -378,17 +378,22 @@ class Toolkit:
     @tool
     def get_google_news(
         query: Annotated[str, "Query to search with"],
-        curr_date: Annotated[str, "Curr date in yyyy-mm-dd format"],
+        curr_date: Annotated[str, "Curr date in yyyy-mm-dd format (optional, defaults to today)"] = None,
     ):
         """
         Retrieve the latest news from Google News based on a query and date range.
         Args:
             query (str): Query to search with
-            curr_date (str): Current date in yyyy-mm-dd format
+            curr_date (str, optional): Current date in yyyy-mm-dd format. Defaults to today's date if not provided.
         Returns:
             str: A formatted string containing the latest news from Google News based on the query and date range.
         """
         from ...dataflows.config import get_config
+        from datetime import datetime
+        
+        # Use today's date if curr_date is not provided
+        if curr_date is None:
+            curr_date = datetime.now().strftime("%Y-%m-%d")
         
         config = get_config()
         lookback_days = config.get("news_lookback_days", 7)

@@ -1870,12 +1870,24 @@ class ExpertSettingsTab:
             # Save expert-specific settings
             self._save_expert_settings(expert_id)
             
+            # Check if any instruments are enabled
+            has_instruments = False
+            if self.instrument_selector:
+                selected_instruments = self.instrument_selector.get_selected_instruments()
+                has_instruments = len(selected_instruments) > 0
+            
             # Save instrument configuration
             self._save_instrument_configuration(expert_id)
             
             self.dialog.close()
             self._update_table_rows()
-            ui.notify('Expert saved successfully!', type='positive')
+            
+            # Show success notification with warning if no instruments
+            if has_instruments:
+                ui.notify('Expert saved successfully!', type='positive')
+            else:
+                ui.notify('Expert saved successfully! ⚠️ Warning: No instruments enabled. This expert will not analyze any symbols.', 
+                         type='warning', timeout=5000)
             
         except Exception as e:
             logger.error(f"Error saving expert: {e}", exc_info=True)
@@ -2834,7 +2846,12 @@ class TradeSettingsTab:
                 
                 new_rule_id = add_instance(new_rule)
                 logger.info(f'Rule {rule_id} duplicated as {new_rule_id}')
-                ui.notify(f'Rule duplicated successfully as "{new_rule.name}"', type='positive')
+                
+                # Get fresh instance from database to avoid detached instance error
+                new_rule_fresh = get_instance(EventAction, new_rule_id)
+                rule_name = new_rule_fresh.name if new_rule_fresh else f"Rule {new_rule_id}"
+                
+                ui.notify(f'Rule duplicated successfully as "{rule_name}"', type='positive')
                 self._update_rules_table()
             except Exception as e:
                 logger.error(f'Error duplicating rule {rule_id}: {e}', exc_info=True)

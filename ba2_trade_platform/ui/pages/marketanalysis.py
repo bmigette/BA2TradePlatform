@@ -21,6 +21,7 @@ class JobMonitoringTab:
         self.worker_queue = None  # Lazy initialization
         self.analysis_table = None
         self.refresh_timer = None
+        self.pagination_container = None  # Container for pagination controls
         # Pagination and filtering state
         self.current_page = 1
         self.page_size = 25
@@ -74,8 +75,10 @@ class JobMonitoringTab:
             # Analysis jobs table
             self._create_analysis_table()
             self.symbol_input.bind_value(self.analysis_table, "filter")
-            # Pagination controls
-            self._create_pagination_controls()
+            # Pagination controls container
+            self.pagination_container = ui.row().classes('w-full')
+            with self.pagination_container:
+                self._create_pagination_controls()
             
             ui.separator().classes('my-4')
             
@@ -233,38 +236,44 @@ class JobMonitoringTab:
 
     def _create_pagination_controls(self):
         """Create pagination controls."""
+        # Clear existing controls if container exists
+        if self.pagination_container is not None:
+            self.pagination_container.clear()
+        
         if self.total_pages <= 1:
             return
-            
-        with ui.row().classes('w-full justify-center items-center mt-4 gap-2'):
-            # Previous button
-            prev_btn = ui.button('Previous', 
-                               on_click=lambda: self._change_page(self.current_page - 1),
-                               icon='chevron_left')
-            prev_btn.props('flat')
-            if self.current_page <= 1:
-                prev_btn.props('disable')
-            
-            # Page info
-            ui.label(f'Page {self.current_page} of {self.total_pages}').classes('mx-4')
-            
-            # Next button  
-            next_btn = ui.button('Next',
-                               on_click=lambda: self._change_page(self.current_page + 1),
-                               icon='chevron_right')
-            next_btn.props('flat')
-            if self.current_page >= self.total_pages:
-                next_btn.props('disable')
-            
-            # Page size selector
-            ui.separator().props('vertical').classes('mx-4')
-            page_size_options = {'10': '10 per page', '25': '25 per page', '50': '50 per page', '100': '100 per page'}
-            page_size_select = ui.select(
-                options=page_size_options,
-                value=str(self.page_size),
-                label='Page Size'
-            ).classes('w-32')
-            page_size_select.on_value_change(self._on_page_size_change)
+        
+        # Create controls in the container
+        with self.pagination_container:
+            with ui.row().classes('w-full justify-center items-center mt-4 gap-2'):
+                # Previous button
+                prev_btn = ui.button('Previous', 
+                                   on_click=lambda: self._change_page(self.current_page - 1),
+                                   icon='chevron_left')
+                prev_btn.props('flat')
+                if self.current_page <= 1:
+                    prev_btn.props('disable')
+                
+                # Page info
+                ui.label(f'Page {self.current_page} of {self.total_pages}').classes('mx-4')
+                
+                # Next button  
+                next_btn = ui.button('Next',
+                                   on_click=lambda: self._change_page(self.current_page + 1),
+                                   icon='chevron_right')
+                next_btn.props('flat')
+                if self.current_page >= self.total_pages:
+                    next_btn.props('disable')
+                
+                # Page size selector
+                ui.separator().props('vertical').classes('mx-4')
+                page_size_options = {'10': '10 per page', '25': '25 per page', '50': '50 per page', '100': '100 per page'}
+                page_size_select = ui.select(
+                    options=page_size_options,
+                    value=str(self.page_size),
+                    label='Page Size'
+                ).classes('w-32')
+                page_size_select.on_value_change(self._on_page_size_change)
     
     def _change_page(self, new_page: int):
         """Change to a specific page."""
@@ -417,7 +426,7 @@ class JobMonitoringTab:
                 self.analysis_table.update()
                 
                 # Re-create pagination controls to update button states
-                # Note: In a real app, you'd want to update controls more efficiently
+                self._create_pagination_controls()
             
             #logger.debug("Job monitoring data refreshed")
             
@@ -588,7 +597,8 @@ class ManualAnalysisTab:
                         int(self.expert_instance_id), 
                         symbol, 
                         subtype=subtype,
-                        bypass_balance_check=True  # Manual analysis bypasses balance check
+                        bypass_balance_check=True,  # Manual analysis bypasses balance check
+                        bypass_transaction_check=True  # Manual analysis bypasses transaction checks
                     )
                     
                     if success:
@@ -624,6 +634,13 @@ class ScheduledJobsTab:
     def __init__(self):
         self.scheduled_jobs_table = None
         self.refresh_timer = None
+        self.pagination_container = None  # Container for pagination controls
+        # Pagination and filtering state
+        self.current_page = 1
+        self.page_size = 25
+        self.total_pages = 1
+        self.total_records = 0
+        self.expert_filter = 'all'  # Filter by expert instance ID
         self.render()
 
     def render(self):
@@ -631,9 +648,23 @@ class ScheduledJobsTab:
             ui.label('Scheduled Analysis Jobs').classes('text-lg font-bold')
             ui.label('View all scheduled analysis jobs for the current week').classes('text-sm text-gray-600 mb-4')
             
+            # Filters and controls
             with ui.row().classes('w-full justify-between items-center mb-4'):
-                filter_input = ui.input('Filter', placeholder='Filter scheduled jobs...').classes('w-1/3')
-                with ui.row():
+                with ui.row().classes('gap-4'):
+                    # Expert instance filter
+                    expert_options = self._get_expert_filter_options()
+                    self.expert_select = ui.select(
+                        options=expert_options,
+                        value='all',
+                        label='Expert Filter'
+                    ).classes('w-48')
+                    self.expert_select.on_value_change(self._on_expert_filter_change)
+                    
+                    # Text filter
+                    self.filter_input = ui.input('Search', placeholder='Filter by symbol...').classes('w-40')
+                
+                with ui.row().classes('gap-2'):
+                    ui.button('Clear Filters', on_click=self._clear_filters, icon='clear')
                     ui.button('Refresh', on_click=self.refresh_data, icon='refresh')
                     with ui.switch('Auto-refresh', value=True) as auto_refresh:
                         auto_refresh.on_value_change(self.toggle_auto_refresh)
@@ -641,11 +672,50 @@ class ScheduledJobsTab:
             # Scheduled jobs table
             self._create_scheduled_jobs_table()
             
-            # Bind filter to table
-            filter_input.bind_value(self.scheduled_jobs_table, "filter")
+            # Bind text filter to table
+            self.filter_input.bind_value(self.scheduled_jobs_table, "filter")
+            
+            # Pagination controls container
+            self.pagination_container = ui.row().classes('w-full')
+            with self.pagination_container:
+                self._create_pagination_controls()
         
         # Start auto-refresh
         self.start_auto_refresh()
+
+    def _get_expert_filter_options(self) -> dict:
+        """Get expert instance filter options."""
+        try:
+            expert_instances = get_all_instances(ExpertInstance)
+            options = {'all': 'All Experts'}
+            
+            for instance in expert_instances:
+                if instance.enabled:
+                    label = f"{instance.expert} (ID: {instance.id})"
+                    if instance.user_description:
+                        label += f" - {instance.user_description}"
+                    options[str(instance.id)] = label
+            
+            return options
+        except Exception as e:
+            logger.error(f"Error getting expert filter options: {e}", exc_info=True)
+            return {'all': 'All Experts'}
+    
+    def _on_expert_filter_change(self, event):
+        """Handle expert filter change."""
+        self.expert_filter = event.value
+        self.current_page = 1  # Reset to first page when filtering
+        self.refresh_data()
+    
+    def _clear_filters(self):
+        """Clear all filters."""
+        self.expert_filter = 'all'
+        self.current_page = 1
+        if hasattr(self, 'expert_select'):
+            self.expert_select.value = 'all'
+        if hasattr(self, 'filter_input'):
+            self.filter_input.value = ''
+        self.refresh_data()
 
     def _create_scheduled_jobs_table(self):
         """Create the scheduled jobs table."""
@@ -684,8 +754,10 @@ class ScheduledJobsTab:
             # Handle events
             self.scheduled_jobs_table.on('run_now', self.run_analysis_now)
 
-    def _get_scheduled_jobs_data(self) -> List[dict]:
-        """Get scheduled jobs data for the current week - one line per instrument per expert instance per job type."""
+    def _get_scheduled_jobs_data(self) -> tuple:
+        """Get scheduled jobs data with pagination and filtering.
+        Returns: (jobs_data, total_count)
+        """
         try:
             from datetime import datetime, timedelta
             import json
@@ -693,6 +765,11 @@ class ScheduledJobsTab:
             
             # Get all enabled expert instances
             expert_instances = get_all_instances(ExpertInstance)
+            
+            # Filter by expert instance if specified
+            if self.expert_filter != 'all':
+                expert_instance_id = int(self.expert_filter)
+                expert_instances = [ei for ei in expert_instances if ei.id == expert_instance_id]
             
             # Group by (expert_instance_id, symbol, job_type) to create one line per combination
             jobs_by_combination = {}
@@ -772,11 +849,76 @@ class ScheduledJobsTab:
             scheduled_jobs = list(jobs_by_combination.values())
             scheduled_jobs.sort(key=lambda x: (x['expert_name'], x['symbol']))
             
-            return scheduled_jobs
+            # Get total count
+            total_count = len(scheduled_jobs)
+            
+            # Apply pagination
+            start_idx = (self.current_page - 1) * self.page_size
+            end_idx = start_idx + self.page_size
+            paginated_jobs = scheduled_jobs[start_idx:end_idx]
+            
+            return paginated_jobs, total_count
             
         except Exception as e:
             logger.error(f"Error getting scheduled jobs data: {e}", exc_info=True)
-            return []
+            return [], 0
+
+    def _create_pagination_controls(self):
+        """Create pagination controls."""
+        # Clear existing controls if container exists
+        if self.pagination_container is not None:
+            self.pagination_container.clear()
+        
+        if self.total_pages <= 1:
+            return
+        
+        # Create controls in the container
+        with self.pagination_container:
+            with ui.row().classes('w-full justify-center items-center mt-4 gap-2'):
+                # Previous button
+                prev_btn = ui.button('Previous', 
+                                   on_click=lambda: self._change_page(self.current_page - 1),
+                                   icon='chevron_left')
+                prev_btn.props('flat')
+                if self.current_page <= 1:
+                    prev_btn.props('disable')
+                
+                # Page info
+                ui.label(f'Page {self.current_page} of {self.total_pages}').classes('mx-4')
+                
+                # Next button  
+                next_btn = ui.button('Next',
+                                   on_click=lambda: self._change_page(self.current_page + 1),
+                                   icon='chevron_right')
+                next_btn.props('flat')
+                if self.current_page >= self.total_pages:
+                    next_btn.props('disable')
+                
+                # Page size selector
+                ui.separator().props('vertical').classes('mx-4')
+                page_size_options = {'10': '10 per page', '25': '25 per page', '50': '50 per page', '100': '100 per page'}
+                page_size_select = ui.select(
+                    options=page_size_options,
+                    value=str(self.page_size),
+                    label='Page Size'
+                ).classes('w-32')
+                page_size_select.on_value_change(self._on_page_size_change)
+    
+    def _change_page(self, new_page: int):
+        """Change to a specific page."""
+        if 1 <= new_page <= self.total_pages:
+            self.current_page = new_page
+            self.refresh_data()
+    
+    def _on_page_size_change(self, event):
+        """Handle page size change."""
+        try:
+            new_size = int(event.value)
+            self.page_size = new_size
+            self.current_page = 1  # Reset to first page
+            self.refresh_data()
+        except ValueError:
+            pass
 
     def run_analysis_now(self, event_data):
         """Run analysis immediately for the selected expert and symbol with proper subtype."""
@@ -803,13 +945,14 @@ class ScheduledJobsTab:
                 expert_instance_id, 
                 symbol, 
                 subtype=subtype,
-                bypass_balance_check=True  # Manual analysis bypasses balance check
+                bypass_balance_check=True,  # Manual analysis bypasses balance check
+                bypass_transaction_check=True  # Manual analysis bypasses transaction checks
             )
             
             if success:
                 ui.notify(f"Analysis started for {symbol} ({subtype}) using expert instance {expert_instance_id}", type='positive')
             else:
-                ui.notify("Analysis already pending for this symbol and expert", type='warning')
+                ui.notify("Analysis already pending for this symbol and expert, or open positions exists", type='warning')
                 
         except Exception as e:
             logger.error(f"Error running analysis now: {e}", exc_info=True)
@@ -819,8 +962,18 @@ class ScheduledJobsTab:
         """Refresh the scheduled jobs data."""
         try:
             if self.scheduled_jobs_table:
-                self.scheduled_jobs_table.rows = self._get_scheduled_jobs_data()
+                scheduled_data, self.total_records = self._get_scheduled_jobs_data()
+                self.total_pages = max(1, math.ceil(self.total_records / self.page_size))
+                
+                # Ensure current page is valid
+                if self.current_page > self.total_pages:
+                    self.current_page = max(1, self.total_pages)
+                
+                self.scheduled_jobs_table.rows = scheduled_data
                 self.scheduled_jobs_table.update()
+                
+                # Re-create pagination controls to update button states
+                self._create_pagination_controls()
             
             #logger.debug("Scheduled jobs data refreshed")
             
