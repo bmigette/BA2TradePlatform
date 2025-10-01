@@ -1,7 +1,7 @@
 {
   "export_version": "1.0",
   "export_type": "rules",
-  "export_timestamp": "2025-10-01T22:15:31.280379",
+  "export_timestamp": "2025-10-01T22:31:02.045754",
   "rules": [
     {
       "name": "BUY_Longterm_70pctConfidence_10pctProfit",
@@ -186,6 +186,11 @@
           "event_type": "expected_profit_target_percent",
           "operator": ">",
           "value": 5.0
+        },
+        "trigger_3": {
+          "event_type": "confidence",
+          "operator": ">",
+          "value": 70.0
         }
       },
       "actions": {

@@ -1009,6 +1009,7 @@ class OrderRecommendationsTab:
         self.detail_container = None
         self.refresh_timer = None
         self.expert_select = None
+        self.expert_filter = 'all'  # Track selected expert filter
         self.render()
 
     def render(self):
@@ -1026,8 +1027,9 @@ class OrderRecommendationsTab:
                     self.expert_select = ui.select(
                         options=expert_options,
                         label='Select Expert',
-                        value=expert_options[0] if expert_options else None
+                        value='all'  # Default to 'all'
                     ).classes('w-64').props('dense outlined')
+                    self.expert_select.on_value_change(self._on_expert_filter_change)
                     
                     ui.button(
                         'Process Recommendations', 
@@ -1053,6 +1055,11 @@ class OrderRecommendationsTab:
             # Auto-refresh every 30 seconds
             self.refresh_timer = ui.timer(30.0, self.refresh_data)
 
+    def _on_expert_filter_change(self, event):
+        """Handle expert filter change."""
+        self.expert_filter = event.value
+        self.refresh_data()
+    
     def refresh_data(self):
         """Refresh the recommendations data."""
         try:
@@ -1139,9 +1146,19 @@ class OrderRecommendationsTab:
                         func.avg(ExpertRecommendation.confidence).label('avg_confidence'),
                         func.max(ExpertRecommendation.created_at).label('latest_created_at')
                     )
-                    .group_by(ExpertRecommendation.symbol)
-                    .order_by(func.max(ExpertRecommendation.created_at).desc())
                 )
+                
+                # Apply expert filter if not 'all'
+                if self.expert_filter and self.expert_filter != 'all':
+                    # Extract expert ID from the filter string format: "ExpertName (ID: 123)"
+                    try:
+                        expert_id = int(self.expert_filter.split('ID: ')[-1].rstrip(')'))
+                        statement = statement.where(ExpertRecommendation.instance_id == expert_id)
+                    except (ValueError, IndexError):
+                        pass  # If parsing fails, show all
+                
+                statement = statement.group_by(ExpertRecommendation.symbol).order_by(func.max(ExpertRecommendation.created_at).desc())
+                
                 
                 results = session.exec(statement).all()
                 
@@ -1266,8 +1283,18 @@ class OrderRecommendationsTab:
                     .join(ExpertInstance, ExpertRecommendation.instance_id == ExpertInstance.id)
                     .outerjoin(MarketAnalysis, ExpertRecommendation.market_analysis_id == MarketAnalysis.id)
                     .where(ExpertRecommendation.symbol == symbol)
-                    .order_by(ExpertRecommendation.created_at.desc())
                 )
+                
+                # Apply expert filter if not 'all'
+                if self.expert_filter and self.expert_filter != 'all':
+                    # Extract expert ID from the filter string format: "ExpertName (ID: 123)"
+                    try:
+                        expert_id = int(self.expert_filter.split('ID: ')[-1].rstrip(')'))
+                        statement = statement.where(ExpertRecommendation.instance_id == expert_id)
+                    except (ValueError, IndexError):
+                        pass  # If parsing fails, show all
+                
+                statement = statement.order_by(ExpertRecommendation.created_at.desc())
                 
                 results = session.exec(statement).all()
                 
@@ -1430,7 +1457,7 @@ class OrderRecommendationsTab:
         try:
             analysis_id = event_data.args if hasattr(event_data, 'args') else event_data
             if analysis_id:
-                ui.navigate.to(f'/market_analysis_detail/{analysis_id}')
+                ui.navigate.to(f'/market_analysis/{analysis_id}')
         except Exception as e:
             logger.error(f"Error navigating to analysis detail: {e}", exc_info=True)
 
@@ -1562,21 +1589,20 @@ class OrderRecommendationsTab:
             experts = get_all_instances(ExpertInstance)
             enabled_experts = [e for e in experts if e.enabled]
             
-            if not enabled_experts:
-                return []
+            # Always start with 'All Experts' option
+            options = ['all']
             
-            # Create options: display name -> instance ID mapping
-            options = {}
+            # Create options: display name with instance ID
             for expert in enabled_experts:
                 desc = expert.user_description or f"Expert {expert.id}"
                 display_name = f"{expert.expert} - {desc} (ID: {expert.id})"
-                options[display_name] = expert.id
+                options.append(display_name)
             
-            return list(options.keys())
+            return options
             
         except Exception as e:
             logger.error(f"Error getting expert options: {e}", exc_info=True)
-            return []
+            return ['all']
 
     def _handle_process_recommendations(self):
         """Process all recommendations for the selected expert."""
