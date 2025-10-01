@@ -731,8 +731,8 @@ class OverviewTab:
             
             with get_db() as session:
                 for order in pending_orders:
-                    if order.order_recommendation_id:
-                        recommendation = session.get(ExpertRecommendation, order.order_recommendation_id)
+                    if order.expert_recommendation_id:
+                        recommendation = session.get(ExpertRecommendation, order.expert_recommendation_id)
                         if recommendation:
                             orders_by_expert[recommendation.instance_id].append(order)
             
@@ -983,7 +983,9 @@ class AccountOverviewTab:
                 .where(TradingOrder.status.in_(pending_statuses))
                 .order_by(TradingOrder.created_at.desc())
             )
-            orders = list(session.exec(statement).all())
+            orders_tuples = session.exec(statement).all()
+            # Unpack tuples to get actual order objects
+            orders = [order[0] if isinstance(order, tuple) else order for order in orders_tuples if order]
             
             if not orders:
                 ui.label('No pending orders found.').classes('text-gray-500')
@@ -1154,7 +1156,7 @@ class TradeHistoryTab:
                 expert_name = ""
                 analysis_link = ""
                 
-                if order.order_recommendation_id:
+                if order.expert_recommendation_id:
                     # Get market analysis ID for navigation
                     analysis_id = get_market_analysis_id_from_order_id(order.id)
                     if analysis_id:
@@ -1162,7 +1164,7 @@ class TradeHistoryTab:
                     
                     # Get expert shortname
                     try:
-                        expert_recommendation = get_instance(ExpertRecommendation, order.order_recommendation_id)
+                        expert_recommendation = get_instance(ExpertRecommendation, order.expert_recommendation_id)
                         if expert_recommendation:
                             expert_instance = get_expert_instance_from_id(expert_recommendation.instance_id)
                             if expert_instance and hasattr(expert_instance, 'shortname'):

@@ -1094,6 +1094,23 @@ class ExpertSettingsTab:
                         
                         ui.separator().classes('my-4')
                         
+                        # Risk Management settings
+                        ui.label('Risk Management:').classes('text-subtitle2 mb-2')
+                        ui.label('Configure risk management parameters for this expert:').classes('text-body2 mb-2')
+                        
+                        with ui.column().classes('w-full gap-2'):
+                            # Max Virtual Equity Per Instrument
+                            with ui.row().classes('items-center gap-2'):
+                                ui.label('Max equity per instrument (%):').classes('text-sm font-medium')
+                                self.max_virtual_equity_per_instrument_input = ui.input(
+                                    value='10.0',
+                                    placeholder='10.0'
+                                ).classes('w-20')
+                                ui.label('%').classes('text-sm')
+                            ui.label('Maximum percentage of virtual trading balance that can be allocated to a single instrument. Recommended: 5-15%.').classes('text-body2 text-grey-7 ml-2')
+                        
+                        ui.separator().classes('my-4')
+                        
                         # Ruleset assignment settings
                         ui.label('Automation Rulesets:').classes('text-subtitle2 mb-2')
                         ui.label('Assign rulesets to control automated trading behavior:').classes('text-body2 mb-2')
@@ -1485,6 +1502,14 @@ class ExpertSettingsTab:
                 self.allow_automated_trade_opening_checkbox.value = allow_automated_trade_opening
             if hasattr(self, 'allow_automated_trade_modification_checkbox'):
                 self.allow_automated_trade_modification_checkbox.value = allow_automated_trade_modification
+            
+            # Load risk management settings
+            max_virtual_equity_per_instrument = expert.settings.get('max_virtual_equity_per_instrument_percent', 10.0)
+            if isinstance(max_virtual_equity_per_instrument, str):
+                max_virtual_equity_per_instrument = float(max_virtual_equity_per_instrument)
+            
+            if hasattr(self, 'max_virtual_equity_per_instrument_input'):
+                self.max_virtual_equity_per_instrument_input.value = str(max_virtual_equity_per_instrument)
             
             # Load ruleset assignments from ExpertInstance model
             if hasattr(self, 'enter_market_ruleset_select') and hasattr(self, 'enter_market_ruleset_map'):
@@ -1882,6 +1907,12 @@ class ExpertSettingsTab:
             expert.save_setting('allow_automated_trade_opening', self.allow_automated_trade_opening_checkbox.value, setting_type="bool")
             expert.save_setting('allow_automated_trade_modification', self.allow_automated_trade_modification_checkbox.value, setting_type="bool")
             logger.debug(f'Saved trading permissions: buy={self.enable_buy_checkbox.value}, sell={self.enable_sell_checkbox.value}, auto_open={self.allow_automated_trade_opening_checkbox.value}, auto_modify={self.allow_automated_trade_modification_checkbox.value}')
+        
+        # Save risk management settings
+        if hasattr(self, 'max_virtual_equity_per_instrument_input'):
+            max_equity_value = float(self.max_virtual_equity_per_instrument_input.value or 10.0)
+            expert.save_setting('max_virtual_equity_per_instrument_percent', max_equity_value, setting_type="float")
+            logger.debug(f'Saved risk management: max_virtual_equity_per_instrument_percent={max_equity_value}%')
         
         # Save expert-specific settings
         if hasattr(self, 'expert_settings_inputs') and self.expert_settings_inputs:

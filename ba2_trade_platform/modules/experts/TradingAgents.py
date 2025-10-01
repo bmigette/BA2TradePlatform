@@ -111,13 +111,6 @@ class TradingAgents(MarketExpertInterface):
                 "type": "bool", "required": True, "default": True,
                 "description": "Enable debug mode with detailed console output",
                 "tooltip": "When enabled, outputs detailed logs of the AI agent's thinking process, data gathering, and decision-making steps. Useful for understanding why recommendations were made. Disable for cleaner logs in production."
-            },
-            
-            # Risk Management
-            "max_virtual_equity_per_instrument_percent": {
-                "type": "float", "required": True, "default": 10.0,
-                "description": "Maximum virtual equity allocation per instrument (%)",
-                "tooltip": "Maximum percentage of virtual trading balance that can be allocated to a single instrument. This helps maintain portfolio diversification. Recommended: 5-15%. Lower values (5-10%) provide better diversification, higher values (10-15%) allow larger positions in high-confidence trades."
             }
         }
 

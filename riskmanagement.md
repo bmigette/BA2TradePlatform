@@ -18,9 +18,8 @@ The `TradeRiskManagement` class implements a comprehensive risk management syste
 ## Algorithm Details
 
 ### Step 1: Order Collection and Filtering
-1. Collect all pending orders with `quantity=0` for the expert
-2. Filter orders based on expert's buy/sell permissions
-3. Fetch linked recommendations with expected profit data
+1. Filter orders based on expert's buy/sell permissions
+2. Fetch linked recommendations with expected profit data
 
 ### Step 2: Profit-Based Prioritization
 1. Sort orders by expected profit percentage (descending)

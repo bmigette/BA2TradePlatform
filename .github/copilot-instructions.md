@@ -86,6 +86,15 @@ logger.error("Error conditions", exc_info=True)  # ALWAYS include exc_info=True 
 
 **Critical Logging Rule**: Always include `exc_info=True` parameter in all `logger.error()` calls to capture full stack traces for debugging. This is mandatory for all error logging throughout the codebase.
 
+### 5. **Live Data Handling**
+**CRITICAL RULE**: Never use default values or fallbacks for live market data (prices, balances, quantities, etc.):
+- ❌ **NEVER DO THIS**: `price = recommendation.current_price or 1.0`
+- ❌ **NEVER DO THIS**: `balance = account.get_balance() or 0.0`
+- ✅ **ALWAYS DO THIS**: Check for `None` explicitly and raise an error or skip the operation
+- ✅ **ALWAYS DO THIS**: Get real-time prices from account interface using `account.get_instrument_current_price(symbol)`
+
+**Rationale**: Using default values for financial data can lead to catastrophic trading errors, incorrect position sizing, and financial loss. Always fail explicitly rather than proceeding with fake data.
+
 ## Dependencies
 - **Trading**: `alpaca-py` (primary broker), `yfinance`, `backtrader`
 - **AI/ML**: `langchain-*` ecosystem, `stockstats`

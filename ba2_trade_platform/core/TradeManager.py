@@ -462,7 +462,7 @@ class TradeManager:
                 stop_price=None,
                 comment=f"expert_{expert_instance.expert}-{expert_instance.id}_{recommendation.id}",
                 # Link to the recommendation and mark as automatic
-                order_recommendation_id=recommendation.id,
+                expert_recommendation_id=recommendation.id,
                 open_type=OrderOpenType.AUTOMATIC
             )
             
@@ -548,7 +548,7 @@ class TradeManager:
             
         return placed_orders
     
-    def process_expert_recommendations_after_analysis(self, expert_instance_id: int) -> List[TradingOrder]:
+    def process_expert_recommendations_after_analysis(self, expert_instance_id: int, lookback_days: int = 1) -> List[TradingOrder]:
         """
         Process expert recommendations after all market analysis jobs for enter_market are completed.
         
@@ -558,6 +558,7 @@ class TradeManager:
         
         Args:
             expert_instance_id: The expert instance ID to process recommendations for
+            lookback_days: Number of days to look back for recommendations (default: 1)
             
         Returns:
             List of TradingOrder objects that were created (in PENDING state)
@@ -606,8 +607,8 @@ class TradeManager:
                 self.logger.debug(f"Still has pending analysis jobs for expert {expert_instance_id}, skipping automated order creation")
                 return created_orders
             
-            # Get recent recommendations (less than 24 hours old) for this expert
-            cutoff_time = datetime.now(timezone.utc) - timedelta(hours=24)
+            # Get recent recommendations based on lookback_days parameter
+            cutoff_time = datetime.now(timezone.utc) - timedelta(days=lookback_days)
             
             with Session(get_db().bind) as session:
                 statement = select(ExpertRecommendation).where(
@@ -655,15 +656,17 @@ class TradeManager:
                         limit_price=None,
                         stop_price=None,
                         comment=f"Auto-created from recommendation {recommendation.id} (awaiting review)",
-                        order_recommendation_id=recommendation.id,
+                        expert_recommendation_id=recommendation.id,
                         open_type=OrderOpenType.AUTOMATIC,
                         created_at=datetime.now(timezone.utc)
                     )
                     
-                    # Add order to database
-                    order_id = add_instance(order)
+                    # Add order to database using the current session
+                    order_id = add_instance(order, session=session)
                     if order_id:
                         order.id = order_id
+                        # Expunge the order from the session so it can be used after session closes
+                        session.expunge(order)
                         created_orders.append(order)
                         self.logger.info(f"Created pending order {order_id} for {recommendation.symbol} (recommendation {recommendation.id} passed ruleset)")
                 

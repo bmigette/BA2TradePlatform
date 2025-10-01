@@ -87,6 +87,12 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 "min_available_balance_pct": {
                     "type": "float", "required": False, "default": 20.0,
                     "description": "Minimum available balance percentage required to enter new market positions (default 20%)"
+                },
+                # Risk Management Settings
+                "max_virtual_equity_per_instrument_percent": {
+                    "type": "float", "required": False, "default": 10.0,
+                    "description": "Maximum virtual equity allocation per instrument (%)",
+                    "tooltip": "Maximum percentage of virtual trading balance that can be allocated to a single instrument. This helps maintain portfolio diversification. Recommended: 5-15%. Lower values (5-10%) provide better diversification, higher values (10-15%) allow larger positions in high-confidence trades."
                 }
                 
             }

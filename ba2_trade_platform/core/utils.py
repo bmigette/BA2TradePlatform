@@ -65,7 +65,7 @@ def get_expert_instance_id_from_order_id(order_id: int) -> Optional[int]:
             # Query order with joined recommendation
             statement = (
                 select(ExpertRecommendation.instance_id)
-                .join(TradingOrder, TradingOrder.order_recommendation_id == ExpertRecommendation.id)
+                .join(TradingOrder, TradingOrder.expert_recommendation_id == ExpertRecommendation.id)
                 .where(TradingOrder.id == order_id)
             )
             result = session.exec(statement).first()
@@ -105,7 +105,7 @@ def get_market_analysis_id_from_order_id(order_id: int) -> Optional[int]:
             # Query order with joined recommendation
             statement = (
                 select(ExpertRecommendation.market_analysis_id)
-                .join(TradingOrder, TradingOrder.order_recommendation_id == ExpertRecommendation.id)
+                .join(TradingOrder, TradingOrder.expert_recommendation_id == ExpertRecommendation.id)
                 .where(TradingOrder.id == order_id)
             )
             result = session.exec(statement).first()
@@ -136,7 +136,7 @@ def has_existing_orders_for_expert_and_symbol(expert_instance_id: int, symbol: s
             # Query orders linked to the expert via recommendations
             statement = (
                 select(TradingOrder.id)
-                .join(ExpertRecommendation, TradingOrder.order_recommendation_id == ExpertRecommendation.id)
+                .join(ExpertRecommendation, TradingOrder.expert_recommendation_id == ExpertRecommendation.id)
                 .where(
                     ExpertRecommendation.instance_id == expert_instance_id,
                     TradingOrder.symbol == symbol,
@@ -168,7 +168,7 @@ def get_orders_for_expert_and_symbol(expert_instance_id: int, symbol: str = None
             # Query orders linked to the expert via recommendations
             statement = (
                 select(TradingOrder)
-                .join(ExpertRecommendation, TradingOrder.order_recommendation_id == ExpertRecommendation.id)
+                .join(ExpertRecommendation, TradingOrder.expert_recommendation_id == ExpertRecommendation.id)
                 .where(ExpertRecommendation.instance_id == expert_instance_id)
             )
             

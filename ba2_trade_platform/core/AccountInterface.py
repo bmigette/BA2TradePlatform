@@ -124,9 +124,9 @@ class AccountInterface(ExtendableSettingsInterface):
         
         # Get expert_id if available through recommendation
         expert_id = None
-        if trading_order.order_recommendation_id:
+        if trading_order.expert_recommendation_id:
             try:
-                recommendation = get_instance(ExpertRecommendation, trading_order.order_recommendation_id)
+                recommendation = get_instance(ExpertRecommendation, trading_order.expert_recommendation_id)
                 if recommendation:
                     expert_instance = get_instance(ExpertInstance, recommendation.instance_id)
                     if expert_instance:

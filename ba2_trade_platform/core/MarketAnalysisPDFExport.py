@@ -317,7 +317,7 @@ class MarketAnalysisPDFExport:
             # Get related orders
             recommendation_ids = [rec.id for rec in recommendations]
             orders_statement = select(TradingOrder).where(
-                TradingOrder.order_recommendation_id.in_(recommendation_ids)
+                TradingOrder.expert_recommendation_id.in_(recommendation_ids)
             ).order_by(TradingOrder.created_at.desc())
             orders = list(session.exec(orders_statement).all())
             

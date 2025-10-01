@@ -101,9 +101,6 @@ class ExpertRecommendation(SQLModel, table=True):
     # Relationship back to market analysis
     market_analysis: Optional["MarketAnalysis"] = Relationship(back_populates="expert_recommendations")
     
-    # Relationship to transactions
-    transactions: List["Transaction"] = Relationship(back_populates="expert_recommendation")
-    
     # Relationship to trade action results
     trade_action_results: List["TradeActionResult"] = Relationship(back_populates="expert_recommendation")
 
@@ -152,10 +149,6 @@ class Transaction(SQLModel, table=True):
     # Optional reference to expert instance for tracking which expert initiated this transaction
     expert_id: int | None = Field(foreign_key="expertinstance.id", nullable=True, ondelete="SET NULL")
     
-    # Relationship to expert recommendation
-    expert_recommendation_id: int | None = Field(foreign_key="expertrecommendation.id", nullable=True, ondelete="SET NULL")
-    expert_recommendation: Optional["ExpertRecommendation"] = Relationship(back_populates="transactions")
-    
     # Relationship to trading orders (1:many - one transaction can have multiple orders)
     trading_orders: List["TradingOrder"] = Relationship(back_populates="transaction")
     
@@ -189,7 +182,7 @@ class TradingOrder(SQLModel, table=True):
     # New fields
     open_type: OrderOpenType = Field(default=OrderOpenType.AUTOMATIC)
     broker_order_id: str | None = Field(default=None, description="Broker-specific order ID for tracking")
-    order_recommendation_id: int | None = Field(default=None, foreign_key="expertrecommendation.id", description="Expert recommendation that generated this order")
+    expert_recommendation_id: int | None = Field(default=None, foreign_key="expertrecommendation.id", description="Expert recommendation that generated this order")
     limit_price: float | None = Field(default=None, description="Limit price for limit orders")
     stop_price: float | None = Field(default=None, description="Stop price for stop orders")
 

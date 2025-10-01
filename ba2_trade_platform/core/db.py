@@ -58,23 +58,32 @@ def add_instance(instance, session: Session | None = None):
         session (Session, optional): An existing SQLModel session. If not provided, a new session is created.
 
     Returns:
-        The added instance.
+        The ID of the added instance.
     """
+    instance_class = instance.__class__.__name__
     try:
-        instance_class = instance.__class__.__name__
         if session:
             session.add(instance)
+            session.flush()  # Flush to generate the ID without committing
+            instance_id = instance.id  # Get ID after flush
             session.commit()
-            logger.info(f"Added instance: {instance_class} (id={instance.id})")
-            return instance.id
+            logger.info(f"Added instance: {instance_class} (id={instance_id})")
+            return instance_id
         else:
-            with Session(engine) as session:
-                session.add(instance)
-                session.commit()
-                logger.info(f"Added instance: {instance_class} (id={instance.id})")
-                return instance.id
+            with Session(engine) as new_session:
+                new_session.add(instance)
+                new_session.flush()  # Flush to generate the ID without committing
+                instance_id = instance.id  # Get ID after flush
+                new_session.commit()
+                logger.info(f"Added instance: {instance_class} (id={instance_id})")
+                return instance_id
     except Exception as e:
-        logger.error(f"Error adding instance: {e}", exc_info=True)
+        # Try to get ID safely, may not be available if instance is detached
+        try:
+            instance_id = instance.id
+            logger.error(f"Error adding instance {instance_class} (id={instance_id}): {e}", exc_info=True)
+        except:
+            logger.error(f"Error adding instance {instance_class}: {e}", exc_info=True)
         raise
 
 def update_instance(instance, session: Session | None = None):
@@ -88,7 +97,7 @@ def update_instance(instance, session: Session | None = None):
         session (Session, optional): An existing SQLModel session. If not provided, a new session is created.
 
     Returns:
-        The updated instance.
+        True if update was successful.
     """
     try:
         if session:
@@ -100,6 +109,7 @@ def update_instance(instance, session: Session | None = None):
                 session.add(instance)
                 session.commit()
                 session.refresh(instance)
+        return True
     except Exception as e:
         logger.error(f"Error updating instance: {e}", exc_info=True)
         raise
