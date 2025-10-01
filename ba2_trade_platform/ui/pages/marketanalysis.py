@@ -1812,18 +1812,99 @@ class OrderRecommendationsTab:
 
 
 def content() -> None:
+    # Tab configuration: (tab_name, tab_label)
+    tab_config = [
+        ('monitoring', 'Job Monitoring'),
+        ('manual', 'Manual Analysis'),
+        ('scheduled', 'Scheduled Jobs'),
+        ('recommendations', 'Order Recommendations')
+    ]
+    
     with ui.tabs() as tabs:
-        ui.tab('Job Monitoring')
-        ui.tab('Manual Analysis')
-        ui.tab('Scheduled Jobs')
-        ui.tab('Order Recommendations')
+        tab_objects = {}
+        for tab_name, tab_label in tab_config:
+            tab_objects[tab_name] = ui.tab(tab_name, label=tab_label)
 
-    with ui.tab_panels(tabs, value='Job Monitoring').classes('w-full'):
-        with ui.tab_panel('Job Monitoring'):
+    with ui.tab_panels(tabs, value=tab_objects['monitoring']).classes('w-full'):
+        with ui.tab_panel(tab_objects['monitoring']):
             JobMonitoringTab()
-        with ui.tab_panel('Manual Analysis'):
+        with ui.tab_panel(tab_objects['manual']):
             ManualAnalysisTab()
-        with ui.tab_panel('Scheduled Jobs'):
+        with ui.tab_panel(tab_objects['scheduled']):
             ScheduledJobsTab()
-        with ui.tab_panel('Order Recommendations'):
+        with ui.tab_panel(tab_objects['recommendations']):
             OrderRecommendationsTab()
+    
+    # Setup HTML5 history navigation for tabs using timer for async compatibility
+    async def setup_tab_navigation():
+        await ui.run_javascript('''
+            (function() {
+                let isPopstateNavigation = false;
+                
+                // Map display labels to tab names
+                const labelToName = {
+                    'Job Monitoring': 'monitoring',
+                    'Manual Analysis': 'manual',
+                    'Scheduled Jobs': 'scheduled',
+                    'Order Recommendations': 'recommendations'
+                };
+                
+                // Get tab name from tab element
+                function getTabName(tab) {
+                    const label = tab.textContent.trim();
+                    return labelToName[label] || label.toLowerCase().replace(/\s+/g, '-');
+                }
+                
+                // Handle browser back/forward buttons
+                window.addEventListener('popstate', (e) => {
+                    isPopstateNavigation = true;
+                    const hash = window.location.hash.substring(1) || 'monitoring';
+                    
+                    // Find and click the correct tab
+                    const tabs = document.querySelectorAll('.q-tab');
+                    tabs.forEach(tab => {
+                        const tabName = getTabName(tab);
+                        if (tabName === hash) {
+                            tab.click();
+                        }
+                    });
+                    
+                    setTimeout(() => { isPopstateNavigation = false; }, 100);
+                });
+                
+                // Setup click handlers for tabs to update URL
+                function setupTabClickHandlers() {
+                    const tabs = document.querySelectorAll('.q-tab');
+                    console.log('Found', tabs.length, 'tabs');
+                    tabs.forEach(tab => {
+                        const tabName = getTabName(tab);
+                        console.log('Setting up listener for tab:', tabName, '(label:', tab.textContent.trim() + ')');
+                        tab.addEventListener('click', () => {
+                            if (!isPopstateNavigation) {
+                                console.log('Tab clicked:', tabName);
+                                history.pushState({tab: tabName}, '', '#' + tabName);
+                            }
+                        });
+                    });
+                }
+                
+                // Handle initial page load with hash
+                const hash = window.location.hash.substring(1);
+                if (hash && hash !== 'monitoring') {
+                    const tabs = document.querySelectorAll('.q-tab');
+                    tabs.forEach(tab => {
+                        if (tab.getAttribute('name') === hash) {
+                            tab.click();
+                        }
+                    });
+                } else if (!hash) {
+                    // Set initial hash if none exists
+                    history.replaceState({tab: 'monitoring'}, '', '#monitoring');
+                }
+                
+                setupTabClickHandlers();
+            })();
+        ''')
+    
+    # Use timer to run JavaScript after page is loaded (increased delay to ensure tabs are rendered)
+    ui.timer(0.5, setup_tab_navigation, once=True)

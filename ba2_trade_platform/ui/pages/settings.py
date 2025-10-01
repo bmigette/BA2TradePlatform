@@ -3071,22 +3071,106 @@ class TradeSettingsTab:
 
 def content() -> None:
     logger.debug('Initializing settings page')
+    
+    # Tab configuration: (tab_name, tab_label)
+    tab_config = [
+        ('global', 'Global Settings'),
+        ('account', 'Account Settings'),
+        ('expert', 'Expert Settings'),
+        ('trade', 'Trade Settings'),
+        ('instruments', 'Instruments')
+    ]
+    
     with ui.tabs() as tabs:
-        ui.tab('Global Settings')
-        ui.tab('Account Settings')
-        ui.tab('Expert Settings')
-        ui.tab('Trade Settings')
-        ui.tab('Instruments')
+        tab_objects = {}
+        for tab_name, tab_label in tab_config:
+            tab_objects[tab_name] = ui.tab(tab_name, label=tab_label)
+    
     logger.info('Settings page tabs initialized')
             
-    with ui.tab_panels(tabs, value='Global Settings').classes('w-full'):
-        with ui.tab_panel('Global Settings'):
+    with ui.tab_panels(tabs, value=tab_objects['global']).classes('w-full'):
+        with ui.tab_panel(tab_objects['global']):
             AppSettingsTab()
-        with ui.tab_panel('Account Settings'):
+        with ui.tab_panel(tab_objects['account']):
             AccountDefinitionsTab()
-        with ui.tab_panel('Expert Settings'):
+        with ui.tab_panel(tab_objects['expert']):
             ExpertSettingsTab()
-        with ui.tab_panel('Trade Settings'):
+        with ui.tab_panel(tab_objects['trade']):
             TradeSettingsTab()
-        with ui.tab_panel('Instruments'):
+        with ui.tab_panel(tab_objects['instruments']):
             InstrumentSettingsTab()
+    
+    # Setup HTML5 history navigation for tabs using timer for async compatibility
+    async def setup_tab_navigation():
+        await ui.run_javascript('''
+            (function() {
+                let isPopstateNavigation = false;
+                
+                // Map display labels to tab names
+                const labelToName = {
+                    'Global Settings': 'global',
+                    'Account Settings': 'account',
+                    'Expert Settings': 'expert',
+                    'Trade Settings': 'trade',
+                    'Instruments': 'instruments'
+                };
+                
+                // Get tab name from tab element
+                function getTabName(tab) {
+                    const label = tab.textContent.trim();
+                    return labelToName[label] || label.toLowerCase().replace(/\s+/g, '-');
+                }
+                
+                // Handle browser back/forward buttons
+                window.addEventListener('popstate', (e) => {
+                    isPopstateNavigation = true;
+                    const hash = window.location.hash.substring(1) || 'global';
+                    
+                    // Find and click the correct tab
+                    const tabs = document.querySelectorAll('.q-tab');
+                    tabs.forEach(tab => {
+                        const tabName = getTabName(tab);
+                        if (tabName === hash) {
+                            tab.click();
+                        }
+                    });
+                    
+                    setTimeout(() => { isPopstateNavigation = false; }, 100);
+                });
+                
+                // Setup click handlers for tabs to update URL
+                function setupTabClickHandlers() {
+                    const tabs = document.querySelectorAll('.q-tab');
+                    console.log('Found', tabs.length, 'tabs');
+                    tabs.forEach(tab => {
+                        const tabName = getTabName(tab);
+                        console.log('Setting up listener for tab:', tabName, '(label:', tab.textContent.trim() + ')');
+                        tab.addEventListener('click', () => {
+                            if (!isPopstateNavigation) {
+                                console.log('Tab clicked:', tabName);
+                                history.pushState({tab: tabName}, '', '#' + tabName);
+                            }
+                        });
+                    });
+                }
+                
+                // Handle initial page load with hash
+                const hash = window.location.hash.substring(1);
+                if (hash && hash !== 'global') {
+                    const tabs = document.querySelectorAll('.q-tab');
+                    tabs.forEach(tab => {
+                        if (tab.getAttribute('name') === hash) {
+                            tab.click();
+                        }
+                    });
+                } else if (!hash) {
+                    // Set initial hash if none exists
+                    history.replaceState({tab: 'global'}, '', '#global');
+                }
+                
+                setupTabClickHandlers();
+            })();
+        ''')
+    
+    # Use timer to run JavaScript after page is loaded (increased delay to ensure tabs are rendered)
+    ui.timer(0.5, setup_tab_navigation, once=True)
