@@ -1160,7 +1160,7 @@ class TradeHistoryTab:
                     # Get market analysis ID for navigation
                     analysis_id = get_market_analysis_id_from_order_id(order.id)
                     if analysis_id:
-                        analysis_link = f"/market-analysis/{analysis_id}"
+                        analysis_link = f"/market_analysis/{analysis_id}"
                     
                     # Get expert shortname
                     try:
@@ -1242,9 +1242,8 @@ class TradeHistoryTab:
             def handle_navigation(e):
                 analysis_link = e.args
                 if analysis_link:
-                    # For now, just show a notification since we don't have routing set up
-                    ui.notify(f'Navigate to: {analysis_link}', type='info')
-                    # TODO: Implement proper navigation to market analysis page
+                    # Navigate to the market analysis page
+                    ui.navigate.to(analysis_link)
             
             table.on('navigate_to_analysis', handle_navigation)
             

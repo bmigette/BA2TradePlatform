@@ -2,6 +2,30 @@
 
 A sophisticated Python-based algorithmic trading platform featuring AI-driven market analysis, multi-agent trading strategies, and a comprehensive plugin architecture for accounts and market experts.
 
+## ⚠️ IMPORTANT DISCLAIMER
+
+**THIS SOFTWARE IS IN BETA AND PROVIDED "AS-IS" WITHOUT WARRANTY OF ANY KIND.**
+
+- 🚨 **Trading involves substantial risk of loss** and is not suitable for all investors
+- 🧪 **This software is experimental** and should be thoroughly tested in paper trading mode before considering live trading
+- 💰 **You can lose money** - possibly all of your investment capital
+- 🤖 **AI-driven decisions are not infallible** - algorithms can make mistakes, markets are unpredictable
+- 📉 **Past performance does not guarantee future results** - backtesting and historical analysis may not reflect real trading conditions
+- ⚙️ **Software bugs may exist** - thoroughly review all code and test extensively before use
+- 🔒 **Use at your own risk and discretion** - you are solely responsible for any trading decisions and their outcomes
+- 💼 **Not financial advice** - this platform is a tool for educational and research purposes
+
+**RECOMMENDED PRACTICES:**
+- ✅ Start with paper trading to familiarize yourself with the platform
+- ✅ Set strict risk limits and position sizing rules
+- ✅ Monitor all automated trades closely
+- ✅ Never invest more than you can afford to lose
+- ✅ Understand the underlying strategies and code before enabling automation
+- ✅ Keep detailed logs and review trading decisions regularly
+- ✅ Test thoroughly in various market conditions before live deployment
+
+By using this software, you acknowledge that you understand and accept these risks.
+
 ## 🚀 Features
 
 ### Core Platform
@@ -73,20 +97,12 @@ A sophisticated Python-based algorithmic trading platform featuring AI-driven ma
    pip install -r requirements.txt
    ```
 
-4. **Configure environment** (optional):
-   Create a `.env` file with your API keys:
-   ```env
-   OPENAI_API_KEY=your_openai_api_key
-   FINNHUB_API_KEY=your_finnhub_api_key
-   FRED_API_KEY=your_fred_api_key
-   ```
-
-5. **Run the application**:
+4. **Run the application**:
    ```bash
    python main.py
    ```
 
-6. **Access the web interface**:
+5. **Access the web interface**:
    Open http://localhost:8080 in your browser
 
 ## 🏗️ Architecture
@@ -128,14 +144,22 @@ def get_settings_definitions(cls) -> Dict[str, Any]:
 ### Database Models
 
 **Core Models** (in `ba2_trade_platform/core/models.py`):
-- `AccountInstance`: Trading account configurations
-- `ExpertInstance`: AI expert configurations with virtual equity allocation
-- `ExpertRecommendation`: Trading recommendations with risk level and time horizon
-- `MarketAnalysis`: Analysis sessions with expert linking
-- `AnalysisOutput`: Detailed analysis outputs
-- `TradingOrder`: Order execution tracking
-- `Position`: Current positions and performance
-- `AppSetting`: Application configuration
+- `AppSetting`: Application-wide configuration (API keys, settings)
+- `AccountDefinition`: Trading account provider configurations
+- `AccountSetting`: Account-specific settings (key-value storage)
+- `ExpertInstance`: AI expert configurations with virtual equity allocation and rulesets
+- `ExpertSetting`: Expert-specific settings (key-value storage)
+- `ExpertRecommendation`: Trading recommendations with risk level, time horizon, and confidence
+- `MarketAnalysis`: Analysis sessions with status tracking and expert linking
+- `AnalysisOutput`: Detailed analysis outputs from individual agents
+- `TradingOrder`: Order lifecycle tracking (PENDING → OPEN → FILLED/CLOSED)
+- `Transaction`: Transaction history for orders (fills, partial fills)
+- `Position`: Current positions with P&L tracking
+- `Instrument`: Instrument metadata (symbols, exchanges, asset classes)
+- `Ruleset`: Rule-based trading logic containers
+- `EventAction`: Conditional actions within rulesets
+- `RulesetEventActionLink`: Many-to-many relationship for rulesets and actions
+- `TradeActionResult`: Results from executed trade actions (BUY, SELL, CLOSE, etc.)
 
 ### Directory Structure
 
@@ -145,20 +169,44 @@ ba2_trade_platform/
 │   ├── AccountInterface.py         # Account provider interface
 │   ├── MarketExpertInterface.py    # Expert interface
 │   ├── ExtendableSettingsInterface.py # Settings management
-│   ├── models.py                   # Database models
-│   ├── types.py                    # Enums and types
-│   └── db.py                       # Database utilities
+│   ├── models.py                   # SQLModel database models
+│   ├── types.py                    # Enums (OrderStatus, OrderDirection, RiskLevel, etc.)
+│   ├── db.py                       # Database utilities (CRUD operations)
+│   ├── utils.py                    # Helper functions
+│   ├── actions.py                  # Trade action helpers
+│   ├── TradeManager.py             # Order processing and recommendation handling
+│   ├── TradeActionEvaluator.py     # Ruleset evaluation engine
+│   ├── TradeActions.py             # Trade action implementations (BUY, SELL, CLOSE)
+│   ├── TradeConditions.py          # Condition evaluation for rulesets
+│   ├── TradeRiskManagement.py      # Risk management and position sizing
+│   ├── JobManager.py               # Background job scheduling
+│   ├── WorkerQueue.py              # Task queue for parallel processing
+│   ├── MarketAnalysisPDFExport.py  # Export analysis to PDF reports
+│   ├── rules_documentation.py      # Ruleset documentation generator
+│   └── rules_export_import.py      # Import/export rulesets
 ├── modules/
 │   ├── accounts/                   # Account implementations
+│   │   ├── __init__.py            # Account registry
 │   │   └── AlpacaAccount.py        # Alpaca integration
-│   └── experts/                    # Expert implementations
-│       └── TradingAgents.py        # Multi-agent expert
+│   ├── experts/                    # Expert implementations
+│   │   ├── __init__.py            # Expert registry
+│   │   └── TradingAgents.py        # Multi-agent LLM expert
+│   └── marketinfo/                 # Market information providers
 ├── thirdparties/
-│   └── TradingAgents/              # TradingAgents framework
+│   └── TradingAgents/              # TradingAgents multi-agent framework
 ├── ui/                             # NiceGUI web interface
-│   ├── main.py                     # Route definitions
+│   ├── main.py                     # Route definitions and app initialization
+│   ├── layout.py                   # Page layout components
+│   ├── menus.py                    # Navigation menus
+│   ├── svg.py                      # SVG icon utilities
 │   ├── pages/                      # Page components
-│   └── components/                 # Reusable UI components
+│   │   ├── overview.py            # Dashboard and account overview
+│   │   ├── marketanalysis.py       # Market analysis management
+│   │   └── settings.py            # Configuration interface
+│   ├── components/                 # Reusable UI components
+│   │   └── InstrumentSelector.py   # Instrument selection widget
+│   └── static/                     # Static assets (favicons, etc.)
+├── logs/                           # Application logs
 ├── config.py                       # Global configuration
 └── logger.py                       # Centralized logging
 ```
@@ -310,12 +358,28 @@ class MyExpert(MarketExpertInterface):
 The platform uses SQLModel for ORM with automatic SQLite database creation:
 
 **Key Tables**:
-- `accountinstance`: Trading account configurations
-- `expertinstance`: AI expert configurations  
-- `expertrecommendation`: Trading recommendations
-- `marketanalysis`: Analysis sessions
-- `analysisoutput`: Detailed analysis outputs
-- `appsetting`: Application settings
+- `appsetting`: Application-wide configuration and API keys
+- `accountdefinition`: Trading account provider configurations
+- `accountsetting`: Account-specific settings (key-value)
+- `expertinstance`: AI expert configurations with rulesets and virtual equity
+- `expertsetting`: Expert-specific settings (key-value)
+- `expertrecommendation`: Trading recommendations with risk/confidence metrics
+- `marketanalysis`: Analysis job tracking with status and timing
+- `analysisoutput`: Detailed outputs from individual analysis agents
+- `tradingorder`: Order lifecycle and execution tracking
+- `transaction`: Transaction history for order fills
+- `position`: Current positions with unrealized P&L
+- `instrument`: Instrument metadata and specifications
+- `ruleset`: Rule-based trading logic containers
+- `eventaction`: Conditional actions (triggers and actions)
+- `ruleseteventactionlink`: Many-to-many relationship for rulesets
+- `tradeactionresult`: Results from executed trade actions
+
+**Database Features**:
+- Automatic schema creation and migrations via Alembic
+- SQLite backend with full ACID compliance
+- Foreign key constraints for data integrity
+- Indexed fields for query performance
 
 Database auto-initializes at: `~/Documents/ba2_trade_platform/db.sqlite`
 
