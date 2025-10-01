@@ -176,17 +176,18 @@ class TradeAction(ABC):
 
 
 class SellAction(TradeAction):
-    """Execute a sell order."""
+    """Create a pending sell order for risk management review."""
     
     def execute(self) -> "TradeActionResult":
         """
-        Execute a sell order for the instrument.
+        Create a pending sell order for the instrument.
+        The RiskManager will review, set quantity, and submit the order.
         
         Returns:
             TradeActionResult object containing execution results
         """
         try:
-            # Get current position to determine quantity
+            # Get current position to validate we can sell
             current_position = self.get_current_position()
             if current_position is None or current_position <= 0:
                 result = self.create_action_result(
@@ -198,10 +199,11 @@ class SellAction(TradeAction):
                 add_instance(result)
                 return result
             
-            # Create order record
+            # Create PENDING order record with quantity=0 (to be set by risk management)
+            # Risk management will determine the actual quantity to sell
             order_record = self.create_order_record(
                 side="sell",
-                quantity=abs(current_position),  # Sell entire position
+                quantity=0.0,  # 0 indicates pending review by risk management
                 order_type="market"
             )
             
@@ -215,44 +217,25 @@ class SellAction(TradeAction):
                 add_instance(result)
                 return result
             
-            # Submit order through account interface
-            submit_result = self.account.submit_order(order_record)
+            # Order stays in PENDING status for risk management review
+            # RiskManager will call account.submit_order() after setting quantity
+            logger.info(f"Created PENDING sell order {order_record.id} for {self.instrument_name} - awaiting risk management review")
             
-            if submit_result is not None:
-                # Update order record with broker order ID
-                if hasattr(submit_result, 'account_order_id') and submit_result.account_order_id:
-                    order_record.broker_order_id = str(submit_result.account_order_id)
-                    order_record.status = OrderStatus.OPEN.value
-                    update_instance(order_record)
-                
-                result = self.create_action_result(
-                    action_type=ExpertActionType.SELL.value,
-                    success=True,
-                    message=f"Sell order submitted for {self.instrument_name}",
-                    data={"order_id": order_record.id, "broker_order_id": submit_result.account_order_id}
-                )
-                add_instance(result)
-                return result
-            else:
-                # Update order status to failed
-                order_record.status = OrderStatus.CANCELED.value
-                update_instance(order_record)
-                
-                result = self.create_action_result(
-                    action_type=ExpertActionType.SELL.value,
-                    success=False,
-                    message=f"Failed to submit sell order",
-                    data={}
-                )
-                add_instance(result)
-                return result
+            result = self.create_action_result(
+                action_type=ExpertActionType.SELL.value,
+                success=True,
+                message=f"Sell order created for {self.instrument_name} (pending risk management review)",
+                data={"order_id": order_record.id, "status": "PENDING"}
+            )
+            add_instance(result)
+            return result
                 
         except Exception as e:
-            logger.error(f"Error executing sell action for {self.instrument_name}: {e}", exc_info=True)
+            logger.error(f"Error creating sell order for {self.instrument_name}: {e}", exc_info=True)
             result = self.create_action_result(
                 action_type=ExpertActionType.SELL.value,
                 success=False,
-                message=f"Error executing sell action: {str(e)}",
+                message=f"Error creating sell order: {str(e)}",
                 data={}
             )
             add_instance(result)
@@ -260,31 +243,31 @@ class SellAction(TradeAction):
     
     def get_description(self) -> str:
         """Get description of sell action."""
-        return f"Sell entire position of {self.instrument_name} at market price"
+        return f"Create pending sell order for {self.instrument_name} (awaiting risk management review)"
 
 
 class BuyAction(TradeAction):
-    """Execute a buy order."""
+    """Create a pending buy order for risk management review."""
     
     def execute(self, quantity: Optional[float] = None) -> "TradeActionResult":
         """
-        Execute a buy order for the instrument.
+        Create a pending buy order for the instrument.
+        The RiskManager will review, set quantity, and submit the order.
         
         Args:
-            quantity: Optional quantity to buy. If not provided, will calculate based on account balance
+            quantity: Optional quantity to buy. If not provided, will be set to 0 (pending review)
             
         Returns:
             TradeActionResult object containing execution results
         """
         try:
-            # If quantity not provided, calculate based on available buying power
+            # Create PENDING order with quantity=0 (to be determined by risk management)
+            # Risk management will calculate quantity based on:
+            # - Available buying power
+            # - Risk management rules
+            # - Position sizing strategies
             if quantity is None:
-                # TODO: Implement dynamic quantity calculation based on:
-                # - Available buying power
-                # - Risk management rules
-                # - Position sizing strategies
-                # For now, use a default small quantity
-                quantity = 1.0
+                quantity = 0.0  # 0 indicates pending review by risk management
             
             current_price = self.get_current_price()
             if current_price is None:
@@ -297,7 +280,7 @@ class BuyAction(TradeAction):
                 add_instance(result)
                 return result
             
-            # Create order record
+            # Create PENDING order record (not submitted to broker yet)
             order_record = self.create_order_record(
                 side="buy",
                 quantity=quantity,
@@ -314,40 +297,25 @@ class BuyAction(TradeAction):
                 add_instance(result)
                 return result
             
-            # Submit order through account interface
-            submit_result = self.account.submit_order(order_record)
+            # Order stays in PENDING status for risk management review
+            # RiskManager will call account.submit_order() after setting quantity
+            logger.info(f"Created PENDING buy order {order_record.id} for {self.instrument_name} - awaiting risk management review")
             
-            if submit_result is not None:
-
-                
-                result = self.create_action_result(
-                    action_type=ExpertActionType.BUY.value,
-                    success=True,
-                    message=f"Buy order submitted for {self.instrument_name}",
-                    data={"order_id": order_record.id, "broker_order_id": submit_result.account_order_id}
-                )
-                add_instance(result)
-                return result
-            else:
-                # Update order status to failed
-                order_record.status = OrderStatus.CANCELED.value
-                update_instance(order_record)
-                
-                result = self.create_action_result(
-                    action_type=ExpertActionType.BUY.value,
-                    success=False,
-                    message=f"Failed to submit buy order",
-                    data={}
-                )
-                add_instance(result)
-                return result
+            result = self.create_action_result(
+                action_type=ExpertActionType.BUY.value,
+                success=True,
+                message=f"Buy order created for {self.instrument_name} (pending risk management review)",
+                data={"order_id": order_record.id, "status": "PENDING"}
+            )
+            add_instance(result)
+            return result
                 
         except Exception as e:
-            logger.error(f"Error executing buy action for {self.instrument_name}: {e}", exc_info=True)
+            logger.error(f"Error creating buy order for {self.instrument_name}: {e}", exc_info=True)
             result = self.create_action_result(
                 action_type=ExpertActionType.BUY.value,
                 success=False,
-                message=f"Error executing buy action: {str(e)}",
+                message=f"Error creating buy order: {str(e)}",
                 data={}
             )
             add_instance(result)
@@ -355,7 +323,7 @@ class BuyAction(TradeAction):
     
     def get_description(self) -> str:
         """Get description of buy action."""
-        return f"Buy {self.instrument_name} at market price"
+        return f"Create pending buy order for {self.instrument_name} (awaiting risk management review)"
 
 
 class CloseAction(TradeAction):

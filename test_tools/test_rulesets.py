@@ -34,11 +34,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from ba2_trade_platform.logger import logger
-from ba2_trade_platform.core.models import ExpertRecommendation, ExpertInstance, Ruleset, TradingOrder
+from ba2_trade_platform.core.models import ExpertRecommendation, ExpertInstance, Ruleset, TradingOrder, AccountDefinition
 from ba2_trade_platform.core.types import OrderRecommendation, OrderDirection, OrderType, OrderStatus, OrderOpenType, AnalysisUseCase
 from ba2_trade_platform.core.db import get_instance, get_all_instances, add_instance, get_db
 from ba2_trade_platform.core.TradeManager import TradeManager
+from ba2_trade_platform.core.TradeActionEvaluator import TradeActionEvaluator
 from ba2_trade_platform.core.utils import get_expert_instance_from_id
+from ba2_trade_platform.modules.accounts import get_account_class
 from sqlmodel import select, Session
 
 
@@ -245,7 +247,7 @@ class RulesetTester:
         index: int,
         total: int
     ) -> Dict:
-        """Evaluate a single recommendation against the ruleset."""
+        """Evaluate a single recommendation against the ruleset using TradeActionEvaluator."""
         
         print(f"[{index}/{total}] Testing Recommendation #{recommendation.id}")
         print(f"  Symbol: {recommendation.symbol}")
@@ -256,39 +258,143 @@ class RulesetTester:
         print(f"  Time Horizon: {recommendation.time_horizon.value}")
         print(f"  Created: {recommendation.created_at}")
         
-        # Evaluate against ruleset
+        # Evaluate against ruleset using TradeActionEvaluator
         if not ruleset:
             print(f"  ⚠️  No ruleset to evaluate against - would PASS by default")
             passed = True
             reason = "No ruleset configured"
+            action_summaries = []
         else:
             print(f"  📋 Evaluating against ruleset: {ruleset.name}")
-            passed = self.trade_manager._evaluate_ruleset(ruleset, recommendation, expert_instance)
             
-            if passed:
-                print(f"  ✅ PASSED ruleset evaluation")
-                reason = "Passed all ruleset checks"
-            else:
-                print(f"  ❌ FAILED ruleset evaluation")
-                reason = "Rejected by ruleset"
+            try:
+                # Get the account instance for this expert
+                account_def = get_instance(AccountDefinition, expert_instance.account_id)
+                if not account_def:
+                    print(f"  ❌ Account definition {expert_instance.account_id} not found")
+                    return {
+                        'recommendation_id': recommendation.id,
+                        'symbol': recommendation.symbol,
+                        'action': recommendation.recommended_action.value,
+                        'confidence': recommendation.confidence,
+                        'risk_level': recommendation.risk_level.value,
+                        'expected_profit': recommendation.expected_profit_percent,
+                        'passed': False,
+                        'reason': 'Account not found',
+                        'order_created': False,
+                        'order_id': None
+                    }
+                
+                account_class = get_account_class(account_def.provider)
+                if not account_class:
+                    print(f"  ❌ Account provider {account_def.provider} not found")
+                    return {
+                        'recommendation_id': recommendation.id,
+                        'symbol': recommendation.symbol,
+                        'action': recommendation.recommended_action.value,
+                        'confidence': recommendation.confidence,
+                        'risk_level': recommendation.risk_level.value,
+                        'expected_profit': recommendation.expected_profit_percent,
+                        'passed': False,
+                        'reason': 'Account provider not found',
+                        'order_created': False,
+                        'order_id': None
+                    }
+                
+                account = account_class(account_def.id)
+                
+                # Create TradeActionEvaluator
+                evaluator = TradeActionEvaluator(account)
+                
+                # Evaluate recommendation through the ruleset
+                action_summaries = evaluator.evaluate(
+                    instrument_name=recommendation.symbol,
+                    expert_recommendation=recommendation,
+                    ruleset_id=ruleset.id,
+                    existing_order=None
+                )
+                
+                # Check if evaluation produced any actions
+                if not action_summaries:
+                    passed = False
+                    reason = "No actions produced - conditions not met"
+                    print(f"  ❌ FAILED ruleset evaluation - no actions to execute")
+                elif any('error' in summary for summary in action_summaries):
+                    passed = False
+                    errors = [s.get('error') for s in action_summaries if 'error' in s]
+                    reason = f"Evaluation errors: {errors}"
+                    print(f"  ❌ FAILED ruleset evaluation - errors: {errors}")
+                else:
+                    passed = True
+                    reason = f"Passed - {len(action_summaries)} action(s) to execute"
+                    print(f"  ✅ PASSED ruleset evaluation - {len(action_summaries)} action(s) ready")
+                    
+                    # Show evaluation details in verbose mode
+                    if self.verbose and action_summaries:
+                        eval_details = evaluator.get_evaluation_details()
+                        print(f"  📊 Evaluation Details:")
+                        print(f"     Conditions Evaluated: {eval_details['summary']['total_conditions']}")
+                        print(f"     Conditions Passed: {eval_details['summary']['passed_conditions']}")
+                        print(f"     Rules Evaluated: {eval_details['summary']['total_rules']}")
+                        print(f"     Rules Executed: {eval_details['summary']['executed_rules']}")
+                        
+                        for action_summary in action_summaries:
+                            print(f"     Action: {action_summary.get('description', 'Unknown')}")
+                
+            except Exception as e:
+                logger.error(f"Error evaluating recommendation {recommendation.id}: {e}", exc_info=True)
+                passed = False
+                reason = f"Evaluation error: {str(e)}"
+                action_summaries = []
+                print(f"  ❌ ERROR during evaluation: {e}")
         
         # Show what would happen
+        order_id = None
         if passed and not self.dry_run:
-            print(f"  🔨 Creating PENDING order...")
-            # Actually create the order
-            order = self._create_order(recommendation, expert_instance)
-            if order:
-                print(f"  ✓ Order {order.id} created")
-                order_id = order.id
-            else:
-                print(f"  ❌ Failed to create order")
-                order_id = None
+            print(f"  🔨 Creating orders via TradeActionEvaluator.execute()...")
+            # Actually execute the actions (creates orders)
+            try:
+                # Get the account instance again for execution
+                account_def = get_instance(AccountDefinition, expert_instance.account_id)
+                account_class = get_account_class(account_def.provider)
+                account = account_class(account_def.id)
+                evaluator = TradeActionEvaluator(account)
+                
+                # Re-evaluate to set up actions for execution
+                evaluator.evaluate(
+                    instrument_name=recommendation.symbol,
+                    expert_recommendation=recommendation,
+                    ruleset_id=ruleset.id,
+                    existing_order=None
+                )
+                
+                # Execute the actions
+                execution_results = evaluator.execute()
+                
+                for result in execution_results:
+                    if result.get('success', False):
+                        print(f"  ✓ Action executed: {result.get('description', 'Unknown')}")
+                        
+                        # Check if a TradingOrder was created
+                        if result.get('data') and isinstance(result['data'], dict):
+                            result_order_id = result['data'].get('order_id')
+                            if result_order_id:
+                                order_id = result_order_id
+                                print(f"  ✓ Order {order_id} created")
+                    else:
+                        print(f"  ❌ Action failed: {result.get('message', 'Unknown error')}")
+                
+            except Exception as e:
+                logger.error(f"Error executing actions for recommendation {recommendation.id}: {e}", exc_info=True)
+                print(f"  ❌ Failed to execute actions: {e}")
+                
         elif passed:
-            print(f"  💭 DRY RUN: Would create PENDING order")
-            order_id = None
+            print(f"  💭 DRY RUN: Would execute {len(action_summaries)} action(s) via TradeActionEvaluator")
+            if self.verbose and action_summaries:
+                for action_summary in action_summaries:
+                    print(f"     - {action_summary.get('description', 'Unknown action')}")
         else:
-            print(f"  ⏭️  Skipping order creation")
-            order_id = None
+            print(f"  ⏭️  Skipping - conditions not met")
         
         print()  # Blank line between recommendations
         
@@ -304,44 +410,6 @@ class RulesetTester:
             'order_created': order_id is not None,
             'order_id': order_id
         }
-    
-    def _create_order(self, recommendation: ExpertRecommendation, expert_instance: ExpertInstance) -> Optional[TradingOrder]:
-        """Create an order from a recommendation (only if dry_run=False)."""
-        try:
-            # Map recommendation action to order direction
-            if recommendation.recommended_action == OrderRecommendation.BUY:
-                side = OrderDirection.BUY
-            elif recommendation.recommended_action == OrderRecommendation.SELL:
-                side = OrderDirection.SELL
-            else:
-                return None
-            
-            # Create a pending order (quantity will be determined later during review)
-            order = TradingOrder(
-                account_id=expert_instance.account_id,
-                symbol=recommendation.symbol,
-                quantity=0,  # To be determined during review/prioritization
-                side=side,
-                order_type=OrderType.MARKET,
-                status=OrderStatus.PENDING,
-                limit_price=None,
-                stop_price=None,
-                comment=f"Test-created from recommendation {recommendation.id} (awaiting review)",
-                expert_recommendation_id=recommendation.id,
-                open_type=OrderOpenType.AUTOMATIC,
-                created_at=datetime.now(timezone.utc)
-            )
-            
-            # Add order to database
-            order_id = add_instance(order)
-            if order_id:
-                order.id = order_id
-                return order
-            
-        except Exception as e:
-            logger.error(f"Error creating order from recommendation {recommendation.id}: {e}", exc_info=True)
-        
-        return None
 
 
 def main():

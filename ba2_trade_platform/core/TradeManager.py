@@ -378,54 +378,6 @@ class TradeManager:
             self.logger.error(f"Error fetching ruleset {ruleset_id}: {e}", exc_info=True)
             return None
             
-    def _evaluate_ruleset(self, ruleset: Ruleset, recommendation: ExpertRecommendation, expert_instance: ExpertInstance) -> bool:
-        """
-        Evaluate a specific ruleset against a recommendation.
-        
-        Args:
-            ruleset: The ruleset to evaluate
-            recommendation: The expert recommendation
-            expert_instance: The expert instance
-            
-        Returns:
-            True if recommendation passes the ruleset, False otherwise
-        """
-        try:
-            # For now, implement basic rule evaluation
-            # This can be expanded to handle complex rule logic
-            
-            for event_action in ruleset.event_actions:
-                # Check triggers
-                triggers = event_action.triggers or {}
-                
-                # Example trigger checks:
-                if 'min_confidence' in triggers:
-                    min_confidence = triggers['min_confidence']
-                    if recommendation.confidence is None or recommendation.confidence < min_confidence:
-                        self.logger.debug(f"Recommendation confidence {recommendation.confidence} below minimum {min_confidence}")
-                        return False
-                        
-                if 'max_risk_level' in triggers:
-                    max_risk = triggers['max_risk_level']
-                    risk_levels = ['LOW', 'MEDIUM', 'HIGH']
-                    if (recommendation.risk_level.value in risk_levels and 
-                        max_risk in risk_levels and
-                        risk_levels.index(recommendation.risk_level.value) > risk_levels.index(max_risk)):
-                        self.logger.debug(f"Recommendation risk level {recommendation.risk_level.value} exceeds maximum {max_risk}")
-                        return False
-                        
-                if 'allowed_actions' in triggers:
-                    allowed_actions = triggers['allowed_actions']
-                    if isinstance(allowed_actions, list) and recommendation.recommended_action.value not in allowed_actions:
-                        self.logger.debug(f"Recommendation action {recommendation.recommended_action.value} not in allowed actions {allowed_actions}")
-                        return False
-                        
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Error evaluating ruleset {ruleset.id}: {e}", exc_info=True)
-            return True  # Allow by default if error
-            
     def _create_order_from_recommendation(self, recommendation: ExpertRecommendation, expert_instance: ExpertInstance) -> Optional[TradingOrder]:
         """
         Create a trading order from an expert recommendation.
@@ -504,11 +456,16 @@ class TradeManager:
             submitted_order = account.submit_order(order)
             if submitted_order:
                 # Save the order to database
+                # Note: add_instance will set the ID on the instance before committing
                 db_id = add_instance(submitted_order)
                 if db_id:
-                    submitted_order.id = db_id
+                    # The submitted_order instance is now detached, but should have the ID set
+                    # Create a simple return value to avoid detached instance issues
                     self.logger.info(f"Order {db_id} successfully placed for {order.symbol}")
-                    return submitted_order
+                    
+                    # Return a fresh instance from the database to avoid detached instance errors
+                    from .db import get_instance
+                    return get_instance(TradingOrder, db_id)
                     
         except Exception as e:
             self.logger.error(f"Error placing order: {e}", exc_info=True)
@@ -553,8 +510,8 @@ class TradeManager:
         Process expert recommendations after all market analysis jobs for enter_market are completed.
         
         This function is called when there are no more pending analysis jobs for a given expert.
-        It evaluates recommendations through the enter_market ruleset and creates pending orders
-        for those that pass all rules (if automated trading is enabled).
+        It evaluates recommendations through the enter_market ruleset using TradeActionEvaluator
+        and executes the resulting actions (if automated trading is enabled).
         
         Args:
             expert_instance_id: The expert instance ID to process recommendations for
@@ -572,6 +529,8 @@ class TradeManager:
             from .types import AnalysisUseCase, TransactionStatus
             from .utils import get_expert_instance_from_id
             from datetime import timedelta
+            from .TradeActionEvaluator import TradeActionEvaluator
+            from ..modules.accounts import get_account_class
             
             # Get the expert instance (with loaded settings)
             expert = get_expert_instance_from_id(expert_instance_id)
@@ -596,16 +555,23 @@ class TradeManager:
                 self.logger.debug(f"No enter_market ruleset configured for expert {expert_instance_id}, skipping automated order creation")
                 return created_orders
             
-            # Get the enter_market ruleset with relationships eagerly loaded
-            enter_market_ruleset = self._get_ruleset_with_relations(expert_instance.enter_market_ruleset_id)
-            if not enter_market_ruleset:
-                self.logger.warning(f"Enter market ruleset {expert_instance.enter_market_ruleset_id} not found for expert {expert_instance_id}")
-                return created_orders
-            
             # Check if there are still pending analysis jobs for this expert
             if self._has_pending_analysis_jobs(expert_instance_id):
                 self.logger.debug(f"Still has pending analysis jobs for expert {expert_instance_id}, skipping automated order creation")
                 return created_orders
+            
+            # Get the account instance for this expert
+            account_def = get_instance(AccountDefinition, expert_instance.account_id)
+            if not account_def:
+                self.logger.error(f"Account definition {expert_instance.account_id} not found", exc_info=True)
+                return created_orders
+                
+            account_class = get_account_class(account_def.provider)
+            if not account_class:
+                self.logger.error(f"Account provider {account_def.provider} not found", exc_info=True)
+                return created_orders
+                
+            account = account_class(account_def.id)
             
             # Get recent recommendations based on lookback_days parameter
             cutoff_time = datetime.now(timezone.utc) - timedelta(days=lookback_days)
@@ -624,53 +590,63 @@ class TradeManager:
                     return created_orders
                 
                 self.logger.info(f"Found {len(recommendations)} actionable recommendations for expert {expert_instance_id}")
-                self.logger.info(f"Evaluating recommendations through enter_market ruleset: {enter_market_ruleset.name}")
+                self.logger.info(f"Evaluating recommendations through enter_market ruleset: {expert_instance.enter_market_ruleset_id}")
                 
-                # Process recommendations through the ruleset
+                # Create TradeActionEvaluator for processing recommendations
+                evaluator = TradeActionEvaluator(account)
+                
+                # Process each recommendation through the enter_market ruleset
                 for recommendation in recommendations:
-                    # Evaluate recommendation through the enter_market ruleset
-                    if not self._evaluate_ruleset(enter_market_ruleset, recommendation, expert_instance):
-                        self.logger.debug(f"Recommendation {recommendation.id} for {recommendation.symbol} rejected by ruleset")
+                    try:
+                        # Evaluate recommendation through the enter_market ruleset
+                        self.logger.debug(f"Evaluating recommendation {recommendation.id} for {recommendation.symbol}")
+                        
+                        action_summaries = evaluator.evaluate(
+                            instrument_name=recommendation.symbol,
+                            expert_recommendation=recommendation,
+                            ruleset_id=expert_instance.enter_market_ruleset_id,
+                            existing_order=None  # No existing order when entering market
+                        )
+                        
+                        # Check if evaluation produced any actions
+                        if not action_summaries:
+                            self.logger.debug(f"Recommendation {recommendation.id} for {recommendation.symbol} - no actions to execute (conditions not met)")
+                            continue
+                        
+                        # Check for evaluation errors
+                        if any('error' in summary for summary in action_summaries):
+                            errors = [s.get('error') for s in action_summaries if 'error' in s]
+                            self.logger.warning(f"Recommendation {recommendation.id} evaluation had errors: {errors}")
+                            continue
+                        
+                        self.logger.info(f"Recommendation {recommendation.id} for {recommendation.symbol} passed ruleset - {len(action_summaries)} action(s) to execute")
+                        
+                        # Execute the actions using TradeActionEvaluator
+                        execution_results = evaluator.execute()
+                        
+                        # Process execution results
+                        for result in execution_results:
+                            if result.get('success', False):
+                                self.logger.info(f"Action executed successfully: {result.get('description', 'Unknown action')}")
+                                
+                                # Check if a TradingOrder was created (data field should contain order_id)
+                                if result.get('data') and isinstance(result['data'], dict):
+                                    order_id = result['data'].get('order_id')
+                                    if order_id:
+                                        # Fetch the created order from database
+                                        order = get_instance(TradingOrder, order_id)
+                                        if order:
+                                            session.expunge(order)
+                                            created_orders.append(order)
+                                            self.logger.info(f"Created order {order_id} for {recommendation.symbol}")
+                            else:
+                                self.logger.warning(f"Action execution failed: {result.get('message', 'Unknown error')}")
+                        
+                    except Exception as e:
+                        self.logger.error(f"Error processing recommendation {recommendation.id}: {e}", exc_info=True)
                         continue
-                    
-                    # If recommendation passes the ruleset, check if there are actions to execute
-                    # For now, we'll create a pending order for approved recommendations
-                    # The order will be reviewed and prioritized once all analysis is complete
-                    
-                    # Map recommendation action to order direction
-                    if recommendation.recommended_action == OrderRecommendation.BUY:
-                        side = OrderDirection.BUY
-                    elif recommendation.recommended_action == OrderRecommendation.SELL:
-                        side = OrderDirection.SELL
-                    else:
-                        continue
-                    
-                    # Create a pending order (quantity will be determined later during review)
-                    order = TradingOrder(
-                        account_id=expert_instance.account_id,
-                        symbol=recommendation.symbol,
-                        quantity=0,  # To be determined during review/prioritization
-                        side=side,
-                        order_type=OrderType.MARKET,
-                        status=OrderStatus.PENDING,  # Keep as PENDING for review
-                        limit_price=None,
-                        stop_price=None,
-                        comment=f"Auto-created from recommendation {recommendation.id} (awaiting review)",
-                        expert_recommendation_id=recommendation.id,
-                        open_type=OrderOpenType.AUTOMATIC,
-                        created_at=datetime.now(timezone.utc)
-                    )
-                    
-                    # Add order to database using the current session
-                    order_id = add_instance(order, session=session)
-                    if order_id:
-                        order.id = order_id
-                        # Expunge the order from the session so it can be used after session closes
-                        session.expunge(order)
-                        created_orders.append(order)
-                        self.logger.info(f"Created pending order {order_id} for {recommendation.symbol} (recommendation {recommendation.id} passed ruleset)")
                 
-                self.logger.info(f"Created {len(created_orders)} pending orders for expert {expert_instance_id} awaiting review and prioritization")
+                self.logger.info(f"Created {len(created_orders)} orders from {len(recommendations)} recommendations for expert {expert_instance_id}")
                 
                 # If we created orders and automated trading is enabled, run risk management
                 if created_orders and allow_automated_trade_opening:

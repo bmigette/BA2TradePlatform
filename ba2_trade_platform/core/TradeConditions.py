@@ -12,7 +12,7 @@ import operator
 
 from .AccountInterface import AccountInterface
 from .models import TradingOrder, ExpertRecommendation, ExpertInstance
-from .types import OrderRecommendation, ExpertEventType, RiskLevel
+from .types import OrderRecommendation, ExpertEventType, RiskLevel, TimeHorizon
 from .db import get_db
 from ..logger import logger
 from sqlmodel import select, Session
@@ -242,7 +242,7 @@ class LongTermCondition(FlagCondition):
     """Check if expert recommendation is long term."""
     def evaluate(self) -> bool:
         try:
-            return getattr(self.expert_recommendation, 'time_horizon', None) == getattr(type(self.expert_recommendation), 'time_horizon', None).LONG_TERM
+            return self.expert_recommendation.time_horizon == TimeHorizon.LONG_TERM
         except Exception as e:
             logger.error(f"Error evaluating long term condition: {e}", exc_info=True)
             return False
@@ -253,7 +253,7 @@ class MediumTermCondition(FlagCondition):
     """Check if expert recommendation is medium term."""
     def evaluate(self) -> bool:
         try:
-            return getattr(self.expert_recommendation, 'time_horizon', None) == getattr(type(self.expert_recommendation), 'time_horizon', None).MEDIUM_TERM
+            return self.expert_recommendation.time_horizon == TimeHorizon.MEDIUM_TERM
         except Exception as e:
             logger.error(f"Error evaluating medium term condition: {e}", exc_info=True)
             return False
@@ -264,7 +264,7 @@ class ShortTermCondition(FlagCondition):
     """Check if expert recommendation is short term."""
     def evaluate(self) -> bool:
         try:
-            return getattr(self.expert_recommendation, 'time_horizon', None) == getattr(type(self.expert_recommendation), 'time_horizon', None).SHORT_TERM
+            return self.expert_recommendation.time_horizon == TimeHorizon.SHORT_TERM
         except Exception as e:
             logger.error(f"Error evaluating short term condition: {e}", exc_info=True)
             return False

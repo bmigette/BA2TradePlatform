@@ -170,13 +170,23 @@ class TradeRiskManagement:
                 all_pending_orders = session.exec(statement).all()
                 
                 # Filter orders that belong to this expert by checking their recommendations
+                # Note: session.exec().all() returns tuples, so we need to unpack them
                 expert_orders = []
+                seen_order_ids = set()  # Track order IDs to prevent duplicates
+                
                 for order_tuple in all_pending_orders:
+                    # Properly unpack tuple - SQLModel exec().all() always returns tuples
                     order = order_tuple[0] if isinstance(order_tuple, tuple) else order_tuple
                     if order and order.expert_recommendation_id:
+                        # Skip if we've already seen this order ID
+                        if order.id in seen_order_ids:
+                            self.logger.warning(f"Skipping duplicate order {order.id} for {order.symbol}")
+                            continue
+                        
                         recommendation = session.get(ExpertRecommendation, order.expert_recommendation_id)
                         if recommendation and recommendation.instance_id == expert_instance_id:
                             expert_orders.append(order)
+                            seen_order_ids.add(order.id)
                             self.logger.debug(f"Found pending order {order.id} for {order.symbol} (side: {order.side.value})")
                 
                 self.logger.info(f"Found {len(expert_orders)} pending orders for review for expert {expert_instance_id}")

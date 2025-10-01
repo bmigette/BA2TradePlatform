@@ -1584,15 +1584,20 @@ class OrderRecommendationsTab:
             orders_to_submit = [order for order in orders if order.quantity > 0]
             orders_zero_quantity = [order for order in orders if order.quantity == 0]
             
+            # Track selected orders
+            selected_orders = []
+            
             with ui.dialog() as review_dialog:
                 with ui.card().classes('w-full max-w-6xl'):
                     ui.label(f'📋 Order Review - Expert {expert_id}').classes('text-h5 mb-4')
                     
                     if orders_to_submit:
                         ui.label(f'✅ Orders Ready for Submission ({len(orders_to_submit)})').classes('text-h6 text-green-600 mb-2')
+                        ui.label('Select orders to submit:').classes('text-caption text-gray-600 mb-2')
                         
-                        # Create table for orders to submit
+                        # Create table for orders to submit with selection
                         submit_columns = [
+                            {'name': 'order_id', 'label': 'ID', 'field': 'order_id', 'align': 'left'},
                             {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left'},
                             {'name': 'side', 'label': 'Side', 'field': 'side', 'align': 'center'},
                             {'name': 'quantity', 'label': 'Quantity', 'field': 'quantity', 'align': 'right'},
@@ -1603,6 +1608,7 @@ class OrderRecommendationsTab:
                         ]
                         
                         submit_data = []
+                        order_map = {}  # Map row keys to order objects
                         total_estimated_value = 0
                         
                         for order in orders_to_submit:
@@ -1633,7 +1639,11 @@ class OrderRecommendationsTab:
                             estimated_value = order.quantity * current_price
                             total_estimated_value += estimated_value
                             
+                            row_key = f"order_{order.id}"
+                            order_map[row_key] = order
+                            
                             submit_data.append({
+                                'order_id': order.id,
                                 'symbol': order.symbol,
                                 'side': order.side.value if hasattr(order.side, 'value') else str(order.side),
                                 'quantity': order.quantity,
@@ -1643,14 +1653,19 @@ class OrderRecommendationsTab:
                                 'comment': order.comment or ''
                             })
                         
-                        ui.table(
+                        # Table with selection (multiple selection enabled)
+                        orders_table = ui.table(
                             columns=submit_columns,
                             rows=submit_data,
-                            row_key='symbol'
+                            row_key='order_id',
+                            selection='multiple'
                         ).classes('w-full mb-4')
                         
+                        # Select all by default
+                        orders_table.selected = [row['order_id'] for row in submit_data]
+                        
                         # Summary
-                        ui.label(f'📊 Total Estimated Value: ${total_estimated_value:.2f}').classes('text-subtitle1 font-bold mb-4')
+                        summary_label = ui.label(f'📊 Total Estimated Value: ${total_estimated_value:.2f}').classes('text-subtitle1 font-bold mb-4')
                     
                     if orders_zero_quantity:
                         ui.label(f'❌ Orders with Zero Quantity ({len(orders_zero_quantity)})').classes('text-h6 text-orange-600 mb-2')
@@ -1680,9 +1695,25 @@ class OrderRecommendationsTab:
                         ui.button('Cancel', on_click=review_dialog.close).props('flat color=grey')
                         
                         if orders_to_submit:
+                            def submit_selected():
+                                # Get selected order IDs from table
+                                selected_ids = orders_table.selected if hasattr(orders_table, 'selected') else []
+                                if not selected_ids:
+                                    ui.notify('Please select at least one order to submit', type='warning')
+                                    return
+                                
+                                # Get the actual order objects for selected IDs
+                                selected_order_objects = [order_map[f"order_{order_id}"] for order_id in selected_ids if f"order_{order_id}" in order_map]
+                                
+                                if not selected_order_objects:
+                                    ui.notify('No valid orders selected', type='warning')
+                                    return
+                                
+                                self._submit_reviewed_orders(expert_id, selected_order_objects, review_dialog)
+                            
                             ui.button(
-                                f'Submit {len(orders_to_submit)} Orders',
-                                on_click=lambda: self._submit_reviewed_orders(expert_id, orders_to_submit, review_dialog)
+                                f'Submit Selected Orders',
+                                on_click=submit_selected
                             ).props('color=primary')
                         else:
                             ui.label('No orders to submit').classes('text-grey-5')

@@ -190,14 +190,25 @@ class AccountInterface(ExtendableSettingsInterface):
         # Handle transaction requirements based on order type
         self._handle_transaction_requirements(trading_order)
         
-        # Override the comment with tracking metadata
-        trading_order.comment = self._generate_tracking_comment(trading_order)
+        # Store comment and account_id values (don't modify potentially detached instance yet)
+        tracking_comment = self._generate_tracking_comment(trading_order)
+        account_id_value = self.id
         
         # Log successful validation
         logger.info(f"Order validation passed for {trading_order.symbol} - {trading_order.side.value} {trading_order.quantity} @ {trading_order.order_type.value}")
-        trading_order.account_id = self.id  # Ensure the order's account_id matches this account
+        
         # Call the child class implementation
-        return self._submit_order_impl(trading_order)
+        result = self._submit_order_impl(trading_order)
+        
+        # After submission, update the order with tracking info if successful
+        if result:
+            # Use update_instance to safely modify the order
+            result.comment = tracking_comment
+            result.account_id = account_id_value
+            from .db import update_instance
+            update_instance(result)
+        
+        return result
     
     def _handle_transaction_requirements(self, trading_order: TradingOrder) -> None:
         """
@@ -244,20 +255,34 @@ class AccountInterface(ExtendableSettingsInterface):
             # Get current price for the symbol (this will be the open_price estimate)
             current_price = self.get_instrument_current_price(trading_order.symbol)
             
+            # Get expert_id from the expert_recommendation if available
+            expert_id = None
+            if trading_order.expert_recommendation_id:
+                from .models import ExpertRecommendation
+                recommendation = get_instance(ExpertRecommendation, trading_order.expert_recommendation_id)
+                if recommendation:
+                    expert_id = recommendation.instance_id
+                    logger.debug(f"Found expert_id {expert_id} from recommendation {trading_order.expert_recommendation_id}")
+                else:
+                    logger.warning(f"Expert recommendation {trading_order.expert_recommendation_id} not found for order")
+            else:
+                logger.debug("Order has no expert_recommendation_id, transaction will have no expert_id")
+            
             # Create new transaction
             transaction = Transaction(
                 symbol=trading_order.symbol,
                 quantity=trading_order.quantity if trading_order.side == OrderDirection.BUY else -trading_order.quantity,
                 open_price=current_price,  # Estimated open price
                 status=TransactionStatus.WAITING,
-                created_at=datetime.now(timezone.utc)
+                created_at=datetime.now(timezone.utc),
+                expert_id=expert_id  # Link to expert instance
             )
             
             # Save transaction to database
             transaction_id = add_instance(transaction)
             trading_order.transaction_id = transaction_id
             
-            logger.info(f"Created transaction {transaction_id} for order: {trading_order.symbol} {trading_order.side.value} {trading_order.quantity}")
+            logger.info(f"Created transaction {transaction_id} for order: {trading_order.symbol} {trading_order.side.value} {trading_order.quantity} (expert_id={expert_id})")
             
         except Exception as e:
             logger.error(f"Error creating transaction for order: {e}", exc_info=True)
