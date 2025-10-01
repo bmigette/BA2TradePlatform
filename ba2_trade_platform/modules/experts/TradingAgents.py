@@ -56,51 +56,68 @@ class TradingAgents(MarketExpertInterface):
             # Analysis Configuration
             "debates_new_positions": {
                 "type": "float", "required": True, "default": 3.0,
-                "description": "Number of debate rounds for new position analysis"
+                "description": "Number of debate rounds for new position analysis",
+                "tooltip": "Controls how many debate rounds the AI agents will conduct when analyzing potential new positions. More rounds = more thorough analysis but takes longer. Recommended: 2-4 rounds."
             },
             "debates_existing_positions": {
                 "type": "float", "required": True, "default": 3.0,
-                "description": "Number of debate rounds for existing position analysis"
+                "description": "Number of debate rounds for existing position analysis",
+                "tooltip": "Controls how many debate rounds the AI agents will conduct when reviewing existing open positions. More rounds = more thorough analysis. Recommended: 2-3 rounds for faster real-time decisions."
             },
             "timeframe": {
                 "type": "str", "required": True, "default": "1h",
                 "description": "Analysis timeframe for market data",
-                "valid_values": ["1m", "5m", "15m", "30m", "1h", "1d", "1wk", "1mo"]
+                "valid_values": ["1m", "5m", "15m", "30m", "1h", "1d", "1wk", "1mo"],
+                "tooltip": "The time interval used for technical analysis charts and indicators. Shorter timeframes (1m, 5m) are for day trading, medium (1h, 1d) for swing trading, longer (1wk, 1mo) for position trading."
             },
             
             # LLM Models
             "deep_think_llm": {
                 "type": "str", "required": True, "default": "gpt-5-mini",
                 "description": "LLM model for complex reasoning and deep analysis",
-                "valid_values": ["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "o4-mini"]
+                "valid_values": ["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "o4-mini"],
+                "tooltip": "The AI model used for in-depth analysis requiring complex reasoning, such as fundamental analysis and debate arbitration. Higher-tier models (gpt-5) provide better insights but cost more. Mini/nano variants balance cost and performance."
             },
             "quick_think_llm": {
                 "type": "str", "required": True, "default": "gpt-5-mini",
                 "description": "LLM model for quick analysis and real-time decisions",
                 "valid_values": ["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "o4-mini", "o4-mini-deep-research"],
-                "help": "For more information on available models, see [OpenAI Models Documentation](https://platform.openai.com/docs/models)"
+                "help": "For more information on available models, see [OpenAI Models Documentation](https://platform.openai.com/docs/models)",
+                "tooltip": "The AI model used for faster analysis tasks like technical indicators and quick data summarization. Nano/mini models are cost-effective for these simpler tasks. The o4-mini-deep-research variant provides enhanced analytical capabilities."
             },
             
             # Data Lookback Periods
             "news_lookback_days": {
                 "type": "int", "required": True, "default": 7,
-                "description": "Days of news data to analyze"
+                "description": "Days of news data to analyze",
+                "tooltip": "How many days back to search for news articles about the symbol. More days = broader context but may include outdated information. Recommended: 3-7 days for active stocks, 14-30 for slower-moving positions."
             },
             "market_history_days": {
                 "type": "int", "required": True, "default": 90,
-                "description": "Days of market history for technical analysis"
+                "description": "Days of market history for technical analysis",
+                "tooltip": "Historical price data window for calculating technical indicators (moving averages, RSI, MACD, etc.). 90 days provides good context for most indicators. Increase to 180-365 for longer-term trend analysis."
             },
             "economic_data_days": {
                 "type": "int", "required": True, "default": 90,
-                "description": "Days of economic data to consider"
+                "description": "Days of economic data to consider",
+                "tooltip": "Lookback period for macroeconomic indicators (inflation, GDP, interest rates, etc.). 90 days captures recent economic trends. Increase to 180-365 for broader economic cycle analysis."
             },
             "social_sentiment_days": {
                 "type": "int", "required": True, "default": 3,
-                "description": "Days of social sentiment data to analyze"
+                "description": "Days of social sentiment data to analyze",
+                "tooltip": "How many days of social media and Reddit sentiment to analyze. Social sentiment changes rapidly, so 1-7 days is typical. Shorter periods (1-3 days) capture current buzz, longer periods (7-14 days) smooth out noise."
             },
             "debug_mode": {
                 "type": "bool", "required": True, "default": True,
-                "description": "Enable debug mode with detailed console output"
+                "description": "Enable debug mode with detailed console output",
+                "tooltip": "When enabled, outputs detailed logs of the AI agent's thinking process, data gathering, and decision-making steps. Useful for understanding why recommendations were made. Disable for cleaner logs in production."
+            },
+            
+            # Risk Management
+            "max_virtual_equity_per_instrument_percent": {
+                "type": "float", "required": True, "default": 10.0,
+                "description": "Maximum virtual equity allocation per instrument (%)",
+                "tooltip": "Maximum percentage of virtual trading balance that can be allocated to a single instrument. This helps maintain portfolio diversification. Recommended: 5-15%. Lower values (5-10%) provide better diversification, higher values (10-15%) allow larger positions in high-confidence trades."
             }
         }
 

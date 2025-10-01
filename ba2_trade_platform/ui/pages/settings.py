@@ -17,6 +17,7 @@ from ...modules.experts import experts
 from ..components.InstrumentSelector import InstrumentSelector
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ...core.rules_export_import import RulesExportImportUI
+from ...core.rules_documentation import get_event_type_documentation, get_action_type_documentation
 
 # --- InstrumentSettingsTab ---
 class InstrumentSettingsTab:
@@ -609,12 +610,29 @@ class AccountDefinitionsTab:
             for key, meta in settings_def.items():
                 label = meta.get("description", key)
                 value = settings_values.get(key, None) if settings_values else None
-                if meta["type"] == "str":
-                    inp = ui.input(label=label, value=value or "").classes('w-full')
-                elif meta["type"] == "bool":
-                    inp = ui.checkbox(text=label, value=bool(value) if value is not None else False)
-                else:
-                    inp = ui.input(label=label, value=value or "").classes('w-full')
+                tooltip_text = meta.get("tooltip")
+                
+                # Create a container for this setting (title + input)
+                with ui.column().classes('w-full mb-4'):
+                    # Create label with tooltip inline
+                    if tooltip_text:
+                        with ui.row().classes('items-center gap-1 mb-2'):
+                            ui.label(label).classes('text-sm font-medium')
+                            ui.icon('help_outline', size='sm').classes('text-gray-500 cursor-help').tooltip(tooltip_text).style('font-size: 18px !important; padding: 12px !important; max-width: 350px !important; line-height: 1.4 !important;')
+                        
+                        # Use empty label for input since we show it above
+                        display_label = ""
+                    else:
+                        display_label = label
+                    
+                    # Create the input field directly in the same container
+                    if meta["type"] == "str":
+                        inp = ui.input(label=display_label, value=value or "").classes('w-full')
+                    elif meta["type"] == "bool":
+                        inp = ui.checkbox(text=display_label, value=bool(value) if value is not None else False)
+                    else:
+                        inp = ui.input(label=display_label, value=value or "").classes('w-full')
+                
                 self.settings_inputs[key] = inp
         else:
             ui.label("No provider-specific settings available.")
@@ -1700,42 +1718,59 @@ class ExpertSettingsTab:
                     # Check if setting has valid_values (dropdown)
                     valid_values = meta.get("valid_values")
                     help_text = meta.get("help")
+                    tooltip_text = meta.get("tooltip")
                     
-                    if meta["type"] == "str":
-                        value = current_value if current_value is not None else default_value or ""
-                        if valid_values:
-                            # Show as dropdown
-                            inp = ui.select(
-                                options=valid_values,
-                                label=label,
-                                value=value if value in valid_values else (valid_values[0] if valid_values else "")
-                            ).classes('w-full')
+                    # Create a container for this setting (title + input)
+                    setting_container = ui.column().classes('w-full mb-4')
+                    with setting_container:
+                        # Create label with tooltip inline
+                        if tooltip_text:
+                            with ui.row().classes('items-center gap-1 mb-2'):
+                                ui.label(label).classes('text-sm font-medium')
+                                ui.icon('help_outline', size='sm').classes('text-gray-500 cursor-help').tooltip(tooltip_text).style('font-size: 18px !important; padding: 12px !important; max-width: 350px !important; line-height: 1.4 !important;')
+                            
+                            # Use empty label for input since we show it above
+                            display_label = ""
                         else:
-                            inp = ui.input(label=label, value=value).classes('w-full')
-                    elif meta["type"] == "bool":
-                        value = current_value if current_value is not None else default_value or False
-                        inp = ui.checkbox(text=label, value=bool(value))
-                    elif meta["type"] == "float":
-                        value = current_value if current_value is not None else default_value or 0.0
-                        inp = ui.input(label=label, value=str(value)).classes('w-full')
-                    else:
-                        value = current_value if current_value is not None else default_value or ""
-                        if valid_values:
-                            # Show as dropdown for other types too if valid_values exist
-                            inp = ui.select(
-                                options=valid_values,
-                                label=label,
-                                value=value if value in valid_values else (valid_values[0] if valid_values else "")
-                            ).classes('w-full')
+                            display_label = label
+                        
+                        # Create the input field directly in the same container
+                        if meta["type"] == "str":
+                            value = current_value if current_value is not None else default_value or ""
+                            if valid_values:
+                                # Show as dropdown
+                                inp = ui.select(
+                                    options=valid_values,
+                                    label=display_label,
+                                    value=value if value in valid_values else (valid_values[0] if valid_values else "")
+                                ).classes('w-full')
+                            else:
+                                inp = ui.input(label=display_label, value=value).classes('w-full')
+                        elif meta["type"] == "bool":
+                            value = current_value if current_value is not None else default_value or False
+                            inp = ui.checkbox(text=display_label, value=bool(value))
+                        elif meta["type"] == "float":
+                            value = current_value if current_value is not None else default_value or 0.0
+                            inp = ui.input(label=display_label, value=str(value)).classes('w-full')
                         else:
-                            inp = ui.input(label=label, value=str(value)).classes('w-full')
+                            value = current_value if current_value is not None else default_value or ""
+                            if valid_values:
+                                # Show as dropdown for other types too if valid_values exist
+                                inp = ui.select(
+                                    options=valid_values,
+                                    label=display_label,
+                                    value=value if value in valid_values else (valid_values[0] if valid_values else "")
+                                ).classes('w-full')
+                            else:
+                                inp = ui.input(label=display_label, value=str(value)).classes('w-full')
+                        
+                        # Add help text if available
+                        if help_text:
+                            ui.markdown(help_text).classes('text-sm text-gray-600 mt-1')
                     
-                    inp.move(self.expert_settings_container)
+                    setting_container.move(self.expert_settings_container)
+                    
                     self.expert_settings_inputs[key] = inp
-                    
-                    # Add help text if available
-                    if help_text:
-                        ui.markdown(help_text).classes('text-sm text-gray-600 mt-1 mb-3').move(self.expert_settings_container)
             else:
                 ui.label("No expert-specific settings available.").move(self.expert_settings_container)
                 
@@ -1961,8 +1996,13 @@ class TradeSettingsTab:
             with ui.tab_panels(trade_tabs, value='Rules').classes('w-full'):
                 # Rules tab
                 with ui.tab_panel('Rules'):
-                    ui.label('Trading Rules (EventAction)').classes('text-h6 mb-2')
-                    ui.label('Rules define triggers and actions for automated trading decisions.').classes('text-grey-7 mb-4')
+                    with ui.row().classes('w-full justify-between items-center mb-4'):
+                        with ui.column():
+                            ui.label('Trading Rules (EventAction)').classes('text-h6 mb-0')
+                            ui.label('Rules define triggers and actions for automated trading decisions.').classes('text-grey-7')
+                        
+                        # Help button for rules documentation
+                        ui.button('📚 Help & Documentation', on_click=self._show_rules_help, icon='help_outline').props('color=info').tooltip('View comprehensive rules documentation with examples')
                     
                     with ui.row().classes('w-full justify-end gap-2 mb-4'):
                         ui.button('Import Rules', on_click=self.rules_export_import_ui.show_import_dialog, icon='upload_file').props('flat')
@@ -2004,8 +2044,13 @@ class TradeSettingsTab:
                 
                 # Rulesets tab
                 with ui.tab_panel('Rulesets'):
-                    ui.label('Trading Rulesets').classes('text-h6 mb-2')
-                    ui.label('Rulesets are collections of rules that work together for specific trading strategies.').classes('text-grey-7 mb-4')
+                    with ui.row().classes('w-full justify-between items-center mb-4'):
+                        with ui.column():
+                            ui.label('Trading Rulesets').classes('text-h6 mb-0')
+                            ui.label('Rulesets are collections of rules that work together for specific trading strategies.').classes('text-grey-7')
+                        
+                        # Help button for rules documentation
+                        ui.button('Help', on_click=self._show_rules_help, icon='help_outline').props('color=info outline')
                     
                     with ui.row().classes('w-full justify-end gap-2 mb-4'):
                         ui.button('Import Rulesets', on_click=self.rules_export_import_ui.show_import_dialog, icon='upload_file').props('flat')
@@ -2042,6 +2087,24 @@ class TradeSettingsTab:
                     self.rulesets_table.on('del', self._on_ruleset_del_click)
         
         logger.debug('TradeSettingsTab UI rendered')
+    
+    def _show_rules_help(self):
+        """Show comprehensive rules documentation dialog."""
+        try:
+            from ...core.rules_documentation import get_rules_overview_html
+            
+            with ui.dialog() as help_dialog, ui.card().classes('w-full max-w-4xl'):
+                help_html = get_rules_overview_html()
+                ui.html(help_html)
+                
+                with ui.row().classes('w-full justify-end mt-4'):
+                    ui.button('Close', on_click=help_dialog.close).props('color=primary')
+            
+            help_dialog.open()
+            
+        except Exception as e:
+            logger.error(f"Error showing rules help: {e}", exc_info=True)
+            ui.notify(f'Error loading help: {str(e)}', type='negative')
     
     def _get_all_rules(self):
         """Get all rules (EventAction) for the table."""
@@ -2146,6 +2209,7 @@ class TradeSettingsTab:
                 with ui.tabs() as rule_tabs:
                     ui.tab('Triggers', icon='play_arrow')
                     ui.tab('Actions', icon='settings')
+                    ui.tab('Help', icon='help')
                 
                 with ui.tab_panels(rule_tabs, value='Triggers').classes('w-full').style('flex: 1; overflow-y: auto'):
                     # Triggers tab
@@ -2177,6 +2241,46 @@ class TradeSettingsTab:
                                 self._add_action_row(action_key, action_config)
                         
                         ui.button('Add Action', on_click=lambda: self._add_action_row(), icon='add').classes('mt-4')
+                    
+                    # Help tab
+                    with ui.tab_panel('Help'):
+                        ui.label('Rules Documentation').classes('text-subtitle1 mb-4')
+                        ui.label('Quick reference for available triggers and actions.').classes('text-grey-7 mb-4')
+                        
+                        with ui.scroll_area().classes('w-full').style('height: 400px'):
+                            # Event Types Documentation
+                            ui.label('📋 Available Trigger Types').classes('text-h6 mb-3')
+                            event_docs = get_event_type_documentation()
+                            
+                            # Group by type
+                            boolean_events = {k: v for k, v in event_docs.items() if v['type'] == 'boolean'}
+                            numeric_events = {k: v for k, v in event_docs.items() if v['type'] == 'numeric'}
+                            
+                            # Boolean events
+                            ui.label('🔄 Boolean Events (True/False)').classes('text-subtitle1 mt-4 mb-2')
+                            for event_key, doc in list(boolean_events.items())[:6]:  # Show first 6
+                                with ui.card().classes('w-full mb-2 p-2 bg-blue-50'):
+                                    ui.label(f"{doc['name']} ({event_key})").classes('text-sm font-medium')
+                                    ui.label(doc['description']).classes('text-xs text-gray-600 mt-1')
+                            
+                            # Numeric events
+                            ui.label('🔢 Numeric Events (Comparisons)').classes('text-subtitle1 mt-4 mb-2')
+                            for event_key, doc in numeric_events.items():
+                                with ui.card().classes('w-full mb-2 p-2 bg-green-50'):
+                                    ui.label(f"{doc['name']} ({event_key})").classes('text-sm font-medium')
+                                    ui.label(doc['description']).classes('text-xs text-gray-600 mt-1')
+                            
+                            # Action Types Documentation
+                            ui.separator().classes('my-4')
+                            ui.label('⚡ Available Action Types').classes('text-h6 mb-3')
+                            action_docs = get_action_type_documentation()
+                            
+                            for action_key, doc in action_docs.items():
+                                with ui.card().classes('w-full mb-2 p-2 bg-orange-50'):
+                                    ui.label(f"{doc['name']} ({action_key})").classes('text-sm font-medium')
+                                    ui.label(doc['description']).classes('text-xs text-gray-600 mt-1')
+                                    if doc.get('use_cases'):
+                                        ui.label(f"• {doc['use_cases'][0]}").classes('text-xs text-gray-500 mt-1 italic')
                 
                 # Save button
                 with ui.row().classes('w-full justify-end mt-4'):
@@ -2203,9 +2307,30 @@ class TradeSettingsTab:
                         value=trigger_config.get('event_type', trigger_config.get('type', ExpertEventType.F_HAS_POSITION.value)) if trigger_config else ExpertEventType.F_HAS_POSITION.value
                     ).classes('flex-1')
                     
+                    # Add help icon with tooltip showing event documentation
+                    help_icon = ui.icon('help_outline', size='sm').classes('text-gray-500 cursor-help ml-2')
+                    
                     # Remove button
                     ui.button('Remove', on_click=lambda: self._remove_trigger_row(trigger_id, trigger_card), 
                              icon='delete', color='red').props('flat dense')
+                
+                # Documentation area for selected trigger type
+                docs_container = ui.column().classes('w-full mt-2')
+                
+                def update_trigger_documentation():
+                    """Update the documentation for the selected trigger type."""
+                    docs_container.clear()
+                    selected_type = trigger_select.value
+                    if selected_type:
+                        event_docs = get_event_type_documentation()
+                        if selected_type in event_docs:
+                            doc = event_docs[selected_type]
+                            with docs_container:
+                                with ui.card().classes('w-full bg-blue-50 border-l-4 border-blue-400 p-3'):
+                                    ui.label(f"📘 {doc['name']}").classes('text-sm font-semibold text-blue-800')
+                                    ui.label(doc['description']).classes('text-sm text-blue-700 mt-1')
+                                    if doc.get('example'):
+                                        ui.label(f"💡 Example: {doc['example']}").classes('text-xs text-blue-600 mt-1 italic')
                 
                 # Value input (for N_ types)
                 value_row = ui.row().classes('w-full')
@@ -2215,6 +2340,9 @@ class TradeSettingsTab:
                 def update_value_inputs():
                     value_row.clear()
                     selected_type = trigger_select.value
+                    
+                    # Update documentation
+                    update_trigger_documentation()
                     
                     if selected_type and is_numeric_event(selected_type):
                         # Numeric trigger - show operator and value
@@ -2271,9 +2399,35 @@ class TradeSettingsTab:
                         value=action_config.get('action_type', action_config.get('type', ExpertActionType.BUY.value)) if action_config else ExpertActionType.BUY.value
                     ).classes('flex-1')
                     
+                    # Add help icon with tooltip showing action documentation
+                    help_icon = ui.icon('help_outline', size='sm').classes('text-gray-500 cursor-help ml-2')
+                    
                     # Remove button
                     ui.button('Remove', on_click=lambda: self._remove_action_row(action_id, action_card), 
                              icon='delete', color='red').props('flat dense')
+                
+                # Documentation area for selected action type
+                action_docs_container = ui.column().classes('w-full mt-2')
+                
+                def update_action_documentation():
+                    """Update the documentation for the selected action type."""
+                    action_docs_container.clear()
+                    selected_type = action_select.value
+                    if selected_type:
+                        action_docs = get_action_type_documentation()
+                        if selected_type in action_docs:
+                            doc = action_docs[selected_type]
+                            with action_docs_container:
+                                with ui.card().classes('w-full bg-green-50 border-l-4 border-green-400 p-3'):
+                                    ui.label(f"⚡ {doc['name']}").classes('text-sm font-semibold text-green-800')
+                                    ui.label(doc['description']).classes('text-sm text-green-700 mt-1')
+                                    if doc.get('example'):
+                                        ui.label(f"💡 Example: {doc['example']}").classes('text-xs text-green-600 mt-1 italic')
+                                    # Show use cases if available
+                                    if doc.get('use_cases'):
+                                        ui.label("Common use cases:").classes('text-xs text-green-700 mt-2 font-medium')
+                                        for use_case in doc['use_cases'][:2]:  # Show first 2 use cases
+                                            ui.label(f"• {use_case}").classes('text-xs text-green-600 ml-2')
                 
                 # Value input (for ADJUST_ types)
                 value_row = ui.row().classes('w-full')
@@ -2283,6 +2437,9 @@ class TradeSettingsTab:
                 def update_action_inputs():
                     value_row.clear()
                     selected_type = action_select.value
+                    
+                    # Update documentation
+                    update_action_documentation()
                     
                     if selected_type and is_adjustment_action(selected_type):
                         # Adjustment action - show value input and reference selector

@@ -476,7 +476,7 @@ class AdjustTakeProfitAction(TradeAction):
     
     def execute(self) -> "TradeActionResult":
         """
-        Create or adjust take profit order linked to existing order.
+        Adjust take profit for existing order using account's set_order_tp method.
         
         Returns:
             TradeActionResult object containing execution results
@@ -511,67 +511,38 @@ class AdjustTakeProfitAction(TradeAction):
                 else:
                     self.take_profit_price = current_price * 0.95
             
-            # Determine TP order side (opposite of main order)
-            tp_side = "sell" if self.existing_order.side == "buy" else "buy"
+            # Use account's set_order_tp method to adjust take profit
+            tp_result = self.account.set_order_tp(self.existing_order, self.take_profit_price)
             
-            # Create take profit order record
-            tp_order_record = self.create_order_record(
-                side=tp_side,
-                quantity=self.existing_order.quantity,
-                order_type="limit",
-                limit_price=self.take_profit_price,
-                linked_order_id=self.existing_order.id
-            )
-            
-            if not tp_order_record:
-                result = self.create_action_result(
-                    action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
-                    success=False,
-                    message="Failed to create take profit order record",
-                    data={}
-                )
-                add_instance(result)
-                return result
-            
-            # Submit TP order through account interface
-            submit_result = self.account.submit_order(tp_order_record)
-            
-            if submit_result is not None:
-                # Update TP order record with broker order ID
-                if hasattr(submit_result, 'account_order_id') and submit_result.account_order_id:
-                    tp_order_record.broker_order_id = str(submit_result.account_order_id)
-                    tp_order_record.status = OrderStatus.OPEN.value
-                    update_instance(tp_order_record)
-                
+            if tp_result is not None:
                 result = self.create_action_result(
                     action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
                     success=True,
-                    message=f"Take profit order created for {self.instrument_name} at ${self.take_profit_price}",
-                    data={"order_id": tp_order_record.id, "broker_order_id": submit_result.account_order_id}
+                    message=f"Take profit adjusted for {self.instrument_name} to ${self.take_profit_price:.2f}",
+                    data={
+                        "order_id": self.existing_order.id, 
+                        "new_tp_price": self.take_profit_price,
+                        "tp_result": str(tp_result)
+                    }
                 )
-                add_instance(result)
-                return result
             else:
-                # Update TP order status to failed
-                tp_order_record.status = OrderStatus.CANCELED.value
-                update_instance(tp_order_record)
-                
                 result = self.create_action_result(
                     action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
                     success=False,
-                    message=f"Failed to submit take profit order",
-                    data={}
+                    message=f"Failed to adjust take profit for {self.instrument_name}",
+                    data={"order_id": self.existing_order.id, "requested_tp_price": self.take_profit_price}
                 )
-                add_instance(result)
-                return result
-                
+            
+            add_instance(result)
+            return result
+            
         except Exception as e:
-            logger.error(f"Error executing adjust take profit action for {self.instrument_name}: {e}", exc_info=True)
+            logger.error(f"Error adjusting take profit for {self.instrument_name}: {e}", exc_info=True)
             result = self.create_action_result(
                 action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
                 success=False,
-                message=f"Error executing adjust take profit action: {str(e)}",
-                data={}
+                message=f"Error adjusting take profit: {str(e)}",
+                data={"order_id": self.existing_order.id if self.existing_order else None}
             )
             add_instance(result)
             return result

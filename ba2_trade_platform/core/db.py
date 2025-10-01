@@ -61,16 +61,17 @@ def add_instance(instance, session: Session | None = None):
         The added instance.
     """
     try:
+        instance_class = instance.__class__.__name__
         if session:
             session.add(instance)
             session.commit()
-            logger.info(f"Added instance: {instance}")
+            logger.info(f"Added instance: {instance_class} (id={instance.id})")
             return instance.id
         else:
             with Session(engine) as session:
                 session.add(instance)
                 session.commit()
-                logger.info(f"Added instance: {instance}")
+                logger.info(f"Added instance: {instance_class} (id={instance.id})")
                 return instance.id
     except Exception as e:
         logger.error(f"Error adding instance: {e}", exc_info=True)

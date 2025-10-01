@@ -80,8 +80,10 @@ class OverviewTab:
                             ui.label(f'📋 {pending_count} Pending Order{"s" if pending_count > 1 else ""} to Review').classes('text-lg font-bold text-blue-800')
                             ui.label(f'There {"are" if pending_count > 1 else "is"} {pending_count} order{"s" if pending_count > 1 else ""} awaiting review and submission.').classes('text-sm text-blue-700')
                         
-                        # View details button
-                        ui.button('Review Orders', on_click=switch_to_account_overview).props('outline color=blue')
+                        # Buttons for pending orders
+                        with ui.column().classes('gap-2'):
+                            ui.button('Review Orders', on_click=switch_to_account_overview).props('outline color=blue')
+                            ui.button('Run Risk Management', on_click=lambda: self._handle_risk_management_from_overview(pending_orders)).props('outline color=green')
                 
                 # Log the pending orders
                 logger.info(f"Found {pending_count} pending orders on overview page")
@@ -711,6 +713,91 @@ class OverviewTab:
         except Exception as e:
             logger.error(f'Unexpected error fetching OpenAI usage data: {e}', exc_info=True)
             return {'error': f'Unexpected error: {str(e)}'}
+
+    def _handle_risk_management_from_overview(self, pending_orders):
+        """Handle risk management execution from overview page."""
+        try:
+            if not pending_orders:
+                ui.notify('No pending orders to process', type='info')
+                return
+            
+            # Group orders by expert instance to run risk management per expert
+            from collections import defaultdict
+            orders_by_expert = defaultdict(list)
+            
+            # Get expert instance IDs from order recommendations
+            from ...core.db import get_db
+            from ...core.models import ExpertRecommendation
+            
+            with get_db() as session:
+                for order in pending_orders:
+                    if order.order_recommendation_id:
+                        recommendation = session.get(ExpertRecommendation, order.order_recommendation_id)
+                        if recommendation:
+                            orders_by_expert[recommendation.instance_id].append(order)
+            
+            if not orders_by_expert:
+                ui.notify('No orders with valid expert recommendations found', type='warning')
+                return
+            
+            # Show processing dialog
+            with ui.dialog() as processing_dialog, ui.card():
+                ui.label('Running Risk Management for All Experts...').classes('text-h6')
+                ui.spinner(size='lg')
+                ui.label('Processing pending orders and calculating quantities').classes('text-sm text-gray-600')
+            
+            processing_dialog.open()
+            
+            try:
+                from ...core.TradeRiskManagement import get_risk_management
+                risk_management = get_risk_management()
+                
+                total_processed = 0
+                experts_processed = 0
+                
+                # Run risk management for each expert
+                for expert_id, expert_orders in orders_by_expert.items():
+                    try:
+                        updated_orders = risk_management.review_and_prioritize_pending_orders(expert_id)
+                        total_processed += len(updated_orders)
+                        experts_processed += 1
+                        logger.info(f"Processed {len(updated_orders)} orders for expert {expert_id}")
+                    except Exception as e:
+                        logger.error(f"Error processing risk management for expert {expert_id}: {e}", exc_info=True)
+                
+                processing_dialog.close()
+                
+                # Report results
+                if total_processed > 0:
+                    ui.notify(
+                        f'Risk Management completed!\n'
+                        f'• Experts processed: {experts_processed}\n'
+                        f'• Orders updated: {total_processed}\n'
+                        f'Check the Account Overview tab to review and submit orders.',
+                        type='positive',
+                        close_button=True,
+                        timeout=7000
+                    )
+                else:
+                    ui.notify(
+                        'No orders were updated. All orders may already have quantities assigned or risk management criteria not met.',
+                        type='info',
+                        timeout=5000
+                    )
+                
+                # Refresh the overview to update the display
+                # Note: We would ideally call a refresh method here, but for now
+                # the user can refresh manually or switch tabs
+                
+            except Exception as e:
+                processing_dialog.close()
+                logger.error(f"Error during risk management execution: {e}", exc_info=True)
+                ui.notify(f'Error running risk management: {str(e)}', type='negative')
+                
+        except Exception as e:
+            logger.error(f"Error in _handle_risk_management_from_overview: {e}", exc_info=True)
+            ui.notify(f'Error: {str(e)}', type='negative')
+
 
 class AccountOverviewTab:
     def __init__(self):

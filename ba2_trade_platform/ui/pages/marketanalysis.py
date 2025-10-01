@@ -855,6 +855,7 @@ class OrderRecommendationsTab:
         self.summary_table = None
         self.detail_container = None
         self.refresh_timer = None
+        self.expert_select = None
         self.render()
 
     def render(self):
@@ -863,8 +864,29 @@ class OrderRecommendationsTab:
             ui.label('Expert recommendations and generated orders').classes('text-sm text-gray-600 mb-4')
             
             # Controls
-            with ui.row().classes('w-full justify-between items-center mb-4'):
-                ui.button('Refresh', on_click=self.refresh_data).props('color=primary outline')
+            with ui.row().classes('w-full justify-between items-center mb-4 gap-4'):
+                with ui.row().classes('items-center gap-2'):
+                    ui.button('Refresh', on_click=self.refresh_data).props('color=primary outline')
+                    
+                    # Expert selector for processing recommendations
+                    expert_options = self._get_expert_options()
+                    self.expert_select = ui.select(
+                        options=expert_options,
+                        label='Select Expert',
+                        value=expert_options[0] if expert_options else None
+                    ).classes('w-64').props('dense outlined')
+                    
+                    ui.button(
+                        'Process Recommendations', 
+                        on_click=self._handle_process_recommendations,
+                        icon='play_arrow'
+                    ).props('color=positive').tooltip('Process all recommendations for the selected expert and create orders')
+                    
+                    ui.button(
+                        'Risk Management & Submit Orders',
+                        on_click=self._handle_risk_management_and_submit,
+                        icon='assessment'
+                    ).props('color=secondary').tooltip('Run risk management on pending orders and submit them to broker')
             
             # Summary table container
             self.summary_container = ui.element('div').classes('w-full mb-4')
@@ -1377,6 +1399,198 @@ class OrderRecommendationsTab:
         except Exception as e:
             logger.error(f"Error placing order: {e}", exc_info=True)
             ui.notify(f'Error placing order: {str(e)}', type='negative')
+
+    def _get_expert_options(self):
+        """Get list of enabled expert instances for dropdown."""
+        try:
+            from ...core.models import ExpertInstance
+            from ...core.db import get_all_instances
+            
+            experts = get_all_instances(ExpertInstance)
+            enabled_experts = [e for e in experts if e.enabled]
+            
+            if not enabled_experts:
+                return []
+            
+            # Create options: display name -> instance ID mapping
+            options = {}
+            for expert in enabled_experts:
+                desc = expert.user_description or f"Expert {expert.id}"
+                display_name = f"{expert.expert} - {desc} (ID: {expert.id})"
+                options[display_name] = expert.id
+            
+            return list(options.keys())
+            
+        except Exception as e:
+            logger.error(f"Error getting expert options: {e}", exc_info=True)
+            return []
+
+    def _handle_process_recommendations(self):
+        """Process all recommendations for the selected expert."""
+        try:
+            if not self.expert_select or not self.expert_select.value:
+                ui.notify('Please select an expert instance', type='warning')
+                return
+            
+            # Extract expert instance ID from the selected value
+            # Format is "ExpertType - Description (ID: X)"
+            selected_text = self.expert_select.value
+            expert_id = int(selected_text.split('ID: ')[-1].rstrip(')'))
+            
+            # Get the Trade Manager
+            from ...core.TradeManager import get_trade_manager
+            trade_manager = get_trade_manager()
+            
+            # Process recommendations
+            with ui.dialog() as processing_dialog, ui.card():
+                ui.label('Processing Recommendations...').classes('text-h6')
+                ui.spinner(size='lg')
+                ui.label('This may take a few moments').classes('text-sm text-gray-600')
+            
+            processing_dialog.open()
+            
+            try:
+                created_orders = trade_manager.process_expert_recommendations_after_analysis(expert_id)
+                processing_dialog.close()
+                
+                if created_orders:
+                    order_ids = [order.id for order in created_orders]
+                    ui.notify(
+                        f'Successfully processed recommendations for expert {expert_id}. '
+                        f'Created {len(created_orders)} order(s): {", ".join(map(str, order_ids))}',
+                        type='positive',
+                        close_button=True,
+                        timeout=5000
+                    )
+                else:
+                    ui.notify(
+                        f'No orders created for expert {expert_id}. '
+                        f'Either no recommendations passed the ruleset filters or automated trading is disabled.',
+                        type='info',
+                        close_button=True,
+                        timeout=5000
+                    )
+                
+                # Refresh data to show new orders
+                self.refresh_data()
+                
+            except Exception as e:
+                processing_dialog.close()
+                logger.error(f"Error processing recommendations for expert {expert_id}: {e}", exc_info=True)
+                ui.notify(f'Error processing recommendations: {str(e)}', type='negative')
+                
+        except Exception as e:
+            logger.error(f"Error in handle_process_recommendations: {e}", exc_info=True)
+            ui.notify(f'Error: {str(e)}', type='negative')
+
+    def _handle_risk_management_and_submit(self):
+        """Run risk management on pending orders and submit them to broker."""
+        try:
+            if not self.expert_select or not self.expert_select.value:
+                ui.notify('Please select an expert instance', type='warning')
+                return
+            
+            # Extract expert instance ID from the selected value
+            # Format is "ExpertType - Description (ID: X)"
+            selected_text = self.expert_select.value
+            expert_id = int(selected_text.split('ID: ')[-1].rstrip(')'))
+            
+            # Get the Risk Management system and Trade Manager
+            from ...core.TradeRiskManagement import get_risk_management
+            from ...core.TradeManager import get_trade_manager
+            from ...core.db import get_all_instances
+            from ...core.models import TradingOrder
+            from ...core.types import OrderStatus
+            
+            # Show processing dialog
+            with ui.dialog() as processing_dialog, ui.card():
+                ui.label('Running Risk Management & Submitting Orders...').classes('text-h6')
+                ui.spinner(size='lg')
+                ui.label('Calculating quantities and submitting to broker').classes('text-sm text-gray-600')
+            
+            processing_dialog.open()
+            
+            try:
+                # Step 1: Run risk management
+                risk_management = get_risk_management()
+                updated_orders = risk_management.review_and_prioritize_pending_orders(expert_id)
+                
+                if not updated_orders:
+                    processing_dialog.close()
+                    ui.notify(
+                        f'No pending orders found for expert {expert_id} or no orders needed quantity updates.',
+                        type='info',
+                        timeout=5000
+                    )
+                    return
+                
+                # Step 2: Submit orders with quantities > 0 to broker
+                trade_manager = get_trade_manager()
+                submitted_count = 0
+                failed_count = 0
+                
+                for order in updated_orders:
+                    if order.quantity > 0:
+                        try:
+                            # Get the expert instance to use for placing the order
+                            from ...core.models import ExpertInstance
+                            from ...core.db import get_instance
+                            expert_instance = get_instance(ExpertInstance, expert_id)
+                            
+                            if expert_instance:
+                                submitted_order = trade_manager._place_order(order, expert_instance)
+                                if submitted_order:
+                                    submitted_count += 1
+                                else:
+                                    failed_count += 1
+                            else:
+                                failed_count += 1
+                                logger.error(f"Expert instance {expert_id} not found for order {order.id}")
+                        except Exception as e:
+                            failed_count += 1
+                            logger.error(f"Error submitting order {order.id}: {e}", exc_info=True)
+                
+                processing_dialog.close()
+                
+                # Report results
+                total_processed = len([o for o in updated_orders if o.quantity > 0])
+                
+                if submitted_count > 0 or total_processed > 0:
+                    result_message = f'Risk Management completed for expert {expert_id}:\n'
+                    result_message += f'• Orders processed: {len(updated_orders)}\n'
+                    result_message += f'• Orders with quantities assigned: {total_processed}\n'
+                    result_message += f'• Orders successfully submitted: {submitted_count}\n'
+                    
+                    if failed_count > 0:
+                        result_message += f'• Failed submissions: {failed_count}'
+                        message_type = 'warning'
+                    else:
+                        message_type = 'positive'
+                    
+                    ui.notify(
+                        result_message,
+                        type=message_type,
+                        close_button=True,
+                        timeout=7000
+                    )
+                else:
+                    ui.notify(
+                        f'No orders were submitted for expert {expert_id}. All orders had quantity 0 after risk management.',
+                        type='info',
+                        timeout=5000
+                    )
+                
+                # Refresh data to show updated orders
+                self.refresh_data()
+                
+            except Exception as e:
+                processing_dialog.close()
+                logger.error(f"Error in risk management and order submission for expert {expert_id}: {e}", exc_info=True)
+                ui.notify(f'Error in risk management: {str(e)}', type='negative')
+                
+        except Exception as e:
+            logger.error(f"Error in _handle_risk_management_and_submit: {e}", exc_info=True)
+            ui.notify(f'Error: {str(e)}', type='negative')
 
     def stop_auto_refresh(self):
         """Stop auto-refresh timer."""

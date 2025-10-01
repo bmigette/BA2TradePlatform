@@ -646,7 +646,7 @@ class TradeManager:
                     
                     # Create a pending order (quantity will be determined later during review)
                     order = TradingOrder(
-                        account_id=expert.account_id,
+                        account_id=expert_instance.account_id,
                         symbol=recommendation.symbol,
                         quantity=0,  # To be determined during review/prioritization
                         side=side,
@@ -655,7 +655,7 @@ class TradeManager:
                         limit_price=None,
                         stop_price=None,
                         comment=f"Auto-created from recommendation {recommendation.id} (awaiting review)",
-                        expert_recommendation_id=recommendation.id,
+                        order_recommendation_id=recommendation.id,
                         open_type=OrderOpenType.AUTOMATIC,
                         created_at=datetime.now(timezone.utc)
                     )
@@ -668,6 +668,17 @@ class TradeManager:
                         self.logger.info(f"Created pending order {order_id} for {recommendation.symbol} (recommendation {recommendation.id} passed ruleset)")
                 
                 self.logger.info(f"Created {len(created_orders)} pending orders for expert {expert_instance_id} awaiting review and prioritization")
+                
+                # If we created orders and automated trading is enabled, run risk management
+                if created_orders and allow_automated_trade_opening:
+                    self.logger.info(f"Running risk management for {len(created_orders)} pending orders")
+                    try:
+                        from .TradeRiskManagement import get_risk_management
+                        risk_management = get_risk_management()
+                        updated_orders = risk_management.review_and_prioritize_pending_orders(expert_instance_id)
+                        self.logger.info(f"Risk management completed: updated {len(updated_orders)} orders with quantities")
+                    except Exception as e:
+                        self.logger.error(f"Error during risk management for expert {expert_instance_id}: {e}", exc_info=True)
                 
         except Exception as e:
             self.logger.error(f"Error processing expert recommendations after analysis for expert {expert_instance_id}: {e}", exc_info=True)
@@ -692,7 +703,7 @@ class TradeManager:
             all_tasks = worker_queue.get_all_tasks()
             
             # Check for pending enter_market tasks for this expert
-            for task in all_tasks:
+            for task in all_tasks.values():
                 if (task.expert_instance_id == expert_instance_id and
                     task.subtype == AnalysisUseCase.ENTER_MARKET and
                     task.status in [WorkerTaskStatus.PENDING, WorkerTaskStatus.RUNNING]):

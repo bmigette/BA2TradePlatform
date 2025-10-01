@@ -427,7 +427,12 @@ def get_stock_stats_indicators_window(
     ],
     look_back_days: Annotated[int, "how many days to look back"],
     online: Annotated[bool, "to fetch data online or offline"],
+    interval: Annotated[str, "Data interval (1m, 5m, 15m, 30m, 1h, 1d, 1wk, 1mo)"] = None,
 ) -> str:
+    # Get interval from config if not provided
+    if interval is None:
+        config = get_config()
+        interval = config.get("timeframe", "1d")
 
     best_ind_params = {
         # Moving Averages
@@ -527,7 +532,7 @@ def get_stock_stats_indicators_window(
             # only do the trading dates
             if curr_date.strftime("%Y-%m-%d") in dates_in_df.values:
                 indicator_value = get_stockstats_indicator(
-                    symbol, indicator, curr_date.strftime("%Y-%m-%d"), online
+                    symbol, indicator, curr_date.strftime("%Y-%m-%d"), online, interval
                 )
 
                 ind_string += f"{curr_date.strftime('%Y-%m-%d')}: {indicator_value}\n"
@@ -538,7 +543,7 @@ def get_stock_stats_indicators_window(
         ind_string = ""
         while curr_date >= before:
             indicator_value = get_stockstats_indicator(
-                symbol, indicator, curr_date.strftime("%Y-%m-%d"), online
+                symbol, indicator, curr_date.strftime("%Y-%m-%d"), online, interval
             )
 
             ind_string += f"{curr_date.strftime('%Y-%m-%d')}: {indicator_value}\n"
@@ -562,7 +567,12 @@ def get_stockstats_indicator(
         str, "The current trading date you are trading on, YYYY-mm-dd"
     ],
     online: Annotated[bool, "to fetch data online or offline"],
+    interval: Annotated[str, "Data interval (1m, 5m, 15m, 30m, 1h, 1d, 1wk, 1mo)"] = None,
 ) -> str:
+    # Get interval from config if not provided
+    if interval is None:
+        config = get_config()
+        interval = config.get("timeframe", "1d")
 
     curr_date = datetime.strptime(curr_date, "%Y-%m-%d")
     curr_date = curr_date.strftime("%Y-%m-%d")
@@ -574,6 +584,7 @@ def get_stockstats_indicator(
             curr_date,
             os.path.join(DATA_DIR, "market_data", "price_data"),
             online=online,
+            interval=interval,
         )
     except Exception as e:
         print(
@@ -629,7 +640,12 @@ def get_YFin_data_online(
     symbol: Annotated[str, "ticker symbol of the company"],
     start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
     end_date: Annotated[str, "End date in yyyy-mm-dd format"],
+    interval: Annotated[str, "Data interval (1m, 5m, 15m, 30m, 1h, 1d, 1wk, 1mo)"] = None,
 ):
+    # Get interval from config if not provided
+    if interval is None:
+        config = get_config()
+        interval = config.get("timeframe", "1d")
 
     datetime.strptime(start_date, "%Y-%m-%d")
     datetime.strptime(end_date, "%Y-%m-%d")
@@ -637,8 +653,8 @@ def get_YFin_data_online(
     # Create ticker object
     ticker = yf.Ticker(symbol.upper())
 
-    # Fetch historical data for the specified date range
-    data = ticker.history(start=start_date, end=end_date)
+    # Fetch historical data for the specified date range with specified interval
+    data = ticker.history(start=start_date, end=end_date, interval=interval)
 
     # Check if data is empty
     if data.empty:
@@ -660,7 +676,7 @@ def get_YFin_data_online(
     csv_string = data.to_csv()
 
     # Add header information
-    header = f"# Stock data for {symbol.upper()} from {start_date} to {end_date}\n"
+    header = f"# Stock data for {symbol.upper()} from {start_date} to {end_date} ({interval} interval)\n"
     header += f"# Total records: {len(data)}\n"
     header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
 
@@ -704,9 +720,14 @@ def get_YFin_data(
 
 def get_stock_news_openai(ticker, curr_date):
     from .config import get_openai_api_key
+    from .prompts import get_stock_news_prompt
+    
     config = get_config()
     api_key = get_openai_api_key()
     client = OpenAI(base_url=config["backend_url"], api_key=api_key)
+
+    lookback_days = config.get("social_sentiment_days", 3)
+    prompt_text = get_stock_news_prompt(ticker, curr_date, lookback_days)
 
     response = client.responses.create(
         model=config["quick_think_llm"],
@@ -716,7 +737,7 @@ def get_stock_news_openai(ticker, curr_date):
                 "content": [
                     {
                         "type": "input_text",
-                        "text": f"Search social media for {ticker} from 7 days before {curr_date} to {curr_date}. Return posts, tweets, and social media mentions about {ticker} with timestamps and sentiment. Focus on official accounts, financial news sources, and relevant discussions.",
+                        "text": prompt_text,
                     }
                 ],
             }
@@ -760,9 +781,14 @@ def get_stock_news_openai(ticker, curr_date):
 
 def get_global_news_openai(curr_date):
     from .config import get_openai_api_key
+    from .prompts import get_global_news_prompt
+    
     config = get_config()
     api_key = get_openai_api_key()
     client = OpenAI(base_url=config["backend_url"], api_key=api_key)
+
+    lookback_days = config.get("news_lookback_days", 7)
+    prompt_text = get_global_news_prompt(curr_date, lookback_days)
 
     response = client.responses.create(
         model=config["quick_think_llm"],
@@ -772,7 +798,7 @@ def get_global_news_openai(curr_date):
                 "content": [
                     {
                         "type": "input_text",
-                        "text": f"Can you search global or macroeconomics news from 7 days before {curr_date} to {curr_date} that would be informative for trading purposes? Make sure you only get the data posted during that period.",
+                        "text": prompt_text,
                     }
                 ],
             }
@@ -794,7 +820,7 @@ def get_global_news_openai(curr_date):
 
     # Handle different response formats
     try:
-        ta_logger.debug(f"GLobal News OpenAI response: {response}")
+        ta_logger.debug(f"Global News OpenAI response: {response}")
         # Try accessing response content
         if hasattr(response, 'output') and len(response.output) > 1:
             if hasattr(response.output[1], 'content') and len(response.output[1].content) > 0:
@@ -815,11 +841,26 @@ def get_global_news_openai(curr_date):
         return f"Error parsing response: {str(e)} - Response: {str(response)}"
 
 
-def get_fundamentals_openai(ticker, curr_date):
+def get_fundamentals_openai(ticker, curr_date, lookback_days=90):
+    """
+    Search for fundamental analysis and financial metrics using OpenAI web search.
+    
+    Args:
+        ticker: Stock ticker symbol
+        curr_date: Current date in YYYY-MM-DD format
+        lookback_days: Number of days to look back (default: 90, typically from economic_data_days setting)
+        
+    Returns:
+        str: Formatted fundamental analysis with financial metrics in markdown table format
+    """
     from .config import get_openai_api_key
+    from .prompts import get_fundamentals_prompt
+    
     config = get_config()
     api_key = get_openai_api_key()
     client = OpenAI(base_url=config["backend_url"], api_key=api_key)
+
+    prompt_text = get_fundamentals_prompt(ticker, curr_date, lookback_days)
 
     response = client.responses.create(
         model=config["quick_think_llm"],
@@ -829,7 +870,7 @@ def get_fundamentals_openai(ticker, curr_date):
                 "content": [
                     {
                         "type": "input_text",
-                        "text": f"Can you search Fundamental for discussions on {ticker} during of the month before {curr_date} to the month of {curr_date}. Make sure you only get the data posted during that period. List as a table, with PE/PS/Cash flow/ etc",
+                        "text": prompt_text,
                     }
                 ],
             }

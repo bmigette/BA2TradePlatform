@@ -60,8 +60,12 @@ class Toolkit:
         Returns:
             str: A formatted dataframe containing the latest global news from Reddit in the specified time frame.
         """
+        from ...dataflows.config import get_config
         
-        global_news_result = interface.get_reddit_global_news(curr_date, 7, 5)
+        config = get_config()
+        lookback_days = config.get("social_sentiment_days", 3)
+        
+        global_news_result = interface.get_reddit_global_news(curr_date, lookback_days, 5)
 
         return global_news_result
 
@@ -114,8 +118,12 @@ class Toolkit:
         Returns:
             str: A formatted dataframe containing the latest news about the company on the given date
         """
+        from ...dataflows.config import get_config
+        
+        config = get_config()
+        lookback_days = config.get("social_sentiment_days", 3)
 
-        stock_news_results = interface.get_reddit_company_news(ticker, curr_date, 7, 5)
+        stock_news_results = interface.get_reddit_company_news(ticker, curr_date, lookback_days, 5)
 
         return stock_news_results
 
@@ -149,6 +157,7 @@ class Toolkit:
     ) -> str:
         """
         Retrieve the stock price data for a given ticker symbol from Yahoo Finance.
+        Uses the timeframe setting from expert configuration.
         Args:
             symbol (str): Ticker symbol of the company, e.g. AAPL, TSM
             start_date (str): Start date in yyyy-mm-dd format
@@ -156,8 +165,8 @@ class Toolkit:
         Returns:
             str: A formatted dataframe containing the stock price data for the specified ticker symbol in the specified date range.
         """
-
-        result_data = interface.get_YFin_data_online(symbol, start_date, end_date)
+        # Pass None for interval to let interface function get it from config
+        result_data = interface.get_YFin_data_online(symbol, start_date, end_date, None)
 
         return result_data
 
@@ -171,21 +180,28 @@ class Toolkit:
         curr_date: Annotated[
             str, "The current trading date you are trading on, YYYY-mm-dd"
         ],
-        look_back_days: Annotated[int, "how many days to look back"] = 30,
+        look_back_days: Annotated[int, "how many days to look back"] = None,
     ) -> str:
         """
         Retrieve stock stats indicators for a given ticker symbol and indicator.
+        Uses the timeframe setting from expert configuration.
         Args:
             symbol (str): Ticker symbol of the company, e.g. AAPL, TSM
             indicator (str): Technical indicator to get the analysis and report of
             curr_date (str): The current trading date you are trading on, YYYY-mm-dd
-            look_back_days (int): How many days to look back, default is 30
+            look_back_days (int): How many days to look back. If None, uses market_history_days from config (default: 90)
         Returns:
             str: A formatted dataframe containing the stock stats indicators for the specified ticker symbol and indicator.
         """
-
+        from ...dataflows.config import get_config
+        
+        if look_back_days is None:
+            config = get_config()
+            look_back_days = config.get("market_history_days", 90)
+        
+        # Pass None for interval to let interface function get it from config
         result_stockstats = interface.get_stock_stats_indicators_window(
-            symbol, indicator, curr_date, look_back_days, False
+            symbol, indicator, curr_date, look_back_days, False, None
         )
 
         return result_stockstats
@@ -200,21 +216,28 @@ class Toolkit:
         curr_date: Annotated[
             str, "The current trading date you are trading on, YYYY-mm-dd"
         ],
-        look_back_days: Annotated[int, "how many days to look back"] = 30,
+        look_back_days: Annotated[int, "how many days to look back"] = None,
     ) -> str:
         """
         Retrieve stock stats indicators for a given ticker symbol and indicator.
+        Uses the timeframe setting from expert configuration.
         Args:
             symbol (str): Ticker symbol of the company, e.g. AAPL, TSM
             indicator (str): Technical indicator to get the analysis and report of
             curr_date (str): The current trading date you are trading on, YYYY-mm-dd
-            look_back_days (int): How many days to look back, default is 30
+            look_back_days (int): How many days to look back. If None, uses market_history_days from config (default: 90)
         Returns:
             str: A formatted dataframe containing the stock stats indicators for the specified ticker symbol and indicator.
         """
+        from ...dataflows.config import get_config
+        
+        if look_back_days is None:
+            config = get_config()
+            look_back_days = config.get("market_history_days", 90)
 
+        # Pass None for interval to let interface function get it from config
         result_stockstats = interface.get_stock_stats_indicators_window(
-            symbol, indicator, curr_date, look_back_days, True
+            symbol, indicator, curr_date, look_back_days, True, None
         )
 
         return result_stockstats
@@ -229,16 +252,21 @@ class Toolkit:
         ],
     ):
         """
-        Retrieve insider sentiment information about a company (retrieved from public SEC information) for the past 30 days
+        Retrieve insider sentiment information about a company (retrieved from public SEC information).
+        Lookback period is determined by economic_data_days setting (default: 90 days).
         Args:
             ticker (str): ticker symbol of the company
             curr_date (str): current date you are trading at, yyyy-mm-dd
         Returns:
-            str: a report of the sentiment in the past 30 days starting at curr_date
+            str: a report of the insider sentiment for the lookback period starting at curr_date
         """
+        from ...dataflows.config import get_config
+        
+        config = get_config()
+        lookback_days = config.get("economic_data_days", 90)
 
         data_sentiment = interface.get_finnhub_company_insider_sentiment(
-            ticker, curr_date, 30
+            ticker, curr_date, lookback_days
         )
 
         return data_sentiment
@@ -253,16 +281,21 @@ class Toolkit:
         ],
     ):
         """
-        Retrieve insider transaction information about a company (retrieved from public SEC information) for the past 30 days
+        Retrieve insider transaction information about a company (retrieved from public SEC information).
+        Lookback period is determined by economic_data_days setting (default: 90 days).
         Args:
             ticker (str): ticker symbol of the company
             curr_date (str): current date you are trading at, yyyy-mm-dd
         Returns:
-            str: a report of the company's insider transactions/trading information in the past 30 days
+            str: a report of the company's insider transactions/trading information for the lookback period
         """
+        from ...dataflows.config import get_config
+        
+        config = get_config()
+        lookback_days = config.get("economic_data_days", 90)
 
         data_trans = interface.get_finnhub_company_insider_transactions(
-            ticker, curr_date, 30
+            ticker, curr_date, lookback_days
         )
 
         return data_trans
@@ -352,12 +385,15 @@ class Toolkit:
         Args:
             query (str): Query to search with
             curr_date (str): Current date in yyyy-mm-dd format
-            look_back_days (int): How many days to look back
         Returns:
             str: A formatted string containing the latest news from Google News based on the query and date range.
         """
+        from ...dataflows.config import get_config
+        
+        config = get_config()
+        lookback_days = config.get("news_lookback_days", 7)
 
-        google_news_results = interface.get_google_news(query, curr_date, 7)
+        google_news_results = interface.get_google_news(query, curr_date, lookback_days)
 
         return google_news_results
 
@@ -405,15 +441,21 @@ class Toolkit:
     ):
         """
         Retrieve the latest fundamental information about a given stock on a given date by using OpenAI's news API.
+        Searches for comprehensive fundamental metrics including valuation ratios, profitability, growth, cash flow, financial health, and dividend information.
+        
         Args:
             ticker (str): Ticker of a company. e.g. AAPL, TSM
             curr_date (str): Current date in yyyy-mm-dd format
         Returns:
-            str: A formatted string containing the latest fundamental information about the company on the given date.
+            str: A formatted markdown table containing fundamental metrics for the company.
         """
-
+        from ...dataflows.config import get_config
+        
+        config = get_config()
+        lookback_days = config.get("economic_data_days", 90)
+        
         openai_fundamentals_results = interface.get_fundamentals_openai(
-            ticker, curr_date
+            ticker, curr_date, lookback_days
         )
 
         return openai_fundamentals_results

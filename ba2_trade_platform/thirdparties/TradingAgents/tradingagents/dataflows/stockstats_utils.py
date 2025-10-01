@@ -24,6 +24,10 @@ class StockstatsUtils:
             bool,
             "whether to use online tools to fetch data or offline tools. If True, will use online tools.",
         ] = False,
+        interval: Annotated[
+            str,
+            "Data interval (1m, 5m, 15m, 30m, 1h, 1d, 1wk, 1mo). Only used when online=True.",
+        ] = "1d",
     ):
         df = None
         data = None
@@ -55,7 +59,7 @@ class StockstatsUtils:
 
             data_file = os.path.join(
                 config["data_cache_dir"],
-                f"{symbol}-YFin-data-{start_date}-{end_date}.csv",
+                f"{symbol}-YFin-data-{start_date}-{end_date}-{interval}.csv",
             )
 
             if os.path.exists(data_file):
@@ -66,6 +70,7 @@ class StockstatsUtils:
                     symbol,
                     start=start_date,
                     end=end_date,
+                    interval=interval,
                     multi_level_index=False,
                     progress=False,
                     auto_adjust=True,
