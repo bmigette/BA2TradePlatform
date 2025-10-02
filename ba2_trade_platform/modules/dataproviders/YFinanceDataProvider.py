@@ -103,8 +103,12 @@ class YFinanceDataProvider(MarketDataProvider):
             if data.empty:
                 raise Exception(f"No data returned for {symbol}")
             
-            # Reset index to make Date a column
+            # Reset index to make Date/Datetime a column
             data = data.reset_index()
+            
+            # Handle both 'Date' (daily) and 'Datetime' (intraday) column names
+            if 'Datetime' in data.columns:
+                data = data.rename(columns={'Datetime': 'Date'})
             
             # Ensure we have all required columns
             required_columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']

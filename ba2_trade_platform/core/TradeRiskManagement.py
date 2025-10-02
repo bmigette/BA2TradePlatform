@@ -5,7 +5,7 @@ This module implements comprehensive risk management for pending orders,
 including profit-based prioritization, position sizing, and diversification.
 """
 
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 import logging
@@ -16,6 +16,9 @@ from .models import TradingOrder, ExpertRecommendation, ExpertInstance, Transact
 from .types import OrderStatus, OrderDirection, TransactionStatus
 from .db import get_instance, get_all_instances, update_instance, get_db
 from sqlmodel import select, Session
+
+if TYPE_CHECKING:
+    from .MarketExpertInterface import MarketExpertInterface
 
 
 class TradeRiskManagement:
@@ -142,7 +145,8 @@ class TradeRiskManagement:
                 total_virtual_balance,
                 max_equity_per_instrument,
                 existing_allocations,
-                account
+                account,
+                expert
             )
             
             # Step 9: Update orders in database
@@ -298,7 +302,8 @@ class TradeRiskManagement:
         total_virtual_balance: float,
         max_equity_per_instrument: float,
         existing_allocations: Dict[str, float],
-        account: AccountInterface
+        account: AccountInterface,
+        expert: 'MarketExpertInterface'
     ) -> List[TradingOrder]:
         """Calculate appropriate quantities for each order.
         
@@ -308,10 +313,15 @@ class TradeRiskManagement:
             max_equity_per_instrument: Maximum allocation per instrument
             existing_allocations: Dict of symbol -> allocated amount
             account: Account instance for fetching current prices
+            expert: Expert instance for accessing instrument weight configurations
         """
         updated_orders = []
         remaining_balance = total_virtual_balance
         instrument_allocations = existing_allocations.copy()
+        
+        # Get instrument weight configurations from expert settings
+        instrument_configs = expert._get_enabled_instruments_config()
+        self.logger.debug(f"Retrieved instrument weight configurations: {len(instrument_configs)} instruments")
         
         # Group orders by symbol for diversity calculation
         orders_by_symbol = {}
@@ -398,6 +408,23 @@ class TradeRiskManagement:
                         if quantity == 0 and max_quantity_by_balance >= 1 and max_quantity_by_instrument >= 1:
                             quantity = 1
                             self.logger.debug(f"  Minimum allocation: setting quantity to 1 share")
+                
+                # Apply instrument weight (formula: result * (weight/100))
+                if quantity > 0 and symbol in instrument_configs:
+                    instrument_weight = instrument_configs[symbol].get('weight', 100.0)
+                    if instrument_weight != 100.0:  # Only log if weight is non-default
+                        original_quantity = quantity
+                        weighted_quantity = quantity * (instrument_weight / 100.0)
+                        quantity = max(0, int(weighted_quantity))
+                        
+                        # Check if we can afford the weighted quantity
+                        weighted_cost = quantity * current_price
+                        if weighted_cost > remaining_balance or weighted_cost > available_for_instrument:
+                            # Revert to original quantity if weighted amount exceeds limits
+                            quantity = original_quantity
+                            self.logger.debug(f"  Weight {instrument_weight}% would exceed limits, keeping original quantity {quantity}")
+                        else:
+                            self.logger.info(f"  Applied instrument weight {instrument_weight}%: {original_quantity} -> {quantity} shares")
                 
                 # Update order with calculated quantity
                 order.quantity = quantity

@@ -169,6 +169,15 @@ class StockstatsUtils:
         if df["Date"].dtype == object:
             df["Date"] = pd.to_datetime(df["Date"])
         
+        # Make start_dt and end_dt timezone-aware if df['Date'] is timezone-aware
+        if hasattr(df["Date"], 'dt') and df["Date"].dt.tz is not None:
+            # DataFrame has timezone-aware dates, convert filter dates to match
+            from datetime import timezone as tz
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=tz.utc)
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=tz.utc)
+        
         mask = (df["Date"] >= start_dt) & (df["Date"] <= end_dt)
         filtered_df = df.loc[mask, ["Date", indicator]].copy()
         

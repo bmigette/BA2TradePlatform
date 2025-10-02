@@ -109,6 +109,10 @@ class TradeManager:
             # Step 3: Check for order status changes and trigger dependent orders
             self._check_order_status_changes_and_trigger_dependents(pre_refresh_order_statuses)
             
+            # Step 4: Also check all WAITING_TRIGGER orders to ensure none are stuck
+            # This catches cases where status changes weren't detected
+            self._check_all_waiting_trigger_orders()
+            
             self.logger.info("Account refresh completed")
             
         except Exception as e:
@@ -180,17 +184,25 @@ class TradeManager:
                         account = account_class(account_def.id)
                         
                         # Submit the dependent order
-                        submitted_order = account.submit_order(dependent_order)
-                        
-                        if submitted_order:
-                            # Update dependent order status to OPEN
-                            dependent_order.status = OrderStatus.OPEN
+                        try:
+                            submitted_order = account.submit_order(dependent_order)
+                            
+                            if submitted_order:
+                                # Update dependent order status to OPEN
+                                dependent_order.status = OrderStatus.OPEN
+                                session.add(dependent_order)
+                                self.logger.info(f"Successfully submitted dependent order {dependent_order.id} triggered by parent order {parent_order_id}")
+                                triggered_orders.append(dependent_order.id)
+                            else:
+                                self.logger.error(f"Failed to submit dependent order {dependent_order.id} - setting to ERROR status")
+                                # Set to ERROR status so it doesn't stay stuck
+                                dependent_order.status = OrderStatus.ERROR
+                                session.add(dependent_order)
+                        except Exception as submit_error:
+                            self.logger.error(f"Exception submitting dependent order {dependent_order.id}: {submit_error}", exc_info=True)
+                            # Set to ERROR status on exception
+                            dependent_order.status = OrderStatus.ERROR
                             session.add(dependent_order)
-                            self.logger.info(f"Successfully submitted dependent order {dependent_order.id} triggered by parent order {parent_order_id}")
-                            triggered_orders.append(dependent_order.id)
-                        else:
-                            self.logger.error(f"Failed to submit dependent order {dependent_order.id}")
-                            # Keep the order in WAITING_TRIGGER status so it can be retried
                         
                 if triggered_orders:
                     session.commit()
@@ -202,6 +214,116 @@ class TradeManager:
                 
         except Exception as e:
             self.logger.error(f"Error checking order status changes: {e}", exc_info=True)
+    
+    def _check_all_waiting_trigger_orders(self):
+        """
+        Check all orders in WAITING_TRIGGER status to see if their parent orders have reached the trigger status.
+        
+        This method is called periodically to ensure no orders get stuck waiting for triggers,
+        catching cases where status change detection may have missed an update.
+        """
+        try:
+            from sqlmodel import select
+            from .db import get_db
+            
+            with get_db() as session:
+                # Get all orders in WAITING_TRIGGER status
+                statement = select(TradingOrder).where(
+                    TradingOrder.status == OrderStatus.WAITING_TRIGGER,
+                    TradingOrder.depends_on_order.isnot(None),
+                    TradingOrder.depends_order_status_trigger.isnot(None)
+                )
+                waiting_orders = session.exec(statement).all()
+                
+                if not waiting_orders:
+                    self.logger.debug("No orders in WAITING_TRIGGER status")
+                    return
+                
+                self.logger.info(f"Checking {len(waiting_orders)} orders in WAITING_TRIGGER status")
+                
+                triggered_orders = []
+                
+                for dependent_order in waiting_orders:
+                    try:
+                        parent_order_id = dependent_order.depends_on_order
+                        trigger_status = dependent_order.depends_order_status_trigger
+                        
+                        # Get current parent order status
+                        parent_order = session.get(TradingOrder, parent_order_id)
+                        if not parent_order:
+                            self.logger.warning(f"Parent order {parent_order_id} not found for dependent order {dependent_order.id} - setting to ERROR")
+                            dependent_order.status = OrderStatus.ERROR
+                            session.add(dependent_order)
+                            continue
+                        
+                        current_status = parent_order.status
+                        
+                        self.logger.debug(f"Checking order {dependent_order.id}: parent {parent_order_id} status is {current_status}, trigger is {trigger_status}")
+                        
+                        # Check if parent order has reached the trigger status
+                        if current_status == trigger_status:
+                            self.logger.info(f"Parent order {parent_order_id} is in trigger status {trigger_status}, processing dependent order {dependent_order.id}")
+                            
+                            # Get the account for this dependent order
+                            from ..modules.accounts import get_account_class
+                            from .models import AccountDefinition
+                            
+                            account_def = session.get(AccountDefinition, dependent_order.account_id)
+                            if not account_def:
+                                self.logger.error(f"Account definition {dependent_order.account_id} not found for dependent order {dependent_order.id} - setting to ERROR")
+                                dependent_order.status = OrderStatus.ERROR
+                                session.add(dependent_order)
+                                continue
+                            
+                            account_class = get_account_class(account_def.provider)
+                            if not account_class:
+                                self.logger.error(f"Account provider {account_def.provider} not found for dependent order {dependent_order.id} - setting to ERROR")
+                                dependent_order.status = OrderStatus.ERROR
+                                session.add(dependent_order)
+                                continue
+                            
+                            account = account_class(account_def.id)
+                            
+                            # Submit the dependent order
+                            try:
+                                submitted_order = account.submit_order(dependent_order)
+                                
+                                if submitted_order:
+                                    # Update dependent order status to OPEN
+                                    dependent_order.status = OrderStatus.OPEN
+                                    session.add(dependent_order)
+                                    self.logger.info(f"Successfully submitted dependent order {dependent_order.id}")
+                                    triggered_orders.append(dependent_order.id)
+                                else:
+                                    self.logger.error(f"Failed to submit dependent order {dependent_order.id} - setting to ERROR status")
+                                    dependent_order.status = OrderStatus.ERROR
+                                    session.add(dependent_order)
+                            except Exception as submit_error:
+                                self.logger.error(f"Exception submitting dependent order {dependent_order.id}: {submit_error}", exc_info=True)
+                                dependent_order.status = OrderStatus.ERROR
+                                session.add(dependent_order)
+                    
+                    except Exception as order_error:
+                        self.logger.error(f"Error processing waiting order {dependent_order.id}: {order_error}", exc_info=True)
+                        # Set to ERROR on any exception during processing
+                        try:
+                            dependent_order.status = OrderStatus.ERROR
+                            session.add(dependent_order)
+                        except:
+                            pass  # If we can't even set error status, log and continue
+                
+                if triggered_orders:
+                    session.commit()
+                    self.logger.info(f"Processed {len(triggered_orders)} waiting trigger orders: {triggered_orders}")
+                else:
+                    # Commit any ERROR status changes
+                    session.commit()
+                    self.logger.debug("No waiting trigger orders were ready to execute")
+                
+                session.close()
+                
+        except Exception as e:
+            self.logger.error(f"Error checking all waiting trigger orders: {e}", exc_info=True)
     
     def process_recommendation(self, recommendation: ExpertRecommendation) -> Optional[TradingOrder]:
         """
@@ -404,10 +526,12 @@ class TradeManager:
             quantity = 0
             
             # Create the order
+            # Convert side to uppercase to match OrderDirection enum
+            side_upper = side.upper() if isinstance(side, str) else side
             order = TradingOrder(
                 symbol=recommendation.symbol,
                 quantity=abs(quantity),  # Ensure positive quantity
-                side=side,
+                side=side_upper,
                 order_type="market",  # Default to market order
                 status=OrderStatus.PENDING,
                 limit_price=None,  # Market order
@@ -577,19 +701,35 @@ class TradeManager:
             cutoff_time = datetime.now(timezone.utc) - timedelta(days=lookback_days)
             
             with Session(get_db().bind) as session:
+                # Get all recommendations for this expert instance within the time window
                 statement = select(ExpertRecommendation).where(
                     ExpertRecommendation.instance_id == expert_instance_id,
                     ExpertRecommendation.created_at >= cutoff_time,
                     ExpertRecommendation.recommended_action != OrderRecommendation.HOLD
-                ).order_by(ExpertRecommendation.expected_profit_percent.desc())  # Order by profit potential
+                ).order_by(ExpertRecommendation.created_at.desc())  # Most recent first
                 
-                recommendations = session.exec(statement).all()
+                all_recommendations = session.exec(statement).all()
                 
-                if not recommendations:
+                if not all_recommendations:
                     self.logger.info(f"No actionable recommendations found for expert {expert_instance_id}")
                     return created_orders
                 
-                self.logger.info(f"Found {len(recommendations)} actionable recommendations for expert {expert_instance_id}")
+                # Filter to get only the latest recommendation per instrument
+                # This prevents processing multiple recommendations for the same symbol
+                latest_per_instrument = {}
+                for rec in all_recommendations:
+                    # Keep only the first (most recent) recommendation for each symbol
+                    if rec.symbol not in latest_per_instrument:
+                        latest_per_instrument[rec.symbol] = rec
+                
+                # Convert to list and sort by profit potential
+                recommendations = sorted(
+                    latest_per_instrument.values(),
+                    key=lambda r: r.expected_profit_percent,
+                    reverse=True
+                )
+                
+                self.logger.info(f"Found {len(recommendations)} unique instruments with recommendations for expert {expert_instance_id} (filtered from {len(all_recommendations)} total recommendations)")
                 self.logger.info(f"Evaluating recommendations through enter_market ruleset: {expert_instance.enter_market_ruleset_id}")
                 
                 # Create TradeActionEvaluator for processing recommendations
@@ -656,6 +796,11 @@ class TradeManager:
                         risk_management = get_risk_management()
                         updated_orders = risk_management.review_and_prioritize_pending_orders(expert_instance_id)
                         self.logger.info(f"Risk management completed: updated {len(updated_orders)} orders with quantities")
+                        
+                        # After risk management, check for any dependent orders (e.g., adjust TP/SL)
+                        # that may now be ready to execute
+                        self.logger.info("Checking for dependent orders after risk management")
+                        self._check_all_waiting_trigger_orders()
                     except Exception as e:
                         self.logger.error(f"Error during risk management for expert {expert_instance_id}: {e}", exc_info=True)
                 

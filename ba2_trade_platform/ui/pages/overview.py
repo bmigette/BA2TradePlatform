@@ -13,6 +13,7 @@ from ...core.types import MarketAnalysisStatus, OrderRecommendation, OrderStatus
 from ...core.utils import get_expert_instance_from_id, get_market_analysis_id_from_order_id
 from ...modules.accounts import providers
 from ...logger import logger
+from ..components import ProfitPerExpertChart, InstrumentDistributionChart
 
 class OverviewTab:
     def __init__(self, tabs_ref=None):
@@ -126,6 +127,39 @@ class OverviewTab:
             self._render_order_statistics_widget()
             with ui.column().classes(''):
                 self._render_order_recommendations_widget()
+            
+            # Row 3: Profit Per Expert and Position Distribution by Label
+            ProfitPerExpertChart()
+            self._render_position_distribution_widget(grouping_field='labels')
+            
+            # Row 4: Position Distribution by Category (spans full width or paired)
+            self._render_position_distribution_widget(grouping_field='categories')
+    
+    def _render_position_distribution_widget(self, grouping_field='labels'):
+        """Fetch positions from accounts and render distribution chart.
+        
+        Args:
+            grouping_field: Either 'labels' or 'categories' to determine grouping
+        """
+        # Fetch positions from all accounts
+        accounts = get_all_instances(AccountDefinition)
+        all_positions_raw = []
+        
+        for acc in accounts:
+            provider_cls = providers.get(acc.provider)
+            if provider_cls:
+                provider_obj = provider_cls(acc.id)
+                try:
+                    positions = provider_obj.get_positions()
+                    for pos in positions:
+                        pos_dict = pos if isinstance(pos, dict) else dict(pos)
+                        pos_dict['account'] = acc.name
+                        all_positions_raw.append(pos_dict)
+                except Exception as e:
+                    logger.error(f"Error fetching positions from account {acc.name}: {e}", exc_info=True)
+        
+        # Render chart with fetched positions and specified grouping field
+        InstrumentDistributionChart(positions=all_positions_raw, grouping_field=grouping_field)
     
     def _render_openai_spending_widget(self):
         """Widget showing OpenAI API spending."""
@@ -806,6 +840,9 @@ class AccountOverviewTab:
     def render(self):
         accounts = get_all_instances(AccountDefinition)
         all_positions = []
+        # Keep unformatted positions for chart calculations
+        all_positions_raw = []
+        
         for acc in accounts:
             provider_cls = providers.get(acc.provider)
             if provider_cls:
@@ -816,7 +853,11 @@ class AccountOverviewTab:
                     for pos in positions:
                         pos_dict = pos if isinstance(pos, dict) else dict(pos)
                         pos_dict['account'] = acc.name
-                        # Format all float values to 2 decimal places
+                        
+                        # Keep raw copy for chart
+                        all_positions_raw.append(pos_dict.copy())
+                        
+                        # Format all float values to 2 decimal places for display
                         for k, v in pos_dict.items():
                             if isinstance(v, float):
                                 pos_dict[k] = f"{v:.2f}"
@@ -843,6 +884,12 @@ class AccountOverviewTab:
             ui.label('Open Positions Across All Accounts').classes('text-h6 mb-4')
             ui.table(columns=columns, rows=all_positions, row_key='account').classes('w-full')
         
+        # Position Distribution Charts (uses same data as table)
+        if all_positions_raw:
+            with ui.grid(columns=2).classes('w-full gap-4'):
+                InstrumentDistributionChart(positions=all_positions_raw, grouping_field='labels')
+                InstrumentDistributionChart(positions=all_positions_raw, grouping_field='categories')
+        
         # All Orders Table
         with ui.card().classes('mt-4'):
             ui.label('Recent Orders from All Accounts (Past 15 Days)').classes('text-h6 mb-4')
@@ -863,22 +910,26 @@ class AccountOverviewTab:
         
         try:
             # Query orders from database with joins to get expert information
+            # Exclude PENDING and WAITING_TRIGGER orders (they have their own section)
             statement = (
                 select(TradingOrder, AccountDefinition, ExpertRecommendation, ExpertInstance)
                 .join(AccountDefinition, TradingOrder.account_id == AccountDefinition.id)
                 .outerjoin(ExpertRecommendation, TradingOrder.expert_recommendation_id == ExpertRecommendation.id)
                 .outerjoin(ExpertInstance, ExpertRecommendation.instance_id == ExpertInstance.id)
                 .where(TradingOrder.created_at >= cutoff_date)
+                .where(TradingOrder.status.not_in([OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER]))
                 .order_by(TradingOrder.created_at.desc())
             )
             
             results = session.exec(statement).all()
             
             for order, account, recommendation, expert_instance in results:
-                # Get expert name if available
+                # Get expert name with ID if available
                 expert_name = ""
                 if expert_instance:
-                    expert_name = expert_instance.user_description or expert_instance.expert
+                    # Format: ExpertType-ID (e.g., "TradingAgents-1")
+                    base_name = expert_instance.user_description or expert_instance.expert
+                    expert_name = f"{base_name}-{expert_instance.id}"
                 elif not recommendation:
                     expert_name = "Manual"  # No recommendation means manual order
                 
@@ -943,6 +994,13 @@ class AccountOverviewTab:
     
     def _render_pending_orders_table(self):
         """Render table with pending orders from database (PENDING or WAITING_TRIGGER)."""
+        # Create a container that can be refreshed
+        self.pending_orders_container = ui.column().classes('w-full')
+        with self.pending_orders_container:
+            self._render_pending_orders_content()
+    
+    def _render_pending_orders_content(self):
+        """Render the actual pending orders table content."""
         session = get_db()
         try:
             # Get orders with PENDING or WAITING_TRIGGER status
@@ -1007,7 +1065,20 @@ class AccountOverviewTab:
                 {'name': 'actions', 'label': 'Actions', 'field': 'actions'}
             ]
             
-            table = ui.table(columns=columns, rows=rows, row_key='order_id').classes('w-full')
+            # Enable multiple selection on the table
+            table = ui.table(columns=columns, rows=rows, row_key='order_id', selection='multiple').classes('w-full')
+            table.selected = []  # Initialize selected list
+            
+            # Add delete button above table (after table is created so we can bind to it)
+            with table.add_slot('top-left'):
+                with ui.row().classes('items-center gap-4'):
+                    ui.button('Delete Selected Orders', 
+                             icon='delete', 
+                             on_click=lambda: self._handle_delete_selected_orders(table.selected))\
+                        .props('color=red')\
+                        .bind_enabled_from(table, 'selected', backward=lambda val: len(val) > 0)
+                    ui.label().bind_text_from(table, 'selected', backward=lambda val: f'{len(val)} order(s) selected')\
+                        .classes('text-sm text-gray-600')
             
             # Add submit button slot for pending orders
             table.add_slot('body-cell-actions', '''
@@ -1090,6 +1161,92 @@ class AccountOverviewTab:
         except Exception as e:
             logger.error(f"Error handling submit order: {e}", exc_info=True)
             ui.notify(f'Error: {str(e)}', type='negative')
+    
+    def _handle_delete_selected_orders(self, selected_rows):
+        """Handle deletion of selected pending orders."""
+        try:
+            if not selected_rows:
+                ui.notify('No orders selected', type='warning')
+                return
+            
+            # Get order IDs from selected rows
+            order_ids = [row['order_id'] for row in selected_rows]
+            
+            # Confirmation dialog
+            with ui.dialog() as dialog, ui.card():
+                ui.label(f'Delete {len(order_ids)} order(s)?').classes('text-h6 mb-4')
+                ui.label('This action cannot be undone. Are you sure you want to delete the selected orders?').classes('mb-4')
+                
+                with ui.row().classes('w-full justify-end gap-2'):
+                    ui.button('Cancel', on_click=dialog.close).props('flat')
+                    ui.button('Delete', on_click=lambda: self._confirm_delete_orders(order_ids, dialog)).props('color=red')
+            
+            dialog.open()
+            
+        except Exception as e:
+            logger.error(f"Error handling delete selected orders: {e}", exc_info=True)
+            ui.notify(f'Error: {str(e)}', type='negative')
+    
+    def _confirm_delete_orders(self, order_ids, dialog):
+        """Confirm and execute order deletion."""
+        from ...core.db import delete_instance
+        session = get_db()
+        
+        try:
+            deleted_count = 0
+            errors = []
+            
+            for order_id in order_ids:
+                try:
+                    # Get the order to check if it can be deleted
+                    order = get_instance(TradingOrder, order_id)
+                    if not order:
+                        errors.append(f"Order {order_id} not found")
+                        continue
+                    
+                    # Only allow deletion of PENDING or WAITING_TRIGGER orders
+                    if order.status not in [OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER]:
+                        errors.append(f"Order {order_id} cannot be deleted (status: {order.status.value})")
+                        continue
+                    
+                    # Don't delete orders that have been submitted to broker
+                    if order.broker_order_id:
+                        errors.append(f"Order {order_id} already submitted to broker, cannot delete")
+                        continue
+                    
+                    # Delete the order
+                    delete_instance(order, session)
+                    deleted_count += 1
+                    logger.info(f"Deleted pending order {order_id}: {order.symbol} {order.side} {order.quantity}")
+                    
+                except Exception as e:
+                    logger.error(f"Error deleting order {order_id}: {e}", exc_info=True)
+                    errors.append(f"Order {order_id}: {str(e)}")
+            
+            # Show results
+            if deleted_count > 0:
+                ui.notify(f'Successfully deleted {deleted_count} order(s)', type='positive')
+            
+            if errors:
+                error_msg = '; '.join(errors[:3])  # Show first 3 errors
+                if len(errors) > 3:
+                    error_msg += f'... and {len(errors) - 3} more errors'
+                ui.notify(f'Errors: {error_msg}', type='warning')
+            
+            # Close dialog and refresh the table
+            dialog.close()
+            
+            # Refresh the pending orders table
+            if hasattr(self, 'pending_orders_container'):
+                self.pending_orders_container.clear()
+                with self.pending_orders_container:
+                    self._render_pending_orders_content()
+            
+        except Exception as e:
+            logger.error(f"Error confirming delete orders: {e}", exc_info=True)
+            ui.notify(f'Error deleting orders: {str(e)}', type='negative')
+        finally:
+            session.close()
 
 class TradeHistoryTab:
     def __init__(self):

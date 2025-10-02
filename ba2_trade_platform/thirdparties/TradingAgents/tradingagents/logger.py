@@ -162,8 +162,11 @@ class TradingAgentsLogger:
         self.logger.warning(message, *args, **kwargs)
     
     def error(self, message: str, *args, **kwargs):
-        """Log error message"""
-        self.logger.error(message, *args, **kwargs, exc_info=True)
+        """
+        Log error message.
+        Note: exc_info should only be passed as True when inside an exception handler.
+        """
+        self.logger.error(message, *args, **kwargs)
     
     def critical(self, message: str, *args, **kwargs):
         """Log critical message"""
@@ -337,9 +340,12 @@ def warning(message: str, *args, **kwargs):
 
 
 def error(message: str, *args, **kwargs):
-    """Log error message using global logger"""
+    """
+    Log error message using global logger.
+    Note: exc_info should only be passed as True when inside an exception handler.
+    """
     if _global_logger:
-        _global_logger.error(message, *args, **kwargs, exc_info=True)
+        _global_logger.error(message, *args, **kwargs)
 
 
 def critical(message: str, *args, **kwargs):

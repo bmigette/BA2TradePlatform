@@ -225,9 +225,17 @@ class MarketDataProvider(ABC):
         if df is None:
             logger.info(f"Fetching data from source for {symbol}")
             
-            # Fetch more historical data for cache (go back 15 years)
-            fetch_start = datetime.now() - timedelta(days=365 * 15)
-            fetch_end = datetime.now()
+            # Determine fetch range based on interval (Yahoo Finance limits)
+            # Intraday data (1m, 5m, 15m, 30m, 1h): max 730 days
+            # Daily data (1d, 1wk, 1mo): can go back 15 years
+            if interval in ['1m', '5m', '15m', '30m', '1h']:
+                # Intraday data limited to ~2 years (730 days)
+                fetch_start = start_date - timedelta(days=729)  # Use 729 to be safe
+            else:
+                # Daily/weekly/monthly data can go back 15 years
+                fetch_start = start_date - timedelta(days=365 * 3)
+            
+            fetch_end = end_date if end_date else datetime.now()
             
             df = self._fetch_data_from_source(symbol, fetch_start, fetch_end, interval)
             
@@ -242,8 +250,19 @@ class MarketDataProvider(ABC):
         if 'Date' in df.columns:
             df['Date'] = pd.to_datetime(df['Date'])
         
+        # Make start_date and end_date timezone-aware if df['Date'] is timezone-aware
+        filter_start = start_date
+        filter_end = end_date
+        if hasattr(df['Date'], 'dt') and df['Date'].dt.tz is not None:
+            # DataFrame has timezone-aware dates, convert filter dates to match
+            from datetime import timezone as tz
+            if start_date.tzinfo is None:
+                filter_start = start_date.replace(tzinfo=tz.utc)
+            if end_date.tzinfo is None:
+                filter_end = end_date.replace(tzinfo=tz.utc)
+        
         # Filter to requested date range
-        mask = (df['Date'] >= start_date) & (df['Date'] <= end_date)
+        mask = (df['Date'] >= filter_start) & (df['Date'] <= filter_end)
         filtered_df = df[mask].copy()
         
         logger.info(f"Filtered to {len(filtered_df)} records in date range")
@@ -294,8 +313,16 @@ class MarketDataProvider(ABC):
         if df is None:
             logger.info(f"Fetching DataFrame from source for {symbol}")
             
-            # Fetch historical data
-            fetch_start = datetime.now() - timedelta(days=365 * 15)
+            # Determine fetch range based on interval (Yahoo Finance limits)
+            # Intraday data (1m, 5m, 15m, 30m, 1h): max 730 days
+            # Daily data (1d, 1wk, 1mo): can go back 15 years
+            if interval in ['1m', '5m', '15m', '30m', '1h']:
+                # Intraday data limited to ~2 years (730 days)
+                fetch_start = datetime.now() - timedelta(days=729)  # Use 729 to be safe
+            else:
+                # Daily/weekly/monthly data can go back 15 years
+                fetch_start = datetime.now() - timedelta(days=365 * 15)
+            
             fetch_end = datetime.now()
             
             df = self._fetch_data_from_source(symbol, fetch_start, fetch_end, interval)
@@ -311,8 +338,19 @@ class MarketDataProvider(ABC):
         if 'Date' in df.columns:
             df['Date'] = pd.to_datetime(df['Date'])
         
+        # Make start_date and end_date timezone-aware if df['Date'] is timezone-aware
+        filter_start = start_date
+        filter_end = end_date
+        if hasattr(df['Date'], 'dt') and df['Date'].dt.tz is not None:
+            # DataFrame has timezone-aware dates, convert filter dates to match
+            from datetime import timezone as tz
+            if start_date.tzinfo is None:
+                filter_start = start_date.replace(tzinfo=tz.utc)
+            if end_date.tzinfo is None:
+                filter_end = end_date.replace(tzinfo=tz.utc)
+        
         # Filter to requested date range
-        mask = (df['Date'] >= start_date) & (df['Date'] <= end_date)
+        mask = (df['Date'] >= filter_start) & (df['Date'] <= filter_end)
         filtered_df = df[mask].copy()
         
         logger.info(f"Returning DataFrame with {len(filtered_df)} records")

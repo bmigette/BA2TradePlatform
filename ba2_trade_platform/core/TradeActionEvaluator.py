@@ -158,18 +158,19 @@ class TradeActionEvaluator:
                     
                     execution_result = action.execute()
                     
-                    # Convert TradeActionResult to dictionary format for compatibility
+                    # execution_result is now a dict (not a TradeActionResult object)
+                    # This avoids DetachedInstanceError issues with SQLAlchemy objects
                     result_dict = {
-                        "action_type": self._get_action_type_from_action(action),
-                        "success": execution_result.success,
-                        "message": execution_result.message,
-                        "data": execution_result.data,
+                        "action_type": execution_result.get('action_type') or self._get_action_type_from_action(action),
+                        "success": execution_result.get('success', False),
+                        "message": execution_result.get('message', ''),
+                        "data": execution_result.get('data', {}),
                         "description": action.get_description()
                     }
                     
                     action_results.append(result_dict)
                     
-                    logger.info(f"Action result: {execution_result.success} - {execution_result.message}")
+                    logger.info(f"Action result: {result_dict['success']} - {result_dict['message']}")
                     
                 except Exception as e:
                     logger.error(f"Error executing action {i+1}: {e}", exc_info=True)

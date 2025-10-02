@@ -77,6 +77,30 @@ def update_market_analysis_status(analysis_id: int, status: Union[str, 'MarketAn
         ta_logger.error(f"Error updating MarketAnalysis {analysis_id}: {e}", exc_info=True)
 
 
+def get_market_analysis_status(analysis_id: int) -> Optional[str]:
+    """
+    Get the current status of a MarketAnalysis record
+    
+    Args:
+        analysis_id: MarketAnalysis ID
+        
+    Returns:
+        Status string (e.g., "FAILED", "COMPLETED", "RUNNING") or None if not found
+    """
+    try:
+        from ba2_trade_platform.core.db import get_instance
+        from ba2_trade_platform.core.models import MarketAnalysis
+        
+        analysis = get_instance(MarketAnalysis, analysis_id)
+        if analysis:
+            # Return the status as a string (whether it's an enum or string)
+            return analysis.status.value if hasattr(analysis.status, 'value') else str(analysis.status)
+        return None
+    except Exception as e:
+        ta_logger.error(f"Error getting MarketAnalysis {analysis_id} status: {e}", exc_info=True)
+        return None
+
+
 def store_analysis_output(market_analysis_id: int, name: str, output_type: str, text: str = None, blob: bytes = None):
     """
     Store an analysis output in the database
@@ -218,80 +242,71 @@ def get_market_analysis_outputs(analysis_id: int):
 
 
 class LoggingToolNode:
-    """Custom ToolNode wrapper that logs tool calls to database."""
+    """Custom ToolNode wrapper that logs tool calls and stores JSON data."""
     
     def __init__(self, tools, market_analysis_id=None):
         from langgraph.prebuilt import ToolNode
-        self.tool_node = ToolNode(tools)
+        from langchain_core.tools import tool
+        
         self.market_analysis_id = market_analysis_id
-        self.tools = {tool.name: tool for tool in tools}
+        self.original_tools = {t.name: t for t in tools}
+        
+        # Wrap each tool to intercept results and store JSON
+        wrapped_tools = []
+        for original_tool in tools:
+            wrapped = self._wrap_tool(original_tool)
+            wrapped_tools.append(wrapped)
+        
+        # Create ToolNode with wrapped tools
+        self.tool_node = ToolNode(wrapped_tools)
     
-    def __call__(self, state):
-        """Execute tools and log the calls."""
-        # Get tool calls from the last message
-        messages = state.get("messages", [])
-        if not messages:
-            return self.tool_node.invoke(state)
+    def _wrap_tool(self, original_tool):
+        """Wrap a tool to intercept its result and store JSON before returning."""
+        from langchain_core.tools import StructuredTool
         
-        last_message = messages[-1]
-        if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
-            # Log each tool call before execution
-            for tool_call in last_message.tool_calls:
-                tool_name = tool_call.get('name', 'unknown_tool')
-                tool_args = tool_call.get('args', {})
-                
-                ta_logger.info(f"[TOOL_CALL] Executing {tool_name} with args: {tool_args}")
-                
-                # Store tool call information immediately
-                if self.market_analysis_id:
-                    store_analysis_output(
-                        market_analysis_id=self.market_analysis_id,
-                        name=f"tool_call_{tool_name}",
-                        output_type="tool_call_input",
-                        text=f"Tool: {tool_name}\nArguments: {tool_args}\nTimestamp: {datetime.now(timezone.utc).isoformat()}"
-                    )
+        tool_name = original_tool.name
+        market_analysis_id = self.market_analysis_id
         
-        # Execute the actual tool node using invoke method
-        result = self.tool_node.invoke(state)
-        
-        # Log tool outputs
-        if self.market_analysis_id and hasattr(last_message, 'tool_calls') and last_message.tool_calls:
-            result_messages = result.get("messages", [])
-            tool_messages = [msg for msg in result_messages if hasattr(msg, 'content') and hasattr(msg, 'tool_call_id')]
+        # Create wrapped function
+        def wrapped_func(**kwargs):
+            """Wrapper that stores JSON and returns text for agent."""
+            # Log tool call
+            ta_logger.info(f"[TOOL_CALL] Executing {tool_name} with args: {kwargs}")
             
-            for tool_msg in tool_messages:
-                # Find the corresponding tool call
-                tool_call_id = getattr(tool_msg, 'tool_call_id', None)
-                matching_call = None
-                for tool_call in last_message.tool_calls:
-                    if tool_call.get('id') == tool_call_id:
-                        matching_call = tool_call
-                        break
+            if market_analysis_id:
+                store_analysis_output(
+                    market_analysis_id=market_analysis_id,
+                    name=f"tool_call_{tool_name}",
+                    output_type="tool_call_input",
+                    text=f"Tool: {tool_name}\nArguments: {kwargs}\nTimestamp: {datetime.now(timezone.utc).isoformat()}"
+                )
+            
+            # Call original tool
+            result = original_tool.invoke(kwargs)
+            
+            # Check if result is dict with internal format
+            if isinstance(result, dict) and result.get('_internal'):
+                text_for_agent = result.get('text_for_agent', '')
+                json_for_storage = result.get('json_for_storage')
+                is_error = result.get('_error', False)
                 
-                tool_name = matching_call.get('name', 'unknown_tool') if matching_call else 'unknown_tool'
-                output_content = tool_msg.content if hasattr(tool_msg, 'content') else str(tool_msg)
-                
-                # Check if tool returned internal format with separate data for agent and storage
-                if isinstance(output_content, dict) and output_content.get('_internal'):
-                    # Tool returned structured format
-                    text_for_agent = output_content.get('text_for_agent', '')
-                    json_for_storage = output_content.get('json_for_storage')
-                    is_error = output_content.get('_error', False)
-                    
-                    # If this is a critical error, update analysis status to FAILED
-                    if is_error:
-                        ta_logger.error(f"[TOOL_ERROR] {tool_name} returned critical error: {text_for_agent}")
+                # Handle error
+                if is_error:
+                    ta_logger.error(f"[TOOL_ERROR] {tool_name} returned critical error")
+                    if market_analysis_id:
                         update_market_analysis_status(
-                            self.market_analysis_id,
+                            market_analysis_id,
                             "FAILED",
                             {"error": text_for_agent, "failed_tool": tool_name, "timestamp": datetime.now(timezone.utc).isoformat()}
                         )
-                    else:
-                        ta_logger.info(f"[TOOL_RESULT] {tool_name} returned: {text_for_agent[:2000]}...")
-                    
+                else:
+                    ta_logger.info(f"[TOOL_RESULT] {tool_name} returned: {text_for_agent[:200]}...")
+                
+                # Store outputs
+                if market_analysis_id:
                     # Store text format
                     store_analysis_output(
-                        market_analysis_id=self.market_analysis_id,
+                        market_analysis_id=market_analysis_id,
                         name=f"tool_output_{tool_name}",
                         output_type="tool_call_output_error" if is_error else "tool_call_output",
                         text=f"Tool: {tool_name}\nOutput: {text_for_agent}\nTimestamp: {datetime.now(timezone.utc).isoformat()}"
@@ -301,23 +316,40 @@ class LoggingToolNode:
                     if json_for_storage:
                         import json
                         store_analysis_output(
-                            market_analysis_id=self.market_analysis_id,
+                            market_analysis_id=market_analysis_id,
                             name=f"tool_output_{tool_name}_json",
                             output_type="tool_call_output_json",
                             text=json.dumps(json_for_storage, indent=2)
                         )
-                else:
-                    # Tool returned simple text (backward compatible)
-                    ta_logger.info(f"[TOOL_RESULT] {tool_name} returned: {output_content[:2000] if isinstance(output_content, str) else str(output_content)[:2000]}...")
-                    
+                        ta_logger.info(f"[JSON_STORED] Saved JSON parameters for {tool_name}")
+                
+                # Return only text for agent
+                return text_for_agent
+            else:
+                # Simple text result
+                ta_logger.info(f"[TOOL_RESULT] {tool_name} returned: {str(result)[:200]}...")
+                if market_analysis_id:
                     store_analysis_output(
-                        market_analysis_id=self.market_analysis_id,
+                        market_analysis_id=market_analysis_id,
                         name=f"tool_output_{tool_name}",
                         output_type="tool_call_output",
-                        text=f"Tool: {tool_name}\nOutput: {output_content}\nTimestamp: {datetime.now(timezone.utc).isoformat()}"
+                        text=f"Tool: {tool_name}\nOutput: {result}\nTimestamp: {datetime.now(timezone.utc).isoformat()}"
                     )
+                return result
         
-        return result
+        # Create new tool using StructuredTool.from_function
+        wrapped_tool = StructuredTool.from_function(
+            func=wrapped_func,
+            name=original_tool.name,
+            description=original_tool.description,
+            args_schema=original_tool.args_schema if hasattr(original_tool, 'args_schema') else None
+        )
+        
+        return wrapped_tool
+    
+    def __call__(self, state):
+        """Execute tools via ToolNode."""
+        return self.tool_node.invoke(state)
 
 
 class DatabaseStorageMixin:

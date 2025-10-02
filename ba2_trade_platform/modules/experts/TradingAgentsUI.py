@@ -643,7 +643,64 @@ class TradingAgentsUI:
                 ui.label('📉 Market Data & Technical Indicators').classes('text-h6 mb-4')
                 ui.label('Interactive charts showing price action and technical indicators from analysis').classes('text-sm text-gray-600 mb-4')
                 
-                # Get analysis outputs from database
+                # Get expert instance to retrieve settings
+                from ...core.db import get_instance
+                from ...core.models import ExpertInstance
+                from datetime import timedelta
+                
+                expert_instance = get_instance(ExpertInstance, self.market_analysis.expert_instance_id)
+                if not expert_instance:
+                    ui.label('Error: Expert instance not found').classes('text-red-500')
+                    return
+                
+                # Get expert settings - use self.settings directly since we're already a TradingAgents instance
+                # Get settings definitions for default values
+                from ...modules.experts.TradingAgents import TradingAgents
+                settings_def = TradingAgents.get_settings_definitions()
+                
+                # Create TradingAgents instance to get settings
+                trading_agents = TradingAgents(expert_instance.id)
+                
+                # Extract key parameters directly from settings
+                market_history_days = int(trading_agents.settings.get('market_history_days', settings_def['market_history_days']['default']))
+                timeframe = trading_agents.settings.get('timeframe', settings_def['timeframe']['default'])
+                
+                # Calculate date range based on analysis run date
+                end_date = self.market_analysis.created_at
+                start_date = end_date - timedelta(days=market_history_days)
+                
+                logger.info(f"Fetching data for visualization: {self.market_analysis.symbol}, "
+                           f"{start_date.date()} to {end_date.date()}, interval={timeframe}, "
+                           f"lookback={market_history_days} days")
+                
+                # Initialize data provider
+                from ba2_trade_platform.modules.dataproviders import YFinanceDataProvider
+                from ba2_trade_platform.config import CACHE_FOLDER
+                
+                provider = YFinanceDataProvider(CACHE_FOLDER)
+                
+                # Fetch price data
+                try:
+                    price_data = provider.get_dataframe(
+                        symbol=self.market_analysis.symbol,
+                        start_date=start_date,
+                        end_date=end_date,
+                        interval=timeframe
+                    )
+                    
+                    # Set Date as index for charting
+                    if 'Date' in price_data.columns and not isinstance(price_data.index, pd.DatetimeIndex):
+                        price_data['Date'] = pd.to_datetime(price_data['Date'])
+                        price_data.set_index('Date', inplace=True)
+                    
+                    logger.info(f"Fetched price data for visualization: {len(price_data)} rows")
+                    
+                except Exception as e:
+                    logger.error(f"Error fetching price data for visualization: {e}", exc_info=True)
+                    ui.label(f'Error fetching price data: {e}').classes('text-red-500')
+                    return
+                
+                # Get analysis outputs from database for indicators
                 session = get_db()
                 try:
                     statement = (
@@ -652,63 +709,14 @@ class TradingAgentsUI:
                     )
                     outputs = session.exec(statement).all()
                     
-                    # Look for price data and indicator outputs
-                    price_data = None
+                    # Look for indicator outputs
                     indicators_data = {}
-                    
-                    # Initialize data provider for reconstructing data from cache
-                    from ba2_trade_platform.modules.dataproviders import YFinanceDataProvider
-                    from ba2_trade_platform.config import CACHE_FOLDER
-                    from datetime import datetime
-                    
-                    provider = YFinanceDataProvider(CACHE_FOLDER)
                     
                     for output in outputs:
                         output_obj = output[0] if isinstance(output, tuple) else output
                         
-                        # Look for YFin data (price data) - JSON contains parameters
-                        if 'tool_output_get_YFin_data' in output_obj.name.lower():
-                            try:
-                                # JSON format contains PARAMETERS to reconstruct from cache
-                                if output_obj.name.endswith('_json') and output_obj.text:
-                                    import json
-                                    params = json.loads(output_obj.text)
-                                    
-                                    # Reconstruct data from cache using stored parameters
-                                    if params.get('tool') == 'get_YFin_data_online':
-                                        logger.info(f"Reconstructing price data from cache: {params['symbol']} {params['interval']}")
-                                        
-                                        # Get data from cache (or fetch if needed)
-                                        price_data = provider.get_dataframe(
-                                            symbol=params['symbol'],
-                                            start_date=datetime.strptime(params['start_date'], '%Y-%m-%d'),
-                                            end_date=datetime.strptime(params['end_date'], '%Y-%m-%d'),
-                                            interval=params['interval']
-                                        )
-                                        
-                                        # Set Date as index for charting
-                                        if 'Date' in price_data.columns and not isinstance(price_data.index, pd.DatetimeIndex):
-                                            price_data['Date'] = pd.to_datetime(price_data['Date'])
-                                            price_data.set_index('Date', inplace=True)
-                                        
-                                        logger.info(f"Reconstructed price data from cache: {len(price_data)} rows")
-                                
-                                # Fallback to CSV parsing (old format) if no parameters
-                                elif not output_obj.name.endswith('_json') and output_obj.text and price_data is None:
-                                    # Parse CSV data (legacy support)
-                                    price_data = pd.read_csv(io.StringIO(output_obj.text))
-                                    
-                                    # Convert Date column to datetime if it exists
-                                    if 'Date' in price_data.columns:
-                                        price_data['Date'] = pd.to_datetime(price_data['Date'])
-                                        price_data.set_index('Date', inplace=True)
-                                    
-                                    logger.info(f"Loaded price data from CSV (legacy): {len(price_data)} rows")
-                            except Exception as e:
-                                logger.error(f"Error reconstructing price data: {e}", exc_info=True)
-                        
                         # Look for technical indicators - JSON contains parameters
-                        elif 'tool_output_get_stockstats_indicators' in output_obj.name.lower():
+                        if 'tool_output_get_stockstats_indicators' in output_obj.name.lower():
                             try:
                                 # JSON format contains PARAMETERS to reconstruct from cache
                                 if output_obj.name.endswith('_json') and output_obj.text:
@@ -722,7 +730,6 @@ class TradingAgentsUI:
                                         
                                         # Use StockstatsUtils to recalculate indicator from cached price data
                                         from ba2_trade_platform.thirdparties.TradingAgents.tradingagents.dataflows.stockstats_utils import StockstatsUtils
-                                        import os
                                         
                                         # Get indicator data using the data provider
                                         indicator_df = StockstatsUtils.get_stock_stats_range(
@@ -813,14 +820,20 @@ class TradingAgentsUI:
                         graph.render()
                     else:
                         ui.label('No price data available for visualization').classes('text-gray-500 text-center py-8')
-                        ui.label('Price data is generated by the tool_output_get_YFin_data_online during analysis').classes('text-sm text-gray-400 text-center')
+                        ui.label(f'Unable to fetch price data for {self.market_analysis.symbol}').classes('text-sm text-gray-400 text-center')
                     
-                    # Show raw data summary
+                    # Show data summary
                     if price_data is not None or indicators_data:
                         ui.separator().classes('my-4')
                         with ui.expansion('📊 Data Summary', icon='info').classes('w-full'):
+                            ui.label('Data Retrieval Parameters:').classes('text-sm font-bold mb-2')
+                            ui.label(f'  • Symbol: {self.market_analysis.symbol}').classes('text-xs text-gray-600')
+                            ui.label(f'  • Date Range: {start_date.date()} to {end_date.date()}').classes('text-xs text-gray-600')
+                            ui.label(f'  • Lookback Period: {market_history_days} days').classes('text-xs text-gray-600')
+                            ui.label(f'  • Timeframe/Interval: {timeframe}').classes('text-xs text-gray-600')
+                            
                             if price_data is not None:
-                                ui.label(f'Price Data: {len(price_data)} data points').classes('text-sm font-bold')
+                                ui.label(f'Price Data: {len(price_data)} data points').classes('text-sm font-bold mt-3')
                                 ui.label(f'Columns: {", ".join(price_data.columns)}').classes('text-xs text-gray-600 mb-2')
                             
                             if indicators_data:

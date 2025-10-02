@@ -20,7 +20,8 @@ class FinancialSituationMemory:
             api_key = None
             
         self.client = OpenAI(base_url=config["backend_url"], api_key=api_key)
-        self.chroma_client = chromadb.Client(Settings(allow_reset=True))
+        # Use EphemeralClient for in-memory storage (ChromaDB 1.0+)
+        self.chroma_client = chromadb.EphemeralClient()
         
         # Create unique collection name to avoid collisions
         if market_analysis_id and symbol:

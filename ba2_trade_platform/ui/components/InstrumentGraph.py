@@ -121,9 +121,12 @@ class InstrumentGraph:
             
             # Add candlestick chart for price
             if all(col in self.price_data.columns for col in ['Open', 'High', 'Low', 'Close']):
+                # Convert DatetimeIndex to strings to avoid JSON serialization issues
+                x_data = self.price_data.index.strftime('%Y-%m-%d').tolist() if isinstance(self.price_data.index, pd.DatetimeIndex) else self.price_data.get('Date', range(len(self.price_data)))
+                
                 fig.add_trace(
                     go.Candlestick(
-                        x=self.price_data.index if isinstance(self.price_data.index, pd.DatetimeIndex) else self.price_data.get('Date', range(len(self.price_data))),
+                        x=x_data,
                         open=self.price_data['Open'],
                         high=self.price_data['High'],
                         low=self.price_data['Low'],
@@ -136,9 +139,12 @@ class InstrumentGraph:
                 )
             elif 'Close' in self.price_data.columns:
                 # Fallback to line chart if OHLC not available
+                # Convert DatetimeIndex to strings to avoid JSON serialization issues
+                x_data = self.price_data.index.strftime('%Y-%m-%d').tolist() if isinstance(self.price_data.index, pd.DatetimeIndex) else self.price_data.get('Date', range(len(self.price_data)))
+                
                 fig.add_trace(
                     go.Scatter(
-                        x=self.price_data.index if isinstance(self.price_data.index, pd.DatetimeIndex) else self.price_data.get('Date', range(len(self.price_data))),
+                        x=x_data,
                         y=self.price_data['Close'],
                         mode='lines',
                         name='Close Price',
@@ -158,9 +164,12 @@ class InstrumentGraph:
                             break
                     
                     if value_col:
+                        # Convert DatetimeIndex to strings to avoid JSON serialization issues
+                        x_data = indicator_df.index.strftime('%Y-%m-%d').tolist() if isinstance(indicator_df.index, pd.DatetimeIndex) else range(len(indicator_df))
+                        
                         fig.add_trace(
                             go.Scatter(
-                                x=indicator_df.index if isinstance(indicator_df.index, pd.DatetimeIndex) else range(len(indicator_df)),
+                                x=x_data,
                                 y=indicator_df[value_col],
                                 mode='lines',
                                 name=indicator_name,
@@ -175,9 +184,12 @@ class InstrumentGraph:
                 colors = ['red' if close < open_ else 'green' 
                          for close, open_ in zip(self.price_data['Close'], self.price_data['Open'])]
                 
+                # Convert DatetimeIndex to strings to avoid JSON serialization issues
+                x_data = self.price_data.index.strftime('%Y-%m-%d').tolist() if isinstance(self.price_data.index, pd.DatetimeIndex) else self.price_data.get('Date', range(len(self.price_data)))
+                
                 fig.add_trace(
                     go.Bar(
-                        x=self.price_data.index if isinstance(self.price_data.index, pd.DatetimeIndex) else self.price_data.get('Date', range(len(self.price_data))),
+                        x=x_data,
                         y=self.price_data['Volume'],
                         name='Volume',
                         marker_color=colors,

@@ -103,6 +103,9 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         
         self.toolkit = Toolkit(config=self.config)
 
+        # Store market_analysis_id for state initialization
+        self._market_analysis_id = market_analysis_id
+        
         # Initialize memories (will be created with unique names in propagate method)
         self.bull_memory = None
         self.bear_memory = None
@@ -389,7 +392,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
 
         # Initialize state
         init_agent_state = self.propagator.create_initial_state(
-            company_name, trade_date
+            company_name, trade_date, self.market_analysis_id
         )
         args = self.propagator.get_graph_args()
         
@@ -404,6 +407,14 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                 accumulated_state = init_agent_state.copy()  # Start with initial state
                 
                 for chunk in self.graph.stream(init_agent_state, **args):
+                    # Check if analysis has been marked as FAILED (e.g., by tool error callback)
+                    if self.market_analysis_id:
+                        from ..db_storage import get_market_analysis_status
+                        current_status = get_market_analysis_status(self.market_analysis_id)
+                        if current_status == "FAILED":
+                            ta_logger.error(f"Analysis {self.market_analysis_id} marked as FAILED, stopping graph execution")
+                            raise Exception("Analysis failed due to critical tool error - stopping graph execution")
+                    
                     if len(chunk["messages"]) == 0:
                         pass
                     else:

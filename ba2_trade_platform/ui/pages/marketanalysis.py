@@ -486,7 +486,9 @@ class JobMonitoringTab:
 class ManualAnalysisTab:
     def __init__(self):
         self.expert_instance_id = None
-        self.analysis_type = None
+        # Initialize with default analysis type
+        from ...core.types import AnalysisUseCase
+        self.analysis_type = AnalysisUseCase.ENTER_MARKET.value
         self.instrument_selector = None
         self.render()
 
@@ -1558,11 +1560,13 @@ class OrderRecommendationsTab:
             account = accounts[0]  # Use first available account
             
             # Create order object with account_id
+            # Convert side to uppercase to match OrderDirection enum
+            side_upper = side.upper() if isinstance(side, str) else side
             order = TradingOrder(
                 account_id=account.id,
                 symbol=symbol,
                 quantity=quantity,
-                side=side,
+                side=side_upper,
                 order_type=order_type,
                 status=OrderStatus.PENDING,
                 limit_price=limit_price,

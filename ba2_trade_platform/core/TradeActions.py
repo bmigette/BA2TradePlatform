@@ -13,7 +13,7 @@ import uuid
 from .AccountInterface import AccountInterface
 from .models import TradingOrder, ExpertRecommendation, TradeActionResult
 from .types import OrderRecommendation, ExpertActionType, OrderDirection, OrderType, OrderStatus
-from .db import get_db, add_instance, update_instance
+from .db import get_db, add_instance, update_instance, get_instance
 from ..logger import logger
 
 
@@ -106,7 +106,7 @@ class TradeAction(ABC):
         Create a TradingOrder database record.
         
         Args:
-            side: Order side ("buy" or "sell")
+            side: Order side ("buy" or "sell", case-insensitive)
             quantity: Order quantity
             order_type: Order type ("market", "limit", "stop", etc.)
             limit_price: Limit price for limit orders
@@ -117,10 +117,13 @@ class TradeAction(ABC):
             TradingOrder instance or None if creation failed
         """
         try:
+            # Convert side to uppercase to match OrderDirection enum values (BUY, SELL)
+            side_upper = side.upper()
+            
             order = TradingOrder(
                 account_id=self.account.id,
                 symbol=self.instrument_name,
-                side=side,
+                side=side_upper,
                 quantity=quantity,
                 order_type=order_type,
                 limit_price=limit_price,
@@ -132,8 +135,9 @@ class TradeAction(ABC):
             
             order_id = add_instance(order)
             if order_id:
-                order.id = order_id
-                return order
+                # Return the order_id directly instead of the detached order object
+                # This prevents DetachedInstanceError when accessing the id later
+                return order_id
             else:
                 logger.error("Failed to create order record in database")
                 return None
@@ -173,6 +177,54 @@ class TradeAction(ABC):
         )
         
         return result
+    
+    def create_and_save_action_result(self, action_type: str, success: bool, message: str, 
+                                       data: Optional[Dict[str, Any]] = None,
+                                       transaction_id: Optional[int] = None,
+                                       expert_recommendation_id: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Create and save a TradeActionResult, returning a dictionary of attributes.
+        
+        This method creates a result, saves it to the database, and returns a dict
+        to avoid DetachedInstanceError when accessing attributes.
+        
+        Args:
+            action_type: Type of action (buy, sell, close, etc.)
+            success: Whether the action was successful
+            message: Human-readable message about the result
+            data: Additional data dictionary
+            transaction_id: Optional transaction ID
+            expert_recommendation_id: Optional expert recommendation ID
+            
+        Returns:
+            Dictionary with result attributes (id, action_type, success, message, data)
+        """
+        if data is None:
+            data = {}
+        
+        # Create the result object
+        result = TradeActionResult(
+            action_type=action_type,
+            success=success,
+            message=message,
+            data=data,
+            transaction_id=transaction_id,
+            expert_recommendation_id=expert_recommendation_id
+        )
+        
+        # Save to database (this closes the session, detaching the object)
+        result_id = add_instance(result)
+        
+        # Return a dictionary instead of the detached object to avoid DetachedInstanceError
+        return {
+            'id': result_id,
+            'action_type': action_type,
+            'success': success,
+            'message': message,
+            'data': data,
+            'transaction_id': transaction_id,
+            'expert_recommendation_id': expert_recommendation_id
+        }
 
 
 class SellAction(TradeAction):
@@ -190,56 +242,48 @@ class SellAction(TradeAction):
             # Get current position to validate we can sell
             current_position = self.get_current_position()
             if current_position is None or current_position <= 0:
-                result = self.create_action_result(
+                return self.create_and_save_action_result(
                     action_type=ExpertActionType.SELL.value,
                     success=False,
                     message=f"No long position to sell for {self.instrument_name}",
                     data={}
                 )
-                add_instance(result)
-                return result
             
             # Create PENDING order record with quantity=0 (to be set by risk management)
             # Risk management will determine the actual quantity to sell
-            order_record = self.create_order_record(
+            order_id = self.create_order_record(
                 side="sell",
                 quantity=0.0,  # 0 indicates pending review by risk management
                 order_type="market"
             )
             
-            if not order_record:
-                result = self.create_action_result(
+            if not order_id:
+                return self.create_and_save_action_result(
                     action_type=ExpertActionType.SELL.value,
                     success=False,
                     message="Failed to create order record",
                     data={}
                 )
-                add_instance(result)
-                return result
             
             # Order stays in PENDING status for risk management review
             # RiskManager will call account.submit_order() after setting quantity
-            logger.info(f"Created PENDING sell order {order_record.id} for {self.instrument_name} - awaiting risk management review")
+            logger.info(f"Created PENDING sell order {order_id} for {self.instrument_name} - awaiting risk management review")
             
-            result = self.create_action_result(
+            return self.create_and_save_action_result(
                 action_type=ExpertActionType.SELL.value,
                 success=True,
                 message=f"Sell order created for {self.instrument_name} (pending risk management review)",
-                data={"order_id": order_record.id, "status": "PENDING"}
+                data={"order_id": order_id, "status": "PENDING"}
             )
-            add_instance(result)
-            return result
                 
         except Exception as e:
             logger.error(f"Error creating sell order for {self.instrument_name}: {e}", exc_info=True)
-            result = self.create_action_result(
+            return self.create_and_save_action_result(
                 action_type=ExpertActionType.SELL.value,
                 success=False,
                 message=f"Error creating sell order: {str(e)}",
                 data={}
             )
-            add_instance(result)
-            return result
     
     def get_description(self) -> str:
         """Get description of sell action."""
@@ -271,55 +315,47 @@ class BuyAction(TradeAction):
             
             current_price = self.get_current_price()
             if current_price is None:
-                result = self.create_action_result(
+                return self.create_and_save_action_result(
                     action_type=ExpertActionType.BUY.value,
                     success=False,
                     message=f"Cannot get current price for {self.instrument_name}",
                     data={}
                 )
-                add_instance(result)
-                return result
             
             # Create PENDING order record (not submitted to broker yet)
-            order_record = self.create_order_record(
+            order_id = self.create_order_record(
                 side="buy",
                 quantity=quantity,
                 order_type="market"
             )
             
-            if not order_record:
-                result = self.create_action_result(
+            if not order_id:
+                return self.create_and_save_action_result(
                     action_type=ExpertActionType.BUY.value,
                     success=False,
                     message="Failed to create order record",
                     data={}
                 )
-                add_instance(result)
-                return result
             
             # Order stays in PENDING status for risk management review
             # RiskManager will call account.submit_order() after setting quantity
-            logger.info(f"Created PENDING buy order {order_record.id} for {self.instrument_name} - awaiting risk management review")
+            logger.info(f"Created PENDING buy order {order_id} for {self.instrument_name} - awaiting risk management review")
             
-            result = self.create_action_result(
+            return self.create_and_save_action_result(
                 action_type=ExpertActionType.BUY.value,
                 success=True,
                 message=f"Buy order created for {self.instrument_name} (pending risk management review)",
-                data={"order_id": order_record.id, "status": "PENDING"}
+                data={"order_id": order_id, "status": "PENDING"}
             )
-            add_instance(result)
-            return result
                 
         except Exception as e:
             logger.error(f"Error creating buy order for {self.instrument_name}: {e}", exc_info=True)
-            result = self.create_action_result(
+            return self.create_and_save_action_result(
                 action_type=ExpertActionType.BUY.value,
                 success=False,
                 message=f"Error creating buy order: {str(e)}",
                 data={}
             )
-            add_instance(result)
-            return result
     
     def get_description(self) -> str:
         """Get description of buy action."""
@@ -339,14 +375,12 @@ class CloseAction(TradeAction):
         try:
             current_position = self.get_current_position()
             if current_position is None or current_position == 0:
-                result = self.create_action_result(
+                return self.create_and_save_action_result(
                     action_type=ExpertActionType.CLOSE.value,
                     success=False,
                     message=f"No position to close for {self.instrument_name}",
                     data={}
                 )
-                add_instance(result)
-                return result
             
             # Determine order side based on current position
             if current_position > 0:
@@ -359,21 +393,30 @@ class CloseAction(TradeAction):
                 quantity = abs(current_position)
             
             # Create order record
-            order_record = self.create_order_record(
+            order_id = self.create_order_record(
                 side=side,
                 quantity=quantity,
                 order_type="market"
             )
             
-            if not order_record:
-                result = self.create_action_result(
+            if not order_id:
+                return self.create_and_save_action_result(
                     action_type=ExpertActionType.CLOSE.value,
                     success=False,
                     message="Failed to create order record",
                     data={}
                 )
-                add_instance(result)
-                return result
+            
+            # Retrieve the order object for submission (needs to be in a session)
+            order_record = get_instance(TradingOrder, order_id)
+            if not order_record:
+                logger.error(f"Failed to retrieve order {order_id} after creation")
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.CLOSE.value,
+                    success=False,
+                    message="Failed to retrieve order record",
+                    data={}
+                )
             
             # Submit order through account interface
             submit_result = self.account.submit_order(order_record)
@@ -385,38 +428,32 @@ class CloseAction(TradeAction):
                     order_record.status = OrderStatus.OPEN.value
                     update_instance(order_record)
                 
-                result = self.create_action_result(
+                return self.create_and_save_action_result(
                     action_type=ExpertActionType.CLOSE.value,
                     success=True,
                     message=f"Close order submitted for {self.instrument_name}",
-                    data={"order_id": order_record.id, "broker_order_id": submit_result.account_order_id}
+                    data={"order_id": order_id, "broker_order_id": submit_result.account_order_id}
                 )
-                add_instance(result)
-                return result
             else:
                 # Update order status to failed
                 order_record.status = OrderStatus.CANCELED.value
                 update_instance(order_record)
                 
-                result = self.create_action_result(
+                return self.create_and_save_action_result(
                     action_type=ExpertActionType.CLOSE.value,
                     success=False,
                     message=f"Failed to submit close order",
                     data={}
                 )
-                add_instance(result)
-                return result
                 
         except Exception as e:
             logger.error(f"Error executing close action for {self.instrument_name}: {e}", exc_info=True)
-            result = self.create_action_result(
+            return self.create_and_save_action_result(
                 action_type=ExpertActionType.CLOSE.value,
                 success=False,
                 message=f"Error executing close action: {str(e)}",
                 data={}
             )
-            add_instance(result)
-            return result
     
     def get_description(self) -> str:
         """Get description of close action."""
@@ -451,27 +488,23 @@ class AdjustTakeProfitAction(TradeAction):
         """
         try:
             if not self.existing_order:
-                result = self.create_action_result(
+                return self.create_and_save_action_result(
                     action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
                     success=False,
                     message="No existing order provided for take profit adjustment",
                     data={}
                 )
-                add_instance(result)
-                return result
             
             # If no take profit price provided, calculate based on current price and some percentage
             if self.take_profit_price is None:
                 current_price = self.get_current_price()
                 if current_price is None:
-                    result = self.create_action_result(
+                    return self.create_and_save_action_result(
                         action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
                         success=False,
                         message=f"Cannot get current price for {self.instrument_name}",
                         data={}
                     )
-                    add_instance(result)
-                    return result
                 
                 # Default to 5% profit target
                 if self.existing_order.side == "buy":
@@ -483,7 +516,7 @@ class AdjustTakeProfitAction(TradeAction):
             tp_result = self.account.set_order_tp(self.existing_order, self.take_profit_price)
             
             if tp_result is not None:
-                result = self.create_action_result(
+                return self.create_and_save_action_result(
                     action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
                     success=True,
                     message=f"Take profit adjusted for {self.instrument_name} to ${self.take_profit_price:.2f}",
@@ -494,26 +527,21 @@ class AdjustTakeProfitAction(TradeAction):
                     }
                 )
             else:
-                result = self.create_action_result(
+                return self.create_and_save_action_result(
                     action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
                     success=False,
                     message=f"Failed to adjust take profit for {self.instrument_name}",
                     data={"order_id": self.existing_order.id, "requested_tp_price": self.take_profit_price}
                 )
             
-            add_instance(result)
-            return result
-            
         except Exception as e:
             logger.error(f"Error adjusting take profit for {self.instrument_name}: {e}", exc_info=True)
-            result = self.create_action_result(
+            return self.create_and_save_action_result(
                 action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
                 success=False,
                 message=f"Error adjusting take profit: {str(e)}",
                 data={"order_id": self.existing_order.id if self.existing_order else None}
             )
-            add_instance(result)
-            return result
     
     def get_description(self) -> str:
         """Get description of adjust take profit action."""
@@ -549,27 +577,23 @@ class AdjustStopLossAction(TradeAction):
         """
         try:
             if not self.existing_order:
-                result = self.create_action_result(
+                return self.create_and_save_action_result(
                     action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
                     success=False,
                     message="No existing order provided for stop loss adjustment",
                     data={}
                 )
-                add_instance(result)
-                return result
             
             # If no stop loss price provided, calculate based on current price and some percentage
             if self.stop_loss_price is None:
                 current_price = self.get_current_price()
                 if current_price is None:
-                    result = self.create_action_result(
+                    return self.create_and_save_action_result(
                         action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
                         success=False,
                         message=f"Cannot get current price for {self.instrument_name}",
                         data={}
                     )
-                    add_instance(result)
-                    return result
                 
                 # Default to 3% stop loss
                 if self.existing_order.side == "buy":
@@ -581,7 +605,7 @@ class AdjustStopLossAction(TradeAction):
             sl_side = "sell" if self.existing_order.side == "buy" else "buy"
             
             # Create stop loss order record
-            sl_order_record = self.create_order_record(
+            sl_order_id = self.create_order_record(
                 side=sl_side,
                 quantity=self.existing_order.quantity,
                 order_type="stop",
@@ -589,15 +613,24 @@ class AdjustStopLossAction(TradeAction):
                 linked_order_id=self.existing_order.id
             )
             
-            if not sl_order_record:
-                result = self.create_action_result(
+            if not sl_order_id:
+                return self.create_and_save_action_result(
                     action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
                     success=False,
                     message="Failed to create stop loss order record",
                     data={}
                 )
-                add_instance(result)
-                return result
+            
+            # Retrieve the order object for submission (needs to be in a session)
+            sl_order_record = get_instance(TradingOrder, sl_order_id)
+            if not sl_order_record:
+                logger.error(f"Failed to retrieve stop loss order {sl_order_id} after creation")
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
+                    success=False,
+                    message="Failed to retrieve stop loss order record",
+                    data={}
+                )
             
             # Submit SL order through account interface
             submit_result = self.account.submit_order(sl_order_record)
@@ -609,38 +642,32 @@ class AdjustStopLossAction(TradeAction):
                     sl_order_record.status = OrderStatus.OPEN.value
                     update_instance(sl_order_record)
                 
-                result = self.create_action_result(
+                return self.create_and_save_action_result(
                     action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
                     success=True,
                     message=f"Stop loss order created for {self.instrument_name} at ${self.stop_loss_price}",
-                    data={"order_id": sl_order_record.id, "broker_order_id": submit_result.account_order_id}
+                    data={"order_id": sl_order_id, "broker_order_id": submit_result.account_order_id}
                 )
-                add_instance(result)
-                return result
             else:
                 # Update SL order status to failed
                 sl_order_record.status = OrderStatus.CANCELED.value
                 update_instance(sl_order_record)
                 
-                result = self.create_action_result(
+                return self.create_and_save_action_result(
                     action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
                     success=False,
                     message=f"Failed to submit stop loss order",
                     data={}
                 )
-                add_instance(result)
-                return result
                 
         except Exception as e:
             logger.error(f"Error executing adjust stop loss action for {self.instrument_name}: {e}", exc_info=True)
-            result = self.create_action_result(
+            return self.create_and_save_action_result(
                 action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
                 success=False,
                 message=f"Error executing adjust stop loss action: {str(e)}",
                 data={}
             )
-            add_instance(result)
-            return result
     
     def get_description(self) -> str:
         """Get description of adjust stop loss action."""

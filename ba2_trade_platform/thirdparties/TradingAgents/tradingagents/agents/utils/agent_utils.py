@@ -167,7 +167,8 @@ class Toolkit:
         """
         # Pass None for interval to let interface function get it from config
         result_data = interface.get_YFin_data_online(symbol, start_date, end_date, None)
-
+        
+        # Return full result - LoggingToolNode will handle dict format
         return result_data
 
     @staticmethod
@@ -203,7 +204,8 @@ class Toolkit:
         result_stockstats = interface.get_stock_stats_indicators_window(
             symbol, indicator, curr_date, look_back_days, False, None
         )
-
+        
+        # Return full result - LoggingToolNode will handle dict format
         return result_stockstats
 
     @staticmethod
@@ -239,7 +241,8 @@ class Toolkit:
         result_stockstats = interface.get_stock_stats_indicators_window(
             symbol, indicator, curr_date, look_back_days, True, None
         )
-
+        
+        # Return full result - LoggingToolNode will handle dict format
         return result_stockstats
 
     @staticmethod
