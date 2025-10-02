@@ -25,6 +25,12 @@ class TradingAgents(MarketExpertInterface):
     def description(cls) -> str:
         return "Multi-agent AI trading system with debate-based analysis and risk assessment"
     
+    @classmethod
+    def _get_timeframe_valid_values(cls) -> List[str]:
+        """Get valid timeframe values from TimeInterval enum."""
+        from ...core.types import TimeInterval
+        return TimeInterval.get_all_intervals()
+    
     def __init__(self, id: int):
         """Initialize TradingAgents expert with database instance."""
         super().__init__(id)
@@ -67,8 +73,8 @@ class TradingAgents(MarketExpertInterface):
             "timeframe": {
                 "type": "str", "required": True, "default": "1h",
                 "description": "Analysis timeframe for market data",
-                "valid_values": ["1m", "5m", "15m", "30m", "1h", "1d", "1wk", "1mo"],
-                "tooltip": "The time interval used for technical analysis charts and indicators. Shorter timeframes (1m, 5m) are for day trading, medium (1h, 1d) for swing trading, longer (1wk, 1mo) for position trading."
+                "valid_values": cls._get_timeframe_valid_values(),
+                "tooltip": "The time interval used for technical analysis charts and indicators. Shorter timeframes (1m, 5m) are for day trading, medium (1h, 4h, 1d) for swing trading, longer (1wk, 1mo) for position trading."
             },
             
             # LLM Models
@@ -149,6 +155,7 @@ class TradingAgents(MarketExpertInterface):
             'market_history_days': int(self.settings.get('market_history_days', settings_def['market_history_days']['default'])),
             'economic_data_days': int(self.settings.get('economic_data_days', settings_def['economic_data_days']['default'])),
             'social_sentiment_days': int(self.settings.get('social_sentiment_days', settings_def['social_sentiment_days']['default'])),
+            'timeframe': self.settings.get('timeframe', settings_def['timeframe']['default']),
         })
         
         return config
@@ -1061,7 +1068,7 @@ Please check back in a few minutes for results."""
             
             recommendation = get_instance(ExpertRecommendation, recommendation_id)
             if not recommendation:
-                logger.error(f"[TRADE MANAGER] ExpertRecommendation {recommendation_id} not found", exc_info=True)
+                logger.error(f"[TRADE MANAGER] ExpertRecommendation {recommendation_id} not found")
                 return
             
             # Skip HOLD recommendations as they don't require orders

@@ -7,6 +7,7 @@ yahooquery
 APScheduler
 alembic
 reportlab
+plotly
 
 # TradingAgents Tools
 typing-extensions

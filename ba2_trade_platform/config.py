@@ -12,7 +12,7 @@ FINNHUB_API_KEY=None
 OPENAI_API_KEY=None
 
 DB_FILE = os.path.join(os.path.expanduser("~"), "Documents", "ba2_trade_platform", "db.sqlite")
-
+CACHE_FOLDER = os.path.join(os.path.expanduser("~"), "Documents", "ba2_trade_platform", "cache")
 # Default account refresh interval in minutes
 account_refresh_interval = 60  # Default to 60 minutes
 

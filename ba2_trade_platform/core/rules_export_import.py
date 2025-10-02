@@ -338,6 +338,21 @@ class RulesExportImportUI:
                 if not items:
                     self.ui.label(f'No {self.current_export_type} available to export.').classes('text-grey-7')
                 else:
+                    # Selection controls row
+                    with self.ui.row().classes('w-full justify-between items-center mb-2'):
+                        self.ui.label(f'{len(items)} {self.current_export_type} available').classes('text-grey-7')
+                        with self.ui.row().classes('gap-2'):
+                            self.ui.button(
+                                'Select All',
+                                on_click=lambda: self._toggle_all_selections(True),
+                                icon='check_box'
+                            ).props('flat dense').classes('text-sm')
+                            self.ui.button(
+                                'Deselect All',
+                                on_click=lambda: self._toggle_all_selections(False),
+                                icon='check_box_outline_blank'
+                            ).props('flat dense').classes('text-sm')
+                    
                     # Selection checkboxes
                     self.export_selections = {}
                     with self.ui.column().classes('w-full gap-2 max-h-96 overflow-y-auto'):
@@ -355,6 +370,11 @@ class RulesExportImportUI:
                     ).classes('mt-4')
 
         self.export_dialog.open()
+
+    def _toggle_all_selections(self, select: bool):
+        """Toggle all checkboxes in the export dialog."""
+        for checkbox in self.export_selections.values():
+            checkbox.value = select
 
     def show_import_dialog(self):
         """Show import dialog."""

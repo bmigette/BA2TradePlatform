@@ -81,10 +81,44 @@ from ba2_trade_platform.logger import logger
 
 logger.debug("Detailed debug info")  # Goes to app.debug.log
 logger.info("General execution info")  # Goes to both logs
-logger.error("Error conditions", exc_info=True)  # ALWAYS include exc_info=True for error logs
+logger.error("Error conditions", exc_info=True)  # Include exc_info=True ONLY in exception handlers
 ```
 
-**Critical Logging Rule**: Always include `exc_info=True` parameter in all `logger.error()` calls to capture full stack traces for debugging. This is mandatory for all error logging throughout the codebase.
+**Critical Logging Rules**:
+
+1. **`exc_info=True` Parameter Usage**:
+   - ✅ **ONLY use `exc_info=True` inside `except` blocks** where you have an active exception context
+   - ❌ **NEVER use `exc_info=True` outside exception handlers** - it will cause `KeyError('exc_info')`
+   
+   **Correct Usage (inside exception handler)**:
+   ```python
+   try:
+       result = risky_operation()
+   except Exception as e:
+       logger.error(f"Operation failed: {e}", exc_info=True)  # ✅ Correct - has exception context
+   ```
+   
+   **Incorrect Usage (outside exception handler)**:
+   ```python
+   if result is None:
+       logger.error("Result is None", exc_info=True)  # ❌ Wrong - no exception context, will cause KeyError
+   ```
+   
+   **Fix for non-exception errors**:
+   ```python
+   if result is None:
+       logger.error("Result is None")  # ✅ Correct - no exc_info parameter
+   ```
+
+2. **When to include `exc_info=True`**:
+   - Use it in `except` blocks to capture full stack traces for debugging
+   - Helps identify the root cause of exceptions
+   - Essential for production error tracking
+
+3. **When NOT to include `exc_info=True`**:
+   - Simple validation failures (e.g., `if x is None`)
+   - Expected error conditions (e.g., "Record not found")
+   - Any error logging outside an `except` block
 
 ### 5. **Live Data Handling**
 **CRITICAL RULE**: Never use default values or fallbacks for live market data (prices, balances, quantities, etc.):

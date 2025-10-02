@@ -1006,7 +1006,7 @@ class ExpertSettingsTab:
                                 try:
                                     self.enter_market_times_container = ui.column().classes('w-full mb-4')
                                     if self.enter_market_times_container is None:
-                                        logger.error("ui.column() returned None for enter_market_times_container", exc_info=True)
+                                        logger.error("ui.column() returned None for enter_market_times_container")
                                         self.enter_market_times_container = ui.column()  # Try again without classes
                                 except Exception as e:
                                     logger.error(f"Error creating enter_market_times_container: {e}", exc_info=True)
@@ -1016,7 +1016,7 @@ class ExpertSettingsTab:
                                 
                                 # Verify container was created successfully
                                 if self.enter_market_times_container is None:
-                                    logger.error("Failed to create enter_market_times_container, skipping time input setup", exc_info=True)
+                                    logger.error("Failed to create enter_market_times_container, skipping time input setup")
                                 else:
                                     # Add initial time input
                                     self._add_time_input_enter_market('09:30')
@@ -1042,7 +1042,7 @@ class ExpertSettingsTab:
                                 try:
                                     self.open_positions_times_container = ui.column().classes('w-full mb-4')
                                     if self.open_positions_times_container is None:
-                                        logger.error("ui.column() returned None for open_positions_times_container", exc_info=True)
+                                        logger.error("ui.column() returned None for open_positions_times_container")
                                         self.open_positions_times_container = ui.column()  # Try again without classes
                                 except Exception as e:
                                     logger.error(f"Error creating open_positions_times_container: {e}", exc_info=True)
@@ -1052,7 +1052,7 @@ class ExpertSettingsTab:
                                 
                                 # Verify container was created successfully
                                 if self.open_positions_times_container is None:
-                                    logger.error("Failed to create open_positions_times_container, skipping time input setup", exc_info=True)
+                                    logger.error("Failed to create open_positions_times_container, skipping time input setup")
                                 else:
                                     # Add initial time inputs (more frequent for position monitoring)
                                     for time in ['09:30', '10:30', '11:30', '12:30', '13:30', '14:30', '15:30']:
@@ -1247,14 +1247,14 @@ class ExpertSettingsTab:
         
         # Additional check - make sure it's a UI element that supports move()
         if not hasattr(self.execution_times_container, '__enter__') or not hasattr(self.execution_times_container, '__exit__'):
-            logger.error(f"execution_times_container is not a context manager: {type(self.execution_times_container)}", exc_info=True)
+            logger.error(f"execution_times_container is not a context manager: {type(self.execution_times_container)}")
             return
             
         try:
             # Create the row and move it to the container
             row = ui.row().classes('w-full gap-2')
             if row is None:
-                logger.error("ui.row() returned None", exc_info=True)
+                logger.error("ui.row() returned None")
                 return
             
             # Move the row to the container - move() modifies the row in place
@@ -2947,14 +2947,14 @@ class TradeSettingsTab:
                     # Get the link records to preserve order
                     links_statement = select(RulesetEventActionLink).where(
                         RulesetEventActionLink.ruleset_id == ruleset_id
-                    ).order_by(RulesetEventActionLink.order)
+                    ).order_by(RulesetEventActionLink.order_index)
                     links = session.exec(links_statement).all()
                     
                     for link in links:
                         new_link = RulesetEventActionLink(
                             ruleset_id=new_ruleset_id,
-                            event_action_id=link.event_action_id,
-                            order=link.order
+                            eventaction_id=link.eventaction_id,
+                            order_index=link.order_index
                         )
                         session.add(new_link)
                     

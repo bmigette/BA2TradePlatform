@@ -21,8 +21,9 @@ from ...logger import logger
 class RulesetTestTab:
     """UI component for testing rulesets against expert recommendations."""
     
-    def __init__(self, initial_ruleset_id: Optional[int] = None):
+    def __init__(self, initial_ruleset_id: Optional[int] = None, market_analysis_id: Optional[int] = None):
         self.initial_ruleset_id = initial_ruleset_id
+        self.market_analysis_id = market_analysis_id
         self.ruleset_select = None
         self.account_select = None
         self.expert_select = None
@@ -36,31 +37,41 @@ class RulesetTestTab:
         self.results_container = None
         self.evaluation_results = []
         
-        # If no initial ruleset_id provided, try to extract from URL
-        if self.initial_ruleset_id is None:
-            self._extract_ruleset_id_from_url()
+        # If no initial ruleset_id or market_analysis_id provided, try to extract from URL
+        if self.initial_ruleset_id is None or self.market_analysis_id is None:
+            self._extract_params_from_url()
         
         self.render()
     
-    def _extract_ruleset_id_from_url(self):
-        """Extract ruleset_id from URL query parameters."""
+    def _extract_params_from_url(self):
+        """Extract ruleset_id and market_analysis_id from URL query parameters."""
         try:
             # Use a simpler approach: get query params via JavaScript but synchronously
-            async def get_url_param():
+            async def get_url_params():
                 try:
-                    result = await ui.run_javascript(
+                    # Get ruleset_id
+                    ruleset_result = await ui.run_javascript(
                         "new URLSearchParams(window.location.search).get('ruleset_id')"
                     )
-                    if result:
-                        self.initial_ruleset_id = int(result)
+                    if ruleset_result:
+                        self.initial_ruleset_id = int(ruleset_result)
                         if self.ruleset_select:
                             self.ruleset_select.value = self.initial_ruleset_id
                             self._on_ruleset_change()
+                    
+                    # Get market_analysis_id
+                    ma_result = await ui.run_javascript(
+                        "new URLSearchParams(window.location.search).get('market_analysis_id')"
+                    )
+                    if ma_result:
+                        self.market_analysis_id = int(ma_result)
+                        self._load_market_analysis_parameters()
+                        
                 except (ValueError, TypeError) as e:
-                    logger.debug(f"Could not parse ruleset_id from URL: {e}")
+                    logger.debug(f"Could not parse parameters from URL: {e}")
             
             # Schedule the parameter extraction
-            ui.timer(0.1, get_url_param, once=True)
+            ui.timer(0.1, get_url_params, once=True)
                 
         except Exception as e:
             logger.debug(f"Error extracting URL parameters: {e}")
@@ -185,6 +196,92 @@ class RulesetTestTab:
         except Exception as e:
             logger.error(f"Error rendering ruleset test tab: {e}", exc_info=True)
             ui.label(f'Error rendering test interface: {str(e)}').classes('text-red-500')
+    
+    def _load_market_analysis_parameters(self):
+        """Load test parameters from a market analysis result."""
+        try:
+            if not self.market_analysis_id:
+                return
+            
+            from ...core.models import MarketAnalysis, ExpertRecommendation
+            
+            # Get the market analysis
+            analysis = get_instance(MarketAnalysis, self.market_analysis_id)
+            if not analysis:
+                logger.warning(f"Market analysis {self.market_analysis_id} not found")
+                ui.notify(f"Market analysis {self.market_analysis_id} not found", type='warning')
+                return
+            
+            # Load parameters from analysis
+            if self.symbol_input:
+                self.symbol_input.value = analysis.symbol
+            
+            # Set expert instance from analysis
+            if self.expert_select and analysis.expert_instance_id:
+                self.expert_select.value = analysis.expert_instance_id
+                self._on_expert_change()
+            
+            # Get the expert instance to find the account
+            if analysis.expert_instance_id:
+                expert_instance = get_instance(ExpertInstance, analysis.expert_instance_id)
+                if expert_instance and self.account_select:
+                    self.account_select.value = expert_instance.account_id
+                    self._on_account_change()
+                    
+                    # Get the ruleset based on analysis subtype
+                    # ENTER_MARKET uses enter_market_ruleset_id, OPEN_POSITIONS uses open_positions_ruleset_id
+                    from ...core.types import AnalysisUseCase
+                    if analysis.subtype == AnalysisUseCase.ENTER_MARKET:
+                        ruleset_id = expert_instance.enter_market_ruleset_id
+                    elif analysis.subtype == AnalysisUseCase.OPEN_POSITIONS:
+                        ruleset_id = expert_instance.open_positions_ruleset_id
+                    else:
+                        ruleset_id = expert_instance.enter_market_ruleset_id  # Default to enter market
+                    
+                    if ruleset_id and self.ruleset_select:
+                        self.ruleset_select.value = ruleset_id
+                        self._on_ruleset_change()
+            
+            # Try to get recommendation data from the analysis
+            with get_db() as session:
+                statement = select(ExpertRecommendation).where(
+                    ExpertRecommendation.market_analysis_id == self.market_analysis_id
+                ).order_by(ExpertRecommendation.created_at.desc()).limit(1)
+                
+                recommendation = session.exec(statement).first()
+                
+                if recommendation:
+                    # Load recommendation parameters
+                    if self.action_select and hasattr(recommendation.recommended_action, 'value'):
+                        self.action_select.value = recommendation.recommended_action.value
+                    
+                    if self.profit_input and recommendation.expected_profit_percent is not None:
+                        self.profit_input.value = recommendation.expected_profit_percent
+                    
+                    if self.confidence_input and recommendation.confidence:
+                        self.confidence_input.value = recommendation.confidence * 100  # Convert to percentage
+                    
+                    if self.risk_select and recommendation.risk_level  is not None:
+                        if hasattr(recommendation.risk_level, 'value'):
+                            self.risk_select.value = recommendation.risk_level.value
+                        else:
+                            self.risk_select.value = str(recommendation.risk_level)
+                    
+                    if self.time_horizon_select and recommendation.time_horizon:
+                        if hasattr(recommendation.time_horizon, 'value'):
+                            self.time_horizon_select.value = recommendation.time_horizon.value
+                        else:
+                            self.time_horizon_select.value = str(recommendation.time_horizon)
+                    
+                    ui.notify(f"Loaded parameters from market analysis {self.market_analysis_id}", type='positive')
+                    logger.info(f"Successfully loaded parameters from market analysis {self.market_analysis_id}")
+                else:
+                    ui.notify(f"No recommendation found for analysis {self.market_analysis_id}, using default parameters", type='info')
+                    logger.debug(f"No recommendation found for market analysis {self.market_analysis_id}")
+        
+        except Exception as e:
+            logger.error(f"Error loading market analysis parameters: {e}", exc_info=True)
+            ui.notify(f"Error loading analysis parameters: {str(e)}", type='negative')
     
     def _get_ruleset_options(self) -> Dict[int, str]:
         """Get available rulesets for selection."""
@@ -540,10 +637,10 @@ class RulesetTestTab:
                 ui.label(f'Error displaying results: {str(e)}').classes('text-red-500')
 
 
-def content(ruleset_id: Optional[int] = None):
+def content(ruleset_id: Optional[int] = None, market_analysis_id: Optional[int] = None):
     """Render the ruleset test page content."""
     try:
-        RulesetTestTab(initial_ruleset_id=ruleset_id)
+        RulesetTestTab(initial_ruleset_id=ruleset_id, market_analysis_id=market_analysis_id)
     except Exception as e:
         logger.error(f"Error rendering ruleset test page: {e}", exc_info=True)
         ui.label(f'Error loading ruleset test page: {str(e)}').classes('text-red-500')

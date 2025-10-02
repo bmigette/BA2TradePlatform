@@ -279,8 +279,8 @@ class TradeActionEvaluator:
                 condition_result = condition.evaluate()
                 condition_evaluation["condition_result"] = condition_result
                 
-                logger.debug(f"Condition {trigger_key} result: {condition_result}")
                 logger.debug(f"Condition description: {condition.get_description()}")
+                logger.debug(f"Condition {trigger_key} result: {condition_result}")
                 
                 rule_evaluation["conditions"].append(condition_evaluation)
                 self.condition_evaluations.append(condition_evaluation.copy())

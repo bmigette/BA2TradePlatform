@@ -1,4 +1,4 @@
-from sqlmodel import  Field, Session, SQLModel, create_engine, Column, Relationship
+from sqlmodel import Field, Session, SQLModel, Column, Relationship
 from sqlalchemy import String, Float, JSON, UniqueConstraint, Table, Integer, ForeignKey
 from sqlalchemy.orm import relationship
 from typing import Optional, Dict, Any, List

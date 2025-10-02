@@ -15,6 +15,8 @@ import yfinance as yf
 from openai import OpenAI
 from .config import get_config, set_config, DATA_DIR
 from .. import logger as ta_logger
+from ba2_trade_platform.modules.dataproviders import YFinanceDataProvider
+from ba2_trade_platform.config import CACHE_FOLDER
 
 def get_finnhub_news(
     ticker: Annotated[
@@ -429,6 +431,10 @@ def get_stock_stats_indicators_window(
     online: Annotated[bool, "to fetch data online or offline"],
     interval: Annotated[str, "Data interval (1m, 5m, 15m, 30m, 1h, 1d, 1wk, 1mo)"] = None,
 ) -> str:
+    """
+    Get technical indicator values for a date range.
+    Returns text format only - JSON format is created by db_storage.py for storage.
+    """
     # Get interval from config if not provided
     if interval is None:
         config = get_config()
@@ -512,52 +518,67 @@ def get_stock_stats_indicators_window(
             f"Indicator {indicator} is not supported. Please choose from: {list(best_ind_params.keys())}"
         )
 
+    # Calculate date range
     end_date = curr_date
-    curr_date = datetime.strptime(curr_date, "%Y-%m-%d")
-    before = curr_date - relativedelta(days=look_back_days)
+    curr_date_dt = datetime.strptime(curr_date, "%Y-%m-%d")
+    start_date_dt = curr_date_dt - relativedelta(days=look_back_days)
+    start_date = start_date_dt.strftime("%Y-%m-%d")
 
-    if not online:
-        # read from YFin data
-        data = pd.read_csv(
-            os.path.join(
-                DATA_DIR,
-                f"market_data/price_data/{symbol}-YFin-data-2015-01-01-2025-03-25.csv",
-            )
+    # Get indicator data for entire range efficiently
+    try:
+        indicator_df = StockstatsUtils.get_stock_stats_range(
+            symbol=symbol,
+            indicator=indicator,
+            start_date=start_date,
+            end_date=end_date,
+            data_dir=os.path.join(DATA_DIR, "market_data", "price_data"),
+            online=online,
+            interval=interval,
         )
-        data["Date"] = pd.to_datetime(data["Date"], utc=True)
-        dates_in_df = data["Date"].astype(str).str[:10]
-
-        ind_string = ""
-        while curr_date >= before:
-            # only do the trading dates
-            if curr_date.strftime("%Y-%m-%d") in dates_in_df.values:
-                indicator_value = get_stockstats_indicator(
-                    symbol, indicator, curr_date.strftime("%Y-%m-%d"), online, interval
-                )
-
-                ind_string += f"{curr_date.strftime('%Y-%m-%d')}: {indicator_value}\n"
-
-            curr_date = curr_date - relativedelta(days=1)
-    else:
-        # online gathering
-        ind_string = ""
-        while curr_date >= before:
-            indicator_value = get_stockstats_indicator(
-                symbol, indicator, curr_date.strftime("%Y-%m-%d"), online, interval
-            )
-
-            ind_string += f"{curr_date.strftime('%Y-%m-%d')}: {indicator_value}\n"
-
-            curr_date = curr_date - relativedelta(days=1)
-
+    except Exception as e:
+        ta_logger.error(f"Error getting indicator {indicator} for {symbol}: {e}", exc_info=True)
+        return f"Error calculating {indicator}: {str(e)}"
+    
+    # Build text format for LangGraph agent
+    ind_string = ""
+    for _, row in indicator_df.iterrows():
+        date_str = row["Date"]
+        value = row["value"]
+        
+        # Handle N/A values
+        if pd.isna(value) or (isinstance(value, str) and "N/A" in value):
+            ind_string += f"{date_str}: N/A: Not a trading day (weekend or holiday)\n"
+        else:
+            ind_string += f"{date_str}: {value}\n"
+    
     result_str = (
-        f"## {indicator} values from {before.strftime('%Y-%m-%d')} to {end_date}:\n\n"
+        f"## {indicator} values from {start_date} to {end_date}:\n\n"
         + ind_string
         + "\n\n"
         + best_ind_params.get(indicator, "No description available.")
     )
-
-    return result_str
+    
+    # Store only the PARAMETERS needed to reconstruct this indicator from cache
+    # The UI will use YFinanceDataProvider + StockstatsUtils to recalculate
+    json_data = {
+        "tool": "get_stock_stats_indicators_window",
+        "indicator": indicator,
+        "symbol": symbol,
+        "interval": interval,
+        "start_date": start_date,
+        "end_date": end_date,
+        "look_back_days": look_back_days,
+        "description": best_ind_params.get(indicator, "No description available."),
+        "data_points": len(indicator_df)  # Just the count, not the data
+    }
+    
+    # Return internal dict with both formats
+    # LangGraph will extract text_for_agent, db_storage will store both
+    return {
+        "_internal": True,
+        "text_for_agent": result_str,
+        "json_for_storage": json_data
+    }
 
 
 def get_stockstats_indicator(
@@ -647,40 +668,83 @@ def get_YFin_data_online(
         config = get_config()
         interval = config.get("timeframe", "1d")
 
-    datetime.strptime(start_date, "%Y-%m-%d")
-    datetime.strptime(end_date, "%Y-%m-%d")
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
 
-    # Create ticker object
-    ticker = yf.Ticker(symbol.upper())
-
-    # Fetch historical data for the specified date range with specified interval
-    data = ticker.history(start=start_date, end=end_date, interval=interval)
-
-    # Check if data is empty
-    if data.empty:
-        return (
-            f"No data found for symbol '{symbol}' between {start_date} and {end_date}"
+    # Use YFinanceDataProvider for smart caching
+    provider = YFinanceDataProvider(CACHE_FOLDER)
+    
+    try:
+        # Get data via data provider (uses smart cache)
+        data = provider.get_dataframe(
+            symbol=symbol,
+            start_date=start_dt,
+            end_date=end_dt,
+            interval=interval
         )
+        
+        # Check if data is empty
+        if data.empty:
+            return (
+                f"No data found for symbol '{symbol}' between {start_date} and {end_date}"
+            )
 
-    # Remove timezone info from index for cleaner output
-    if data.index.tz is not None:
-        data.index = data.index.tz_localize(None)
+        # Remove timezone info from Date column if present
+        if hasattr(data['Date'], 'dt') and data['Date'].dt.tz is not None:
+            data['Date'] = data['Date'].dt.tz_localize(None)
 
-    # Round numerical values to 2 decimal places for cleaner display
-    numeric_columns = ["Open", "High", "Low", "Close", "Adj Close"]
-    for col in numeric_columns:
-        if col in data.columns:
-            data[col] = data[col].round(2)
+        # Round numerical values to 2 decimal places for cleaner display
+        numeric_columns = ["Open", "High", "Low", "Close"]
+        for col in numeric_columns:
+            if col in data.columns:
+                data[col] = data[col].round(2)
 
-    # Convert DataFrame to CSV string
-    csv_string = data.to_csv()
+        # Set Date as index for CSV output (matches old format)
+        data_indexed = data.set_index('Date')
+        
+        # Convert DataFrame to CSV string
+        csv_string = data_indexed.to_csv()
 
-    # Add header information
-    header = f"# Stock data for {symbol.upper()} from {start_date} to {end_date} ({interval} interval)\n"
-    header += f"# Total records: {len(data)}\n"
-    header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        # Add header information
+        header = f"# Stock data for {symbol.upper()} from {start_date} to {end_date} ({interval} interval)\n"
+        header += f"# Total records: {len(data)}\n"
+        header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
 
-    return header + csv_string
+        # Store only the PARAMETERS needed to reconstruct this data from cache
+        # The UI will use YFinanceDataProvider to get the data using these params
+        json_data = {
+            "tool": "get_YFin_data_online",
+            "symbol": symbol.upper(),
+            "interval": interval,
+            "start_date": start_date,
+            "end_date": end_date,
+            "total_records": len(data)
+        }
+        
+        # Return internal dict with both formats
+        # LangGraph will extract text_for_agent, db_storage will store both
+        return {
+            "_internal": True,
+            "text_for_agent": header + csv_string,
+            "json_for_storage": json_data
+        }
+    except Exception as e:
+        ta_logger.error(f"Error fetching data for {symbol}: {e}", exc_info=True)
+        # Return error that will stop graph flow
+        error_msg = f"CRITICAL ERROR: Failed to fetch market data for {symbol}. {str(e)}"
+        return {
+            "_internal": True,
+            "text_for_agent": error_msg,
+            "json_for_storage": {
+                "tool": "get_YFin_data_online",
+                "error": error_msg,
+                "symbol": symbol,
+                "interval": interval,
+                "start_date": start_date,
+                "end_date": end_date
+            },
+            "_error": True  # Flag to indicate this is an error result
+        }
 
 
 def get_YFin_data(

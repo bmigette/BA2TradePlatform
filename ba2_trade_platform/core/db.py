@@ -9,7 +9,21 @@ import os
 # Create engine and session
 logger.debug(f"Database file path: {DB_FILE}")
 
-engine = create_engine(f"sqlite:///{DB_FILE}", connect_args={"check_same_thread": False})
+# Configure connection pool for multi-threaded application
+# pool_size: Number of connections to maintain in the pool
+# max_overflow: Number of additional connections that can be created beyond pool_size
+# pool_timeout: Seconds to wait before giving up on getting a connection from the pool
+# pool_recycle: Recycle connections after this many seconds (prevents stale connections)
+# pool_pre_ping: Test connections before using them to ensure they're still valid
+engine = create_engine(
+    f"sqlite:///{DB_FILE}", 
+    connect_args={"check_same_thread": False},
+    pool_size=20,           # Increased from default 5 to 20
+    max_overflow=40,        # Increased from default 10 to 40 (total max connections: 60)
+    pool_timeout=60,        # Increased from default 30 to 60 seconds
+    pool_recycle=3600,      # Recycle connections after 1 hour
+    pool_pre_ping=True      # Test connections before use
+)
 
 
 def init_db():

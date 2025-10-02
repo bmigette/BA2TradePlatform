@@ -8,7 +8,7 @@ import asyncio
 import json
 
 from ...core.db import get_all_instances, get_db, get_instance
-from ...core.models import AccountDefinition, MarketAnalysis, ExpertRecommendation, AppSetting, TradingOrder
+from ...core.models import AccountDefinition, MarketAnalysis, ExpertRecommendation, ExpertInstance, AppSetting, TradingOrder
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, OrderStatus, OrderOpenType
 from ...core.utils import get_expert_instance_from_id, get_market_analysis_id_from_order_id
 from ...modules.accounts import providers
@@ -854,123 +854,92 @@ class AccountOverviewTab:
             self._render_pending_orders_table()
     
     def _render_live_orders_table(self):
-        """Render table with recent orders from account providers (past 15 days)."""
-        accounts = get_all_instances(AccountDefinition)
+        """Render table with recent orders from database (past 15 days) with expert information."""
+        session = get_db()
         all_orders = []
         
         # Calculate cutoff date (15 days ago) - use UTC to avoid timezone issues
         cutoff_date = datetime.now(timezone.utc) - timedelta(days=15)
         
-        for acc in accounts:
-            provider_cls = providers.get(acc.provider)
-            if provider_cls:
-                try:
-                    provider_obj = provider_cls(acc.id)
-                    # Get recent orders - check if provider supports get_orders method
-                    if hasattr(provider_obj, 'get_orders'):
-                        orders = provider_obj.get_orders()
-                        
-                        # Filter and format orders for table display
-                        for order in orders:
-                            order_dict = order if isinstance(order, dict) else dict(order)
-                            
-                            # Filter by date - check for created_at or submitted_at fields
-                            order_date = None
-                            if hasattr(order, 'created_at') and order.created_at:
-                                order_date = order.created_at
-                            elif hasattr(order, 'submitted_at') and order.submitted_at:
-                                order_date = order.submitted_at
-                            elif 'created_at' in order_dict and order_dict['created_at']:
-                                # Handle string dates if needed
-                                if isinstance(order_dict['created_at'], str):
-                                    try:
-                                        # Try parsing ISO format datetime string
-                                        order_date = datetime.fromisoformat(order_dict['created_at'].replace('Z', '+00:00'))
-                                    except:
-                                        continue  # Skip if can't parse date
-                                else:
-                                    order_date = order_dict['created_at']
-                            elif 'submitted_at' in order_dict and order_dict['submitted_at']:
-                                if isinstance(order_dict['submitted_at'], str):
-                                    try:
-                                        order_date = datetime.fromisoformat(order_dict['submitted_at'].replace('Z', '+00:00'))
-                                    except:
-                                        continue
-                                else:
-                                    order_date = order_dict['submitted_at']
-                            
-                            # Ensure both dates are timezone-aware for comparison
-                            if order_date:
-                                # If order_date is naive, assume it's UTC
-                                if order_date.tzinfo is None:
-                                    order_date = order_date.replace(tzinfo=timezone.utc)
-                                
-                                # Skip orders older than 15 days
-                                if order_date < cutoff_date:
-                                    continue
-                            
-                            order_dict['account'] = acc.name
-                            order_dict['provider'] = acc.provider
-                            
-                            # Format float values
-                            for k, v in order_dict.items():
-                                if isinstance(v, float):
-                                    order_dict[k] = f"{v:.2f}"
-                            
-                            # Add comment field for all orders
-                            order_dict['comment'] = order_dict.get('comment', '')
-                            
-                            all_orders.append(order_dict)
-                    else:
-                        # Provider doesn't support orders - add info row
-                        all_orders.append({
-                            'account': acc.name,
-                            'provider': acc.provider,
-                            'symbol': 'N/A',
-                            'side': 'Orders not supported',
-                            'qty': '',
-                            'order_type': '',
-                            'status': '',
-                            'submitted_at': '',
-                            'filled_at': '',
-                            'comment': ''
-                        })
-                except Exception as e:
-                    # Add error row if can't fetch orders
-                    logger.error(f"Error fetching orders for account {acc.name}: {e}", exc_info=True)
-                    all_orders.append({
-                        'account': acc.name,
-                        'provider': acc.provider,
-                        'symbol': 'ERROR',
-                        'side': str(e),
-                        'qty': '',
-                        'order_type': '',
-                        'status': '',
-                        'submitted_at': '',
-                        'filled_at': '',
-                        'comment': ''
-                    })
+        try:
+            # Query orders from database with joins to get expert information
+            statement = (
+                select(TradingOrder, AccountDefinition, ExpertRecommendation, ExpertInstance)
+                .join(AccountDefinition, TradingOrder.account_id == AccountDefinition.id)
+                .outerjoin(ExpertRecommendation, TradingOrder.expert_recommendation_id == ExpertRecommendation.id)
+                .outerjoin(ExpertInstance, ExpertRecommendation.instance_id == ExpertInstance.id)
+                .where(TradingOrder.created_at >= cutoff_date)
+                .order_by(TradingOrder.created_at.desc())
+            )
+            
+            results = session.exec(statement).all()
+            
+            for order, account, recommendation, expert_instance in results:
+                # Get expert name if available
+                expert_name = ""
+                if expert_instance:
+                    expert_name = expert_instance.user_description or expert_instance.expert
+                elif not recommendation:
+                    expert_name = "Manual"  # No recommendation means manual order
+                
+                # Format the order data
+                order_dict = {
+                    'account': account.name,
+                    'provider': account.provider,
+                    'symbol': order.symbol,
+                    'side': order.side.value if hasattr(order.side, 'value') else str(order.side),
+                    'qty': f"{order.quantity:.2f}" if order.quantity else "",
+                    'order_type': order.order_type.value if hasattr(order.order_type, 'value') else str(order.order_type),
+                    'status': order.status.value if hasattr(order.status, 'value') else str(order.status),
+                    'limit_price': f"${order.limit_price:.2f}" if order.limit_price else "",
+                    'filled_qty': f"{order.filled_qty:.2f}" if order.filled_qty else "",
+                    'created_at': order.created_at.strftime('%Y-%m-%d %H:%M') if order.created_at else "",
+                    'comment': order.comment or "",
+                    'expert': expert_name
+                }
+                
+                all_orders.append(order_dict)
+                
+        except Exception as e:
+            logger.error(f"Error fetching orders from database: {e}", exc_info=True)
+            all_orders.append({
+                'account': 'ERROR',
+                'provider': '',
+                'symbol': 'ERROR',
+                'side': str(e),
+                'qty': '',
+                'order_type': '',
+                'status': '',
+                'limit_price': '',
+                'filled_price': '',
+                'created_at': '',
+                'comment': '',
+                'expert': ''
+            })
+        finally:
+            session.close()
         
         # Define columns for orders table
         order_columns = [
-            {'name': 'account', 'label': 'Account', 'field': 'account'},
-            {'name': 'provider', 'label': 'Provider', 'field': 'provider'},
-            {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol'},
-            {'name': 'side', 'label': 'Side', 'field': 'side'},
-            {'name': 'qty', 'label': 'Quantity', 'field': 'qty'},
-            {'name': 'order_type', 'label': 'Order Type', 'field': 'order_type'},
-            {'name': 'status', 'label': 'Status', 'field': 'status'},
-            {'name': 'limit_price', 'label': 'Limit Price', 'field': 'limit_price'},
-            {'name': 'filled_price', 'label': 'Filled Price', 'field': 'filled_price'},
-            {'name': 'submitted_at', 'label': 'Submitted', 'field': 'submitted_at'},
-            {'name': 'filled_at', 'label': 'Filled', 'field': 'filled_at'},
-            {'name': 'comment', 'label': 'Comment', 'field': 'comment'}
+            {'name': 'created_at', 'label': 'Date', 'field': 'created_at', 'align': 'left'},
+            {'name': 'account', 'label': 'Account', 'field': 'account', 'align': 'left'},
+            {'name': 'provider', 'label': 'Provider', 'field': 'provider', 'align': 'left'},
+            {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left'},
+            {'name': 'side', 'label': 'Side', 'field': 'side', 'align': 'center'},
+            {'name': 'qty', 'label': 'Quantity', 'field': 'qty', 'align': 'right'},
+            {'name': 'order_type', 'label': 'Order Type', 'field': 'order_type', 'align': 'center'},
+            {'name': 'status', 'label': 'Status', 'field': 'status', 'align': 'center'},
+            {'name': 'limit_price', 'label': 'Limit Price', 'field': 'limit_price', 'align': 'right'},
+            {'name': 'filled_qty', 'label': 'Filled Qty', 'field': 'filled_qty', 'align': 'right'},
+            {'name': 'expert', 'label': 'Expert', 'field': 'expert', 'align': 'left'},
+            {'name': 'comment', 'label': 'Comment', 'field': 'comment', 'align': 'left'}
         ]
         
         if all_orders:
-            ui.table(columns=order_columns, rows=all_orders, row_key='account').classes('w-full')
+            ui.table(columns=order_columns, rows=all_orders, row_key='symbol').classes('w-full')
         else:
             ui.label('No orders found or no accounts configured.').classes('text-gray-500')
+    
     
     def _render_pending_orders_table(self):
         """Render table with pending orders from database (PENDING or WAITING_TRIGGER)."""

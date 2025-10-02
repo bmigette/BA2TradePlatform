@@ -140,12 +140,18 @@ class JobMonitoringTab:
                            :disable="props.row.status === 'running'">
                         <q-tooltip>Cancel Analysis</q-tooltip>
                     </q-btn>
+                    <q-btn flat dense icon="bug_report" 
+                           color="accent" 
+                           @click="$parent.$emit('troubleshoot_ruleset', props.row.id)">
+                        <q-tooltip>Troubleshoot Ruleset</q-tooltip>
+                    </q-btn>
                 </q-td>
             ''')
             
             # Handle events
             self.analysis_table.on('cancel_analysis', self.cancel_analysis)
             self.analysis_table.on('view_details', self.view_analysis_details)
+            self.analysis_table.on('troubleshoot_ruleset', self.troubleshoot_ruleset)
 
     def _create_queue_status(self):
         """Create worker queue status display."""
@@ -409,6 +415,29 @@ class JobMonitoringTab:
         except Exception as e:
             logger.error(f"Error navigating to analysis details {analysis_id if analysis_id else 'unknown'}: {e}", exc_info=True)
             ui.notify(f"Error opening details: {str(e)}", type='negative')
+    
+    def troubleshoot_ruleset(self, event_data):
+        """Navigate to the ruleset test page with market analysis parameters."""
+        analysis_id = None
+        try:
+            # Extract analysis_id from event data
+            if hasattr(event_data, 'args') and hasattr(event_data.args, '__len__') and len(event_data.args) > 0:
+                analysis_id = int(event_data.args[0])
+            elif isinstance(event_data, int):
+                analysis_id = event_data
+            elif hasattr(event_data, 'args') and isinstance(event_data.args, int):
+                analysis_id = event_data.args
+            else:
+                logger.error(f"Invalid event data for troubleshoot_ruleset: {event_data}", exc_info=True)
+                ui.notify("Invalid event data", type='negative')
+                return
+            
+            # Navigate to ruleset test page with market analysis ID
+            ui.navigate.to(f'/rulesettest?market_analysis_id={analysis_id}')
+            
+        except Exception as e:
+            logger.error(f"Error navigating to ruleset test {analysis_id if analysis_id else 'unknown'}: {e}", exc_info=True)
+            ui.notify(f"Error opening ruleset test: {str(e)}", type='negative')
 
     def refresh_data(self):
         """Refresh the data in all tables."""

@@ -1,7 +1,7 @@
 {
   "export_version": "1.0",
   "export_type": "rulesets",
-  "export_timestamp": "2025-10-01T22:15:09.720736",
+  "export_timestamp": "2025-10-02T11:11:45.124336",
   "rulesets": [
     {
       "name": "Medium/Long Term Enter",
@@ -194,7 +194,7 @@
       ]
     },
     {
-      "name": "Short_Term_Enter",
+      "name": "Short/Med_Term_Enter",
       "description": null,
       "type": "trading_recommendation_rule",
       "subtype": "enter_market",
@@ -214,6 +214,11 @@
               "event_type": "expected_profit_target_percent",
               "operator": ">",
               "value": 5.0
+            },
+            "trigger_3": {
+              "event_type": "confidence",
+              "operator": ">",
+              "value": 70.0
             }
           },
           "actions": {
@@ -229,17 +234,53 @@
           "extra_parameters": {},
           "continue_processing": false,
           "order_index": 0
+        },
+        {
+          "name": "MedTerm_Is_Positive",
+          "type": "trading_recommendation_rule",
+          "subtype": "enter_market",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "medium_term"
+            },
+            "trigger_1": {
+              "event_type": "current_rating_positive"
+            },
+            "trigger_2": {
+              "event_type": "expected_profit_target_percent",
+              "operator": ">",
+              "value": 5.0
+            },
+            "trigger_3": {
+              "event_type": "confidence",
+              "operator": ">",
+              "value": 70.0
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "buy"
+            },
+            "action_1": {
+              "action_type": "adjust_take_profit",
+              "value": 0.0,
+              "reference_value": "expert_target_price"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 1
         }
       ]
     },
     {
-      "name": "Short_Term_Exit",
+      "name": "Short/Med_Term_Exit",
       "description": null,
       "type": "trading_recommendation_rule",
       "subtype": "open_positions",
       "rules": [
         {
-          "name": "ShortTerm_Neutral_Exit_No_Profit",
+          "name": "Neutral_Exit_No_Profit",
           "type": "trading_recommendation_rule",
           "subtype": "open_positions",
           "triggers": {
@@ -265,7 +306,7 @@
           "order_index": 0
         },
         {
-          "name": "ShortTerm_Negative_Exit_loss5%",
+          "name": "Negative_Exit_loss5%",
           "type": "trading_recommendation_rule",
           "subtype": "open_positions",
           "triggers": {
@@ -296,7 +337,7 @@
           "order_index": 1
         },
         {
-          "name": "ShortTerm_Negative_Exit_loss10",
+          "name": "Negative_Exit_loss10",
           "type": "trading_recommendation_rule",
           "subtype": "open_positions",
           "triggers": {
@@ -320,6 +361,117 @@
           "actions": {
             "action_0": {
               "action_type": "close"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 2
+        }
+      ]
+    },
+    {
+      "name": "Short/Med_Term_Enter_FinnHub",
+      "description": null,
+      "type": "trading_recommendation_rule",
+      "subtype": "enter_market",
+      "rules": [
+        {
+          "name": "ShortTerm_Is_Positive",
+          "type": "trading_recommendation_rule",
+          "subtype": "enter_market",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "short_term"
+            },
+            "trigger_1": {
+              "event_type": "current_rating_positive"
+            },
+            "trigger_2": {
+              "event_type": "expected_profit_target_percent",
+              "operator": ">",
+              "value": 5.0
+            },
+            "trigger_3": {
+              "event_type": "confidence",
+              "operator": ">",
+              "value": 70.0
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "buy"
+            },
+            "action_1": {
+              "action_type": "adjust_take_profit",
+              "value": 0.0,
+              "reference_value": "expert_target_price"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 0
+        },
+        {
+          "name": "MedTerm_Is_Positive",
+          "type": "trading_recommendation_rule",
+          "subtype": "enter_market",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "medium_term"
+            },
+            "trigger_1": {
+              "event_type": "current_rating_positive"
+            },
+            "trigger_2": {
+              "event_type": "expected_profit_target_percent",
+              "operator": ">",
+              "value": 5.0
+            },
+            "trigger_3": {
+              "event_type": "confidence",
+              "operator": ">",
+              "value": 70.0
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "buy"
+            },
+            "action_1": {
+              "action_type": "adjust_take_profit",
+              "value": 0.0,
+              "reference_value": "expert_target_price"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 1
+        },
+        {
+          "name": "ShortTerm_Is_Positive_0ProfitTarget",
+          "type": "trading_recommendation_rule",
+          "subtype": "enter_market",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "short_term"
+            },
+            "trigger_1": {
+              "event_type": "current_rating_positive"
+            },
+            "trigger_3": {
+              "event_type": "confidence",
+              "operator": ">",
+              "value": 70.0
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "buy"
+            },
+            "action_1": {
+              "action_type": "adjust_take_profit",
+              "value": 0.0,
+              "reference_value": "expert_target_price"
             }
           },
           "extra_parameters": {},

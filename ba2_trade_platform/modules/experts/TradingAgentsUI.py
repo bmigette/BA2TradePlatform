@@ -2,14 +2,17 @@ from nicegui import ui
 from typing import Dict, Any, Optional
 import json
 from datetime import datetime
+import pandas as pd
+import io
 
-from ...core.models import MarketAnalysis
+from ...core.models import MarketAnalysis, AnalysisOutput
 from ...core.types import MarketAnalysisStatus
 from ...logger import logger
 # Load expert recommendations using a proper database session
 from ...core.db import get_db
 from ...core.models import ExpertRecommendation
 from sqlmodel import select
+from ...ui.components import InstrumentGraph
             
 
 class TradingAgentsUI:
@@ -50,6 +53,7 @@ class TradingAgentsUI:
         """Render the completed analysis with full tab interface."""
         with ui.tabs().classes('w-full') as tabs:
             summary_tab = ui.tab('📊 Summary')
+            dataviz_tab = ui.tab('📉 Data Visualization')
             market_tab = ui.tab('📈 Market Analysis')
             sentiment_tab = ui.tab('💬 Social Sentiment') 
             news_tab = ui.tab('📰 News Analysis')
@@ -64,6 +68,9 @@ class TradingAgentsUI:
         with ui.tab_panels(tabs, value=summary_tab).classes('w-full'):
             with ui.tab_panel(summary_tab):
                 self._render_summary_panel()
+            
+            with ui.tab_panel(dataviz_tab):
+                self._render_data_visualization_panel()
             
             with ui.tab_panel(market_tab):
                 self._render_content_panel('market_report', '📈 Market Analysis', 
@@ -109,6 +116,7 @@ class TradingAgentsUI:
         """Render in-progress analysis with partial data in tabs."""
         with ui.tabs().classes('w-full') as tabs:
             summary_tab = ui.tab('📊 Summary')
+            dataviz_tab = ui.tab('📉 Data Visualization')
             market_tab = ui.tab(self._get_tab_label('market_report', '📈 Market Analysis'))
             sentiment_tab = ui.tab(self._get_tab_label('sentiment_report', '💬 Social Sentiment'))
             news_tab = ui.tab(self._get_tab_label('news_report', '📰 News Analysis'))
@@ -123,6 +131,9 @@ class TradingAgentsUI:
         with ui.tab_panels(tabs, value=summary_tab).classes('w-full'):
             with ui.tab_panel(summary_tab):
                 self._render_in_progress_summary()
+            
+            with ui.tab_panel(dataviz_tab):
+                self._render_data_visualization_panel()
             
             with ui.tab_panel(market_tab):
                 self._render_content_panel('market_report', '📈 Market Analysis', 
@@ -624,3 +635,202 @@ class TradingAgentsUI:
         except Exception as e:
             logger.error(f"Error rendering expert recommendation: {e}", exc_info=True)
             # Fail silently to not break the UI
+    
+    def _render_data_visualization_panel(self) -> None:
+        """Render data visualization panel with price and indicator charts."""
+        try:
+            with ui.card().classes('w-full p-4'):
+                ui.label('📉 Market Data & Technical Indicators').classes('text-h6 mb-4')
+                ui.label('Interactive charts showing price action and technical indicators from analysis').classes('text-sm text-gray-600 mb-4')
+                
+                # Get analysis outputs from database
+                session = get_db()
+                try:
+                    statement = (
+                        select(AnalysisOutput)
+                        .where(AnalysisOutput.market_analysis_id == self.market_analysis.id)
+                    )
+                    outputs = session.exec(statement).all()
+                    
+                    # Look for price data and indicator outputs
+                    price_data = None
+                    indicators_data = {}
+                    
+                    # Initialize data provider for reconstructing data from cache
+                    from ba2_trade_platform.modules.dataproviders import YFinanceDataProvider
+                    from ba2_trade_platform.config import CACHE_FOLDER
+                    from datetime import datetime
+                    
+                    provider = YFinanceDataProvider(CACHE_FOLDER)
+                    
+                    for output in outputs:
+                        output_obj = output[0] if isinstance(output, tuple) else output
+                        
+                        # Look for YFin data (price data) - JSON contains parameters
+                        if 'tool_output_get_YFin_data' in output_obj.name.lower():
+                            try:
+                                # JSON format contains PARAMETERS to reconstruct from cache
+                                if output_obj.name.endswith('_json') and output_obj.text:
+                                    import json
+                                    params = json.loads(output_obj.text)
+                                    
+                                    # Reconstruct data from cache using stored parameters
+                                    if params.get('tool') == 'get_YFin_data_online':
+                                        logger.info(f"Reconstructing price data from cache: {params['symbol']} {params['interval']}")
+                                        
+                                        # Get data from cache (or fetch if needed)
+                                        price_data = provider.get_dataframe(
+                                            symbol=params['symbol'],
+                                            start_date=datetime.strptime(params['start_date'], '%Y-%m-%d'),
+                                            end_date=datetime.strptime(params['end_date'], '%Y-%m-%d'),
+                                            interval=params['interval']
+                                        )
+                                        
+                                        # Set Date as index for charting
+                                        if 'Date' in price_data.columns and not isinstance(price_data.index, pd.DatetimeIndex):
+                                            price_data['Date'] = pd.to_datetime(price_data['Date'])
+                                            price_data.set_index('Date', inplace=True)
+                                        
+                                        logger.info(f"Reconstructed price data from cache: {len(price_data)} rows")
+                                
+                                # Fallback to CSV parsing (old format) if no parameters
+                                elif not output_obj.name.endswith('_json') and output_obj.text and price_data is None:
+                                    # Parse CSV data (legacy support)
+                                    price_data = pd.read_csv(io.StringIO(output_obj.text))
+                                    
+                                    # Convert Date column to datetime if it exists
+                                    if 'Date' in price_data.columns:
+                                        price_data['Date'] = pd.to_datetime(price_data['Date'])
+                                        price_data.set_index('Date', inplace=True)
+                                    
+                                    logger.info(f"Loaded price data from CSV (legacy): {len(price_data)} rows")
+                            except Exception as e:
+                                logger.error(f"Error reconstructing price data: {e}", exc_info=True)
+                        
+                        # Look for technical indicators - JSON contains parameters
+                        elif 'tool_output_get_stockstats_indicators' in output_obj.name.lower():
+                            try:
+                                # JSON format contains PARAMETERS to reconstruct from cache
+                                if output_obj.name.endswith('_json') and output_obj.text:
+                                    import json
+                                    params = json.loads(output_obj.text)
+                                    
+                                    # Reconstruct indicator data from cache using stored parameters
+                                    if params.get('tool') == 'get_stock_stats_indicators_window':
+                                        indicator_name = params.get('indicator', 'Unknown Indicator').replace('_', ' ').title()
+                                        logger.info(f"Reconstructing indicator '{indicator_name}' from cache")
+                                        
+                                        # Use StockstatsUtils to recalculate indicator from cached price data
+                                        from ba2_trade_platform.thirdparties.TradingAgents.tradingagents.dataflows.stockstats_utils import StockstatsUtils
+                                        import os
+                                        
+                                        # Get indicator data using the data provider
+                                        indicator_df = StockstatsUtils.get_stock_stats_range(
+                                            symbol=params['symbol'],
+                                            indicator=params['indicator'],
+                                            start_date=params['start_date'],
+                                            end_date=params['end_date'],
+                                            data_dir='',  # Not used when online=True
+                                            online=True,  # Use data provider
+                                            interval=params['interval']
+                                        )
+                                        
+                                        # Convert Date column to datetime index
+                                        if 'Date' in indicator_df.columns:
+                                            indicator_df['Date'] = pd.to_datetime(indicator_df['Date'])
+                                            indicator_df.set_index('Date', inplace=True)
+                                        
+                                        indicators_data[indicator_name] = indicator_df
+                                        logger.info(f"Reconstructed indicator '{indicator_name}' from cache: {len(indicator_df)} rows")
+                                
+                                # Fallback to markdown parsing (old format) if no parameters
+                                elif not output_obj.name.endswith('_json') and output_obj.text:
+                                    # Parse markdown-formatted indicator data (legacy support)
+                                    # Format: "## indicator_name values from date to date:\n\nYYYY-MM-DD: value\n..."
+                                    
+                                    # Extract indicator name from first line
+                                    lines = output_obj.text.strip().split('\n')
+                                    indicator_name = "Unknown Indicator"
+                                    
+                                    if lines and lines[0].startswith('##'):
+                                        # Extract indicator name from header like "## close_50_sma values from..."
+                                        header = lines[0].replace('##', '').strip()
+                                        if ' values from' in header:
+                                            indicator_name = header.split(' values from')[0].strip().replace('_', ' ').title()
+                                    
+                                    # Parse date-value pairs
+                                    dates = []
+                                    values = []
+                                    
+                                    for line in lines[1:]:  # Skip header line
+                                        line = line.strip()
+                                        if not line or line.startswith('##'):
+                                            continue
+                                        
+                                        # Parse lines like "2025-09-30: 355.00339782714843"
+                                        if ':' in line:
+                                            parts = line.split(':', 1)
+                                            if len(parts) == 2:
+                                                date_str = parts[0].strip()
+                                                value_str = parts[1].strip()
+                                                
+                                                # Skip N/A values (weekends/holidays)
+                                                if 'N/A' in value_str or 'Not a trading day' in value_str:
+                                                    continue
+                                                
+                                                try:
+                                                    # Parse date
+                                                    date = pd.to_datetime(date_str)
+                                                    # Parse value (handle potential extra text after the number)
+                                                    value = float(value_str.split()[0]) if value_str else None
+                                                    
+                                                    if value is not None:
+                                                        dates.append(date)
+                                                        values.append(value)
+                                                except (ValueError, IndexError):
+                                                    continue
+                                    
+                                    # Create DataFrame if we have data
+                                    if dates and values:
+                                        indicator_df = pd.DataFrame({
+                                            'value': values
+                                        }, index=pd.DatetimeIndex(dates))
+                                        
+                                        indicators_data[indicator_name] = indicator_df
+                                        logger.info(f"Loaded indicator {indicator_name}: {len(indicator_df)} rows")
+                                    
+                            except Exception as e:
+                                logger.error(f"Error parsing indicator data from {output_obj.name}: {e}", exc_info=True)
+                    
+                    # Render the graph if we have data
+                    if price_data is not None and not price_data.empty:
+                        ui.separator().classes('my-4')
+                        graph = InstrumentGraph(
+                            symbol=self.market_analysis.symbol,
+                            price_data=price_data,
+                            indicators_data=indicators_data
+                        )
+                        graph.render()
+                    else:
+                        ui.label('No price data available for visualization').classes('text-gray-500 text-center py-8')
+                        ui.label('Price data is generated by the tool_output_get_YFin_data_online during analysis').classes('text-sm text-gray-400 text-center')
+                    
+                    # Show raw data summary
+                    if price_data is not None or indicators_data:
+                        ui.separator().classes('my-4')
+                        with ui.expansion('📊 Data Summary', icon='info').classes('w-full'):
+                            if price_data is not None:
+                                ui.label(f'Price Data: {len(price_data)} data points').classes('text-sm font-bold')
+                                ui.label(f'Columns: {", ".join(price_data.columns)}').classes('text-xs text-gray-600 mb-2')
+                            
+                            if indicators_data:
+                                ui.label(f'Technical Indicators: {len(indicators_data)} indicators loaded').classes('text-sm font-bold mt-2')
+                                for name, df in indicators_data.items():
+                                    ui.label(f'  • {name}: {len(df)} data points, columns: {", ".join(df.columns)}').classes('text-xs text-gray-600')
+                
+                finally:
+                    session.close()
+                    
+        except Exception as e:
+            logger.error(f"Error rendering data visualization panel: {e}", exc_info=True)
+            ui.label(f'Error loading visualization data: {e}').classes('text-red-500')

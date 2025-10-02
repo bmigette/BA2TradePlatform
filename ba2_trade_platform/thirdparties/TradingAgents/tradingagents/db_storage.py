@@ -271,15 +271,51 @@ class LoggingToolNode:
                 tool_name = matching_call.get('name', 'unknown_tool') if matching_call else 'unknown_tool'
                 output_content = tool_msg.content if hasattr(tool_msg, 'content') else str(tool_msg)
                 
-                ta_logger.info(f"[TOOL_RESULT] {tool_name} returned: {output_content[:2000]}...")
-                
-                # Store tool output
-                store_analysis_output(
-                    market_analysis_id=self.market_analysis_id,
-                    name=f"tool_output_{tool_name}",
-                    output_type="tool_call_output",
-                    text=f"Tool: {tool_name}\nOutput: {output_content}\nTimestamp: {datetime.now(timezone.utc).isoformat()}"
-                )
+                # Check if tool returned internal format with separate data for agent and storage
+                if isinstance(output_content, dict) and output_content.get('_internal'):
+                    # Tool returned structured format
+                    text_for_agent = output_content.get('text_for_agent', '')
+                    json_for_storage = output_content.get('json_for_storage')
+                    is_error = output_content.get('_error', False)
+                    
+                    # If this is a critical error, update analysis status to FAILED
+                    if is_error:
+                        ta_logger.error(f"[TOOL_ERROR] {tool_name} returned critical error: {text_for_agent}")
+                        update_market_analysis_status(
+                            self.market_analysis_id,
+                            "FAILED",
+                            {"error": text_for_agent, "failed_tool": tool_name, "timestamp": datetime.now(timezone.utc).isoformat()}
+                        )
+                    else:
+                        ta_logger.info(f"[TOOL_RESULT] {tool_name} returned: {text_for_agent[:2000]}...")
+                    
+                    # Store text format
+                    store_analysis_output(
+                        market_analysis_id=self.market_analysis_id,
+                        name=f"tool_output_{tool_name}",
+                        output_type="tool_call_output_error" if is_error else "tool_call_output",
+                        text=f"Tool: {tool_name}\nOutput: {text_for_agent}\nTimestamp: {datetime.now(timezone.utc).isoformat()}"
+                    )
+                    
+                    # Store JSON format if provided
+                    if json_for_storage:
+                        import json
+                        store_analysis_output(
+                            market_analysis_id=self.market_analysis_id,
+                            name=f"tool_output_{tool_name}_json",
+                            output_type="tool_call_output_json",
+                            text=json.dumps(json_for_storage, indent=2)
+                        )
+                else:
+                    # Tool returned simple text (backward compatible)
+                    ta_logger.info(f"[TOOL_RESULT] {tool_name} returned: {output_content[:2000] if isinstance(output_content, str) else str(output_content)[:2000]}...")
+                    
+                    store_analysis_output(
+                        market_analysis_id=self.market_analysis_id,
+                        name=f"tool_output_{tool_name}",
+                        output_type="tool_call_output",
+                        text=f"Tool: {tool_name}\nOutput: {output_content}\nTimestamp: {datetime.now(timezone.utc).isoformat()}"
+                    )
         
         return result
 
