@@ -259,7 +259,7 @@ class RulesetTestTab:
                         self.profit_input.value = recommendation.expected_profit_percent
                     
                     if self.confidence_input and recommendation.confidence:
-                        self.confidence_input.value = recommendation.confidence * 100  # Convert to percentage
+                        self.confidence_input.value = recommendation.confidence  # Already stored as 1-100
                     
                     if self.risk_select and recommendation.risk_level  is not None:
                         if hasattr(recommendation.risk_level, 'value'):

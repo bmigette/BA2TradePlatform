@@ -153,8 +153,8 @@ class FinnHubRating(MarketExpertInterface):
             signal = OrderRecommendation.HOLD
             dominant_score = hold_score
         
-        # Calculate confidence (ratio of dominant signal to total)
-        confidence = dominant_score / total_weighted if total_weighted > 0 else 0.0
+        # Calculate confidence (ratio of dominant signal to total) - stored as 1-100 scale
+        confidence = (dominant_score / total_weighted * 100) if total_weighted > 0 else 0.0
         
         # Build details string
         details = f"""Finnhub Recommendation Trends Analysis (Period: {period})
@@ -173,13 +173,13 @@ Weighted Scores (Strong Factor: {strong_factor}x):
 - Total Weighted: {total_weighted:.1f}
 
 Recommendation: {signal.value}
-Confidence: {confidence:.1%}
+Confidence: {confidence:.1f}%
 
 Calculation Method:
 Buy Score = (Strong Buy × {strong_factor}) + Buy = ({strong_buy} × {strong_factor}) + {buy} = {buy_score:.1f}
 Hold Score = Hold = {hold}
 Sell Score = (Strong Sell × {strong_factor}) + Sell = ({strong_sell} × {strong_factor}) + {sell} = {sell_score:.1f}
-Confidence = Dominant Score / Total = {dominant_score:.1f} / {total_weighted:.1f} = {confidence:.1%}
+Confidence = Dominant Score / Total × 100 = {dominant_score:.1f} / {total_weighted:.1f} × 100 = {confidence:.1f}%
 """
         
         return {
@@ -205,7 +205,7 @@ Confidence = Dominant Score / Total = {dominant_score:.1f} / {total_weighted:.1f
                 expected_profit_percent=0.0,  # FinnHub doesn't provide profit targets
                 price_at_date=current_price or 0.0,
                 details=recommendation_data['details'][:100000] if recommendation_data['details'] else None,
-                confidence=round(recommendation_data['confidence'], 3),
+                confidence=round(recommendation_data['confidence'], 1),  # Store as 1-100 scale
                 risk_level=RiskLevel.MEDIUM,  # Always medium risk
                 time_horizon=TimeHorizon.MEDIUM_TERM,  # Always medium term
                 market_analysis_id=market_analysis_id,
@@ -214,7 +214,7 @@ Confidence = Dominant Score / Total = {dominant_score:.1f} / {total_weighted:.1f
             
             recommendation_id = add_instance(expert_recommendation)
             logger.info(f"Created ExpertRecommendation (ID: {recommendation_id}) for {symbol}: "
-                       f"{recommendation_data['signal'].value} with {recommendation_data['confidence']:.1%} confidence")
+                       f"{recommendation_data['signal'].value} with {recommendation_data['confidence']:.1f}% confidence")
             return recommendation_id
             
         except Exception as e:
@@ -331,7 +331,7 @@ Confidence = Dominant Score / Total = {dominant_score:.1f} / {total_weighted:.1f
             update_instance(market_analysis)
             
             logger.info(f"Completed FinnHubRating analysis for {symbol}: {recommendation_data['signal'].value} "
-                       f"(confidence: {recommendation_data['confidence']:.1%})")
+                       f"(confidence: {recommendation_data['confidence']:.1f}%)")
             
         except Exception as e:
             logger.error(f"FinnHubRating analysis failed for {symbol}: {e}", exc_info=True)
@@ -483,7 +483,7 @@ Confidence = Dominant Score / Total = {dominant_score:.1f} / {total_weighted:.1f
                     
                     with ui.column().classes('text-right'):
                         ui.label('Confidence').classes('text-grey-6 text-caption')
-                        ui.label(f'{confidence:.1%}').classes('text-h4')
+                        ui.label(f'{confidence:.1f}%').classes('text-h4')
                 
                 if current_price:
                     ui.separator().classes('my-2')

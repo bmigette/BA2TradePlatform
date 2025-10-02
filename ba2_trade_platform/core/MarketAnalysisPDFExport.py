@@ -285,7 +285,7 @@ class MarketAnalysisPDFExport:
                 
                 for rec in recommendations:
                     action = rec.recommended_action.value if hasattr(rec.recommended_action, 'value') else str(rec.recommended_action)
-                    confidence = f"{rec.confidence:.1%}" if rec.confidence is not None else 'N/A'
+                    confidence = f"{rec.confidence:.1f}%" if rec.confidence is not None else 'N/A'
                     profit = f"{rec.expected_profit_percent:.2f}%" if rec.expected_profit_percent else 'N/A'
                     risk = rec.risk_level.value if hasattr(rec.risk_level, 'value') else str(rec.risk_level)
                     horizon = rec.time_horizon.value.replace('_', ' ').title() if hasattr(rec.time_horizon, 'value') else str(rec.time_horizon)

@@ -387,7 +387,7 @@ def _render_order_recommendations_tab(market_analysis: MarketAnalysis) -> None:
                         'symbol': rec.symbol,
                         'action': action,
                         'action_color': {'BUY': 'green', 'SELL': 'red', 'HOLD': 'orange'}.get(action, 'grey'),
-                        'confidence': f"{rec.confidence:.1%}" if rec.confidence is not None else 'N/A',
+                        'confidence': f"{rec.confidence:.1f}%" if rec.confidence is not None else 'N/A',
                         'expected_profit': f"{rec.expected_profit_percent:.2f}%" if rec.expected_profit_percent else 'N/A',
                         'price_at_date': f"${rec.price_at_date:.2f}" if rec.price_at_date else 'N/A',
                         'risk_level': rec.risk_level.value if hasattr(rec.risk_level, 'value') else str(rec.risk_level),

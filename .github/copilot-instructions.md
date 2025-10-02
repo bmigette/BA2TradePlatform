@@ -129,6 +129,31 @@ logger.error("Error conditions", exc_info=True)  # Include exc_info=True ONLY in
 
 **Rationale**: Using default values for financial data can lead to catastrophic trading errors, incorrect position sizing, and financial loss. Always fail explicitly rather than proceeding with fake data.
 
+### 6. **Confidence Level Handling**
+**CRITICAL RULE**: Confidence values are **always stored as 1-100 scale** in the database, never divided or multiplied:
+- ✅ **ALWAYS DO THIS**: Store confidence as 1-100 (e.g., 78.1 means 78.1% confidence)
+- ✅ **ALWAYS DO THIS**: Display using `f"{confidence:.1f}%"` format (e.g., "78.1%")
+- ❌ **NEVER DO THIS**: `confidence * 100` or `confidence / 100` when reading/writing
+- ❌ **NEVER DO THIS**: Use `.1%` format string (expects 0-1 scale, we use 1-100)
+
+**Examples:**
+```python
+# ✅ Correct - Store as 1-100
+confidence = 78.1
+expert_rec.confidence = round(confidence, 1)
+
+# ✅ Correct - Display as number with % sign
+print(f"Confidence: {confidence:.1f}%")  # "Confidence: 78.1%"
+
+# ❌ Wrong - Don't multiply/divide
+confidence = recommendation.confidence * 100  # NO!
+
+# ❌ Wrong - Don't use .1% format
+print(f"Confidence: {confidence:.1%}")  # Expects 0-1, we have 1-100!
+```
+
+**Rationale**: Consistency across all experts and UI components. All confidence values use the same 1-100 scale to avoid conversion errors and confusion.
+
 ## Dependencies
 - **Trading**: `alpaca-py` (primary broker), `yfinance`, `backtrader`
 - **AI/ML**: `langchain-*` ecosystem, `stockstats`

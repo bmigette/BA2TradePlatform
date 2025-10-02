@@ -205,7 +205,7 @@ class TradingAgents(MarketExpertInterface):
             
             recommendation_id = add_instance(expert_recommendation)
             logger.info(f"[SUCCESS] Created ExpertRecommendation (ID: {recommendation_id}) for {symbol}: "
-                       f"{recommendation_data['signal']} with {recommendation_data['confidence']:.1%} confidence")
+                       f"{recommendation_data['signal']} with {recommendation_data['confidence']:.1f}% confidence")
             return recommendation_id
             
         except Exception as e:
@@ -264,7 +264,7 @@ class TradingAgents(MarketExpertInterface):
         return f"""TradingAgents Analysis Summary for {symbol}:
 
 Signal: {recommendation_data.get('signal', 'UNKNOWN')}
-Confidence: {recommendation_data.get('confidence', 0.0):.1%}
+Confidence: {recommendation_data.get('confidence', 0.0):.1f}%
 Expected Profit: {recommendation_data.get('expected_profit', 0.0):.2f}%
 Risk Level: {recommendation_data.get('risk_level', 'UNKNOWN')}
 Time Horizon: {recommendation_data.get('time_horizon', 'UNKNOWN')}
@@ -319,7 +319,7 @@ Analysis completed at: {self._get_current_timestamp()}"""
             update_instance(market_analysis)
 
             logger.info(f"[COMPLETE] TradingAgents analysis completed for {symbol}: "
-                       f"{recommendation_data['signal']} ({recommendation_data['confidence']:.1%} confidence)")
+                       f"{recommendation_data['signal']} ({recommendation_data['confidence']:.1f}% confidence)")
             
             # Trigger Trade Manager to process the recommendation (if automatic trading is enabled)
             self._notify_trade_manager(recommendation_id, symbol)
