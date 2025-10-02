@@ -732,12 +732,17 @@ class TradeManager:
                 self.logger.info(f"Found {len(recommendations)} unique instruments with recommendations for expert {expert_instance_id} (filtered from {len(all_recommendations)} total recommendations)")
                 self.logger.info(f"Evaluating recommendations through enter_market ruleset: {expert_instance.enter_market_ruleset_id}")
                 
-                # Create TradeActionEvaluator for processing recommendations
-                evaluator = TradeActionEvaluator(account)
-                
                 # Process each recommendation through the enter_market ruleset
                 for recommendation in recommendations:
                     try:
+                        # Create TradeActionEvaluator with instrument_name for this recommendation
+                        # No existing_transactions for entering_markets use case
+                        evaluator = TradeActionEvaluator(
+                            account=account,
+                            instrument_name=recommendation.symbol,
+                            existing_transactions=None
+                        )
+                        
                         # Evaluate recommendation through the enter_market ruleset
                         self.logger.debug(f"Evaluating recommendation {recommendation.id} for {recommendation.symbol}")
                         
@@ -762,7 +767,12 @@ class TradeManager:
                         self.logger.info(f"Recommendation {recommendation.id} for {recommendation.symbol} passed ruleset - {len(action_summaries)} action(s) to execute")
                         
                         # Execute the actions using TradeActionEvaluator
+                        # Actions are already sorted by priority (BUY/SELL first, then TP/SL)
+                        # Thanks to _sort_actions_by_priority in execute() method
                         execution_results = evaluator.execute()
+                        
+                        # Track the main order (BUY/SELL) that was created so we can use it for TP/SL
+                        main_order = None
                         
                         # Process execution results
                         for result in execution_results:
@@ -773,11 +783,19 @@ class TradeManager:
                                 if result.get('data') and isinstance(result['data'], dict):
                                     order_id = result['data'].get('order_id')
                                     if order_id:
-                                        # Fetch the created order from database
-                                        order = get_instance(TradingOrder, order_id)
+                                        # Query the order from the current session (not using get_instance)
+                                        # to ensure it's attached to this session before expunge
+                                        from sqlmodel import select
+                                        statement = select(TradingOrder).where(TradingOrder.id == order_id)
+                                        order = session.exec(statement).first()
                                         if order:
                                             session.expunge(order)
                                             created_orders.append(order)
+                                            # Track the main order (first BUY/SELL order created)
+                                            # This will be the pending order that TP/SL can reference
+                                            if main_order is None and order.side in [OrderDirection.BUY, OrderDirection.SELL]:
+                                                main_order = order
+                                                self.logger.debug(f"Main order {order_id} will be used for TP/SL actions")
                                             self.logger.info(f"Created order {order_id} for {recommendation.symbol}")
                             else:
                                 self.logger.warning(f"Action execution failed: {result.get('message', 'Unknown error')}")
@@ -797,7 +815,24 @@ class TradeManager:
                         updated_orders = risk_management.review_and_prioritize_pending_orders(expert_instance_id)
                         self.logger.info(f"Risk management completed: updated {len(updated_orders)} orders with quantities")
                         
-                        # After risk management, check for any dependent orders (e.g., adjust TP/SL)
+                        # Auto-submit orders with quantity > 0 to broker
+                        submitted_count = 0
+                        for order in updated_orders:
+                            if order.quantity and order.quantity > 0:
+                                try:
+                                    self.logger.info(f"Auto-submitting order {order.id} for {order.symbol}: {order.quantity} shares")
+                                    submitted_order = account.submit_order(order)
+                                    if submitted_order:
+                                        submitted_count += 1
+                                        self.logger.info(f"Successfully submitted order {order.id} to broker")
+                                    else:
+                                        self.logger.warning(f"Failed to submit order {order.id} to broker")
+                                except Exception as submit_error:
+                                    self.logger.error(f"Error submitting order {order.id}: {submit_error}", exc_info=True)
+                        
+                        self.logger.info(f"Auto-submitted {submitted_count}/{len(updated_orders)} orders to broker")
+                        
+                        # After submitting orders, check for any dependent orders (e.g., TP/SL WAITING_TRIGGER)
                         # that may now be ready to execute
                         self.logger.info("Checking for dependent orders after risk management")
                         self._check_all_waiting_trigger_orders()

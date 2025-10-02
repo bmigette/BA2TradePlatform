@@ -1,7 +1,7 @@
 {
   "export_version": "1.0",
   "export_type": "rules",
-  "export_timestamp": "2025-10-02T11:12:10.232391",
+  "export_timestamp": "2025-10-02T21:47:57.680541",
   "rules": [
     {
       "name": "BUY_Longterm_70pctConfidence_10pctProfit",
@@ -23,6 +23,9 @@
         },
         "trigger_3": {
           "event_type": "long_term"
+        },
+        "trigger_4": {
+          "event_type": "has_no_position"
         }
       },
       "actions": {
@@ -58,6 +61,9 @@
         },
         "trigger_3": {
           "event_type": "medium_term"
+        },
+        "trigger_4": {
+          "event_type": "has_no_position"
         }
       },
       "actions": {
@@ -191,6 +197,9 @@
           "event_type": "confidence",
           "operator": ">",
           "value": 70.0
+        },
+        "trigger_4": {
+          "event_type": "has_no_position"
         }
       },
       "actions": {
@@ -311,6 +320,9 @@
           "event_type": "confidence",
           "operator": ">",
           "value": 70.0
+        },
+        "trigger_4": {
+          "event_type": "has_no_position"
         }
       },
       "actions": {
@@ -327,20 +339,18 @@
       "continue_processing": false
     },
     {
-      "name": "ShortTerm_Is_Positive_0ProfitTarget",
+      "name": "MedTerm_Is_Positive_0ProfitTarget",
       "type": "trading_recommendation_rule",
       "subtype": "enter_market",
       "triggers": {
         "trigger_0": {
-          "event_type": "short_term"
+          "event_type": "medium_term"
         },
         "trigger_1": {
           "event_type": "current_rating_positive"
         },
         "trigger_3": {
-          "event_type": "confidence",
-          "operator": ">",
-          "value": 70.0
+          "event_type": "has_no_position"
         }
       },
       "actions": {

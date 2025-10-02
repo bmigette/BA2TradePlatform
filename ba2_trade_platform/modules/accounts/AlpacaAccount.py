@@ -603,7 +603,7 @@ class AlpacaAccount(AccountInterface):
                             db_order.status = alpaca_order.status
                             has_changes = True
                         
-                        if float(db_order.filled_qty) != float(alpaca_order.filled_qty):
+                        if db_order.filled_qty is None or float(db_order.filled_qty) != float(alpaca_order.filled_qty):
                             logger.debug(f"Order {db_order.id} filled_qty changed: {db_order.filled_qty} -> {alpaca_order.filled_qty}")
                             db_order.filled_qty = alpaca_order.filled_qty
                             has_changes = True

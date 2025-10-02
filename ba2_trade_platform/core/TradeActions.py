@@ -29,7 +29,8 @@ class TradeAction(ABC):
     """
     
     def __init__(self, instrument_name: str, account: AccountInterface, 
-                 order_recommendation: OrderRecommendation, existing_order: Optional[TradingOrder] = None):
+                 order_recommendation: OrderRecommendation, existing_order: Optional[TradingOrder] = None,
+                 expert_recommendation: Optional[ExpertRecommendation] = None):
         """
         Initialize the trade action.
         
@@ -38,11 +39,13 @@ class TradeAction(ABC):
             account: Account interface for executing trades
             order_recommendation: The recommendation that triggered this action
             existing_order: Optional existing order related to this action
+            expert_recommendation: Optional expert recommendation object for linking
         """
         self.instrument_name = instrument_name
         self.account = account
         self.order_recommendation = order_recommendation
         self.existing_order = existing_order
+        self.expert_recommendation = expert_recommendation
         
     @abstractmethod
     def execute(self) -> "TradeActionResult":
@@ -120,6 +123,20 @@ class TradeAction(ABC):
             # Convert side to uppercase to match OrderDirection enum values (BUY, SELL)
             side_upper = side.upper()
             
+            # Build comment string with ACC/TR/REC format
+            # [ACC:1/TR:3/REC:5] where ACC=account_id, TR=expert_instance_id, REC=expert_recommendation_id
+            comment_parts = [f"ACC:{self.account.id}"]
+            expert_instance_id = None
+            expert_recommendation_id = None
+            
+            if self.expert_recommendation:
+                expert_instance_id = self.expert_recommendation.instance_id
+                expert_recommendation_id = self.expert_recommendation.id
+                comment_parts.append(f"TR:{expert_instance_id}")
+                comment_parts.append(f"REC:{expert_recommendation_id}")
+            
+            comment = f"[{'/'.join(comment_parts)}]"
+            
             order = TradingOrder(
                 account_id=self.account.id,
                 symbol=self.instrument_name,
@@ -130,6 +147,8 @@ class TradeAction(ABC):
                 stop_price=stop_price,
                 status=OrderStatus.PENDING.value,
                 linked_order_id=linked_order_id,
+                expert_recommendation_id=expert_recommendation_id,
+                comment=comment,
                 created_at=datetime.now(timezone.utc)
             )
             
@@ -473,10 +492,10 @@ class AdjustTakeProfitAction(TradeAction):
             instrument_name: Instrument name
             account: Account interface
             order_recommendation: Order recommendation
-            existing_order: Existing order to adjust (required)
+            existing_order: Existing order to adjust (required - from enter_market or open position)
             take_profit_price: New take profit price
         """
-        super().__init__(instrument_name, account, order_recommendation, existing_order)
+        super().__init__(instrument_name, account, order_recommendation, existing_order, expert_recommendation=None)
         self.take_profit_price = take_profit_price
     
     def execute(self) -> "TradeActionResult":
@@ -562,10 +581,10 @@ class AdjustStopLossAction(TradeAction):
             instrument_name: Instrument name
             account: Account interface
             order_recommendation: Order recommendation
-            existing_order: Existing order to adjust (required)
+            existing_order: Existing order to adjust (required - from enter_market or open position)
             stop_loss_price: New stop loss price
         """
-        super().__init__(instrument_name, account, order_recommendation, existing_order)
+        super().__init__(instrument_name, account, order_recommendation, existing_order, expert_recommendation=None)
         self.stop_loss_price = stop_loss_price
     
     def execute(self) -> "TradeActionResult":
@@ -678,6 +697,7 @@ class AdjustStopLossAction(TradeAction):
 # Factory function to create actions based on action type
 def create_action(action_type: ExpertActionType, instrument_name: str, account: AccountInterface,
                  order_recommendation: OrderRecommendation, existing_order: Optional[TradingOrder] = None,
+                 expert_recommendation: Optional[ExpertRecommendation] = None,
                  **kwargs) -> TradeAction:
     """
     Factory function to create appropriate action based on action type.
@@ -688,6 +708,7 @@ def create_action(action_type: ExpertActionType, instrument_name: str, account: 
         account: Account interface
         order_recommendation: Order recommendation
         existing_order: Optional existing order
+        expert_recommendation: Optional expert recommendation for linking
         **kwargs: Additional arguments for specific action types
         
     Returns:
@@ -706,10 +727,13 @@ def create_action(action_type: ExpertActionType, instrument_name: str, account: 
         raise ValueError(f"Unknown action type: {action_type}")
     
     # Create action with appropriate arguments
+    # Only pass expert_recommendation to order-creating actions (BUY, SELL, CLOSE)
+    # AdjustTP/SL actions only need existing_order from enter_market or open positions
     if action_type in [ExpertActionType.ADJUST_TAKE_PROFIT, ExpertActionType.ADJUST_STOP_LOSS]:
         return action_class(instrument_name, account, order_recommendation, existing_order, **kwargs)
     else:
-        return action_class(instrument_name, account, order_recommendation, existing_order)
+        # BUY, SELL, CLOSE actions get expert_recommendation for order linking
+        return action_class(instrument_name, account, order_recommendation, existing_order, expert_recommendation)
 
 
 # TODO: Implement sequence management for complex trading scenarios

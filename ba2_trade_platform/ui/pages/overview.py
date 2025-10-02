@@ -118,21 +118,19 @@ class OverviewTab:
         # Check for PENDING orders and display notification
         self._check_and_display_pending_orders(self.tabs_ref)
         
-        with ui.grid(columns=2).classes('w-full gap-4'):
-            # Row 1: OpenAI Spending and Analysis Jobs
+        with ui.grid(columns=3).classes('w-full gap-4'):
+            # Row 1: OpenAI Spending, Analysis Jobs, and Order Statistics
             self._render_openai_spending_widget()
             self._render_analysis_jobs_widget()
-            
-            # Row 2: Order Statistics per Account and Order Recommendations
             self._render_order_statistics_widget()
+            
+            # Row 2: Order Recommendations, Profit Per Expert, and Position Distribution by Label
             with ui.column().classes(''):
                 self._render_order_recommendations_widget()
-            
-            # Row 3: Profit Per Expert and Position Distribution by Label
             ProfitPerExpertChart()
             self._render_position_distribution_widget(grouping_field='labels')
             
-            # Row 4: Position Distribution by Category (spans full width or paired)
+            # Row 3: Position Distribution by Category (can span or be paired with other widgets)
             self._render_position_distribution_widget(grouping_field='categories')
     
     def _render_position_distribution_widget(self, grouping_field='labels'):
@@ -883,12 +881,6 @@ class AccountOverviewTab:
         with ui.card():
             ui.label('Open Positions Across All Accounts').classes('text-h6 mb-4')
             ui.table(columns=columns, rows=all_positions, row_key='account').classes('w-full')
-        
-        # Position Distribution Charts (uses same data as table)
-        if all_positions_raw:
-            with ui.grid(columns=2).classes('w-full gap-4'):
-                InstrumentDistributionChart(positions=all_positions_raw, grouping_field='labels')
-                InstrumentDistributionChart(positions=all_positions_raw, grouping_field='categories')
         
         # All Orders Table
         with ui.card().classes('mt-4'):
