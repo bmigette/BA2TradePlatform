@@ -593,10 +593,10 @@ class AccountInterface(ExtendableSettingsInterface):
         Refresh/synchronize transaction states based on linked order and position states.
         
         This method ensures transaction states are in sync with their linked orders:
-        - If all market orders for a transaction are in a final state (filled, canceled, expired, etc.),
-          the transaction should be marked as CLOSED
-        - If any market order is filled and position exists, transaction should be OPENED
-        - Otherwise, transaction remains in WAITING state
+        - If any market entry order (order without depends_on_order) is FILLED, transaction should be OPENED
+        - If a closing order is FILLED, transaction should be CLOSED with close_price set
+        - If all orders are canceled/rejected before execution, transaction should be CLOSED
+        - Updates open_price and close_price based on filled orders
         
         Returns:
             bool: True if refresh was successful, False otherwise
@@ -605,22 +605,9 @@ class AccountInterface(ExtendableSettingsInterface):
             from sqlmodel import select, Session
             from .db import get_db
             
-            # Define final order states that indicate completion
-            final_order_states = {
-                OrderStatus.FILLED,
-                OrderStatus.CLOSED,
-                OrderStatus.CANCELED,
-                OrderStatus.EXPIRED,
-                OrderStatus.REJECTED,
-                OrderStatus.DONE_FOR_DAY,
-                OrderStatus.STOPPED,
-            }
-            
-            # Define order states that indicate the order was executed (position opened)
-            executed_states = {
-                OrderStatus.FILLED,
-                OrderStatus.PARTIALLY_FILLED,
-            }
+            # Get terminal and executed order states from OrderStatus
+            terminal_statuses = OrderStatus.get_terminal_statuses()
+            executed_statuses = OrderStatus.get_executed_statuses()
             
             updated_count = 0
             
@@ -634,6 +621,7 @@ class AccountInterface(ExtendableSettingsInterface):
                 
                 for transaction in transactions:
                     original_status = transaction.status
+                    has_changes = False
                     
                     # Get all orders for this transaction
                     orders_statement = select(TradingOrder).where(
@@ -645,33 +633,117 @@ class AccountInterface(ExtendableSettingsInterface):
                     if not orders:
                         continue
                     
-                    # Check order states to determine transaction status
-                    has_executed_order = any(order.status in executed_states for order in orders)
-                    all_final = all(order.status in final_order_states for order in orders)
+                    # Separate orders into market entry orders and TP/SL orders
+                    # Market entry orders are orders that open a position (no depends_on_order)
+                    # TP/SL orders are dependent orders (have depends_on_order set)
+                    market_entry_orders = [o for o in orders if not o.depends_on_order]
+                    dependent_orders = [o for o in orders if o.depends_on_order]
                     
-                    # Determine new transaction status
+                    # Check if any market entry order is filled (to open transaction)
+                    has_filled_entry_order = any(order.status in executed_statuses for order in market_entry_orders)
+                    
+                    # Check if all MARKET ENTRY orders are in terminal state (not TP/SL orders)
+                    # This determines if the transaction should be closed
+                    all_entry_orders_terminal = (
+                        len(market_entry_orders) > 0 and
+                        all(order.status in terminal_statuses for order in market_entry_orders)
+                    )
+                    
+                    # Check if we have a filled closing order (dependent order that closes position)
+                    filled_closing_orders = [o for o in dependent_orders if o.status == OrderStatus.FILLED]
+                    
+                    # Calculate transaction quantity from filled market entry orders
+                    # Sum all filled quantities from market entry orders
+                    calculated_quantity = 0.0
+                    for order in market_entry_orders:
+                        if order.status in executed_statuses:
+                            # Use filled_qty if available, otherwise use order quantity
+                            qty = order.filled_qty if order.filled_qty else order.quantity
+                            if qty:
+                                # Add for BUY orders, subtract for SELL orders (for short positions)
+                                if order.side == OrderDirection.BUY:
+                                    calculated_quantity += float(qty)
+                                elif order.side == OrderDirection.SELL:
+                                    calculated_quantity -= float(qty)
+                    
+                    # Update transaction quantity if different
+                    if calculated_quantity != 0 and transaction.quantity != calculated_quantity:
+                        transaction.quantity = calculated_quantity
+                        has_changes = True
+                        logger.debug(f"Transaction {transaction.id} quantity updated to {calculated_quantity}")
+                    
+                    # Update transaction status based on order states
                     new_status = None
                     
-                    if has_executed_order and transaction.status == TransactionStatus.WAITING:
-                        # At least one order was filled, mark transaction as OPENED
+                    # WAITING -> OPENED: If any market entry order is FILLED
+                    if has_filled_entry_order and transaction.status == TransactionStatus.WAITING:
                         new_status = TransactionStatus.OPENED
                         if not transaction.open_date:
                             transaction.open_date = datetime.now(timezone.utc)
-                        logger.debug(f"Transaction {transaction.id} has executed orders, marking as OPENED")
+                            has_changes = True
+                        
+                        # Set open_price from the first filled market entry order
+                        if not transaction.open_price:
+                            for order in market_entry_orders:
+                                if order.status in executed_statuses and order.limit_price:
+                                    transaction.open_price = order.limit_price
+                                    has_changes = True
+                                    break
+                                # For market orders, try to get current price from broker
+                                elif order.status in executed_statuses:
+                                    # We don't have exact fill price, but we can try to get current price
+                                    # This is a fallback - ideally filled_avg_price would be stored
+                                    try:
+                                        current_price = self.get_instrument_current_price(order.symbol)
+                                        if current_price:
+                                            transaction.open_price = current_price
+                                            has_changes = True
+                                            break
+                                    except:
+                                        pass
+                        
+                        logger.debug(f"Transaction {transaction.id} has filled market entry order, marking as OPENED")
+                        has_changes = True
                     
-                    if all_final and transaction.status != TransactionStatus.CLOSED:
-                        # All orders are in final state, check if we should close the transaction
-                        # Close transaction if:
-                        # 1. Transaction was OPENED and all orders are now final (position closed)
-                        # 2. Transaction was WAITING and orders were canceled/rejected (never opened)
-                        if transaction.status == TransactionStatus.OPENED:
+                    # OPENED -> CLOSED: If we have a filled closing order (TP/SL)
+                    if filled_closing_orders and transaction.status == TransactionStatus.OPENED:
+                        new_status = TransactionStatus.CLOSED
+                        transaction.close_date = datetime.now(timezone.utc)
+                        
+                        # Set close_price from the first filled closing order
+                        if not transaction.close_price:
+                            closing_order = filled_closing_orders[0]  # Use first filled closing order
+                            if closing_order.limit_price:
+                                transaction.close_price = closing_order.limit_price
+                            else:
+                                # Fallback to current price for market orders
+                                try:
+                                    current_price = self.get_instrument_current_price(closing_order.symbol)
+                                    if current_price:
+                                        transaction.close_price = current_price
+                                except:
+                                    pass
+                        
+                        logger.debug(f"Transaction {transaction.id} has filled closing order, marking as CLOSED")
+                        has_changes = True
+                    
+                    # WAITING -> CLOSED: If all market entry orders are in terminal state without execution
+                    # This handles canceled/rejected/error orders before the transaction ever opened
+                    elif all_entry_orders_terminal and transaction.status == TransactionStatus.WAITING and not has_filled_entry_order:
+                        new_status = TransactionStatus.CLOSED
+                        logger.debug(f"Transaction {transaction.id} all market entry orders terminal without execution, marking as CLOSED")
+                        has_changes = True
+                    
+                    # OPENED -> CLOSED: If all market entry orders are in terminal state after opening
+                    # This handles cases where the position was closed via broker or manual intervention
+                    elif all_entry_orders_terminal and transaction.status == TransactionStatus.OPENED and not filled_closing_orders:
+                        # Only close if we don't have any active TP/SL orders waiting
+                        active_dependent_orders = [o for o in dependent_orders if o.status not in terminal_statuses]
+                        if not active_dependent_orders:
                             new_status = TransactionStatus.CLOSED
                             transaction.close_date = datetime.now(timezone.utc)
-                            logger.debug(f"Transaction {transaction.id} all orders final after opening, marking as CLOSED")
-                        elif transaction.status == TransactionStatus.WAITING and not has_executed_order:
-                            # Transaction never opened (orders were canceled/rejected before execution)
-                            new_status = TransactionStatus.CLOSED
-                            logger.debug(f"Transaction {transaction.id} orders finalized without execution, marking as CLOSED")
+                            logger.debug(f"Transaction {transaction.id} all market entry orders terminal after opening, marking as CLOSED")
+                            has_changes = True
                     
                     # Update transaction status if changed
                     if new_status and new_status != original_status:
@@ -679,6 +751,10 @@ class AccountInterface(ExtendableSettingsInterface):
                         session.add(transaction)
                         updated_count += 1
                         logger.info(f"Updated transaction {transaction.id} status: {original_status.value} -> {new_status.value}")
+                    elif has_changes:
+                        # Even if status didn't change, we may have updated prices
+                        session.add(transaction)
+                        updated_count += 1
                 
                 session.commit()
             

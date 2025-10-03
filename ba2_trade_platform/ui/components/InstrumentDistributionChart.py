@@ -146,8 +146,9 @@ class InstrumentDistributionChart:
                     'formatter': '{b}<br/>{d}%'
                 },
                 'legend': {
-                    'orient': 'vertical',
-                    'left': 'left',
+                    'orient': 'horizontal',
+                    'bottom': 0,
+                    'left': 'center',
                     'type': 'scroll',
                     'pageButtonItemGap': 5,
                     'pageIconSize': 12,
@@ -159,7 +160,7 @@ class InstrumentDistributionChart:
                     'name': 'Position Distribution',
                     'type': 'pie',
                     'radius': ['40%', '70%'],
-                    'center': ['60%', '50%'],
+                    'center': ['50%', '45%'],
                     'avoidLabelOverlap': True,
                     'itemStyle': {
                         'borderRadius': 10,

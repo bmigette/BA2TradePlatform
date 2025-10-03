@@ -19,6 +19,13 @@ def initialize_system():
     
     # Initialize database
     init_db()
+    
+    # Force sync all transactions based on current order states
+    # This ensures transaction states are correct after restart
+    logger.info("Force syncing all transactions based on order states...")
+    from ba2_trade_platform.core.TradeManager import get_trade_manager
+    trade_manager = get_trade_manager()
+    trade_manager.force_sync_all_transactions()
 
     # Initialize and start job manager for scheduled analysis
     logger.info("Starting job manager for scheduled analysis...")

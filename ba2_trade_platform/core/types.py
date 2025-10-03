@@ -109,6 +109,47 @@ class OrderStatus(str, Enum):
     CALCULATED = "calculated"
     HELD = "held"
     ERROR = "ERROR"
+    
+    @classmethod
+    def get_terminal_statuses(cls):
+        """
+        Return a set of order statuses that indicate the order is in a terminal/closed state.
+        These are statuses where the order will not change anymore.
+        
+        Terminal statuses include:
+        - CLOSED: Order is closed
+        - REJECTED: Order was rejected by the broker
+        - CANCELED: Order was canceled
+        - EXPIRED: Order expired
+        - STOPPED: Order was stopped
+        - ERROR: Order encountered an error
+        - REPLACED: Order was replaced by another order
+        
+        Returns:
+            set: Set of OrderStatus values representing terminal states
+        """
+        return {
+            cls.CLOSED,
+            cls.REJECTED,
+            cls.CANCELED,
+            cls.EXPIRED,
+            cls.STOPPED,
+            cls.ERROR,
+            cls.REPLACED,
+        }
+    
+    @classmethod
+    def get_executed_statuses(cls):
+        """
+        Return a set of order statuses that indicate the order was executed (position opened).
+        
+        Returns:
+            set: Set of OrderStatus values representing executed states
+        """
+        return {
+            cls.FILLED,
+            cls.PARTIALLY_FILLED,
+        }
 
 
 

@@ -96,6 +96,232 @@ class OverviewTab:
         finally:
             session.close()
     
+    def _check_and_display_quantity_mismatches(self):
+        """Check for quantity mismatches between broker positions and transactions."""
+        from ...core.models import Transaction
+        from ...core.types import TransactionStatus
+        
+        session = get_db()
+        mismatches = []
+        
+        try:
+            # Get all accounts
+            accounts = get_all_instances(AccountDefinition)
+            
+            for acc in accounts:
+                provider_cls = providers.get(acc.provider)
+                if not provider_cls:
+                    continue
+                
+                provider_obj = provider_cls(acc.id)
+                
+                try:
+                    # Get positions from broker
+                    positions = provider_obj.get_positions()
+                    
+                    # Create a map of symbol -> broker quantity
+                    broker_positions = {}
+                    for pos in positions:
+                        pos_dict = pos if isinstance(pos, dict) else dict(pos)
+                        symbol = pos_dict.get('symbol')
+                        qty = pos_dict.get('qty', 0)
+                        if symbol and qty:
+                            broker_positions[symbol] = float(qty)
+                    
+                    # Get all open transactions for this account
+                    # First, get all trading orders for this account to find their transaction IDs
+                    orders_stmt = select(TradingOrder).where(
+                        TradingOrder.account_id == acc.id,
+                        TradingOrder.transaction_id.isnot(None)
+                    )
+                    account_orders = session.exec(orders_stmt).all()
+                    
+                    # Get unique transaction IDs
+                    transaction_ids = list(set(o.transaction_id for o in account_orders if o.transaction_id))
+                    
+                    # Get transactions
+                    if transaction_ids:
+                        txn_stmt = select(Transaction).where(
+                            Transaction.id.in_(transaction_ids),
+                            Transaction.status == TransactionStatus.OPENED
+                        )
+                        transactions = session.exec(txn_stmt).all()
+                        
+                        # Calculate total quantity per symbol from transactions
+                        transaction_quantities = {}
+                        for txn in transactions:
+                            if txn.symbol and txn.quantity:
+                                if txn.symbol not in transaction_quantities:
+                                    transaction_quantities[txn.symbol] = 0
+                                transaction_quantities[txn.symbol] += float(txn.quantity)
+                        
+                        # Compare broker positions with transaction quantities
+                        for symbol, broker_qty in broker_positions.items():
+                            txn_qty = transaction_quantities.get(symbol, 0)
+                            
+                            # Check if broker quantity is less than transaction quantity (potential issue)
+                            if abs(broker_qty) < abs(txn_qty) - 0.01:  # 0.01 tolerance for float comparison
+                                # Get all transactions for this symbol
+                                symbol_txns = [t for t in transactions if t.symbol == symbol]
+                                
+                                mismatches.append({
+                                    'account': acc.name,
+                                    'account_id': acc.id,
+                                    'symbol': symbol,
+                                    'broker_qty': broker_qty,
+                                    'transaction_qty': txn_qty,
+                                    'difference': txn_qty - broker_qty,
+                                    'transactions': symbol_txns
+                                })
+                
+                except Exception as e:
+                    logger.error(f"Error checking quantity mismatch for account {acc.name}: {e}", exc_info=True)
+            
+            # Display alerts for mismatches
+            if mismatches:
+                for mismatch in mismatches:
+                    self._render_quantity_mismatch_alert(mismatch)
+        
+        except Exception as e:
+            logger.error(f"Error checking for quantity mismatches: {e}", exc_info=True)
+        finally:
+            session.close()
+    
+    def _render_quantity_mismatch_alert(self, mismatch):
+        """Render an alert for a quantity mismatch."""
+        symbol = mismatch['symbol']
+        broker_qty = mismatch['broker_qty']
+        txn_qty = mismatch['transaction_qty']
+        diff = mismatch['difference']
+        account = mismatch['account']
+        
+        with ui.card().classes('w-full bg-yellow-50 border-l-4 border-yellow-500 p-4 mb-4'):
+            with ui.row().classes('w-full items-center gap-4'):
+                ui.icon('warning', size='lg').classes('text-yellow-600')
+                with ui.column().classes('flex-1'):
+                    ui.label(f'⚠️ Quantity Mismatch: {symbol}').classes('text-lg font-bold text-yellow-800')
+                    ui.label(
+                        f'Account: {account} | Broker: {broker_qty:+.2f} | Transactions: {txn_qty:+.2f} | Difference: {diff:+.2f}'
+                    ).classes('text-sm text-yellow-700')
+                    ui.label(
+                        'The quantity at the broker is lower than the sum of open transaction quantities. This may indicate closed positions not reflected in transactions.'
+                    ).classes('text-xs text-yellow-600')
+                
+                # Button to open correction dialog
+                ui.button(
+                    'Adjust Quantities',
+                    on_click=lambda m=mismatch: self._show_quantity_correction_dialog(m)
+                ).props('outline color=yellow-800')
+    
+    def _show_quantity_correction_dialog(self, mismatch):
+        """Show dialog to adjust transaction quantities to match broker."""
+        from ...core.models import Transaction
+        from ...core.db import update_instance
+        
+        symbol = mismatch['symbol']
+        broker_qty = mismatch['broker_qty']
+        txn_qty = mismatch['transaction_qty']
+        transactions = mismatch['transactions']
+        account = mismatch['account']
+        
+        with ui.dialog() as dialog, ui.card().classes('w-[800px]'):
+            ui.label(f'Adjust Quantities for {symbol}').classes('text-h6 mb-4')
+            
+            with ui.column().classes('w-full gap-4'):
+                # Summary
+                with ui.card().classes('bg-blue-50 p-4'):
+                    ui.label(f'Account: {account}').classes('text-sm font-bold')
+                    ui.label(f'Broker Position: {broker_qty:+.2f}').classes('text-sm')
+                    ui.label(f'Transaction Total: {txn_qty:+.2f}').classes('text-sm')
+                    ui.label(f'Difference: {txn_qty - broker_qty:+.2f}').classes('text-sm text-red-600 font-bold')
+                
+                ui.label('Open Transactions:').classes('text-subtitle2 mt-4')
+                
+                # Table of transactions with editable quantities
+                transaction_inputs = {}
+                
+                with ui.card().classes('w-full'):
+                    for txn in transactions:
+                        with ui.row().classes('w-full items-center gap-4 p-2 border-b'):
+                            ui.label(f'ID: {txn.id}').classes('w-20')
+                            ui.label(f'{txn.symbol}').classes('w-24')
+                            ui.label(f'Opened: {txn.open_date.strftime("%Y-%m-%d") if txn.open_date else "N/A"}').classes('w-32')
+                            
+                            # Editable quantity
+                            qty_input = ui.number(
+                                label='Quantity',
+                                value=txn.quantity,
+                                format='%.2f'
+                            ).classes('w-32')
+                            transaction_inputs[txn.id] = qty_input
+                            
+                            ui.label(f'Original: {txn.quantity:+.2f}').classes('text-xs text-gray-500')
+                
+                # Action buttons
+                with ui.row().classes('w-full justify-between mt-4'):
+                    with ui.row().classes('gap-2'):
+                        ui.button(
+                            'Set All to Match Broker',
+                            on_click=lambda: self._distribute_broker_quantity(
+                                transactions, broker_qty, transaction_inputs
+                            )
+                        ).props('color=primary outline')
+                    
+                    with ui.row().classes('gap-2'):
+                        ui.button('Cancel', on_click=dialog.close).props('flat')
+                        ui.button(
+                            'Apply Changes',
+                            on_click=lambda: self._apply_quantity_changes(
+                                transactions, transaction_inputs, dialog
+                            )
+                        ).props('color=primary')
+        
+        dialog.open()
+    
+    def _distribute_broker_quantity(self, transactions, broker_qty, transaction_inputs):
+        """Distribute broker quantity proportionally across transactions."""
+        total_current_qty = sum(t.quantity for t in transactions if t.quantity)
+        
+        if total_current_qty == 0:
+            # Equal distribution
+            qty_per_txn = broker_qty / len(transactions)
+            for txn in transactions:
+                if txn.id in transaction_inputs:
+                    transaction_inputs[txn.id].value = qty_per_txn
+        else:
+            # Proportional distribution
+            for txn in transactions:
+                if txn.id in transaction_inputs:
+                    proportion = txn.quantity / total_current_qty
+                    new_qty = broker_qty * proportion
+                    transaction_inputs[txn.id].value = new_qty
+        
+        ui.notify('Quantities distributed proportionally', type='info')
+    
+    def _apply_quantity_changes(self, transactions, transaction_inputs, dialog):
+        """Apply quantity changes to transactions."""
+        from ...core.db import update_instance
+        
+        try:
+            updated_count = 0
+            for txn in transactions:
+                if txn.id in transaction_inputs:
+                    new_qty = transaction_inputs[txn.id].value
+                    if new_qty != txn.quantity:
+                        txn.quantity = new_qty
+                        update_instance(txn)
+                        updated_count += 1
+            
+            ui.notify(f'Updated {updated_count} transaction(s)', type='positive')
+            dialog.close()
+            
+            # Refresh the page to show updated data
+            ui.navigate.reload()
+        
+        except Exception as e:
+            logger.error(f"Error applying quantity changes: {e}", exc_info=True)
+            ui.notify(f'Error updating quantities: {str(e)}', type='negative')
+    
     def render(self):
         """Render the overview tab                row = {
                     'order_id': order.id,
@@ -114,6 +340,9 @@ class OverviewTab:
         
         # Check for ERROR orders and display alert
         self._check_and_display_error_orders()
+        
+        # Check for quantity mismatches between broker and transactions
+        self._check_and_display_quantity_mismatches()
         
         # Check for PENDING orders and display notification
         self._check_and_display_pending_orders(self.tabs_ref)
@@ -1240,136 +1469,601 @@ class AccountOverviewTab:
         finally:
             session.close()
 
-class TradeHistoryTab:
+class TransactionsTab:
+    """Comprehensive transactions management tab with full control over positions."""
+    
     def __init__(self):
+        self.transactions_container = None
+        self.selected_transaction = None
         self.render()
     
-    def render(self):
-        """Render the trade history tab with orders in OPEN, CLOSED, or FILLED states."""
-        with ui.card():
-            ui.label('📋 Trade History').classes('text-h6 mb-4')
-            self._render_orders_table()
+    def _get_order_status_color(self, status):
+        """Get color for order status badge."""
+        from ...core.types import OrderStatus
+        
+        color_map = {
+            OrderStatus.FILLED: 'green',
+            OrderStatus.OPEN: 'blue',
+            OrderStatus.PENDING: 'orange',
+            OrderStatus.WAITING_TRIGGER: 'purple',
+            OrderStatus.CANCELED: 'grey',
+            OrderStatus.REJECTED: 'red',
+            OrderStatus.ERROR: 'red',
+            OrderStatus.EXPIRED: 'grey',
+            OrderStatus.PARTIALLY_FILLED: 'teal',
+            OrderStatus.CLOSED: 'grey',
+        }
+        return color_map.get(status, 'grey')
     
-    def _render_orders_table(self):
-        """Render table with orders in OPEN, CLOSED, or FILLED states."""
+    def render(self):
+        """Render the transactions tab with filtering and control options."""
+        with ui.card().classes('w-full'):
+            with ui.row().classes('w-full items-center justify-between mb-4'):
+                ui.label('💼 Transactions').classes('text-h6')
+                
+                # Filter controls
+                with ui.row().classes('gap-2'):
+                    self.status_filter = ui.select(
+                        label='Status Filter',
+                        options=['All', 'Open', 'Closed', 'Waiting'],
+                        value='All',
+                        on_change=lambda: self._refresh_transactions()
+                    ).classes('w-32')
+                    
+                    # Expert filter - will be populated dynamically
+                    self.expert_filter = ui.select(
+                        label='Expert',
+                        options=['All'],
+                        value='All',
+                        on_change=lambda: self._refresh_transactions()
+                    ).classes('w-48')
+                    
+                    self.symbol_filter = ui.input(
+                        label='Symbol',
+                        placeholder='Filter by symbol...',
+                        on_change=lambda: self._refresh_transactions()
+                    ).classes('w-40')
+                    
+                    ui.button('Refresh', icon='refresh', on_click=lambda: self._refresh_transactions()).props('outline')
+            
+            # Transactions table container
+            self.transactions_container = ui.column().classes('w-full')
+            self._render_transactions_table()
+    
+    def _refresh_transactions(self):
+        """Refresh the transactions table."""
+        self.transactions_container.clear()
+        with self.transactions_container:
+            self._render_transactions_table()
+    
+    def _render_transactions_table(self):
+        """Render the main transactions table."""
+        from ...core.models import Transaction, ExpertInstance
+        from ...core.types import TransactionStatus
+        from sqlmodel import col
+        
         session = get_db()
         try:
-            # Get orders with the relevant statuses
-            relevant_statuses = [OrderStatus.OPEN, OrderStatus.CLOSED, OrderStatus.FILLED]
-            statement = (
-                select(TradingOrder)
-                .where(TradingOrder.status.in_(relevant_statuses))
-                .order_by(TradingOrder.created_at.desc())
-            )
-            orders = list(session.exec(statement).all())
+            # Populate expert filter options if not already done
+            if hasattr(self, 'expert_filter'):
+                # Get all unique experts from transactions
+                expert_statement = select(ExpertInstance).join(
+                    Transaction, Transaction.expert_id == ExpertInstance.id
+                ).distinct()
+                experts = list(session.exec(expert_statement).all())
+                
+                # Build expert options list with shortnames
+                expert_options = ['All']
+                expert_map = {'All': 'All'}
+                for expert in experts:
+                    # Create shortname: "expert_name-id" or use user_description if available
+                    shortname = expert.user_description if expert.user_description else f"{expert.expert}-{expert.id}"
+                    expert_options.append(shortname)
+                    expert_map[shortname] = expert.id
+                
+                # Store the map for filtering
+                self.expert_id_map = expert_map
+                
+                # Update expert filter options
+                current_value = self.expert_filter.value
+                self.expert_filter.options = expert_options
+                if current_value not in expert_options:
+                    self.expert_filter.value = 'All'
             
-            if not orders:
-                ui.label('No orders found with OPEN, CLOSED, or FILLED status.').classes('text-gray-500')
+            # Build query based on filters - join with ExpertInstance for expert info
+            statement = select(Transaction, ExpertInstance).outerjoin(
+                ExpertInstance, Transaction.expert_id == ExpertInstance.id
+            ).order_by(Transaction.created_at.desc())
+            
+            # Apply status filter
+            status_value = self.status_filter.value if hasattr(self, 'status_filter') else 'All'
+            if status_value != 'All':
+                status_map = {
+                    'Open': TransactionStatus.OPENED,
+                    'Closed': TransactionStatus.CLOSED,
+                    'Waiting': TransactionStatus.WAITING
+                }
+                statement = statement.where(Transaction.status == status_map[status_value])
+            
+            # Apply expert filter
+            if hasattr(self, 'expert_filter') and self.expert_filter.value != 'All':
+                expert_id = self.expert_id_map.get(self.expert_filter.value)
+                if expert_id and expert_id != 'All':
+                    statement = statement.where(Transaction.expert_id == expert_id)
+            
+            # Apply symbol filter
+            if hasattr(self, 'symbol_filter') and self.symbol_filter.value:
+                statement = statement.where(Transaction.symbol.contains(self.symbol_filter.value.upper()))
+            
+            # Execute query and separate transaction and expert
+            results = list(session.exec(statement).all())
+            transactions = []
+            transaction_experts = {}
+            for txn, expert in results:
+                transactions.append(txn)
+                transaction_experts[txn.id] = expert
+            
+            if not transactions:
+                ui.label('No transactions found.').classes('text-gray-500')
                 return
             
-            # Prepare data for table
+            # Prepare table data
             rows = []
-            for order in orders:
-                # Get expert information if order has linked recommendation
-                expert_name = ""
-                analysis_link = ""
+            for txn in transactions:
+                # Get current P/L for open transactions
+                current_pnl = ''
+                current_price_str = ''
                 
-                if order.expert_recommendation_id:
-                    # Get market analysis ID for navigation
-                    analysis_id = get_market_analysis_id_from_order_id(order.id)
-                    if analysis_id:
-                        analysis_link = f"/market_analysis/{analysis_id}"
-                    
-                    # Get expert shortname
+                if txn.status == TransactionStatus.OPENED and txn.order_id:
                     try:
-                        expert_recommendation = get_instance(ExpertRecommendation, order.expert_recommendation_id)
-                        if expert_recommendation:
-                            expert_instance = get_expert_instance_from_id(expert_recommendation.instance_id)
-                            if expert_instance and hasattr(expert_instance, 'shortname'):
-                                expert_name = expert_instance.shortname
+                        order = get_instance(TradingOrder, txn.order_id)
+                        if order and order.account_id:
+                            from ...modules.accounts import get_account_class
+                            from ...core.models import AccountDefinition
+                            acc_def = get_instance(AccountDefinition, order.account_id)
+                            if acc_def:
+                                account_class = get_account_class(acc_def.provider)
+                                if account_class:
+                                    account = account_class(acc_def.id)
+                                    current_price = account.get_instrument_current_price(txn.symbol)
+                                    if current_price:
+                                        current_price_str = f"${current_price:.2f}"
+                                        # Calculate P/L
+                                        if txn.quantity > 0:  # Long position
+                                            pnl = (current_price - txn.open_price) * abs(txn.quantity)
+                                        else:  # Short position
+                                            pnl = (txn.open_price - current_price) * abs(txn.quantity)
+                                        current_pnl = f"${pnl:+.2f}"
                     except Exception:
                         pass
                 
-                # Format dates
-                created_at_str = order.created_at.strftime('%Y-%m-%d %H:%M:%S') if order.created_at else ''
+                # Closed P/L - calculate from open/close prices
+                closed_pnl = ''
+                if txn.close_price and txn.open_price and txn.quantity:
+                    if txn.quantity > 0:  # Long position
+                        pnl_closed = (txn.close_price - txn.open_price) * abs(txn.quantity)
+                    else:  # Short position
+                        pnl_closed = (txn.open_price - txn.close_price) * abs(txn.quantity)
+                    closed_pnl = f"${pnl_closed:+.2f}"
                 
-                # Status badge color
+                # Status styling
                 status_color = {
-                    OrderStatus.OPEN: 'orange',
-                    OrderStatus.CLOSED: 'gray', 
-                    OrderStatus.FILLED: 'green'
-                }.get(order.status, 'gray')
+                    TransactionStatus.OPENED: 'green',
+                    TransactionStatus.CLOSED: 'gray',
+                    TransactionStatus.WAITING: 'orange'
+                }.get(txn.status, 'gray')
+                
+                # Get expert shortname
+                expert = transaction_experts.get(txn.id)
+                expert_shortname = ''
+                if expert:
+                    expert_shortname = expert.user_description if expert.user_description else f"{expert.expert}-{expert.id}"
+                
+                # Get all orders for this transaction
+                orders_data = []
+                if txn.id:
+                    try:
+                        orders_statement = select(TradingOrder).where(
+                            TradingOrder.transaction_id == txn.id
+                        ).order_by(TradingOrder.created_at)
+                        txn_orders = list(session.exec(orders_statement).all())
+                        
+                        for order in txn_orders:
+                            order_type_display = order.order_type.value if hasattr(order.order_type, 'value') else str(order.order_type)
+                            order_side_display = order.side.value if hasattr(order.side, 'value') else str(order.side)
+                            order_status_display = order.status.value if hasattr(order.status, 'value') else str(order.status)
+                            
+                            # Determine if this is a TP/SL order
+                            order_category = 'Entry'
+                            if order.depends_on_order:
+                                if 'TP' in order.comment or 'take_profit' in order.comment.lower() if order.comment else False:
+                                    order_category = 'Take Profit'
+                                elif 'SL' in order.comment or 'stop_loss' in order.comment.lower() if order.comment else False:
+                                    order_category = 'Stop Loss'
+                                else:
+                                    order_category = 'Dependent'
+                            
+                            orders_data.append({
+                                'id': order.id,
+                                'type': order_type_display,
+                                'side': order_side_display,
+                                'category': order_category,
+                                'quantity': f"{order.quantity:.2f}" if order.quantity else '0.00',
+                                'filled_qty': f"{order.filled_qty:.2f}" if order.filled_qty else '0.00',
+                                'limit_price': f"${order.limit_price:.2f}" if order.limit_price else '',
+                                'stop_price': f"${order.stop_price:.2f}" if order.stop_price else '',
+                                'status': order_status_display,
+                                'status_color': self._get_order_status_color(order.status),
+                                'broker_order_id': order.broker_order_id or '',
+                                'created_at': order.created_at.strftime('%Y-%m-%d %H:%M') if order.created_at else '',
+                                'comment': order.comment or ''
+                            })
+                    except Exception as e:
+                        logger.error(f"Error loading orders for transaction {txn.id}: {e}")
                 
                 row = {
-                    'id': order.id,
-                    'symbol': order.symbol,
-                    'side': order.side,
-                    'quantity': f"{order.quantity:.2f}" if order.quantity else '',
-                    'order_type': order.order_type,
-                    'status': order.status,
+                    'id': txn.id,
+                    'symbol': txn.symbol,
+                    'expert': expert_shortname,
+                    'quantity': f"{txn.quantity:+.2f}",
+                    'open_price': f"${txn.open_price:.2f}" if txn.open_price else '',
+                    'current_price': current_price_str,
+                    'close_price': f"${txn.close_price:.2f}" if txn.close_price else '',
+                    'take_profit': f"${txn.take_profit:.2f}" if txn.take_profit else '',
+                    'stop_loss': f"${txn.stop_loss:.2f}" if txn.stop_loss else '',
+                    'current_pnl': current_pnl,
+                    'closed_pnl': closed_pnl,
+                    'status': txn.status.value,
                     'status_color': status_color,
-                    'limit_price': f"${order.limit_price:.2f}" if order.limit_price else '',
-                    'filled_qty': f"{order.filled_qty:.2f}" if order.filled_qty else '',
-                    'expert_name': expert_name,
-                    'created_at': created_at_str,
-                    'analysis_link': analysis_link,
-                    'has_analysis': bool(analysis_link)
+                    'created_at': txn.created_at.strftime('%Y-%m-%d %H:%M') if txn.created_at else '',
+                    'is_open': txn.status == TransactionStatus.OPENED,
+                    'orders': orders_data,  # Add orders for expansion
+                    'order_count': len(orders_data)  # Show order count
                 }
                 rows.append(row)
             
-            # Define table columns
+            # Table columns
             columns = [
-                {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left'},
-                {'name': 'side', 'label': 'Side', 'field': 'side', 'align': 'left'},
-                {'name': 'quantity', 'label': 'Quantity', 'field': 'quantity', 'align': 'right'},
-                {'name': 'order_type', 'label': 'Type', 'field': 'order_type', 'align': 'left'},
-                {'name': 'status', 'label': 'Status', 'field': 'status', 'align': 'center'},
-                {'name': 'limit_price', 'label': 'Limit Price', 'field': 'limit_price', 'align': 'right'},
-                {'name': 'filled_qty', 'label': 'Filled', 'field': 'filled_qty', 'align': 'right'},
-                {'name': 'expert_name', 'label': 'Expert', 'field': 'expert_name', 'align': 'left'},
-                {'name': 'created_at', 'label': 'Created', 'field': 'created_at', 'align': 'left'},
+                {'name': 'expand', 'label': '', 'field': 'expand', 'align': 'left'},  # Expand column
+                {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left', 'sortable': True},
+                {'name': 'expert', 'label': 'Expert', 'field': 'expert', 'align': 'left', 'sortable': True},
+                {'name': 'quantity', 'label': 'Qty', 'field': 'quantity', 'align': 'right', 'sortable': True},
+                {'name': 'open_price', 'label': 'Open Price', 'field': 'open_price', 'align': 'right', 'sortable': True},
+                {'name': 'current_price', 'label': 'Current', 'field': 'current_price', 'align': 'right'},
+                {'name': 'close_price', 'label': 'Close Price', 'field': 'close_price', 'align': 'right'},
+                {'name': 'take_profit', 'label': 'TP', 'field': 'take_profit', 'align': 'right'},
+                {'name': 'stop_loss', 'label': 'SL', 'field': 'stop_loss', 'align': 'right'},
+                {'name': 'current_pnl', 'label': 'Current P/L', 'field': 'current_pnl', 'align': 'right'},
+                {'name': 'closed_pnl', 'label': 'Closed P/L', 'field': 'closed_pnl', 'align': 'right'},
+                {'name': 'status', 'label': 'Status', 'field': 'status', 'align': 'center', 'sortable': True},
+                {'name': 'order_count', 'label': 'Orders', 'field': 'order_count', 'align': 'center'},
+                {'name': 'created_at', 'label': 'Created', 'field': 'created_at', 'align': 'left', 'sortable': True},
                 {'name': 'actions', 'label': 'Actions', 'field': 'actions', 'align': 'center'}
             ]
             
-            # Create table with custom cell rendering
-            table = ui.table(columns=columns, rows=rows, row_key='id').classes('w-full')
+            # Create table with expansion enabled
+            table = ui.table(
+                columns=columns, 
+                rows=rows, 
+                row_key='id',
+                pagination={'rowsPerPage': 20}
+            ).classes('w-full')
             
-            # Add custom cell rendering for status badges and action buttons
-            table.add_slot('body-cell-status', '''
-                <q-td :props="props">
-                    <q-badge :color="props.row.status_color" :label="props.row.status" />
-                </q-td>
-            ''')
+            # Add Quasar table props for expansion
+            table.props('flat bordered')
             
-            table.add_slot('body-cell-actions', '''
+            # Add expand button in first column
+            table.add_slot('body-cell-expand', '''
                 <q-td :props="props">
-                    <q-btn v-if="props.row.has_analysis" 
-                           icon="analytics" 
-                           size="sm" 
-                           flat 
-                           round 
-                           color="primary"
-                           @click="$parent.$emit('navigate_to_analysis', props.row.analysis_link)"
-                           :title="'View Market Analysis'"
+                    <q-btn
+                        size="sm"
+                        color="primary"
+                        round
+                        dense
+                        @click="props.expand = !props.expand"
+                        :icon="props.expand ? 'expand_less' : 'expand_more'"
                     />
-                    <span v-else class="text-grey-5">—</span>
                 </q-td>
             ''')
             
-            # Handle navigation events
-            def handle_navigation(e):
-                analysis_link = e.args
-                if analysis_link:
-                    # Navigate to the market analysis page
-                    ui.navigate.to(analysis_link)
+            # Add expansion details showing orders
+            table.add_slot('body', '''
+                <q-tr :props="props">
+                    <q-td v-for="col in props.cols" :key="col.name" :props="props">
+                        <template v-if="col.name === 'expand'">
+                            <q-btn
+                                size="sm"
+                                color="primary"
+                                round
+                                dense
+                                @click="props.expand = !props.expand"
+                                :icon="props.expand ? 'expand_less' : 'expand_more'"
+                            />
+                        </template>
+                        <template v-else-if="col.name === 'status'">
+                            <q-badge :color="props.row.status_color" :label="col.value" />
+                        </template>
+                        <template v-else-if="col.name === 'current_pnl'">
+                            <span :class="col.value.startsWith('+') ? 'text-green-600 font-bold' : col.value.startsWith('-') ? 'text-red-600 font-bold' : ''">
+                                {{ col.value }}
+                            </span>
+                        </template>
+                        <template v-else-if="col.name === 'closed_pnl'">
+                            <span :class="col.value.startsWith('+') ? 'text-green-600 font-bold' : col.value.startsWith('-') ? 'text-red-600 font-bold' : ''">
+                                {{ col.value }}
+                            </span>
+                        </template>
+                        <template v-else-if="col.name === 'actions'">
+                            <q-btn v-if="props.row.is_open" 
+                                   icon="edit" 
+                                   size="sm" 
+                                   flat 
+                                   round 
+                                   color="primary"
+                                   @click="$parent.$emit('edit_transaction', props.row.id)"
+                                   title="Adjust TP/SL"
+                            />
+                            <q-btn v-if="props.row.is_open" 
+                                   icon="close" 
+                                   size="sm" 
+                                   flat 
+                                   round 
+                                   color="negative"
+                                   @click="$parent.$emit('close_transaction', props.row.id)"
+                                   title="Close Position"
+                            />
+                            <span v-else class="text-grey-5">—</span>
+                        </template>
+                        <template v-else>
+                            {{ col.value }}
+                        </template>
+                    </q-td>
+                </q-tr>
+                <q-tr v-show="props.expand" :props="props" class="bg-blue-50">
+                    <q-td colspan="100%">
+                        <div class="q-pa-md">
+                            <div class="text-subtitle2 q-mb-sm">📋 Related Orders ({{ props.row.order_count }})</div>
+                            <q-markup-table flat bordered dense v-if="props.row.orders.length > 0">
+                                <thead>
+                                    <tr class="bg-grey-3">
+                                        <th class="text-left">ID</th>
+                                        <th class="text-left">Category</th>
+                                        <th class="text-left">Type</th>
+                                        <th class="text-left">Side</th>
+                                        <th class="text-right">Quantity</th>
+                                        <th class="text-right">Filled</th>
+                                        <th class="text-right">Limit Price</th>
+                                        <th class="text-right">Stop Price</th>
+                                        <th class="text-center">Status</th>
+                                        <th class="text-left">Broker ID</th>
+                                        <th class="text-left">Created</th>
+                                        <th class="text-left">Comment</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr v-for="order in props.row.orders" :key="order.id">
+                                        <td class="text-left">{{ order.id }}</td>
+                                        <td class="text-left">
+                                            <q-badge :color="order.category === 'Entry' ? 'blue' : order.category === 'Take Profit' ? 'green' : order.category === 'Stop Loss' ? 'red' : 'grey'" 
+                                                     :label="order.category" />
+                                        </td>
+                                        <td class="text-left">{{ order.type }}</td>
+                                        <td class="text-left">
+                                            <q-badge :color="order.side === 'BUY' ? 'positive' : 'negative'" :label="order.side" />
+                                        </td>
+                                        <td class="text-right">{{ order.quantity }}</td>
+                                        <td class="text-right">{{ order.filled_qty }}</td>
+                                        <td class="text-right">{{ order.limit_price }}</td>
+                                        <td class="text-right">{{ order.stop_price }}</td>
+                                        <td class="text-center">
+                                            <q-badge :color="order.status_color" :label="order.status" />
+                                        </td>
+                                        <td class="text-left text-caption">{{ order.broker_order_id }}</td>
+                                        <td class="text-left">{{ order.created_at }}</td>
+                                        <td class="text-left text-caption">{{ order.comment }}</td>
+                                    </tr>
+                                </tbody>
+                            </q-markup-table>
+                            <div v-else class="text-grey-6 text-center q-pa-md">No orders found for this transaction</div>
+                        </div>
+                    </q-td>
+                </q-tr>
+            ''')
             
-            table.on('navigate_to_analysis', handle_navigation)
+            # Handle events
+            table.on('edit_transaction', lambda e: self._show_edit_dialog(e.args))
+            table.on('close_transaction', lambda e: self._show_close_dialog(e.args))
             
         except Exception as e:
-            logger.error(f"Error rendering orders table: {e}", exc_info=True)
-            ui.label(f'Error loading orders: {str(e)}').classes('text-red-500')
+            logger.error(f"Error rendering transactions table: {e}", exc_info=True)
+            ui.label(f'Error loading transactions: {str(e)}').classes('text-red-500')
         finally:
             session.close()
+    
+    def _show_edit_dialog(self, transaction_id):
+        """Show dialog to edit TP/SL for a transaction."""
+        from ...core.models import Transaction
+        
+        txn = get_instance(Transaction, transaction_id)
+        if not txn:
+            ui.notify('Transaction not found', type='negative')
+            return
+        
+        with ui.dialog() as dialog, ui.card().classes('w-96'):
+            ui.label(f'Adjust TP/SL for {txn.symbol}').classes('text-h6 mb-4')
+            
+            with ui.column().classes('w-full gap-4'):
+                ui.label(f'Position: {txn.quantity:+.2f} @ ${txn.open_price:.2f}').classes('text-sm text-gray-600')
+                
+                tp_input = ui.number(
+                    label='Take Profit Price',
+                    value=txn.take_profit if txn.take_profit else None,
+                    format='%.2f',
+                    prefix='$'
+                ).classes('w-full')
+                
+                sl_input = ui.number(
+                    label='Stop Loss Price',
+                    value=txn.stop_loss if txn.stop_loss else None,
+                    format='%.2f',
+                    prefix='$'
+                ).classes('w-full')
+                
+                with ui.row().classes('w-full justify-end gap-2'):
+                    ui.button('Cancel', on_click=dialog.close).props('flat')
+                    ui.button('Update', on_click=lambda: self._update_tp_sl(
+                        transaction_id, tp_input.value, sl_input.value, dialog
+                    )).props('color=primary')
+        
+        dialog.open()
+    
+    def _update_tp_sl(self, transaction_id, tp_price, sl_price, dialog):
+        """Update TP/SL for a transaction."""
+        from ...core.models import Transaction
+        from ...core.db import update_instance
+        
+        try:
+            txn = get_instance(Transaction, transaction_id)
+            if not txn:
+                ui.notify('Transaction not found', type='negative')
+                return
+            
+            # Get the order associated with this transaction
+            if not txn.order_id:
+                ui.notify('No order linked to this transaction', type='negative')
+                return
+            
+            order = get_instance(TradingOrder, txn.order_id)
+            if not order or not order.account_id:
+                ui.notify('Order or account not found', type='negative')
+                return
+            
+            # Get account to use set_order_tp/set_order_sl methods
+            from ...modules.accounts import get_account_class
+            from ...core.models import AccountDefinition
+            
+            acc_def = get_instance(AccountDefinition, order.account_id)
+            if not acc_def:
+                ui.notify('Account definition not found', type='negative')
+                return
+            
+            account_class = get_account_class(acc_def.provider)
+            if not account_class:
+                ui.notify(f'Account provider {acc_def.provider} not found', type='negative')
+                return
+            
+            account = account_class(acc_def.id)
+            
+            # Update TP if changed
+            if tp_price and tp_price != txn.take_profit:
+                try:
+                    account.set_order_tp(order, tp_price)
+                    ui.notify(f'Take Profit updated to ${tp_price:.2f}', type='positive')
+                except Exception as e:
+                    ui.notify(f'Error updating TP: {str(e)}', type='negative')
+                    logger.error(f"Error updating TP: {e}", exc_info=True)
+            
+            # Update SL if changed and method exists
+            if sl_price and sl_price != txn.stop_loss:
+                if hasattr(account, 'set_order_sl'):
+                    try:
+                        account.set_order_sl(order, sl_price)
+                        ui.notify(f'Stop Loss updated to ${sl_price:.2f}', type='positive')
+                    except Exception as e:
+                        ui.notify(f'Error updating SL: {str(e)}', type='negative')
+                        logger.error(f"Error updating SL: {e}", exc_info=True)
+                else:
+                    # Manually update transaction if method doesn't exist
+                    txn.stop_loss = sl_price
+                    update_instance(txn)
+                    ui.notify(f'Stop Loss updated to ${sl_price:.2f} (in transaction only)', type='info')
+            
+            dialog.close()
+            self._refresh_transactions()
+            
+        except Exception as e:
+            ui.notify(f'Error: {str(e)}', type='negative')
+            logger.error(f"Error updating TP/SL: {e}", exc_info=True)
+    
+    def _show_close_dialog(self, transaction_id):
+        """Show confirmation dialog to close a position."""
+        from ...core.models import Transaction
+        
+        txn = get_instance(Transaction, transaction_id)
+        if not txn:
+            ui.notify('Transaction not found', type='negative')
+            return
+        
+        with ui.dialog() as dialog, ui.card().classes('w-96'):
+            ui.label(f'Close Position').classes('text-h6 mb-4')
+            
+            ui.label(f'Are you sure you want to close this position?').classes('mb-2')
+            ui.label(f'{txn.symbol}: {txn.quantity:+.2f} @ ${txn.open_price:.2f}').classes('text-sm font-bold mb-4')
+            
+            with ui.row().classes('w-full justify-end gap-2'):
+                ui.button('Cancel', on_click=dialog.close).props('flat')
+                ui.button('Close Position', on_click=lambda: self._close_position(transaction_id, dialog)).props('color=negative')
+        
+        dialog.open()
+    
+    def _close_position(self, transaction_id, dialog):
+        """Close a position by creating a closing order."""
+        from ...core.models import Transaction
+        from ...core.types import OrderDirection, OrderType, TransactionStatus
+        
+        try:
+            txn = get_instance(Transaction, transaction_id)
+            if not txn or not txn.order_id:
+                ui.notify('Transaction or order not found', type='negative')
+                return
+            
+            order = get_instance(TradingOrder, txn.order_id)
+            if not order or not order.account_id:
+                ui.notify('Order or account not found', type='negative')
+                return
+            
+            # Get account
+            from ...modules.accounts import get_account_class
+            from ...core.models import AccountDefinition
+            
+            acc_def = get_instance(AccountDefinition, order.account_id)
+            if not acc_def:
+                ui.notify('Account not found', type='negative')
+                return
+            
+            account_class = get_account_class(acc_def.provider)
+            if not account_class:
+                ui.notify(f'Account provider not found', type='negative')
+                return
+            
+            account = account_class(acc_def.id)
+            
+            # Create closing order (opposite side)
+            close_side = OrderDirection.SELL if txn.quantity > 0 else OrderDirection.BUY
+            
+            close_order = TradingOrder(
+                account_id=order.account_id,
+                symbol=txn.symbol,
+                quantity=abs(txn.quantity),
+                side=close_side,
+                order_type=OrderType.MARKET,
+                transaction_id=txn.id,
+                comment=f'Closing position for transaction {txn.id}'
+            )
+            
+            # Submit the closing order
+            submitted_order = account.submit_order(close_order)
+            
+            if submitted_order:
+                ui.notify(f'Closing order submitted for {txn.symbol}', type='positive')
+                dialog.close()
+                self._refresh_transactions()
+            else:
+                ui.notify('Failed to submit closing order', type='negative')
+            
+        except Exception as e:
+            ui.notify(f'Error: {str(e)}', type='negative')
+            logger.error(f"Error closing position: {e}", exc_info=True)
 
 class PerformanceTab:
     def __init__(self):
@@ -1383,7 +2077,7 @@ def content() -> None:
     tab_config = [
         ('overview', 'Overview'),
         ('account', 'Account Overview'),
-        ('history', 'Trade History'),
+        ('transactions', 'Transactions'),
         ('performance', 'Performance')
     ]
     
@@ -1397,8 +2091,8 @@ def content() -> None:
             OverviewTab(tabs_ref=tabs)
         with ui.tab_panel(tab_objects['account']):
             AccountOverviewTab()
-        with ui.tab_panel(tab_objects['history']):
-            TradeHistoryTab()
+        with ui.tab_panel(tab_objects['transactions']):
+            TransactionsTab()
         with ui.tab_panel(tab_objects['performance']):
             PerformanceTab()
     
@@ -1412,7 +2106,7 @@ def content() -> None:
                 const labelToName = {
                     'Overview': 'overview',
                     'Account Overview': 'account',
-                    'Trade History': 'history',
+                    'Transactions': 'transactions',
                     'Performance': 'performance'
                 };
                 

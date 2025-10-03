@@ -889,6 +889,62 @@ class TradeManager:
         except Exception as e:
             self.logger.error(f"Error checking for pending analysis jobs for expert {expert_instance_id}: {e}", exc_info=True)
             return True  # Assume there are pending jobs if we can't check
+    
+    def force_sync_all_transactions(self):
+        """
+        Force synchronization of all transactions based on their linked order states.
+        
+        This method is intended to be run at startup to ensure all transaction states
+        are in sync with their orders, without waiting for order state change triggers.
+        
+        It calls refresh_transactions for all accounts which will:
+        - Update WAITING -> OPENED when market entry orders are FILLED
+        - Update OPENED -> CLOSED when closing orders are FILLED
+        - Update WAITING -> CLOSED when orders are canceled/rejected
+        - Set open_price, close_price, open_date, close_date appropriately
+        """
+        try:
+            from .models import AccountDefinition
+            from ..modules.accounts import get_account_class
+            
+            self.logger.info("Starting force sync of all transactions at startup...")
+            
+            # Get all account definitions
+            account_definitions = get_all_instances(AccountDefinition)
+            
+            total_synced = 0
+            
+            for account_def in account_definitions:
+                try:
+                    # Get the account class for this provider
+                    account_class = get_account_class(account_def.provider)
+                    if not account_class:
+                        self.logger.warning(f"No account class found for provider {account_def.provider}")
+                        continue
+                    
+                    # Create account instance
+                    account = account_class(account_def.id)
+                    
+                    # Force sync transactions based on current order states
+                    if hasattr(account, 'refresh_transactions'):
+                        self.logger.info(f"Force syncing transactions for account {account_def.name}...")
+                        success = account.refresh_transactions()
+                        if success:
+                            total_synced += 1
+                            self.logger.info(f"Successfully synced transactions for {account_def.name}")
+                        else:
+                            self.logger.warning(f"Failed to sync transactions for {account_def.name}")
+                    else:
+                        self.logger.warning(f"Account {account_def.name} does not support transaction refresh")
+                        
+                except Exception as e:
+                    self.logger.error(f"Error syncing transactions for account {account_def.name}: {e}", exc_info=True)
+                    continue
+            
+            self.logger.info(f"Force sync completed: {total_synced}/{len(account_definitions)} accounts synced")
+            
+        except Exception as e:
+            self.logger.error(f"Error during force sync of transactions: {e}", exc_info=True)
 
 
 # Global trade manager instance
