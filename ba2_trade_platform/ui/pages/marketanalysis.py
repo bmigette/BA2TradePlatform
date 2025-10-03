@@ -97,6 +97,8 @@ class JobMonitoringTab:
             {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'style': 'width: 100px'},
             {'name': 'expert', 'label': 'Expert', 'field': 'expert_name', 'sortable': True, 'style': 'width: 150px'},
             {'name': 'status', 'label': 'Status', 'field': 'status_display', 'sortable': True, 'style': 'width: 120px'},
+            {'name': 'recommendation', 'label': 'Recommendation', 'field': 'recommendation', 'sortable': True, 'style': 'width: 130px'},
+            {'name': 'confidence', 'label': 'Confidence', 'field': 'confidence', 'sortable': True, 'style': 'width: 100px'},
             {'name': 'created_at', 'label': 'Created', 'field': 'created_at_local', 'sortable': True, 'style': 'width: 160px'},
             {'name': 'subtype', 'label': 'Type', 'field': 'subtype', 'sortable': True, 'style': 'width: 120px'},
             {'name': 'actions', 'label': 'Actions', 'field': 'actions', 'sortable': False, 'style': 'width: 100px'}
@@ -198,7 +200,7 @@ class JobMonitoringTab:
                 for analysis in market_analyses:
                     # Get expert instance info
                     expert_instance = get_instance(ExpertInstance, analysis.expert_instance_id)
-                    expert_name = expert_instance.expert if expert_instance else "Unknown"
+                    expert_name = expert_instance.user_description or expert_instance.expert if expert_instance else "Unknown"
                     
                     # Convert UTC to local time for display
                     local_time = analysis.created_at.replace(tzinfo=timezone.utc).astimezone() if analysis.created_at else None
@@ -222,12 +224,35 @@ class JobMonitoringTab:
                     # Get subtype display
                     subtype_display = analysis.subtype.value.replace('_', ' ').title() if analysis.subtype else 'Unknown'
                     
+                    # Get recommendation and confidence from expert_recommendations
+                    recommendation_display = '-'
+                    confidence_display = '-'
+                    if analysis.expert_recommendations and len(analysis.expert_recommendations) > 0:
+                        # Get the first (most recent) recommendation
+                        rec = analysis.expert_recommendations[0]
+                        if rec.recommended_action:
+                            # Add icons for BUY/SELL
+                            action_icons = {
+                                'BUY': '📈',
+                                'SELL': '📉',
+                                'HOLD': '⏸️',
+                                'ERROR': '❌'
+                            }
+                            action_value = rec.recommended_action.value
+                            action_icon = action_icons.get(action_value, '')
+                            recommendation_display = f'{action_icon} {action_value}'
+                        
+                        if rec.confidence is not None:
+                            confidence_display = f'{rec.confidence:.1f}%'
+                    
                     analysis_data.append({
                         'id': analysis.id,
                         'symbol': analysis.symbol,
                         'expert_name': expert_name,
                         'status': status_value,
                         'status_display': status_display,
+                        'recommendation': recommendation_display,
+                        'confidence': confidence_display,
                         'created_at_local': created_local,
                         'subtype': subtype_display,
                         'can_cancel': can_cancel,

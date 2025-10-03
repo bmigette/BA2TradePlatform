@@ -119,6 +119,8 @@ class AccountInterface(ExtendableSettingsInterface):
         Returns:
             str: The formatted comment with tracking metadata, truncated to 128 characters if needed
         """
+        import re
+        
         # Get account_id
         account_id = trading_order.account_id or self.id
         
@@ -144,8 +146,10 @@ class AccountInterface(ExtendableSettingsInterface):
         exp_part = f"/EXP:{expert_id}" if expert_id else ""
         tracking_prefix = f"[ACC:{account_id}{exp_part}/TR:{transaction_id}/ORD:{order_id}]"
         
-        # Get original comment
+        # Get original comment and clean any existing automated comment prefix
         original_comment = trading_order.comment or ""
+        # Remove any existing [ACC:...] prefix using regex
+        original_comment = re.sub(r'^\[ACC:\d+(?:/EXP:\d+)?/TR:\w+/ORD:\w+\]\s*', '', original_comment).strip()
         
         # Combine prefix with original comment
         if original_comment:
