@@ -631,22 +631,23 @@ class AlpacaAccount(AccountInterface):
 
     def _set_order_tp_impl(self, trading_order: TradingOrder, tp_price: float) -> TradingOrder:
         """
-        Set take profit for an order by creating/modifying a take profit order at Alpaca.
+        Set take profit for an order by creating a WAITING_TRIGGER TP order.
         
         Logic:
-        - Check if there's already a take profit order linked to the same transaction
-        - If exists, modify the existing order with new price
-        - If not, create a new take profit order (opposite side, same quantity)
+        - Creates a TP order with WAITING_TRIGGER status
+        - Order will be automatically submitted when parent order reaches FILLED status
+        - Quantity will be set at trigger time based on parent order's filled quantity
         
         Args:
             trading_order: The original TradingOrder object
             tp_price: The take profit price
             
         Returns:
-            TradingOrder: The created/modified take profit order
+            TradingOrder: The created WAITING_TRIGGER take profit order
         """
         try:
             from ...core.db import add_instance, get_instance
+            from ...core.types import OrderStatus
             
             # Round take profit price to 4 decimal places
             tp_price = self._round_price(tp_price, trading_order.symbol)
@@ -655,40 +656,23 @@ class AlpacaAccount(AccountInterface):
             existing_tp_order = self._find_existing_tp_order(trading_order.transaction_id)
             
             if existing_tp_order:
-                # Modify existing take profit order
-                logger.info(f"Modifying existing take profit order {existing_tp_order.broker_order_id} to price ${tp_price}")
-                
-                # Use Alpaca's modify order functionality
-                try:
-                    modified_order = self.modify_order(existing_tp_order.broker_order_id, 
-                                                      self._create_tp_order_object(trading_order, tp_price))
-                    if modified_order:
-                        # Update database record
-                        existing_tp_order.limit_price = tp_price
-                        from ...core.db import update_instance
-                        update_instance(existing_tp_order)
-                        logger.info(f"Successfully modified take profit order to ${tp_price}")
-                        return existing_tp_order
-                    else:
-                        raise Exception("Failed to modify take profit order at broker")
-                        
-                except Exception as modify_error:
-                    logger.warning(f"Failed to modify existing TP order, will create new one: {modify_error}")
-                    # Cancel the old order and create a new one
-                    self.cancel_order(existing_tp_order.broker_order_id)
-                    # Continue to create new order below
+                # Update existing take profit order price
+                logger.info(f"Updating existing TP order {existing_tp_order.id} to price ${tp_price}")
+                existing_tp_order.limit_price = tp_price
+                from ...core.db import update_instance
+                update_instance(existing_tp_order)
+                logger.info(f"Successfully updated TP order to ${tp_price}")
+                return existing_tp_order
             
-            # Create new take profit order
+            # Create new WAITING_TRIGGER take profit order
             tp_order = self._create_tp_order_object(trading_order, tp_price)
             
-            # Submit the take profit order
-            submitted_order = self._submit_order_impl(tp_order)
+            # Save to database - it will be submitted when parent order is FILLED
+            tp_order_id = add_instance(tp_order)
+            tp_order.id = tp_order_id
             
-            if submitted_order:
-                logger.info(f"Successfully created take profit order at ${tp_price} for transaction {trading_order.transaction_id}")
-                return submitted_order
-            else:
-                raise Exception("Failed to submit take profit order")
+            logger.info(f"Created WAITING_TRIGGER TP order {tp_order_id} at ${tp_price} (will submit when order {trading_order.id} is FILLED)")
+            return tp_order
                 
         except Exception as e:
             logger.error(f"Error setting take profit for order {trading_order.id}: {e}", exc_info=True)
@@ -714,7 +698,7 @@ class AlpacaAccount(AccountInterface):
                 statement = select(TradingOrder).where(
                     TradingOrder.transaction_id == transaction_id,
                     TradingOrder.order_type.in_([CoreOrderType.BUY_LIMIT, CoreOrderType.SELL_LIMIT]),
-                    TradingOrder.status.in_([OrderStatus.OPEN, OrderStatus.PENDING])
+                    TradingOrder.status.in_([OrderStatus.OPEN, OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER])
                 )
                 orders = session.exec(statement).all()
                 
@@ -732,6 +716,8 @@ class AlpacaAccount(AccountInterface):
     def _create_tp_order_object(self, original_order: TradingOrder, tp_price: float) -> TradingOrder:
         """
         Create a take profit order object based on the original order.
+        Creates a WAITING_TRIGGER order that will be submitted when the parent order is FILLED.
+        Quantity will be set when trigger is hit based on the parent order's filled quantity.
         
         Args:
             original_order: The original trading order
@@ -751,16 +737,19 @@ class AlpacaAccount(AccountInterface):
             tp_side = OrderDirection.BUY
             tp_order_type = CoreOrderType.BUY_LIMIT
         
-        # Create take profit order
+        # Create take profit order in WAITING_TRIGGER status
+        # Quantity will be set when parent order is FILLED
         tp_order = TradingOrder(
             account_id=self.id,
             symbol=original_order.symbol,
-            quantity=original_order.quantity,  # Same quantity as original
+            quantity=0,  # Will be set when trigger is hit
             side=tp_side,  # Opposite side
             order_type=tp_order_type,  # BUY_LIMIT or SELL_LIMIT based on side
             limit_price=tp_price,
             transaction_id=original_order.transaction_id,  # Link to same transaction
-            status=OrderStatus.PENDING,
+            status=OrderStatus.WAITING_TRIGGER,  # Wait for parent order to be FILLED
+            depends_on_order=original_order.id,  # Trigger when this order changes
+            depends_order_status_trigger=OrderStatus.FILLED,  # Trigger when parent is FILLED
             comment=f"TP for order {original_order.id}",
             created_at=datetime.now(timezone.utc)
         )

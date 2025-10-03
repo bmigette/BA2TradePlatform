@@ -287,6 +287,54 @@ class AccountInterface(ExtendableSettingsInterface):
         except Exception as e:
             logger.error(f"Error creating transaction for order: {e}", exc_info=True)
             raise ValueError(f"Failed to create transaction for order: {e}")
+    
+    def _submit_pending_tp_sl_orders(self, trading_order: TradingOrder) -> None:
+        """
+        Check if the order's transaction has pending TP/SL values and submit them to the broker.
+        This is called after a PENDING order is successfully submitted to the broker.
+        
+        Args:
+            trading_order: The order that was just submitted
+        """
+        try:
+            if not trading_order.transaction_id:
+                return
+            
+            transaction = get_instance(Transaction, trading_order.transaction_id)
+            if not transaction:
+                return
+            
+            # Check if transaction has take_profit or stop_loss set
+            if transaction.take_profit:
+                logger.info(f"Submitting pending TP order (${transaction.take_profit}) to broker for order {trading_order.id}")
+                try:
+                    # Call the implementation method directly to create TP order at broker
+                    # Skip the check for PENDING status since order is now submitted
+                    from .types import OrderStatus
+                    original_status = trading_order.status
+                    trading_order.status = OrderStatus.SUBMITTED  # Temporarily mark as submitted
+                    self._set_order_tp_impl(trading_order, transaction.take_profit)
+                    trading_order.status = original_status  # Restore original status
+                    logger.info(f"Successfully submitted TP order to broker")
+                except Exception as tp_error:
+                    logger.error(f"Failed to submit TP order to broker: {tp_error}", exc_info=True)
+            
+            if transaction.stop_loss:
+                logger.info(f"Submitting pending SL order (${transaction.stop_loss}) to broker for order {trading_order.id}")
+                try:
+                    # Call the implementation method if it exists
+                    if hasattr(self, '_set_order_sl_impl'):
+                        from .types import OrderStatus
+                        original_status = trading_order.status
+                        trading_order.status = OrderStatus.SUBMITTED
+                        self._set_order_sl_impl(trading_order, transaction.stop_loss)
+                        trading_order.status = original_status
+                        logger.info(f"Successfully submitted SL order to broker")
+                except Exception as sl_error:
+                    logger.error(f"Failed to submit SL order to broker: {sl_error}", exc_info=True)
+                    
+        except Exception as e:
+            logger.error(f"Error submitting pending TP/SL orders: {e}", exc_info=True)
 
     def _validate_trading_order(self, trading_order: TradingOrder) -> Dict[str, Any]:
         """

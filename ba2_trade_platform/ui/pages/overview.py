@@ -42,7 +42,7 @@ class OverviewTab:
                             ui.label(f'There {"are" if error_count > 1 else "is"} {error_count} order{"s" if error_count > 1 else ""} with ERROR status that need{"" if error_count > 1 else "s"} attention.').classes('text-sm text-red-700')
                         
                         # View details button
-                        ui.button('View Orders', on_click=lambda: ui.navigate.to('/trading')).props('outline color=red')
+                        ui.button('View Orders', on_click=lambda: ui.navigate.to('/#account')).props('outline color=red')
                 
                 # Log the error orders for debugging
                 logger.warning(f"Found {error_count} orders with ERROR status on overview page")
@@ -118,15 +118,15 @@ class OverviewTab:
         # Check for PENDING orders and display notification
         self._check_and_display_pending_orders(self.tabs_ref)
         
-        with ui.grid(columns=3).classes('w-full gap-4'):
-            # Row 1: OpenAI Spending, Analysis Jobs, and Order Statistics
+        with ui.grid(columns=4).classes('w-full gap-4'):
+            # Row 1: OpenAI Spending, Analysis Jobs, Order Statistics, and Order Recommendations
             self._render_openai_spending_widget()
             self._render_analysis_jobs_widget()
             self._render_order_statistics_widget()
-            
-            # Row 2: Order Recommendations, Profit Per Expert, and Position Distribution by Label
             with ui.column().classes(''):
                 self._render_order_recommendations_widget()
+            
+            # Row 2: Profit Per Expert and Position Distribution by Label
             ProfitPerExpertChart()
             self._render_position_distribution_widget(grouping_field='labels')
             
@@ -889,7 +889,7 @@ class AccountOverviewTab:
         
         # Pending Orders Table
         with ui.card().classes('mt-4'):
-            ui.label('Pending Orders (PENDING or WAITING_TRIGGER)').classes('text-h6 mb-4')
+            ui.label('Pending Orders (PENDING, WAITING_TRIGGER, or ERROR)').classes('text-h6 mb-4')
             self._render_pending_orders_table()
     
     def _render_live_orders_table(self):
@@ -985,7 +985,7 @@ class AccountOverviewTab:
     
     
     def _render_pending_orders_table(self):
-        """Render table with pending orders from database (PENDING or WAITING_TRIGGER)."""
+        """Render table with pending orders from database (PENDING, WAITING_TRIGGER, or ERROR)."""
         # Create a container that can be refreshed
         self.pending_orders_container = ui.column().classes('w-full')
         with self.pending_orders_container:
@@ -995,8 +995,8 @@ class AccountOverviewTab:
         """Render the actual pending orders table content."""
         session = get_db()
         try:
-            # Get orders with PENDING or WAITING_TRIGGER status
-            pending_statuses = [OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER]
+            # Get orders with PENDING, WAITING_TRIGGER, or ERROR status
+            pending_statuses = [OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER, OrderStatus.ERROR]
             statement = (
                 select(TradingOrder)
                 .where(TradingOrder.status.in_(pending_statuses))
@@ -1196,8 +1196,8 @@ class AccountOverviewTab:
                         errors.append(f"Order {order_id} not found")
                         continue
                     
-                    # Only allow deletion of PENDING or WAITING_TRIGGER orders
-                    if order.status not in [OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER]:
+                    # Only allow deletion of PENDING, WAITING_TRIGGER, or ERROR orders
+                    if order.status not in [OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER, OrderStatus.ERROR]:
                         errors.append(f"Order {order_id} cannot be deleted (status: {order.status.value})")
                         continue
                     

@@ -284,6 +284,12 @@ class TradeManager:
                             
                             account = account_class(account_def.id)
                             
+                            # Set quantity based on parent order's filled quantity (for TP/SL orders)
+                            if dependent_order.quantity == 0 and parent_order.quantity > 0:
+                                self.logger.info(f"Setting dependent order {dependent_order.id} quantity to {parent_order.quantity} (matching parent order)")
+                                dependent_order.quantity = parent_order.quantity
+                                session.add(dependent_order)
+                            
                             # Submit the dependent order
                             try:
                                 submitted_order = account.submit_order(dependent_order)
@@ -831,6 +837,16 @@ class TradeManager:
                                     self.logger.error(f"Error submitting order {order.id}: {submit_error}", exc_info=True)
                         
                         self.logger.info(f"Auto-submitted {submitted_count}/{len(updated_orders)} orders to broker")
+                        
+                        # Refresh order statuses from broker to detect if any orders are already FILLED
+                        # This is important for market orders which fill immediately
+                        if submitted_count > 0:
+                            self.logger.info("Refreshing order statuses from broker after submission")
+                            try:
+                                account.refresh_orders()
+                                self.logger.info("Order status refresh completed")
+                            except Exception as refresh_error:
+                                self.logger.error(f"Error refreshing order statuses: {refresh_error}", exc_info=True)
                         
                         # After submitting orders, check for any dependent orders (e.g., TP/SL WAITING_TRIGGER)
                         # that may now be ready to execute
