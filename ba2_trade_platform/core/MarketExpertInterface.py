@@ -417,6 +417,37 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         """
         pass
 
+    @classmethod
+    def get_expert_actions(cls) -> List[Dict[str, Any]]:
+        """
+        Get list of expert-specific actions that can be performed.
+        
+        Actions will be displayed in a separate tab in the expert settings UI.
+        Each action should have:
+        - name: Unique identifier for the action
+        - label: Display name shown to user
+        - description: What the action does
+        - icon: Optional icon name (NiceGUI icon)
+        - callback: Method name to call (must exist on expert instance)
+        
+        Returns:
+            List[Dict[str, Any]]: List of action dictionaries. Empty list if no actions.
+        
+        Example:
+            return [
+                {
+                    "name": "clear_memory",
+                    "label": "Clear Memory",
+                    "description": "Delete stored memory collections for this expert",
+                    "icon": "delete",
+                    "callback": "clear_memory_action"
+                }
+            ]
+        """
+        return []
+
+
+   
 
 
    

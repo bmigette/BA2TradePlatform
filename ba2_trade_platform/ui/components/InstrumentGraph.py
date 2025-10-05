@@ -176,10 +176,10 @@ class InstrumentGraph:
                 specs=specs
             )
             
-            # Prepare x-axis data - use datetime objects directly for proper time series handling
-            # Plotly handles pandas DatetimeIndex natively
+            # Prepare x-axis data - convert to ISO strings for JSON serialization
+            # Plotly accepts datetime strings and will parse them correctly
             if isinstance(self.price_data.index, pd.DatetimeIndex):
-                x_data = self.price_data.index
+                x_data = self.price_data.index.strftime('%Y-%m-%d %H:%M:%S').tolist()
             else:
                 x_data = self.price_data.get('Date', list(range(len(self.price_data))))
             
@@ -233,9 +233,9 @@ class InstrumentGraph:
                         break
                 
                 if value_col:
-                    # Use DatetimeIndex directly - Plotly handles it natively
+                    # Convert DatetimeIndex to ISO strings for JSON serialization
                     if isinstance(indicator_df.index, pd.DatetimeIndex):
-                        indicator_x = indicator_df.index
+                        indicator_x = indicator_df.index.strftime('%Y-%m-%d %H:%M:%S').tolist()
                     else:
                         indicator_x = list(range(len(indicator_df)))
                     
@@ -289,9 +289,9 @@ class InstrumentGraph:
                             break
                     
                     if value_col:
-                        # Use DatetimeIndex directly - Plotly handles it natively
+                        # Convert DatetimeIndex to ISO strings for JSON serialization
                         if isinstance(indicator_df.index, pd.DatetimeIndex):
-                            indicator_x = indicator_df.index
+                            indicator_x = indicator_df.index.strftime('%Y-%m-%d %H:%M:%S').tolist()
                         else:
                             indicator_x = list(range(len(indicator_df)))
                         
@@ -328,9 +328,9 @@ class InstrumentGraph:
                     # MACD often has multiple columns (MACD, Signal, Histogram)
                     for col in indicator_df.columns:
                         if indicator_df[col].dtype in ['float64', 'int64']:
-                            # Use DatetimeIndex directly - Plotly handles it natively
+                            # Convert DatetimeIndex to ISO strings for JSON serialization
                             if isinstance(indicator_df.index, pd.DatetimeIndex):
-                                indicator_x = indicator_df.index
+                                indicator_x = indicator_df.index.strftime('%Y-%m-%d %H:%M:%S').tolist()
                             else:
                                 indicator_x = list(range(len(indicator_df)))
                             

@@ -274,6 +274,33 @@ Confidence = Dominant Score / Total × 100 = {dominant_score:.1f} / {total_weigh
             logger.error(f"Error getting current price for {symbol}: {e}", exc_info=True)
             return None
     
+    def _sanitize_api_response(self, trends_data: list) -> list:
+        """
+        Sanitize API response data to make it JSON serializable.
+        Converts pandas Timestamp objects to strings.
+        
+        Args:
+            trends_data: List of recommendation trends from Finnhub API
+            
+        Returns:
+            Sanitized list safe for JSON serialization
+        """
+        import pandas as pd
+        
+        sanitized = []
+        for item in trends_data:
+            sanitized_item = {}
+            for key, value in item.items():
+                # Convert pandas Timestamp to string
+                if isinstance(value, pd.Timestamp):
+                    sanitized_item[key] = value.strftime('%Y-%m-%d') if pd.notna(value) else None
+                # Handle other non-serializable types if needed
+                else:
+                    sanitized_item[key] = value
+            sanitized.append(sanitized_item)
+        
+        return sanitized
+    
     def run_analysis(self, symbol: str, market_analysis: MarketAnalysis) -> None:
         """
         Run FinnHubRating analysis for a symbol and create ExpertRecommendation.
@@ -312,11 +339,25 @@ Confidence = Dominant Score / Total × 100 = {dominant_score:.1f} / {total_weigh
             # Store analysis outputs
             self._store_analysis_outputs(market_analysis.id, symbol, recommendation_data, trends_data)
             
+            # Sanitize API response for JSON serialization
+            sanitized_trends = self._sanitize_api_response(trends_data)
+            
+            # Sanitize recommendation data (convert enums to values)
+            sanitized_recommendation = {
+                'signal': recommendation_data['signal'].value if hasattr(recommendation_data['signal'], 'value') else recommendation_data['signal'],
+                'confidence': recommendation_data['confidence'],
+                'details': recommendation_data['details'],
+                'buy_score': recommendation_data['buy_score'],
+                'sell_score': recommendation_data['sell_score'],
+                'hold_score': recommendation_data['hold_score'],
+                'period': str(recommendation_data['period']) if recommendation_data['period'] else None
+            }
+            
             # Store analysis state
             market_analysis.state = {
                 'finnhub_rating': {
-                    'recommendation': recommendation_data,
-                    'api_response': trends_data,
+                    'recommendation': sanitized_recommendation,
+                    'api_response': sanitized_trends,
                     'settings': {
                         'strong_factor': strong_factor
                     },

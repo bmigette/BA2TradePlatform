@@ -43,6 +43,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         debug=False,
         config: Dict[str, Any] = None,
         market_analysis_id: Optional[int] = None,
+        expert_instance_id: Optional[int] = None,
     ):
         """Initialize the trading agents graph and components.
 
@@ -51,11 +52,13 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             debug: Whether to run in debug mode
             config: Configuration dictionary. If None, uses default config
             market_analysis_id: Existing MarketAnalysis ID to use (prevents creating a new one)
+            expert_instance_id: Expert instance ID for persistent memory storage
         """
         super().__init__()
         self.debug = debug
         self.config = config or DEFAULT_CONFIG
         self.market_analysis_id = market_analysis_id
+        self.expert_instance_id = expert_instance_id
 
         # Initialize logger
         # Use LOG_FOLDER from BA2 platform config
@@ -348,11 +351,11 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         """Initialize memory collections and create the graph with properly initialized memories"""
         from ..agents.utils.memory import FinancialSituationMemory
         
-        self.bull_memory = FinancialSituationMemory("bull_memory", self.config, symbol, self.market_analysis_id)
-        self.bear_memory = FinancialSituationMemory("bear_memory", self.config, symbol, self.market_analysis_id)
-        self.trader_memory = FinancialSituationMemory("trader_memory", self.config, symbol, self.market_analysis_id)
-        self.invest_judge_memory = FinancialSituationMemory("invest_judge_memory", self.config, symbol, self.market_analysis_id)
-        self.risk_manager_memory = FinancialSituationMemory("risk_manager_memory", self.config, symbol, self.market_analysis_id)
+        self.bull_memory = FinancialSituationMemory("bull_memory", self.config, symbol, self.market_analysis_id, self.expert_instance_id)
+        self.bear_memory = FinancialSituationMemory("bear_memory", self.config, symbol, self.market_analysis_id, self.expert_instance_id)
+        self.trader_memory = FinancialSituationMemory("trader_memory", self.config, symbol, self.market_analysis_id, self.expert_instance_id)
+        self.invest_judge_memory = FinancialSituationMemory("invest_judge_memory", self.config, symbol, self.market_analysis_id, self.expert_instance_id)
+        self.risk_manager_memory = FinancialSituationMemory("risk_manager_memory", self.config, symbol, self.market_analysis_id, self.expert_instance_id)
         
         # Create GraphSetup with the newly initialized memories
         self.graph_setup = GraphSetup(

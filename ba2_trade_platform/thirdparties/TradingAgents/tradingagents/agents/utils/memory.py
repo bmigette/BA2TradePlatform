@@ -3,10 +3,12 @@ from chromadb.config import Settings
 from openai import OpenAI
 import numpy as np
 from ... import logger as ta_logger
+import os
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 
 class FinancialSituationMemory:
-    def __init__(self, name, config, symbol=None, market_analysis_id=None):
+    def __init__(self, name, config, symbol=None, market_analysis_id=None, expert_instance_id=None):
         if config["backend_url"] == "http://localhost:11434/v1":
             self.embedding = "nomic-embed-text"
         else:
@@ -20,31 +22,45 @@ class FinancialSituationMemory:
             api_key = None
             
         self.client = OpenAI(base_url=config["backend_url"], api_key=api_key)
-        # Use EphemeralClient for in-memory storage (ChromaDB 1.0+)
-        self.chroma_client = chromadb.EphemeralClient()
         
-        # Create unique collection name to avoid collisions
-        if market_analysis_id and symbol:
-            collection_name = f"{name}_{symbol}_{market_analysis_id}"
-        elif symbol:
-            from datetime import datetime
-            date_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
-            collection_name = f"{name}_{symbol}_{date_suffix}"
+        # Use persistent client with expert-specific subdirectory
+        from ba2_trade_platform.config import CACHE_FOLDER
+        
+        if expert_instance_id:
+            persist_directory = os.path.join(CACHE_FOLDER, "chromadb", f"expert_{expert_instance_id}")
         else:
             # Fallback for backward compatibility
-            from datetime import datetime
-
-            date_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
-            collection_name = f"{name}_{date_suffix}"
+            persist_directory = os.path.join(CACHE_FOLDER, "chromadb", "default")
+        
+        # Create directory if it doesn't exist
+        os.makedirs(persist_directory, exist_ok=True)
+        
+        # Use PersistentClient for disk storage
+        self.chroma_client = chromadb.PersistentClient(path=persist_directory)
+        
+        # Create collection name without analysis_id (only name and symbol)
+        if symbol:
+            collection_name = f"{name}_{symbol}"
+        else:
+            collection_name = name
+        
+        # Sanitize collection name (ChromaDB requires alphanumeric, underscore, hyphen)
+        collection_name = collection_name.replace(' ', '_').replace('.', '_')
         
         # Try to get existing collection or create new one
         try:
             self.situation_collection = self.chroma_client.get_collection(name=collection_name)
+            ta_logger.debug(f"Retrieved existing ChromaDB collection: {collection_name}")
         except:
             self.situation_collection = self.chroma_client.create_collection(name=collection_name)
+            ta_logger.debug(f"Created new ChromaDB collection: {collection_name}")
 
     def get_embedding(self, text):
-        """Get OpenAI embedding for a text, handling long texts by splitting and averaging embeddings"""
+        """Get OpenAI embeddings for a text, using RecursiveCharacterTextSplitter for long texts.
+        
+        Returns:
+            list: List of embeddings (one per chunk). If text is short, returns list with single embedding.
+        """
         # text-embedding-3-small has a max context length of 8192 tokens
         # Conservative estimate: ~3 characters per token for safety margin
         max_chars = 24000  # ~8000 tokens * 3 chars/token
@@ -54,30 +70,20 @@ class FinancialSituationMemory:
             response = self.client.embeddings.create(
                 model=self.embedding, input=text
             )
-            return response.data[0].embedding
+            return [response.data[0].embedding]
         
-        # Text is too long, split into chunks and average embeddings
+        # Text is too long, use RecursiveCharacterTextSplitter
         ta_logger.info(f"Text length {len(text)} exceeds limit, splitting into chunks for embedding")
         
-        # Split text into overlapping chunks to preserve context
-        chunk_size = max_chars - 1000  # Leave some buffer
-        overlap = 500  # Overlap between chunks to preserve context
-        chunks = []
+        # Use RecursiveCharacterTextSplitter for intelligent chunking
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=max_chars - 1000,  # Leave some buffer
+            chunk_overlap=500,  # Overlap to preserve context
+            length_function=len,
+            separators=["\n\n", "\n", ". ", " ", ""]  # Try to split at natural boundaries
+        )
         
-        start = 0
-        while start < len(text):
-            end = min(start + chunk_size, len(text))
-            
-            # Try to break at sentence boundaries to preserve meaning
-            if end < len(text):
-                # Look for sentence ending within last 200 chars
-                sentence_break = text.rfind('.', end - 200, end)
-                if sentence_break > start:
-                    end = sentence_break + 1
-            
-            chunks.append(text[start:end])
-            start = max(start + chunk_size - overlap, end)
-        
+        chunks = text_splitter.split_text(text)
         ta_logger.info(f"Split text into {len(chunks)} chunks for embedding")
         
         # Get embeddings for all chunks
@@ -95,10 +101,7 @@ class FinancialSituationMemory:
         if not chunk_embeddings:
             raise ValueError("Failed to get embeddings for any chunks")
         
-        # Average the embeddings (simple approach)
-        averaged_embedding = np.mean(chunk_embeddings, axis=0).tolist()
-        
-        return averaged_embedding
+        return chunk_embeddings
     
     def add_situations(self, situations_and_advice):
         """Add financial situations and their corresponding advice. Parameter is a list of tuples (situation, rec)"""
@@ -109,12 +112,19 @@ class FinancialSituationMemory:
         embeddings = []
 
         offset = self.situation_collection.count()
+        current_id = offset
 
-        for i, (situation, recommendation) in enumerate(situations_and_advice):
-            situations.append(situation)
-            advice.append(recommendation)
-            ids.append(str(offset + i))
-            embeddings.append(self.get_embedding(situation))
+        for situation, recommendation in situations_and_advice:
+            # Get embeddings (returns list of embeddings for chunks)
+            situation_embeddings = self.get_embedding(situation)
+            
+            # Add each chunk as a separate document
+            for chunk_idx, embedding in enumerate(situation_embeddings):
+                situations.append(situation)  # Store full situation for each chunk
+                advice.append(recommendation)
+                ids.append(str(current_id))
+                embeddings.append(embedding)
+                current_id += 1
 
         self.situation_collection.add(
             documents=situations,
@@ -125,7 +135,14 @@ class FinancialSituationMemory:
 
     def get_memories(self, current_situation, n_matches=1):
         """Find matching recommendations using OpenAI embeddings"""
-        query_embedding = self.get_embedding(current_situation)
+        # Get embeddings (returns list)
+        query_embeddings = self.get_embedding(current_situation)
+        
+        # Average embeddings if multiple chunks
+        if len(query_embeddings) > 1:
+            query_embedding = np.mean(query_embeddings, axis=0).tolist()
+        else:
+            query_embedding = query_embeddings[0]
 
         results = self.situation_collection.query(
             query_embeddings=[query_embedding],

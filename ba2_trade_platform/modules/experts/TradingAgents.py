@@ -1,4 +1,4 @@
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 import json
 
@@ -117,6 +117,11 @@ class TradingAgents(MarketExpertInterface):
                 "type": "bool", "required": True, "default": True,
                 "description": "Enable debug mode with detailed console output",
                 "tooltip": "When enabled, outputs detailed logs of the AI agent's thinking process, data gathering, and decision-making steps. Useful for understanding why recommendations were made. Disable for cleaner logs in production."
+            },
+            "use_memory": {
+                "type": "bool", "required": True, "default": True,
+                "description": "Use memory system for context-aware analysis",
+                "tooltip": "When enabled, agents retrieve past experiences and recommendations from memory to inform current decisions. Memories are always stored but only used when this is enabled. Disabling may be useful for fresh analysis without historical bias."
             }
         }
 
@@ -341,7 +346,8 @@ Analysis completed at: {self._get_current_timestamp()}"""
         ta_graph = TradingAgentsGraph(
             debug=debug_mode,
             config=config,
-            market_analysis_id=market_analysis_id
+            market_analysis_id=market_analysis_id,
+            expert_instance_id=self.id  # Pass expert instance ID for persistent memory
         )
         
         # Run analysis
@@ -1089,3 +1095,148 @@ Please check back in a few minutes for results."""
                 
         except Exception as e:
             logger.error(f"[TRADE MANAGER] Error notifying trade manager for recommendation {recommendation_id}, symbol {symbol}: {e}", exc_info=True)
+    
+    @classmethod
+    def get_expert_actions(cls) -> List[Dict[str, Any]]:
+        """Define expert-specific actions for TradingAgents."""
+        return [
+            {
+                "name": "clear_memory",
+                "label": "Clear Memory",
+                "description": "Delete stored memory collections for this expert instance",
+                "icon": "delete_forever",
+                "callback": "clear_memory_action"
+            }
+        ]
+    
+    def clear_memory_action(self) -> Dict[str, Any]:
+        """
+        Clear memory collections for this expert instance.
+        
+        Returns:
+            Dict with status and message about the operation
+        """
+        try:
+            import chromadb
+            import os
+            from ...config import CACHE_FOLDER
+            
+            # Get the persist directory for this expert
+            persist_directory = os.path.join(CACHE_FOLDER, "chromadb", f"expert_{self.id}")
+            
+            if not os.path.exists(persist_directory):
+                return {
+                    "status": "info",
+                    "message": "No memory collections found for this expert."
+                }
+            
+            # Connect to the persistent client
+            client = chromadb.PersistentClient(path=persist_directory)
+            
+            # Get all collections
+            collections = client.list_collections()
+            
+            if not collections:
+                return {
+                    "status": "info",
+                    "message": "No memory collections found for this expert."
+                }
+            
+            # Return list of collections for user to confirm
+            collection_info = []
+            for collection in collections:
+                count = collection.count()
+                collection_info.append({
+                    "name": collection.name,
+                    "count": count
+                })
+            
+            return {
+                "status": "confirm",
+                "message": f"Found {len(collections)} memory collection(s). This action will permanently delete all stored memories.",
+                "collections": collection_info,
+                "action": "confirm_clear_memory"
+            }
+            
+        except Exception as e:
+            logger.error(f"Error listing memory collections for expert {self.id}: {e}", exc_info=True)
+            return {
+                "status": "error",
+                "message": f"Error accessing memory collections: {str(e)}"
+            }
+    
+    def confirm_clear_memory(self, collection_names: Optional[List[str]] = None) -> Dict[str, Any]:
+        """
+        Confirm and execute memory clearing for selected collections.
+        
+        Args:
+            collection_names: List of collection names to delete. If None, deletes all.
+        
+        Returns:
+            Dict with status and message about the operation
+        """
+        try:
+            import chromadb
+            import os
+            import shutil
+            from ...config import CACHE_FOLDER
+            
+            # Get the persist directory for this expert
+            persist_directory = os.path.join(CACHE_FOLDER, "chromadb", f"expert_{self.id}")
+            
+            if not os.path.exists(persist_directory):
+                return {
+                    "status": "info",
+                    "message": "No memory collections found."
+                }
+            
+            # Connect to the persistent client
+            client = chromadb.PersistentClient(path=persist_directory)
+            
+            # Get all collections
+            all_collections = client.list_collections()
+            
+            deleted_count = 0
+            errors = []
+            
+            for collection in all_collections:
+                # If collection_names is specified, only delete those
+                if collection_names and collection.name not in collection_names:
+                    continue
+                
+                try:
+                    client.delete_collection(collection.name)
+                    deleted_count += 1
+                    logger.info(f"Deleted memory collection '{collection.name}' for expert {self.id}")
+                except Exception as e:
+                    error_msg = f"Failed to delete collection '{collection.name}': {str(e)}"
+                    errors.append(error_msg)
+                    logger.error(error_msg, exc_info=True)
+            
+            # If all collections deleted, remove the entire directory
+            if deleted_count == len(all_collections) and not errors:
+                try:
+                    shutil.rmtree(persist_directory)
+                    logger.info(f"Removed memory directory for expert {self.id}")
+                except Exception as e:
+                    logger.warning(f"Could not remove memory directory: {e}")
+            
+            # Build result message
+            if errors:
+                return {
+                    "status": "warning",
+                    "message": f"Deleted {deleted_count} collection(s) with {len(errors)} error(s).",
+                    "errors": errors
+                }
+            else:
+                return {
+                    "status": "success",
+                    "message": f"Successfully deleted {deleted_count} memory collection(s)."
+                }
+            
+        except Exception as e:
+            logger.error(f"Error clearing memory collections for expert {self.id}: {e}", exc_info=True)
+            return {
+                "status": "error",
+                "message": f"Error clearing memory collections: {str(e)}"
+            }

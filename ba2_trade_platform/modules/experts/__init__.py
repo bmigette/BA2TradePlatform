@@ -1,8 +1,8 @@
 from .TradingAgents import TradingAgents
 from .FinnHubRating import FinnHubRating
-from .FinRobotExpert import FinRobotExpert
+#from .FinRobotExpert import FinRobotExpert
 
-experts = [TradingAgents, FinnHubRating, FinRobotExpert]
+experts = [TradingAgents, FinnHubRating] #, FinRobotExpert]
 
 def get_expert_class(expert_type):
     """Get the expert class by type name."""
