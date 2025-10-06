@@ -660,10 +660,12 @@ class WorkerQueue:
             has_transactions = self.has_existing_transactions(task.expert_instance_id, task.symbol)
             
             if task.subtype == AnalysisUseCase.ENTER_MARKET:
+                # ENTER_MARKET: Skip if there ARE existing transactions (OPENED or WAITING)
                 if has_transactions:
-                    logger.info(f"Skipping ENTER_MARKET analysis for expert {task.expert_instance_id}, symbol {task.symbol}: existing transactions found")
+                    logger.info(f"Skipping ENTER_MARKET analysis for expert {task.expert_instance_id}, symbol {task.symbol}: existing transactions found (OPENED or WAITING)")
                     return "existing transactions found for enter_market analysis"
             elif task.subtype == AnalysisUseCase.OPEN_POSITIONS:
+                # OPEN_POSITIONS: Skip if there are NO existing transactions (inverted logic)
                 if not has_transactions:
                     logger.info(f"Skipping OPEN_POSITIONS analysis for expert {task.expert_instance_id}, symbol {task.symbol}: no existing transactions found")
                     return "no existing transactions found for open_positions analysis"

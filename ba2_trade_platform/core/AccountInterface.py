@@ -667,6 +667,13 @@ class AccountInterface(ExtendableSettingsInterface):
                         all(order.status in terminal_statuses for order in market_entry_orders)
                     )
                     
+                    # Check if ALL orders (not just entry orders) are canceled or in non-executed terminal states
+                    canceled_statuses = {OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.ERROR, OrderStatus.EXPIRED}
+                    all_orders_canceled = (
+                        len(orders) > 0 and
+                        all(order.status in canceled_statuses for order in orders)
+                    )
+                    
                     # Check if we have a filled closing order (dependent order that closes position)
                     filled_closing_orders = [o for o in dependent_orders if o.status == OrderStatus.FILLED]
                     
@@ -683,6 +690,22 @@ class AccountInterface(ExtendableSettingsInterface):
                                     calculated_quantity += float(qty)
                                 elif order.side == OrderDirection.SELL:
                                     calculated_quantity -= float(qty)
+                    
+                    # Sum ALL filled buy and sell orders (including limit orders, market orders, TP/SL, etc.)
+                    # If quantities match, the position is balanced and transaction should be closed
+                    total_filled_buy = 0.0
+                    total_filled_sell = 0.0
+                    for order in orders:
+                        if order.status in executed_statuses:
+                            qty = order.filled_qty if order.filled_qty else order.quantity
+                            if qty:
+                                if order.side == OrderDirection.BUY:
+                                    total_filled_buy += float(qty)
+                                elif order.side == OrderDirection.SELL:
+                                    total_filled_sell += float(qty)
+                    
+                    # If buy and sell orders match (within a small tolerance for floating point), position is closed
+                    position_balanced = abs(total_filled_buy - total_filled_sell) < 0.0001
                     
                     # Update transaction quantity if different
                     if calculated_quantity != 0 and transaction.quantity != calculated_quantity:
@@ -743,6 +766,41 @@ class AccountInterface(ExtendableSettingsInterface):
                                     pass
                         
                         logger.debug(f"Transaction {transaction.id} has filled closing order, marking as CLOSED")
+                        has_changes = True
+                    
+                    # ANY STATUS -> CLOSED: If all orders are canceled/rejected/error/expired (no execution)
+                    elif all_orders_canceled and transaction.status != TransactionStatus.CLOSED:
+                        new_status = TransactionStatus.CLOSED
+                        if not transaction.close_date:
+                            transaction.close_date = datetime.now(timezone.utc)
+                        logger.info(f"Transaction {transaction.id} all orders canceled/rejected, marking as CLOSED")
+                        has_changes = True
+                    
+                    # OPENED -> CLOSED: If filled buy and sell orders sum to match quantity (position balanced)
+                    elif position_balanced and transaction.status != TransactionStatus.CLOSED and (total_filled_buy > 0 or total_filled_sell > 0):
+                        new_status = TransactionStatus.CLOSED
+                        transaction.close_date = datetime.now(timezone.utc)
+                        
+                        # Set close_price from the last filled order that closed the position
+                        if not transaction.close_price:
+                            # Find the last filled order chronologically
+                            filled_orders = [o for o in orders if o.status in executed_statuses]
+                            if filled_orders:
+                                # Sort by created_at to get the last one
+                                filled_orders.sort(key=lambda x: x.created_at if x.created_at else datetime.min)
+                                last_order = filled_orders[-1]
+                                if last_order.limit_price:
+                                    transaction.close_price = last_order.limit_price
+                                else:
+                                    # Fallback to current price for market orders
+                                    try:
+                                        current_price = self.get_instrument_current_price(last_order.symbol)
+                                        if current_price:
+                                            transaction.close_price = current_price
+                                    except:
+                                        pass
+                        
+                        logger.info(f"Transaction {transaction.id} filled buy/sell orders balanced (buy={total_filled_buy}, sell={total_filled_sell}), marking as CLOSED")
                         has_changes = True
                     
                     # WAITING -> CLOSED: If all market entry orders are in terminal state without execution

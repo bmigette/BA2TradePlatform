@@ -150,6 +150,37 @@ def has_existing_orders_for_expert_and_symbol(expert_instance_id: int, symbol: s
         return False
 
 
+def has_existing_transactions_for_expert_and_symbol(expert_instance_id: int, symbol: str) -> bool:
+    """
+    Check if there are existing OPENED or WAITING transactions for a specific expert and symbol.
+    
+    Args:
+        expert_instance_id (int): The expert instance ID
+        symbol (str): The trading symbol
+        
+    Returns:
+        bool: True if transactions exist in OPENED or WAITING status, False otherwise
+    """
+    try:
+        from .models import Transaction
+        from .types import TransactionStatus
+        
+        with Session(get_db().bind) as session:
+            statement = (
+                select(Transaction.id)
+                .where(
+                    Transaction.expert_id == expert_instance_id,
+                    Transaction.symbol == symbol,
+                    Transaction.status.in_([TransactionStatus.WAITING, TransactionStatus.OPENED])
+                )
+                .limit(1)  # We only need to know if any exist
+            )
+            result = session.exec(statement).first()
+            return result is not None
+    except Exception:
+        return False
+
+
 def get_orders_for_expert_and_symbol(expert_instance_id: int, symbol: str = None, 
                                    statuses: List[OrderStatus] = None) -> List[TradingOrder]:
     """

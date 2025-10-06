@@ -232,16 +232,13 @@ class JobManager:
         except ValueError:
             raise ValueError(f"Invalid subtype '{subtype}'. Must be one of: {[e.value for e in AnalysisUseCase]}")
         
-        # For ENTER_MARKET analysis, check if existing orders exist for this expert and symbol
+        # For ENTER_MARKET analysis, check if existing transactions exist for this expert and symbol
         if analysis_use_case == AnalysisUseCase.ENTER_MARKET:
-            from .utils import has_existing_orders_for_expert_and_symbol
-            from .types import OrderStatus
+            from .utils import has_existing_transactions_for_expert_and_symbol
             
-            # Check for orders in states that indicate the expert has already entered the market
-            relevant_statuses = [OrderStatus.PENDING, OrderStatus.OPEN, OrderStatus.FILLED]
-            
-            if has_existing_orders_for_expert_and_symbol(expert_instance_id, symbol, relevant_statuses):
-                logger.info(f"Skipping ENTER_MARKET analysis for expert {expert_instance_id}, symbol {symbol}: existing orders found in states {[s.value for s in relevant_statuses]}")
+            # Check for transactions in OPENED or WAITING status
+            if has_existing_transactions_for_expert_and_symbol(expert_instance_id, symbol):
+                logger.info(f"Skipping ENTER_MARKET analysis for expert {expert_instance_id}, symbol {symbol}: existing transactions found (OPENED or WAITING)")
                 return None
             
         # Submit to worker queue with subtype
