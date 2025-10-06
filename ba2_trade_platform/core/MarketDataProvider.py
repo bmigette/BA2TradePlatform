@@ -6,7 +6,7 @@ All data providers should extend this class and implement the fetch methods.
 """
 
 from abc import ABC, abstractmethod
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from typing import List, Optional
 import pandas as pd
 import os
@@ -35,6 +35,64 @@ class MarketDataProvider(ABC):
         self.cache_folder = cache_folder
         os.makedirs(cache_folder, exist_ok=True)
         logger.debug(f"{self.__class__.__name__} initialized with cache folder: {cache_folder}")
+    
+    @staticmethod
+    def normalize_time_to_interval(dt: datetime, interval: str) -> datetime:
+        """
+        Normalize (floor) a datetime to the given interval.
+        
+        This ensures that timestamps align to interval boundaries for proper time series.
+        
+        Examples:
+            - 15:54:00 with interval '15m' -> 15:45:00
+            - 15:54:00 with interval '1h' -> 15:00:00
+            - 15:54:00 with interval '4h' -> 12:00:00 (4h blocks start at midnight: 0h, 4h, 8h, 12h, 16h, 20h)
+            - 15:54:00 with interval '1d' -> 00:00:00 (start of day)
+        
+        Args:
+            dt: Datetime to normalize
+            interval: Interval string ('1m', '5m', '15m', '30m', '1h', '4h', '1d', '1wk', '1mo')
+        
+        Returns:
+            Normalized datetime floored to the interval boundary
+        """
+        # Parse interval to extract number and unit
+        interval = interval.lower().strip()
+        
+        # Extract numeric value and unit
+        if interval.endswith('m'):  # Minutes
+            minutes = int(interval[:-1])
+            # Floor to the minute interval
+            total_minutes = dt.hour * 60 + dt.minute
+            floored_minutes = (total_minutes // minutes) * minutes
+            floored_hour = floored_minutes // 60
+            floored_minute = floored_minutes % 60
+            return dt.replace(hour=floored_hour, minute=floored_minute, second=0, microsecond=0)
+        
+        elif interval.endswith('h'):  # Hours
+            hours = int(interval[:-1])
+            # Floor to the hour interval (counting from midnight)
+            floored_hour = (dt.hour // hours) * hours
+            return dt.replace(hour=floored_hour, minute=0, second=0, microsecond=0)
+        
+        elif interval.endswith('d') or interval == '1d':  # Days
+            # Floor to start of day
+            return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        elif interval.endswith('wk'):  # Weeks
+            # Floor to start of week (Monday)
+            days_since_monday = dt.weekday()  # Monday is 0, Sunday is 6
+            start_of_week = dt - timedelta(days=days_since_monday)
+            return start_of_week.replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        elif interval.endswith('mo'):  # Months
+            # Floor to start of month
+            return dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        
+        else:
+            # Unknown interval, return as-is with seconds/microseconds zeroed
+            logger.warning(f"Unknown interval format '{interval}', returning time with seconds zeroed")
+            return dt.replace(second=0, microsecond=0)
     
     @abstractmethod
     def _fetch_data_from_source(
@@ -192,17 +250,18 @@ class MarketDataProvider(ABC):
         Get market data with smart caching.
         
         This is the main public method to fetch data. It handles:
-        1. Cache validation (check if cache exists and is recent)
-        2. Loading from cache if valid
-        3. Fetching from source if cache invalid
-        4. Filtering to requested date range
-        5. Converting to MarketDataPoint objects
+        1. Normalize start/end dates to interval boundaries
+        2. Cache validation (check if cache exists and is recent)
+        3. Loading from cache if valid
+        4. Fetching from source if cache invalid
+        5. Filtering to requested date range
+        6. Converting to MarketDataPoint objects
         
         Args:
             symbol: Ticker symbol (e.g., 'AAPL', 'MSFT')
-            start_date: Start date for data
+            start_date: Start date for data (will be floored to interval boundary)
             end_date: End date for data
-            interval: Data interval ('1m', '5m', '15m', '30m', '1h', '1d', '1wk', '1mo')
+            interval: Data interval ('1m', '5m', '15m', '30m', '1h', '4h', '1d', '1wk', '1mo')
             use_cache: Whether to use caching (default: True)
             max_cache_age_hours: Maximum age of cache in hours (default: 24)
         
@@ -212,7 +271,12 @@ class MarketDataProvider(ABC):
         Raises:
             Exception: If data fetching fails
         """
-        logger.info(f"Getting data for {symbol} from {start_date.date()} to {end_date.date()}, interval={interval}")
+        # Normalize start_date to interval boundary for proper time series alignment
+        normalized_start = self.normalize_time_to_interval(start_date, interval)
+        
+        logger.info(f"Getting data for {symbol} from {normalized_start.date()} to {end_date.date()}, interval={interval}")
+        if normalized_start != start_date:
+            logger.debug(f"Start date normalized from {start_date} to {normalized_start} for interval {interval}")
         
         cache_file = self._get_cache_file_path(symbol, interval)
         df = None
@@ -226,14 +290,14 @@ class MarketDataProvider(ABC):
             logger.info(f"Fetching data from source for {symbol}")
             
             # Determine fetch range based on interval (Yahoo Finance limits)
-            # Intraday data (1m, 5m, 15m, 30m, 1h): max 730 days
+            # Intraday data (1m, 5m, 15m, 30m, 1h, 4h): max 730 days
             # Daily data (1d, 1wk, 1mo): can go back 15 years
-            if interval in ['1m', '5m', '15m', '30m', '1h']:
+            if interval in ['1m', '5m', '15m', '30m', '1h', '4h']:
                 # Intraday data limited to ~2 years (730 days)
-                fetch_start = start_date - timedelta(days=729)  # Use 729 to be safe
+                fetch_start = normalized_start - timedelta(days=729)  # Use 729 to be safe
             else:
                 # Daily/weekly/monthly data can go back 15 years
-                fetch_start = start_date - timedelta(days=365 * 3)
+                fetch_start = normalized_start - timedelta(days=365 * 3)
             
             fetch_end = end_date if end_date else datetime.now()
             
@@ -251,17 +315,17 @@ class MarketDataProvider(ABC):
             df['Date'] = pd.to_datetime(df['Date'])
         
         # Make start_date and end_date timezone-aware if df['Date'] is timezone-aware
-        filter_start = start_date
+        filter_start = normalized_start
         filter_end = end_date
         if hasattr(df['Date'], 'dt') and df['Date'].dt.tz is not None:
             # DataFrame has timezone-aware dates, convert filter dates to match
             from datetime import timezone as tz
-            if start_date.tzinfo is None:
-                filter_start = start_date.replace(tzinfo=tz.utc)
+            if normalized_start.tzinfo is None:
+                filter_start = normalized_start.replace(tzinfo=tz.utc)
             if end_date.tzinfo is None:
                 filter_end = end_date.replace(tzinfo=tz.utc)
         
-        # Filter to requested date range
+        # Filter to requested date range (using normalized start)
         mask = (df['Date'] >= filter_start) & (df['Date'] <= filter_end)
         filtered_df = df[mask].copy()
         
@@ -291,7 +355,7 @@ class MarketDataProvider(ABC):
         
         Args:
             symbol: Ticker symbol
-            start_date: Start date for data
+            start_date: Start date for data (will be floored to interval boundary)
             end_date: End date for data
             interval: Data interval
             use_cache: Whether to use caching
@@ -300,7 +364,12 @@ class MarketDataProvider(ABC):
         Returns:
             DataFrame with columns: Date, Open, High, Low, Close, Volume
         """
-        logger.info(f"Getting DataFrame for {symbol} from {start_date.date()} to {end_date.date()}")
+        # Normalize start_date to interval boundary for proper time series alignment
+        normalized_start = self.normalize_time_to_interval(start_date, interval)
+        
+        logger.info(f"Getting DataFrame for {symbol} from {normalized_start.date()} to {end_date.date()}, interval={interval}")
+        if normalized_start != start_date:
+            logger.debug(f"Start date normalized from {start_date} to {normalized_start} for interval {interval}")
         
         cache_file = self._get_cache_file_path(symbol, interval)
         df = None
@@ -314,9 +383,9 @@ class MarketDataProvider(ABC):
             logger.info(f"Fetching DataFrame from source for {symbol}")
             
             # Determine fetch range based on interval (Yahoo Finance limits)
-            # Intraday data (1m, 5m, 15m, 30m, 1h): max 730 days
+            # Intraday data (1m, 5m, 15m, 30m, 1h, 4h): max 730 days
             # Daily data (1d, 1wk, 1mo): can go back 15 years
-            if interval in ['1m', '5m', '15m', '30m', '1h']:
+            if interval in ['1m', '5m', '15m', '30m', '1h', '4h']:
                 # Intraday data limited to ~2 years (730 days)
                 fetch_start = datetime.now() - timedelta(days=729)  # Use 729 to be safe
             else:
@@ -339,17 +408,17 @@ class MarketDataProvider(ABC):
             df['Date'] = pd.to_datetime(df['Date'])
         
         # Make start_date and end_date timezone-aware if df['Date'] is timezone-aware
-        filter_start = start_date
+        filter_start = normalized_start
         filter_end = end_date
         if hasattr(df['Date'], 'dt') and df['Date'].dt.tz is not None:
             # DataFrame has timezone-aware dates, convert filter dates to match
             from datetime import timezone as tz
-            if start_date.tzinfo is None:
-                filter_start = start_date.replace(tzinfo=tz.utc)
+            if normalized_start.tzinfo is None:
+                filter_start = normalized_start.replace(tzinfo=tz.utc)
             if end_date.tzinfo is None:
                 filter_end = end_date.replace(tzinfo=tz.utc)
         
-        # Filter to requested date range
+        # Filter to requested date range (using normalized start)
         mask = (df['Date'] >= filter_start) & (df['Date'] <= filter_end)
         filtered_df = df[mask].copy()
         

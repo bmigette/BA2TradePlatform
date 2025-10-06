@@ -374,6 +374,7 @@ class AppSettingsTab:
         self.openai_admin_input = None
         self.finnhub_input = None
         self.fred_input = None
+        self.alpha_vantage_input = None
         self.worker_count_input = None
         self.account_refresh_interval_input = None
         self.render()
@@ -384,6 +385,7 @@ class AppSettingsTab:
         openai_admin = session.exec(select(AppSetting).where(AppSetting.key == 'openai_admin_api_key')).first()
         finnhub = session.exec(select(AppSetting).where(AppSetting.key == 'finnhub_api_key')).first()
         fred = session.exec(select(AppSetting).where(AppSetting.key == 'fred_api_key')).first()
+        alpha_vantage = session.exec(select(AppSetting).where(AppSetting.key == 'alpha_vantage_api_key')).first()
         worker_count = session.exec(select(AppSetting).where(AppSetting.key == 'worker_count')).first()
         account_refresh_interval = session.exec(select(AppSetting).where(AppSetting.key == 'account_refresh_interval')).first()
         
@@ -394,6 +396,7 @@ class AppSettingsTab:
                 ui.link('Get Admin Key', 'https://platform.openai.com/settings/organization/admin-keys', new_tab=True).classes('text-sm text-blue-600 underline')
             self.finnhub_input = ui.input(label='Finnhub API Key', value=finnhub.value_str if finnhub else '').classes('w-full')
             self.fred_input = ui.input(label='FRED API Key', value=fred.value_str if fred else '').classes('w-full')
+            self.alpha_vantage_input = ui.input(label='Alpha Vantage API Key', value=alpha_vantage.value_str if alpha_vantage else '').classes('w-full')
             self.worker_count_input = ui.number(
                 label='Worker Count', 
                 value=int(worker_count.value_str) if worker_count and worker_count.value_str else 4,
@@ -454,6 +457,15 @@ class AppSettingsTab:
             else:
                 fred = AppSetting(key='fred_api_key', value_str=self.fred_input.value)
                 add_instance(fred, session)
+
+            # Alpha Vantage
+            alpha_vantage = session.exec(select(AppSetting).where(AppSetting.key == 'alpha_vantage_api_key')).first()
+            if alpha_vantage:
+                alpha_vantage.value_str = self.alpha_vantage_input.value
+                update_instance(alpha_vantage, session)
+            else:
+                alpha_vantage = AppSetting(key='alpha_vantage_api_key', value_str=self.alpha_vantage_input.value)
+                add_instance(alpha_vantage, session)
             
             # Worker Count
             worker_count = session.exec(select(AppSetting).where(AppSetting.key == 'worker_count')).first()
@@ -2022,71 +2034,69 @@ class ExpertSettingsTab:
     
     def _execute_cleanup(self, expert_instance=None):
         """Execute the cleanup operation."""
-        # Confirm with user
-        async def confirm_and_execute():
-            result = await ui.run_javascript('''
-                new Promise((resolve) => {
-                    if (confirm("⚠️ This will permanently delete the previewed analyses and their data. Are you sure?")) {
-                        resolve(true);
-                    } else {
-                        resolve(false);
-                    }
-                })
-            ''')
+        # Create confirmation dialog
+        with ui.dialog() as dialog, ui.card():
+            ui.label('⚠️ Confirm Cleanup').classes('text-h6 mb-4')
+            ui.label('This will permanently delete the previewed analyses and their data.').classes('text-body1 mb-4')
+            ui.label('Are you sure you want to continue?').classes('text-body2 mb-4')
             
-            if not result:
-                return
-            
-            try:
-                # Get selected statuses
-                selected_statuses = [
-                    status for status, checkbox in self.cleanup_status_checkboxes.items()
-                    if checkbox.value
-                ]
-                
-                # Get days to keep
-                days_to_keep = int(self.cleanup_days_input.value)
-                
-                # Execute cleanup
-                expert_id = expert_instance.id if expert_instance else None
-                cleanup_result = execute_cleanup(
-                    days_to_keep=days_to_keep,
-                    statuses=selected_statuses,
-                    expert_instance_id=expert_id
-                )
-                
-                if cleanup_result['success']:
-                    message = f"✅ Cleanup completed!\n"
-                    message += f"Deleted: {cleanup_result['analyses_deleted']} analyses\n"
-                    message += f"Protected: {cleanup_result['analyses_protected']} analyses with open transactions\n"
-                    message += f"Outputs deleted: {cleanup_result['outputs_deleted']}\n"
-                    message += f"Recommendations deleted: {cleanup_result['recommendations_deleted']}"
-                    
-                    if cleanup_result['errors']:
-                        message += f"\n⚠️ {len(cleanup_result['errors'])} errors occurred"
-                    
-                    ui.notify(message, type='positive', multi_line=True, timeout=5000)
-                    
-                    # Refresh statistics
-                    self._refresh_cleanup_statistics(expert_instance)
-                    
-                    # Clear preview
-                    self.cleanup_preview_container.clear()
-                    with self.cleanup_preview_container:
-                        ui.label('Click "Preview Cleanup" to see what will be deleted.').classes('text-body2 text-grey')
-                    
-                    # Disable execute button
-                    self.cleanup_execute_button.set_enabled(False)
-                else:
-                    error_msg = "❌ Cleanup failed:\n" + "\n".join(cleanup_result['errors'])
-                    ui.notify(error_msg, type='negative', multi_line=True, timeout=5000)
-            
-            except Exception as e:
-                logger.error(f'Error executing cleanup: {e}')
-                ui.notify(f'❌ Error: {str(e)}', type='negative')
+            with ui.row().classes('w-full justify-end gap-2'):
+                ui.button('Cancel', on_click=dialog.close).props('flat')
+                ui.button('Delete', on_click=lambda: self._perform_cleanup(expert_instance, dialog)).props('color=negative')
         
-        # Run the async confirmation
-        ui.timer(0.1, confirm_and_execute, once=True)
+        dialog.open()
+    
+    def _perform_cleanup(self, expert_instance, dialog):
+        """Perform the actual cleanup operation."""
+        dialog.close()
+        
+        try:
+            # Get selected statuses
+            selected_statuses = [
+                status for status, checkbox in self.cleanup_status_checkboxes.items()
+                if checkbox.value
+            ]
+            
+            # Get days to keep
+            days_to_keep = int(self.cleanup_days_input.value)
+            
+            # Execute cleanup
+            expert_id = expert_instance.id if expert_instance else None
+            cleanup_result = execute_cleanup(
+                days_to_keep=days_to_keep,
+                statuses=selected_statuses,
+                expert_instance_id=expert_id
+            )
+            
+            if cleanup_result['success']:
+                message = f"✅ Cleanup completed!\n"
+                message += f"Deleted: {cleanup_result['analyses_deleted']} analyses\n"
+                message += f"Protected: {cleanup_result['analyses_protected']} analyses with open transactions\n"
+                message += f"Outputs deleted: {cleanup_result['outputs_deleted']}\n"
+                message += f"Recommendations deleted: {cleanup_result['recommendations_deleted']}"
+                
+                if cleanup_result['errors']:
+                    message += f"\n⚠️ {len(cleanup_result['errors'])} errors occurred"
+                
+                ui.notify(message, type='positive', multi_line=True, timeout=5000)
+                
+                # Refresh statistics
+                self._refresh_cleanup_statistics(expert_instance)
+                
+                # Clear preview
+                self.cleanup_preview_container.clear()
+                with self.cleanup_preview_container:
+                    ui.label('Click "Preview Cleanup" to see what will be deleted.').classes('text-body2 text-grey')
+                
+                # Disable execute button
+                self.cleanup_execute_button.set_enabled(False)
+            else:
+                error_msg = "❌ Cleanup failed:\n" + "\n".join(cleanup_result['errors'])
+                ui.notify(error_msg, type='negative', multi_line=True, timeout=5000)
+        
+        except Exception as e:
+            logger.error(f'Error executing cleanup: {e}')
+            ui.notify(f'❌ Error: {str(e)}', type='negative')
     
     def _on_instrument_selection_change(self, selected_instruments):
         """Handle instrument selection changes."""

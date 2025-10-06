@@ -273,7 +273,7 @@ class WorkerQueue:
             logger.info(f"Task '{task_id}' cancelled")
             return True
     
-    def cancel_analysis_task(self, expert_instance_id: int, symbol: str) -> bool:
+    def cancel_analysis_task(self, expert_instance_id: int, symbol: str) -> tuple[bool, str]:
         """
         Cancel a pending analysis task by expert instance ID and symbol.
         
@@ -282,14 +282,21 @@ class WorkerQueue:
             symbol: The symbol
             
         Returns:
-            True if task was cancelled, False if task not found or not pending
+            Tuple of (success: bool, message: str) - success indicates if cancelled, message explains why
         """
         with self._task_lock:
             # Find task by expert instance and symbol
             for task_id, task in self._tasks.items():
                 if (task.expert_instance_id == expert_instance_id and 
-                    task.symbol == symbol and 
-                    task.status == WorkerTaskStatus.PENDING):
+                    task.symbol == symbol):
+                    
+                    # Check if task is already running
+                    if task.status == WorkerTaskStatus.RUNNING:
+                        return False, "Task is currently running and cannot be cancelled"
+                    
+                    # Check if task is not pending
+                    if task.status != WorkerTaskStatus.PENDING:
+                        return False, f"Task is in '{task.status.value}' status and cannot be cancelled"
                     
                     # Remove from task key mapping
                     task_key = task.get_task_key()
@@ -302,9 +309,47 @@ class WorkerQueue:
                     task.completed_at = time.time()
                     
                     logger.info(f"Analysis task for expert {expert_instance_id}, symbol {symbol} cancelled")
-                    return True
+                    return True, "Task cancelled successfully"
         
-        return False
+        return False, "Task not found in queue - it may have already started or completed"
+    
+    def cancel_analysis_by_market_analysis_id(self, market_analysis_id: int) -> tuple[bool, str]:
+        """
+        Cancel a pending analysis task by market analysis ID.
+        
+        Args:
+            market_analysis_id: The market analysis ID
+            
+        Returns:
+            Tuple of (success: bool, message: str) - success indicates if cancelled, message explains why
+        """
+        with self._task_lock:
+            # Find task by market_analysis_id
+            for task_id, task in self._tasks.items():
+                if task.market_analysis_id == market_analysis_id:
+                    
+                    # Check if task is already running
+                    if task.status == WorkerTaskStatus.RUNNING:
+                        return False, "Task is currently running and cannot be cancelled"
+                    
+                    # Check if task is not pending
+                    if task.status != WorkerTaskStatus.PENDING:
+                        return False, f"Task is in '{task.status.value}' status and cannot be cancelled"
+                    
+                    # Remove from task key mapping
+                    task_key = task.get_task_key()
+                    if task_key in self._task_keys and self._task_keys[task_key] == task_id:
+                        del self._task_keys[task_key]
+                        
+                    # Update task status
+                    task.status = WorkerTaskStatus.FAILED
+                    task.error = Exception("Analysis task cancelled by user")
+                    task.completed_at = time.time()
+                    
+                    logger.info(f"Analysis task with market_analysis_id {market_analysis_id} cancelled")
+                    return True, "Task cancelled successfully"
+        
+        return False, "Task not found in queue - it may have already started or completed"
         
     def _get_worker_count(self) -> int:
         """Get the configured worker count from AppSettings."""

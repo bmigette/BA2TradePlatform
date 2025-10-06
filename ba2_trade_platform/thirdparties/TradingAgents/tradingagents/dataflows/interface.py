@@ -1091,7 +1091,7 @@ VENDOR_METHODS = {
         "alpha_vantage": get_alpha_vantage_news,
         "openai": get_stock_news_openai,
         "google": get_google_news,
-        "local": [get_finnhub_news, get_reddit_company_news, get_google_news],
+        "local": [get_finnhub_news, get_reddit_company_news],
     },
     "get_global_news": {
         "openai": get_global_news_openai,

@@ -99,6 +99,7 @@ class JobMonitoringTab:
             {'name': 'status', 'label': 'Status', 'field': 'status_display', 'sortable': True, 'style': 'width: 120px'},
             {'name': 'recommendation', 'label': 'Recommendation', 'field': 'recommendation', 'sortable': True, 'style': 'width: 130px'},
             {'name': 'confidence', 'label': 'Confidence', 'field': 'confidence', 'sortable': True, 'style': 'width: 100px'},
+            {'name': 'expected_profit', 'label': 'Expected Profit', 'field': 'expected_profit', 'sortable': True, 'style': 'width: 120px'},
             {'name': 'created_at', 'label': 'Created', 'field': 'created_at_local', 'sortable': True, 'style': 'width: 160px'},
             {'name': 'subtype', 'label': 'Type', 'field': 'subtype', 'sortable': True, 'style': 'width: 120px'},
             {'name': 'actions', 'label': 'Actions', 'field': 'actions', 'sortable': False, 'style': 'width: 100px'}
@@ -234,6 +235,7 @@ class JobMonitoringTab:
                     # Get recommendation and confidence from expert_recommendations
                     recommendation_display = '-'
                     confidence_display = '-'
+                    expected_profit_display = '-'
                     if analysis.expert_recommendations and len(analysis.expert_recommendations) > 0:
                         # Get the first (most recent) recommendation
                         rec = analysis.expert_recommendations[0]
@@ -251,6 +253,11 @@ class JobMonitoringTab:
                         
                         if rec.confidence is not None:
                             confidence_display = f'{rec.confidence:.1f}%'
+                        
+                        if rec.expected_profit_percent is not None:
+                            # Format with + or - sign and color indicator
+                            sign = '+' if rec.expected_profit_percent >= 0 else ''
+                            expected_profit_display = f'{sign}{rec.expected_profit_percent:.2f}%'
                     
                     analysis_data.append({
                         'id': analysis.id,
@@ -260,6 +267,7 @@ class JobMonitoringTab:
                         'status_display': status_display,
                         'recommendation': recommendation_display,
                         'confidence': confidence_display,
+                        'expected_profit': expected_profit_display,
                         'created_at_local': created_local,
                         'subtype': subtype_display,
                         'can_cancel': can_cancel,
@@ -406,7 +414,7 @@ class JobMonitoringTab:
                 return
             
             # Try to cancel the task in the worker queue
-            success = self._get_worker_queue().cancel_analysis_task(analysis.expert_instance_id, analysis.symbol)
+            success, message = self._get_worker_queue().cancel_analysis_by_market_analysis_id(analysis_id)
             
             if success:
                 # Update the analysis status
@@ -417,7 +425,7 @@ class JobMonitoringTab:
                 ui.notify(f"Analysis {analysis_id} cancelled successfully", type='positive')
                 self.refresh_data()
             else:
-                ui.notify("Failed to cancel analysis - task may already be running", type='warning')
+                ui.notify(f"Failed to cancel analysis: {message}", type='warning')
                 
         except Exception as e:
             logger.error(f"Error cancelling analysis {analysis_id if analysis_id else 'unknown'}: {e}", exc_info=True)
