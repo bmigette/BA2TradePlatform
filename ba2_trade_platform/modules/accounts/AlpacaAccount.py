@@ -443,7 +443,7 @@ class AlpacaAccount(AccountInterface):
             bool: True if cancellation was successful, False otherwise.
         """
         try:
-            self.client.cancel_order(order_id)
+            self.client.cancel_order_by_id(order_id)
             logger.info(f"Cancelled Alpaca order: {order_id}")
             return True
         except Exception as e:

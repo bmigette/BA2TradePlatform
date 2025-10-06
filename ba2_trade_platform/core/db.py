@@ -61,7 +61,7 @@ def get_db():
     """
     return Session(engine)
 
-def add_instance(instance, session: Session | None = None):
+def add_instance(instance, session: Session | None = None, expunge_after_flush: bool = False):
     """
     Add a new instance to the database.
     If a session is provided, use it; otherwise, create a new session.
@@ -70,6 +70,9 @@ def add_instance(instance, session: Session | None = None):
     Args:
         instance: The instance to add.
         session (Session, optional): An existing SQLModel session. If not provided, a new session is created.
+        expunge_after_flush (bool, optional): If True, expunge the instance from the session after flush
+            to prevent attribute expiration. This allows the instance to be used like a normal 
+            Pydantic/SQLModel object without session errors. Default is False for backward compatibility.
 
     Returns:
         The ID of the added instance.
@@ -80,6 +83,8 @@ def add_instance(instance, session: Session | None = None):
             session.add(instance)
             session.flush()  # Flush to generate the ID without committing
             instance_id = instance.id  # Get ID after flush
+            if expunge_after_flush:
+                session.expunge(instance)  # Detach from session to prevent attribute expiration
             session.commit()
             logger.info(f"Added instance: {instance_class} (id={instance_id})")
             return instance_id
@@ -88,6 +93,8 @@ def add_instance(instance, session: Session | None = None):
                 new_session.add(instance)
                 new_session.flush()  # Flush to generate the ID without committing
                 instance_id = instance.id  # Get ID after flush
+                if expunge_after_flush:
+                    new_session.expunge(instance)  # Detach from session to prevent attribute expiration
                 new_session.commit()
                 logger.info(f"Added instance: {instance_class} (id={instance_id})")
                 return instance_id

@@ -150,6 +150,40 @@ class OrderStatus(str, Enum):
             cls.FILLED,
             cls.PARTIALLY_FILLED,
         }
+    
+    @classmethod
+    def get_unfilled_statuses(cls):
+        """
+        Return a set of order statuses that indicate the order is not yet filled.
+        These are statuses where the order is still pending or waiting.
+        
+        Unfilled statuses include:
+        - PENDING: Order is pending
+        - NEW: Order is new
+        - OPEN: Order is open
+        - PENDING_NEW: Order is pending creation
+        - WAITING_TRIGGER: Order is waiting for a trigger condition
+        - ACCEPTED: Order was accepted but not filled
+        - PENDING_CANCEL: Order is pending cancellation
+        - PENDING_REPLACE: Order is pending replacement
+        - PENDING_REVIEW: Order is pending review
+        - ACCEPTED_FOR_BIDDING: Order accepted for bidding
+        - HELD: Order is held
+        
+        Returns:
+            set: Set of OrderStatus values representing unfilled states
+        """
+        return {
+            cls.PENDING,
+            cls.NEW,
+            cls.OPEN,
+            cls.PENDING_NEW,
+            cls.ACCEPTED,
+            cls.PENDING_REPLACE,
+            cls.PENDING_REVIEW,
+            cls.ACCEPTED_FOR_BIDDING,
+            cls.HELD,
+        }
 
 
 
@@ -184,6 +218,7 @@ class OrderRecommendation(str, Enum):
 class TransactionStatus(str, Enum):
     WAITING = "WAITING"
     OPENED = "OPENED"
+    CLOSING = "CLOSING"
     CLOSED = "CLOSED"
 
 class RiskLevel(str, Enum):

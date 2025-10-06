@@ -110,16 +110,20 @@ class AccountInterface(ExtendableSettingsInterface):
 
     def _generate_tracking_comment(self, trading_order: TradingOrder) -> str:
         """
-        Generate a tracking comment for the order with metadata prefix.
-        Format: [ACC:X/EXP:Y/TR:Z/ORD:W] original_comment
+        Generate a tracking comment for the order with epoch time and metadata prefix.
+        Format: {epoch}-[ACC:X/EXP:Y/TR:Z/ORD:W] original_comment
         
         Args:
             trading_order: The TradingOrder object
             
         Returns:
-            str: The formatted comment with tracking metadata, truncated to 128 characters if needed
+            str: The formatted comment with epoch time and tracking metadata, truncated to 128 characters if needed
         """
         import re
+        import time
+        
+        # Get epoch time (microseconds precision) for uniqueness
+        epoch = int(time.time() * 1000000)
         
         # Get account_id
         account_id = trading_order.account_id or self.id
@@ -142,14 +146,14 @@ class AccountInterface(ExtendableSettingsInterface):
         # Get order_id (will be None for new orders)
         order_id = trading_order.id or "NEW"
         
-        # Build tracking prefix
+        # Build tracking prefix with epoch time at the beginning
         exp_part = f"/EXP:{expert_id}" if expert_id else ""
-        tracking_prefix = f"[ACC:{account_id}{exp_part}/TR:{transaction_id}/ORD:{order_id}]"
+        tracking_prefix = f"{epoch}-[ACC:{account_id}{exp_part}/TR:{transaction_id}/ORD:{order_id}]"
         
         # Get original comment and clean any existing automated comment prefix
         original_comment = trading_order.comment or ""
-        # Remove any existing [ACC:...] prefix using regex
-        original_comment = re.sub(r'^\[ACC:\d+(?:/EXP:\d+)?/TR:\w+/ORD:\w+\]\s*', '', original_comment).strip()
+        # Remove any existing epoch-[ACC:...] prefix using regex
+        original_comment = re.sub(r'^\d+-\[ACC:\d+(?:/EXP:\d+)?/TR:\w+/ORD:\w+\]\s*', '', original_comment).strip()
         
         # Combine prefix with original comment
         if original_comment:
@@ -194,23 +198,33 @@ class AccountInterface(ExtendableSettingsInterface):
         # Handle transaction requirements based on order type
         self._handle_transaction_requirements(trading_order)
         
-        # Store comment and account_id values (don't modify potentially detached instance yet)
+        # Generate tracking comment and set account_id BEFORE saving to DB
         tracking_comment = self._generate_tracking_comment(trading_order)
-        account_id_value = self.id
+        trading_order.comment = tracking_comment
+        trading_order.account_id = self.id
         
-        # Log successful validation
-        logger.info(f"Order validation passed for {trading_order.symbol} - {trading_order.side.value} {trading_order.quantity} @ {trading_order.order_type.value}")
+        # Capture values for logging BEFORE saving (to avoid detached instance errors)
+        symbol = trading_order.symbol
+        side = trading_order.side
+        quantity = trading_order.quantity
+        order_type = trading_order.order_type
         
-        # Call the child class implementation
+        # CRITICAL: Save order to database BEFORE broker submission
+        # This ensures the order has an ID for error tracking
+        # Use expunge_after_flush=True to allow normal attribute access after save
+        from .db import add_instance
+        
+        if not trading_order.id:
+            # Save to database - object will be expunged and can be used like a normal Pydantic object
+            order_id = add_instance(trading_order, expunge_after_flush=True)
+            logger.debug(f"Created order {order_id} in database before broker submission")
+        
+        # Log successful validation (using captured values to avoid any potential issues)
+        logger.info(f"Order validation passed for {symbol} - {side.value} {quantity} @ {order_type.value}")
+        
+        # Call the child class implementation (this will update the order with broker_order_id)
+        # The trading_order object is now detached but all attributes are accessible
         result = self._submit_order_impl(trading_order)
-        
-        # After submission, update the order with tracking info if successful
-        if result:
-            # Use update_instance to safely modify the order
-            result.comment = tracking_comment
-            result.account_id = account_id_value
-            from .db import update_instance
-            update_instance(result)
         
         return result
     

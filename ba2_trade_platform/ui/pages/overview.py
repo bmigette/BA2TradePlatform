@@ -1655,6 +1655,7 @@ class TransactionsTab:
                 # Status styling
                 status_color = {
                     TransactionStatus.OPENED: 'green',
+                    TransactionStatus.CLOSING: 'orange',
                     TransactionStatus.CLOSED: 'gray',
                     TransactionStatus.WAITING: 'orange'
                 }.get(txn.status, 'gray')
@@ -1723,6 +1724,7 @@ class TransactionsTab:
                     'status_color': status_color,
                     'created_at': txn.created_at.strftime('%Y-%m-%d %H:%M') if txn.created_at else '',
                     'is_open': txn.status == TransactionStatus.OPENED,
+                    'is_closing': txn.status == TransactionStatus.CLOSING,  # Track CLOSING status
                     'orders': orders_data,  # Add orders for expansion
                     'order_count': len(orders_data)  # Show order count
                 }
@@ -1809,7 +1811,7 @@ class TransactionsTab:
                                    @click="$parent.$emit('edit_transaction', props.row.id)"
                                    title="Adjust TP/SL"
                             />
-                            <q-btn v-if="props.row.is_open" 
+                            <q-btn v-if="props.row.is_open && !props.row.is_closing" 
                                    icon="close" 
                                    size="sm" 
                                    flat 
@@ -1817,6 +1819,15 @@ class TransactionsTab:
                                    color="negative"
                                    @click="$parent.$emit('close_transaction', props.row.id)"
                                    title="Close Position"
+                            />
+                            <q-btn v-else-if="props.row.is_closing"
+                                   icon="hourglass_empty"
+                                   size="sm"
+                                   flat
+                                   round
+                                   color="orange"
+                                   disable
+                                   title="Closing in progress..."
                             />
                             <span v-else class="text-grey-5">—</span>
                         </template>
@@ -2014,9 +2025,15 @@ class TransactionsTab:
         dialog.open()
     
     def _close_position(self, transaction_id, dialog):
-        """Close a position by creating a closing order."""
+        """
+        Close a position by:
+        1. Canceling any unfilled orders
+        2. Deleting WAITING_TRIGGER orders from DB
+        3. Creating a closing order for filled positions
+        """
         from ...core.models import Transaction
-        from ...core.types import OrderDirection, OrderType, TransactionStatus
+        from ...core.types import OrderDirection, OrderType, TransactionStatus, OrderStatus
+        from ...core.db import delete_instance
         
         try:
             txn = get_instance(Transaction, transaction_id)
@@ -2024,22 +2041,40 @@ class TransactionsTab:
                 ui.notify('Transaction not found', type='negative')
                 return
             
-            # Query for the first (opening) order from the transaction
-            session = get_db()
-            order_statement = select(TradingOrder).where(
-                TradingOrder.transaction_id == transaction_id
-            ).order_by(TradingOrder.created_at).limit(1)
-            order = session.exec(order_statement).first()
+            # Check if transaction is already being closed
+            if txn.status == TransactionStatus.CLOSING:
+                ui.notify('Transaction is already being closed', type='warning')
+                dialog.close()
+                return
             
-            if not order or not order.account_id:
-                ui.notify('Order not found or account not found', type='negative')
+            # Set transaction status to CLOSING to prevent duplicate close attempts
+            from ...core.db import update_instance
+            txn.status = TransactionStatus.CLOSING
+            update_instance(txn)
+            logger.info(f"Set transaction {transaction_id} status to CLOSING")
+            
+            # Query for ALL orders associated with this transaction
+            session = get_db()
+            all_orders_statement = select(TradingOrder).where(
+                TradingOrder.transaction_id == transaction_id
+            ).order_by(TradingOrder.created_at)
+            all_orders = list(session.exec(all_orders_statement).all())
+            
+            if not all_orders:
+                ui.notify('No orders found for this transaction', type='negative')
+                return
+            
+            # Get account from first order
+            first_order = all_orders[0]
+            if not first_order.account_id:
+                ui.notify('Account not found', type='negative')
                 return
             
             # Get account
             from ...modules.accounts import get_account_class
             from ...core.models import AccountDefinition
             
-            acc_def = get_instance(AccountDefinition, order.account_id)
+            acc_def = get_instance(AccountDefinition, first_order.account_id)
             if not acc_def:
                 ui.notify('Account not found', type='negative')
                 return
@@ -2051,28 +2086,83 @@ class TransactionsTab:
             
             account = account_class(acc_def.id)
             
-            # Create closing order (opposite side)
-            close_side = OrderDirection.SELL if txn.quantity > 0 else OrderDirection.BUY
+            # Process all orders for this transaction
+            unfilled_statuses = OrderStatus.get_unfilled_statuses()
+            canceled_count = 0
+            deleted_count = 0
+            has_filled = False
             
-            close_order = TradingOrder(
-                account_id=order.account_id,
-                symbol=txn.symbol,
-                quantity=abs(txn.quantity),
-                side=close_side,
-                order_type=OrderType.MARKET,
-                transaction_id=txn.id,
-                comment=f'Closing position for transaction {txn.id}'
-            )
+            for order in all_orders:
+                # Check if order was filled
+                if order.status in OrderStatus.get_executed_statuses():
+                    has_filled = True
+                    continue
+                
+                # Handle WAITING_TRIGGER orders - delete from DB
+                if order.status == OrderStatus.WAITING_TRIGGER:
+                    try:
+                        delete_instance(order)
+                        deleted_count += 1
+                        logger.info(f"Deleted WAITING_TRIGGER order {order.id} for transaction {transaction_id}")
+                    except Exception as e:
+                        logger.error(f"Error deleting WAITING_TRIGGER order {order.id}: {e}")
+                    continue
+                
+                # Cancel unfilled orders
+                if order.status in unfilled_statuses:
+                    try:
+                        if hasattr(account, 'cancel_order') and order.broker_order_id:
+                            account.cancel_order(order.broker_order_id)
+                            canceled_count += 1
+                            logger.info(f"Canceled unfilled order {order.id} (broker: {order.broker_order_id})")
+                    except Exception as e:
+                        logger.error(f"Error canceling order {order.id}: {e}")
             
-            # Submit the closing order
-            submitted_order = account.submit_order(close_order)
-            
-            if submitted_order:
-                ui.notify(f'Closing order submitted for {txn.symbol}', type='positive')
-                dialog.close()
-                self._refresh_transactions()
+            # If position was filled, create closing order
+            if has_filled:
+                # Create closing order (opposite side)
+                close_side = OrderDirection.SELL if txn.quantity > 0 else OrderDirection.BUY
+                
+                close_order = TradingOrder(
+                    account_id=first_order.account_id,
+                    symbol=txn.symbol,
+                    quantity=abs(txn.quantity),
+                    side=close_side,
+                    order_type=OrderType.MARKET,
+                    transaction_id=txn.id,
+                    comment=f'Closing position for transaction {txn.id}'
+                )
+                
+                # Submit the closing order
+                submitted_order = account.submit_order(close_order)
+                
+                if submitted_order:
+                    msg = f'Closing order submitted for {txn.symbol}'
+                    if canceled_count > 0:
+                        msg += f' ({canceled_count} orders canceled)'
+                    if deleted_count > 0:
+                        msg += f' ({deleted_count} waiting orders deleted)'
+                    ui.notify(msg, type='positive')
+                    dialog.close()
+                    # Reload page to refresh transactions after a short delay
+                    def reload_page():
+                        ui.navigate.reload()
+                    ui.timer(0.3, reload_page, once=True)
+                else:
+                    ui.notify('Failed to submit closing order', type='negative')
             else:
-                ui.notify('Failed to submit closing order', type='negative')
+                # No filled position, just report cleanup
+                msg = f'Transaction cleanup completed'
+                if canceled_count > 0:
+                    msg += f': {canceled_count} orders canceled'
+                if deleted_count > 0:
+                    msg += f', {deleted_count} waiting orders deleted'
+                ui.notify(msg, type='info')
+                dialog.close()
+                # Reload page to refresh transactions after a short delay
+                def reload_page():
+                    ui.navigate.reload()
+                ui.timer(0.3, reload_page, once=True)
             
         except Exception as e:
             ui.notify(f'Error: {str(e)}', type='negative')
