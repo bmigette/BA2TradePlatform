@@ -129,13 +129,37 @@ class TradeAction(ABC):
             expert_instance_id = None
             expert_recommendation_id = None
             
+            # First try to get expert recommendation from self.expert_recommendation (for BUY/SELL/CLOSE actions)
             if self.expert_recommendation:
                 expert_instance_id = self.expert_recommendation.instance_id
                 expert_recommendation_id = self.expert_recommendation.id
                 comment_parts.append(f"TR:{expert_instance_id}")
                 comment_parts.append(f"REC:{expert_recommendation_id}")
+            # For TP/SL orders, copy from existing_order if no expert_recommendation
+            elif self.existing_order and self.existing_order.expert_recommendation_id:
+                expert_recommendation_id = self.existing_order.expert_recommendation_id
+                # Get expert instance ID from the recommendation
+                from .db import get_instance
+                from .models import ExpertRecommendation
+                expert_rec = get_instance(ExpertRecommendation, expert_recommendation_id)
+                if expert_rec:
+                    expert_instance_id = expert_rec.instance_id
+                    comment_parts.append(f"TR:{expert_instance_id}")
+                    comment_parts.append(f"REC:{expert_recommendation_id}")
             
             comment = f"[{'/'.join(comment_parts)}]"
+            
+            # Determine open_type: AUTOMATIC for TP/SL orders, otherwise from expert_recommendation presence
+            from .types import OrderOpenType
+            if linked_order_id is not None:
+                # This is a TP/SL order (has a linked parent order)
+                open_type = OrderOpenType.AUTOMATIC
+            elif expert_recommendation_id is not None:
+                # Order created from expert recommendation
+                open_type = OrderOpenType.AUTOMATIC
+            else:
+                # Manual order
+                open_type = OrderOpenType.MANUAL
             
             order = TradingOrder(
                 account_id=self.account.id,
@@ -148,6 +172,7 @@ class TradeAction(ABC):
                 status=OrderStatus.PENDING.value,
                 linked_order_id=linked_order_id,
                 expert_recommendation_id=expert_recommendation_id,
+                open_type=open_type,
                 comment=comment,
                 created_at=datetime.now(timezone.utc)
             )
@@ -484,7 +509,8 @@ class AdjustTakeProfitAction(TradeAction):
     
     def __init__(self, instrument_name: str, account: AccountInterface, 
                  order_recommendation: OrderRecommendation, existing_order: Optional[TradingOrder] = None,
-                 take_profit_price: Optional[float] = None):
+                 take_profit_price: Optional[float] = None,
+                 reference_value: Optional[str] = None, percent: Optional[float] = None):
         """
         Initialize adjust take profit action.
         
@@ -493,10 +519,14 @@ class AdjustTakeProfitAction(TradeAction):
             account: Account interface
             order_recommendation: Order recommendation
             existing_order: Existing order to adjust (required - from enter_market or open position)
-            take_profit_price: New take profit price
+            take_profit_price: New take profit price (if provided directly)
+            reference_value: Reference price type ('order_open_price', 'current_price', 'expert_target_price')
+            percent: Percentage to apply to reference value (e.g., 5.0 for +5%)
         """
         super().__init__(instrument_name, account, order_recommendation, existing_order, expert_recommendation=None)
         self.take_profit_price = take_profit_price
+        self.reference_value = reference_value
+        self.percent = percent
     
     def execute(self) -> "TradeActionResult":
         """
@@ -514,22 +544,113 @@ class AdjustTakeProfitAction(TradeAction):
                     data={}
                 )
             
-            # If no take profit price provided, calculate based on current price and some percentage
+            # Calculate take profit price if not directly provided
             if self.take_profit_price is None:
-                current_price = self.get_current_price()
-                if current_price is None:
+                if self.reference_value is None or self.percent is None:
+                    logger.error(f"No take profit price, reference_value, or percent provided for {self.instrument_name}")
                     return self.create_and_save_action_result(
                         action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
                         success=False,
-                        message=f"Cannot get current price for {self.instrument_name}",
+                        message=f"Missing required parameters: take_profit_price or (reference_value + percent)",
                         data={}
                     )
                 
-                # Default to 5% profit target
-                if self.existing_order.side == "buy":
-                    self.take_profit_price = current_price * 1.05
+                logger.info(f"TP Calculation START for {self.instrument_name} - Order ID: {self.existing_order.id}, Side: {self.existing_order.side.upper()}, reference_value: {self.reference_value}, percent: {self.percent:+.2f}%")
+                
+                # Get reference price based on reference_value type
+                from .types import ReferenceValue
+                reference_price = None
+                
+                if self.reference_value == ReferenceValue.ORDER_OPEN_PRICE.value:
+                    # Use the order's limit_price as open price
+                    reference_price = self.existing_order.limit_price
+                    if reference_price is None:
+                        logger.error(f"Order {self.existing_order.id} has no limit_price for ORDER_OPEN_PRICE reference")
+                        return self.create_and_save_action_result(
+                            action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
+                            success=False,
+                            message="Order has no open price (limit_price) available",
+                            data={}
+                        )
+                    logger.info(f"TP Reference: ORDER_OPEN_PRICE = ${reference_price:.2f} (from order.limit_price)")
+                    
+                elif self.reference_value == ReferenceValue.CURRENT_PRICE.value:
+                    reference_price = self.get_current_price()
+                    if reference_price is None:
+                        logger.error(f"Cannot get current price for {self.instrument_name}")
+                        return self.create_and_save_action_result(
+                            action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
+                            success=False,
+                            message=f"Cannot get current market price for {self.instrument_name}",
+                            data={}
+                        )
+                    logger.info(f"TP Reference: CURRENT_PRICE = ${reference_price:.2f} (from market data)")
+                    
+                elif self.reference_value == ReferenceValue.EXPERT_TARGET_PRICE.value:
+                    # Get target price from expert recommendation
+                    # Target = price_at_date * (1 + expected_profit_percent/100) for BUY
+                    # Target = price_at_date * (1 - expected_profit_percent/100) for SELL
+                    if self.existing_order and self.existing_order.expert_recommendation_id:
+                        from .db import get_instance
+                        from .models import ExpertRecommendation
+                        expert_rec = get_instance(ExpertRecommendation, self.existing_order.expert_recommendation_id)
+                        if expert_rec and hasattr(expert_rec, 'price_at_date') and hasattr(expert_rec, 'expected_profit_percent'):
+                            base_price = expert_rec.price_at_date
+                            expected_profit = expert_rec.expected_profit_percent
+                            
+                            logger.info(f"TP Reference: EXPERT_TARGET_PRICE - base_price: ${base_price:.2f}, expected_profit: {expected_profit:.1f}%, action: {expert_rec.recommended_action}")
+                            
+                            # Calculate target price based on recommendation direction
+                            if expert_rec.recommended_action == OrderRecommendation.BUY:
+                                reference_price = base_price * (1 + expected_profit / 100)
+                                logger.info(f"TP Target (BUY): ${base_price:.2f} * (1 + {expected_profit:.1f}/100) = ${reference_price:.2f}")
+                            elif expert_rec.recommended_action == OrderRecommendation.SELL:
+                                reference_price = base_price * (1 - expected_profit / 100)
+                                logger.info(f"TP Target (SELL): ${base_price:.2f} * (1 - {expected_profit:.1f}/100) = ${reference_price:.2f}")
+                            else:
+                                logger.error(f"Invalid recommendation action: {expert_rec.recommended_action}")
+                                return self.create_and_save_action_result(
+                                    action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
+                                    success=False,
+                                    message=f"Invalid recommendation action: {expert_rec.recommended_action}",
+                                    data={}
+                                )
+                        else:
+                            logger.error(f"Cannot get expert target price for order {self.existing_order.id} - missing price_at_date or expected_profit_percent")
+                            return self.create_and_save_action_result(
+                                action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
+                                success=False,
+                                message="Cannot get expert target price from recommendation",
+                                data={}
+                            )
+                    else:
+                        logger.error(f"No expert recommendation linked to order {self.existing_order.id}")
+                        return self.create_and_save_action_result(
+                            action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
+                            success=False,
+                            message="No expert recommendation available for target price",
+                            data={}
+                        )
                 else:
-                    self.take_profit_price = current_price * 0.95
+                    logger.error(f"Unknown reference_value: {self.reference_value}")
+                    return self.create_and_save_action_result(
+                        action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
+                        success=False,
+                        message=f"Unknown reference_value: {self.reference_value}",
+                        data={}
+                    )
+                
+                # Calculate TP price based on reference price and percent
+                # For BUY orders: TP is above entry (positive percent)
+                # For SELL orders: TP is below entry (negative percent implied)
+                if self.existing_order.side.upper() == "BUY":
+                    self.take_profit_price = reference_price * (1 + self.percent / 100)
+                    logger.info(f"TP Final (BUY): ${reference_price:.2f} * (1 + {self.percent:+.2f}/100) = ${self.take_profit_price:.2f}")
+                else:  # SELL order
+                    self.take_profit_price = reference_price * (1 - self.percent / 100)
+                    logger.info(f"TP Final (SELL): ${reference_price:.2f} * (1 - {self.percent:+.2f}/100) = ${self.take_profit_price:.2f}")
+                
+                logger.info(f"TP Calculation COMPLETE for {self.instrument_name} - Final TP Price: ${self.take_profit_price:.2f}")
             
             # Use account's set_order_tp method to adjust take profit
             tp_result = self.account.set_order_tp(self.existing_order, self.take_profit_price)
@@ -573,7 +694,8 @@ class AdjustStopLossAction(TradeAction):
     
     def __init__(self, instrument_name: str, account: AccountInterface, 
                  order_recommendation: OrderRecommendation, existing_order: Optional[TradingOrder] = None,
-                 stop_loss_price: Optional[float] = None):
+                 stop_loss_price: Optional[float] = None,
+                 reference_value: Optional[str] = None, percent: Optional[float] = None):
         """
         Initialize adjust stop loss action.
         
@@ -582,10 +704,14 @@ class AdjustStopLossAction(TradeAction):
             account: Account interface
             order_recommendation: Order recommendation
             existing_order: Existing order to adjust (required - from enter_market or open position)
-            stop_loss_price: New stop loss price
+            stop_loss_price: New stop loss price (if provided directly)
+            reference_value: Reference price type ('order_open_price', 'current_price', 'expert_target_price')
+            percent: Percentage to apply to reference value (e.g., -3.0 for -3%)
         """
         super().__init__(instrument_name, account, order_recommendation, existing_order, expert_recommendation=None)
         self.stop_loss_price = stop_loss_price
+        self.reference_value = reference_value
+        self.percent = percent
     
     def execute(self) -> "TradeActionResult":
         """
@@ -603,22 +729,113 @@ class AdjustStopLossAction(TradeAction):
                     data={}
                 )
             
-            # If no stop loss price provided, calculate based on current price and some percentage
+            # Calculate stop loss price if not directly provided
             if self.stop_loss_price is None:
-                current_price = self.get_current_price()
-                if current_price is None:
+                if self.reference_value is None or self.percent is None:
+                    logger.error(f"No stop loss price, reference_value, or percent provided for {self.instrument_name}")
                     return self.create_and_save_action_result(
                         action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
                         success=False,
-                        message=f"Cannot get current price for {self.instrument_name}",
+                        message=f"Missing required parameters: stop_loss_price or (reference_value + percent)",
                         data={}
                     )
                 
-                # Default to 3% stop loss
-                if self.existing_order.side == "buy":
-                    self.stop_loss_price = current_price * 0.97
+                logger.info(f"SL Calculation START for {self.instrument_name} - Order ID: {self.existing_order.id}, Side: {self.existing_order.side.upper()}, reference_value: {self.reference_value}, percent: {self.percent:+.2f}%")
+                
+                # Get reference price based on reference_value type
+                from .types import ReferenceValue
+                reference_price = None
+                
+                if self.reference_value == ReferenceValue.ORDER_OPEN_PRICE.value:
+                    # Use the order's limit_price as open price
+                    reference_price = self.existing_order.limit_price
+                    if reference_price is None:
+                        logger.error(f"Order {self.existing_order.id} has no limit_price for ORDER_OPEN_PRICE reference")
+                        return self.create_and_save_action_result(
+                            action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
+                            success=False,
+                            message="Order has no open price (limit_price) available",
+                            data={}
+                        )
+                    logger.info(f"SL Reference: ORDER_OPEN_PRICE = ${reference_price:.2f} (from order.limit_price)")
+                    
+                elif self.reference_value == ReferenceValue.CURRENT_PRICE.value:
+                    reference_price = self.get_current_price()
+                    if reference_price is None:
+                        logger.error(f"Cannot get current price for {self.instrument_name}")
+                        return self.create_and_save_action_result(
+                            action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
+                            success=False,
+                            message=f"Cannot get current market price for {self.instrument_name}",
+                            data={}
+                        )
+                    logger.info(f"SL Reference: CURRENT_PRICE = ${reference_price:.2f} (from market data)")
+                    
+                elif self.reference_value == ReferenceValue.EXPERT_TARGET_PRICE.value:
+                    # Get target price from expert recommendation
+                    # Target = price_at_date * (1 + expected_profit_percent/100) for BUY
+                    # Target = price_at_date * (1 - expected_profit_percent/100) for SELL
+                    if self.existing_order and self.existing_order.expert_recommendation_id:
+                        from .db import get_instance
+                        from .models import ExpertRecommendation
+                        expert_rec = get_instance(ExpertRecommendation, self.existing_order.expert_recommendation_id)
+                        if expert_rec and hasattr(expert_rec, 'price_at_date') and hasattr(expert_rec, 'expected_profit_percent'):
+                            base_price = expert_rec.price_at_date
+                            expected_profit = expert_rec.expected_profit_percent
+                            
+                            logger.info(f"SL Reference: EXPERT_TARGET_PRICE - base_price: ${base_price:.2f}, expected_profit: {expected_profit:.1f}%, action: {expert_rec.recommended_action}")
+                            
+                            # Calculate target price based on recommendation direction
+                            if expert_rec.recommended_action == OrderRecommendation.BUY:
+                                reference_price = base_price * (1 + expected_profit / 100)
+                                logger.info(f"SL Target (BUY): ${base_price:.2f} * (1 + {expected_profit:.1f}/100) = ${reference_price:.2f}")
+                            elif expert_rec.recommended_action == OrderRecommendation.SELL:
+                                reference_price = base_price * (1 - expected_profit / 100)
+                                logger.info(f"SL Target (SELL): ${base_price:.2f} * (1 - {expected_profit:.1f}/100) = ${reference_price:.2f}")
+                            else:
+                                logger.error(f"Invalid recommendation action: {expert_rec.recommended_action}")
+                                return self.create_and_save_action_result(
+                                    action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
+                                    success=False,
+                                    message=f"Invalid recommendation action: {expert_rec.recommended_action}",
+                                    data={}
+                                )
+                        else:
+                            logger.error(f"Cannot get expert target price for order {self.existing_order.id} - missing price_at_date or expected_profit_percent")
+                            return self.create_and_save_action_result(
+                                action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
+                                success=False,
+                                message="Cannot get expert target price from recommendation",
+                                data={}
+                            )
+                    else:
+                        logger.error(f"No expert recommendation linked to order {self.existing_order.id}")
+                        return self.create_and_save_action_result(
+                            action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
+                            success=False,
+                            message="No expert recommendation available for target price",
+                            data={}
+                        )
                 else:
-                    self.stop_loss_price = current_price * 1.03
+                    logger.error(f"Unknown reference_value: {self.reference_value}")
+                    return self.create_and_save_action_result(
+                        action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
+                        success=False,
+                        message=f"Unknown reference_value: {self.reference_value}",
+                        data={}
+                    )
+                
+                # Calculate SL price based on reference price and percent
+                # For BUY orders: SL is below entry (negative percent)
+                # For SELL orders: SL is above entry (positive percent implied)
+                if self.existing_order.side.upper() == "BUY":
+                    self.stop_loss_price = reference_price * (1 + self.percent / 100)
+                    logger.info(f"SL Final (BUY): ${reference_price:.2f} * (1 + {self.percent:+.2f}/100) = ${self.stop_loss_price:.2f}")
+                else:  # SELL order
+                    self.stop_loss_price = reference_price * (1 - self.percent / 100)
+                    logger.info(f"SL Final (SELL): ${reference_price:.2f} * (1 - {self.percent:+.2f}/100) = ${self.stop_loss_price:.2f}")
+                
+                logger.info(f"SL Calculation COMPLETE for {self.instrument_name} - Final SL Price: ${self.stop_loss_price:.2f}")
             
             # Determine SL order side (opposite of main order)
             sl_side = "sell" if self.existing_order.side == "buy" else "buy"

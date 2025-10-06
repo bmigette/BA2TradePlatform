@@ -259,10 +259,13 @@ class ExpertEventType(str, Enum):
     F_HIGHRISK = "highrisk"
     F_MEDIUMRISK = "mediumrisk"
     F_LOWRISK = "lowrisk"
+    F_NEW_TARGET_HIGHER = "new_target_higher"  # New expert target is higher than current TP (with 2% tolerance)
+    F_NEW_TARGET_LOWER = "new_target_lower"    # New expert target is lower than current TP (with 2% tolerance)
     
     # N = Number/Count
     N_EXPECTED_PROFIT_TARGET_PERCENT = "expected_profit_target_percent"
-    N_PERCENT_TO_TARGET = "percent_to_target"
+    N_PERCENT_TO_CURRENT_TARGET = "percent_to_current_target"  # Distance from current price to current TP
+    N_PERCENT_TO_NEW_TARGET = "percent_to_new_target"          # Distance from current price to new expert target
     N_PROFIT_LOSS_AMOUNT = "profit_loss_amount"
     N_PROFIT_LOSS_PERCENT = "profit_loss_percent"
     N_DAYS_OPENED = "days_opened"

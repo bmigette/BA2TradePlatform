@@ -579,8 +579,16 @@ class TradeActionEvaluator:
             kwargs = {}
             
             if action_type == ExpertActionType.ADJUST_TAKE_PROFIT:
+                # Extract reference_value and percent (value) for TP calculation
+                kwargs['reference_value'] = action_config.get('reference_value')
+                kwargs['percent'] = action_config.get('value')  # 'value' in config is the percentage
+                # Also allow direct take_profit_price if provided
                 kwargs['take_profit_price'] = action_config.get('take_profit_price')
             elif action_type == ExpertActionType.ADJUST_STOP_LOSS:
+                # Extract reference_value and percent (value) for SL calculation
+                kwargs['reference_value'] = action_config.get('reference_value')
+                kwargs['percent'] = action_config.get('value')  # 'value' in config is the percentage
+                # Also allow direct stop_loss_price if provided
                 kwargs['stop_loss_price'] = action_config.get('stop_loss_price')
             
             # Create action using factory function, passing expert_recommendation

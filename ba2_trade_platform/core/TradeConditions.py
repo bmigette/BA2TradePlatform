@@ -346,6 +346,136 @@ class LowRiskCondition(FlagCondition):
         return f"Check if expert recommendation for {self.instrument_name} has LOW risk"
 
 
+class NewTargetHigherCondition(FlagCondition):
+    """Check if new expert target is higher than current TP (with 2% tolerance)."""
+    
+    TOLERANCE_PERCENT = 2.0  # 2% tolerance
+    
+    def evaluate(self) -> bool:
+        try:
+            if not self.existing_order:
+                logger.debug(f"No existing order for new target higher evaluation")
+                return False
+            
+            # Get current TP price from transaction
+            current_tp_price = None
+            if self.existing_order.transaction_id:
+                from .db import get_instance
+                from .models import Transaction
+                transaction = get_instance(Transaction, self.existing_order.transaction_id)
+                if transaction and transaction.take_profit:
+                    current_tp_price = transaction.take_profit
+            
+            if current_tp_price is None:
+                logger.debug(f"No current TP price available for order {self.existing_order.id}")
+                return False
+            
+            # Calculate new expert target price
+            if not self.expert_recommendation:
+                logger.debug(f"No expert recommendation for new target evaluation")
+                return False
+            
+            if not hasattr(self.expert_recommendation, 'price_at_date') or not hasattr(self.expert_recommendation, 'expected_profit_percent'):
+                logger.error(f"Expert recommendation missing price_at_date or expected_profit_percent")
+                return False
+            
+            base_price = self.expert_recommendation.price_at_date
+            expected_profit = self.expert_recommendation.expected_profit_percent
+            
+            # Calculate new target based on recommendation direction
+            from .types import OrderRecommendation
+            if self.expert_recommendation.recommended_action == OrderRecommendation.BUY:
+                new_target_price = base_price * (1 + expected_profit / 100)
+            elif self.expert_recommendation.recommended_action == OrderRecommendation.SELL:
+                new_target_price = base_price * (1 - expected_profit / 100)
+            else:
+                logger.debug(f"Recommendation action is HOLD, cannot calculate target")
+                return False
+            
+            # Calculate percent difference (new_target vs current_tp)
+            percent_diff = ((new_target_price - current_tp_price) / current_tp_price) * 100
+            
+            # Check if new target is higher by more than tolerance
+            is_higher = percent_diff > self.TOLERANCE_PERCENT
+            
+            logger.info(f"New target comparison for {self.instrument_name}: current_TP=${current_tp_price:.2f}, new_target=${new_target_price:.2f}, diff={percent_diff:+.2f}%, is_higher={is_higher} (tolerance={self.TOLERANCE_PERCENT}%)")
+            
+            return is_higher
+            
+        except Exception as e:
+            logger.error(f"Error evaluating new target higher condition: {e}", exc_info=True)
+            return False
+    
+    def get_description(self) -> str:
+        """Get description of new target higher condition."""
+        return f"Check if new expert target is higher than current TP for {self.instrument_name} (>{self.TOLERANCE_PERCENT}% tolerance)"
+
+
+class NewTargetLowerCondition(FlagCondition):
+    """Check if new expert target is lower than current TP (with 2% tolerance)."""
+    
+    TOLERANCE_PERCENT = 2.0  # 2% tolerance
+    
+    def evaluate(self) -> bool:
+        try:
+            if not self.existing_order:
+                logger.debug(f"No existing order for new target lower evaluation")
+                return False
+            
+            # Get current TP price from transaction
+            current_tp_price = None
+            if self.existing_order.transaction_id:
+                from .db import get_instance
+                from .models import Transaction
+                transaction = get_instance(Transaction, self.existing_order.transaction_id)
+                if transaction and transaction.take_profit:
+                    current_tp_price = transaction.take_profit
+            
+            if current_tp_price is None:
+                logger.debug(f"No current TP price available for order {self.existing_order.id}")
+                return False
+            
+            # Calculate new expert target price
+            if not self.expert_recommendation:
+                logger.debug(f"No expert recommendation for new target evaluation")
+                return False
+            
+            if not hasattr(self.expert_recommendation, 'price_at_date') or not hasattr(self.expert_recommendation, 'expected_profit_percent'):
+                logger.error(f"Expert recommendation missing price_at_date or expected_profit_percent")
+                return False
+            
+            base_price = self.expert_recommendation.price_at_date
+            expected_profit = self.expert_recommendation.expected_profit_percent
+            
+            # Calculate new target based on recommendation direction
+            from .types import OrderRecommendation
+            if self.expert_recommendation.recommended_action == OrderRecommendation.BUY:
+                new_target_price = base_price * (1 + expected_profit / 100)
+            elif self.expert_recommendation.recommended_action == OrderRecommendation.SELL:
+                new_target_price = base_price * (1 - expected_profit / 100)
+            else:
+                logger.debug(f"Recommendation action is HOLD, cannot calculate target")
+                return False
+            
+            # Calculate percent difference (new_target vs current_tp)
+            percent_diff = ((new_target_price - current_tp_price) / current_tp_price) * 100
+            
+            # Check if new target is lower by more than tolerance
+            is_lower = percent_diff < -self.TOLERANCE_PERCENT
+            
+            logger.info(f"New target comparison for {self.instrument_name}: current_TP=${current_tp_price:.2f}, new_target=${new_target_price:.2f}, diff={percent_diff:+.2f}%, is_lower={is_lower} (tolerance={self.TOLERANCE_PERCENT}%)")
+            
+            return is_lower
+            
+        except Exception as e:
+            logger.error(f"Error evaluating new target lower condition: {e}", exc_info=True)
+            return False
+    
+    def get_description(self) -> str:
+        """Get description of new target lower condition."""
+        return f"Check if new expert target is lower than current TP for {self.instrument_name} (<-{self.TOLERANCE_PERCENT}% tolerance)"
+
+
 class RatingChangeCondition(FlagCondition):
     """Check if rating changed from one recommendation type to another."""
     
@@ -462,31 +592,105 @@ class ExpectedProfitTargetPercentCondition(CompareCondition):
         return f"Check if expected profit target percent for {self.instrument_name} is {self.operator_str} {self.value}%"
 
 
-class PercentToTargetCondition(CompareCondition):
-    """Compare percent to target price."""
+class PercentToCurrentTargetCondition(CompareCondition):
+    """Compare percent from current price to current TP target price."""
     
     def evaluate(self) -> bool:
         try:
             if not self.existing_order:
+                logger.debug(f"No existing order for percent to current target evaluation")
                 return False
-                
-            current_price = self.get_current_price()
-            if current_price is None or not hasattr(self.existing_order, 'limit_price') or self.existing_order.limit_price is None:
-                return False
-                
-            # Calculate percent to target
-            target_price = self.existing_order.limit_price
-            percent_to_target = ((target_price - current_price) / current_price) * 100
             
-            return self.operator_func(percent_to_target, self.value)
+            # Get current market price
+            current_price = self.get_current_price()
+            if current_price is None:
+                logger.error(f"Cannot get current price for {self.instrument_name}")
+                return False
+            
+            # Get current TP price from transaction or order
+            current_tp_price = None
+            
+            # First try to get from transaction's take_profit field
+            if self.existing_order.transaction_id:
+                from .db import get_instance
+                from .models import Transaction
+                transaction = get_instance(Transaction, self.existing_order.transaction_id)
+                if transaction and transaction.take_profit:
+                    current_tp_price = transaction.take_profit
+                    logger.debug(f"Current TP from transaction: ${current_tp_price:.2f}")
+            
+            # If no TP in transaction, we can't evaluate
+            if current_tp_price is None:
+                logger.debug(f"No current TP price available for order {self.existing_order.id}")
+                return False
+            
+            # Calculate percent to current target
+            percent_to_current_target = ((current_tp_price - current_price) / current_price) * 100
+            
+            logger.info(f"Percent to CURRENT target for {self.instrument_name}: current=${current_price:.2f}, TP=${current_tp_price:.2f}, distance={percent_to_current_target:+.2f}%")
+            
+            return self.operator_func(percent_to_current_target, self.value)
             
         except Exception as e:
-            logger.error(f"Error evaluating percent to target condition: {e}", exc_info=True)
+            logger.error(f"Error evaluating percent to current target condition: {e}", exc_info=True)
             return False
     
     def get_description(self) -> str:
-        """Get description of percent to target condition."""
-        return f"Check if percent to target price for {self.instrument_name} is {self.operator_str} {self.value}%"
+        """Get description of percent to current target condition."""
+        return f"Check if percent from current price to current TP for {self.instrument_name} is {self.operator_str} {self.value}%"
+
+
+class PercentToNewTargetCondition(CompareCondition):
+    """Compare percent from current price to new expert target price."""
+    
+    def evaluate(self) -> bool:
+        try:
+            if not self.existing_order:
+                logger.debug(f"No existing order for percent to new target evaluation")
+                return False
+            
+            # Get current market price
+            current_price = self.get_current_price()
+            if current_price is None:
+                logger.error(f"Cannot get current price for {self.instrument_name}")
+                return False
+            
+            # Calculate new expert target price from current recommendation
+            if not self.expert_recommendation:
+                logger.debug(f"No expert recommendation for new target evaluation")
+                return False
+            
+            if not hasattr(self.expert_recommendation, 'price_at_date') or not hasattr(self.expert_recommendation, 'expected_profit_percent'):
+                logger.error(f"Expert recommendation missing price_at_date or expected_profit_percent")
+                return False
+            
+            base_price = self.expert_recommendation.price_at_date
+            expected_profit = self.expert_recommendation.expected_profit_percent
+            
+            # Calculate new target based on recommendation direction
+            from .types import OrderRecommendation
+            if self.expert_recommendation.recommended_action == OrderRecommendation.BUY:
+                new_target_price = base_price * (1 + expected_profit / 100)
+            elif self.expert_recommendation.recommended_action == OrderRecommendation.SELL:
+                new_target_price = base_price * (1 - expected_profit / 100)
+            else:
+                logger.debug(f"Recommendation action is HOLD, cannot calculate target")
+                return False
+            
+            # Calculate percent to new target
+            percent_to_new_target = ((new_target_price - current_price) / current_price) * 100
+            
+            logger.info(f"Percent to NEW target for {self.instrument_name}: current=${current_price:.2f}, new_target=${new_target_price:.2f} (base=${base_price:.2f}, profit={expected_profit:.1f}%), distance={percent_to_new_target:+.2f}%")
+            
+            return self.operator_func(percent_to_new_target, self.value)
+            
+        except Exception as e:
+            logger.error(f"Error evaluating percent to new target condition: {e}", exc_info=True)
+            return False
+    
+    def get_description(self) -> str:
+        """Get description of percent to new target condition."""
+        return f"Check if percent from current price to new expert target for {self.instrument_name} is {self.operator_str} {self.value}%"
 
 
 class ProfitLossAmountCondition(CompareCondition):
@@ -627,8 +831,11 @@ def create_condition(event_type: ExpertEventType, account: AccountInterface,
         ExpertEventType.F_HIGHRISK: HighRiskCondition,
         ExpertEventType.F_MEDIUMRISK: MediumRiskCondition,
         ExpertEventType.F_LOWRISK: LowRiskCondition,
+        ExpertEventType.F_NEW_TARGET_HIGHER: NewTargetHigherCondition,
+        ExpertEventType.F_NEW_TARGET_LOWER: NewTargetLowerCondition,
         ExpertEventType.N_EXPECTED_PROFIT_TARGET_PERCENT: ExpectedProfitTargetPercentCondition,
-        ExpertEventType.N_PERCENT_TO_TARGET: PercentToTargetCondition,
+        ExpertEventType.N_PERCENT_TO_CURRENT_TARGET: PercentToCurrentTargetCondition,
+        ExpertEventType.N_PERCENT_TO_NEW_TARGET: PercentToNewTargetCondition,
         ExpertEventType.N_PROFIT_LOSS_AMOUNT: ProfitLossAmountCondition,
         ExpertEventType.N_PROFIT_LOSS_PERCENT: ProfitLossPercentCondition,
         ExpertEventType.N_DAYS_OPENED: DaysOpenedCondition,

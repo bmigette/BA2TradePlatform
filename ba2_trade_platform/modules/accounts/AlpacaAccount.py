@@ -243,30 +243,51 @@ class AlpacaAccount(AccountInterface):
         """
         Submit a new order to Alpaca.
         
+        Logic:
+        1. If order.id is None, create new database record with status PENDING
+        2. Submit order to broker
+        3. Update database record with broker response (broker_order_id, status)
+        4. If error occurs, mark order as ERROR in database
+        
         Args:
             trading_order: A TradingOrder object containing all order details
-            depends_on_order_id (Optional[int]): ID of the order this order depends on (for conditional orders)
-            depends_on_status (Optional[str]): Status that the depends_on_order must reach to trigger this order
-            good_for (str): Time in force for the order (e.g., "gtc", "day").
-            open_type (OrderOpenType): Specifies how the order should be opened (automatic/manual).
             
         Returns:
-            TradingOrder: The created order if successful, None if an error occurs.
+            TradingOrder: The database order record (updated with broker info), or None if failed
         """
+        from sqlmodel import Session
+        from ...core.db import add_instance
+        
         try:
+            # Step 1: Create database record if it doesn't exist yet
+            if trading_order.id is None:
+                logger.debug(f"Order has no ID, creating new database record")
+                
+                # Set initial status to PENDING
+                trading_order.status = OrderStatus.PENDING
+                
+                # Round prices before saving
+                if trading_order.limit_price is not None:
+                    trading_order.limit_price = self._round_price(trading_order.limit_price, trading_order.symbol)
+                if trading_order.stop_price is not None:
+                    trading_order.stop_price = self._round_price(trading_order.stop_price, trading_order.symbol)
+                
+                # Insert into database
+                order_id = add_instance(trading_order)
+                trading_order.id = order_id
+                logger.info(f"Created new order {order_id} in database with status PENDING")
+            else:
+                logger.debug(f"Order {trading_order.id} already exists in database")
+            
             # Log dependency information if provided
             if trading_order.depends_on_order is not None:
                 logger.info(f"Submitting order with dependency: depends on order {trading_order.depends_on_order} reaching status {trading_order.depends_order_status_trigger}")
             
-            # Round all price fields to 4 decimal places to comply with Alpaca pricing requirements
-            # This prevents sub-penny increment errors from floating-point arithmetic
-            if trading_order.limit_price is not None:
-                trading_order.limit_price = self._round_price(trading_order.limit_price, trading_order.symbol)
-            if trading_order.stop_price is not None:
-                trading_order.stop_price = self._round_price(trading_order.stop_price, trading_order.symbol)
-
-            # Convert string values to enums
+            # Step 2: Submit order to Alpaca broker
+            
+            # Convert side to Alpaca enum
             side = OrderSide.BUY if trading_order.side == OrderDirection.BUY else OrderSide.SELL
+            
             # Map good_for to TimeInForce enum
             good_for_value = (trading_order.good_for or '').lower()
             tif_map = {
@@ -300,8 +321,7 @@ class AlpacaAccount(AccountInterface):
             elif order_type_value in [CoreOrderType.BUY_LIMIT.value.lower(), 
                                       CoreOrderType.SELL_LIMIT.value.lower()]:
                 if not trading_order.limit_price:
-                    logger.error(f"Limit price is required for limit orders")
-                    return None
+                    raise ValueError("Limit price is required for limit orders")
                     
                 order_request = LimitOrderRequest(
                     symbol=trading_order.symbol,
@@ -314,8 +334,7 @@ class AlpacaAccount(AccountInterface):
             elif order_type_value in [CoreOrderType.BUY_STOP.value.lower(), 
                                       CoreOrderType.SELL_STOP.value.lower()]:
                 if not trading_order.stop_price:
-                    logger.error(f"Stop price is required for stop orders")
-                    return None
+                    raise ValueError("Stop price is required for stop orders")
                     
                 order_request = StopOrderRequest(
                     symbol=trading_order.symbol,
@@ -326,60 +345,61 @@ class AlpacaAccount(AccountInterface):
                     client_order_id=trading_order.comment
                 )
             else:
-                logger.error(f"Unsupported order type: {trading_order.order_type} (value: {order_type_value})")
-                return None
-            logger.debug(f"Submitting Alpaca order: {order_request} (client_order_id={trading_order.comment})")
-            order = self.client.submit_order(order_request)
-            logger.info(f"Submitted Alpaca order: {order.id}")
-
-            # Convert to TradingOrder and set the broker_order_id
-            result_order = self.alpaca_order_to_tradingorder(order)
+                raise ValueError(f"Unsupported order type: {trading_order.order_type} (value: {order_type_value})")
             
-            # Update the order in the database using a fresh session
-            from sqlmodel import Session
+            logger.debug(f"Submitting Alpaca order: {order_request} (client_order_id={trading_order.comment})")
+            alpaca_order = self.client.submit_order(order_request)
+            logger.info(f"Successfully submitted order to Alpaca: broker_order_id={alpaca_order.id}")
+
+            # Step 3: Update database record with broker response
             with Session(get_db().bind) as session:
                 # Re-fetch the order from the database to get a fresh instance
-                if trading_order.id:
-                    fresh_order = session.get(TradingOrder, trading_order.id)
-                    if fresh_order:
-                        fresh_order.broker_order_id = str(order.id) if order.id else None
-                        fresh_order.status = result_order.status if result_order.status else None
-                        session.add(fresh_order)
-                        session.commit()
-                        session.refresh(fresh_order)
-                        return fresh_order
-                    else:
-                        logger.warning(f"Could not find order {trading_order.id} to update")
-                        return trading_order
+                fresh_order = session.get(TradingOrder, trading_order.id)
+                if fresh_order:
+                    # Update with broker order ID
+                    fresh_order.broker_order_id = str(alpaca_order.id) if alpaca_order.id else None
+                    
+                    # Update status from broker response
+                    result_order = self.alpaca_order_to_tradingorder(alpaca_order)
+                    if result_order.status:
+                        fresh_order.status = result_order.status
+                    
+                    session.add(fresh_order)
+                    session.commit()
+                    session.refresh(fresh_order)
+                    
+                    logger.info(f"Updated order {fresh_order.id} in database: broker_order_id={fresh_order.broker_order_id}, status={fresh_order.status}")
+                    return fresh_order
                 else:
-                    logger.warning(f"Order has no ID to update in database")
-                    return trading_order
+                    logger.error(f"Could not find order {trading_order.id} in database to update")
+                    return None
+                    
         except Exception as e:
-            logger.error(f"Error creating Alpaca order: {e}", exc_info=True)
+            logger.error(f"Error submitting order to Alpaca: {e}", exc_info=True)
             
-            # Mark the order as ERROR in the database using a fresh session
+            # Step 4: Mark order as ERROR in database
             try:
-                from sqlmodel import Session
-                
-                # Use a fresh session to avoid session conflicts
                 with Session(get_db().bind) as session:
-                    # Re-fetch the order from the database to get a fresh instance
                     if trading_order.id:
                         fresh_order = session.get(TradingOrder, trading_order.id)
                         if fresh_order:
                             fresh_order.status = OrderStatus.ERROR
-                            # Store error details in comment field
+                            
+                            # Store error details in comment field (append to existing comment)
+                            error_msg = f"Error: {str(e)[:200]}"
                             if not fresh_order.comment:
-                                fresh_order.comment = f"Error: {str(e)[:200]}"
+                                fresh_order.comment = error_msg
                             else:
-                                fresh_order.comment = f"{fresh_order.comment} | Error: {str(e)[:150]}"
+                                # Append error to existing comment, truncate if too long
+                                fresh_order.comment = f"{fresh_order.comment} | {error_msg}"[:500]
+                            
                             session.add(fresh_order)
                             session.commit()
                             logger.info(f"Marked order {trading_order.id} as ERROR in database")
                         else:
                             logger.warning(f"Could not find order {trading_order.id} to mark as ERROR")
                     else:
-                        logger.warning(f"Cannot mark order as ERROR - order has no ID yet")
+                        logger.warning(f"Cannot mark order as ERROR - order has no ID")
             except Exception as update_error:
                 logger.error(f"Failed to update order status to ERROR: {update_error}", exc_info=True)
             
@@ -727,7 +747,7 @@ class AlpacaAccount(AccountInterface):
             TradingOrder: The take profit order object
         """
         # Import OrderType enum from core.types
-        from ...core.types import OrderType as CoreOrderType
+        from ...core.types import OrderType as CoreOrderType, OrderOpenType
         
         # Determine opposite side and appropriate order type for take profit
         if original_order.side == OrderDirection.BUY:
@@ -750,6 +770,8 @@ class AlpacaAccount(AccountInterface):
             status=OrderStatus.WAITING_TRIGGER,  # Wait for parent order to be FILLED
             depends_on_order=original_order.id,  # Trigger when this order changes
             depends_order_status_trigger=OrderStatus.FILLED,  # Trigger when parent is FILLED
+            expert_recommendation_id=original_order.expert_recommendation_id,  # Link to same expert recommendation
+            open_type=OrderOpenType.AUTOMATIC,  # Automatically created by system
             comment=f"TP for order {original_order.id}",
             created_at=datetime.now(timezone.utc)
         )

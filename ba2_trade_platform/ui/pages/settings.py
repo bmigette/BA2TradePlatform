@@ -3411,8 +3411,8 @@ def content() -> None:
             InstrumentSettingsTab()
     
     # Setup HTML5 history navigation for tabs using timer for async compatibility
-    async def setup_tab_navigation():
-        await ui.run_javascript('''
+    def setup_tab_navigation():
+        ui.run_javascript('''
             (function() {
                 let isPopstateNavigation = false;
                 

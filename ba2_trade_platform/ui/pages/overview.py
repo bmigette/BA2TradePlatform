@@ -33,6 +33,11 @@ class OverviewTab:
             if error_orders:
                 error_count = len(error_orders)
                 
+                # Function to switch to Account Overview tab
+                def switch_to_account_tab():
+                    if self.tabs_ref:
+                        self.tabs_ref.set_value('account')
+                
                 # Create alert banner
                 with ui.card().classes('w-full bg-red-50 border-l-4 border-red-500 p-4 mb-4'):
                     with ui.row().classes('w-full items-center gap-4'):
@@ -42,7 +47,7 @@ class OverviewTab:
                             ui.label(f'There {"are" if error_count > 1 else "is"} {error_count} order{"s" if error_count > 1 else ""} with ERROR status that need{"" if error_count > 1 else "s"} attention.').classes('text-sm text-red-700')
                         
                         # View details button
-                        ui.button('View Orders', on_click=lambda: ui.navigate.to('/#account')).props('outline color=red')
+                        ui.button('View Orders', on_click=switch_to_account_tab).props('outline color=red')
                 
                 # Log the error orders for debugging
                 logger.warning(f"Found {error_count} orders with ERROR status on overview page")
@@ -84,7 +89,9 @@ class OverviewTab:
                         # Buttons for pending orders
                         with ui.column().classes('gap-2'):
                             ui.button('Review Orders', on_click=switch_to_account_overview).props('outline color=blue')
-                            ui.button('Run Risk Management', on_click=lambda: self._handle_risk_management_from_overview(pending_orders)).props('outline color=green')
+                            # Store only order IDs to avoid capturing database objects
+                            order_ids = [order.id for order in pending_orders]
+                            ui.button('Run Risk Management', on_click=lambda ids=order_ids: self._handle_risk_management_from_overview_by_ids(ids)).props('outline color=green')
                 
                 # Log the pending orders
                 logger.info(f"Found {pending_count} pending orders on overview page")
@@ -208,9 +215,19 @@ class OverviewTab:
                     ).classes('text-xs text-yellow-600')
                 
                 # Button to open correction dialog
+                # Store only scalar values to avoid capturing database objects
+                mismatch_data = {
+                    'account': mismatch['account'],
+                    'account_id': mismatch['account_id'],
+                    'symbol': mismatch['symbol'],
+                    'broker_qty': mismatch['broker_qty'],
+                    'transaction_qty': mismatch['transaction_qty'],
+                    'difference': mismatch['difference'],
+                    'transaction_ids': [t.id for t in mismatch['transactions']]
+                }
                 ui.button(
                     'Adjust Quantities',
-                    on_click=lambda m=mismatch: self._show_quantity_correction_dialog(m)
+                    on_click=lambda data=mismatch_data: self._show_quantity_correction_dialog_by_ids(data)
                 ).props('outline color=yellow-800')
     
     def _show_quantity_correction_dialog(self, mismatch):
@@ -325,20 +342,8 @@ class OverviewTab:
             ui.notify(f'Error updating quantities: {str(e)}', type='negative')
     
     def render(self):
-        """Render the overview tab                row = {
-                    'order_id': order.id,
-                    'account': account_name,
-                    'symbol': order.symbol,
-                    'side': order.side,
-                    'quantity': f"{order.quantity:.2f}" if order.quantity else '',
-                    'order_type': order.order_type,
-                    'status': order.status.value,
-                    'limit_price': f"${order.limit_price:.2f}" if order.limit_price else '',
-                    'comment': order.comment or '',
-                    'created_at': created_at_str,
-                    'waited_status': 'Waiting for trigger' if order.status == OrderStatus.WAITING_TRIGGER else '',
-                    'can_submit': order.status == OrderStatus.PENDING and not order.broker_order_id
-                }."""
+        """Render the overview tab."""
+        logger.debug("[RENDER] OverviewTab.render() - START")
         
         # Check for ERROR orders and display alert
         self._check_and_display_error_orders()
@@ -350,6 +355,7 @@ class OverviewTab:
         self._check_and_display_pending_orders(self.tabs_ref)
         
         with ui.grid(columns=4).classes('w-full gap-4'):
+            pass
             # Row 1: OpenAI Spending, Analysis Jobs, Order Statistics, and Order Recommendations
             self._render_openai_spending_widget()
             self._render_analysis_jobs_widget()
@@ -1060,13 +1066,83 @@ class OverviewTab:
         except Exception as e:
             logger.error(f"Error in _handle_risk_management_from_overview: {e}", exc_info=True)
             ui.notify(f'Error: {str(e)}', type='negative')
+    
+    def _handle_risk_management_from_overview_by_ids(self, order_ids):
+        """Handle risk management execution from overview page using order IDs.
+        
+        This method fetches fresh order data from the database using the provided IDs,
+        avoiding JSON serialization issues with captured database objects.
+        """
+        try:
+            if not order_ids:
+                ui.notify('No pending orders to process', type='info')
+                return
+            
+            # Fetch fresh order data from database
+            session = get_db()
+            try:
+                pending_orders = []
+                for order_id in order_ids:
+                    order = session.get(TradingOrder, order_id)
+                    if order:
+                        pending_orders.append(order)
+            finally:
+                session.close()
+            
+            # Delegate to the original method
+            self._handle_risk_management_from_overview(pending_orders)
+            
+        except Exception as e:
+            logger.error(f"Error in _handle_risk_management_from_overview_by_ids: {e}", exc_info=True)
+            ui.notify(f'Error: {str(e)}', type='negative')
+    
+    def _show_quantity_correction_dialog_by_ids(self, mismatch_data):
+        """Show dialog to adjust transaction quantities using transaction IDs.
+        
+        This method fetches fresh transaction data from the database,
+        avoiding JSON serialization issues with captured database objects.
+        """
+        from ...core.models import Transaction
+        from ...core.db import get_db
+        
+        try:
+            # Fetch fresh transaction data from database
+            session = get_db()
+            try:
+                transactions = []
+                for txn_id in mismatch_data['transaction_ids']:
+                    txn = session.get(Transaction, txn_id)
+                    if txn:
+                        transactions.append(txn)
+            finally:
+                session.close()
+            
+            # Reconstruct mismatch dictionary with fresh transaction objects
+            mismatch = {
+                'account': mismatch_data['account'],
+                'account_id': mismatch_data['account_id'],
+                'symbol': mismatch_data['symbol'],
+                'broker_qty': mismatch_data['broker_qty'],
+                'transaction_qty': mismatch_data['transaction_qty'],
+                'difference': mismatch_data['difference'],
+                'transactions': transactions
+            }
+            
+            # Delegate to the original method
+            self._show_quantity_correction_dialog(mismatch)
+            
+        except Exception as e:
+            logger.error(f"Error in _show_quantity_correction_dialog_by_ids: {e}", exc_info=True)
+            ui.notify(f'Error: {str(e)}', type='negative')
 
 
 class AccountOverviewTab:
     def __init__(self):
         self.render()
+        pass
 
     def render(self):
+        logger.debug("[RENDER] AccountOverviewTab.render() - START")
         accounts = get_all_instances(AccountDefinition)
         all_positions = []
         # Keep unformatted positions for chart calculations
@@ -1499,6 +1575,7 @@ class TransactionsTab:
     
     def render(self):
         """Render the transactions tab with filtering and control options."""
+        logger.debug("[RENDER] TransactionsTab.render() - START")
         with ui.card().classes('w-full'):
             with ui.row().classes('w-full items-center justify-between mb-4'):
                 ui.label('💼 Transactions').classes('text-h6')
@@ -1540,6 +1617,7 @@ class TransactionsTab:
     
     def _render_transactions_table(self):
         """Render the main transactions table."""
+        logger.debug("[RENDER] _render_transactions_table() - START")
         from ...core.models import Transaction, ExpertInstance
         from ...core.types import TransactionStatus
         from sqlmodel import col
@@ -1610,6 +1688,7 @@ class TransactionsTab:
                 return
             
             # Prepare table data
+            logger.debug(f"[RENDER] _render_transactions_table() - Building rows for {len(transactions)} transactions")
             rows = []
             for txn in transactions:
                 # Get current P/L for open transactions
@@ -1750,6 +1829,7 @@ class TransactionsTab:
             ]
             
             # Create table with expansion enabled
+            logger.debug(f"[RENDER] _render_transactions_table() - Creating table with {len(rows)} rows")
             table = ui.table(
                 columns=columns, 
                 rows=rows, 
@@ -1888,8 +1968,10 @@ class TransactionsTab:
             ''')
             
             # Handle events
-            table.on('edit_transaction', lambda e: self._show_edit_dialog(e.args))
-            table.on('close_transaction', lambda e: self._show_close_dialog(e.args))
+            logger.debug("[RENDER] _render_transactions_table() - Setting up event handlers")
+            table.on('edit_transaction', self._show_edit_dialog)
+            table.on('close_transaction', self._show_close_dialog)
+            logger.debug("[RENDER] _render_transactions_table() - END (success)")
             
         except Exception as e:
             logger.error(f"Error rendering transactions table: {e}", exc_info=True)
@@ -1897,9 +1979,12 @@ class TransactionsTab:
         finally:
             session.close()
     
-    def _show_edit_dialog(self, transaction_id):
+    def _show_edit_dialog(self, event_data):
         """Show dialog to edit TP/SL for a transaction."""
         from ...core.models import Transaction
+        
+        # Extract transaction_id from event_data
+        transaction_id = event_data.args if hasattr(event_data, 'args') else event_data
         
         txn = get_instance(Transaction, transaction_id)
         if not txn:
@@ -2003,9 +2088,12 @@ class TransactionsTab:
             ui.notify(f'Error: {str(e)}', type='negative')
             logger.error(f"Error updating TP/SL: {e}", exc_info=True)
     
-    def _show_close_dialog(self, transaction_id):
-        """Show confirmation dialog to close a position."""
+    def _show_close_dialog(self, event_data):
+        """Show confirmation dialog before closing a position."""
         from ...core.models import Transaction
+        
+        # Extract transaction_id from event_data
+        transaction_id = event_data.args if hasattr(event_data, 'args') else event_data
         
         txn = get_instance(Transaction, transaction_id)
         if not txn:
@@ -2144,10 +2232,8 @@ class TransactionsTab:
                         msg += f' ({deleted_count} waiting orders deleted)'
                     ui.notify(msg, type='positive')
                     dialog.close()
-                    # Reload page to refresh transactions after a short delay
-                    def reload_page():
-                        ui.navigate.reload()
-                    ui.timer(0.3, reload_page, once=True)
+                    # Refresh transactions table after a short delay
+                    ui.timer(0.3, self._refresh_transactions, once=True)
                 else:
                     ui.notify('Failed to submit closing order', type='negative')
             else:
@@ -2159,10 +2245,8 @@ class TransactionsTab:
                     msg += f', {deleted_count} waiting orders deleted'
                 ui.notify(msg, type='info')
                 dialog.close()
-                # Reload page to refresh transactions after a short delay
-                def reload_page():
-                    ui.navigate.reload()
-                ui.timer(0.3, reload_page, once=True)
+                # Refresh transactions table after a short delay
+                ui.timer(0.3, self._refresh_transactions, once=True)
             
         except Exception as e:
             ui.notify(f'Error: {str(e)}', type='negative')
@@ -2172,10 +2256,12 @@ class PerformanceTab:
     def __init__(self):
         self.render()
     def render(self):
+        logger.debug("[RENDER] PerformanceTab.render() - START")
         with ui.card():
             ui.label('Performance metrics and analytics will be displayed here.')
 
 def content() -> None:
+    logger.debug("[RENDER] overview.content() - START")
     # Tab configuration: (tab_name, tab_label)
     tab_config = [
         ('overview', 'Overview'),
@@ -2190,6 +2276,7 @@ def content() -> None:
             tab_objects[tab_name] = ui.tab(tab_name, label=tab_label)
 
     with ui.tab_panels(tabs, value=tab_objects['overview']).classes('w-full'):
+        logger.debug("[RENDER] overview.content() - Creating tab panels")
         with ui.tab_panel(tab_objects['overview']):
             OverviewTab(tabs_ref=tabs)
         with ui.tab_panel(tab_objects['account']):
@@ -2200,8 +2287,9 @@ def content() -> None:
             PerformanceTab()
     
     # Setup HTML5 history navigation for tabs using timer for async compatibility
-    async def setup_tab_navigation():
-        await ui.run_javascript('''
+    def setup_tab_navigation():
+        # Non-async version - run_javascript without await
+        ui.run_javascript('''
             (function() {
                 let isPopstateNavigation = false;
                 

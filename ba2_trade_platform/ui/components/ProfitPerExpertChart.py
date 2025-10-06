@@ -98,8 +98,16 @@ class ProfitPerExpertChart:
             expert_names = list(profit_data.keys())
             profit_values = list(profit_data.values())
             
-            # Determine colors based on profit/loss
-            colors = ['green' if p >= 0 else 'red' for p in profit_values]
+            # Create data array with individual colors for each bar
+            # ECharts expects data as objects with value and itemStyle properties
+            chart_data = []
+            for profit in profit_values:
+                chart_data.append({
+                    'value': profit,
+                    'itemStyle': {
+                        'color': 'green' if profit >= 0 else 'red'
+                    }
+                })
             
             # Create echart options
             options = {
@@ -135,10 +143,7 @@ class ProfitPerExpertChart:
                 'series': [{
                     'name': 'Profit',
                     'type': 'bar',
-                    'data': profit_values,
-                    'itemStyle': {
-                        'color': lambda params: colors[params['dataIndex']]
-                    },
+                    'data': chart_data,
                     'label': {
                         'show': True,
                         'position': 'top',
@@ -170,8 +175,17 @@ class ProfitPerExpertChart:
             if profit_data:
                 expert_names = list(profit_data.keys())
                 profit_values = list(profit_data.values())
-                colors = ['green' if p >= 0 else 'red' for p in profit_values]
+                
+                # Create data array with individual colors for each bar
+                chart_data = []
+                for profit in profit_values:
+                    chart_data.append({
+                        'value': profit,
+                        'itemStyle': {
+                            'color': 'green' if profit >= 0 else 'red'
+                        }
+                    })
                 
                 self.chart.options['xAxis']['data'] = expert_names
-                self.chart.options['series'][0]['data'] = profit_values
+                self.chart.options['series'][0]['data'] = chart_data
                 self.chart.update()

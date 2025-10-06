@@ -1,7 +1,9 @@
+import logging
 from nicegui import ui, Client, app
 from .pages import overview, settings, marketanalysis, market_analysis_detail, rulesettest
 from .layout import layout_render
 from pathlib import Path
+from ..logger import logger
 
 # Configure NiceGUI JavaScript timeout globally
 # This affects all JavaScript requests throughout the application
@@ -51,26 +53,31 @@ except Exception as e:
 # Example 1: use a custom page decorator directly and putting the content creation into a separate function
 @ui.page('/')
 def index_page() -> None:
+    logger.debug("[ROUTE] / - Loading overview page")
     with layout_render('Overview'):
         overview.content()
 
 @ui.page('/marketanalysis')
 def marketanalysis_page() -> None:
+    logger.debug("[ROUTE] /marketanalysis - Loading market analysis page")
     with layout_render('Market Analysis'):
         marketanalysis.content()
 
 @ui.page('/settings')
 def settings_page() -> None:
+    logger.debug("[ROUTE] /settings - Loading settings page")
     with layout_render('Settings'):
         settings.content()
 
 @ui.page('/market_analysis/{analysis_id}')
 def market_analysis_detail_page(analysis_id: int) -> None:
+    logger.debug(f"[ROUTE] /market_analysis/{analysis_id} - Loading market analysis detail page")
     with layout_render(f'Market Analysis Detail'):
         market_analysis_detail.content(analysis_id)
 
 @ui.page('/rulesettest')
 def rulesettest_page() -> None:
+    logger.debug("[ROUTE] /rulesettest - Loading ruleset test page")
     # Get query parameters from the request
     from nicegui import app
     ruleset_id = None
@@ -97,4 +104,5 @@ ui.run(
     reconnect_timeout=5.0,
     # Increase binding refresh interval to reduce pressure
     binding_refresh_interval=0.5,
+    #uvicorn_logging_level=logging.DEBUG,
 )
