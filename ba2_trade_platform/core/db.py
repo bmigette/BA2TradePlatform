@@ -4,10 +4,21 @@ from ..config import DB_FILE
 from ..logger import logger
 from sqlalchemy import String, Float, JSON, select
 import os
+import threading
+
+
+# Create engine and session
+import os
+import threading
 
 
 # Create engine and session
 logger.debug(f"Database file path: {DB_FILE}")
+
+# Thread lock for all database write operations
+_db_write_lock = threading.Lock()
+
+# Configure connection pool for multi-threaded application
 
 # Configure connection pool for multi-threaded application
 # pool_size: Number of connections to maintain in the pool
