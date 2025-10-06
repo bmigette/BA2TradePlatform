@@ -1492,7 +1492,7 @@ class OrderRecommendationsTab:
                         'confidence': f"{recommendation.confidence:.1f}%" if recommendation.confidence is not None else 'N/A',
                         'expected_profit': f"{recommendation.expected_profit_percent:.2f}%" if recommendation.expected_profit_percent else 'N/A',
                         'price_at_date': f"${recommendation.price_at_date:.2f}" if recommendation.price_at_date else 'N/A',
-                        'risk_level': recommendation.risk_level.value if hasattr(recommendation.risk_level, 'value') else (recommendation.risk_level.name if hasattr(recommendation.risk_level, 'name') else str(recommendation.risk_level)),
+                        'risk_level': recommendation.risk_level.value.title() if hasattr(recommendation.risk_level, 'value') else (recommendation.risk_level.name.title() if hasattr(recommendation.risk_level, 'name') else str(recommendation.risk_level)),
                         'time_horizon': recommendation.time_horizon.value.replace('_', ' ').title() if hasattr(recommendation.time_horizon, 'value') else str(recommendation.time_horizon),
                         'expert_name': expert_instance.user_description or expert_instance.expert,
                         'created_at': created_at,
@@ -1980,7 +1980,7 @@ class OrderRecommendationsTab:
                                 recommendation = get_instance(ExpertRecommendation, order.expert_recommendation_id)
                                 if recommendation:
                                     roi = f"{recommendation.expected_profit_percent:.2f}%" if recommendation.expected_profit_percent else 'N/A'
-                                    risk_level = recommendation.risk_level.value if hasattr(recommendation.risk_level, 'value') else (recommendation.risk_level.name if hasattr(recommendation.risk_level, 'name') else str(recommendation.risk_level))
+                                    risk_level = recommendation.risk_level.value.title() if hasattr(recommendation.risk_level, 'value') else (recommendation.risk_level.name.title() if hasattr(recommendation.risk_level, 'name') else str(recommendation.risk_level))
                             
                             # Get current price from account interface
                             current_price = account.get_instrument_current_price(order.symbol)

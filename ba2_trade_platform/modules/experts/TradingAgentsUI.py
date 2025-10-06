@@ -630,12 +630,16 @@ class TradingAgentsUI:
             # Risk and Time Horizon if available
             with ui.row().classes('w-full gap-4 mt-3'):
                 if latest_recommendation.risk_level:
-                    risk_icon = {'LOW': '🟢', 'MEDIUM': '🟡', 'HIGH': '🔴'}.get(latest_recommendation.risk_level, '⚪')
-                    ui.label(f'{risk_icon} Risk: {latest_recommendation.risk_level}').classes('text-sm')
+                    # Get the risk level value and format it properly
+                    risk_value = latest_recommendation.risk_level.value if hasattr(latest_recommendation.risk_level, 'value') else str(latest_recommendation.risk_level)
+                    risk_icon = {'LOW': '🟢', 'MEDIUM': '🟡', 'HIGH': '🔴'}.get(risk_value, '⚪')
+                    ui.label(f'{risk_icon} Risk: {risk_value.title()}').classes('text-sm')
                 
                 if latest_recommendation.time_horizon:
-                    horizon_icon = {'SHORT_TERM': '⏱️', 'MEDIUM_TERM': '📅', 'LONG_TERM': '🗓️'}.get(latest_recommendation.time_horizon, '⏰')
-                    horizon_text = latest_recommendation.time_horizon.replace('_', ' ').title()
+                    # Get the time horizon value and format it properly
+                    horizon_value = latest_recommendation.time_horizon.value if hasattr(latest_recommendation.time_horizon, 'value') else str(latest_recommendation.time_horizon)
+                    horizon_icon = {'SHORT_TERM': '⏱️', 'MEDIUM_TERM': '📅', 'LONG_TERM': '🗓️'}.get(horizon_value, '⏰')
+                    horizon_text = horizon_value.replace('_', ' ').title()
                     ui.label(f'{horizon_icon} Horizon: {horizon_text}').classes('text-sm')
                 
                 if latest_recommendation.created_at:
