@@ -1769,9 +1769,19 @@ class OrderRecommendationsTab:
                 ui.notify('Please select an expert instance', type='warning')
                 return
             
+            # Check if "All Experts" is selected
+            selected_value = self.expert_select.value
+            if selected_value == 'all':
+                ui.notify(
+                    'Please select a specific expert instance. Recommendation processing cannot run for "All Experts".',
+                    type='warning',
+                    timeout=5000
+                )
+                return
+            
             # Extract expert instance ID from the selected value
             # Format is "ExpertType - Description (ID: X)"
-            selected_text = self.expert_select.value
+            selected_text = selected_value
             expert_id = int(selected_text.split('ID: ')[-1].rstrip(')'))
             
             # Show dialog to ask for days lookback period
@@ -1856,9 +1866,19 @@ class OrderRecommendationsTab:
                 ui.notify('Please select an expert instance', type='warning')
                 return
             
+            # Check if "All Experts" is selected
+            selected_value = self.expert_select.value
+            if selected_value == 'all':
+                ui.notify(
+                    'Please select a specific expert instance. Risk management cannot run for "All Experts".',
+                    type='warning',
+                    timeout=5000
+                )
+                return
+            
             # Extract expert instance ID from the selected value
             # Format is "ExpertType - Description (ID: X)"
-            selected_text = self.expert_select.value
+            selected_text = selected_value
             expert_id = int(selected_text.split('ID: ')[-1].rstrip(')'))
             
             # Get the Risk Management system

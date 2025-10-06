@@ -4,15 +4,40 @@ from dateutil.relativedelta import relativedelta
 import yfinance as yf
 import os
 from .stockstats_utils import StockstatsUtils
+from .config import get_config
 
 def get_YFin_data_online(
     symbol: Annotated[str, "ticker symbol of the company"],
-    start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
-    end_date: Annotated[str, "End date in yyyy-mm-dd format"],
+    start_date: Annotated[str, "Start date in yyyy-mm-dd format. If not provided, defaults to market_history_days ago."] = None,
+    end_date: Annotated[str, "End date in yyyy-mm-dd format. If not provided, defaults to today."] = None,
 ):
-
-    datetime.strptime(start_date, "%Y-%m-%d")
-    datetime.strptime(end_date, "%Y-%m-%d")
+    """Get stock data online from Yahoo Finance.
+    
+    Args:
+        symbol: Ticker symbol
+        start_date: Start date in yyyy-mm-dd format. Defaults to market_history_days ago if None.
+        end_date: End date in yyyy-mm-dd format. Defaults to today if None.
+        
+    Returns:
+        CSV string with stock data
+    """
+    # Get config for defaults
+    config = get_config()
+    
+    # Handle end_date default
+    if end_date is None:
+        end_dt = datetime.now()
+        end_date = end_dt.strftime("%Y-%m-%d")
+    else:
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    
+    # Handle start_date default
+    if start_date is None:
+        lookback_days = config.get('market_history_days', 90)
+        start_dt = end_dt - relativedelta(days=lookback_days)
+        start_date = start_dt.strftime("%Y-%m-%d")
+    else:
+        datetime.strptime(start_date, "%Y-%m-%d")
 
     # Create ticker object
     ticker = yf.Ticker(symbol.upper())
@@ -52,8 +77,26 @@ def get_stock_stats_indicators_window(
     curr_date: Annotated[
         str, "The current trading date you are trading on, YYYY-mm-dd"
     ],
-    look_back_days: Annotated[int, "how many days to look back"],
+    look_back_days: Annotated[
+        int,
+        "Number of days to look back for indicator data. If not provided, defaults to market_history_days from config (typically 90 days). You can specify a custom value to analyze shorter or longer periods."
+    ] = None,
 ) -> str:
+    """Get technical indicator values for a date range.
+    
+    Args:
+        symbol: Ticker symbol
+        indicator: Technical indicator name
+        curr_date: Current trading date
+        look_back_days: Number of days to look back. Defaults to market_history_days from config if None.
+        
+    Returns:
+        String with indicator values and description
+    """
+    # Get lookback days from config if not provided
+    if look_back_days is None:
+        config = get_config()
+        look_back_days = config.get('market_history_days', 90)
 
     best_ind_params = {
         # Moving Averages

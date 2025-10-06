@@ -53,16 +53,29 @@ def get_fred_data(series_id: str, start_date: str, end_date: str) -> Dict:
         return {"error": f"Failed to fetch FRED data for {series_id}: {str(e)}"}
 
 
-def get_treasury_yield_curve(curr_date: str) -> str:
+def get_treasury_yield_curve(
+    curr_date: Annotated[str, "Current date in YYYY-MM-DD format"],
+    lookback_days: Annotated[
+        int,
+        "Number of days to look back for yield curve data. If not provided, defaults to economic_data_days from config (typically 90 days). You can specify a custom value to analyze different time periods."
+    ] = None
+) -> str:
     """
     Get current Treasury yield curve data
     
     Args:
         curr_date: Current date in YYYY-MM-DD format
+        lookback_days: Number of days to look back for data. If not provided, defaults to economic_data_days from config (typically 90 days). You can specify a custom value to analyze different time periods.
         
     Returns:
         Formatted string with yield curve data
     """
+    # Get lookback days from config if not provided
+    if lookback_days is None:
+        from .config import get_config
+        config = get_config()
+        lookback_days = config.get('economic_data_days', 90)
+    
     # Treasury yield series IDs
     yield_series = {
         "1 Month": "DGS1MO",
@@ -78,7 +91,7 @@ def get_treasury_yield_curve(curr_date: str) -> str:
         "30 Year": "DGS30"
     }
     
-    start_date = (datetime.strptime(curr_date, "%Y-%m-%d") - timedelta(days=30)).strftime("%Y-%m-%d")
+    start_date = (datetime.strptime(curr_date, "%Y-%m-%d") - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     
     result = f"## Treasury Yield Curve as of {curr_date}\n\n"
     
@@ -129,17 +142,23 @@ def get_treasury_yield_curve(curr_date: str) -> str:
     return result
 
 
-def get_economic_indicators_report(curr_date: str, lookback_days: int = 90) -> str:
+def get_economic_indicators_report(curr_date: str, lookback_days: int = None) -> str:
     """
     Get comprehensive economic indicators report
     
     Args:
         curr_date: Current date in YYYY-MM-DD format
-        lookback_days: How many days to look back for data
+        lookback_days: Number of days to look back for data. If not provided, defaults to economic_data_days from config (typically 90 days). You can specify a custom value to analyze shorter or longer periods.
         
     Returns:
         Formatted string with economic indicators
     """
+    # Get lookback days from config if not provided
+    if lookback_days is None:
+        from .config import get_config
+        config = get_config()
+        lookback_days = config.get('economic_data_days', 90)
+        
     start_date = (datetime.strptime(curr_date, "%Y-%m-%d") - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     
     # Key economic indicators
@@ -285,20 +304,33 @@ def get_economic_indicators_report(curr_date: str, lookback_days: int = 90) -> s
     return result
 
 
-def get_fed_calendar_and_minutes(curr_date: str) -> str:
+def get_fed_calendar_and_minutes(
+    curr_date: Annotated[str, "Current date in YYYY-MM-DD format"],
+    lookback_days: Annotated[
+        int,
+        "Number of days to look back for Fed policy data. If not provided, defaults to economic_data_days from config (typically 90 days). You can specify a custom value (e.g., 365 for 1 year) to see longer policy trajectory."
+    ] = None
+) -> str:
     """
     Get Federal Reserve meeting calendar and recent minutes
     
     Args:
         curr_date: Current date in YYYY-MM-DD format
+        lookback_days: Number of days to look back for data. If not provided, defaults to economic_data_days from config (typically 90 days). You can specify a custom value to analyze different time periods.
         
     Returns:
         Formatted string with Fed calendar information
     """
+    # Get lookback days from config if not provided
+    if lookback_days is None:
+        from .config import get_config
+        config = get_config()
+        lookback_days = config.get('economic_data_days', 90)
+    
     result = f"## Federal Reserve Calendar & Policy Updates\n\n"
     
     # Get recent Fed Funds rate data to show policy trajectory
-    start_date = (datetime.strptime(curr_date, "%Y-%m-%d") - timedelta(days=365)).strftime("%Y-%m-%d")
+    start_date = (datetime.strptime(curr_date, "%Y-%m-%d") - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     fed_data = get_fred_data("FEDFUNDS", start_date, curr_date)
     
     if "error" not in fed_data:
@@ -326,23 +358,35 @@ def get_fed_calendar_and_minutes(curr_date: str) -> str:
     return result
 
 
-def get_macro_economic_summary(curr_date: str, lookback_days: int = 90) -> str:
+def get_macro_economic_summary(
+    curr_date: Annotated[str, "Current date in YYYY-MM-DD format"],
+    lookback_days: Annotated[
+        int,
+        "Number of days to look back for all macro economic data. If not provided, defaults to economic_data_days from config (typically 90 days). You can specify a custom value to analyze different time periods."
+    ] = None
+) -> str:
     """
     Get comprehensive macro economic summary combining economic indicators, yield curves, and Fed data
     
     Args:
         curr_date: Current date in YYYY-MM-DD format
-        lookback_days: How many days to look back for data
+        lookback_days: Number of days to look back for data. If not provided, defaults to economic_data_days from config (typically 90 days). You can specify a custom value to analyze different time periods.
         
     Returns:
         Complete macro economic analysis
     """
+    # Get lookback days from config if not provided
+    if lookback_days is None:
+        from .config import get_config
+        config = get_config()
+        lookback_days = config.get('economic_data_days', 90)
+    
     result = f"# Macro Economic Analysis - {curr_date}\n\n"
     
-    # Get all components
+    # Get all components - pass lookback_days to all sub-functions
     indicators_report = get_economic_indicators_report(curr_date, lookback_days)
-    yield_curve = get_treasury_yield_curve(curr_date)
-    fed_calendar = get_fed_calendar_and_minutes(curr_date)
+    yield_curve = get_treasury_yield_curve(curr_date, lookback_days)
+    fed_calendar = get_fed_calendar_and_minutes(curr_date, lookback_days)
     
     # Combine all reports
     result += indicators_report + "\n"

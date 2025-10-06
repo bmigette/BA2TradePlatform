@@ -1,10 +1,11 @@
 from .alpha_vantage_common import _make_api_request
+from .config import get_config
 
 def get_indicator(
     symbol: str,
     indicator: str,
     curr_date: str,
-    look_back_days: int,
+    look_back_days: int = None,
     interval: str = "daily",
     time_period: int = 14,
     series_type: str = "close"
@@ -16,7 +17,7 @@ def get_indicator(
         symbol: ticker symbol of the company
         indicator: technical indicator to get the analysis and report of
         curr_date: The current trading date you are trading on, YYYY-mm-dd
-        look_back_days: how many days to look back
+        look_back_days: Number of days to look back. If not provided, defaults to market_history_days from config (typically 90 days).
         interval: Time interval (daily, weekly, monthly)
         time_period: Number of data points for calculation
         series_type: The desired price type (close, open, high, low)
@@ -26,6 +27,11 @@ def get_indicator(
     """
     from datetime import datetime
     from dateutil.relativedelta import relativedelta
+
+    # Get lookback days from config if not provided
+    if look_back_days is None:
+        config = get_config()
+        look_back_days = config.get('market_history_days', 90)
 
     supported_indicators = {
         "close_50_sma": ("50 SMA", "close"),

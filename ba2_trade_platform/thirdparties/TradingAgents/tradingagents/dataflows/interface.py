@@ -48,19 +48,26 @@ def get_finnhub_news(
         "Search query of a company's, e.g. 'AAPL, TSM, etc.",
     ],
     curr_date: Annotated[str, "Current date in yyyy-mm-dd format"],
-    look_back_days: Annotated[int, "how many days to look back"],
+    look_back_days: Annotated[
+        int,
+        "Number of days to look back. If not provided, defaults to news_lookback_days from config (typically 7 days). You can specify a custom value to get more or less historical news."
+    ] = None,
 ):
     """
     Retrieve news about a company within a time frame
 
     Args
         ticker (str): ticker for the company you are interested in
-        start_date (str): Start date in yyyy-mm-dd format
-        end_date (str): End date in yyyy-mm-dd format
+        curr_date (str): Current date in yyyy-mm-dd format
+        look_back_days (int, optional): Number of days to look back. Defaults to config value if None.
     Returns
         str: dataframe containing the news of the company in the time frame
 
     """
+    # Get lookback days from config if not provided
+    if look_back_days is None:
+        config = get_config()
+        look_back_days = config.get('news_lookback_days', 7)
 
     start_date = datetime.strptime(curr_date, "%Y-%m-%d")
     before = start_date - relativedelta(days=look_back_days)
@@ -90,16 +97,24 @@ def get_finnhub_company_insider_sentiment(
         str,
         "current date of you are trading at, yyyy-mm-dd",
     ],
-    look_back_days: Annotated[int, "number of days to look back"],
+    look_back_days: Annotated[
+        int,
+        "Number of days to look back for insider sentiment data. If not provided, defaults to market_history_days from config (typically 90 days). You can specify a custom value to analyze shorter or longer periods."
+    ] = None,
 ):
     """
-    Retrieve insider sentiment about a company (retrieved from public SEC information) for the past 15 days
+    Retrieve insider sentiment about a company (retrieved from public SEC information)
     Args:
         ticker (str): ticker symbol of the company
         curr_date (str): current date you are trading on, yyyy-mm-dd
+        look_back_days (int, optional): Number of days to look back. Defaults to config value if None.
     Returns:
-        str: a report of the sentiment in the past 15 days starting at curr_date
+        str: a report of the insider sentiment starting at curr_date
     """
+    # Get lookback days from config if not provided
+    if look_back_days is None:
+        config = get_config()
+        look_back_days = config.get('market_history_days', 90)
 
     date_obj = datetime.strptime(curr_date, "%Y-%m-%d")
     before = date_obj - relativedelta(days=look_back_days)
@@ -131,16 +146,24 @@ def get_finnhub_company_insider_transactions(
         str,
         "current date you are trading at, yyyy-mm-dd",
     ],
-    look_back_days: Annotated[int, "how many days to look back"],
+    look_back_days: Annotated[
+        int,
+        "Number of days to look back for insider transactions. If not provided, defaults to market_history_days from config (typically 90 days). You can specify a custom value to analyze shorter or longer periods."
+    ] = None,
 ):
     """
-    Retrieve insider transcaction information about a company (retrieved from public SEC information) for the past 15 days
+    Retrieve insider transaction information about a company (retrieved from public SEC information)
     Args:
         ticker (str): ticker symbol of the company
         curr_date (str): current date you are trading at, yyyy-mm-dd
+        look_back_days (int, optional): Number of days to look back. Defaults to config value if None.
     Returns:
-        str: a report of the company's insider transaction/trading informtaion in the past 15 days
+        str: a report of the company's insider transaction/trading information
     """
+    # Get lookback days from config if not provided
+    if look_back_days is None:
+        config = get_config()
+        look_back_days = config.get('market_history_days', 90)
 
     date_obj = datetime.strptime(curr_date, "%Y-%m-%d")
     before = date_obj - relativedelta(days=look_back_days)
@@ -310,9 +333,27 @@ def get_simfin_income_statements(
 
 def get_google_news(
     query: Annotated[str, "Query to search with"],
-    curr_date: Annotated[str, "Curr date in yyyy-mm-dd format"],
-    look_back_days: Annotated[int, "how many days to look back"],
+    curr_date: Annotated[str, "Current date in yyyy-mm-dd format"],
+    look_back_days: Annotated[
+        int,
+        "Number of days to look back for news. If not provided, defaults to news_lookback_days from config (typically 7 days). You can specify a custom value to get more or less historical news."
+    ] = None,
 ) -> str:
+    """Search for news using Google News.
+    
+    Args:
+        query: Query to search with
+        curr_date: Current date in yyyy-mm-dd format
+        look_back_days: Number of days to look back. Defaults to config value if None.
+        
+    Returns:
+        Formatted news results as string
+    """
+    # Get lookback days from config if not provided
+    if look_back_days is None:
+        config = get_config()
+        look_back_days = config.get('news_lookback_days', 7)
+        
     query = query.replace(" ", "+")
 
     start_date = datetime.strptime(curr_date, "%Y-%m-%d")
@@ -336,17 +377,25 @@ def get_google_news(
 
 def get_reddit_global_news(
     start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
-    look_back_days: Annotated[int, "how many days to look back"],
-    max_limit_per_day: Annotated[int, "Maximum number of news per day"],
+    look_back_days: Annotated[
+        int,
+        "Number of days to look back for global news. If not provided, defaults to news_lookback_days from config (typically 7 days). You can specify a custom value to get more or less historical news."
+    ] = None,
+    max_limit_per_day: Annotated[int, "Maximum number of news per day"] = 5,
 ) -> str:
     """
     Retrieve the latest top reddit news
     Args:
         start_date: Start date in yyyy-mm-dd format
-        end_date: End date in yyyy-mm-dd format
+        look_back_days: Number of days to look back. Defaults to config value if None.
+        max_limit_per_day: Maximum number of news per day
     Returns:
         str: A formatted dataframe containing the latest news articles posts on reddit and meta information in these columns: "created_utc", "id", "title", "selftext", "score", "num_comments", "url"
     """
+    # Get lookback days from config if not provided
+    if look_back_days is None:
+        config = get_config()
+        look_back_days = config.get('news_lookback_days', 7)
 
     start_date = datetime.strptime(start_date, "%Y-%m-%d")
     before = start_date - relativedelta(days=look_back_days)
@@ -389,18 +438,26 @@ def get_reddit_global_news(
 def get_reddit_company_news(
     ticker: Annotated[str, "ticker symbol of the company"],
     start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
-    look_back_days: Annotated[int, "how many days to look back"],
-    max_limit_per_day: Annotated[int, "Maximum number of news per day"],
+    look_back_days: Annotated[
+        int,
+        "Number of days to look back for company news. If not provided, defaults to news_lookback_days from config (typically 7 days). You can specify a custom value to get more or less historical news."
+    ] = None,
+    max_limit_per_day: Annotated[int, "Maximum number of news per day"] = 5,
 ) -> str:
     """
-    Retrieve the latest top reddit news
+    Retrieve the latest top reddit news for a company
     Args:
         ticker: ticker symbol of the company
         start_date: Start date in yyyy-mm-dd format
-        end_date: End date in yyyy-mm-dd format
+        look_back_days: Number of days to look back. Defaults to config value if None.
+        max_limit_per_day: Maximum number of news per day
     Returns:
         str: A formatted dataframe containing the latest news articles posts on reddit and meta information in these columns: "created_utc", "id", "title", "selftext", "score", "num_comments", "url"
     """
+    # Get lookback days from config if not provided
+    if look_back_days is None:
+        config = get_config()
+        look_back_days = config.get('news_lookback_days', 7)
 
     start_date = datetime.strptime(start_date, "%Y-%m-%d")
     before = start_date - relativedelta(days=look_back_days)
@@ -451,14 +508,22 @@ def get_stock_stats_indicators_window(
     curr_date: Annotated[
         str, "The current trading date you are trading on, YYYY-mm-dd"
     ],
-    look_back_days: Annotated[int, "how many days to look back"],
-    online: Annotated[bool, "to fetch data online or offline"],
-    interval: Annotated[str, "Data interval (1m, 5m, 15m, 30m, 1h, 1d, 1wk, 1mo)"] = None,
+    look_back_days: Annotated[
+        int,
+        "Number of days to look back for indicator data. If not provided, defaults to market_history_days from config (typically 90 days). You can specify a custom value to analyze shorter or longer periods."
+    ] = None,
+    online: Annotated[bool, "to fetch data online or offline"] = True,
+    interval: Annotated[str, "Data interval (1m, 5m, 15m, 30m, 1h, 4h, 1d, 1wk, 1mo)"] = None,
 ) -> str:
     """
     Get technical indicator values for a date range.
     Returns text format only - JSON format is created by db_storage.py for storage.
     """
+    # Get lookback days from config if not provided
+    if look_back_days is None:
+        config = get_config()
+        look_back_days = config.get('market_history_days', 90)
+        
     # Get interval from config if not provided
     if interval is None:
         config = get_config()
@@ -683,17 +748,43 @@ def get_YFin_data_window(
 
 def get_YFin_data_online(
     symbol: Annotated[str, "ticker symbol of the company"],
-    start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
-    end_date: Annotated[str, "End date in yyyy-mm-dd format"],
-    interval: Annotated[str, "Data interval (1m, 5m, 15m, 30m, 1h, 1d, 1wk, 1mo)"] = None,
+    start_date: Annotated[str, "Start date in yyyy-mm-dd format"] = None,
+    end_date: Annotated[str, "End date in yyyy-mm-dd format"] = None,
+    interval: Annotated[str, "Data interval (1m, 5m, 15m, 30m, 1h, 4h, 1d, 1wk, 1mo). If not provided, defaults to timeframe from config (typically 1d)."] = None,
 ):
+    """
+    Get stock data online using YFinance data provider with smart caching.
+    
+    Args:
+        symbol: Ticker symbol of the company
+        start_date: Start date in yyyy-mm-dd format. If not provided, defaults to market_history_days ago from today.
+        end_date: End date in yyyy-mm-dd format. If not provided, defaults to today.
+        interval: Data interval. If not provided, defaults to timeframe from config.
+        
+    Returns:
+        Internal dict with text_for_agent and json_for_storage, or error dict
+    """
+    # Get config
+    config = get_config()
+    
     # Get interval from config if not provided
     if interval is None:
-        config = get_config()
         interval = config.get("timeframe", "1d")
-
-    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    
+    # Handle start_date and end_date defaults
+    if end_date is None:
+        end_dt = datetime.now()
+        end_date = end_dt.strftime("%Y-%m-%d")
+    else:
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    
+    if start_date is None:
+        # Default to market_history_days ago
+        lookback_days = config.get('market_history_days', 90)
+        start_dt = end_dt - relativedelta(days=lookback_days)
+        start_date = start_dt.strftime("%Y-%m-%d")
+    else:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
 
     # Use YFinanceDataProvider for smart caching
     provider = YFinanceDataProvider(CACHE_FOLDER)
@@ -806,7 +897,24 @@ def get_YFin_data(
     return filtered_data
 
 
-def get_stock_news_openai(ticker, curr_date):
+def get_stock_news_openai(
+    ticker: Annotated[str, "Ticker symbol of the company"],
+    curr_date: Annotated[str, "Current date in yyyy-mm-dd format"],
+    lookback_days: Annotated[
+        int,
+        "Number of days to look back for news and social sentiment. If not provided, defaults to social_sentiment_days from config (typically 3 days). You can specify a custom value to get more or less historical sentiment data."
+    ] = None
+):
+    """Get stock news and sentiment using OpenAI web search.
+    
+    Args:
+        ticker: Ticker symbol
+        curr_date: Current date in yyyy-mm-dd format
+        lookback_days: Number of days to look back. Defaults to social_sentiment_days from config if None.
+        
+    Returns:
+        News and sentiment analysis as string
+    """
     from .config import get_openai_api_key
     from .prompts import get_stock_news_prompt
     
@@ -814,7 +922,10 @@ def get_stock_news_openai(ticker, curr_date):
     api_key = get_openai_api_key()
     client = OpenAI(base_url=config["backend_url"], api_key=api_key)
 
-    lookback_days = config.get("social_sentiment_days", 3)
+    # Get lookback days from config if not provided
+    if lookback_days is None:
+        lookback_days = config.get("social_sentiment_days", 3)
+        
     prompt_text = get_stock_news_prompt(ticker, curr_date, lookback_days)
 
     response = client.responses.create(
@@ -867,7 +978,22 @@ def get_stock_news_openai(ticker, curr_date):
         return f"Error parsing response: {str(e)} - Response: {str(response)}"
 
 
-def get_global_news_openai(curr_date):
+def get_global_news_openai(
+    curr_date: Annotated[str, "Current date in yyyy-mm-dd format"],
+    lookback_days: Annotated[
+        int,
+        "Number of days to look back for global news. If not provided, defaults to news_lookback_days from config (typically 7 days). You can specify a custom value to get more or less historical news."
+    ] = None
+):
+    """Get global news using OpenAI web search.
+    
+    Args:
+        curr_date: Current date in yyyy-mm-dd format
+        lookback_days: Number of days to look back. Defaults to news_lookback_days from config if None.
+        
+    Returns:
+        Global news as string
+    """
     from .config import get_openai_api_key
     from .prompts import get_global_news_prompt
     
@@ -875,7 +1001,10 @@ def get_global_news_openai(curr_date):
     api_key = get_openai_api_key()
     client = OpenAI(base_url=config["backend_url"], api_key=api_key)
 
-    lookback_days = config.get("news_lookback_days", 7)
+    # Get lookback days from config if not provided
+    if lookback_days is None:
+        lookback_days = config.get("news_lookback_days", 7)
+        
     prompt_text = get_global_news_prompt(curr_date, lookback_days)
 
     response = client.responses.create(
@@ -929,14 +1058,21 @@ def get_global_news_openai(curr_date):
         return f"Error parsing response: {str(e)} - Response: {str(response)}"
 
 
-def get_fundamentals_openai(ticker, curr_date, lookback_days=90):
+def get_fundamentals_openai(
+    ticker: Annotated[str, "Stock ticker symbol"],
+    curr_date: Annotated[str, "Current date in yyyy-mm-dd format"],
+    lookback_days: Annotated[
+        int,
+        "Number of days to look back for fundamental data. If not provided, defaults to economic_data_days from config (typically 90 days). You can specify a custom value to analyze shorter or longer periods."
+    ] = None
+):
     """
     Search for fundamental analysis and financial metrics using OpenAI web search.
     
     Args:
         ticker: Stock ticker symbol
         curr_date: Current date in YYYY-MM-DD format
-        lookback_days: Number of days to look back (default: 90, typically from economic_data_days setting)
+        lookback_days: Number of days to look back. Defaults to economic_data_days from config if None.
         
     Returns:
         str: Formatted fundamental analysis with financial metrics in markdown table format
@@ -948,6 +1084,10 @@ def get_fundamentals_openai(ticker, curr_date, lookback_days=90):
     api_key = get_openai_api_key()
     client = OpenAI(base_url=config["backend_url"], api_key=api_key)
 
+    # Get lookback days from config if not provided
+    if lookback_days is None:
+        lookback_days = config.get('economic_data_days', 90)
+        
     prompt_text = get_fundamentals_prompt(ticker, curr_date, lookback_days)
 
     response = client.responses.create(

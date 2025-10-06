@@ -438,6 +438,9 @@ class TradeManager:
             
     def _apply_rulesets(self, recommendation: ExpertRecommendation, expert_instance: ExpertInstance) -> bool:
         """
+        DEPRECATED: This method is no longer used. Ruleset evaluation is now handled by TradeActionEvaluator.
+        See process_expert_recommendations_after_analysis() for the new implementation.
+        
         Apply rulesets to determine if a recommendation should be executed.
         
         Args:
@@ -445,30 +448,12 @@ class TradeManager:
             expert_instance: The expert instance
             
         Returns:
-            True if recommendation passes all rulesets, False otherwise
+            True (always allows - deprecated method)
         """
-        try:
-            # Get enter market ruleset (for new positions) from the model field
-            if expert_instance.enter_market_ruleset_id:
-                ruleset = self._get_ruleset_with_relations(expert_instance.enter_market_ruleset_id)
-                if ruleset:
-                    if not self._evaluate_ruleset(ruleset, recommendation, expert_instance):
-                        self.logger.info(f"Recommendation rejected by enter market ruleset {ruleset.name}")
-                        return False
-                        
-            # Get open positions ruleset (for managing existing positions) from the model field
-            if expert_instance.open_positions_ruleset_id:
-                ruleset = self._get_ruleset_with_relations(expert_instance.open_positions_ruleset_id)
-                if ruleset:
-                    if not self._evaluate_ruleset(ruleset, recommendation, expert_instance):
-                        self.logger.info(f"Recommendation rejected by open positions ruleset {ruleset.name}")
-                        return False
-                        
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Error applying rulesets: {e}", exc_info=True)
-            return True  # Allow by default if error
+        # This method is deprecated and no longer evaluates rulesets
+        # Ruleset evaluation is now done by TradeActionEvaluator in process_expert_recommendations_after_analysis
+        self.logger.warning("_apply_rulesets called but is deprecated - returning True (allow)")
+        return True
     
     def _get_ruleset_with_relations(self, ruleset_id: int) -> Optional[Ruleset]:
         """
