@@ -1,6 +1,7 @@
 from nicegui import ui
 from typing import Dict, Any, Optional
 import json
+import html
 from datetime import datetime
 import pandas as pd
 import io
@@ -54,6 +55,7 @@ class TradingAgentsUI:
         with ui.tabs().classes('w-full') as tabs:
             summary_tab = ui.tab('📊 Summary')
             dataviz_tab = ui.tab('📉 Data Visualization')
+            tools_tab = ui.tab('🔧 Tool Outputs')
             market_tab = ui.tab('📈 Market Analysis')
             sentiment_tab = ui.tab('💬 Social Sentiment') 
             news_tab = ui.tab('📰 News Analysis')
@@ -71,6 +73,9 @@ class TradingAgentsUI:
             
             with ui.tab_panel(dataviz_tab):
                 self._render_data_visualization_panel()
+            
+            with ui.tab_panel(tools_tab):
+                self._render_tool_outputs_panel()
             
             with ui.tab_panel(market_tab):
                 self._render_content_panel('market_report', '📈 Market Analysis', 
@@ -117,6 +122,7 @@ class TradingAgentsUI:
         with ui.tabs().classes('w-full') as tabs:
             summary_tab = ui.tab('📊 Summary')
             dataviz_tab = ui.tab('📉 Data Visualization')
+            tools_tab = ui.tab('🔧 Tool Outputs')
             market_tab = ui.tab(self._get_tab_label('market_report', '📈 Market Analysis'))
             sentiment_tab = ui.tab(self._get_tab_label('sentiment_report', '💬 Social Sentiment'))
             news_tab = ui.tab(self._get_tab_label('news_report', '📰 News Analysis'))
@@ -134,6 +140,9 @@ class TradingAgentsUI:
             
             with ui.tab_panel(dataviz_tab):
                 self._render_data_visualization_panel()
+            
+            with ui.tab_panel(tools_tab):
+                self._render_tool_outputs_panel()
             
             with ui.tab_panel(market_tab):
                 self._render_content_panel('market_report', '📈 Market Analysis', 
@@ -331,13 +340,13 @@ class TradingAgentsUI:
                     bear_messages = debate_state.get('bear_messages', [])
                     if bull_messages or bear_messages:
                         has_individual_messages = True
-                        # Interleave messages based on chronological order
+                        # Interleave messages: Bull speaks first, then alternates Bull → Bear → Bull → Bear
                         max_len = max(len(bull_messages), len(bear_messages))
                         for i in range(max_len):
                             if i < len(bull_messages):
-                                all_messages.append(('Bull Analyst', bull_messages[i], 'blue'))
+                                all_messages.append(('Bull Researcher', bull_messages[i], 'blue'))
                             if i < len(bear_messages):
-                                all_messages.append(('Bear Analyst', bear_messages[i], 'red'))
+                                all_messages.append(('Bear Researcher', bear_messages[i], 'red'))
                 
                 elif state_key == 'risk_debate_state':
                     risky_messages = debate_state.get('risky_messages', [])
@@ -345,7 +354,7 @@ class TradingAgentsUI:
                     neutral_messages = debate_state.get('neutral_messages', [])
                     if risky_messages or safe_messages or neutral_messages:
                         has_individual_messages = True
-                        # Interleave messages based on chronological order
+                        # Interleave messages: Risky → Safe → Neutral → Risky → Safe → Neutral cycle
                         max_len = max(len(risky_messages), len(safe_messages), len(neutral_messages))
                         for i in range(max_len):
                             if i < len(risky_messages):
@@ -847,3 +856,115 @@ class TradingAgentsUI:
         except Exception as e:
             logger.error(f"Error rendering data visualization panel: {e}", exc_info=True)
             ui.label(f'Error loading visualization data: {e}').classes('text-red-500')
+    
+    def _render_tool_outputs_panel(self) -> None:
+        """Render tool outputs panel with expandable sections and JSON viewer for JSON outputs."""
+        try:
+            with ui.card().classes('w-full p-4'):
+                ui.label('🔧 Tool Outputs').classes('text-h6 mb-4')
+                ui.label('All tool calls made during analysis with their outputs').classes('text-sm text-gray-600 mb-4')
+                
+                # Get analysis outputs from database
+                session = get_db()
+                try:
+                    statement = (
+                        select(AnalysisOutput)
+                        .where(AnalysisOutput.market_analysis_id == self.market_analysis.id)
+                        .order_by(AnalysisOutput.id)
+                    )
+                    outputs = session.exec(statement).all()
+                    
+                    if not outputs:
+                        with ui.card().classes('w-full p-8 text-center bg-grey-1'):
+                            ui.icon('build', size='3rem', color='grey-5').classes('mb-4')
+                            ui.label('No tool outputs available').classes('text-h6 text-grey-7')
+                            ui.label('Tool outputs will appear here once the analysis runs').classes('text-caption text-grey-6')
+                        return
+                    
+                    # Group outputs by type/category
+                    tool_outputs = []
+                    for output in outputs:
+                        output_obj = output[0] if isinstance(output, tuple) else output
+                        
+                        # Skip non-tool outputs (like analysis summaries)
+                        if not output_obj.name or 'tool_output' not in output_obj.name.lower():
+                            continue
+                        
+                        tool_outputs.append(output_obj)
+                    
+                    if not tool_outputs:
+                        ui.label('No tool outputs found (only analysis summaries available)').classes('text-grey-7')
+                        return
+                    
+                    # Display count
+                    ui.label(f'Total Tool Calls: {len(tool_outputs)}').classes('text-sm font-bold mb-4')
+                    
+                    # Render each tool output in an expandable section
+                    for idx, output_obj in enumerate(tool_outputs, 1):
+                        # Determine icon based on tool type
+                        tool_name = output_obj.name.lower()
+                        if 'price' in tool_name or 'market' in tool_name:
+                            icon = '📈'
+                        elif 'news' in tool_name:
+                            icon = '📰'
+                        elif 'social' in tool_name or 'sentiment' in tool_name:
+                            icon = '💬'
+                        elif 'financial' in tool_name or 'fundamental' in tool_name:
+                            icon = '🏛️'
+                        elif 'indicator' in tool_name or 'technical' in tool_name:
+                            icon = '📊'
+                        elif 'macro' in tool_name or 'economic' in tool_name:
+                            icon = '🌍'
+                        else:
+                            icon = '🔧'
+                        
+                        # Clean up tool name for display
+                        display_name = output_obj.name.replace('tool_output_', '').replace('_', ' ').title()
+                        
+                        # Check if this is a JSON output
+                        is_json_output = output_obj.name.endswith('_json')
+                        
+                        with ui.expansion(f'{icon} {display_name}', icon='code').classes('w-full mb-2'):
+                            with ui.card().classes('w-full p-4 bg-grey-1'):
+                                # Show metadata
+                                with ui.row().classes('w-full gap-4 mb-3'):
+                                    ui.label(f'Output #{idx}').classes('text-xs text-grey-7')
+                                    ui.label(f'Type: {output_obj.type}').classes('text-xs text-grey-7')
+                                    if output_obj.created_at:
+                                        ui.label(f'Time: {output_obj.created_at.strftime("%H:%M:%S")}').classes('text-xs text-grey-7')
+                                
+                                ui.separator().classes('my-2')
+                                
+                                # Render content based on type
+                                if is_json_output and output_obj.text:
+                                    # JSON output - use json_editor for nice display
+                                    try:
+                                        json_data = json.loads(output_obj.text)
+                                        ui.label('📋 Tool Parameters (JSON):').classes('text-sm font-bold mb-2')
+                                        ui.json_editor({'content': {'json': json_data}}).classes('w-full')
+                                    except json.JSONDecodeError as e:
+                                        logger.warning(f"Failed to parse JSON for {output_obj.name}: {e}")
+                                        # Fallback to text display with pre tag
+                                        with ui.scroll_area().classes('w-full max-h-96'):
+                                            escaped_text = html.escape(output_obj.text or '(empty)')
+                                            ui.html(f'<pre class="whitespace-pre-wrap text-xs font-mono bg-white p-3 rounded border overflow-x-auto">{escaped_text}</pre>')
+                                
+                                elif output_obj.text:
+                                    # Text/Markdown output - show in scrollable pre
+                                    with ui.scroll_area().classes('w-full max-h-96'):
+                                        if self._looks_like_markdown(output_obj.text):
+                                            ui.markdown(output_obj.text).classes('text-sm')
+                                        else:
+                                            # Use pre tag for preserving formatting and whitespace
+                                            escaped_text = html.escape(output_obj.text)
+                                            ui.html(f'<pre class="whitespace-pre-wrap text-xs font-mono bg-white p-3 rounded border overflow-x-auto">{escaped_text}</pre>')
+                                else:
+                                    ui.label('(No output content)').classes('text-grey-5 italic')
+                
+                finally:
+                    session.close()
+                    
+        except Exception as e:
+            logger.error(f"Error rendering tool outputs panel: {e}", exc_info=True)
+            with ui.card().classes('w-full p-4'):
+                ui.label(f'Error loading tool outputs: {e}').classes('text-red-500')

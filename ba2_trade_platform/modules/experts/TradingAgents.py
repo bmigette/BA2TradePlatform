@@ -113,6 +113,79 @@ class TradingAgents(MarketExpertInterface):
                 "description": "Days of social sentiment data to analyze",
                 "tooltip": "How many days of social media and Reddit sentiment to analyze. Social sentiment changes rapidly, so 1-7 days is typical. Shorter periods (1-3 days) capture current buzz, longer periods (7-14 days) smooth out noise."
             },
+            
+            # Data Vendor Settings
+            "vendor_stock_data": {
+                "type": "list", "required": True, "default": ["yfinance"],
+                "description": "Data vendor(s) for OHLCV stock price data",
+                "valid_values": ["yfinance", "alpha_vantage", "local"],
+                "multiple": True,
+                "tooltip": "Select one or more data providers for historical stock prices (Open, High, Low, Close, Volume). Multiple vendors enable automatic fallback. Order matters: first vendor is tried first. YFinance is free and reliable. Alpha Vantage requires API key. Local uses pre-downloaded data."
+            },
+            "vendor_indicators": {
+                "type": "list", "required": True, "default": ["yfinance"],
+                "description": "Data vendor(s) for technical indicators",
+                "valid_values": ["yfinance", "alpha_vantage", "local"],
+                "multiple": True,
+                "tooltip": "Select one or more data providers for technical indicators (RSI, MACD, Bollinger Bands, etc.). Multiple vendors enable automatic fallback. YFinance calculates indicators locally. Alpha Vantage provides pre-calculated indicators. Local uses cached data."
+            },
+            "vendor_fundamentals": {
+                "type": "list", "required": True, "default": ["openai"],
+                "description": "Data vendor(s) for fundamental analysis",
+                "valid_values": ["openai", "alpha_vantage"],
+                "multiple": True,
+                "tooltip": "Select one or more data providers for fundamental analysis (P/E ratio, earnings, cash flow, etc.). Multiple vendors enable automatic fallback. OpenAI searches web for latest data. Alpha Vantage provides structured financial statements."
+            },
+            "vendor_balance_sheet": {
+                "type": "list", "required": True, "default": ["yfinance"],
+                "description": "Data vendor(s) for balance sheet data",
+                "valid_values": ["yfinance", "alpha_vantage", "local"],
+                "multiple": True,
+                "tooltip": "Select one or more data providers for balance sheet data (assets, liabilities, equity). Multiple vendors enable automatic fallback. YFinance provides quarterly/annual data. Alpha Vantage offers similar data. Local uses SimFin pre-downloaded data."
+            },
+            "vendor_cashflow": {
+                "type": "list", "required": True, "default": ["yfinance"],
+                "description": "Data vendor(s) for cash flow statement data",
+                "valid_values": ["yfinance", "alpha_vantage", "local"],
+                "multiple": True,
+                "tooltip": "Select one or more data providers for cash flow statements (operating, investing, financing activities). Multiple vendors enable automatic fallback. YFinance provides quarterly/annual data. Alpha Vantage offers similar data. Local uses SimFin data."
+            },
+            "vendor_income_statement": {
+                "type": "list", "required": True, "default": ["yfinance"],
+                "description": "Data vendor(s) for income statement data",
+                "valid_values": ["yfinance", "alpha_vantage", "local"],
+                "multiple": True,
+                "tooltip": "Select one or more data providers for income statements (revenue, expenses, net income). Multiple vendors enable automatic fallback. YFinance provides quarterly/annual data. Alpha Vantage offers similar data. Local uses SimFin data."
+            },
+            "vendor_news": {
+                "type": "list", "required": True, "default": ["openai", "alpha_vantage"],
+                "description": "Data vendor(s) for company news",
+                "valid_values": ["openai", "alpha_vantage", "local"],
+                "multiple": True,
+                "tooltip": "Select one or more data providers for company news articles. Multiple vendors enable automatic fallback. OpenAI searches social media/news. Alpha Vantage provides news sentiment API. Local uses Finnhub/Reddit cached data. Note: Google News scraping is unreliable due to bot detection."
+            },
+            "vendor_global_news": {
+                "type": "list", "required": True, "default": ["openai"],
+                "description": "Data vendor(s) for global/macro news",
+                "valid_values": ["openai", "local"],
+                "multiple": True,
+                "tooltip": "Select one or more data providers for global macroeconomic news (interest rates, inflation, geopolitics, etc.). Multiple vendors enable automatic fallback. OpenAI searches web for latest news. Local uses Reddit cached data."
+            },
+            "vendor_insider_sentiment": {
+                "type": "list", "required": True, "default": ["local"],
+                "description": "Data vendor(s) for insider sentiment data",
+                "valid_values": ["local"],
+                "multiple": True,
+                "tooltip": "Insider sentiment data (SEC filings) from company insiders. Currently only available through local Finnhub cached data."
+            },
+            "vendor_insider_transactions": {
+                "type": "list", "required": True, "default": ["yfinance"],
+                "description": "Data vendor(s) for insider transaction data",
+                "valid_values": ["yfinance", "alpha_vantage", "local"],
+                "multiple": True,
+                "tooltip": "Select one or more data providers for insider trading transactions (buys/sells by executives). Multiple vendors enable automatic fallback. YFinance provides free data. Alpha Vantage offers similar data. Local uses Finnhub cached data."
+            },
+            
             "debug_mode": {
                 "type": "bool", "required": True, "default": True,
                 "description": "Enable debug mode with detailed console output",
@@ -150,6 +223,29 @@ class TradingAgents(MarketExpertInterface):
             max_debate_rounds = int(self.settings.get('debates_new_positions', settings_def['debates_new_positions']['default']))
             max_risk_discuss_rounds = int(self.settings.get('debates_existing_positions', settings_def['debates_existing_positions']['default']))
         
+        # Build tool_vendors mapping from individual vendor settings
+        # Convert list-type vendor settings to comma-separated strings
+        def _get_vendor_string(key: str) -> str:
+            """Get vendor setting as comma-separated string."""
+            value = self.settings.get(key, settings_def[key]['default'])
+            # If value is already a list, join with commas; otherwise return as-is
+            if isinstance(value, list):
+                return ','.join(value)
+            return value
+        
+        tool_vendors = {
+            'get_stock_data': _get_vendor_string('vendor_stock_data'),
+            'get_indicators': _get_vendor_string('vendor_indicators'),
+            'get_fundamentals': _get_vendor_string('vendor_fundamentals'),
+            'get_balance_sheet': _get_vendor_string('vendor_balance_sheet'),
+            'get_cashflow': _get_vendor_string('vendor_cashflow'),
+            'get_income_statement': _get_vendor_string('vendor_income_statement'),
+            'get_news': _get_vendor_string('vendor_news'),
+            'get_global_news': _get_vendor_string('vendor_global_news'),
+            'get_insider_sentiment': _get_vendor_string('vendor_insider_sentiment'),
+            'get_insider_transactions': _get_vendor_string('vendor_insider_transactions'),
+        }
+        
         # Apply user settings with defaults from settings definitions
         config.update({
             'max_debate_rounds': max_debate_rounds,
@@ -161,6 +257,7 @@ class TradingAgents(MarketExpertInterface):
             'economic_data_days': int(self.settings.get('economic_data_days', settings_def['economic_data_days']['default'])),
             'social_sentiment_days': int(self.settings.get('social_sentiment_days', settings_def['social_sentiment_days']['default'])),
             'timeframe': self.settings.get('timeframe', settings_def['timeframe']['default']),
+            'tool_vendors': tool_vendors,  # Add tool_vendors to config
         })
         
         return config

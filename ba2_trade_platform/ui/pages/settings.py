@@ -10,7 +10,8 @@ from ...logger import logger
 from ...core.db import get_db, get_all_instances, delete_instance, add_instance, update_instance, get_instance
 from ...modules.accounts import providers
 from ...core.AccountInterface import AccountInterface
-from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, AnalysisUseCase
+from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, AnalysisUseCase, MarketAnalysisStatus
+from ...core.cleanup import preview_cleanup, execute_cleanup, get_cleanup_statistics
 from yahooquery import Ticker, search as yq_search
 from nicegui.events import UploadEventArguments
 from ...modules.experts import experts
@@ -979,6 +980,7 @@ class ExpertSettingsTab:
                     ui.tab('General Settings', icon='schedule')
                     ui.tab('Instruments', icon='trending_up')
                     ui.tab('Expert Settings', icon='settings')
+                    ui.tab('Cleanup', icon='delete_sweep')
                 
                 with ui.tab_panels(settings_tabs, value='General Settings').classes('w-full').style('flex: 1; overflow-y: auto'):
                     # General Settings tab
@@ -1161,6 +1163,10 @@ class ExpertSettingsTab:
                         # Update settings when expert type changes
                         self.expert_select.on('update:model-value', 
                                             lambda e: self._on_expert_type_change(e, expert_instance))
+                    
+                    # Cleanup tab
+                    with ui.tab_panel('Cleanup'):
+                        self._render_cleanup_tab(expert_instance)
                 
                 # Load general settings if editing
                 if is_edit:
@@ -1771,6 +1777,21 @@ class ExpertSettingsTab:
                                 ).classes('w-full')
                             else:
                                 inp = ui.input(label=display_label, value=value).classes('w-full')
+                        elif meta["type"] == "list":
+                            # Handle list-type settings
+                            value = current_value if current_value is not None else default_value or []
+                            if valid_values and meta.get("multiple", False):
+                                # Show as multi-select dropdown
+                                inp = ui.select(
+                                    options=valid_values,
+                                    label=display_label,
+                                    value=value if isinstance(value, list) else [value] if value else [],
+                                    multiple=True
+                                ).classes('w-full')
+                            else:
+                                # Fallback to JSON input for list without valid_values
+                                import json
+                                inp = ui.input(label=display_label, value=json.dumps(value)).classes('w-full')
                         elif meta["type"] == "bool":
                             value = current_value if current_value is not None else default_value or False
                             inp = ui.checkbox(text=display_label, value=bool(value))
@@ -1807,6 +1828,265 @@ class ExpertSettingsTab:
         """Handle expert type change."""
         logger.debug(f'Expert type changed to: {event.value if hasattr(event, "value") else event}')
         self._render_expert_settings(expert_instance)
+    
+    def _render_cleanup_tab(self, expert_instance=None):
+        """Render the cleanup tab for managing old analysis data."""
+        ui.label('Database Cleanup').classes('text-subtitle1 mb-4')
+        ui.label('Remove old market analysis records and associated data to keep your database clean.').classes('text-body2 mb-4')
+        
+        # Show statistics first
+        with ui.card().classes('w-full mb-4'):
+            ui.label('Current Database Statistics').classes('text-subtitle2 mb-2')
+            self.cleanup_stats_container = ui.column().classes('w-full')
+            self._refresh_cleanup_statistics(expert_instance)
+        
+        # Cleanup configuration
+        with ui.card().classes('w-full mb-4'):
+            ui.label('Cleanup Configuration').classes('text-subtitle2 mb-2')
+            
+            # Days to keep
+            ui.label('Analyses older than this many days will be cleaned up:').classes('text-body2 mb-2')
+            self.cleanup_days_input = ui.number(
+                label='Days to Keep',
+                value=30,
+                min=1,
+                max=365,
+                step=1,
+                format='%.0f'
+            ).classes('w-full mb-4').props('outlined')
+            
+            # Status filter
+            ui.label('Select which analysis statuses to clean up:').classes('text-body2 mb-2')
+            with ui.column().classes('w-full mb-4'):
+                self.cleanup_status_checkboxes = {}
+                for status in MarketAnalysisStatus:
+                    # Default: clean up COMPLETED and FAILED, but not PENDING, RUNNING, or CANCELLED
+                    default_checked = status in [MarketAnalysisStatus.COMPLETED, MarketAnalysisStatus.FAILED]
+                    self.cleanup_status_checkboxes[status] = ui.checkbox(
+                        status.value.upper(),
+                        value=default_checked
+                    ).classes('mb-2')
+            
+            ui.label('⚠️ Analyses with open transactions will never be deleted.').classes('text-caption text-orange mb-2')
+        
+        # Preview results container
+        with ui.card().classes('w-full mb-4'):
+            ui.label('Preview').classes('text-subtitle2 mb-2')
+            self.cleanup_preview_container = ui.column().classes('w-full')
+            ui.label('Click "Preview Cleanup" to see what will be deleted.').classes('text-body2 text-grey')
+        
+        # Action buttons
+        with ui.row().classes('w-full gap-2 justify-end'):
+            ui.button(
+                'Preview Cleanup',
+                icon='visibility',
+                on_click=lambda: self._preview_cleanup(expert_instance)
+            ).props('outlined')
+            
+            self.cleanup_execute_button = ui.button(
+                'Execute Cleanup',
+                icon='delete_sweep',
+                on_click=lambda: self._execute_cleanup(expert_instance)
+            ).props('color=orange')
+            self.cleanup_execute_button.set_enabled(False)  # Disabled until preview is run
+    
+    def _refresh_cleanup_statistics(self, expert_instance=None):
+        """Refresh the cleanup statistics display."""
+        self.cleanup_stats_container.clear()
+        
+        try:
+            expert_id = expert_instance.id if expert_instance else None
+            stats = get_cleanup_statistics(expert_id)
+            
+            with self.cleanup_stats_container:
+                with ui.grid(columns=2).classes('w-full gap-4'):
+                    # Total analyses
+                    with ui.card().classes('p-4'):
+                        ui.label('Total Analyses').classes('text-caption text-grey')
+                        ui.label(str(stats['total_analyses'])).classes('text-h6')
+                    
+                    # Total outputs
+                    with ui.card().classes('p-4'):
+                        ui.label('Total Outputs').classes('text-caption text-grey')
+                        ui.label(str(stats['total_outputs'])).classes('text-h6')
+                    
+                    # Total recommendations
+                    with ui.card().classes('p-4'):
+                        ui.label('Total Recommendations').classes('text-caption text-grey')
+                        ui.label(str(stats['total_recommendations'])).classes('text-h6')
+                
+                # By status
+                if stats['analyses_by_status']:
+                    ui.label('Analyses by Status:').classes('text-body2 mt-4 mb-2')
+                    with ui.grid(columns=3).classes('w-full gap-2'):
+                        for status, count in sorted(stats['analyses_by_status'].items()):
+                            with ui.card().classes('p-2'):
+                                ui.label(status.upper()).classes('text-caption text-grey')
+                                ui.label(str(count)).classes('text-subtitle2')
+                
+                # By age
+                ui.label('Analyses by Age:').classes('text-body2 mt-4 mb-2')
+                with ui.grid(columns=5).classes('w-full gap-2'):
+                    age_labels = {
+                        '7_days': '< 7 days',
+                        '30_days': '7-30 days',
+                        '90_days': '30-90 days',
+                        '180_days': '90-180 days',
+                        'older': '> 180 days'
+                    }
+                    for age_key, label in age_labels.items():
+                        count = stats['analyses_by_age'].get(age_key, 0)
+                        with ui.card().classes('p-2'):
+                            ui.label(label).classes('text-caption text-grey')
+                            ui.label(str(count)).classes('text-subtitle2')
+        
+        except Exception as e:
+            logger.error(f'Error refreshing cleanup statistics: {e}')
+            with self.cleanup_stats_container:
+                ui.label(f'Error loading statistics: {str(e)}').classes('text-negative')
+    
+    def _preview_cleanup(self, expert_instance=None):
+        """Preview what would be cleaned up."""
+        self.cleanup_preview_container.clear()
+        
+        try:
+            # Get selected statuses
+            selected_statuses = [
+                status for status, checkbox in self.cleanup_status_checkboxes.items()
+                if checkbox.value
+            ]
+            
+            if not selected_statuses:
+                with self.cleanup_preview_container:
+                    ui.label('⚠️ Please select at least one status to clean up.').classes('text-orange')
+                self.cleanup_execute_button.set_enabled(False)
+                return
+            
+            # Get days to keep
+            days_to_keep = int(self.cleanup_days_input.value)
+            
+            # Get preview
+            expert_id = expert_instance.id if expert_instance else None
+            preview = preview_cleanup(
+                days_to_keep=days_to_keep,
+                statuses=selected_statuses,
+                expert_instance_id=expert_id
+            )
+            
+            with self.cleanup_preview_container:
+                # Summary
+                with ui.card().classes('w-full p-4 mb-4').style('border: 2px solid orange'):
+                    ui.label('Cleanup Summary').classes('text-subtitle2 mb-2')
+                    
+                    if preview['deletable_analyses'] == 0:
+                        ui.label('✅ No analyses to clean up with current settings.').classes('text-positive')
+                        self.cleanup_execute_button.set_enabled(False)
+                        return
+                    
+                    with ui.grid(columns=2).classes('w-full gap-4'):
+                        with ui.column():
+                            ui.label(f"Will delete: {preview['deletable_analyses']} analyses").classes('text-body1 font-bold text-orange')
+                            ui.label(f"Protected: {preview['protected_analyses']} analyses (have open transactions)").classes('text-body2')
+                        
+                        with ui.column():
+                            ui.label(f"Outputs to delete: {preview['estimated_outputs_deleted']}").classes('text-body2')
+                            ui.label(f"Recommendations to delete: {preview['estimated_recommendations_deleted']}").classes('text-body2')
+                
+                # Details table
+                if preview['preview_items']:
+                    ui.label('Sample of analyses to be deleted (up to 100):').classes('text-body2 mt-4 mb-2')
+                    
+                    columns = [
+                        {'name': 'id', 'label': 'ID', 'field': 'id', 'align': 'left', 'sortable': True},
+                        {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left', 'sortable': True},
+                        {'name': 'status', 'label': 'Status', 'field': 'status', 'align': 'left', 'sortable': True},
+                        {'name': 'created_at', 'label': 'Created', 'field': 'created_at', 'align': 'left', 'sortable': True},
+                        {'name': 'outputs_count', 'label': 'Outputs', 'field': 'outputs_count', 'align': 'right', 'sortable': True},
+                        {'name': 'recommendations_count', 'label': 'Recs', 'field': 'recommendations_count', 'align': 'right', 'sortable': True}
+                    ]
+                    
+                    ui.table(
+                        columns=columns,
+                        rows=preview['preview_items'],
+                        row_key='id'
+                    ).classes('w-full')
+                
+                # Enable execute button
+                self.cleanup_execute_button.set_enabled(True)
+        
+        except Exception as e:
+            logger.error(f'Error previewing cleanup: {e}')
+            with self.cleanup_preview_container:
+                ui.label(f'❌ Error: {str(e)}').classes('text-negative')
+            self.cleanup_execute_button.set_enabled(False)
+    
+    def _execute_cleanup(self, expert_instance=None):
+        """Execute the cleanup operation."""
+        # Confirm with user
+        async def confirm_and_execute():
+            result = await ui.run_javascript('''
+                new Promise((resolve) => {
+                    if (confirm("⚠️ This will permanently delete the previewed analyses and their data. Are you sure?")) {
+                        resolve(true);
+                    } else {
+                        resolve(false);
+                    }
+                })
+            ''')
+            
+            if not result:
+                return
+            
+            try:
+                # Get selected statuses
+                selected_statuses = [
+                    status for status, checkbox in self.cleanup_status_checkboxes.items()
+                    if checkbox.value
+                ]
+                
+                # Get days to keep
+                days_to_keep = int(self.cleanup_days_input.value)
+                
+                # Execute cleanup
+                expert_id = expert_instance.id if expert_instance else None
+                cleanup_result = execute_cleanup(
+                    days_to_keep=days_to_keep,
+                    statuses=selected_statuses,
+                    expert_instance_id=expert_id
+                )
+                
+                if cleanup_result['success']:
+                    message = f"✅ Cleanup completed!\n"
+                    message += f"Deleted: {cleanup_result['analyses_deleted']} analyses\n"
+                    message += f"Protected: {cleanup_result['analyses_protected']} analyses with open transactions\n"
+                    message += f"Outputs deleted: {cleanup_result['outputs_deleted']}\n"
+                    message += f"Recommendations deleted: {cleanup_result['recommendations_deleted']}"
+                    
+                    if cleanup_result['errors']:
+                        message += f"\n⚠️ {len(cleanup_result['errors'])} errors occurred"
+                    
+                    ui.notify(message, type='positive', multi_line=True, timeout=5000)
+                    
+                    # Refresh statistics
+                    self._refresh_cleanup_statistics(expert_instance)
+                    
+                    # Clear preview
+                    self.cleanup_preview_container.clear()
+                    with self.cleanup_preview_container:
+                        ui.label('Click "Preview Cleanup" to see what will be deleted.').classes('text-body2 text-grey')
+                    
+                    # Disable execute button
+                    self.cleanup_execute_button.set_enabled(False)
+                else:
+                    error_msg = "❌ Cleanup failed:\n" + "\n".join(cleanup_result['errors'])
+                    ui.notify(error_msg, type='negative', multi_line=True, timeout=5000)
+            
+            except Exception as e:
+                logger.error(f'Error executing cleanup: {e}')
+                ui.notify(f'❌ Error: {str(e)}', type='negative')
+        
+        # Run the async confirmation
+        ui.timer(0.1, confirm_and_execute, once=True)
     
     def _on_instrument_selection_change(self, selected_instruments):
         """Handle instrument selection changes."""
@@ -1937,6 +2217,9 @@ class ExpertSettingsTab:
                     expert.save_setting(key, inp.value, setting_type="bool")
                 elif meta.get("type") == "float":
                     expert.save_setting(key, float(inp.value or 0), setting_type="float")
+                elif meta.get("type") == "list":
+                    # Handle list types - save as JSON
+                    expert.save_setting(key, inp.value, setting_type="json")
                 else:
                     expert.save_setting(key, inp.value, setting_type="str")
         

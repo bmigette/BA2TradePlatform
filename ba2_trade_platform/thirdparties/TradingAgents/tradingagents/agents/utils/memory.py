@@ -35,8 +35,23 @@ class FinancialSituationMemory:
         # Create directory if it doesn't exist
         os.makedirs(persist_directory, exist_ok=True)
         
-        # Use PersistentClient for disk storage
-        self.chroma_client = chromadb.PersistentClient(path=persist_directory)
+        # Use PersistentClient for disk storage with explicit settings to avoid tenant issues
+        # ChromaDB has a bug with tenant validation in some versions, so we use Settings to bypass it
+        chroma_settings = Settings(
+            anonymized_telemetry=False,
+            allow_reset=True,
+            is_persistent=True
+        )
+        
+        try:
+            self.chroma_client = chromadb.PersistentClient(
+                path=persist_directory,
+                settings=chroma_settings
+            )
+        except Exception as e:
+            ta_logger.warning(f"Failed to create PersistentClient with settings: {e}, falling back to simple initialization")
+            # Fallback: try without settings
+            self.chroma_client = chromadb.PersistentClient(path=persist_directory)
         
         # Create collection name without analysis_id (only name and symbol)
         if symbol:

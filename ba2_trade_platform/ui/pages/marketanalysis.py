@@ -142,6 +142,12 @@ class JobMonitoringTab:
                            :disable="props.row.status === 'running'">
                         <q-tooltip>Cancel Analysis</q-tooltip>
                     </q-btn>
+                    <q-btn v-if="props.row.status === 'failed'" 
+                           flat dense icon="refresh" 
+                           color="orange" 
+                           @click="$parent.$emit('rerun_analysis', props.row.id)">
+                        <q-tooltip>Re-run Failed Analysis</q-tooltip>
+                    </q-btn>
                     <q-btn flat dense icon="bug_report" 
                            color="accent" 
                            @click="$parent.$emit('troubleshoot_ruleset', props.row.id)">
@@ -154,6 +160,7 @@ class JobMonitoringTab:
             self.analysis_table.on('cancel_analysis', self.cancel_analysis)
             self.analysis_table.on('view_details', self.view_analysis_details)
             self.analysis_table.on('troubleshoot_ruleset', self.troubleshoot_ruleset)
+            self.analysis_table.on('rerun_analysis', self.rerun_analysis)
 
     def _create_queue_status(self):
         """Create worker queue status display."""
@@ -463,6 +470,91 @@ class JobMonitoringTab:
         except Exception as e:
             logger.error(f"Error navigating to ruleset test {analysis_id if analysis_id else 'unknown'}: {e}", exc_info=True)
             ui.notify(f"Error opening ruleset test: {str(e)}", type='negative')
+    
+    def rerun_analysis(self, event_data):
+        """Re-run a failed analysis by clearing outputs and re-queuing."""
+        analysis_id = None
+        try:
+            # Extract analysis_id from event data
+            if hasattr(event_data, 'args') and hasattr(event_data.args, '__len__') and len(event_data.args) > 0:
+                analysis_id = int(event_data.args[0])
+            elif isinstance(event_data, int):
+                analysis_id = event_data
+            elif hasattr(event_data, 'args') and isinstance(event_data.args, int):
+                analysis_id = event_data.args
+            else:
+                logger.error(f"Invalid event data for rerun_analysis: {event_data}", exc_info=True)
+                ui.notify("Invalid event data", type='negative')
+                return
+            
+            # Get the market analysis
+            analysis = get_instance(MarketAnalysis, analysis_id)
+            if not analysis:
+                ui.notify("Analysis not found", type='negative')
+                return
+            
+            # Only allow re-run for failed analyses
+            if analysis.status != MarketAnalysisStatus.FAILED:
+                ui.notify("Can only re-run failed analyses", type='warning')
+                return
+            
+            # Clear existing data
+            from ...core.db import get_db
+            from ...core.models import AnalysisOutput, ExpertRecommendation
+            from sqlmodel import select
+            
+            with get_db() as session:
+                # Delete all analysis outputs
+                outputs_statement = select(AnalysisOutput).where(AnalysisOutput.market_analysis_id == analysis_id)
+                outputs = session.exec(outputs_statement).all()
+                for output in outputs:
+                    session.delete(output)
+                
+                # Delete all expert recommendations
+                recs_statement = select(ExpertRecommendation).where(ExpertRecommendation.market_analysis_id == analysis_id)
+                recommendations = session.exec(recs_statement).all()
+                for rec in recommendations:
+                    session.delete(rec)
+                
+                # Clear state and reset status
+                analysis.state = None
+                analysis.status = MarketAnalysisStatus.PENDING
+                session.add(analysis)
+                session.commit()
+                session.refresh(analysis)
+                
+                logger.info(f"Cleared {len(outputs)} outputs and {len(recommendations)} recommendations for analysis {analysis_id}")
+            
+            # Re-queue the analysis
+            try:
+                worker_queue = self._get_worker_queue()
+                task_id = worker_queue.submit_analysis_task(
+                    expert_instance_id=analysis.expert_instance_id,
+                    symbol=analysis.symbol,
+                    subtype=analysis.subtype,
+                    priority=0  # Normal priority for re-runs
+                )
+                
+                ui.notify(f"Analysis {analysis_id} queued for re-run (Task: {task_id})", type='positive')
+                self.refresh_data()
+                
+            except ValueError as ve:
+                # Task already exists - this shouldn't happen since we reset status
+                logger.warning(f"Duplicate task when re-running analysis {analysis_id}: {ve}")
+                ui.notify(f"Analysis already queued: {str(ve)}", type='warning')
+                self.refresh_data()
+                
+            except Exception as qe:
+                # Restore failed status if queueing failed
+                analysis.status = MarketAnalysisStatus.FAILED
+                from ...core.db import update_instance
+                update_instance(analysis)
+                logger.error(f"Failed to queue re-run for analysis {analysis_id}: {qe}", exc_info=True)
+                ui.notify(f"Failed to queue analysis for re-run: {str(qe)}", type='negative')
+                
+        except Exception as e:
+            logger.error(f"Error re-running analysis {analysis_id if analysis_id else 'unknown'}: {e}", exc_info=True)
+            ui.notify(f"Error re-running analysis: {str(e)}", type='negative')
 
     def refresh_data(self):
         """Refresh the data in all tables."""
@@ -1392,7 +1484,7 @@ class OrderRecommendationsTab:
                         'confidence': f"{recommendation.confidence:.1f}%" if recommendation.confidence is not None else 'N/A',
                         'expected_profit': f"{recommendation.expected_profit_percent:.2f}%" if recommendation.expected_profit_percent else 'N/A',
                         'price_at_date': f"${recommendation.price_at_date:.2f}" if recommendation.price_at_date else 'N/A',
-                        'risk_level': recommendation.risk_level.value if hasattr(recommendation.risk_level, 'value') else str(recommendation.risk_level),
+                        'risk_level': recommendation.risk_level.value if hasattr(recommendation.risk_level, 'value') else (recommendation.risk_level.name if hasattr(recommendation.risk_level, 'name') else str(recommendation.risk_level)),
                         'time_horizon': recommendation.time_horizon.value.replace('_', ' ').title() if hasattr(recommendation.time_horizon, 'value') else str(recommendation.time_horizon),
                         'expert_name': expert_instance.user_description or expert_instance.expert,
                         'created_at': created_at,
@@ -1860,7 +1952,7 @@ class OrderRecommendationsTab:
                                 recommendation = get_instance(ExpertRecommendation, order.expert_recommendation_id)
                                 if recommendation:
                                     roi = f"{recommendation.expected_profit_percent:.2f}%" if recommendation.expected_profit_percent else 'N/A'
-                                    risk_level = recommendation.risk_level.value if hasattr(recommendation.risk_level, 'value') else str(recommendation.risk_level)
+                                    risk_level = recommendation.risk_level.value if hasattr(recommendation.risk_level, 'value') else (recommendation.risk_level.name if hasattr(recommendation.risk_level, 'name') else str(recommendation.risk_level))
                             
                             # Get current price from account interface
                             current_price = account.get_instrument_current_price(order.symbol)

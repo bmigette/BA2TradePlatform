@@ -109,6 +109,18 @@ class ExtendableSettingsInterface(ABC):
             else:
                 setting = setting_model(**{lk_field: self.id, "key": key, "value_json": value})
                 add_instance(setting, session)
+        
+        elif value_type == "list":
+            # List values are stored as JSON
+            if not isinstance(value, list):
+                raise ValueError(f"List setting '{key}' must be a list, got {type(value).__name__}: {repr(value)}")
+            
+            if setting:
+                setting.value_json = value
+                update_instance(setting, session)
+            else:
+                setting = setting_model(**{lk_field: self.id, "key": key, "value_json": value})
+                add_instance(setting, session)
                 
         elif value_type == "bool":
             json_value = json.dumps(value)
@@ -219,8 +231,8 @@ class ExtendableSettingsInterface(ABC):
                         value_type = "str"
                     #logger.debug(f"Setting '{setting.key}' found in DB but not in definitions, using type: {value_type}")
                 
-                if value_type == "json":
-                    # All JSON values are now stored as Dict objects in the database
+                if value_type == "json" or value_type == "list":
+                    # JSON and list values are stored as JSON in the database
                     settings[setting.key] = setting.value_json
                 elif value_type == "bool":
                     # Convert JSON string to bool with robust handling of corrupted values
