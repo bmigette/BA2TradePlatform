@@ -77,6 +77,7 @@ def add_instance(instance, session: Session | None = None, expunge_after_flush: 
     Add a new instance to the database.
     If a session is provided, use it; otherwise, create a new session.
     Commits the transaction after adding.
+    Thread-safe: Uses a lock to prevent concurrent write conflicts.
 
     Args:
         instance: The instance to add.
@@ -89,40 +90,42 @@ def add_instance(instance, session: Session | None = None, expunge_after_flush: 
         The ID of the added instance.
     """
     instance_class = instance.__class__.__name__
-    try:
-        if session:
-            session.add(instance)
-            session.flush()  # Flush to generate the ID without committing
-            instance_id = instance.id  # Get ID after flush
-            if expunge_after_flush:
-                session.expunge(instance)  # Detach from session to prevent attribute expiration
-            session.commit()
-            logger.info(f"Added instance: {instance_class} (id={instance_id})")
-            return instance_id
-        else:
-            with Session(engine) as new_session:
-                new_session.add(instance)
-                new_session.flush()  # Flush to generate the ID without committing
+    with _db_write_lock:
+        try:
+            if session:
+                session.add(instance)
+                session.flush()  # Flush to generate the ID without committing
                 instance_id = instance.id  # Get ID after flush
                 if expunge_after_flush:
-                    new_session.expunge(instance)  # Detach from session to prevent attribute expiration
-                new_session.commit()
+                    session.expunge(instance)  # Detach from session to prevent attribute expiration
+                session.commit()
                 logger.info(f"Added instance: {instance_class} (id={instance_id})")
                 return instance_id
-    except Exception as e:
-        # Try to get ID safely, may not be available if instance is detached
-        try:
-            instance_id = instance.id
-            logger.error(f"Error adding instance {instance_class} (id={instance_id}): {e}", exc_info=True)
-        except:
-            logger.error(f"Error adding instance {instance_class}: {e}", exc_info=True)
-        raise
+            else:
+                with Session(engine) as new_session:
+                    new_session.add(instance)
+                    new_session.flush()  # Flush to generate the ID without committing
+                    instance_id = instance.id  # Get ID after flush
+                    if expunge_after_flush:
+                        new_session.expunge(instance)  # Detach from session to prevent attribute expiration
+                    new_session.commit()
+                    logger.info(f"Added instance: {instance_class} (id={instance_id})")
+                    return instance_id
+        except Exception as e:
+            # Try to get ID safely, may not be available if instance is detached
+            try:
+                instance_id = instance.id
+                logger.error(f"Error adding instance {instance_class} (id={instance_id}): {e}", exc_info=True)
+            except:
+                logger.error(f"Error adding instance {instance_class}: {e}", exc_info=True)
+            raise
 
 def update_instance(instance, session: Session | None = None):
     """
     Update an existing instance in the database.
     If a session is provided, use it; otherwise, create a new session.
     Commits and refreshes the instance after updating.
+    Thread-safe: Uses a lock to prevent concurrent write conflicts.
 
     Args:
         instance: The instance to update.
@@ -131,26 +134,28 @@ def update_instance(instance, session: Session | None = None):
     Returns:
         True if update was successful.
     """
-    try:
-        if session:
-            session.add(instance)
-            session.commit()
-            session.refresh(instance)
-        else:
-            with Session(engine) as session:
+    with _db_write_lock:
+        try:
+            if session:
                 session.add(instance)
                 session.commit()
                 session.refresh(instance)
-        return True
-    except Exception as e:
-        logger.error(f"Error updating instance: {e}", exc_info=True)
-        raise
+            else:
+                with Session(engine) as session:
+                    session.add(instance)
+                    session.commit()
+                    session.refresh(instance)
+            return True
+        except Exception as e:
+            logger.error(f"Error updating instance: {e}", exc_info=True)
+            raise
 
 def delete_instance(instance, session: Session | None = None):
     """
     Delete an instance from the database.
     If a session is provided, use it; otherwise, create a new session.
     Commits the transaction after deleting.
+    Thread-safe: Uses a lock to prevent concurrent write conflicts.
 
     Args:
         instance: The instance to delete.
@@ -159,22 +164,23 @@ def delete_instance(instance, session: Session | None = None):
     Returns:
         True if deletion was successful.
     """
-    try:
-        instance_id = instance.id
-        if session:
-            session.delete(instance)
-            session.commit()
-            logger.info(f"Deleted instance with id: {instance_id}")
-            return True
-        else:
-            with Session(engine) as session:
+    with _db_write_lock:
+        try:
+            instance_id = instance.id
+            if session:
                 session.delete(instance)
                 session.commit()
                 logger.info(f"Deleted instance with id: {instance_id}")
                 return True
-    except Exception as e:
-        logger.error(f"Error deleting instance: {e}", exc_info=True)
-        raise
+            else:
+                with Session(engine) as session:
+                    session.delete(instance)
+                    session.commit()
+                    logger.info(f"Deleted instance with id: {instance_id}")
+                    return True
+        except Exception as e:
+            logger.error(f"Error deleting instance: {e}", exc_info=True)
+            raise
 
 def get_instance(model_class, instance_id):
     """
@@ -256,6 +262,7 @@ def get_setting(key: str) -> str | None:
 def reorder_ruleset_rules(ruleset_id: int, rule_order: list[int]) -> bool:
     """
     Reorder the rules in a ruleset by updating the order_index field.
+    Thread-safe: Uses a lock to prevent concurrent write conflicts.
     
     Args:
         ruleset_id: The ID of the ruleset to reorder
@@ -264,35 +271,37 @@ def reorder_ruleset_rules(ruleset_id: int, rule_order: list[int]) -> bool:
     Returns:
         True if successful, False otherwise
     """
-    try:
-        from .models import RulesetEventActionLink
-        with Session(engine) as session:
-            # Update each link with its new order index
-            for index, eventaction_id in enumerate(rule_order):
-                # Use SQLAlchemy Core update for better performance and compatibility
-                from sqlalchemy import update
-                stmt = update(RulesetEventActionLink).where(
-                    RulesetEventActionLink.ruleset_id == ruleset_id,
-                    RulesetEventActionLink.eventaction_id == eventaction_id
-                ).values(order_index=index)
+    with _db_write_lock:
+        try:
+            from .models import RulesetEventActionLink
+            with Session(engine) as session:
+                # Update each link with its new order index
+                for index, eventaction_id in enumerate(rule_order):
+                    # Use SQLAlchemy Core update for better performance and compatibility
+                    from sqlalchemy import update
+                    stmt = update(RulesetEventActionLink).where(
+                        RulesetEventActionLink.ruleset_id == ruleset_id,
+                        RulesetEventActionLink.eventaction_id == eventaction_id
+                    ).values(order_index=index)
+                    
+                    result = session.execute(stmt)
+                    if result.rowcount == 0:
+                        logger.error(f"Link not found for ruleset {ruleset_id}, eventaction {eventaction_id}")
+                        return False
                 
-                result = session.execute(stmt)
-                if result.rowcount == 0:
-                    logger.error(f"Link not found for ruleset {ruleset_id}, eventaction {eventaction_id}")
-                    return False
-            
-            session.commit()
-            logger.info(f"Reordered rules for ruleset {ruleset_id}")
-            return True
-            
-    except Exception as e:
-        logger.error(f"Error reordering ruleset rules: {e}", exc_info=True)
-        return False
+                session.commit()
+                logger.info(f"Reordered rules for ruleset {ruleset_id}")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error reordering ruleset rules: {e}", exc_info=True)
+            return False
 
 
 def move_rule_up(ruleset_id: int, eventaction_id: int) -> bool:
     """
     Move a rule up one position in the ruleset order.
+    Thread-safe: Uses a lock to prevent concurrent write conflicts.
     
     Args:
         ruleset_id: The ID of the ruleset
@@ -301,62 +310,64 @@ def move_rule_up(ruleset_id: int, eventaction_id: int) -> bool:
     Returns:
         True if successful, False otherwise
     """
-    try:
-        from .models import RulesetEventActionLink
-        from sqlalchemy import update
-        with Session(engine) as session:
-            # Get the current order index
-            current_result = session.exec(
-                select(RulesetEventActionLink.order_index).where(
-                    RulesetEventActionLink.ruleset_id == ruleset_id,
-                    RulesetEventActionLink.eventaction_id == eventaction_id
-                )
-            ).first()
-            
-            if not current_result or current_result == 0:
-                return False  # Already at top or not found
-            
-            current_order = current_result
-            target_order = current_order - 1
-            
-            # Get the eventaction_id that's currently at the target position
-            above_result = session.exec(
-                select(RulesetEventActionLink.eventaction_id).where(
-                    RulesetEventActionLink.ruleset_id == ruleset_id,
-                    RulesetEventActionLink.order_index == target_order
-                )
-            ).first()
-            
-            if above_result:
-                # Swap the order indexes using SQLAlchemy Core updates
-                # Move current rule to target position
-                stmt1 = update(RulesetEventActionLink).where(
-                    RulesetEventActionLink.ruleset_id == ruleset_id,
-                    RulesetEventActionLink.eventaction_id == eventaction_id
-                ).values(order_index=target_order)
+    with _db_write_lock:
+        try:
+            from .models import RulesetEventActionLink
+            from sqlalchemy import update
+            with Session(engine) as session:
+                # Get the current order index
+                current_result = session.exec(
+                    select(RulesetEventActionLink.order_index).where(
+                        RulesetEventActionLink.ruleset_id == ruleset_id,
+                        RulesetEventActionLink.eventaction_id == eventaction_id
+                    )
+                ).first()
                 
-                # Move above rule to current position
-                stmt2 = update(RulesetEventActionLink).where(
-                    RulesetEventActionLink.ruleset_id == ruleset_id,
-                    RulesetEventActionLink.eventaction_id == above_result
-                ).values(order_index=current_order)
+                if not current_result or current_result == 0:
+                    return False  # Already at top or not found
                 
-                session.execute(stmt1)
-                session.execute(stmt2)
-                session.commit()
-                logger.info(f"Moved rule {eventaction_id} up in ruleset {ruleset_id}")
-                return True
-            
+                current_order = current_result
+                target_order = current_order - 1
+                
+                # Get the eventaction_id that's currently at the target position
+                above_result = session.exec(
+                    select(RulesetEventActionLink.eventaction_id).where(
+                        RulesetEventActionLink.ruleset_id == ruleset_id,
+                        RulesetEventActionLink.order_index == target_order
+                    )
+                ).first()
+                
+                if above_result:
+                    # Swap the order indexes using SQLAlchemy Core updates
+                    # Move current rule to target position
+                    stmt1 = update(RulesetEventActionLink).where(
+                        RulesetEventActionLink.ruleset_id == ruleset_id,
+                        RulesetEventActionLink.eventaction_id == eventaction_id
+                    ).values(order_index=target_order)
+                    
+                    # Move above rule to current position
+                    stmt2 = update(RulesetEventActionLink).where(
+                        RulesetEventActionLink.ruleset_id == ruleset_id,
+                        RulesetEventActionLink.eventaction_id == above_result
+                    ).values(order_index=current_order)
+                    
+                    session.execute(stmt1)
+                    session.execute(stmt2)
+                    session.commit()
+                    logger.info(f"Moved rule {eventaction_id} up in ruleset {ruleset_id}")
+                    return True
+                
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error moving rule up: {e}", exc_info=True)
             return False
-            
-    except Exception as e:
-        logger.error(f"Error moving rule up: {e}", exc_info=True)
-        return False
 
 
 def move_rule_down(ruleset_id: int, eventaction_id: int) -> bool:
     """
     Move a rule down one position in the ruleset order.
+    Thread-safe: Uses a lock to prevent concurrent write conflicts.
     
     Args:
         ruleset_id: The ID of the ruleset
@@ -365,65 +376,66 @@ def move_rule_down(ruleset_id: int, eventaction_id: int) -> bool:
     Returns:
         True if successful, False otherwise
     """
-    try:
-        from .models import RulesetEventActionLink
-        from sqlalchemy import update
-        with Session(engine) as session:
-            # Get the current order index
-            current_result = session.exec(
-                select(RulesetEventActionLink.order_index).where(
-                    RulesetEventActionLink.ruleset_id == ruleset_id,
-                    RulesetEventActionLink.eventaction_id == eventaction_id
-                )
-            ).first()
-            
-            if not current_result:
-                return False  # Not found
-            
-            current_order = current_result
-            
-            # Get the max order index for this ruleset
-            max_order = session.exec(
-                select(RulesetEventActionLink.order_index).where(
-                    RulesetEventActionLink.ruleset_id == ruleset_id
-                ).order_by(RulesetEventActionLink.order_index.desc())
-            ).first()
-            
-            if not max_order or current_order >= max_order:
-                return False  # Already at bottom
-            
-            target_order = current_order + 1
-            
-            # Get the eventaction_id that's currently at the target position
-            below_result = session.exec(
-                select(RulesetEventActionLink.eventaction_id).where(
-                    RulesetEventActionLink.ruleset_id == ruleset_id,
-                    RulesetEventActionLink.order_index == target_order
-                )
-            ).first()
-            
-            if below_result:
-                # Swap the order indexes using SQLAlchemy Core updates
-                # Move current rule to target position
-                stmt1 = update(RulesetEventActionLink).where(
-                    RulesetEventActionLink.ruleset_id == ruleset_id,
-                    RulesetEventActionLink.eventaction_id == eventaction_id
-                ).values(order_index=target_order)
+    with _db_write_lock:
+        try:
+            from .models import RulesetEventActionLink
+            from sqlalchemy import update
+            with Session(engine) as session:
+                # Get the current order index
+                current_result = session.exec(
+                    select(RulesetEventActionLink.order_index).where(
+                        RulesetEventActionLink.ruleset_id == ruleset_id,
+                        RulesetEventActionLink.eventaction_id == eventaction_id
+                    )
+                ).first()
                 
-                # Move below rule to current position
-                stmt2 = update(RulesetEventActionLink).where(
-                    RulesetEventActionLink.ruleset_id == ruleset_id,
-                    RulesetEventActionLink.eventaction_id == below_result
-                ).values(order_index=current_order)
+                if not current_result:
+                    return False  # Not found
                 
-                session.execute(stmt1)
-                session.execute(stmt2)
-                session.commit()
-                logger.info(f"Moved rule {eventaction_id} down in ruleset {ruleset_id}")
-                return True
-            
+                current_order = current_result
+                
+                # Get the max order index for this ruleset
+                max_order = session.exec(
+                    select(RulesetEventActionLink.order_index).where(
+                        RulesetEventActionLink.ruleset_id == ruleset_id
+                    ).order_by(RulesetEventActionLink.order_index.desc())
+                ).first()
+                
+                if not max_order or current_order >= max_order:
+                    return False  # Already at bottom
+                
+                target_order = current_order + 1
+                
+                # Get the eventaction_id that's currently at the target position
+                below_result = session.exec(
+                    select(RulesetEventActionLink.eventaction_id).where(
+                        RulesetEventActionLink.ruleset_id == ruleset_id,
+                        RulesetEventActionLink.order_index == target_order
+                    )
+                ).first()
+                
+                if below_result:
+                    # Swap the order indexes using SQLAlchemy Core updates
+                    # Move current rule to target position
+                    stmt1 = update(RulesetEventActionLink).where(
+                        RulesetEventActionLink.ruleset_id == ruleset_id,
+                        RulesetEventActionLink.eventaction_id == eventaction_id
+                    ).values(order_index=target_order)
+                    
+                    # Move below rule to current position
+                    stmt2 = update(RulesetEventActionLink).where(
+                        RulesetEventActionLink.ruleset_id == ruleset_id,
+                        RulesetEventActionLink.eventaction_id == below_result
+                    ).values(order_index=current_order)
+                    
+                    session.execute(stmt1)
+                    session.execute(stmt2)
+                    session.commit()
+                    logger.info(f"Moved rule {eventaction_id} down in ruleset {ruleset_id}")
+                    return True
+                
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error moving rule down: {e}", exc_info=True)
             return False
-            
-    except Exception as e:
-        logger.error(f"Error moving rule down: {e}", exc_info=True)
-        return False
