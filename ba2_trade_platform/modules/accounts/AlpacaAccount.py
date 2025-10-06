@@ -328,7 +328,7 @@ class AlpacaAccount(AccountInterface):
             else:
                 logger.error(f"Unsupported order type: {trading_order.order_type} (value: {order_type_value})")
                 return None
-
+            logger.debug(f"Submitting Alpaca order: {order_request} (client_order_id={trading_order.comment})")
             order = self.client.submit_order(order_request)
             logger.info(f"Submitted Alpaca order: {order.id}")
 

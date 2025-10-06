@@ -81,14 +81,18 @@ def get_stock_stats_indicators_window(
         int,
         "Number of days to look back for indicator data. If not provided, defaults to market_history_days from config (typically 90 days). You can specify a custom value to analyze shorter or longer periods."
     ] = None,
+    online: Annotated[bool, "Whether to fetch data online"] = True,
+    interval: Annotated[str, "Data interval for online mode"] = "1d",
 ) -> str:
-    """Get technical indicator values for a date range.
+    """Get technical indicator values for a date range efficiently.
     
     Args:
         symbol: Ticker symbol
         indicator: Technical indicator name
         curr_date: Current trading date
         look_back_days: Number of days to look back. Defaults to market_history_days from config if None.
+        online: Whether to fetch data online (default: True)
+        interval: Data interval for online mode (default: "1d")
         
     Returns:
         String with indicator values and description
@@ -176,23 +180,38 @@ def get_stock_stats_indicators_window(
             f"Indicator {indicator} is not supported. Please choose from: {list(best_ind_params.keys())}"
         )
 
-    end_date = curr_date
+    # Calculate date range
     curr_date_dt = datetime.strptime(curr_date, "%Y-%m-%d")
-    before = curr_date_dt - relativedelta(days=look_back_days)
+    start_date_dt = curr_date_dt - relativedelta(days=look_back_days)
+    start_date = start_date_dt.strftime("%Y-%m-%d")
+    end_date = curr_date
 
-    # online gathering only
-    ind_string = ""
-    while curr_date_dt >= before:
-        indicator_value = get_stockstats_indicator(
-            symbol, indicator, curr_date_dt.strftime("%Y-%m-%d")
+    # Use the optimized get_stock_stats_range method instead of looping through each day
+    try:
+        # Note: data_dir not needed when online=True
+        df = StockstatsUtils.get_stock_stats_range(
+            symbol=symbol,
+            indicator=indicator,
+            start_date=start_date,
+            end_date=end_date,
+            data_dir="",  # Not used when online=True
+            online=online,
+            interval=interval
         )
-
-        ind_string += f"{curr_date_dt.strftime('%Y-%m-%d')}: {indicator_value}\n"
-
-        curr_date_dt = curr_date_dt - relativedelta(days=1)
+        
+        # Format results into string
+        ind_string = ""
+        for _, row in df.iterrows():
+            ind_string += f"{row['Date']}: {row['value']}\n"
+        
+        if not ind_string:
+            ind_string = "No data available for the specified date range.\n"
+            
+    except Exception as e:
+        ind_string = f"Error retrieving indicator data: {str(e)}\n"
 
     result_str = (
-        f"## {indicator} values from {before.strftime('%Y-%m-%d')} to {end_date}:\n\n"
+        f"## {indicator} values from {start_date} to {end_date}:\n\n"
         + ind_string
         + "\n\n"
         + best_ind_params.get(indicator, "No description available.")
@@ -207,16 +226,32 @@ def get_stockstats_indicator(
     curr_date: Annotated[
         str, "The current trading date you are trading on, YYYY-mm-dd"
     ],
+    online: Annotated[bool, "Whether to fetch data online"] = True,
+    interval: Annotated[str, "Data interval for online mode"] = "1d",
 ) -> str:
-
+    """Get a single indicator value for a specific date.
+    
+    Args:
+        symbol: Ticker symbol
+        indicator: Technical indicator name
+        curr_date: Trading date in YYYY-mm-dd format
+        online: Whether to fetch data online (default: True)
+        interval: Data interval for online mode (default: "1d")
+        
+    Returns:
+        String representation of the indicator value
+    """
     curr_date_dt = datetime.strptime(curr_date, "%Y-%m-%d")
     curr_date = curr_date_dt.strftime("%Y-%m-%d")
 
     try:
         indicator_value = StockstatsUtils.get_stock_stats(
-            symbol,
-            indicator,
-            curr_date,
+            symbol=symbol,
+            indicator=indicator,
+            curr_date=curr_date,
+            data_dir="",  # Not used when online=True
+            online=online,
+            interval=interval
         )
     except Exception as e:
         print(

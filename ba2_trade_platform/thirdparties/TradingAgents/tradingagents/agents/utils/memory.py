@@ -148,32 +148,73 @@ class FinancialSituationMemory:
             ids=ids,
         )
 
-    def get_memories(self, current_situation, n_matches=1):
-        """Find matching recommendations using OpenAI embeddings"""
+    def get_memories(self, current_situation, n_matches=1, aggregate_chunks=True):
+        """Find matching recommendations using OpenAI embeddings
+        
+        Args:
+            current_situation (str): The current financial situation to match
+            n_matches (int): Number of matches to return per chunk (default: 1)
+            aggregate_chunks (bool): If True, averages chunk embeddings before querying.
+                                    If False, queries with each chunk separately and merges results.
+        
+        Returns:
+            list: List of matched results with similarity scores
+        """
         # Get embeddings (returns list)
         query_embeddings = self.get_embedding(current_situation)
         
-        # Average embeddings if multiple chunks
-        if len(query_embeddings) > 1:
-            query_embedding = np.mean(query_embeddings, axis=0).tolist()
+        if len(query_embeddings) > 1 and not aggregate_chunks:
+            # Query with each chunk separately and merge results
+            ta_logger.debug(f"Querying with {len(query_embeddings)} chunks separately")
+            all_matches = {}  # Use dict to deduplicate by ID
+            
+            for chunk_idx, query_embedding in enumerate(query_embeddings):
+                results = self.situation_collection.query(
+                    query_embeddings=[query_embedding],
+                    n_results=n_matches,
+                    include=["metadatas", "documents", "distances"],
+                )
+                
+                # Collect matches from this chunk
+                for i in range(len(results["documents"][0])):
+                    doc_id = results["ids"][0][i] if "ids" in results else str(i)
+                    similarity = 1 - results["distances"][0][i]
+                    
+                    # Keep best similarity score if document appears in multiple chunk queries
+                    if doc_id not in all_matches or all_matches[doc_id]["similarity_score"] < similarity:
+                        all_matches[doc_id] = {
+                            "matched_situation": results["documents"][0][i],
+                            "recommendation": results["metadatas"][0][i]["recommendation"],
+                            "similarity_score": similarity,
+                            "chunk_match": chunk_idx  # Track which chunk matched
+                        }
+            
+            # Sort by similarity and return top n_matches
+            matched_results = sorted(all_matches.values(), key=lambda x: x["similarity_score"], reverse=True)[:n_matches]
+            
         else:
-            query_embedding = query_embeddings[0]
+            # Average embeddings if multiple chunks (original behavior)
+            if len(query_embeddings) > 1:
+                ta_logger.debug(f"Averaging {len(query_embeddings)} chunk embeddings")
+                query_embedding = np.mean(query_embeddings, axis=0).tolist()
+            else:
+                query_embedding = query_embeddings[0]
 
-        results = self.situation_collection.query(
-            query_embeddings=[query_embedding],
-            n_results=n_matches,
-            include=["metadatas", "documents", "distances"],
-        )
-
-        matched_results = []
-        for i in range(len(results["documents"][0])):
-            matched_results.append(
-                {
-                    "matched_situation": results["documents"][0][i],
-                    "recommendation": results["metadatas"][0][i]["recommendation"],
-                    "similarity_score": 1 - results["distances"][0][i],
-                }
+            results = self.situation_collection.query(
+                query_embeddings=[query_embedding],
+                n_results=n_matches,
+                include=["metadatas", "documents", "distances"],
             )
+
+            matched_results = []
+            for i in range(len(results["documents"][0])):
+                matched_results.append(
+                    {
+                        "matched_situation": results["documents"][0][i],
+                        "recommendation": results["metadatas"][0][i]["recommendation"],
+                        "similarity_score": 1 - results["distances"][0][i],
+                    }
+                )
 
         return matched_results
 
@@ -212,13 +253,27 @@ if __name__ == "__main__":
     """
 
     try:
-        recommendations = matcher.get_memories(current_situation, n_matches=2)
+        # Option 1: Average chunk embeddings (default, faster)
+        print("\n=== Option 1: Averaged Embeddings ===")
+        recommendations = matcher.get_memories(current_situation, n_matches=2, aggregate_chunks=True)
 
         for i, rec in enumerate(recommendations, 1):
             print(f"\nMatch {i}:")
             print(f"Similarity Score: {rec['similarity_score']:.2f}")
             print(f"Matched Situation: {rec['matched_situation']}")
             print(f"Recommendation: {rec['recommendation']}")
+        
+        # Option 2: Query with each chunk separately and merge results (more accurate for long texts)
+        print("\n\n=== Option 2: Per-Chunk Querying (merged results) ===")
+        recommendations = matcher.get_memories(current_situation, n_matches=2, aggregate_chunks=False)
+
+        for i, rec in enumerate(recommendations, 1):
+            print(f"\nMatch {i}:")
+            print(f"Similarity Score: {rec['similarity_score']:.2f}")
+            print(f"Matched Situation: {rec['matched_situation']}")
+            print(f"Recommendation: {rec['recommendation']}")
+            if 'chunk_match' in rec:
+                print(f"Best Chunk Match: {rec['chunk_match']}")
 
     except Exception as e:
         print(f"Error during recommendation: {str(e)}")

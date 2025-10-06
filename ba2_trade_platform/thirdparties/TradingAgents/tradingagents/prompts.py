@@ -243,7 +243,7 @@ FINAL_SUMMARIZATION_AGENT_PROMPT = """You are the Final Summarization Agent for 
 {{
     "symbol": "TICKER",
     "recommended_action": "BUY|SELL|HOLD",
-    "expected_profit_percent": 0.0,
+    "expected_profit_percent": 0.0,  // REQUIRED: Estimate potential profit/loss percentage based on analysis. For BUY/SELL provide realistic estimate (e.g., 5-20%)
     "price_at_date": 0.0,
     "confidence": 0.0,  // Confidence level (0-100 scale)
     "details": "Detailed explanation (max 2000 chars)",
@@ -279,7 +279,11 @@ FINAL_SUMMARIZATION_AGENT_PROMPT = """You are the Final Summarization Agent for 
 - Use technical/fundamental/sentiment data to EXPLAIN why the final_trade_decision makes sense
 - Extract confidence levels from the decision-making process (0-100 scale, where 100 = completely certain)
 - Derive risk levels from the certainty and market conditions described
-- Use supporting analysis to set realistic profit expectations and stop/take profit levels
+- **ESTIMATE expected_profit_percent based on the final_trade_decision and analysis**:
+  - For BUY/SELL: Provide a realistic profit estimate based on technical targets, fundamental valuation gaps, or momentum analysis (typically 5-20%)
+  - For HOLD: Use 0.0
+  - Consider time_horizon: SHORT_TERM (5-10%), MEDIUM_TERM (10-15%), LONG_TERM (15-25%)
+  - Example: Bullish momentum + undervalued fundamentals + positive sentiment → estimate 12-18% profit potential
 
 **Risk Levels**: LOW (high certainty in final decision) | MEDIUM (moderate certainty) | HIGH (low certainty or volatile conditions)
 

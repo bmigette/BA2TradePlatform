@@ -117,6 +117,12 @@ class MarketAnalysis(SQLModel, table=True):
     # Relationships
     analysis_outputs: List["AnalysisOutput"] = Relationship(back_populates="market_analysis")
     expert_recommendations: List["ExpertRecommendation"] = Relationship(back_populates="market_analysis")
+    
+    def __init__(self, **data):
+        """Ensure state is always a dict, never None."""
+        super().__init__(**data)
+        if self.state is None:
+            self.state = {}
 
 
 class AnalysisOutput(SQLModel, table=True):

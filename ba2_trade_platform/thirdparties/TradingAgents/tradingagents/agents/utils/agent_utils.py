@@ -181,10 +181,14 @@ class Toolkit:
         curr_date: Annotated[
             str, "The current trading date you are trading on, YYYY-mm-dd"
         ],
-        look_back_days: Annotated[int, "how many days to look back"] = None,
+        look_back_days: Annotated[
+            int,
+            "Number of days to look back for indicator data. If not provided, defaults to market_history_days from config (typically 90 days). You can specify a custom value to analyze different time periods. The function efficiently fetches the entire date range at once."
+        ] = None,
     ) -> str:
         """
-        Retrieve stock stats indicators for a given ticker symbol and indicator.
+        Retrieve stock stats indicators for a given ticker symbol and indicator over a date range.
+        Efficiently fetches data for the entire lookback period in a single request.
         Uses the timeframe setting from expert configuration.
         Args:
             symbol (str): Ticker symbol of the company, e.g. AAPL, TSM
@@ -218,10 +222,14 @@ class Toolkit:
         curr_date: Annotated[
             str, "The current trading date you are trading on, YYYY-mm-dd"
         ],
-        look_back_days: Annotated[int, "how many days to look back"] = None,
+        look_back_days: Annotated[
+            int,
+            "Number of days to look back for indicator data. If not provided, defaults to market_history_days from config (typically 90 days). You can specify a custom value to analyze different time periods. The function efficiently fetches the entire date range at once."
+        ] = None,
     ) -> str:
         """
-        Retrieve stock stats indicators for a given ticker symbol and indicator.
+        Retrieve stock stats indicators for a given ticker symbol and indicator over a date range.
+        Efficiently fetches data for the entire lookback period in a single request.
         Uses the timeframe setting from expert configuration.
         Args:
             symbol (str): Ticker symbol of the company, e.g. AAPL, TSM
@@ -410,17 +418,22 @@ class Toolkit:
     def get_stock_news_openai(
         ticker: Annotated[str, "the company's ticker"],
         curr_date: Annotated[str, "Current date in yyyy-mm-dd format"],
+        lookback_days: Annotated[
+            int,
+            "Number of days to look back for news and social sentiment. If not provided, defaults to social_sentiment_days from config (typically 3 days). You can specify a custom value to get more or less historical sentiment data."
+        ] = None,
     ):
         """
         Retrieve the latest news about a given stock by using OpenAI's news API.
         Args:
             ticker (str): Ticker of a company. e.g. AAPL, TSM
             curr_date (str): Current date in yyyy-mm-dd format
+            lookback_days (int, optional): Number of days to look back. If not provided, defaults to social_sentiment_days from config (typically 3 days).
         Returns:
             str: A formatted string containing the latest news about the company on the given date.
         """
 
-        openai_news_results = interface.get_stock_news_openai(ticker, curr_date)
+        openai_news_results = interface.get_stock_news_openai(ticker, curr_date, lookback_days)
 
         return openai_news_results
 
@@ -428,16 +441,21 @@ class Toolkit:
     @tool
     def get_global_news_openai(
         curr_date: Annotated[str, "Current date in yyyy-mm-dd format"],
+        lookback_days: Annotated[
+            int,
+            "Number of days to look back for global news and sentiment. If not provided, defaults to social_sentiment_days from config (typically 3 days). You can specify a custom value to get more or less historical news data."
+        ] = None,
     ):
         """
         Retrieve the latest macroeconomics news on a given date using OpenAI's macroeconomics news API.
         Args:
             curr_date (str): Current date in yyyy-mm-dd format
+            lookback_days (int, optional): Number of days to look back. If not provided, defaults to social_sentiment_days from config (typically 3 days).
         Returns:
             str: A formatted string containing the latest macroeconomic news on the given date.
         """
 
-        openai_news_results = interface.get_global_news_openai(curr_date)
+        openai_news_results = interface.get_global_news_openai(curr_date, lookback_days)
 
         return openai_news_results
 
@@ -446,6 +464,10 @@ class Toolkit:
     def get_fundamentals_openai(
         ticker: Annotated[str, "the company's ticker"],
         curr_date: Annotated[str, "Current date in yyyy-mm-dd format"],
+        lookback_days: Annotated[
+            int,
+            "Number of days to look back for fundamental data. If not provided, defaults to economic_data_days from config (typically 90 days). You can specify a custom value to analyze shorter or longer periods."
+        ] = None,
     ):
         """
         Retrieve the latest fundamental information about a given stock on a given date by using OpenAI's news API.
@@ -454,14 +476,10 @@ class Toolkit:
         Args:
             ticker (str): Ticker of a company. e.g. AAPL, TSM
             curr_date (str): Current date in yyyy-mm-dd format
+            lookback_days (int, optional): Number of days to look back. If not provided, defaults to economic_data_days from config (typically 90 days).
         Returns:
             str: A formatted markdown table containing fundamental metrics for the company.
         """
-        from ...dataflows.config import get_config
-        
-        config = get_config()
-        lookback_days = config.get("economic_data_days", 90)
-        
         openai_fundamentals_results = interface.get_fundamentals_openai(
             ticker, curr_date, lookback_days
         )

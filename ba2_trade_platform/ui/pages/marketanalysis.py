@@ -533,14 +533,15 @@ class JobMonitoringTab:
                 
                 logger.info(f"Cleared {len(outputs)} outputs and {len(recommendations)} recommendations for analysis {analysis_id}")
             
-            # Re-queue the analysis
+            # Re-queue the analysis with the existing market_analysis_id
             try:
                 worker_queue = self._get_worker_queue()
                 task_id = worker_queue.submit_analysis_task(
                     expert_instance_id=analysis.expert_instance_id,
                     symbol=analysis.symbol,
                     subtype=analysis.subtype,
-                    priority=0  # Normal priority for re-runs
+                    priority=0,  # Normal priority for re-runs
+                    market_analysis_id=analysis_id  # Reuse the same MarketAnalysis record
                 )
                 
                 ui.notify(f"Analysis {analysis_id} queued for re-run (Task: {task_id})", type='positive')

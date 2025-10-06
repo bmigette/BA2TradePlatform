@@ -26,7 +26,7 @@ class FinnHubRating(MarketExpertInterface):
     def __init__(self, id: int):
         """Initialize FinnHubRating expert with database instance."""
         super().__init__(id)
-        logger.debug(f'Initializing FinnHubRating expert with instance ID: {id}')
+        #logger.debug(f'Initializing FinnHubRating expert with instance ID: {id}')
         
         self._load_expert_instance(id)
         self._api_key = self._get_finnhub_api_key()
@@ -36,7 +36,7 @@ class FinnHubRating(MarketExpertInterface):
         self.instance = get_instance(ExpertInstance, id)
         if not self.instance:
             raise ValueError(f"ExpertInstance with ID {id} not found")
-        logger.debug(f'FinnHubRating expert loaded: {self.instance.expert}')
+        #logger.debug(f'FinnHubRating expert loaded: {self.instance.expert}')
     
     def _get_finnhub_api_key(self) -> Optional[str]:
         """Get Finnhub API key from app settings."""

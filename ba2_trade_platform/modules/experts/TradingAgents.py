@@ -414,6 +414,9 @@ Analysis completed at: {self._get_current_timestamp()}"""
             
             # Mark analysis as completed
             market_analysis.status = MarketAnalysisStatus.COMPLETED
+            # Ensure state is initialized (protect against None from database)
+            if market_analysis.state is None:
+                market_analysis.state = {}
             market_analysis.state['trading_agent_graph'] = self._clean_state_for_json_storage(final_state)
             # Explicitly mark the state field as modified for SQLAlchemy
             from sqlalchemy.orm import attributes

@@ -316,7 +316,9 @@ class OverviewTab:
             dialog.close()
             
             # Refresh the page to show updated data
-            ui.navigate.reload()
+            async def reload_page():
+                await ui.navigate.reload()
+            ui.timer(0.1, reload_page, once=True)
         
         except Exception as e:
             logger.error(f"Error applying quantity changes: {e}", exc_info=True)
@@ -1614,9 +1616,13 @@ class TransactionsTab:
                 current_pnl = ''
                 current_price_str = ''
                 
-                if txn.status == TransactionStatus.OPENED and txn.order_id:
+                if txn.status == TransactionStatus.OPENED and txn.id:
                     try:
-                        order = get_instance(TradingOrder, txn.order_id)
+                        # Query for the first (opening) order from the transaction
+                        order_statement = select(TradingOrder).where(
+                            TradingOrder.transaction_id == txn.id
+                        ).order_by(TradingOrder.created_at).limit(1)
+                        order = session.exec(order_statement).first()
                         if order and order.account_id:
                             from ...modules.accounts import get_account_class
                             from ...core.models import AccountDefinition
@@ -1928,14 +1934,15 @@ class TransactionsTab:
                 ui.notify('Transaction not found', type='negative')
                 return
             
-            # Get the order associated with this transaction
-            if not txn.order_id:
-                ui.notify('No order linked to this transaction', type='negative')
-                return
+            # Query for the first (opening) order associated with this transaction
+            session = get_db()
+            order_statement = select(TradingOrder).where(
+                TradingOrder.transaction_id == transaction_id
+            ).order_by(TradingOrder.created_at).limit(1)
+            order = session.exec(order_statement).first()
             
-            order = get_instance(TradingOrder, txn.order_id)
             if not order or not order.account_id:
-                ui.notify('Order or account not found', type='negative')
+                ui.notify('No orders linked to this transaction or order account not found', type='negative')
                 return
             
             # Get account to use set_order_tp/set_order_sl methods
@@ -2013,13 +2020,19 @@ class TransactionsTab:
         
         try:
             txn = get_instance(Transaction, transaction_id)
-            if not txn or not txn.order_id:
-                ui.notify('Transaction or order not found', type='negative')
+            if not txn:
+                ui.notify('Transaction not found', type='negative')
                 return
             
-            order = get_instance(TradingOrder, txn.order_id)
+            # Query for the first (opening) order from the transaction
+            session = get_db()
+            order_statement = select(TradingOrder).where(
+                TradingOrder.transaction_id == transaction_id
+            ).order_by(TradingOrder.created_at).limit(1)
+            order = session.exec(order_statement).first()
+            
             if not order or not order.account_id:
-                ui.notify('Order or account not found', type='negative')
+                ui.notify('Order not found or account not found', type='negative')
                 return
             
             # Get account

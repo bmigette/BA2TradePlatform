@@ -27,7 +27,7 @@ class ExpertRecommendation(BaseModel):
     """Structured expert recommendation output"""
     symbol: str = Field(description="Stock ticker symbol")
     recommended_action: str = Field(description="BUY|SELL|HOLD")
-    expected_profit_percent: float = Field(description="Expected profit/loss percentage")
+    expected_profit_percent: float = Field(description="Expected profit/loss percentage. Calculate as: For BUY: ((take_profit - price_at_date) / price_at_date) * 100. For SELL: ((price_at_date - stop_loss) / price_at_date) * 100. For HOLD: 0.0")
     price_at_date: float = Field(description="Current stock price at analysis")
     confidence: float = Field(description="Confidence level (0-100)")
     details: str = Field(description="Detailed explanation of recommendation", max_length=2000)
@@ -229,8 +229,8 @@ def _create_fallback_recommendation(state: Dict[str, Any], symbol: str, current_
         "risk_level": "MEDIUM",
         "time_horizon": "MEDIUM_TERM",
         "key_factors": ["Analysis error occurred"],
-        "stop_loss": current_price * 0.95 if current_price > 0 else 0.0,
-        "take_profit": current_price * 1.05 if current_price > 0 else 0.0,
+        "stop_loss": 0.0,
+        "take_profit": 0.0,
         "analysis_summary": {
             "market_trend": "NEUTRAL",
             "fundamental_strength": "MODERATE",

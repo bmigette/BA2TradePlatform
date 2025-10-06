@@ -66,15 +66,15 @@ class StockstatsUtils:
             config = get_config()
             lookback_days = config.get("market_history_days", 90)
             
-            # Add 1 year buffer for technical indicator calculation (need history for moving averages, etc.)
-            total_lookback_days = lookback_days + 365
+            # Add buffer for technical indicator calculation (need history for moving averages, etc.)
+            # Most technical indicators need 200-day history for calculations
+            # Yahoo Finance limit: 730 days total for all intervals
+            buffer_days = 365  # 1 year buffer for indicator calculation
+            total_lookback_days = min(lookback_days + buffer_days, 730)
             
-            # Yahoo Finance intraday data limit: 730 days for intervals < 1d
-            # Check if interval is intraday and limit accordingly
-            if interval in ['1m', '5m', '15m', '30m', '1h'] and total_lookback_days > 730:
-                total_lookback_days = 730
+            if total_lookback_days >= 730:
                 from .. import logger as ta_logger
-                ta_logger.warning(f"Limiting lookback to 730 days for {interval} interval (Yahoo Finance limit)")
+                ta_logger.debug(f"Limiting total lookback to 730 days for {symbol} (Yahoo Finance limit)")
             
             # Get data via data provider (uses smart cache)
             data = provider.get_dataframe(
@@ -132,21 +132,27 @@ class StockstatsUtils:
             start_dt = datetime.strptime(start_date, "%Y-%m-%d")
             end_dt = datetime.strptime(end_date, "%Y-%m-%d")
             
-            # Get config for lookback period
-            config = get_config()
-            lookback_days = config.get("market_history_days", 90)
+            # Calculate requested range in days
+            requested_days = (end_dt - start_dt).days
             
-            # Add 1 year buffer for technical indicator calculation
-            total_lookback_days = lookback_days + 365
+            # Add buffer for technical indicator calculation (need history for moving averages, etc.)
+            # Most technical indicators need 200-day history for calculations
+            # Yahoo Finance limit: 730 days total for all intervals
+            buffer_days = 365  # 1 year buffer for indicator calculation
+            total_lookback_days = min(requested_days + buffer_days, 730)
             
-            # Yahoo Finance intraday data limit: 730 days for intervals < 1d
-            if interval in ['1m', '5m', '15m', '30m', '1h'] and total_lookback_days > 730:
-                total_lookback_days = 730
+            if total_lookback_days >= 730:
                 from .. import logger as ta_logger
-                ta_logger.warning(f"Limiting lookback to 730 days for {interval} interval (Yahoo Finance limit)")
+                ta_logger.debug(f"Limiting total lookback to 730 days for {symbol} (Yahoo Finance limit)")
             
             # Fetch more history for indicator calculation
-            fetch_start = start_dt - timedelta(days=total_lookback_days)
+            fetch_start = start_dt - timedelta(days=buffer_days)
+            # But ensure we don't exceed 730 days total
+            max_start = end_dt - timedelta(days=730)
+            if fetch_start < max_start:
+                fetch_start = max_start
+                from .. import logger as ta_logger
+                ta_logger.debug(f"Adjusted fetch_start to {fetch_start} to stay within 730-day limit")
             
             data = provider.get_dataframe(
                 symbol=symbol,

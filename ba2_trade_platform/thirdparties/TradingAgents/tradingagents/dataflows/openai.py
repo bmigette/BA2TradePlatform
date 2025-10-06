@@ -72,9 +72,20 @@ def get_global_news_openai(curr_date, look_back_days=7, limit=5):
     return response.output[1].content[0].text
 
 
-def get_fundamentals_openai(ticker, curr_date):
+def get_fundamentals_openai(ticker, curr_date, lookback_days=None):
     config = get_config()
+    
+    # Use provided lookback_days or default from config
+    if lookback_days is None:
+        lookback_days = config.get("economic_data_days", 90)
+    
     client = OpenAI(base_url=config["backend_url"])
+
+    # Calculate start date based on lookback_days
+    from datetime import datetime, timedelta
+    curr_date_dt = datetime.strptime(curr_date, "%Y-%m-%d")
+    start_date_dt = curr_date_dt - timedelta(days=lookback_days)
+    start_date = start_date_dt.strftime("%Y-%m-%d")
 
     response = client.responses.create(
         model=config["quick_think_llm"],
@@ -84,7 +95,7 @@ def get_fundamentals_openai(ticker, curr_date):
                 "content": [
                     {
                         "type": "input_text",
-                        "text": f"Can you search Fundamental for discussions on {ticker} during of the month before {curr_date} to the month of {curr_date}. Make sure you only get the data posted during that period. List as a table, with PE/PS/Cash flow/ etc",
+                        "text": f"Can you search Fundamental for discussions on {ticker} from {start_date} to {curr_date}. Make sure you only get the data posted during that period. List as a table, with PE/PS/Cash flow/ etc",
                     }
                 ],
             }

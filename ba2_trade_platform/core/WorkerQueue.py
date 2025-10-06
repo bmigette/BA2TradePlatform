@@ -9,7 +9,7 @@ through the AppSettings system.
 import threading
 import queue
 import time
-from typing import Callable, Any, Optional, Dict
+from typing import Callable, Any, Optional, Dict, Set
 from dataclasses import dataclass
 from enum import Enum
 from ..logger import logger
@@ -66,6 +66,8 @@ class WorkerQueue:
         self._tasks: Dict[str, AnalysisTask] = {}
         self._task_keys: Dict[str, str] = {}  # Maps task_key to task_id for duplicate checking
         self._queue_counter = 0  # Counter for tiebreaking in priority queue
+        self._risk_manager_lock = threading.Lock()  # Lock for risk manager processing per expert
+        self._processing_experts: Set[int] = set()  # Track which experts are currently being processed
         
         logger.info("WorkerQueue system initialized")
         
@@ -138,7 +140,8 @@ class WorkerQueue:
                            subtype: str = AnalysisUseCase.ENTER_MARKET, 
                            priority: int = 0, task_id: Optional[str] = None,
                            bypass_balance_check: bool = False,
-                           bypass_transaction_check: bool = False) -> str:
+                           bypass_transaction_check: bool = False,
+                           market_analysis_id: Optional[int] = None) -> str:
         """
         Submit an analysis task to be processed by the worker queue.
         
@@ -150,6 +153,7 @@ class WorkerQueue:
             task_id: Optional custom task ID
             bypass_balance_check: If True, skip balance verification for this task
             bypass_transaction_check: If True, skip existing transaction checks for this task
+            market_analysis_id: Optional existing MarketAnalysis ID to reuse (for retries)
             
         Returns:
             Task ID that can be used to track the task
@@ -183,7 +187,8 @@ class WorkerQueue:
                 subtype=subtype,
                 priority=priority,
                 bypass_balance_check=bypass_balance_check,
-                bypass_transaction_check=bypass_transaction_check
+                bypass_transaction_check=bypass_transaction_check,
+                market_analysis_id=market_analysis_id
             )
             
             self._tasks[task_id] = task
@@ -480,18 +485,34 @@ class WorkerQueue:
                     logger.debug(f"Analysis task '{task.id}' skipped due to insufficient balance in {execution_time:.2f}s")
                     return
 
-            # Create MarketAnalysis record with subtype
-            market_analysis = MarketAnalysis(
-                symbol=task.symbol,
-                expert_instance_id=task.expert_instance_id,
-                status=MarketAnalysisStatus.PENDING,
-                subtype=AnalysisUseCase(task.subtype)
-            )
-            market_analysis_id = add_instance(market_analysis)
-            task.market_analysis_id = market_analysis_id
-            
-            # Reload the market analysis object to get the ID
-            market_analysis = get_instance(MarketAnalysis, market_analysis_id)
+            # Create or reuse MarketAnalysis record
+            if task.market_analysis_id:
+                # Reusing existing MarketAnalysis for retry
+                market_analysis_id = task.market_analysis_id
+                market_analysis = get_instance(MarketAnalysis, market_analysis_id)
+                if not market_analysis:
+                    raise ValueError(f"MarketAnalysis {market_analysis_id} not found for retry")
+                # Ensure state is initialized (protect against NULL in database)
+                if market_analysis.state is None:
+                    market_analysis.state = {}
+                # Update status to PENDING for retry
+                market_analysis.status = MarketAnalysisStatus.PENDING
+                from .db import update_instance
+                update_instance(market_analysis)
+                logger.info(f"Reusing MarketAnalysis {market_analysis_id} for retry of {task.symbol}")
+            else:
+                # Create new MarketAnalysis record with subtype
+                market_analysis = MarketAnalysis(
+                    symbol=task.symbol,
+                    expert_instance_id=task.expert_instance_id,
+                    status=MarketAnalysisStatus.PENDING,
+                    subtype=AnalysisUseCase(task.subtype)
+                )
+                market_analysis_id = add_instance(market_analysis)
+                task.market_analysis_id = market_analysis_id
+                
+                # Reload the market analysis object to get the ID
+                market_analysis = get_instance(MarketAnalysis, market_analysis_id)
             
             # Run the analysis - this updates the market_analysis object
             expert.run_analysis(task.symbol, market_analysis)
@@ -537,30 +558,46 @@ class WorkerQueue:
             expert_instance_id: The expert instance ID to check
         """
         try:
-            # Check if there are still pending ENTER_MARKET tasks for this expert
-            has_pending = False
-            with self._task_lock:
-                for task in self._tasks.values():
-                    if (task.expert_instance_id == expert_instance_id and
-                        task.subtype == AnalysisUseCase.ENTER_MARKET and
-                        task.status in [WorkerTaskStatus.PENDING, WorkerTaskStatus.RUNNING]):
-                        has_pending = True
-                        break
-            
-            if not has_pending:
-                logger.info(f"All ENTER_MARKET analysis tasks completed for expert {expert_instance_id}, triggering automated order processing")
+            # Check if there are any pending ENTER_MARKET tasks for this expert
+            # If not, trigger automated order processing
+            # Use lock to prevent race condition when multiple jobs complete simultaneously
+            with self._risk_manager_lock:
+                # Check if this expert is already being processed by another thread
+                if expert_instance_id in self._processing_experts:
+                    logger.debug(f"Expert {expert_instance_id} is already being processed for risk management, skipping")
+                    return
                 
-                # Import TradeManager and process recommendations
-                from .TradeManager import get_trade_manager
-                trade_manager = get_trade_manager()
-                created_orders = trade_manager.process_expert_recommendations_after_analysis(expert_instance_id)
+                # Check for pending tasks
+                has_pending = False
+                with self._task_lock:
+                    for task in self._tasks.values():
+                        if (task.expert_instance_id == expert_instance_id and
+                            task.subtype == AnalysisUseCase.ENTER_MARKET and
+                            task.status in [WorkerTaskStatus.PENDING, WorkerTaskStatus.RUNNING]):
+                            has_pending = True
+                            break
                 
-                if created_orders:
-                    logger.info(f"Automated order processing created {len(created_orders)} orders for expert {expert_instance_id}")
+                if not has_pending:
+                    # Mark this expert as being processed
+                    self._processing_experts.add(expert_instance_id)
+                    
+                    try:
+                        logger.info(f"All ENTER_MARKET analysis tasks completed for expert {expert_instance_id}, triggering automated order processing")
+                        
+                        # Import TradeManager and process recommendations
+                        from .TradeManager import get_trade_manager
+                        trade_manager = get_trade_manager()
+                        created_orders = trade_manager.process_expert_recommendations_after_analysis(expert_instance_id)
+                        
+                        if created_orders:
+                            logger.info(f"Automated order processing created {len(created_orders)} orders for expert {expert_instance_id}")
+                        else:
+                            logger.debug(f"No orders created by automated processing for expert {expert_instance_id}")
+                    finally:
+                        # Always remove from processing set, even if an error occurred
+                        self._processing_experts.discard(expert_instance_id)
                 else:
-                    logger.debug(f"No orders created by automated processing for expert {expert_instance_id}")
-            else:
-                logger.debug(f"Still has pending ENTER_MARKET tasks for expert {expert_instance_id}, skipping automated order processing")
+                    logger.debug(f"Still has pending ENTER_MARKET tasks for expert {expert_instance_id}, skipping automated order processing")
                 
         except Exception as e:
             logger.error(f"Error checking and processing expert recommendations for expert {expert_instance_id}: {e}", exc_info=True)

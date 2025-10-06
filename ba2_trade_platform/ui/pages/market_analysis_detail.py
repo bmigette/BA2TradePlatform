@@ -176,7 +176,9 @@ def _render_pending_state(market_analysis: MarketAnalysis) -> None:
         ui.label('Please check back in a few minutes.').classes('text-grey-7')
         
         # Auto-refresh for pending analyses
-        ui.timer(10.0, lambda: ui.navigate.reload())
+        async def reload_page():
+            await ui.navigate.reload()
+        ui.timer(10.0, reload_page)
 
 
 def _render_cancelled_state(market_analysis: MarketAnalysis) -> None:
