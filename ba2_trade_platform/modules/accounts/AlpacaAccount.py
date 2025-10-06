@@ -666,37 +666,77 @@ class AlpacaAccount(AccountInterface):
             TradingOrder: The created WAITING_TRIGGER take profit order
         """
         try:
-            from ...core.db import add_instance, get_instance
+            from ...core.db import add_instance, get_instance, get_db
             from ...core.types import OrderStatus
+            from sqlmodel import Session
             
             # Round take profit price to 4 decimal places
             tp_price = self._round_price(tp_price, trading_order.symbol)
             
-            # Check if there's already a take profit order for this transaction
-            existing_tp_order = self._find_existing_tp_order(trading_order.transaction_id)
-            
-            if existing_tp_order:
-                # Update existing take profit order price
-                logger.info(f"Updating existing TP order {existing_tp_order.id} to price ${tp_price}")
-                existing_tp_order.limit_price = tp_price
-                from ...core.db import update_instance
-                update_instance(existing_tp_order)
-                logger.info(f"Successfully updated TP order to ${tp_price}")
-                return existing_tp_order
-            
-            # Create new WAITING_TRIGGER take profit order
-            tp_order = self._create_tp_order_object(trading_order, tp_price)
-            
-            # Save to database - it will be submitted when parent order is FILLED
-            tp_order_id = add_instance(tp_order)
-            tp_order.id = tp_order_id
-            
-            logger.info(f"Created WAITING_TRIGGER TP order {tp_order_id} at ${tp_price} (will submit when order {trading_order.id} is FILLED)")
-            return tp_order
+            # Use a session context to ensure all database operations are in the same session
+            with Session(get_db().bind) as session:
+                # Ensure trading_order is attached to this session
+                trading_order = self._ensure_order_in_session(trading_order, session)
+                
+                # Check if there's already a take profit order for this transaction
+                existing_tp_order = self._find_existing_tp_order(trading_order.transaction_id)
+                
+                if existing_tp_order:
+                    # Ensure existing TP order is attached to the session
+                    existing_tp_order = self._ensure_order_in_session(existing_tp_order, session)
+                    
+                    # Update existing take profit order price
+                    logger.info(f"Updating existing TP order {existing_tp_order.id} to price ${tp_price}")
+                    existing_tp_order.limit_price = tp_price
+                    session.add(existing_tp_order)
+                    session.commit()
+                    session.refresh(existing_tp_order)
+                    logger.info(f"Successfully updated TP order to ${tp_price}")
+                    return existing_tp_order
+                
+                # Create new WAITING_TRIGGER take profit order
+                tp_order = self._create_tp_order_object(trading_order, tp_price)
+                
+                # Add to session and flush to get the ID
+                session.add(tp_order)
+                session.commit()
+                session.refresh(tp_order)
+                
+                logger.info(f"Created WAITING_TRIGGER TP order {tp_order.id} at ${tp_price} (will submit when order {trading_order.id} is FILLED)")
+                return tp_order
                 
         except Exception as e:
             logger.error(f"Error setting take profit for order {trading_order.id}: {e}", exc_info=True)
             raise
+    
+    def _ensure_order_in_session(self, order: TradingOrder, session: Session) -> TradingOrder:
+        """
+        Ensure a TradingOrder instance is attached to the given session.
+        If the order is detached, fetch it from the database.
+        
+        Args:
+            order: The TradingOrder instance (may be detached)
+            session: The active SQLModel session
+            
+        Returns:
+            TradingOrder: The order instance attached to the session
+        """
+        from sqlalchemy.orm import object_session
+        
+        # Check if order is already in this session
+        order_session = object_session(order)
+        if order_session is session:
+            return order
+        
+        # Order is detached or in a different session - fetch from database
+        if order.id:
+            attached_order = session.get(TradingOrder, order.id)
+            if attached_order:
+                return attached_order
+        
+        # If we can't get it from database, return the original (will likely fail, but let it)
+        logger.warning(f"Could not attach order {order.id if order.id else 'unknown'} to session, using detached instance")
+        return order
     
     def _find_existing_tp_order(self, transaction_id: int) -> Optional[TradingOrder]:
         """

@@ -1782,7 +1782,9 @@ class TransactionsTab:
                                 'status_color': self._get_order_status_color(order.status),
                                 'broker_order_id': order.broker_order_id or '',
                                 'created_at': order.created_at.strftime('%Y-%m-%d %H:%M') if order.created_at else '',
-                                'comment': order.comment or ''
+                                'comment': order.comment or '',
+                                'expert_recommendation_id': order.expert_recommendation_id,
+                                'has_recommendation': order.expert_recommendation_id is not None
                             })
                     except Exception as e:
                         logger.error(f"Error loading orders for transaction {txn.id}: {e}")
@@ -1803,6 +1805,7 @@ class TransactionsTab:
                     'status_color': status_color,
                     'created_at': txn.created_at.strftime('%Y-%m-%d %H:%M') if txn.created_at else '',
                     'is_open': txn.status == TransactionStatus.OPENED,
+                    'is_waiting': txn.status == TransactionStatus.WAITING,  # Track WAITING status
                     'is_closing': txn.status == TransactionStatus.CLOSING,  # Track CLOSING status
                     'orders': orders_data,  # Add orders for expansion
                     'order_count': len(orders_data)  # Show order count
@@ -1891,14 +1894,14 @@ class TransactionsTab:
                                    @click="$parent.$emit('edit_transaction', props.row.id)"
                                    title="Adjust TP/SL"
                             />
-                            <q-btn v-if="props.row.is_open && !props.row.is_closing" 
+                            <q-btn v-if="(props.row.is_open || props.row.is_waiting) && !props.row.is_closing" 
                                    icon="close" 
                                    size="sm" 
                                    flat 
                                    round 
                                    color="negative"
                                    @click="$parent.$emit('close_transaction', props.row.id)"
-                                   title="Close Position"
+                                   :title="props.row.is_waiting ? 'Cancel Orders' : 'Close Position'"
                             />
                             <q-btn v-else-if="props.row.is_closing"
                                    icon="hourglass_empty"
@@ -1935,6 +1938,7 @@ class TransactionsTab:
                                         <th class="text-left">Broker ID</th>
                                         <th class="text-left">Created</th>
                                         <th class="text-left">Comment</th>
+                                        <th class="text-center">Actions</th>
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -1958,6 +1962,18 @@ class TransactionsTab:
                                         <td class="text-left text-caption">{{ order.broker_order_id }}</td>
                                         <td class="text-left">{{ order.created_at }}</td>
                                         <td class="text-left text-caption">{{ order.comment }}</td>
+                                        <td class="text-center">
+                                            <q-btn v-if="order.has_recommendation" 
+                                                   icon="info" 
+                                                   size="sm" 
+                                                   flat 
+                                                   round 
+                                                   color="primary"
+                                                   @click="$parent.$emit('view_recommendation', order.expert_recommendation_id)"
+                                                   title="View Expert Recommendation"
+                                            />
+                                            <span v-else class="text-grey-5">—</span>
+                                        </td>
                                     </tr>
                                 </tbody>
                             </q-markup-table>
@@ -1971,6 +1987,7 @@ class TransactionsTab:
             logger.debug("[RENDER] _render_transactions_table() - Setting up event handlers")
             table.on('edit_transaction', self._show_edit_dialog)
             table.on('close_transaction', self._show_close_dialog)
+            table.on('view_recommendation', self._show_recommendation_dialog)
             logger.debug("[RENDER] _render_transactions_table() - END (success)")
             
         except Exception as e:
@@ -2251,6 +2268,112 @@ class TransactionsTab:
         except Exception as e:
             ui.notify(f'Error: {str(e)}', type='negative')
             logger.error(f"Error closing position: {e}", exc_info=True)
+    
+    def _show_recommendation_dialog(self, event_data):
+        """Show expert recommendation details in a dialog."""
+        from ...core.models import ExpertRecommendation, ExpertInstance
+        
+        # Extract recommendation_id from event_data
+        recommendation_id = event_data.args if hasattr(event_data, 'args') else event_data
+        
+        if not recommendation_id:
+            ui.notify('No recommendation ID provided', type='warning')
+            return
+        
+        # Get the recommendation
+        rec = get_instance(ExpertRecommendation, recommendation_id)
+        if not rec:
+            ui.notify('Recommendation not found', type='negative')
+            return
+        
+        # Get expert instance
+        expert = get_instance(ExpertInstance, rec.instance_id) if rec.instance_id else None
+        expert_name = f"{expert.expert} (ID: {expert.id})" if expert else "Unknown Expert"
+        
+        with ui.dialog() as dialog, ui.card().classes('w-full max-w-2xl'):
+            ui.label('📊 Expert Recommendation Details').classes('text-h6 mb-4')
+            
+            # Expert and symbol info
+            with ui.row().classes('w-full mb-4'):
+                with ui.card().classes('flex-1'):
+                    ui.label('Expert').classes('text-caption text-grey-7')
+                    ui.label(expert_name).classes('text-body1 font-bold')
+                with ui.card().classes('flex-1'):
+                    ui.label('Symbol').classes('text-caption text-grey-7')
+                    ui.label(rec.symbol).classes('text-body1 font-bold')
+            
+            # Recommendation details
+            with ui.grid(columns=2).classes('w-full gap-4 mb-4'):
+                # Order recommendation
+                with ui.card():
+                    ui.label('Recommendation').classes('text-caption text-grey-7')
+                    rec_color = 'green' if rec.recommended_action.value == 'BUY' else 'red' if rec.recommended_action.value == 'SELL' else 'grey'
+                    ui.badge(rec.recommended_action.value, color=rec_color).classes('text-body1')
+                
+                # Confidence
+                with ui.card():
+                    ui.label('Confidence').classes('text-caption text-grey-7')
+                    confidence_pct = rec.confidence if rec.confidence else 0.0
+                    ui.label(f'{confidence_pct:.1f}%').classes('text-body1 font-bold')
+                
+                # Expected profit
+                with ui.card():
+                    ui.label('Expected Profit').classes('text-caption text-grey-7')
+                    profit_str = f'{rec.expected_profit_percent:+.2f}%' if rec.expected_profit_percent else 'N/A'
+                    ui.label(profit_str).classes('text-body1 font-bold')
+                
+                # Price at date
+                with ui.card():
+                    ui.label('Price at Recommendation').classes('text-caption text-grey-7')
+                    price_str = f'${rec.price_at_date:.2f}' if rec.price_at_date else 'N/A'
+                    ui.label(price_str).classes('text-body1')
+                
+                # Time horizon
+                if rec.time_horizon:
+                    with ui.card():
+                        ui.label('Time Horizon').classes('text-caption text-grey-7')
+                        ui.label(rec.time_horizon.value).classes('text-body1')
+                
+                # Risk level
+                if rec.risk_level:
+                    with ui.card():
+                        ui.label('Risk Level').classes('text-caption text-grey-7')
+                        risk_color = 'red' if 'HIGH' in rec.risk_level.value else 'orange' if 'MEDIUM' in rec.risk_level.value else 'green'
+                        ui.badge(rec.risk_level.value, color=risk_color).classes('text-body1')
+            
+            # Analysis/Reasoning
+            if rec.details:
+                with ui.card().classes('w-full mb-4'):
+                    ui.label('Analysis').classes('text-caption text-grey-7 mb-2')
+                    ui.label(rec.details).classes('text-body2 whitespace-pre-wrap')
+            
+            # Metadata
+            with ui.expansion('Metadata', icon='info').classes('w-full'):
+                with ui.grid(columns=2).classes('gap-2'):
+                    ui.label('Recommendation ID:').classes('text-caption font-bold')
+                    ui.label(str(rec.id)).classes('text-caption')
+                    
+                    ui.label('Created:').classes('text-caption font-bold')
+                    created_str = rec.created_at.strftime('%Y-%m-%d %H:%M:%S') if rec.created_at else 'N/A'
+                    ui.label(created_str).classes('text-caption')
+                    
+                    ui.label('Market Analysis ID:').classes('text-caption font-bold')
+                    ui.label(str(rec.market_analysis_id) if rec.market_analysis_id else 'N/A').classes('text-caption')
+            
+            # Action buttons
+            with ui.row().classes('w-full justify-between mt-4'):
+                # Navigate to analysis button (only show if market_analysis_id exists)
+                if rec.market_analysis_id:
+                    ui.button('View Market Analysis', 
+                             on_click=lambda: ui.navigate.to(f'/market_analysis/{rec.market_analysis_id}'),
+                             icon='analytics').props('color=secondary')
+                else:
+                    ui.space()  # Empty space if no analysis link
+                
+                # Close button
+                ui.button('Close', on_click=dialog.close).props('flat color=primary')
+        
+        dialog.open()
 
 class PerformanceTab:
     def __init__(self):

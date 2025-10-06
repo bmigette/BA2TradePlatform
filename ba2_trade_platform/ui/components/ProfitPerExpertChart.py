@@ -103,7 +103,7 @@ class ProfitPerExpertChart:
             chart_data = []
             for profit in profit_values:
                 chart_data.append({
-                    'value': profit,
+                    'value': round(profit, 2),
                     'itemStyle': {
                         'color': 'green' if profit >= 0 else 'red'
                     }
@@ -180,7 +180,7 @@ class ProfitPerExpertChart:
                 chart_data = []
                 for profit in profit_values:
                     chart_data.append({
-                        'value': profit,
+                        'value': round(profit, 2),
                         'itemStyle': {
                             'color': 'green' if profit >= 0 else 'red'
                         }

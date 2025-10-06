@@ -141,6 +141,20 @@ def get_event_type_documentation() -> dict:
             "example": "Conservative, safer investment opportunities"
         },
         
+        # Target Comparison Flags
+        ExpertEventType.F_NEW_TARGET_HIGHER.value: {
+            "name": "New Target Higher Than Current TP",
+            "description": "Triggers when the expert's new recommended target price is higher than the current take profit price (with 2% tolerance). Indicates expert is more bullish.",
+            "type": "boolean",
+            "example": "Increase TP when new_target_higher to capture more upside"
+        },
+        ExpertEventType.F_NEW_TARGET_LOWER.value: {
+            "name": "New Target Lower Than Current TP",
+            "description": "Triggers when the expert's new recommended target price is lower than the current take profit price (with 2% tolerance). Indicates expert is less optimistic.",
+            "type": "boolean",
+            "example": "Close position early when new_target_lower (reduced expectations)"
+        },
+        
         # Numeric Events (N_ prefix)
         ExpertEventType.N_EXPECTED_PROFIT_TARGET_PERCENT.value: {
             "name": "Expected Profit Target %",
@@ -148,11 +162,17 @@ def get_event_type_documentation() -> dict:
             "type": "numeric",
             "example": "Trigger when expected profit >= 10% for high-conviction trades"
         },
-        ExpertEventType.N_PERCENT_TO_TARGET.value: {
-            "name": "Percent to Price Target",
-            "description": "For open positions: percentage distance from current price to the expert's target price. Used with numeric comparisons.",
+        ExpertEventType.N_PERCENT_TO_CURRENT_TARGET.value: {
+            "name": "Percent to Current Take Profit Target",
+            "description": "For open positions: percentage distance from current price to the current take profit price. Used with numeric comparisons.",
             "type": "numeric",
-            "example": "Close position when percent_to_target <= 5% (near target)"
+            "example": "Close position when percent_to_current_target <= 5% (near current TP)"
+        },
+        ExpertEventType.N_PERCENT_TO_NEW_TARGET.value: {
+            "name": "Percent to New Expert Target",
+            "description": "For open positions: percentage distance from current price to the new expert's recommended target price. Used with numeric comparisons.",
+            "type": "numeric",
+            "example": "Adjust TP when percent_to_new_target >= 10% (expert sees more upside)"
         },
         ExpertEventType.N_PROFIT_LOSS_AMOUNT.value: {
             "name": "Profit/Loss Amount",

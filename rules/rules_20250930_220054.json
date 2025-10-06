@@ -1,7 +1,7 @@
 {
   "export_version": "1.0",
   "export_type": "rules",
-  "export_timestamp": "2025-10-02T21:47:57.680541",
+  "export_timestamp": "2025-10-06T22:24:33.089506",
   "rules": [
     {
       "name": "BUY_Longterm_70pctConfidence_10pctProfit",
@@ -359,8 +359,74 @@
         },
         "action_1": {
           "action_type": "adjust_take_profit",
-          "value": 0.0,
-          "reference_value": "expert_target_price"
+          "value": 10.0,
+          "reference_value": "current_price"
+        }
+      },
+      "extra_parameters": {},
+      "continue_processing": false
+    },
+    {
+      "name": "BUY_Longterm_70pctConfidence_0pctProfit",
+      "type": "trading_recommendation_rule",
+      "subtype": "enter_market",
+      "triggers": {
+        "trigger_0": {
+          "event_type": "bullish"
+        },
+        "trigger_2": {
+          "event_type": "confidence",
+          "operator": ">",
+          "value": 70.0
+        },
+        "trigger_3": {
+          "event_type": "long_term"
+        },
+        "trigger_4": {
+          "event_type": "has_no_position"
+        }
+      },
+      "actions": {
+        "action_0": {
+          "action_type": "buy"
+        },
+        "action_1": {
+          "action_type": "adjust_take_profit",
+          "value": 10.0,
+          "reference_value": "current_price"
+        }
+      },
+      "extra_parameters": {},
+      "continue_processing": false
+    },
+    {
+      "name": "BUY_Medterm_70pctConfidence_0pctProfit",
+      "type": "trading_recommendation_rule",
+      "subtype": "enter_market",
+      "triggers": {
+        "trigger_0": {
+          "event_type": "bullish"
+        },
+        "trigger_2": {
+          "event_type": "confidence",
+          "operator": ">",
+          "value": 70.0
+        },
+        "trigger_3": {
+          "event_type": "medium_term"
+        },
+        "trigger_4": {
+          "event_type": "has_no_position"
+        }
+      },
+      "actions": {
+        "action_0": {
+          "action_type": "buy"
+        },
+        "action_1": {
+          "action_type": "adjust_take_profit",
+          "value": 10.0,
+          "reference_value": "order_open_price"
         }
       },
       "extra_parameters": {},

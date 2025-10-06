@@ -311,7 +311,8 @@ def get_numeric_event_values():
     """Return list of numeric event type values (N_ prefixed enums)."""
     return [
         ExpertEventType.N_EXPECTED_PROFIT_TARGET_PERCENT.value,
-        ExpertEventType.N_PERCENT_TO_TARGET.value,
+        ExpertEventType.N_PERCENT_TO_CURRENT_TARGET.value,
+        ExpertEventType.N_PERCENT_TO_NEW_TARGET.value,
         ExpertEventType.N_PROFIT_LOSS_AMOUNT.value,
         ExpertEventType.N_PROFIT_LOSS_PERCENT.value,
         ExpertEventType.N_DAYS_OPENED.value,

@@ -668,7 +668,7 @@ class AccountInterface(ExtendableSettingsInterface):
                     )
                     
                     # Check if ALL orders (not just entry orders) are canceled or in non-executed terminal states
-                    canceled_statuses = {OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.ERROR, OrderStatus.EXPIRED}
+                    canceled_statuses = {OrderStatus.CANCELED, OrderStatus.WAITING_TRIGGER, OrderStatus.REJECTED, OrderStatus.ERROR, OrderStatus.EXPIRED}
                     all_orders_canceled = (
                         len(orders) > 0 and
                         all(order.status in canceled_statuses for order in orders)
