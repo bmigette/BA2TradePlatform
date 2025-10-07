@@ -678,12 +678,14 @@ class TradingAgentsUI:
                 market_history_days = int(trading_agents.settings.get('market_history_days', settings_def['market_history_days']['default']))
                 timeframe = trading_agents.settings.get('timeframe', settings_def['timeframe']['default'])
                 
-                # Calculate date range based on analysis run date
-                end_date = self.market_analysis.created_at
-                start_date = end_date - timedelta(days=market_history_days)
+                # Calculate date range - start from original analysis date, extend to current date
+                from datetime import datetime
+                recommendation_date = self.market_analysis.created_at  # Date when recommendation was made
+                start_date = recommendation_date - timedelta(days=market_history_days)
+                end_date = datetime.now()  # Extend to current date to see how prediction performed
                 
                 logger.info(f"Fetching data for visualization: {self.market_analysis.symbol}, "
-                           f"{start_date.date()} to {end_date.date()}, interval={timeframe}, "
+                           f"{start_date.date()} to {end_date.date()} (recommendation: {recommendation_date.date()}), interval={timeframe}, "
                            f"lookback={market_history_days} days")
                 
                 # Initialize data provider
@@ -736,9 +738,26 @@ class TradingAgentsUI:
                                     import json
                                     params = json.loads(output_obj.text)
                                     
+                                    # Log the params to understand what we're getting
+                                    logger.debug(f"Processing indicator output: {output_obj.name}")
+                                    logger.debug(f"Params keys: {params.keys() if isinstance(params, dict) else 'Not a dict'}")
+                                    
                                     # Reconstruct indicator data from cache using stored parameters
                                     if params.get('tool') == 'get_stock_stats_indicators_window':
-                                        indicator_name = params.get('indicator', 'Unknown Indicator').replace('_', ' ').title()
+                                        # Try to get indicator name from params, or extract from output name
+                                        indicator_name = params.get('indicator')
+                                        if not indicator_name:
+                                            # Try to extract from output_obj.name
+                                            # Format: tool_output_get_stockstats_indicators_window_INDICATORNAME_json
+                                            name_parts = output_obj.name.replace('_json', '').split('_')
+                                            if len(name_parts) > 5:
+                                                # Join parts after 'window' as indicator name
+                                                indicator_name = '_'.join(name_parts[5:])
+                                            else:
+                                                indicator_name = 'Unknown Indicator'
+                                        
+                                        # Clean up indicator name
+                                        indicator_name = indicator_name.replace('_', ' ').title()
                                         logger.info(f"Reconstructing indicator '{indicator_name}' from cache")
                                         
                                         # Use StockstatsUtils to recalculate indicator from cached price data
@@ -747,7 +766,7 @@ class TradingAgentsUI:
                                         # Get indicator data using the data provider
                                         indicator_df = StockstatsUtils.get_stock_stats_range(
                                             symbol=params['symbol'],
-                                            indicator=params['indicator'],
+                                            indicator=params.get('indicator', ''),
                                             start_date=params['start_date'],
                                             end_date=params['end_date'],
                                             data_dir='',  # Not used when online=True
@@ -755,28 +774,53 @@ class TradingAgentsUI:
                                             interval=params['interval']
                                         )
                                         
-                                        # Convert Date column to datetime index
+                                        # Convert Date column to datetime index and match price data timezone
                                         if 'Date' in indicator_df.columns:
                                             indicator_df['Date'] = pd.to_datetime(indicator_df['Date'])
+                                            # Make timezone-aware to match price data (UTC)
+                                            if indicator_df['Date'].dt.tz is None:
+                                                indicator_df['Date'] = indicator_df['Date'].dt.tz_localize('UTC')
                                             indicator_df.set_index('Date', inplace=True)
+                                        
+                                        logger.debug(f"Indicator '{indicator_name}' index: {indicator_df.index[0] if len(indicator_df) > 0 else 'N/A'}, "
+                                                    f"tz-aware: {indicator_df.index.tz is not None if len(indicator_df) > 0 else 'N/A'}")
                                         
                                         indicators_data[indicator_name] = indicator_df
                                         logger.info(f"Reconstructed indicator '{indicator_name}' from cache: {len(indicator_df)} rows")
                                 
+                                # DISABLED: Markdown parsing fallback - kept for reference
+                                # Markdown format is deprecated in favor of JSON format
+                                # Uncomment if needed for legacy data
+                                """
                                 # Fallback to markdown parsing (old format) if no parameters
                                 elif not output_obj.name.endswith('_json') and output_obj.text:
                                     # Parse markdown-formatted indicator data (legacy support)
                                     # Format: "## indicator_name values from date to date:\n\nYYYY-MM-DD: value\n..."
                                     
-                                    # Extract indicator name from first line
+                                    # Extract indicator name from first line or output name
                                     lines = output_obj.text.strip().split('\n')
-                                    indicator_name = "Unknown Indicator"
+                                    indicator_name = None
                                     
                                     if lines and lines[0].startswith('##'):
                                         # Extract indicator name from header like "## close_50_sma values from..."
                                         header = lines[0].replace('##', '').strip()
                                         if ' values from' in header:
-                                            indicator_name = header.split(' values from')[0].strip().replace('_', ' ').title()
+                                            indicator_name = header.split(' values from')[0].strip()
+                                    
+                                    # If we couldn't extract from markdown, try from output name
+                                    if not indicator_name:
+                                        # Format: tool_output_get_stockstats_indicators_window_INDICATORNAME
+                                        name_parts = output_obj.name.split('_')
+                                        if len(name_parts) > 5:
+                                            # Join parts after 'window' as indicator name
+                                            indicator_name = '_'.join(name_parts[5:])
+                                        else:
+                                            indicator_name = "Unknown Indicator"
+                                            logger.warning(f"Could not extract indicator name from output: {output_obj.name}")
+                                    
+                                    # Clean up indicator name
+                                    indicator_name = indicator_name.replace('_', ' ').title()
+                                    logger.info(f"Parsing markdown indicator '{indicator_name}' from {output_obj.name}")
                                     
                                     # Parse date-value pairs
                                     dates = []
@@ -818,6 +862,7 @@ class TradingAgentsUI:
                                         
                                         indicators_data[indicator_name] = indicator_df
                                         logger.info(f"Loaded indicator {indicator_name}: {len(indicator_df)} rows")
+                                """
                                     
                             except Exception as e:
                                 logger.error(f"Error parsing indicator data from {output_obj.name}: {e}", exc_info=True)
@@ -825,10 +870,26 @@ class TradingAgentsUI:
                     # Render the graph if we have data
                     if price_data is not None and not price_data.empty:
                         ui.separator().classes('my-4')
+                        
+                        # Get recommendation action for chart marker
+                        recommendation_action = None
+                        session2 = get_db()
+                        try:
+                            statement = select(ExpertRecommendation).where(
+                                ExpertRecommendation.market_analysis_id == self.market_analysis.id
+                            ).order_by(ExpertRecommendation.created_at.desc())
+                            recommendations = session2.exec(statement).all()
+                            if recommendations:
+                                recommendation_action = recommendations[0].recommended_action
+                        finally:
+                            session2.close()
+                        
                         graph = InstrumentGraph(
                             symbol=self.market_analysis.symbol,
                             price_data=price_data,
-                            indicators_data=indicators_data
+                            indicators_data=indicators_data,
+                            recommendation_date=recommendation_date,  # Show marker on chart
+                            recommendation_action=recommendation_action  # BUY/SELL/HOLD for marker label
                         )
                         graph.render()
                     else:
@@ -842,7 +903,8 @@ class TradingAgentsUI:
                             ui.label('Data Retrieval Parameters:').classes('text-sm font-bold mb-2')
                             ui.label(f'  • Symbol: {self.market_analysis.symbol}').classes('text-xs text-gray-600')
                             ui.label(f'  • Date Range: {start_date.date()} to {end_date.date()}').classes('text-xs text-gray-600')
-                            ui.label(f'  • Lookback Period: {market_history_days} days').classes('text-xs text-gray-600')
+                            ui.label(f'  • 📊 Recommendation Date: {recommendation_date.date()} (marked on chart)').classes('text-xs text-amber-600 font-semibold')
+                            ui.label(f'  • Lookback Period: {market_history_days} days before recommendation').classes('text-xs text-gray-600')
                             ui.label(f'  • Timeframe/Interval: {timeframe}').classes('text-xs text-gray-600')
                             
                             if price_data is not None:

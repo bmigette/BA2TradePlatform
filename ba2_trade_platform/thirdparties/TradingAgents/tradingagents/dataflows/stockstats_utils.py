@@ -187,8 +187,9 @@ class StockstatsUtils:
         mask = (df["Date"] >= start_dt) & (df["Date"] <= end_dt)
         filtered_df = df.loc[mask, ["Date", indicator]].copy()
         
-        # Format date as string for consistency
-        filtered_df["Date"] = filtered_df["Date"].dt.strftime("%Y-%m-%d")
+        # Format date to preserve time component for intraday data
+        # Keep timezone info and full datetime for proper alignment with price data
+        filtered_df["Date"] = filtered_df["Date"].dt.strftime("%Y-%m-%d %H:%M:%S")
         
         # Rename indicator column to 'value' for consistency
         filtered_df = filtered_df.rename(columns={indicator: "value"})

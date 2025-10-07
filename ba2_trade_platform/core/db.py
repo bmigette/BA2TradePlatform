@@ -2,9 +2,11 @@ from sqlmodel import  Field, Session, SQLModel, create_engine
 
 from ..config import DB_FILE
 from ..logger import logger
-from sqlalchemy import String, Float, JSON, select
+from sqlalchemy import String, Float, JSON, select, event
 import os
 import threading
+import time
+from typing import Any
 
 
 # Create engine and session
@@ -26,15 +28,58 @@ _db_write_lock = threading.Lock()
 # pool_timeout: Seconds to wait before giving up on getting a connection from the pool
 # pool_recycle: Recycle connections after this many seconds (prevents stale connections)
 # pool_pre_ping: Test connections before using them to ensure they're still valid
+# SQLite WAL mode enables better concurrency (multiple readers + 1 writer)
+# busy_timeout: Wait up to 30 seconds for locks to be released
 engine = create_engine(
     f"sqlite:///{DB_FILE}", 
-    connect_args={"check_same_thread": False},
+    connect_args={
+        "check_same_thread": False,
+        "timeout": 30.0,  # SQLite busy timeout in seconds
+    },
     pool_size=20,           # Increased from default 5 to 20
     max_overflow=40,        # Increased from default 10 to 40 (total max connections: 60)
     pool_timeout=60,        # Increased from default 30 to 60 seconds
     pool_recycle=3600,      # Recycle connections after 1 hour
-    pool_pre_ping=True      # Test connections before use
+    pool_pre_ping=True,     # Test connections before use
+    echo=False              # Disable SQL echo for performance
 )
+
+
+# Enable SQLite WAL mode for better concurrency
+@event.listens_for(engine, "connect")
+def set_sqlite_pragma(dbapi_conn, connection_record):
+    """Set SQLite pragmas for better concurrency and performance."""
+    cursor = dbapi_conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")  # Write-Ahead Logging for concurrent reads/writes
+    cursor.execute("PRAGMA synchronous=NORMAL")  # Faster writes while still safe
+    cursor.execute("PRAGMA busy_timeout=30000")  # 30 second timeout for locks
+    cursor.close()
+
+
+def retry_on_lock(func):
+    """Decorator to retry database operations on lock errors with exponential backoff."""
+    def wrapper(*args, **kwargs):
+        max_retries = 5
+        base_delay = 0.1  # Start with 100ms
+        
+        for attempt in range(max_retries):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                # Check if it's a database lock error
+                if "database is locked" in str(e).lower():
+                    if attempt < max_retries - 1:
+                        delay = base_delay * (2 ** attempt)  # Exponential backoff
+                        logger.warning(f"Database locked, retrying in {delay:.2f}s (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(delay)
+                    else:
+                        logger.error(f"Database locked after {max_retries} attempts")
+                        raise
+                else:
+                    # Not a lock error, raise immediately
+                    raise
+        
+    return wrapper
 
 
 def init_db():
@@ -48,6 +93,7 @@ def init_db():
     # Create directory for database if it doesn't exist
     os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
     SQLModel.metadata.create_all(engine)
+    logger.info("Database initialized with WAL mode enabled")
 
 def get_db_gen():
     """
@@ -72,12 +118,14 @@ def get_db():
     """
     return Session(engine)
 
+@retry_on_lock
 def add_instance(instance, session: Session | None = None, expunge_after_flush: bool = False):
     """
     Add a new instance to the database.
     If a session is provided, use it; otherwise, create a new session.
     Commits the transaction after adding.
     Thread-safe: Uses a lock to prevent concurrent write conflicts.
+    Retries on database lock errors with exponential backoff.
 
     Args:
         instance: The instance to add.
@@ -120,12 +168,14 @@ def add_instance(instance, session: Session | None = None, expunge_after_flush: 
                 logger.error(f"Error adding instance {instance_class}: {e}", exc_info=True)
             raise
 
+@retry_on_lock
 def update_instance(instance, session: Session | None = None):
     """
     Update an existing instance in the database.
     If a session is provided, use it; otherwise, create a new session.
     Commits and refreshes the instance after updating.
     Thread-safe: Uses a lock to prevent concurrent write conflicts.
+    Retries on database lock errors with exponential backoff.
 
     Args:
         instance: The instance to update.

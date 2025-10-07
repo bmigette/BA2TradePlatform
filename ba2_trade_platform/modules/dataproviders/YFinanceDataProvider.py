@@ -92,8 +92,8 @@ class YFinanceDataProvider(MarketDataProvider):
             # Download data from Yahoo Finance
             data = yf.download(
                 symbol,
-                start=start_date.strftime("%Y-%m-%d"),
-                end=end_date.strftime("%Y-%m-%d"),
+                start=self.normalize_time_to_interval(start_date, interval), #.strftime("%Y-%m-%d"),
+                end=self.normalize_time_to_interval(end_date, interval), #.strftime("%Y-%m-%d"),
                 interval=interval,
                 multi_level_index=False,
                 progress=False,
@@ -102,6 +102,10 @@ class YFinanceDataProvider(MarketDataProvider):
             
             if data.empty:
                 raise Exception(f"No data returned for {symbol}")
+            
+            logger.debug(f"Raw data from YFinance: {len(data)} records, "
+                        f"first={data.index[0] if len(data) > 0 else 'N/A'}, "
+                        f"last={data.index[-1] if len(data) > 0 else 'N/A'}")
             
             # Reset index to make Date/Datetime a column
             data = data.reset_index()
@@ -120,7 +124,29 @@ class YFinanceDataProvider(MarketDataProvider):
             # Select only the required columns (drop any extras)
             data = data[required_columns]
             
-            logger.info(f"Successfully fetched {len(data)} records for {symbol}")
+            # Normalize timestamps to interval boundaries
+            # This ensures proper alignment (e.g., 13:30 -> 13:00 for 1h interval)
+            #logger.debug(f"Normalizing {len(data)} timestamps to {interval} interval boundaries")
+            #data['Date'] = data['Date'].apply(
+            #    lambda dt: self.normalize_time_to_interval(dt, interval)
+            #}
+            
+            # Group by normalized timestamp and aggregate (in case multiple rows map to same timestamp)
+            # Use OHLC aggregation: first Open, max High, min Low, last Close, sum Volume
+            if len(data) != len(data['Date'].unique()):
+                logger.debug(f"Found duplicate timestamps after normalization, aggregating...")
+                data = data.groupby('Date').agg({
+                    'Open': 'first',
+                    'High': 'max',
+                    'Low': 'min',
+                    'Close': 'last',
+                    'Volume': 'sum'
+                }).reset_index()
+            
+            # Sort by date to ensure chronological order
+            data = data.sort_values('Date').reset_index(drop=True)
+            
+            logger.info(f"Successfully fetched and normalized {len(data)} records for {symbol}")
             
             return data
             

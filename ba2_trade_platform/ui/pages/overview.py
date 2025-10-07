@@ -38,6 +38,45 @@ class OverviewTab:
                     if self.tabs_ref:
                         self.tabs_ref.set_value('account')
                 
+                # Function to attempt broker sync with heuristic mapping
+                async def attempt_broker_sync():
+                    try:
+                        sync_button.set_enabled(False)
+                        sync_button.props('loading')
+                        
+                        # Get all accounts and call refresh_orders with heuristic_mapping=True
+                        accounts = get_all_instances(AccountDefinition)
+                        success_count = 0
+                        
+                        for account_def in accounts:
+                            try:
+                                # Instantiate account provider
+                                account_provider_class = providers.get(account_def.provider)
+                                if account_provider_class:
+                                    account = account_provider_class(account_def.id)
+                                    # Call refresh_orders with heuristic_mapping=True
+                                    if account.refresh_orders(heuristic_mapping=True):
+                                        success_count += 1
+                                        logger.info(f"Successfully synced orders for account {account_def.id} ({account_def.provider}) with heuristic mapping")
+                            except Exception as e:
+                                logger.error(f"Error syncing orders for account {account_def.id}: {e}", exc_info=True)
+                        
+                        if success_count > 0:
+                            ui.notify(f'Successfully synced {success_count} account(s) from broker - refreshing page...', type='positive')
+                        else:
+                            ui.notify('No accounts synced successfully', type='warning')
+                        
+                        # Always refresh the page after sync to update order counts
+                        await asyncio.sleep(1.5)  # Brief delay to show notification
+                        ui.navigate.reload()
+                    
+                    except Exception as e:
+                        logger.error(f"Error during broker sync: {e}", exc_info=True)
+                        ui.notify(f'Error syncing from broker: {str(e)}', type='negative')
+                        # Still refresh to show any partial updates
+                        await asyncio.sleep(1.5)
+                        ui.navigate.reload()
+                
                 # Create alert banner
                 with ui.card().classes('w-full bg-red-50 border-l-4 border-red-500 p-4 mb-4'):
                     with ui.row().classes('w-full items-center gap-4'):
@@ -46,8 +85,12 @@ class OverviewTab:
                             ui.label(f'⚠️ {error_count} Order{"s" if error_count > 1 else ""} Failed').classes('text-lg font-bold text-red-800')
                             ui.label(f'There {"are" if error_count > 1 else "is"} {error_count} order{"s" if error_count > 1 else ""} with ERROR status that need{"" if error_count > 1 else "s"} attention.').classes('text-sm text-red-700')
                         
-                        # View details button
-                        ui.button('View Orders', on_click=switch_to_account_tab).props('outline color=red')
+                        with ui.row().classes('gap-2'):
+                            # Attempt sync from broker button
+                            sync_button = ui.button('Attempt sync from broker', on_click=attempt_broker_sync).props('outline color=orange')
+                            
+                            # View details button
+                            ui.button('View Orders', on_click=switch_to_account_tab).props('outline color=red')
                 
                 # Log the error orders for debugging
                 logger.warning(f"Found {error_count} orders with ERROR status on overview page")

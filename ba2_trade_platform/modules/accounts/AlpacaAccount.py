@@ -8,7 +8,7 @@ from ...logger import logger
 from ...core.models import TradingOrder, Position, Transaction
 from ...core.types import OrderDirection, OrderStatus, OrderOpenType
 from ...core.AccountInterface import AccountInterface
-from ...core.db import get_db, update_instance
+from ...core.db import get_db, get_instance, update_instance
 from sqlmodel import Session, select
 
 class AlpacaAccount(AccountInterface):
@@ -353,57 +353,53 @@ class AlpacaAccount(AccountInterface):
             alpaca_order = self.client.submit_order(order_request)
             logger.info(f"Successfully submitted order to Alpaca: broker_order_id={alpaca_order.id}")
 
-            # Step 3: Update database record with broker response
-            with Session(get_db().bind) as session:
-                # Re-fetch the order from the database to get a fresh instance
-                fresh_order = session.get(TradingOrder, trading_order.id)
-                if fresh_order:
-                    # Update with broker order ID
-                    fresh_order.broker_order_id = str(alpaca_order.id) if alpaca_order.id else None
-                    
-                    # Update status from broker response
-                    result_order = self.alpaca_order_to_tradingorder(alpaca_order)
-                    if result_order.status:
-                        fresh_order.status = result_order.status
-                    
-                    session.add(fresh_order)
-                    session.commit()
-                    session.refresh(fresh_order)
-                    
-                    logger.info(f"Updated order {fresh_order.id} in database: broker_order_id={fresh_order.broker_order_id}, status={fresh_order.status}")
-                    return fresh_order
-                else:
-                    logger.error(f"Could not find order {trading_order.id} in database to update")
-                    return None
+            # Step 3: Update database record with broker response using thread-safe function
+            fresh_order = get_instance(TradingOrder, trading_order.id)
+            if fresh_order:
+                # Update with broker order ID
+                fresh_order.broker_order_id = str(alpaca_order.id) if alpaca_order.id else None
+                
+                # Update status from broker response
+                result_order = self.alpaca_order_to_tradingorder(alpaca_order)
+                if result_order.status:
+                    fresh_order.status = result_order.status
+                
+                # Use thread-safe update function with retry logic
+                update_instance(fresh_order)
+                
+                logger.info(f"Updated order {fresh_order.id} in database: broker_order_id={fresh_order.broker_order_id}, status={fresh_order.status}")
+                return fresh_order
+            else:
+                logger.error(f"Could not find order {trading_order.id} in database to update")
+                return None
                     
         except Exception as e:
             logger.error(f"Error submitting order to Alpaca: {e}", exc_info=True)
             
-            # Step 4: Mark order as ERROR in database
+            # Step 4: Mark order as ERROR in database using thread-safe function
             try:
-                with Session(get_db().bind) as session:
-                    if trading_order.id:
-                        fresh_order = session.get(TradingOrder, trading_order.id)
-                        if fresh_order:
-                            fresh_order.status = OrderStatus.ERROR
-                            
-                            # Store error details in comment field (append to existing comment)
-                            error_msg = f"Error: {str(e)[:200]}"
-                            if not fresh_order.comment:
-                                fresh_order.comment = error_msg
-                            else:
-                                # Append error to existing comment, truncate if too long
-                                fresh_order.comment = f"{fresh_order.comment} | {error_msg}"[:500]
-                            
-                            session.add(fresh_order)
-                            session.commit()
-                            logger.info(f"Marked order {trading_order.id} as ERROR in database")
+                if trading_order.id:
+                    fresh_order = get_instance(TradingOrder, trading_order.id)
+                    if fresh_order:
+                        fresh_order.status = OrderStatus.ERROR
+                        
+                        # Store error details in comment field (append to existing comment)
+                        error_msg = f"Error: {str(e)[:200]}"
+                        if not fresh_order.comment:
+                            fresh_order.comment = error_msg
                         else:
-                            logger.warning(f"Could not find order {trading_order.id} to mark as ERROR")
+                            # Append error to existing comment, truncate if too long
+                            fresh_order.comment = f"{fresh_order.comment} | {error_msg}"[:500]
+                        
+                        # Use thread-safe update function with retry logic
+                        update_instance(fresh_order)
+                        logger.info(f"Marked order {trading_order.id} as ERROR in database")
                     else:
-                        logger.warning(f"Cannot mark order as ERROR - order has no ID")
+                        logger.warning(f"Could not find order {trading_order.id} to mark as ERROR")
+                else:
+                    logger.warning(f"Cannot mark order as ERROR - order has no ID")
             except Exception as update_error:
-                logger.error(f"Failed to update order status to ERROR: {update_error}", exc_info=True)
+                logger.error(f"Failed to update order status to ERROR: {update_error}")
             
             return None
 
@@ -585,17 +581,20 @@ class AlpacaAccount(AccountInterface):
             logger.error(f"Error refreshing positions from Alpaca: {e}", exc_info=True)
             return False
 
-    def refresh_orders(self) -> bool:
+    def refresh_orders(self, heuristic_mapping: bool = False) -> bool:
         """
         Refresh/synchronize account orders from Alpaca broker.
         This method updates database records with current order states from the broker.
+        
+        Args:
+            heuristic_mapping (bool): If True, attempt to map orders by comment field when broker_order_id is missing.
+                                      Useful for recovering from errors where broker_order_id wasn't saved.
+                                      Assumes comment field is unique for this account's orders.
         
         Returns:
             bool: True if refresh was successful, False otherwise
         """
         try:
-
-            
             # Get all orders from Alpaca
             alpaca_orders = self.get_orders(OrderStatus.ALL)
             
@@ -604,59 +603,95 @@ class AlpacaAccount(AccountInterface):
                 return True
             
             updated_count = 0
+            mapped_count = 0
             
-            # Update database records with current Alpaca order states
-            with Session(get_db().bind) as session:
-                for alpaca_order in alpaca_orders:
-                    if not alpaca_order.broker_order_id:
-                        continue
-                    # Find corresponding database record
-                    statement = select(TradingOrder).where(
-                        TradingOrder.broker_order_id == alpaca_order.broker_order_id
-                    )
-                    db_order = session.exec(statement).first()
-                    if db_order:
-                        # Track if any changes were made
-                        has_changes = False
-                        
-                        # Update database order with current Alpaca state only if values differ
-                        if db_order.status != alpaca_order.status:
-                            logger.debug(f"Order {db_order.id} status changed: {db_order.status} -> {alpaca_order.status}")
-                            db_order.status = alpaca_order.status
-                            has_changes = True
-                        
-                        if db_order.filled_qty is None or float(db_order.filled_qty) != float(alpaca_order.filled_qty):
-                            logger.debug(f"Order {db_order.id} filled_qty changed: {db_order.filled_qty} -> {alpaca_order.filled_qty}")
-                            db_order.filled_qty = alpaca_order.filled_qty
-                            has_changes = True
-                        
-                        # Update filled_avg_price if it changed
-                        if alpaca_order.filled_avg_price and (db_order.filled_avg_price is None or float(db_order.filled_avg_price) != float(alpaca_order.filled_avg_price)):
-                            logger.debug(f"Order {db_order.id} filled_avg_price changed: {db_order.filled_avg_price} -> {alpaca_order.filled_avg_price}")
-                            db_order.filled_avg_price = alpaca_order.filled_avg_price
-                            has_changes = True
-                        
-                        # Update open_price if it changed (use filled_avg_price)
-                        if alpaca_order.open_price and (db_order.open_price is None or float(db_order.open_price) != float(alpaca_order.open_price)):
-                            logger.debug(f"Order {db_order.id} open_price changed: {db_order.open_price} -> {alpaca_order.open_price}")
-                            db_order.open_price = alpaca_order.open_price
-                            has_changes = True
-                        
-                        # Update broker_order_id if it wasn't set before
-                        if not db_order.broker_order_id:
-                            logger.debug(f"Order {db_order.id} broker_order_id set to: {alpaca_order.broker_order_id}")
-                            db_order.broker_order_id = alpaca_order.broker_order_id
-                            has_changes = True
-                        
-                        # Only add to session and increment counter if there were actual changes
-                        if has_changes:
-                            session.add(db_order)
-                            updated_count += 1
-                            logger.debug(f"Updated database order {db_order.id} with changes from Alpaca order {alpaca_order.broker_order_id}")
+            # Get all database orders for this account (for heuristic mapping)
+            if heuristic_mapping:
+                from ...core.db import get_db
+                with Session(get_db().bind) as session:
+                    db_orders = session.exec(
+                        select(TradingOrder).where(TradingOrder.account_id == self.id)
+                    ).all()
+                    # Create lookup maps: comment -> db_order and broker_order_id -> db_order
+                    comment_map = {order.comment: order for order in db_orders if order.comment}
+                    broker_id_map = {order.broker_order_id: order for order in db_orders if order.broker_order_id}
+            
+            # Process each Alpaca order
+            for alpaca_order in alpaca_orders:
+                if not alpaca_order.broker_order_id:
+                    continue
                 
-                session.commit()
+                db_order = None
+                
+                # Step 1: Try to find by broker_order_id first
+                if heuristic_mapping and alpaca_order.broker_order_id in broker_id_map:
+                    db_order = broker_id_map[alpaca_order.broker_order_id]
+                else:
+                    # Standard lookup by broker_order_id
+                    db_order = get_instance(TradingOrder, None) if False else None  # Placeholder
+                    with Session(get_db().bind) as session:
+                        statement = select(TradingOrder).where(
+                            TradingOrder.broker_order_id == alpaca_order.broker_order_id
+                        )
+                        result = session.exec(statement).first()
+                        if result:
+                            db_order = get_instance(TradingOrder, result.id)
+                
+                # Step 2: If not found and heuristic_mapping enabled, try comment matching
+                if not db_order and heuristic_mapping and alpaca_order.comment:
+                    if alpaca_order.comment in comment_map:
+                        candidate = comment_map[alpaca_order.comment]
+                        # Only map if broker_order_id is empty (avoid overwriting valid mappings)
+                        if not candidate.broker_order_id:
+                            db_order = get_instance(TradingOrder, candidate.id)
+                            db_order.broker_order_id = alpaca_order.broker_order_id
+                            update_instance(db_order)
+                            mapped_count += 1
+                            logger.info(f"Heuristic mapping: Linked database order {db_order.id} to broker order {alpaca_order.broker_order_id} via comment '{alpaca_order.comment}'")
+                
+                # Step 3: Update order state if we found a match
+                if db_order:
+                    has_changes = False
+                    
+                    # Update database order with current Alpaca state only if values differ
+                    if db_order.status != alpaca_order.status:
+                        logger.debug(f"Order {db_order.id} status changed: {db_order.status} -> {alpaca_order.status}")
+                        db_order.status = alpaca_order.status
+                        has_changes = True
+                    
+                    if db_order.filled_qty is None or float(db_order.filled_qty) != float(alpaca_order.filled_qty):
+                        logger.debug(f"Order {db_order.id} filled_qty changed: {db_order.filled_qty} -> {alpaca_order.filled_qty}")
+                        db_order.filled_qty = alpaca_order.filled_qty
+                        has_changes = True
+                    
+                    # Update filled_avg_price if it changed
+                    if alpaca_order.filled_avg_price and (db_order.filled_avg_price is None or float(db_order.filled_avg_price) != float(alpaca_order.filled_avg_price)):
+                        logger.debug(f"Order {db_order.id} filled_avg_price changed: {db_order.filled_avg_price} -> {alpaca_order.filled_avg_price}")
+                        db_order.filled_avg_price = alpaca_order.filled_avg_price
+                        has_changes = True
+                    
+                    # Update open_price if it changed (use filled_avg_price)
+                    if alpaca_order.open_price and (db_order.open_price is None or float(db_order.open_price) != float(alpaca_order.open_price)):
+                        logger.debug(f"Order {db_order.id} open_price changed: {db_order.open_price} -> {alpaca_order.open_price}")
+                        db_order.open_price = alpaca_order.open_price
+                        has_changes = True
+                    
+                    # Update broker_order_id if it wasn't set before (non-heuristic path)
+                    if not db_order.broker_order_id:
+                        logger.debug(f"Order {db_order.id} broker_order_id set to: {alpaca_order.broker_order_id}")
+                        db_order.broker_order_id = alpaca_order.broker_order_id
+                        has_changes = True
+                    
+                    # Use thread-safe update if there were changes
+                    if has_changes:
+                        update_instance(db_order)
+                        updated_count += 1
+                        logger.debug(f"Updated database order {db_order.id} with changes from Alpaca order {alpaca_order.broker_order_id}")
             
-            logger.info(f"Successfully refreshed orders from Alpaca: {updated_count} database records updated")
+            if heuristic_mapping and mapped_count > 0:
+                logger.info(f"Successfully refreshed orders from Alpaca: {updated_count} updated, {mapped_count} mapped via comment heuristic")
+            else:
+                logger.info(f"Successfully refreshed orders from Alpaca: {updated_count} database records updated")
             return True
             
         except Exception as e:
