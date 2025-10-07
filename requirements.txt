@@ -1,5 +1,5 @@
 # my tools
-nicegui
+nicegui>=3.0.0  # Requires NiceGUI 3.0+ - see migration notes in docs/NICEGUI_3_MIGRATION.md
 alpaca-py
 sqlmodel
 python-dotenv

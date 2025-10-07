@@ -2431,7 +2431,7 @@ class TradeSettingsTab:
             
             with ui.dialog() as help_dialog, ui.card().classes('w-full max-w-4xl'):
                 help_html = get_rules_overview_html()
-                ui.html(help_html)
+                ui.html(help_html, sanitize=False)
                 
                 with ui.row().classes('w-full justify-end mt-4'):
                     ui.button('Close', on_click=help_dialog.close).props('color=primary')

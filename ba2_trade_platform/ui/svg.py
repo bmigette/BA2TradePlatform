@@ -8,4 +8,4 @@ GITHUB_SVG = (PATH / 'github.svg').read_text(encoding='utf-8')
 
 
 def github() -> ui.html:
-    return ui.html(GITHUB_SVG)
+    return ui.html(GITHUB_SVG, sanitize=False)

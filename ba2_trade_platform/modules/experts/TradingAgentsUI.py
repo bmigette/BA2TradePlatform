@@ -314,7 +314,7 @@ class TradingAgentsUI:
                         ui.markdown(content).classes('w-full')
                     else:
                         with ui.element('pre').classes('whitespace-pre-wrap text-sm p-4 bg-grey-1 rounded font-mono overflow-x-auto'):
-                            ui.html(content)  # Use html() to preserve formatting
+                            ui.html(content, sanitize=False)  # Use html() to preserve formatting
             else:
                 # Show in-progress indicator
                 with ui.card().classes('w-full p-8 text-center bg-grey-1'):
@@ -460,7 +460,7 @@ class TradingAgentsUI:
                     ui.markdown(history).classes('w-full mb-4')
                 else:
                     with ui.element('pre').classes('whitespace-pre-wrap text-sm p-4 bg-grey-1 rounded mb-4 font-mono overflow-x-auto'):
-                        ui.html(history)  # Use html() to preserve formatting
+                        ui.html(history, sanitize=False)  # Use html() to preserve formatting
             
             # Current responses
             current_response = debate_state.get('current_response', '')
@@ -470,7 +470,7 @@ class TradingAgentsUI:
                     ui.markdown(current_response).classes('w-full mb-4')
                 else:
                     with ui.element('pre').classes('whitespace-pre-wrap text-sm p-4 bg-grey-1 rounded mb-4 font-mono overflow-x-auto'):
-                        ui.html(current_response)  # Use html() to preserve formatting
+                        ui.html(current_response, sanitize=False)  # Use html() to preserve formatting
             
             # Risk-specific responses
             if state_key == 'risk_debate_state':
@@ -484,7 +484,7 @@ class TradingAgentsUI:
                         ui.markdown(risk_response).classes('w-full mb-4')
                     else:
                         with ui.element('pre').classes('whitespace-pre-wrap text-sm p-4 bg-red-1 rounded mb-4 font-mono overflow-x-auto'):
-                            ui.html(risk_response)  # Use html() to preserve formatting
+                            ui.html(risk_response, sanitize=False)  # Use html() to preserve formatting
                 
                 if safe_response:
                     ui.label('🛡️ Conservative Assessment').classes('text-h6 mb-2')
@@ -492,7 +492,7 @@ class TradingAgentsUI:
                         ui.markdown(safe_response).classes('w-full mb-4')
                     else:
                         with ui.element('pre').classes('whitespace-pre-wrap text-sm p-4 bg-green-1 rounded mb-4 font-mono overflow-x-auto'):
-                            ui.html(safe_response)  # Use html() to preserve formatting
+                            ui.html(safe_response, sanitize=False)  # Use html() to preserve formatting
                 
                 if neutral_response:
                     ui.label('⚖️ Balanced Assessment').classes('text-h6 mb-2')
@@ -500,7 +500,7 @@ class TradingAgentsUI:
                         ui.markdown(neutral_response).classes('w-full mb-4')
                     else:
                         with ui.element('pre').classes('whitespace-pre-wrap text-sm p-4 bg-blue-1 rounded mb-4 font-mono overflow-x-auto'):
-                            ui.html(neutral_response)  # Use html() to preserve formatting
+                            ui.html(neutral_response, sanitize=False)  # Use html() to preserve formatting
             
             # Debate count
             count = debate_state.get('count', 0)
@@ -527,7 +527,7 @@ class TradingAgentsUI:
                 if error_info:
                     ui.label('Error Details:').classes('text-h6 mb-2')
                     with ui.element('pre').classes('bg-red-50 p-3 rounded text-sm overflow-auto max-h-32 whitespace-pre-wrap font-mono text-red-900 border'):
-                        ui.html(str(error_info))  # Use html() to preserve formatting
+                        ui.html(str(error_info), sanitize=False)  # Use html() to preserve formatting
     
     def _render_error_ui(self, error_message: str) -> None:
         """Render UI for rendering errors."""
@@ -537,7 +537,7 @@ class TradingAgentsUI:
             ui.label('An error occurred while rendering the analysis results.').classes('text-grey-7 mb-4')
             
             with ui.element('pre').classes('bg-orange-50 p-3 rounded text-sm overflow-auto max-h-32 whitespace-pre-wrap font-mono text-orange-900 border'):
-                ui.html(error_message)  # Use html() to preserve formatting
+                ui.html(error_message, sanitize=False)  # Use html() to preserve formatting
     
     def _looks_like_markdown(self, content: str) -> bool:
         """Check if content appears to be markdown formatted."""
@@ -625,7 +625,7 @@ class TradingAgentsUI:
                         ui.markdown(latest_recommendation.details).classes('text-sm text-grey-8')
                     else:
                         with ui.element('pre').classes('whitespace-pre-wrap text-sm text-grey-8 font-mono bg-grey-50 p-2 rounded overflow-x-auto'):
-                            ui.html(latest_recommendation.details)  # Use html() to preserve formatting
+                            ui.html(latest_recommendation.details, sanitize=False)  # Use html() to preserve formatting
             
             # Risk and Time Horizon if available
             with ui.row().classes('w-full gap-4 mt-3'):
@@ -951,7 +951,7 @@ class TradingAgentsUI:
                                         # Fallback to text display with pre tag
                                         with ui.scroll_area().classes('w-full max-h-96'):
                                             escaped_text = html.escape(output_obj.text or '(empty)')
-                                            ui.html(f'<pre class="whitespace-pre-wrap text-xs font-mono bg-white p-3 rounded border overflow-x-auto">{escaped_text}</pre>')
+                                            ui.html(f'<pre class="whitespace-pre-wrap text-xs font-mono bg-white p-3 rounded border overflow-x-auto">{escaped_text}</pre>', sanitize=False)
                                 
                                 elif output_obj.text:
                                     # Text/Markdown output - show in scrollable pre
@@ -961,7 +961,7 @@ class TradingAgentsUI:
                                         else:
                                             # Use pre tag for preserving formatting and whitespace
                                             escaped_text = html.escape(output_obj.text)
-                                            ui.html(f'<pre class="whitespace-pre-wrap text-xs font-mono bg-white p-3 rounded border overflow-x-auto">{escaped_text}</pre>')
+                                            ui.html(f'<pre class="whitespace-pre-wrap text-xs font-mono bg-white p-3 rounded border overflow-x-auto">{escaped_text}</pre>', sanitize=False)
                                 else:
                                     ui.label('(No output content)').classes('text-grey-5 italic')
                 

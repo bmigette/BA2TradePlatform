@@ -578,7 +578,8 @@ class JobMonitoringTab:
                     self.current_page = max(1, self.total_pages)
                 
                 self.analysis_table.rows = analysis_data
-                self.analysis_table.update()
+                # Note: In NiceGUI 3.0+, .update() is automatic when modifying table.rows
+                # self.analysis_table.update()  # Not needed in 3.0+
                 
                 # Re-create pagination controls to update button states
                 self._create_pagination_controls()
@@ -1127,7 +1128,8 @@ class ScheduledJobsTab:
                     self.current_page = max(1, self.total_pages)
                 
                 self.scheduled_jobs_table.rows = scheduled_data
-                self.scheduled_jobs_table.update()
+                # Note: In NiceGUI 3.0+, .update() is automatic when modifying table.rows
+                # self.scheduled_jobs_table.update()  # Not needed in 3.0+
                 
                 # Re-create pagination controls to update button states
                 self._create_pagination_controls()

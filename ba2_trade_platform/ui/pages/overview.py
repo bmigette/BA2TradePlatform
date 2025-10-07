@@ -1633,7 +1633,8 @@ class TransactionsTab:
             # Update the table rows
             self.transactions_table.rows.clear()
             self.transactions_table.rows.extend(new_rows)
-            self.transactions_table.update()
+            # Note: In NiceGUI 3.0+, .update() is automatic when modifying table.rows
+            # self.transactions_table.update()  # Not needed in 3.0+
             
             logger.debug("[REFRESH] _refresh_transactions() - Complete")
         except Exception as e:

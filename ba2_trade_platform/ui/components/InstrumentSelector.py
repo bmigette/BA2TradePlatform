@@ -178,7 +178,8 @@ class InstrumentSelector:
             filtered_instruments = self._get_filtered_instruments()
             self.table.rows = filtered_instruments
             # Force table to update its display
-            self.table.update()
+            # Note: In NiceGUI 3.0+, .update() is automatic when modifying table.rows
+            # self.table.update()  # Not needed in 3.0+
             logger.debug(f'Table updated with {len(filtered_instruments)} instruments')
     
     def render(self):
