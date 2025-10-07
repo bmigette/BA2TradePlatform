@@ -184,6 +184,24 @@ class OrderStatus(str, Enum):
             cls.ACCEPTED_FOR_BIDDING,
             cls.HELD,
         }
+    
+    @classmethod
+    def get_unsent_statuses(cls):
+        """
+        Return a set of order statuses that indicate the order was never sent to the broker.
+        These orders only exist in the database and can be safely closed without broker communication.
+        
+        Unsent statuses include:
+        - PENDING: Order is pending submission to broker
+        - WAITING_TRIGGER: Order is waiting for trigger condition (legacy)
+        
+        Returns:
+            set: Set of OrderStatus values representing unsent states
+        """
+        return {
+            cls.PENDING,
+            cls.WAITING_TRIGGER,
+        }
 
 
 

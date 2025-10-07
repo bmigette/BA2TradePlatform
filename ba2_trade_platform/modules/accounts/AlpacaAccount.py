@@ -607,7 +607,6 @@ class AlpacaAccount(AccountInterface):
             
             # Get all database orders for this account (for heuristic mapping)
             if heuristic_mapping:
-                from ...core.db import get_db
                 with Session(get_db().bind) as session:
                     db_orders = session.exec(
                         select(TradingOrder).where(TradingOrder.account_id == self.id)

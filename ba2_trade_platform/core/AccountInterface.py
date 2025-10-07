@@ -959,6 +959,7 @@ class AccountInterface(ExtendableSettingsInterface):
                 # Process orders
                 unfilled_statuses = OrderStatus.get_unfilled_statuses()
                 executed_statuses = OrderStatus.get_executed_statuses()
+                unsent_statuses = OrderStatus.get_unsent_statuses()
                 has_filled = False
                 existing_close_order = None
                 
@@ -981,17 +982,18 @@ class AccountInterface(ExtendableSettingsInterface):
                         logger.info(f"Found existing closing order {order.id} with status {order.status}")
                         continue
                     
-                    # Handle WAITING_TRIGGER orders - delete from DB
-                    if order.status == OrderStatus.WAITING_TRIGGER:
+                    # Handle unsent orders (PENDING, WAITING_TRIGGER) - just mark as CLOSED
+                    if order.status in unsent_statuses:
                         try:
-                            delete_instance(order, session=session)
+                            order.status = OrderStatus.CLOSED
+                            update_instance(order)
                             result['deleted_count'] += 1
-                            logger.info(f"Deleted WAITING_TRIGGER order {order.id} for transaction {transaction_id}")
+                            logger.info(f"Marked unsent order {order.id} (status: {order.status}) as CLOSED for transaction {transaction_id}")
                         except Exception as e:
-                            logger.error(f"Error deleting WAITING_TRIGGER order {order.id}: {e}")
+                            logger.error(f"Error marking unsent order {order.id} as CLOSED: {e}")
                         continue
                     
-                    # Cancel unfilled orders (but not closing orders)
+                    # Cancel unfilled orders at broker (only if they were sent to broker)
                     if order.status in unfilled_statuses and not is_closing_order:
                         try:
                             if hasattr(self, 'cancel_order') and order.broker_order_id:
