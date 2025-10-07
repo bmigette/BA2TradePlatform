@@ -840,3 +840,242 @@ class AccountInterface(ExtendableSettingsInterface):
         except Exception as e:
             logger.error(f"Error refreshing transactions for account {self.id}: {e}", exc_info=True)
             return False
+    
+    async def close_transaction_async(self, transaction_id: int) -> dict:
+        """
+        Close a transaction asynchronously by:
+        1. For unfilled orders: Cancel them at broker and delete WAITING_TRIGGER orders from DB
+        2. For filled positions: Check if there's already a pending close order
+           - If close order exists and is in ERROR state: Retry submitting it
+           - If close order exists and is not in ERROR: Do nothing (log it)
+           - If no close order exists: Create and submit a new closing order
+        3. Refresh orders from broker
+        4. Refresh transactions to update status
+        
+        This method handles both initial close and retry close operations.
+        This async version prevents UI blocking during broker operations.
+        
+        Args:
+            transaction_id: The transaction ID to close
+            
+        Returns:
+            dict: Result containing:
+                - success: bool
+                - message: str (user-friendly message)
+                - canceled_count: int (orders canceled)
+                - deleted_count: int (orders deleted)
+                - close_order_id: int (closing order ID if created/retried)
+        """
+        import asyncio
+        
+        # Get transaction details for logging
+        transaction = get_instance(Transaction, transaction_id)
+        if transaction:
+            open_date_str = transaction.open_date.strftime('%Y-%m-%d %H:%M:%S') if transaction.open_date else 'N/A'
+            logger.info(f"Closing transaction {transaction_id} - Account: {self.id}, Symbol: {transaction.symbol}, Opened: {open_date_str}")
+        else:
+            logger.warning(f"Closing transaction {transaction_id} - Account: {self.id}, transaction not found in database")
+        
+        # Run the synchronous close_transaction in a thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, self.close_transaction, transaction_id)
+        
+        # After closing, refresh orders from broker to get latest status
+        if result['success']:
+            logger.info(f"Refreshing orders from broker after close transaction {transaction_id}")
+            await loop.run_in_executor(None, self.refresh_orders)
+            
+            # Then refresh transactions to update transaction status
+            logger.info(f"Refreshing transactions after close transaction {transaction_id}")
+            await loop.run_in_executor(None, self.refresh_transactions)
+        
+        return result
+    
+    def close_transaction(self, transaction_id: int) -> dict:
+        """
+        Close a transaction by:
+        1. For unfilled orders: Cancel them at broker and delete WAITING_TRIGGER orders from DB
+        2. For filled positions: Check if there's already a pending close order
+           - If close order exists and is in ERROR state: Retry submitting it
+           - If close order exists and is not in ERROR: Do nothing (log it)
+           - If no close order exists: Create and submit a new closing order
+        
+        This method handles both initial close and retry close operations.
+        For async version with automatic refresh, use close_transaction_async().
+        
+        Args:
+            transaction_id: The transaction ID to close
+            
+        Returns:
+            dict: Result containing:
+                - success: bool
+                - message: str (user-friendly message)
+                - canceled_count: int (orders canceled)
+                - deleted_count: int (orders deleted)
+                - close_order_id: int (closing order ID if created/retried)
+        """
+        from sqlmodel import select, Session
+        from .db import get_db, delete_instance
+        from .types import OrderDirection, OrderType, TransactionStatus, OrderStatus
+        
+        result = {
+            'success': False,
+            'message': '',
+            'canceled_count': 0,
+            'deleted_count': 0,
+            'close_order_id': None
+        }
+        
+        try:
+            # Get transaction
+            transaction = get_instance(Transaction, transaction_id)
+            if not transaction:
+                result['message'] = 'Transaction not found'
+                return result
+            
+            # Check if transaction is already being closed
+            if transaction.status == TransactionStatus.CLOSING:
+                logger.info(f"Transaction {transaction_id} is already in CLOSING status")
+                # Continue anyway - this could be a retry
+            
+            # Set transaction status to CLOSING to prevent duplicate close attempts
+            if transaction.status != TransactionStatus.CLOSING:
+                transaction.status = TransactionStatus.CLOSING
+                update_instance(transaction)
+                logger.info(f"Set transaction {transaction_id} status to CLOSING")
+            
+            # Query for ALL orders associated with this transaction
+            with Session(get_db().bind) as session:
+                all_orders_statement = select(TradingOrder).where(
+                    TradingOrder.transaction_id == transaction_id,
+                    TradingOrder.account_id == self.id
+                ).order_by(TradingOrder.created_at)
+                all_orders = list(session.exec(all_orders_statement).all())
+                
+                if not all_orders:
+                    result['message'] = 'No orders found for this transaction'
+                    return result
+                
+                # Process orders
+                unfilled_statuses = OrderStatus.get_unfilled_statuses()
+                executed_statuses = OrderStatus.get_executed_statuses()
+                has_filled = False
+                existing_close_order = None
+                
+                for order in all_orders:
+                    # Check if this is a filled entry order
+                    if order.status in executed_statuses and not order.depends_on_order:
+                        has_filled = True
+                    
+                    # Check if this is a closing order (market order to close position)
+                    # Closing orders are typically MARKET orders with opposite side to position
+                    # and have a comment indicating they're closing orders
+                    is_closing_order = (
+                        order.order_type == OrderType.MARKET and
+                        order.comment and 
+                        'closing' in order.comment.lower()
+                    )
+                    
+                    if is_closing_order:
+                        existing_close_order = order
+                        logger.info(f"Found existing closing order {order.id} with status {order.status}")
+                        continue
+                    
+                    # Handle WAITING_TRIGGER orders - delete from DB
+                    if order.status == OrderStatus.WAITING_TRIGGER:
+                        try:
+                            delete_instance(order, session=session)
+                            result['deleted_count'] += 1
+                            logger.info(f"Deleted WAITING_TRIGGER order {order.id} for transaction {transaction_id}")
+                        except Exception as e:
+                            logger.error(f"Error deleting WAITING_TRIGGER order {order.id}: {e}")
+                        continue
+                    
+                    # Cancel unfilled orders (but not closing orders)
+                    if order.status in unfilled_statuses and not is_closing_order:
+                        try:
+                            if hasattr(self, 'cancel_order') and order.broker_order_id:
+                                self.cancel_order(order.broker_order_id)
+                                result['canceled_count'] += 1
+                                logger.info(f"Canceled unfilled order {order.id} (broker: {order.broker_order_id})")
+                        except Exception as e:
+                            logger.error(f"Error canceling order {order.id}: {e}")
+                
+                # Handle filled positions
+                if has_filled:
+                    # Check if there's an existing close order
+                    if existing_close_order:
+                        if existing_close_order.status == OrderStatus.ERROR:
+                            # Retry the error order by resubmitting it
+                            logger.info(f"Retrying close order {existing_close_order.id} which is in ERROR state")
+                            try:
+                                # Resubmit the order
+                                submitted_order = self.submit_order(existing_close_order)
+                                if submitted_order:
+                                    result['success'] = True
+                                    result['close_order_id'] = existing_close_order.id
+                                    result['message'] = f'Retried close order for {transaction.symbol}'
+                                    if result['canceled_count'] > 0:
+                                        result['message'] += f' ({result["canceled_count"]} orders canceled)'
+                                    if result['deleted_count'] > 0:
+                                        result['message'] += f' ({result["deleted_count"]} waiting orders deleted)'
+                                else:
+                                    result['message'] = 'Failed to retry closing order'
+                            except Exception as e:
+                                logger.error(f"Error retrying close order: {e}", exc_info=True)
+                                result['message'] = f'Error retrying close order: {str(e)}'
+                        else:
+                            # Close order exists but not in error - do nothing
+                            logger.info(f"Close order {existing_close_order.id} exists with status {existing_close_order.status}, no action needed")
+                            result['success'] = True
+                            result['message'] = f'Close order already exists with status {existing_close_order.status.value}'
+                            if result['canceled_count'] > 0:
+                                result['message'] += f' ({result["canceled_count"]} orders canceled)'
+                            if result['deleted_count'] > 0:
+                                result['message'] += f' ({result["deleted_count"]} waiting orders deleted)'
+                    else:
+                        # No existing close order - create a new one
+                        logger.info(f"Creating new closing order for transaction {transaction_id}")
+                        # Determine closing side (opposite of position)
+                        close_side = OrderDirection.SELL if transaction.quantity > 0 else OrderDirection.BUY
+                        
+                        close_order = TradingOrder(
+                            account_id=self.id,
+                            symbol=transaction.symbol,
+                            quantity=abs(transaction.quantity),
+                            side=close_side,
+                            order_type=OrderType.MARKET,
+                            transaction_id=transaction.id,
+                            comment=f'Closing position for transaction {transaction.id}'
+                        )
+                        
+                        # Submit the closing order
+                        submitted_order = self.submit_order(close_order)
+                        
+                        if submitted_order:
+                            result['success'] = True
+                            result['close_order_id'] = submitted_order.id if hasattr(submitted_order, 'id') else None
+                            result['message'] = f'Closing order submitted for {transaction.symbol}'
+                            if result['canceled_count'] > 0:
+                                result['message'] += f' ({result["canceled_count"]} orders canceled)'
+                            if result['deleted_count'] > 0:
+                                result['message'] += f' ({result["deleted_count"]} waiting orders deleted)'
+                        else:
+                            result['message'] = 'Failed to submit closing order'
+                else:
+                    # No filled position, just report cleanup
+                    result['success'] = True
+                    result['message'] = 'Transaction cleanup completed'
+                    if result['canceled_count'] > 0:
+                        result['message'] += f': {result["canceled_count"]} orders canceled'
+                    if result['deleted_count'] > 0:
+                        result['message'] += f', {result["deleted_count"]} waiting orders deleted'
+                
+                session.commit()
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error closing transaction {transaction_id}: {e}", exc_info=True)
+            result['message'] = f'Error: {str(e)}'
+            return result

@@ -1955,13 +1955,13 @@ class TransactionsTab:
                                    :title="props.row.is_waiting ? 'Cancel Orders' : 'Close Position'"
                             />
                             <q-btn v-else-if="props.row.is_closing"
-                                   icon="hourglass_empty"
+                                   icon="refresh"
                                    size="sm"
                                    flat
                                    round
                                    color="orange"
-                                   disable
-                                   title="Closing in progress..."
+                                   @click="$parent.$emit('retry_close_transaction', props.row.id)"
+                                   title="Retry Close (reset status and try again)"
                             />
                             <span v-else class="text-grey-5">—</span>
                         </template>
@@ -2038,6 +2038,7 @@ class TransactionsTab:
         logger.debug("[RENDER] _render_transactions_table() - Setting up event handlers")
         self.transactions_table.on('edit_transaction', self._show_edit_dialog)
         self.transactions_table.on('close_transaction', self._show_close_dialog)
+        self.transactions_table.on('retry_close_transaction', self._show_retry_close_dialog)
         self.transactions_table.on('view_recommendation', self._show_recommendation_dialog)
         logger.debug("[RENDER] _render_transactions_table() - END (success)")
     
@@ -2150,6 +2151,130 @@ class TransactionsTab:
             ui.notify(f'Error: {str(e)}', type='negative')
             logger.error(f"Error updating TP/SL: {e}", exc_info=True)
     
+    def _show_retry_close_dialog(self, event_data):
+        """Show dialog to retry closing a transaction stuck in CLOSING status."""
+        from ...core.models import Transaction
+        from ...core.types import TransactionStatus
+        
+        # Extract transaction_id from event_data
+        transaction_id = event_data.args if hasattr(event_data, 'args') else event_data
+        
+        txn = get_instance(Transaction, transaction_id)
+        if not txn:
+            ui.notify('Transaction not found', type='negative')
+            return
+        
+        if txn.status != TransactionStatus.CLOSING:
+            ui.notify('Transaction is not in CLOSING status', type='warning')
+            return
+        
+        with ui.dialog() as dialog, ui.card().classes('w-96'):
+            ui.label('⚠️ Retry Close Transaction').classes('text-h6 mb-4')
+            
+            ui.label('This transaction is stuck in CLOSING status.').classes('mb-2')
+            ui.label(f'{txn.symbol}: {txn.quantity:+.2f} @ ${txn.open_price:.2f}').classes('text-sm font-bold mb-2')
+            
+            ui.separator().classes('my-4')
+            
+            ui.label('This will:').classes('font-bold mb-2')
+            with ui.column().classes('ml-4 mb-4'):
+                ui.label('1. Reset status back to OPENED/WAITING').classes('text-sm')
+                ui.label('2. Allow you to retry closing the position').classes('text-sm')
+                ui.label('3. You can then click Close again').classes('text-sm')
+            
+            ui.label('⚠️ Use this if the close operation failed or got stuck.').classes('text-sm text-orange mb-4')
+            
+            with ui.row().classes('w-full justify-end gap-2'):
+                ui.button('Cancel', on_click=dialog.close).props('flat')
+                ui.button('Reset & Retry', on_click=lambda: self._retry_close_position(transaction_id, dialog)).props('color=orange')
+        
+        dialog.open()
+    
+    def _retry_close_position(self, transaction_id, dialog):
+        """Reset transaction status from CLOSING to allow retry, then close using AccountInterface."""
+        from ...core.models import Transaction, TradingOrder
+        from ...core.types import TransactionStatus, OrderStatus
+        from ...core.db import update_instance
+        
+        try:
+            txn = get_instance(Transaction, transaction_id)
+            if not txn:
+                ui.notify('Transaction not found', type='negative')
+                return
+            
+            if txn.status != TransactionStatus.CLOSING:
+                ui.notify('Transaction is not in CLOSING status', type='warning')
+                dialog.close()
+                return
+            
+            # Get account interface
+            session = get_db()
+            orders_statement = select(TradingOrder).where(
+                TradingOrder.transaction_id == transaction_id
+            ).limit(1)
+            first_order = session.exec(orders_statement).first()
+            
+            if not first_order or not first_order.account_id:
+                ui.notify('Cannot find account for transaction', type='negative')
+                return
+            
+            from ...modules.accounts import get_account_class
+            from ...core.models import AccountDefinition
+            
+            acc_def = get_instance(AccountDefinition, first_order.account_id)
+            if not acc_def:
+                ui.notify('Account not found', type='negative')
+                return
+            
+            account_class = get_account_class(acc_def.provider)
+            if not account_class:
+                ui.notify(f'Account provider not found', type='negative')
+                return
+            
+            account = account_class(acc_def.id)
+            
+            # Capture client for background task
+            from nicegui import context
+            client = context.client
+            
+            # Use async AccountInterface close_transaction method (handles retry logic and refresh)
+            logger.info(f"Retrying close for transaction {transaction_id}")
+            
+            async def retry_close_async():
+                try:
+                    result = await account.close_transaction_async(transaction_id)
+                    
+                    # Use client.safe_invoke for UI updates from background task
+                    def show_result():
+                        if result['success']:
+                            ui.notify(result['message'], type='positive')
+                            logger.info(f"Retry close transaction {transaction_id}: {result['message']}")
+                        else:
+                            ui.notify(result['message'], type='negative')
+                            logger.error(f"Retry close transaction {transaction_id} failed: {result['message']}")
+                        self._refresh_transactions()
+                    
+                    client.safe_invoke(show_result)
+                    
+                except Exception as e:
+                    # Schedule error notification via client
+                    def show_error():
+                        ui.notify(f'Error during retry close: {str(e)}', type='negative')
+                    client.safe_invoke(show_error)
+                    logger.error(f"Error in retry_close_async: {e}", exc_info=True)
+            
+            # Run async operation using background_tasks
+            from nicegui import background_tasks
+            background_tasks.create(retry_close_async(), name=f'retry_close_{transaction_id}')
+            
+            dialog.close()
+            # Show immediate feedback
+            ui.notify('Closing transaction...', type='info')
+            
+        except Exception as e:
+            ui.notify(f'Error: {str(e)}', type='negative')
+            logger.error(f"Error retrying close position: {e}", exc_info=True)
+    
     def _show_close_dialog(self, event_data):
         """Show confirmation dialog before closing a position."""
         from ...core.models import Transaction
@@ -2176,14 +2301,15 @@ class TransactionsTab:
     
     def _close_position(self, transaction_id, dialog):
         """
-        Close a position by:
-        1. Canceling any unfilled orders
-        2. Deleting WAITING_TRIGGER orders from DB
-        3. Creating a closing order for filled positions
+        Close a position using AccountInterface.close_transaction method.
+        This handles all closing logic including:
+        - Canceling unfilled orders
+        - Deleting WAITING_TRIGGER orders
+        - Checking for existing close orders
+        - Creating new closing orders if needed
         """
-        from ...core.models import Transaction
-        from ...core.types import OrderDirection, OrderType, TransactionStatus, OrderStatus
-        from ...core.db import delete_instance
+        from ...core.models import Transaction, TradingOrder
+        from ...core.types import TransactionStatus
         
         try:
             txn = get_instance(Transaction, transaction_id)
@@ -2197,30 +2323,18 @@ class TransactionsTab:
                 dialog.close()
                 return
             
-            # Set transaction status to CLOSING to prevent duplicate close attempts
-            from ...core.db import update_instance
-            txn.status = TransactionStatus.CLOSING
-            update_instance(txn)
-            logger.info(f"Set transaction {transaction_id} status to CLOSING")
-            
-            # Query for ALL orders associated with this transaction
-            session = get_db()
-            all_orders_statement = select(TradingOrder).where(
-                TradingOrder.transaction_id == transaction_id
-            ).order_by(TradingOrder.created_at)
-            all_orders = list(session.exec(all_orders_statement).all())
-            
-            if not all_orders:
-                ui.notify('No orders found for this transaction', type='negative')
-                return
-            
             # Get account from first order
-            first_order = all_orders[0]
-            if not first_order.account_id:
-                ui.notify('Account not found', type='negative')
+            session = get_db()
+            order_statement = select(TradingOrder).where(
+                TradingOrder.transaction_id == transaction_id
+            ).limit(1)
+            first_order = session.exec(order_statement).first()
+            
+            if not first_order or not first_order.account_id:
+                ui.notify('Cannot find account for transaction', type='negative')
                 return
             
-            # Get account
+            # Get account interface
             from ...modules.accounts import get_account_class
             from ...core.models import AccountDefinition
             
@@ -2236,80 +2350,43 @@ class TransactionsTab:
             
             account = account_class(acc_def.id)
             
-            # Process all orders for this transaction
-            unfilled_statuses = OrderStatus.get_unfilled_statuses()
-            canceled_count = 0
-            deleted_count = 0
-            has_filled = False
+            # Capture client for background task
+            from nicegui import context
+            client = context.client
             
-            for order in all_orders:
-                # Check if order was filled
-                if order.status in OrderStatus.get_executed_statuses():
-                    has_filled = True
-                    continue
-                
-                # Handle WAITING_TRIGGER orders - delete from DB
-                if order.status == OrderStatus.WAITING_TRIGGER:
-                    try:
-                        # Pass the session to avoid attachment issues
-                        delete_instance(order, session=session)
-                        deleted_count += 1
-                        logger.info(f"Deleted WAITING_TRIGGER order {order.id} for transaction {transaction_id}")
-                    except Exception as e:
-                        logger.error(f"Error deleting WAITING_TRIGGER order {order.id}: {e}")
-                    continue
-                
-                # Cancel unfilled orders
-                if order.status in unfilled_statuses:
-                    try:
-                        if hasattr(account, 'cancel_order') and order.broker_order_id:
-                            account.cancel_order(order.broker_order_id)
-                            canceled_count += 1
-                            logger.info(f"Canceled unfilled order {order.id} (broker: {order.broker_order_id})")
-                    except Exception as e:
-                        logger.error(f"Error canceling order {order.id}: {e}")
+            # Use async AccountInterface close_transaction method (includes refresh)
+            logger.info(f"Closing transaction {transaction_id}")
             
-            # If position was filled, create closing order
-            if has_filled:
-                # Create closing order (opposite side)
-                close_side = OrderDirection.SELL if txn.quantity > 0 else OrderDirection.BUY
-                
-                close_order = TradingOrder(
-                    account_id=first_order.account_id,
-                    symbol=txn.symbol,
-                    quantity=abs(txn.quantity),
-                    side=close_side,
-                    order_type=OrderType.MARKET,
-                    transaction_id=txn.id,
-                    comment=f'Closing position for transaction {txn.id}'
-                )
-                
-                # Submit the closing order
-                submitted_order = account.submit_order(close_order)
-                
-                if submitted_order:
-                    msg = f'Closing order submitted for {txn.symbol}'
-                    if canceled_count > 0:
-                        msg += f' ({canceled_count} orders canceled)'
-                    if deleted_count > 0:
-                        msg += f' ({deleted_count} waiting orders deleted)'
-                    ui.notify(msg, type='positive')
-                    dialog.close()
-                    # Refresh transactions table after a short delay
-                    ui.timer(0.3, self._refresh_transactions, once=True)
-                else:
-                    ui.notify('Failed to submit closing order', type='negative')
-            else:
-                # No filled position, just report cleanup
-                msg = f'Transaction cleanup completed'
-                if canceled_count > 0:
-                    msg += f': {canceled_count} orders canceled'
-                if deleted_count > 0:
-                    msg += f', {deleted_count} waiting orders deleted'
-                ui.notify(msg, type='info')
-                dialog.close()
-                # Refresh transactions table after a short delay
-                ui.timer(0.3, self._refresh_transactions, once=True)
+            async def close_async():
+                try:
+                    result = await account.close_transaction_async(transaction_id)
+                    
+                    # Use client.safe_invoke for UI updates from background task
+                    def show_result():
+                        if result['success']:
+                            ui.notify(result['message'], type='positive')
+                            logger.info(f"Close transaction {transaction_id}: {result['message']}")
+                        else:
+                            ui.notify(result['message'], type='negative')
+                            logger.error(f"Close transaction {transaction_id} failed: {result['message']}")
+                        self._refresh_transactions()
+                    
+                    client.safe_invoke(show_result)
+                    
+                except Exception as e:
+                    # Schedule error notification via client
+                    def show_error():
+                        ui.notify(f'Error during close: {str(e)}', type='negative')
+                    client.safe_invoke(show_error)
+                    logger.error(f"Error in close_async: {e}", exc_info=True)
+            
+            # Run async operation using background_tasks
+            from nicegui import background_tasks
+            background_tasks.create(close_async(), name=f'close_{transaction_id}')
+            
+            dialog.close()
+            # Show immediate feedback
+            ui.notify('Closing transaction...', type='info')
             
         except Exception as e:
             ui.notify(f'Error: {str(e)}', type='negative')
