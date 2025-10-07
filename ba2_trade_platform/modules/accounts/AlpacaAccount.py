@@ -664,9 +664,9 @@ class AlpacaAccount(AccountInterface):
                         has_changes = True
                     
                     # Update open_price if it changed (use broker's filled_avg_price)
-                    if alpaca_order.filled_avg_price and (db_order.open_price is None or float(db_order.open_price) != float(alpaca_order.filled_avg_price)):
-                        logger.debug(f"Order {db_order.id} open_price changed: {db_order.open_price} -> {alpaca_order.filled_avg_price}")
-                        db_order.open_price = alpaca_order.filled_avg_price
+                    if alpaca_order.open_price and (db_order.open_price is None or float(db_order.open_price) != float(alpaca_order.open_price)):
+                        logger.debug(f"Order {db_order.id} open_price changed: {db_order.open_price} -> {alpaca_order.open_price}")
+                        db_order.open_price = alpaca_order.open_price
                         has_changes = True
                     
                     # Update broker_order_id if it wasn't set before (non-heuristic path)
