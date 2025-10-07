@@ -986,9 +986,9 @@ class AccountInterface(ExtendableSettingsInterface):
                     if order.status in unsent_statuses:
                         try:
                             order.status = OrderStatus.CLOSED
-                            update_instance(order)
+                            session.add(order)  # Use the existing session
                             result['deleted_count'] += 1
-                            logger.info(f"Marked unsent order {order.id} (status: {order.status}) as CLOSED for transaction {transaction_id}")
+                            logger.info(f"Marked unsent order {order.id} as CLOSED for transaction {transaction_id}")
                         except Exception as e:
                             logger.error(f"Error marking unsent order {order.id} as CLOSED: {e}")
                         continue
@@ -1072,6 +1072,18 @@ class AccountInterface(ExtendableSettingsInterface):
                         result['message'] += f': {result["canceled_count"]} orders canceled'
                     if result['deleted_count'] > 0:
                         result['message'] += f', {result["deleted_count"]} waiting orders deleted'
+                
+                # Check if all orders are now in terminal statuses and close transaction if so
+                terminal_statuses = OrderStatus.get_terminal_statuses()
+                all_orders_terminal = all(order.status in terminal_statuses for order in all_orders)
+                
+                if all_orders_terminal and transaction.status != TransactionStatus.CLOSED:
+                    transaction.status = TransactionStatus.CLOSED
+                    if not transaction.close_date:
+                        transaction.close_date = datetime.now(timezone.utc)
+                    session.add(transaction)
+                    logger.info(f"All orders for transaction {transaction_id} are in terminal status, marking transaction as CLOSED")
+                    result['message'] += ' (transaction closed)'
                 
                 session.commit()
             
