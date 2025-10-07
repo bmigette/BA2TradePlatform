@@ -2195,9 +2195,13 @@ def content() -> None:
         with ui.tab_panel(tab_objects['recommendations']):
             OrderRecommendationsTab()
     
-    # Setup HTML5 history navigation for tabs using timer for async compatibility
-    def setup_tab_navigation():
-        ui.run_javascript('''
+    # Setup HTML5 history navigation for tabs (NiceGUI 3.0 compatible)
+    async def setup_tab_navigation():
+        # In NiceGUI 3.0, ui.run_javascript automatically waits for client.connected()
+        # So we use await to properly handle the async nature
+        from nicegui import context
+        await context.client.connected()
+        await ui.run_javascript('''
             (function() {
                 let isPopstateNavigation = false;
                 
@@ -2251,12 +2255,17 @@ def content() -> None:
                 // Handle initial page load with hash
                 const hash = window.location.hash.substring(1);
                 if (hash && hash !== 'monitoring') {
-                    const tabs = document.querySelectorAll('.q-tab');
-                    tabs.forEach(tab => {
-                        if (tab.getAttribute('name') === hash) {
-                            tab.click();
-                        }
-                    });
+                    // Wait a bit for tabs to be fully rendered
+                    setTimeout(() => {
+                        const tabs = document.querySelectorAll('.q-tab');
+                        tabs.forEach(tab => {
+                            const tabName = getTabName(tab);
+                            if (tabName === hash) {
+                                console.log('Initial load: activating tab for hash:', hash);
+                                tab.click();
+                            }
+                        });
+                    }, 50);
                 } else if (!hash) {
                     // Set initial hash if none exists
                     history.replaceState({tab: 'monitoring'}, '', '#monitoring');
@@ -2264,7 +2273,7 @@ def content() -> None:
                 
                 setupTabClickHandlers();
             })();
-        ''')
+        ''', timeout=3.0)
     
-    # Use timer to run JavaScript after page is loaded (increased delay to ensure tabs are rendered)
-    ui.timer(0.5, setup_tab_navigation, once=True)
+    # Use timer to run async setup (shorter delay since we explicitly wait for connection)
+    ui.timer(0.1, setup_tab_navigation, once=True)

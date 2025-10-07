@@ -64,7 +64,72 @@ self.table.rows.extend(new_rows)
 # No .update() needed - automatic in 3.0+
 ```
 
-### 2. Updated requirements.txt ✅
+### 3. Fixed Hash Navigation for Async JavaScript Execution ✅
+
+**Why**: In NiceGUI 3.0, `ui.run_javascript()` automatically waits for `client.connected()` before executing. This broke hash-based tab navigation that relied on synchronous JavaScript execution with timer delays.
+
+**Files Changed:**
+- `ba2_trade_platform/ui/pages/overview.py` (hash navigation for tabs)
+- `ba2_trade_platform/ui/pages/settings.py` (hash navigation for tabs)
+- `ba2_trade_platform/ui/pages/marketanalysis.py` (hash navigation for tabs)
+
+**Before (2.x):**
+```python
+def setup_tab_navigation():
+    ui.run_javascript('''...''')  # Synchronous execution
+    
+ui.timer(0.5, setup_tab_navigation, once=True)  # Long delay to ensure DOM ready
+```
+
+**After (3.0):**
+```python
+async def setup_tab_navigation():
+    from nicegui import context
+    await context.client.connected()  # Explicit connection wait
+    await ui.run_javascript('''...''', timeout=3.0)  # Async with timeout
+    
+ui.timer(0.1, setup_tab_navigation, once=True)  # Shorter delay since we wait explicitly
+```
+
+**What Changed**: 
+- Converted to async function with `async def`
+- Added explicit `await context.client.connected()` 
+- Use `await ui.run_javascript()` for proper async handling
+- Reduced timer delay from 0.5s to 0.1s (connection wait is now explicit)
+- Added 3.0 second timeout to JavaScript execution
+- **Fixed initial page load**: Use `getTabName()` function consistently instead of checking `name` attribute
+- **Added 50ms delay** for tab rendering before clicking on initial load
+
+**JavaScript Changes**:
+```javascript
+// OLD - Wrong approach (checked name attribute)
+const tabs = document.querySelectorAll('.q-tab[name]');
+tabs.forEach(tab => {
+    if (tab.getAttribute('name') === hash) {
+        tab.click();
+    }
+});
+
+// NEW - Correct approach (use getTabName function)
+setTimeout(() => {
+    const tabs = document.querySelectorAll('.q-tab');
+    tabs.forEach(tab => {
+        const tabName = getTabName(tab);
+        if (tabName === hash) {
+            console.log('Initial load: activating tab for hash:', hash);
+            tab.click();
+        }
+    });
+}, 50);
+```
+
+**Impact**: 
+- ✅ Hash navigation now works on initial page load (e.g., `http://127.0.0.1:8080/#account`)
+- ✅ Cross-page navigation with hash works (e.g., `/marketanalysis#manual`)
+- ✅ Browser back/forward buttons work correctly
+- ✅ Tab switching updates URL hash
+
+### 4. Updated requirements.txt ✅
 
 Changed `nicegui` to `nicegui>=3.0.0` to ensure version 3.0+ is installed.
 
@@ -118,6 +183,9 @@ After upgrading to NiceGUI 3.0:
 - [ ] Test SVG icons render correctly
 - [ ] Test settings page help text displays
 - [ ] Test TradingAgents expert output displays correctly
+- [ ] **Test hash navigation works (/#overview, /#transactions, etc.)**
+- [ ] **Test browser back/forward buttons work with hash navigation**
+- [ ] **Test direct URL loading with hash (e.g., /#transactions)**
 - [ ] Test transaction table updates (overview page)
 - [ ] Test market analysis table updates
 - [ ] Test instrument selector table updates
