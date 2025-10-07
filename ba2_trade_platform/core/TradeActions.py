@@ -911,6 +911,372 @@ class AdjustStopLossAction(TradeAction):
         return f"Set or adjust stop loss order for {self.instrument_name}{price_desc}"
 
 
+class IncreaseInstrumentShareAction(TradeAction):
+    """Increase position size for an instrument to reach target allocation percentage."""
+    
+    def __init__(self, instrument_name: str, account: AccountInterface, 
+                 order_recommendation: OrderRecommendation, existing_order: Optional[TradingOrder] = None,
+                 expert_recommendation: Optional[ExpertRecommendation] = None,
+                 target_percent: Optional[float] = None):
+        """
+        Initialize increase instrument share action.
+        
+        Args:
+            instrument_name: Instrument name
+            account: Account interface
+            order_recommendation: Order recommendation
+            existing_order: Existing order (optional)
+            expert_recommendation: Expert recommendation for linking
+            target_percent: Target percentage of virtual equity (e.g., 15.0 for 15%)
+        """
+        super().__init__(instrument_name, account, order_recommendation, existing_order, expert_recommendation)
+        self.target_percent = target_percent
+    
+    def execute(self) -> "TradeActionResult":
+        """
+        Increase position to reach target percentage of virtual equity.
+        
+        Returns:
+            TradeActionResult object containing execution results
+        """
+        try:
+            if self.target_percent is None or self.target_percent <= 0:
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.INCREASE_INSTRUMENT_SHARE.value,
+                    success=False,
+                    message="Invalid target_percent provided",
+                    data={}
+                )
+            
+            # Get expert instance and virtual equity
+            expert_instance_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
+            if not expert_instance_id:
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.INCREASE_INSTRUMENT_SHARE.value,
+                    success=False,
+                    message="No expert instance ID available",
+                    data={}
+                )
+            
+            from .utils import get_expert_instance_from_id
+            expert = get_expert_instance_from_id(expert_instance_id)
+            if not expert:
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.INCREASE_INSTRUMENT_SHARE.value,
+                    success=False,
+                    message=f"Expert instance {expert_instance_id} not found",
+                    data={}
+                )
+            
+            # Get virtual equity (available balance)
+            virtual_equity = expert.get_available_balance()
+            if virtual_equity is None or virtual_equity <= 0:
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.INCREASE_INSTRUMENT_SHARE.value,
+                    success=False,
+                    message="Cannot get virtual equity for expert",
+                    data={}
+                )
+            
+            # Get max allowed per instrument
+            max_percent_per_instrument = expert.settings.get('max_virtual_equity_per_instrument_percent', 10.0)
+            if self.target_percent > max_percent_per_instrument:
+                logger.warning(f"Target percent {self.target_percent}% exceeds max allowed {max_percent_per_instrument}%. Using max.")
+                self.target_percent = max_percent_per_instrument
+            
+            # Calculate target position value
+            target_value = virtual_equity * (self.target_percent / 100.0)
+            
+            # Get current position value
+            current_position_qty = self.get_current_position()
+            if current_position_qty is None:
+                current_position_qty = 0.0
+            
+            current_price = self.get_current_price()
+            if current_price is None:
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.INCREASE_INSTRUMENT_SHARE.value,
+                    success=False,
+                    message=f"Cannot get current price for {self.instrument_name}",
+                    data={}
+                )
+            
+            current_value = abs(current_position_qty) * current_price
+            
+            # Calculate additional value needed
+            additional_value = target_value - current_value
+            
+            if additional_value <= 0:
+                logger.info(f"Current position value ${current_value:.2f} already at or above target ${target_value:.2f}")
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.INCREASE_INSTRUMENT_SHARE.value,
+                    success=False,
+                    message=f"Position already at target (current: {(current_value/virtual_equity*100):.1f}%, target: {self.target_percent}%)",
+                    data={"current_value": current_value, "target_value": target_value}
+                )
+            
+            # Check available balance
+            account_balance = self.account.get_account_info().get('buying_power', 0)
+            if additional_value > account_balance:
+                logger.warning(f"Additional value ${additional_value:.2f} exceeds available balance ${account_balance:.2f}")
+                additional_value = account_balance
+            
+            # Calculate additional quantity needed
+            additional_qty = additional_value / current_price
+            
+            # Round to appropriate lot size (minimum 1 share)
+            additional_qty = max(1.0, round(additional_qty))
+            
+            logger.info(f"Increasing {self.instrument_name}: current={current_position_qty}, additional={additional_qty}, "
+                       f"target_value=${target_value:.2f} ({self.target_percent}% of ${virtual_equity:.2f})")
+            
+            # Determine side based on current position or recommendation
+            if current_position_qty >= 0:
+                side = "BUY"
+            else:
+                side = "SELL"  # Short position - sell more
+            
+            # Create market order
+            order = self.create_order_record(
+                side=side,
+                quantity=additional_qty,
+                order_type="market"
+            )
+            
+            if not order:
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.INCREASE_INSTRUMENT_SHARE.value,
+                    success=False,
+                    message="Failed to create order record",
+                    data={}
+                )
+            
+            # Save order to database
+            order_id = add_instance(order)
+            if not order_id:
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.INCREASE_INSTRUMENT_SHARE.value,
+                    success=False,
+                    message="Failed to save order to database",
+                    data={}
+                )
+            
+            logger.info(f"Created increase share order {order_id}: {side} {additional_qty} {self.instrument_name}")
+            
+            return self.create_and_save_action_result(
+                action_type=ExpertActionType.INCREASE_INSTRUMENT_SHARE.value,
+                success=True,
+                message=f"Created order to increase {self.instrument_name} to {self.target_percent}% of portfolio",
+                data={
+                    "order_id": order_id,
+                    "quantity": additional_qty,
+                    "side": side,
+                    "current_percent": (current_value / virtual_equity * 100),
+                    "target_percent": self.target_percent
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"Error executing increase instrument share action for {self.instrument_name}: {e}", exc_info=True)
+            return self.create_and_save_action_result(
+                action_type=ExpertActionType.INCREASE_INSTRUMENT_SHARE.value,
+                success=False,
+                message=f"Error: {str(e)}",
+                data={}
+            )
+    
+    def get_description(self) -> str:
+        """Get description of increase instrument share action."""
+        return f"Increase {self.instrument_name} position to {self.target_percent}% of virtual equity"
+
+
+class DecreaseInstrumentShareAction(TradeAction):
+    """Decrease position size for an instrument to reach target allocation percentage."""
+    
+    def __init__(self, instrument_name: str, account: AccountInterface, 
+                 order_recommendation: OrderRecommendation, existing_order: Optional[TradingOrder] = None,
+                 expert_recommendation: Optional[ExpertRecommendation] = None,
+                 target_percent: Optional[float] = None):
+        """
+        Initialize decrease instrument share action.
+        
+        Args:
+            instrument_name: Instrument name
+            account: Account interface
+            order_recommendation: Order recommendation
+            existing_order: Existing order (optional)
+            expert_recommendation: Expert recommendation for linking
+            target_percent: Target percentage of virtual equity (e.g., 5.0 for 5%)
+        """
+        super().__init__(instrument_name, account, order_recommendation, existing_order, expert_recommendation)
+        self.target_percent = target_percent
+    
+    def execute(self) -> "TradeActionResult":
+        """
+        Decrease position to reach target percentage of virtual equity.
+        Maintains minimum of 1 share if not fully closing.
+        
+        Returns:
+            TradeActionResult object containing execution results
+        """
+        try:
+            if self.target_percent is None or self.target_percent < 0:
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.DECREASE_INSTRUMENT_SHARE.value,
+                    success=False,
+                    message="Invalid target_percent provided",
+                    data={}
+                )
+            
+            # Get expert instance and virtual equity
+            expert_instance_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
+            if not expert_instance_id:
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.DECREASE_INSTRUMENT_SHARE.value,
+                    success=False,
+                    message="No expert instance ID available",
+                    data={}
+                )
+            
+            from .utils import get_expert_instance_from_id
+            expert = get_expert_instance_from_id(expert_instance_id)
+            if not expert:
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.DECREASE_INSTRUMENT_SHARE.value,
+                    success=False,
+                    message=f"Expert instance {expert_instance_id} not found",
+                    data={}
+                )
+            
+            # Get virtual equity (available balance)
+            virtual_equity = expert.get_available_balance()
+            if virtual_equity is None or virtual_equity <= 0:
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.DECREASE_INSTRUMENT_SHARE.value,
+                    success=False,
+                    message="Cannot get virtual equity for expert",
+                    data={}
+                )
+            
+            # Calculate target position value
+            target_value = virtual_equity * (self.target_percent / 100.0)
+            
+            # Get current position
+            current_position_qty = self.get_current_position()
+            if current_position_qty is None or current_position_qty == 0:
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.DECREASE_INSTRUMENT_SHARE.value,
+                    success=False,
+                    message="No position to decrease",
+                    data={}
+                )
+            
+            current_price = self.get_current_price()
+            if current_price is None:
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.DECREASE_INSTRUMENT_SHARE.value,
+                    success=False,
+                    message=f"Cannot get current price for {self.instrument_name}",
+                    data={}
+                )
+            
+            current_value = abs(current_position_qty) * current_price
+            
+            # Calculate reduction needed
+            reduction_value = current_value - target_value
+            
+            if reduction_value <= 0:
+                logger.info(f"Current position value ${current_value:.2f} already at or below target ${target_value:.2f}")
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.DECREASE_INSTRUMENT_SHARE.value,
+                    success=False,
+                    message=f"Position already at target (current: {(current_value/virtual_equity*100):.1f}%, target: {self.target_percent}%)",
+                    data={"current_value": current_value, "target_value": target_value}
+                )
+            
+            # Calculate quantity to sell
+            reduction_qty = reduction_value / current_price
+            
+            # Round appropriately
+            reduction_qty = round(reduction_qty)
+            
+            # Ensure we keep at least 1 share if not closing completely
+            remaining_qty = abs(current_position_qty) - reduction_qty
+            if self.target_percent > 0 and remaining_qty < 1:
+                # Adjust to keep minimum 1 share
+                reduction_qty = abs(current_position_qty) - 1
+                if reduction_qty < 1:
+                    return self.create_and_save_action_result(
+                        action_type=ExpertActionType.DECREASE_INSTRUMENT_SHARE.value,
+                        success=False,
+                        message="Cannot reduce position while maintaining minimum 1 share",
+                        data={}
+                    )
+            
+            logger.info(f"Decreasing {self.instrument_name}: current_qty={current_position_qty}, reduction={reduction_qty}, "
+                       f"target_value=${target_value:.2f} ({self.target_percent}% of ${virtual_equity:.2f})")
+            
+            # Determine side (opposite of current position)
+            if current_position_qty > 0:
+                side = "SELL"  # Close long position
+            else:
+                side = "BUY"   # Cover short position
+            
+            # Create market order
+            order = self.create_order_record(
+                side=side,
+                quantity=reduction_qty,
+                order_type="market"
+            )
+            
+            if not order:
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.DECREASE_INSTRUMENT_SHARE.value,
+                    success=False,
+                    message="Failed to create order record",
+                    data={}
+                )
+            
+            # Save order to database
+            order_id = add_instance(order)
+            if not order_id:
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.DECREASE_INSTRUMENT_SHARE.value,
+                    success=False,
+                    message="Failed to save order to database",
+                    data={}
+                )
+            
+            logger.info(f"Created decrease share order {order_id}: {side} {reduction_qty} {self.instrument_name}")
+            
+            return self.create_and_save_action_result(
+                action_type=ExpertActionType.DECREASE_INSTRUMENT_SHARE.value,
+                success=True,
+                message=f"Created order to decrease {self.instrument_name} to {self.target_percent}% of portfolio",
+                data={
+                    "order_id": order_id,
+                    "quantity": reduction_qty,
+                    "side": side,
+                    "current_percent": (current_value / virtual_equity * 100),
+                    "target_percent": self.target_percent,
+                    "remaining_qty": remaining_qty
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"Error executing decrease instrument share action for {self.instrument_name}: {e}", exc_info=True)
+            return self.create_and_save_action_result(
+                action_type=ExpertActionType.DECREASE_INSTRUMENT_SHARE.value,
+                success=False,
+                message=f"Error: {str(e)}",
+                data={}
+            )
+    
+    def get_description(self) -> str:
+        """Get description of decrease instrument share action."""
+        return f"Decrease {self.instrument_name} position to {self.target_percent}% of virtual equity"
+
+
 # Factory function to create actions based on action type
 def create_action(action_type: ExpertActionType, instrument_name: str, account: AccountInterface,
                  order_recommendation: OrderRecommendation, existing_order: Optional[TradingOrder] = None,
@@ -937,6 +1303,8 @@ def create_action(action_type: ExpertActionType, instrument_name: str, account: 
         ExpertActionType.CLOSE: CloseAction,
         ExpertActionType.ADJUST_TAKE_PROFIT: AdjustTakeProfitAction,
         ExpertActionType.ADJUST_STOP_LOSS: AdjustStopLossAction,
+        ExpertActionType.INCREASE_INSTRUMENT_SHARE: IncreaseInstrumentShareAction,
+        ExpertActionType.DECREASE_INSTRUMENT_SHARE: DecreaseInstrumentShareAction,
     }
     
     action_class = action_map.get(action_type)
@@ -944,13 +1312,13 @@ def create_action(action_type: ExpertActionType, instrument_name: str, account: 
         raise ValueError(f"Unknown action type: {action_type}")
     
     # Create action with appropriate arguments
-    # Only pass expert_recommendation to order-creating actions (BUY, SELL, CLOSE)
+    # Only pass expert_recommendation to order-creating actions (BUY, SELL, CLOSE, INCREASE/DECREASE_SHARE)
     # AdjustTP/SL actions only need existing_order from enter_market or open positions
     if action_type in [ExpertActionType.ADJUST_TAKE_PROFIT, ExpertActionType.ADJUST_STOP_LOSS]:
         return action_class(instrument_name, account, order_recommendation, existing_order, **kwargs)
     else:
-        # BUY, SELL, CLOSE actions get expert_recommendation for order linking
-        return action_class(instrument_name, account, order_recommendation, existing_order, expert_recommendation)
+        # BUY, SELL, CLOSE, INCREASE/DECREASE_SHARE actions get expert_recommendation for order linking
+        return action_class(instrument_name, account, order_recommendation, existing_order, expert_recommendation, **kwargs)
 
 
 # TODO: Implement sequence management for complex trading scenarios

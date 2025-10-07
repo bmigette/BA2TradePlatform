@@ -197,6 +197,12 @@ def get_event_type_documentation() -> dict:
             "description": "The expert's confidence level in this recommendation, typically 0.0-1.0 (0-100%). Higher = more confident. Used with numeric comparisons.",
             "type": "numeric",
             "example": "Only enter trades when confidence >= 0.75 (75%)"
+        },
+        ExpertEventType.N_INSTRUMENT_ACCOUNT_SHARE.value: {
+            "name": "Instrument Account Share",
+            "description": "Current market value of the instrument position as a percentage of the expert's virtual equity (available balance). Useful for portfolio rebalancing and position sizing.",
+            "type": "numeric",
+            "example": "Rebalance when instrument_account_share > 15% (position too large) or < 5% (position too small)"
         }
     }
 
@@ -265,6 +271,30 @@ def get_action_type_documentation() -> dict:
             ],
             "parameters": "Requires reference value (order_open_price, current_price, expert_target_price) and percentage/amount adjustment",
             "example": "When profit_loss_percent >= 10%, adjust_stop_loss to entry price (breakeven)"
+        },
+        ExpertActionType.INCREASE_INSTRUMENT_SHARE.value: {
+            "name": "Increase Instrument Share",
+            "description": "Increase position size to reach a target percentage of virtual equity. Respects max_virtual_equity_per_instrument_percent setting and available balance constraints.",
+            "use_cases": [
+                "Scale into high-conviction positions",
+                "Rebalance portfolio when instrument share is too low",
+                "Increase allocation when confidence improves",
+                "Build position gradually over time"
+            ],
+            "parameters": "Requires target_percent (e.g., 15.0 for 15% of virtual equity). Automatically calculates required quantity.",
+            "example": "When confidence >= 85% and instrument_account_share < 10%, increase_instrument_share to 12%"
+        },
+        ExpertActionType.DECREASE_INSTRUMENT_SHARE.value: {
+            "name": "Decrease Instrument Share",
+            "description": "Decrease position size to reach a target percentage of virtual equity. Maintains minimum of 1 share unless fully closing (target 0%). Used for risk management and rebalancing.",
+            "use_cases": [
+                "Reduce overweight positions for diversification",
+                "Take partial profits while maintaining position",
+                "Rebalance when instrument share exceeds target",
+                "Reduce exposure when confidence decreases"
+            ],
+            "parameters": "Requires target_percent (e.g., 5.0 for 5% of virtual equity). Keeps minimum 1 share if target > 0%. Automatically calculates quantity to sell.",
+            "example": "When instrument_account_share > 15%, decrease_instrument_share to 10% (rebalance)"
         }
     }
 

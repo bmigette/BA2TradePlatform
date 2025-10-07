@@ -169,6 +169,189 @@ class Transaction(SQLModel, table=True):
     
     def __str__(self) -> str:
         return self.as_string()
+    
+    def get_current_open_qty(self) -> float:
+        """
+        Get the total quantity of filled orders (BUY/SELL) for this transaction.
+        Does not include limit/stop orders that haven't been filled yet.
+        
+        Returns:
+            float: Total filled quantity (positive for longs, negative for shorts)
+        """
+        from .db import get_db
+        from sqlmodel import Session, select
+        
+        total_qty = 0.0
+        
+        with Session(get_db().bind) as session:
+            # Get all orders for this transaction
+            statement = select(TradingOrder).where(
+                TradingOrder.transaction_id == self.id
+            )
+            orders = session.exec(statement).all()
+            
+            for order in orders:
+                # Only count filled orders
+                if order.status in OrderStatus.get_executed_statuses() and order.filled_qty:
+                    # Add to total based on side (BUY is positive, SELL is negative)
+                    if order.side == OrderDirection.BUY:
+                        total_qty += order.filled_qty
+                    elif order.side == OrderDirection.SELL:
+                        total_qty -= order.filled_qty
+        
+        return total_qty
+    
+    def get_pending_open_qty(self) -> float:
+        """
+        Get the total quantity of pending unfilled orders (BUY/SELL) for this transaction.
+        Includes orders that are open but not yet filled.
+        
+        Returns:
+            float: Total pending quantity (positive for buy orders, negative for sell orders)
+        """
+        from .db import get_db
+        from sqlmodel import Session, select
+        
+        total_qty = 0.0
+        
+        with Session(get_db().bind) as session:
+            # Get all orders for this transaction
+            statement = select(TradingOrder).where(
+                TradingOrder.transaction_id == self.id
+            )
+            orders = session.exec(statement).all()
+            
+            for order in orders:
+                # Only count unfilled orders (excluding take profit and stop loss orders)
+                if order.status in OrderStatus.get_unfilled_statuses():
+                    # Skip dependent orders (TP/SL orders)
+                    if order.depends_on_order is not None:
+                        continue
+                    
+                    # Calculate remaining quantity
+                    remaining_qty = order.quantity
+                    if order.filled_qty:
+                        remaining_qty -= order.filled_qty
+                    
+                    if remaining_qty > 0:
+                        # Add to total based on side (BUY is positive, SELL is negative)
+                        if order.side == OrderDirection.BUY:
+                            total_qty += remaining_qty
+                        elif order.side == OrderDirection.SELL:
+                            total_qty -= remaining_qty
+        
+        return total_qty
+    
+    def get_current_open_equity(self, account_interface=None) -> float:
+        """
+        Calculate the equity value of currently filled orders.
+        Uses the open_price from filled orders.
+        
+        Args:
+            account_interface: Optional account interface for getting current market price
+        
+        Returns:
+            float: Total equity value of filled positions
+        """
+        from .db import get_db
+        from sqlmodel import Session, select
+        from ..logger import logger
+        
+        total_equity = 0.0
+        
+        with Session(get_db().bind) as session:
+            # Get all orders for this transaction
+            statement = select(TradingOrder).where(
+                TradingOrder.transaction_id == self.id
+            )
+            orders = session.exec(statement).all()
+            
+            # logger.debug(f"Transaction {self.id}.get_current_open_equity(): Found {len(orders)} orders")
+            
+            for order in orders:
+                # Only count filled orders
+                if order.status in OrderStatus.get_executed_statuses() and order.filled_qty:
+                    # Use open_price if available, otherwise use filled_avg_price
+                    price = order.open_price if order.open_price else order.filled_avg_price
+                    
+                    if price:
+                        # Calculate value: quantity × price
+                        equity = abs(order.filled_qty) * price
+                        total_equity += equity
+                        # logger.debug(f"  Order {order.id}: filled_qty={order.filled_qty}, price={price}, equity=${equity:.2f}")
+                    # else:
+                    #     logger.debug(f"  Order {order.id}: No price available (open_price={order.open_price}, filled_avg_price={order.filled_avg_price})")
+                # else:
+                #     logger.debug(f"  Order {order.id}: Skipped (status={order.status}, filled_qty={order.filled_qty})")
+            
+            # logger.debug(f"Transaction {self.id}.get_current_open_equity(): Total = ${total_equity:.2f}")
+        
+        return total_equity
+    
+    def get_pending_open_equity(self, account_interface=None) -> float:
+        """
+        Calculate the equity value of pending unfilled orders.
+        Uses market price for pending orders.
+        
+        Args:
+            account_interface: Account interface for getting current market price (required)
+        
+        Returns:
+            float: Total equity value of pending orders
+        """
+        from .db import get_db
+        from sqlmodel import Session, select
+        from ..logger import logger
+        
+        total_equity = 0.0
+        
+        # Get market price if account interface provided
+        market_price = None
+        if account_interface:
+            try:
+                market_price = account_interface.get_instrument_current_price(self.symbol)
+                # logger.debug(f"Transaction {self.id}.get_pending_open_equity(): Market price for {self.symbol} = ${market_price}")
+            except Exception as e:
+                logger.debug(f"Transaction {self.id}.get_pending_open_equity(): Could not get market price: {e}")
+        
+        # If we don't have market price, we can't calculate pending equity accurately
+        if not market_price:
+            # logger.debug(f"Transaction {self.id}.get_pending_open_equity(): No market price available, returning 0")
+            return 0.0
+        
+        with Session(get_db().bind) as session:
+            # Get all orders for this transaction
+            statement = select(TradingOrder).where(
+                TradingOrder.transaction_id == self.id
+            )
+            orders = session.exec(statement).all()
+            
+            # logger.debug(f"Transaction {self.id}.get_pending_open_equity(): Found {len(orders)} orders")
+            
+            for order in orders:
+                # Only count unfilled orders (excluding TP/SL orders)
+                if order.status in OrderStatus.get_unfilled_statuses():
+                    # Skip dependent orders (TP/SL orders)
+                    if order.depends_on_order is not None:
+                        # logger.debug(f"  Order {order.id}: Skipped (dependent order)")
+                        continue
+                    
+                    # Calculate remaining quantity
+                    remaining_qty = order.quantity
+                    if order.filled_qty:
+                        remaining_qty -= order.filled_qty
+                    
+                    if remaining_qty > 0:
+                        # Use market price for pending orders
+                        equity = abs(remaining_qty) * market_price
+                        total_equity += equity
+                        # logger.debug(f"  Order {order.id}: remaining_qty={remaining_qty}, market_price=${market_price}, equity=${equity:.2f}")
+                # else:
+                #     logger.debug(f"  Order {order.id}: Skipped (status={order.status})")
+            
+            # logger.debug(f"Transaction {self.id}.get_pending_open_equity(): Total = ${total_equity:.2f}")
+        
+        return total_equity
 
 
 class TradingOrder(SQLModel, table=True):
@@ -182,6 +365,8 @@ class TradingOrder(SQLModel, table=True):
     good_for: str | None
     status: OrderStatus = OrderStatus.UNKNOWN
     filled_qty: float | None
+    filled_avg_price: float | None = Field(default=None, description="Average price at which the order was filled")
+    open_price: float | None = Field(default=None, description="Price at which the order opened (for filled orders)")
     comment: str | None
     created_at: DateTime | None = Field(default_factory=lambda: DateTime.now(timezone.utc))
     

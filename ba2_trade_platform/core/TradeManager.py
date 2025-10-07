@@ -8,6 +8,7 @@ expert settings, rulesets, and trading permissions.
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timezone
 import logging
+import threading
 from ..logger import logger
 from .models import ExpertRecommendation, ExpertInstance, TradingOrder, Ruleset
 from .types import OrderRecommendation, OrderStatus, OrderDirection, OrderOpenType, OrderType
@@ -30,6 +31,10 @@ class TradeManager:
     def __init__(self):
         """Initialize the trade manager."""
         self.logger = logger.getChild("TradeManager")
+        # Lock dictionary for preventing concurrent processing of recommendations
+        # Key format: "expert_{expert_id}_usecase_{use_case}"
+        self._processing_locks: Dict[str, threading.Lock] = {}
+        self._locks_dict_lock = threading.Lock()  # Lock for accessing the locks dictionary
     
     def trigger_and_place_order(self, account, order: TradingOrder, parent_status: OrderStatus, trigger_status: OrderStatus):
         """
@@ -628,6 +633,10 @@ class TradeManager:
         It evaluates recommendations through the enter_market ruleset using TradeActionEvaluator
         and executes the resulting actions (if automated trading is enabled).
         
+        This method uses thread-safe locking to ensure only one thread processes recommendations
+        for a given expert/use_case at a time. If the lock cannot be acquired within 0.5 seconds,
+        the method returns immediately (another thread is already processing).
+        
         Args:
             expert_instance_id: The expert instance ID to process recommendations for
             lookback_days: Number of days to look back for recommendations (default: 1)
@@ -635,9 +644,29 @@ class TradeManager:
         Returns:
             List of TradingOrder objects that were created (in PENDING state)
         """
+        # Use enter_market as the use case for this method (it only handles enter_market)
+        lock_key = f"expert_{expert_instance_id}_usecase_enter_market"
+        
+        # Get or create a lock for this expert/use_case combination
+        with self._locks_dict_lock:
+            if lock_key not in self._processing_locks:
+                self._processing_locks[lock_key] = threading.Lock()
+            processing_lock = self._processing_locks[lock_key]
+        
+        # Try to acquire the lock with a very short timeout (0.5 seconds)
+        # If we can't get it, another thread is already processing this expert
+        lock_acquired = processing_lock.acquire(blocking=True, timeout=0.5)
+        
+        if not lock_acquired:
+            self.logger.info(f"Could not acquire lock for expert {expert_instance_id} (enter_market) - another thread is already processing. Skipping.")
+            return []
+        
+        # We have the lock - make sure we release it when done
         created_orders = []
         
         try:
+            self.logger.debug(f"Acquired processing lock for expert {expert_instance_id} (enter_market)")
+            
             from sqlmodel import select, Session
             from .db import get_db
             from .models import Transaction, AccountDefinition
@@ -757,6 +786,22 @@ class TradeManager:
                         
                         self.logger.info(f"Recommendation {recommendation.id} for {recommendation.symbol} passed ruleset - {len(action_summaries)} action(s) to execute")
                         
+                        # SAFETY CHECK: For enter_market, check if there's already an open/waiting transaction
+                        # for this symbol and expert to prevent duplicate positions
+                        existing_txn_statement = select(Transaction).where(
+                            Transaction.expert_instance_id == expert_instance_id,
+                            Transaction.symbol == recommendation.symbol,
+                            Transaction.status.in_([TransactionStatus.OPENED, TransactionStatus.WAITING])
+                        )
+                        existing_txn = session.exec(existing_txn_statement).first()
+                        
+                        if existing_txn:
+                            self.logger.warning(
+                                f"SAFETY CHECK: Skipping recommendation {recommendation.id} for {recommendation.symbol} - "
+                                f"existing transaction {existing_txn.id} in {existing_txn.status} status for expert {expert_instance_id}"
+                            )
+                            continue
+                        
                         # Execute the actions using TradeActionEvaluator
                         # Actions are already sorted by priority (BUY/SELL first, then TP/SL)
                         # Thanks to _sort_actions_by_priority in execute() method
@@ -842,6 +887,10 @@ class TradeManager:
                 
         except Exception as e:
             self.logger.error(f"Error processing expert recommendations after analysis for expert {expert_instance_id}: {e}", exc_info=True)
+        finally:
+            # Always release the lock when we're done
+            processing_lock.release()
+            self.logger.debug(f"Released processing lock for expert {expert_instance_id} (enter_market)")
         
         return created_orders
     

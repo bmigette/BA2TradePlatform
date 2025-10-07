@@ -13,7 +13,7 @@ from ...core.types import MarketAnalysisStatus, OrderRecommendation, OrderStatus
 from ...core.utils import get_expert_instance_from_id, get_market_analysis_id_from_order_id
 from ...modules.accounts import providers
 from ...logger import logger
-from ..components import ProfitPerExpertChart, InstrumentDistributionChart
+from ..components import ProfitPerExpertChart, InstrumentDistributionChart, BalanceUsagePerExpertChart
 
 class OverviewTab:
     def __init__(self, tabs_ref=None):
@@ -363,8 +363,11 @@ class OverviewTab:
             with ui.column().classes(''):
                 self._render_order_recommendations_widget()
             
-            # Row 2: Profit Per Expert and Position Distribution by Label
+            # Row 2: Profit Per Expert and Balance Usage Per Expert
             ProfitPerExpertChart()
+            BalanceUsagePerExpertChart()
+            
+            # Row 3: Position Distribution by Label
             self._render_position_distribution_widget(grouping_field='labels')
             
             # Row 3: Position Distribution by Category (can span or be paired with other widgets)
@@ -1552,6 +1555,7 @@ class TransactionsTab:
     
     def __init__(self):
         self.transactions_container = None
+        self.transactions_table = None
         self.selected_transaction = None
         self.render()
     
@@ -1611,13 +1615,41 @@ class TransactionsTab:
     
     def _refresh_transactions(self):
         """Refresh the transactions table."""
-        self.transactions_container.clear()
-        with self.transactions_container:
-            self._render_transactions_table()
+        logger.debug("[REFRESH] _refresh_transactions() - Updating table rows")
+        
+        # If table doesn't exist yet, create it
+        if not self.transactions_table:
+            logger.debug("[REFRESH] Table doesn't exist, creating new table")
+            self.transactions_container.clear()
+            with self.transactions_container:
+                self._render_transactions_table()
+            return
+        
+        # Otherwise, just update the rows data
+        try:
+            new_rows = self._get_transactions_data()
+            logger.debug(f"[REFRESH] Updating table with {len(new_rows)} rows")
+            
+            # Update the table rows
+            self.transactions_table.rows.clear()
+            self.transactions_table.rows.extend(new_rows)
+            self.transactions_table.update()
+            
+            logger.debug("[REFRESH] _refresh_transactions() - Complete")
+        except Exception as e:
+            logger.error(f"Error refreshing transactions table: {e}", exc_info=True)
+            # If update fails, recreate the table
+            logger.debug("[REFRESH] Update failed, recreating table")
+            self.transactions_container.clear()
+            with self.transactions_container:
+                self._render_transactions_table()
     
-    def _render_transactions_table(self):
-        """Render the main transactions table."""
-        logger.debug("[RENDER] _render_transactions_table() - START")
+    def _get_transactions_data(self):
+        """Get transactions data for the table.
+        
+        Returns:
+            List of row dictionaries for the table
+        """
         from ...core.models import Transaction, ExpertInstance
         from ...core.types import TransactionStatus
         from sqlmodel import col
@@ -1812,53 +1844,72 @@ class TransactionsTab:
                 }
                 rows.append(row)
             
-            # Table columns
-            columns = [
-                {'name': 'expand', 'label': '', 'field': 'expand', 'align': 'left'},  # Expand column
-                {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left', 'sortable': True},
-                {'name': 'expert', 'label': 'Expert', 'field': 'expert', 'align': 'left', 'sortable': True},
-                {'name': 'quantity', 'label': 'Qty', 'field': 'quantity', 'align': 'right', 'sortable': True},
-                {'name': 'open_price', 'label': 'Open Price', 'field': 'open_price', 'align': 'right', 'sortable': True},
-                {'name': 'current_price', 'label': 'Current', 'field': 'current_price', 'align': 'right'},
-                {'name': 'close_price', 'label': 'Close Price', 'field': 'close_price', 'align': 'right'},
-                {'name': 'take_profit', 'label': 'TP', 'field': 'take_profit', 'align': 'right'},
-                {'name': 'stop_loss', 'label': 'SL', 'field': 'stop_loss', 'align': 'right'},
-                {'name': 'current_pnl', 'label': 'Current P/L', 'field': 'current_pnl', 'align': 'right'},
-                {'name': 'closed_pnl', 'label': 'Closed P/L', 'field': 'closed_pnl', 'align': 'right'},
-                {'name': 'status', 'label': 'Status', 'field': 'status', 'align': 'center', 'sortable': True},
-                {'name': 'order_count', 'label': 'Orders', 'field': 'order_count', 'align': 'center'},
-                {'name': 'created_at', 'label': 'Created', 'field': 'created_at', 'align': 'left', 'sortable': True},
-                {'name': 'actions', 'label': 'Actions', 'field': 'actions', 'align': 'center'}
-            ]
+            return rows
             
-            # Create table with expansion enabled
-            logger.debug(f"[RENDER] _render_transactions_table() - Creating table with {len(rows)} rows")
-            table = ui.table(
-                columns=columns, 
-                rows=rows, 
-                row_key='id',
-                pagination={'rowsPerPage': 20}
-            ).classes('w-full')
-            
-            # Add Quasar table props for expansion
-            table.props('flat bordered')
-            
-            # Add expand button in first column
-            table.add_slot('body-cell-expand', '''
-                <q-td :props="props">
-                    <q-btn
-                        size="sm"
-                        color="primary"
-                        round
-                        dense
-                        @click="props.expand = !props.expand"
-                        :icon="props.expand ? 'expand_less' : 'expand_more'"
-                    />
-                </q-td>
-            ''')
-            
-            # Add expansion details showing orders
-            table.add_slot('body', '''
+        except Exception as e:
+            logger.error(f"Error getting transactions data: {e}", exc_info=True)
+            return []
+        finally:
+            session.close()
+    
+    def _render_transactions_table(self):
+        """Render the main transactions table."""
+        logger.debug("[RENDER] _render_transactions_table() - START")
+        
+        # Get transactions data
+        rows = self._get_transactions_data()
+        
+        if not rows:
+            ui.label('No transactions found.').classes('text-gray-500')
+            return
+        
+        # Table columns
+        columns = [
+            {'name': 'expand', 'label': '', 'field': 'expand', 'align': 'left'},  # Expand column
+            {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left', 'sortable': True},
+            {'name': 'expert', 'label': 'Expert', 'field': 'expert', 'align': 'left', 'sortable': True},
+            {'name': 'quantity', 'label': 'Qty', 'field': 'quantity', 'align': 'right', 'sortable': True},
+            {'name': 'open_price', 'label': 'Open Price', 'field': 'open_price', 'align': 'right', 'sortable': True},
+            {'name': 'current_price', 'label': 'Current', 'field': 'current_price', 'align': 'right'},
+            {'name': 'close_price', 'label': 'Close Price', 'field': 'close_price', 'align': 'right'},
+            {'name': 'take_profit', 'label': 'TP', 'field': 'take_profit', 'align': 'right'},
+            {'name': 'stop_loss', 'label': 'SL', 'field': 'stop_loss', 'align': 'right'},
+            {'name': 'current_pnl', 'label': 'Current P/L', 'field': 'current_pnl', 'align': 'right'},
+            {'name': 'closed_pnl', 'label': 'Closed P/L', 'field': 'closed_pnl', 'align': 'right'},
+            {'name': 'status', 'label': 'Status', 'field': 'status', 'align': 'center', 'sortable': True},
+            {'name': 'order_count', 'label': 'Orders', 'field': 'order_count', 'align': 'center'},
+            {'name': 'created_at', 'label': 'Created', 'field': 'created_at', 'align': 'left', 'sortable': True},
+            {'name': 'actions', 'label': 'Actions', 'field': 'actions', 'align': 'center'}
+        ]
+        
+        # Create table with expansion enabled
+        logger.debug(f"[RENDER] _render_transactions_table() - Creating table with {len(rows)} rows")
+        self.transactions_table = ui.table(
+            columns=columns, 
+            rows=rows, 
+            row_key='id',
+            pagination={'rowsPerPage': 20}
+        ).classes('w-full')
+        
+        # Add Quasar table props for expansion
+        self.transactions_table.props('flat bordered')
+        
+        # Add expand button in first column
+        self.transactions_table.add_slot('body-cell-expand', '''
+            <q-td :props="props">
+                <q-btn
+                    size="sm"
+                    color="primary"
+                    round
+                    dense
+                    @click="props.expand = !props.expand"
+                    :icon="props.expand ? 'expand_less' : 'expand_more'"
+                />
+            </q-td>
+        ''')
+        
+        # Add expansion details showing orders
+        self.transactions_table.add_slot('body', '''
                 <q-tr :props="props">
                     <q-td v-for="col in props.cols" :key="col.name" :props="props">
                         <template v-if="col.name === 'expand'">
@@ -1981,20 +2032,14 @@ class TransactionsTab:
                         </div>
                     </q-td>
                 </q-tr>
-            ''')
-            
-            # Handle events
-            logger.debug("[RENDER] _render_transactions_table() - Setting up event handlers")
-            table.on('edit_transaction', self._show_edit_dialog)
-            table.on('close_transaction', self._show_close_dialog)
-            table.on('view_recommendation', self._show_recommendation_dialog)
-            logger.debug("[RENDER] _render_transactions_table() - END (success)")
-            
-        except Exception as e:
-            logger.error(f"Error rendering transactions table: {e}", exc_info=True)
-            ui.label(f'Error loading transactions: {str(e)}').classes('text-red-500')
-        finally:
-            session.close()
+        ''')
+        
+        # Handle events
+        logger.debug("[RENDER] _render_transactions_table() - Setting up event handlers")
+        self.transactions_table.on('edit_transaction', self._show_edit_dialog)
+        self.transactions_table.on('close_transaction', self._show_close_dialog)
+        self.transactions_table.on('view_recommendation', self._show_recommendation_dialog)
+        logger.debug("[RENDER] _render_transactions_table() - END (success)")
     
     def _show_edit_dialog(self, event_data):
         """Show dialog to edit TP/SL for a transaction."""
@@ -2206,7 +2251,8 @@ class TransactionsTab:
                 # Handle WAITING_TRIGGER orders - delete from DB
                 if order.status == OrderStatus.WAITING_TRIGGER:
                     try:
-                        delete_instance(order)
+                        # Pass the session to avoid attachment issues
+                        delete_instance(order, session=session)
                         deleted_count += 1
                         logger.info(f"Deleted WAITING_TRIGGER order {order.id} for transaction {transaction_id}")
                     except Exception as e:

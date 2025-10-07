@@ -181,6 +181,8 @@ class AlpacaAccount(AccountInterface):
             stop_price=getattr(order, "stop_price", None),
             status=status,
             filled_qty=getattr(order, "filled_qty", None),
+            filled_avg_price=getattr(order, "filled_avg_price", None),
+            open_price=getattr(order, "filled_avg_price", None),  # Use filled_avg_price as open_price for filled orders
             comment=getattr(order, "client_order_id", None),
             created_at=getattr(order, "created_at", None),
         )
@@ -626,6 +628,18 @@ class AlpacaAccount(AccountInterface):
                         if db_order.filled_qty is None or float(db_order.filled_qty) != float(alpaca_order.filled_qty):
                             logger.debug(f"Order {db_order.id} filled_qty changed: {db_order.filled_qty} -> {alpaca_order.filled_qty}")
                             db_order.filled_qty = alpaca_order.filled_qty
+                            has_changes = True
+                        
+                        # Update filled_avg_price if it changed
+                        if alpaca_order.filled_avg_price and (db_order.filled_avg_price is None or float(db_order.filled_avg_price) != float(alpaca_order.filled_avg_price)):
+                            logger.debug(f"Order {db_order.id} filled_avg_price changed: {db_order.filled_avg_price} -> {alpaca_order.filled_avg_price}")
+                            db_order.filled_avg_price = alpaca_order.filled_avg_price
+                            has_changes = True
+                        
+                        # Update open_price if it changed (use filled_avg_price)
+                        if alpaca_order.open_price and (db_order.open_price is None or float(db_order.open_price) != float(alpaca_order.open_price)):
+                            logger.debug(f"Order {db_order.id} open_price changed: {db_order.open_price} -> {alpaca_order.open_price}")
+                            db_order.open_price = alpaca_order.open_price
                             has_changes = True
                         
                         # Update broker_order_id if it wasn't set before

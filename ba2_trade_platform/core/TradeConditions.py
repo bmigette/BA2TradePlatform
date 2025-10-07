@@ -793,6 +793,86 @@ class DaysOpenedCondition(CompareCondition):
         return f"Check if days since {self.instrument_name} order was opened is {self.operator_str} {self.value} days"
 
 
+class InstrumentAccountShareCondition(CompareCondition):
+    """Compare current instrument value as percentage of expert virtual equity."""
+    
+    def evaluate(self) -> bool:
+        try:
+            # Get current position value
+            position_value = self._get_instrument_position_value()
+            if position_value is None:
+                logger.debug(f"No position value available for {self.instrument_name}")
+                return False
+            
+            # Get expert virtual equity
+            virtual_equity = self._get_expert_virtual_equity()
+            if virtual_equity is None or virtual_equity <= 0:
+                logger.error(f"Invalid virtual equity for expert")
+                return False
+            
+            # Calculate share percentage
+            share_percent = (position_value / virtual_equity) * 100.0
+            
+            logger.debug(f"Instrument {self.instrument_name} share: {share_percent:.2f}% "
+                        f"(position_value=${position_value:.2f}, virtual_equity=${virtual_equity:.2f})")
+            
+            return self.operator_func(share_percent, self.value)
+            
+        except Exception as e:
+            logger.error(f"Error evaluating instrument account share condition: {e}", exc_info=True)
+            return False
+    
+    def _get_instrument_position_value(self) -> Optional[float]:
+        """Get current market value of instrument position."""
+        try:
+            # Get current position quantity
+            position_qty = self.get_current_position()
+            if position_qty is None or position_qty == 0:
+                return 0.0  # No position means 0% share
+            
+            # Get current price
+            current_price = self.get_current_price()
+            if current_price is None:
+                logger.error(f"Cannot get current price for {self.instrument_name}")
+                return None
+            
+            # Calculate market value
+            position_value = abs(position_qty) * current_price
+            return position_value
+            
+        except Exception as e:
+            logger.error(f"Error getting instrument position value: {e}", exc_info=True)
+            return None
+    
+    def _get_expert_virtual_equity(self) -> Optional[float]:
+        """Get expert's virtual equity (available balance)."""
+        try:
+            # Get expert instance from recommendation
+            expert_instance_id = self.expert_recommendation.instance_id
+            
+            # Load expert instance with loaded settings
+            from .utils import get_expert_instance_from_id
+            expert = get_expert_instance_from_id(expert_instance_id)
+            if not expert:
+                logger.error(f"Expert instance {expert_instance_id} not found")
+                return None
+            
+            # Get available balance (virtual equity)
+            available_balance = expert.get_available_balance()
+            if available_balance is None:
+                logger.error(f"Could not get available balance for expert {expert_instance_id}")
+                return None
+            
+            return available_balance
+            
+        except Exception as e:
+            logger.error(f"Error getting expert virtual equity: {e}", exc_info=True)
+            return None
+    
+    def get_description(self) -> str:
+        return f"Check if {self.instrument_name} position value as % of expert virtual equity is {self.operator_str} {self.value}%"
+
+
 # Factory function to create conditions based on event type
 
 
@@ -840,6 +920,7 @@ def create_condition(event_type: ExpertEventType, account: AccountInterface,
         ExpertEventType.N_PROFIT_LOSS_PERCENT: ProfitLossPercentCondition,
         ExpertEventType.N_DAYS_OPENED: DaysOpenedCondition,
         ExpertEventType.N_CONFIDENCE: ConfidenceCondition,
+        ExpertEventType.N_INSTRUMENT_ACCOUNT_SHARE: InstrumentAccountShareCondition,
     }
     condition_class = condition_map.get(event_type)
     if not condition_class:

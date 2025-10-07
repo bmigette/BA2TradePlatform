@@ -167,17 +167,31 @@ def delete_instance(instance, session: Session | None = None):
     with _db_write_lock:
         try:
             instance_id = instance.id
+            model_class = type(instance)
+            
             if session:
-                session.delete(instance)
-                session.commit()
-                logger.info(f"Deleted instance with id: {instance_id}")
-                return True
-            else:
-                with Session(engine) as session:
-                    session.delete(instance)
+                # Merge the instance into the current session to avoid attachment issues
+                merged_instance = session.get(model_class, instance_id)
+                if merged_instance:
+                    session.delete(merged_instance)
                     session.commit()
                     logger.info(f"Deleted instance with id: {instance_id}")
                     return True
+                else:
+                    logger.warning(f"Instance {model_class.__name__} with id {instance_id} not found in database")
+                    return False
+            else:
+                with Session(engine) as new_session:
+                    # Get the instance in this session
+                    merged_instance = new_session.get(model_class, instance_id)
+                    if merged_instance:
+                        new_session.delete(merged_instance)
+                        new_session.commit()
+                        logger.info(f"Deleted instance with id: {instance_id}")
+                        return True
+                    else:
+                        logger.warning(f"Instance {model_class.__name__} with id {instance_id} not found in database")
+                        return False
         except Exception as e:
             logger.error(f"Error deleting instance: {e}", exc_info=True)
             raise

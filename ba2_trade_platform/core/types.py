@@ -270,6 +270,7 @@ class ExpertEventType(str, Enum):
     N_PROFIT_LOSS_PERCENT = "profit_loss_percent"
     N_DAYS_OPENED = "days_opened"
     N_CONFIDENCE = "confidence"
+    N_INSTRUMENT_ACCOUNT_SHARE = "instrument_account_share"    # Current instrument value as % of expert virtual equity
     
 
 class ExpertActionType(str, Enum):
@@ -278,6 +279,8 @@ class ExpertActionType(str, Enum):
     CLOSE = "close"
     ADJUST_TAKE_PROFIT = "adjust_take_profit"
     ADJUST_STOP_LOSS = "adjust_stop_loss"
+    INCREASE_INSTRUMENT_SHARE = "increase_instrument_share"
+    DECREASE_INSTRUMENT_SHARE = "decrease_instrument_share"
 
 class MarketAnalysisStatus(str, Enum):
     PENDING = "pending"
@@ -316,7 +319,8 @@ def get_numeric_event_values():
         ExpertEventType.N_PROFIT_LOSS_AMOUNT.value,
         ExpertEventType.N_PROFIT_LOSS_PERCENT.value,
         ExpertEventType.N_DAYS_OPENED.value,
-        ExpertEventType.N_CONFIDENCE.value
+        ExpertEventType.N_CONFIDENCE.value,
+        ExpertEventType.N_INSTRUMENT_ACCOUNT_SHARE.value
     ]
 
 
