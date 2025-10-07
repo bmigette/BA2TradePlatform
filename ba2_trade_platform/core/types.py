@@ -350,6 +350,14 @@ def get_adjustment_action_values():
     ]
 
 
+def get_share_adjustment_action_values():
+    """Return list of share adjustment action type values (INCREASE/DECREASE_INSTRUMENT_SHARE)."""
+    return [
+        ExpertActionType.INCREASE_INSTRUMENT_SHARE.value,
+        ExpertActionType.DECREASE_INSTRUMENT_SHARE.value
+    ]
+
+
 def is_numeric_event(event_value):
     """Check if an event value corresponds to a numeric event type."""
     return event_value in get_numeric_event_values()
@@ -358,3 +366,8 @@ def is_numeric_event(event_value):
 def is_adjustment_action(action_value):
     """Check if an action value corresponds to an adjustment action type."""
     return action_value in get_adjustment_action_values()
+
+
+def is_share_adjustment_action(action_value):
+    """Check if an action value corresponds to a share adjustment action type."""
+    return action_value in get_share_adjustment_action_values()

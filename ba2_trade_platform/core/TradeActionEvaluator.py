@@ -26,7 +26,9 @@ class TradeActionEvaluator:
     """
     
     def __init__(self, account: AccountInterface, instrument_name: Optional[str] = None,
-                 existing_transactions: Optional[List[Any]] = None):
+                 existing_transactions: Optional[List[Any]] = None, 
+                 evaluate_all_conditions: bool = False,
+                 force_generate_actions: bool = False):
         """
         Initialize the evaluator with an account interface.
         
@@ -34,10 +36,14 @@ class TradeActionEvaluator:
             account: Account interface for executing trades and accessing account data
             instrument_name: Instrument symbol for looking up existing transactions
             existing_transactions: List of existing Transaction objects for open_positions use case
+            evaluate_all_conditions: If True, evaluate all conditions even after first failure (for debugging)
+            force_generate_actions: If True, generate actions even when conditions fail (for debugging)
         """
         self.account = account
         self.instrument_name = instrument_name
         self.existing_transactions = existing_transactions or []
+        self.evaluate_all_conditions = evaluate_all_conditions
+        self.force_generate_actions = force_generate_actions
         # Track condition evaluation results for detailed reporting
         self.condition_evaluations = []
         self.rule_evaluations = []
@@ -69,6 +75,9 @@ class TradeActionEvaluator:
             self.condition_evaluations = []
             self.rule_evaluations = []
             self.trade_actions = []
+            
+            # NEW: Track generated actions to prevent duplicates (key: action_type + config hash)
+            generated_actions = set()
             
             # Store instrument name for later use in execute()
             self.instrument_name = instrument_name
@@ -107,18 +116,24 @@ class TradeActionEvaluator:
                     event_action, instrument_name, expert_recommendation, existing_order
                 )
                 
-                if conditions_met:
-                    logger.info(f"Conditions met for event action: {event_action.name}")
+                # In debug mode, we can force action generation even if conditions not met
+                should_generate_actions = conditions_met or self.force_generate_actions
+                
+                if should_generate_actions:
+                    if conditions_met:
+                        logger.info(f"Conditions met for event action: {event_action.name}")
+                    else:
+                        logger.warning(f"DEBUG MODE: Forcing action generation despite failed conditions for: {event_action.name}")
                     
-                    # Create and store TradeAction objects
-                    action_summaries.extend(
-                        self._create_and_store_trade_actions(
-                            event_action, instrument_name, expert_recommendation, existing_order
-                        )
+                    # Create and store TradeAction objects (with duplicate prevention)
+                    new_actions = self._create_and_store_trade_actions(
+                        event_action, instrument_name, expert_recommendation, existing_order, generated_actions
                     )
+                    action_summaries.extend(new_actions)
                     
                     # Check if we should continue processing more event actions
-                    if not event_action.continue_processing:
+                    # In force mode, always continue to see all possible actions
+                    if not event_action.continue_processing and not self.force_generate_actions:
                         logger.debug(f"Stopping processing after {event_action.name} (continue_processing=False)")
                         break
                 else:
@@ -153,6 +168,13 @@ class TradeActionEvaluator:
         created_order_ids = []  # Track orders created during this execution
         
         logger.info(f"🚀 EXECUTE() CALLED with {len(self.trade_actions)} trade actions for {self.instrument_name}")
+        
+        # Prepare evaluation details for storage in TradeActionResult
+        # This includes condition evaluations, rule evaluations, and action calculations
+        evaluation_details = {
+            "condition_evaluations": self.condition_evaluations.copy() if hasattr(self, 'condition_evaluations') else [],
+            "rule_evaluations": self.rule_evaluations.copy() if hasattr(self, 'rule_evaluations') else []
+        }
         
         try:
             if not self.trade_actions:
@@ -197,6 +219,9 @@ class TradeActionEvaluator:
             for i, action in enumerate(order_creating_actions):
                 try:
                     logger.info(f"Phase 1 - Creating order: {action.get_description()}")
+                    
+                    # Attach evaluation details to the action for storage in TradeActionResult
+                    action.evaluation_details = evaluation_details
                     
                     execution_result = action.execute()
                     action_type = self._get_action_type_from_action(action)
@@ -284,6 +309,9 @@ class TradeActionEvaluator:
                             # Update action's existing_order to the current order
                             action.existing_order = order
                             
+                            # Attach evaluation details to the action for storage in TradeActionResult
+                            action.evaluation_details = evaluation_details
+                            
                             logger.info(f"Phase 2 - Adjusting order {order.id}: {action.get_description()}")
                             
                             execution_result = action.execute()
@@ -364,9 +392,12 @@ class TradeActionEvaluator:
                     "event_type": None,
                     "operator": trigger_config.get('operator'),
                     "value": trigger_config.get('value'),
+                    "reference_value": trigger_config.get('reference_value'),  # NEW: For storing reference value type
                     "condition_result": False,
                     "condition_description": None,
-                    "error": None
+                    "error": None,
+                    "left_operand": None,  # NEW: Actual calculated/compared value
+                    "right_operand": None  # NEW: The threshold/target value
                 }
                 
                 # Parse trigger configuration
@@ -409,6 +440,24 @@ class TradeActionEvaluator:
                 condition_result = condition.evaluate()
                 condition_evaluation["condition_result"] = condition_result
                 
+                # Capture calculated value for numeric conditions
+                if hasattr(condition, 'get_calculated_value'):
+                    calculated_value = condition.get_calculated_value()
+                    if calculated_value is not None:
+                        condition_evaluation["calculated_value"] = calculated_value
+                        # For numeric conditions, left_operand is calculated value, right_operand is the threshold
+                        condition_evaluation["left_operand"] = calculated_value
+                        condition_evaluation["right_operand"] = trigger_config.get('value')
+                
+                # For flag conditions (like new_target_higher), try to capture comparison values
+                # Check if condition has stored comparison attributes after evaluation
+                if hasattr(condition, 'current_tp_price'):
+                    condition_evaluation["left_operand"] = getattr(condition, 'current_tp_price', None)
+                if hasattr(condition, 'new_target_price'):
+                    condition_evaluation["right_operand"] = getattr(condition, 'new_target_price', None)
+                if hasattr(condition, 'percent_diff'):
+                    condition_evaluation["calculated_value"] = getattr(condition, 'percent_diff', None)
+                
                 logger.debug(f"Condition description: {condition.get_description()}")
                 logger.debug(f"Condition {trigger_key} result: {condition_result}")
                 
@@ -416,15 +465,27 @@ class TradeActionEvaluator:
                 self.condition_evaluations.append(condition_evaluation.copy())
                 
                 if not condition_result:
-                    logger.debug(f"Condition {trigger_key} not met, stopping evaluation")
+                    logger.debug(f"Condition {trigger_key} not met")
                     rule_evaluation["all_conditions_met"] = False
-                    self.rule_evaluations.append(rule_evaluation)
-                    return False
+                    
+                    # If not in "evaluate all" mode, stop here
+                    if not self.evaluate_all_conditions:
+                        logger.debug(f"Stopping evaluation (evaluate_all_conditions=False)")
+                        self.rule_evaluations.append(rule_evaluation)
+                        return False
+                    else:
+                        logger.debug(f"Continuing to next condition (evaluate_all_conditions=True)")
             
-            logger.debug(f"All conditions met for event action {event_action.name}")
-            rule_evaluation["executed"] = True
+            # Check final result
+            all_met = rule_evaluation["all_conditions_met"]
+            if all_met:
+                logger.debug(f"All conditions met for event action {event_action.name}")
+                rule_evaluation["executed"] = True
+            else:
+                logger.debug(f"Not all conditions met for event action {event_action.name}")
+            
             self.rule_evaluations.append(rule_evaluation)
-            return True
+            return all_met
             
         except Exception as e:
             logger.error(f"Error evaluating conditions for event action {event_action.name}: {e}", exc_info=True)
@@ -480,7 +541,8 @@ class TradeActionEvaluator:
     
     def _create_and_store_trade_actions(self, event_action: EventAction, instrument_name: str,
                                       expert_recommendation: ExpertRecommendation,
-                                      existing_order: Optional[TradingOrder]) -> List[Dict[str, Any]]:
+                                      existing_order: Optional[TradingOrder],
+                                      generated_actions: set) -> List[Dict[str, Any]]:
         """
         Create TradeAction objects for an event action and store them for later execution.
         
@@ -489,6 +551,7 @@ class TradeActionEvaluator:
             instrument_name: Instrument name
             expert_recommendation: Expert recommendation
             existing_order: Optional existing order
+            generated_actions: Set of action keys already generated (to prevent duplicates)
             
         Returns:
             List of action summaries
@@ -522,6 +585,27 @@ class TradeActionEvaluator:
                     logger.error(f"Invalid action type: {action_type_str}")
                     continue
                 
+                # NEW: Create unique key for this action (prevents duplicates)
+                # Hash based on action type + key configuration parameters
+                import hashlib
+                import json
+                action_hash_data = {
+                    "type": action_type.value,
+                    "reference_value": action_config.get('reference_value'),
+                    "value": action_config.get('value'),
+                    "instrument": instrument_name
+                }
+                action_hash = hashlib.md5(json.dumps(action_hash_data, sort_keys=True).encode()).hexdigest()
+                action_unique_key = f"{action_type.value}_{action_hash}"
+                
+                # Skip if this exact action was already generated
+                if action_unique_key in generated_actions:
+                    logger.debug(f"Skipping duplicate action: {action_type.value} (already generated)")
+                    continue
+                
+                # Mark this action as generated
+                generated_actions.add(action_unique_key)
+                
                 # Create TradeAction instance
                 trade_action = self._create_trade_action(
                     action_type, action_config, instrument_name,
@@ -532,11 +616,26 @@ class TradeActionEvaluator:
                     # Store the action for later execution
                     self.trade_actions.append(trade_action)
                     
-                    # Create summary for display
+                    # Create summary for display with calculation details
                     action_summary = {
                         "action_type": action_type,
-                        "description": trade_action.get_description()
+                        "description": trade_action.get_description(),
+                        "action_config": {}  # Store configuration for display
                     }
+                    
+                    # Extract calculation details for TP/SL actions
+                    if action_type in [ExpertActionType.ADJUST_TAKE_PROFIT, ExpertActionType.ADJUST_STOP_LOSS]:
+                        # Get calculation preview if action supports it
+                        if hasattr(trade_action, 'get_calculation_preview'):
+                            calc_preview = trade_action.get_calculation_preview()
+                            action_summary["action_config"]["reference_type"] = calc_preview.get("reference_type")
+                            action_summary["action_config"]["adjustment_percent"] = calc_preview.get("percent")
+                            action_summary["action_config"]["reference_price"] = calc_preview.get("reference_price")
+                            action_summary["action_config"]["calculated_price"] = calc_preview.get("calculated_price")
+                        else:
+                            # Fallback to basic config
+                            action_summary["action_config"]["reference_value"] = action_config.get('reference_value')
+                            action_summary["action_config"]["percent"] = action_config.get('value')
                     
                     action_summaries.append(action_summary)
                     logger.info(f"Created and stored TradeAction: {action_type.value} for {instrument_name}")
@@ -590,6 +689,12 @@ class TradeActionEvaluator:
                 kwargs['percent'] = action_config.get('value')  # 'value' in config is the percentage
                 # Also allow direct stop_loss_price if provided
                 kwargs['stop_loss_price'] = action_config.get('stop_loss_price')
+            elif action_type == ExpertActionType.INCREASE_INSTRUMENT_SHARE:
+                # Extract target_percent for position sizing
+                kwargs['target_percent'] = action_config.get('value')  # 'value' in config is target percentage
+            elif action_type == ExpertActionType.DECREASE_INSTRUMENT_SHARE:
+                # Extract target_percent for position sizing
+                kwargs['target_percent'] = action_config.get('value')  # 'value' in config is target percentage
             
             # Create action using factory function, passing expert_recommendation
             action = create_action(

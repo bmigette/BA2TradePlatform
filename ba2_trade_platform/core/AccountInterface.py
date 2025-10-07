@@ -29,6 +29,8 @@ class AccountInterface(ExtendableSettingsInterface):
             id (int): The unique identifier for the account.
         """
         self.id = id
+        # Instance-level price cache: {symbol: {'price': float, 'timestamp': datetime}}
+        self._price_cache: Dict[str, Dict[str, Any]] = {}
 
 
 
@@ -513,9 +515,11 @@ class AccountInterface(ExtendableSettingsInterface):
 
 
     @abstractmethod
-    def get_instrument_current_price(self, symbol: str) -> Optional[float]:
+    @abstractmethod
+    def _get_instrument_current_price_impl(self, symbol: str) -> Optional[float]:
         """
-        Get the current market price for a given instrument/symbol.
+        Internal implementation of price fetching. This method should be implemented by child classes.
+        This is called by get_instrument_current_price() when cache is stale or missing.
         
         Args:
             symbol (str): The asset symbol to get the price for
@@ -524,6 +528,49 @@ class AccountInterface(ExtendableSettingsInterface):
             Optional[float]: The current price if available, None if not found or error occurred
         """
         pass
+    
+    def get_instrument_current_price(self, symbol: str) -> Optional[float]:
+        """
+        Get the current market price for a given instrument/symbol with caching.
+        
+        This method implements a cache with configurable TTL (PRICE_CACHE_TIME in config.py).
+        If a price was fetched recently (within PRICE_CACHE_TIME seconds), the cached value
+        is returned. Otherwise, the implementation method is called to fetch a fresh price.
+        
+        Args:
+            symbol (str): The asset symbol to get the price for
+        
+        Returns:
+            Optional[float]: The current price if available, None if not found or error occurred
+        """
+        from .. import config
+        
+        # Check if we have a cached price
+        if symbol in self._price_cache:
+            cached_data = self._price_cache[symbol]
+            cached_time = cached_data['timestamp']
+            current_time = datetime.now(timezone.utc)
+            time_diff = (current_time - cached_time).total_seconds()
+            
+            # If cache is still valid, return cached price
+            if time_diff < config.PRICE_CACHE_TIME:
+                logger.debug(f"Returning cached price for {symbol}: ${cached_data['price']} (age: {time_diff:.1f}s)")
+                return cached_data['price']
+            else:
+                logger.debug(f"Cache expired for {symbol} (age: {time_diff:.1f}s > {config.PRICE_CACHE_TIME}s)")
+        
+        # Cache miss or expired - fetch fresh price
+        price = self._get_instrument_current_price_impl(symbol)
+        
+        # Update cache if we got a valid price
+        if price is not None:
+            self._price_cache[symbol] = {
+                'price': price,
+                'timestamp': datetime.now(timezone.utc)
+            }
+            logger.debug(f"Cached new price for {symbol}: ${price}")
+        
+        return price
 
     @abstractmethod
     def _set_order_tp_impl(self, trading_order: TradingOrder, tp_price: float) -> Any:
@@ -716,6 +763,19 @@ class AccountInterface(ExtendableSettingsInterface):
                     # Update transaction status based on order states
                     new_status = None
                     
+                    # Update open_price from the oldest filled market entry order (always update to ensure accuracy)
+                    filled_entry_orders = [
+                        order for order in market_entry_orders 
+                        if order.status in executed_statuses and order.open_price
+                    ]
+                    if filled_entry_orders:
+                        # Sort by created_at to get the oldest filled order
+                        oldest_order = min(filled_entry_orders, key=lambda o: o.created_at or datetime.min.replace(tzinfo=timezone.utc))
+                        if transaction.open_price != oldest_order.open_price:
+                            transaction.open_price = oldest_order.open_price
+                            has_changes = True
+                            logger.debug(f"Transaction {transaction.id} open_price updated to {oldest_order.open_price} from oldest filled order {oldest_order.id}")
+                    
                     # WAITING -> OPENED: If any market entry order is FILLED
                     if has_filled_entry_order and transaction.status == TransactionStatus.WAITING:
                         new_status = TransactionStatus.OPENED
@@ -723,47 +783,21 @@ class AccountInterface(ExtendableSettingsInterface):
                             transaction.open_date = datetime.now(timezone.utc)
                             has_changes = True
                         
-                        # Set open_price from the first filled market entry order
-                        if not transaction.open_price:
-                            for order in market_entry_orders:
-                                if order.status in executed_statuses and order.limit_price:
-                                    transaction.open_price = order.limit_price
-                                    has_changes = True
-                                    break
-                                # For market orders, try to get current price from broker
-                                elif order.status in executed_statuses:
-                                    # We don't have exact fill price, but we can try to get current price
-                                    # This is a fallback - ideally filled_avg_price would be stored
-                                    try:
-                                        current_price = self.get_instrument_current_price(order.symbol)
-                                        if current_price:
-                                            transaction.open_price = current_price
-                                            has_changes = True
-                                            break
-                                    except:
-                                        pass
-                        
                         logger.debug(f"Transaction {transaction.id} has filled market entry order, marking as OPENED")
                         has_changes = True
+                    
+                    # Update close_price from filled closing orders (always update to ensure accuracy)
+                    if filled_closing_orders:
+                        closing_order = filled_closing_orders[0]  # Use first filled closing order
+                        if closing_order.open_price and transaction.close_price != closing_order.open_price:
+                            transaction.close_price = closing_order.open_price
+                            has_changes = True
+                            logger.debug(f"Transaction {transaction.id} close_price updated to {closing_order.open_price} from filled closing order {closing_order.id}")
                     
                     # OPENED -> CLOSED: If we have a filled closing order (TP/SL)
                     if filled_closing_orders and transaction.status == TransactionStatus.OPENED:
                         new_status = TransactionStatus.CLOSED
                         transaction.close_date = datetime.now(timezone.utc)
-                        
-                        # Set close_price from the first filled closing order
-                        if not transaction.close_price:
-                            closing_order = filled_closing_orders[0]  # Use first filled closing order
-                            if closing_order.limit_price:
-                                transaction.close_price = closing_order.limit_price
-                            else:
-                                # Fallback to current price for market orders
-                                try:
-                                    current_price = self.get_instrument_current_price(closing_order.symbol)
-                                    if current_price:
-                                        transaction.close_price = current_price
-                                except:
-                                    pass
                         
                         logger.debug(f"Transaction {transaction.id} has filled closing order, marking as CLOSED")
                         has_changes = True
@@ -781,24 +815,17 @@ class AccountInterface(ExtendableSettingsInterface):
                         new_status = TransactionStatus.CLOSED
                         transaction.close_date = datetime.now(timezone.utc)
                         
-                        # Set close_price from the last filled order that closed the position
-                        if not transaction.close_price:
-                            # Find the last filled order chronologically
-                            filled_orders = [o for o in orders if o.status in executed_statuses]
-                            if filled_orders:
-                                # Sort by created_at to get the last one
-                                filled_orders.sort(key=lambda x: x.created_at if x.created_at else datetime.min)
-                                last_order = filled_orders[-1]
-                                if last_order.limit_price:
-                                    transaction.close_price = last_order.limit_price
-                                else:
-                                    # Fallback to current price for market orders
-                                    try:
-                                        current_price = self.get_instrument_current_price(last_order.symbol)
-                                        if current_price:
-                                            transaction.close_price = current_price
-                                    except:
-                                        pass
+                        # Update close_price from the last filled order that closed the position (always update)
+                        # Find the last filled order chronologically
+                        filled_orders = [o for o in orders if o.status in executed_statuses and o.open_price]
+                        if filled_orders:
+                            # Sort by created_at to get the last one
+                            filled_orders.sort(key=lambda x: x.created_at if x.created_at else datetime.min)
+                            last_order = filled_orders[-1]
+                            if transaction.close_price != last_order.open_price:
+                                transaction.close_price = last_order.open_price
+                                has_changes = True
+                                logger.debug(f"Transaction {transaction.id} close_price updated to {last_order.open_price} from last filled order {last_order.id}")
                         
                         logger.info(f"Transaction {transaction.id} filled buy/sell orders balanced (buy={total_filled_buy}, sell={total_filled_sell}), marking as CLOSED")
                         has_changes = True

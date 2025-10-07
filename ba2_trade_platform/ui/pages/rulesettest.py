@@ -16,6 +16,7 @@ from ...core.types import OrderRecommendation, AnalysisUseCase
 from ...core.db import get_db, get_all_instances, get_instance
 from ...modules.accounts.AlpacaAccount import AlpacaAccount
 from ...logger import logger
+from ..components.RuleEvaluationDisplay import render_rule_evaluations
 
 
 class RulesetTestTab:
@@ -36,6 +37,8 @@ class RulesetTestTab:
         self.time_horizon_select = None
         self.results_container = None
         self.evaluation_results = []
+        self.evaluate_all_conditions_checkbox = None
+        self.force_generate_actions_checkbox = None
         
         # If no initial ruleset_id or market_analysis_id provided, try to extract from URL
         if self.initial_ruleset_id is None or self.market_analysis_id is None:
@@ -165,6 +168,21 @@ class RulesetTestTab:
                             options={horizon.value: horizon.value for horizon in TimeHorizon},
                             value=TimeHorizon.MEDIUM_TERM.value
                         ).classes('w-full mb-4')
+                        
+                        # Debug option: Evaluate all conditions
+                        ui.separator().classes('my-4')
+                        ui.label('Debug Options:').classes('text-sm font-medium mb-2')
+                        self.evaluate_all_conditions_checkbox = ui.checkbox(
+                            'Evaluate all conditions (don\'t stop at first failure)',
+                            value=False
+                        ).classes('mb-2')
+                        ui.label('Enable this to see all condition results, even after the first failure.').classes('text-xs text-grey-6 mb-3')
+                        
+                        self.force_generate_actions_checkbox = ui.checkbox(
+                            'Force generate actions (even if conditions fail)',
+                            value=False
+                        ).classes('mb-2')
+                        ui.label('Enable this to see what actions would be generated, regardless of condition results.').classes('text-xs text-grey-6 mb-4')
                         
                         # Test button
                         ui.button(
@@ -360,9 +378,17 @@ class RulesetTestTab:
             if not self.account_select.value:
                 return None
             
+            # Get the debug flags from checkboxes
+            evaluate_all = self.evaluate_all_conditions_checkbox.value if self.evaluate_all_conditions_checkbox else False
+            force_actions = self.force_generate_actions_checkbox.value if self.force_generate_actions_checkbox else False
+            
             # Create account interface
             account = AlpacaAccount(self.account_select.value)
-            evaluator = TradeActionEvaluator(account)
+            evaluator = TradeActionEvaluator(
+                account, 
+                evaluate_all_conditions=evaluate_all,
+                force_generate_actions=force_actions
+            )
             return evaluator
         except Exception as e:
             logger.error(f"Error creating evaluator: {e}", exc_info=True)
@@ -488,149 +514,27 @@ class RulesetTestTab:
                             ui.label(f'Total Conditions: {summary.get("total_conditions", 0)}').classes('text-sm')
                             ui.label(f'Conditions Passed: {summary.get("passed_conditions", 0)}').classes('text-sm')
                             ui.label(f'Conditions Failed: {summary.get("failed_conditions", 0)}').classes('text-sm')
+                            
+                            # Show debug mode status
+                            debug_modes = []
+                            if self.evaluate_all_conditions_checkbox and self.evaluate_all_conditions_checkbox.value:
+                                debug_modes.append('Evaluate All')
+                            if self.force_generate_actions_checkbox and self.force_generate_actions_checkbox.value:
+                                debug_modes.append('Force Actions')
+                            
+                            if debug_modes:
+                                with ui.row().classes('items-center gap-2 mt-2'):
+                                    ui.icon('bug_report', size='sm').classes('text-orange-600')
+                                    ui.label(f'Debug: {" + ".join(debug_modes)}').classes('text-xs text-orange-600 font-medium')
                 
                 # Rule and Condition Evaluation Details
                 ui.separator().classes('my-4')
-                ui.label('📋 Rule and Condition Evaluation Details').classes('text-h6 mb-3')
                 
-                rule_evaluations = evaluation_details.get('rule_evaluations', [])
-                
-                if rule_evaluations:
-                    for rule_eval in rule_evaluations:
-                        rule_name = rule_eval.get('rule_name', 'Unknown Rule')
-                        all_conditions_met = rule_eval.get('all_conditions_met', False)
-                        executed = rule_eval.get('executed', False)
-                        conditions = rule_eval.get('conditions', [])
-                        rule_error = rule_eval.get('error')
-                        
-                        # Color coding based on rule status
-                        if rule_error:
-                            card_color = 'bg-red-100 border-red-300'
-                            status_color = 'bg-red-500'
-                            status_text = 'ERROR'
-                        elif executed:
-                            card_color = 'bg-green-100 border-green-300'
-                            status_color = 'bg-green-500'
-                            status_text = 'EXECUTED'
-                        elif all_conditions_met:
-                            card_color = 'bg-blue-100 border-blue-300'
-                            status_color = 'bg-blue-500'
-                            status_text = 'CONDITIONS MET'
-                        else:
-                            card_color = 'bg-orange-100 border-orange-300'
-                            status_color = 'bg-orange-500'
-                            status_text = 'CONDITIONS NOT MET'
-                        
-                        with ui.card().classes(f'w-full mb-3 border {card_color}'):
-                            with ui.row().classes('w-full items-center justify-between p-2'):
-                                with ui.column().classes('flex-1'):
-                                    ui.label(f'Rule: {rule_name}').classes('font-medium')
-                                    if rule_error:
-                                        ui.label(f'Error: {rule_error}').classes('text-sm text-red-600')
-                                    else:
-                                        ui.label(f'Conditions: {len(conditions)} total').classes('text-sm text-grey-7')
-                                
-                                ui.badge(status_text).classes(f'{status_color} text-white px-2 py-1')
-                            
-                            # Show individual conditions
-                            if conditions:
-                                with ui.expansion('Condition Details', icon='list').classes('w-full'):
-                                    for condition in conditions:
-                                        trigger_key = condition.get('trigger_key', 'Unknown')
-                                        event_type = condition.get('event_type', 'Unknown')
-                                        operator = condition.get('operator', '')
-                                        value = condition.get('value', '')
-                                        result = condition.get('condition_result', False)
-                                        description = condition.get('condition_description', 'No description')
-                                        cond_error = condition.get('error')
-                                        
-                                        # Condition status styling
-                                        if cond_error:
-                                            cond_class = 'text-red-600'
-                                            result_icon = '❌'
-                                            result_text = 'ERROR'
-                                        elif result:
-                                            cond_class = 'text-green-600'
-                                            result_icon = '✅'
-                                            result_text = 'PASSED'
-                                        else:
-                                            cond_class = 'text-orange-600'
-                                            result_icon = '❌'
-                                            result_text = 'FAILED'
-                                        
-                                        with ui.row().classes('w-full items-center p-2 border-b border-grey-200'):
-                                            ui.label(result_icon).classes('text-lg mr-2')
-                                            with ui.column().classes('flex-1'):
-                                                condition_label = f'{trigger_key}: {event_type}'
-                                                if operator and value is not None:
-                                                    condition_label += f' {operator} {value}'
-                                                ui.label(condition_label).classes(f'font-medium {cond_class}')
-                                                ui.label(description).classes('text-sm text-grey-6')
-                                                if cond_error:
-                                                    ui.label(f'Error: {cond_error}').classes('text-sm text-red-500')
-                                            ui.badge(result_text).classes(f'text-white px-2 py-1 {"bg-green-500" if result else "bg-red-500" if cond_error else "bg-orange-500"}')
-                else:
-                    with ui.card().classes('w-full p-4 text-center bg-grey-50 border border-grey-200'):
-                        ui.label('No rule evaluation data available').classes('text-grey-600')
-                
-                ui.separator().classes('my-4')
-                
-                # Individual action definitions
-                if results:
-                    ui.label('🎯 Action Results').classes('text-h6 mb-3')
-                    
-                    for i, result in enumerate(results, 1):
-                        # Check if this is an error result
-                        is_error = 'error' in result
-                        card_color = 'bg-red-100 border-red-300' if is_error else 'bg-blue-100 border-blue-300'
-                        
-                        with ui.card().classes(f'w-full mb-3 border {card_color}'):
-                            with ui.row().classes('w-full items-center justify-between p-2'):
-                                with ui.column().classes('flex-1'):
-                                    if is_error:
-                                        ui.label(f'Error {i}: {result.get("error", "Unknown error")}').classes('font-medium text-red-600')
-                                    else:
-                                        action_type = result.get('action_type', 'Unknown')
-                                        # Handle enum values
-                                        if hasattr(action_type, 'value'):
-                                            action_type = action_type.value
-                                        ui.label(f'Action {i}: {action_type}').classes('font-medium')
-                                        ui.label(result.get('description', 'No description')).classes('text-sm text-grey-7')
-                                
-                                # Status badge
-                                if is_error:
-                                    ui.badge('ERROR').classes('bg-red-500 text-white px-2 py-1')
-                                else:
-                                    ui.badge('READY TO EXECUTE').classes('bg-blue-500 text-white px-2 py-1')
-                            
-                            # Additional info for action definitions
-                            if not is_error and result.get('action_config'):
-                                ui.label(f"Configuration: {result['action_config']}").classes('text-sm px-4 pb-2')
-                            
-                            # Show full action definition details
-                            if not is_error:
-                                with ui.expansion('Action Definition Details', icon='info').classes('w-full'):
-                                    # Create a clean view of the action definition
-                                    display_data = {k: v for k, v in result.items() if k not in ['description']}
-                                    # Convert enum values to strings for display
-                                    for key, value in display_data.items():
-                                        if hasattr(value, 'value'):
-                                            display_data[key] = value.value
-                                    ui.json_editor({'content': {'json': display_data}}).classes('w-full')
-                
-                else:
-                    with ui.card().classes('w-full p-6 text-center bg-yellow-50 border border-yellow-200'):
-                        ui.icon('info', size='2em').classes('text-yellow-600 mb-2')
-                        ui.label('No actions were triggered by this ruleset').classes('text-lg font-medium text-yellow-800')
-                        ui.label('This could mean the conditions were not met or the ruleset has no applicable rules for this scenario').classes('text-sm text-yellow-700')
-                        
-                        # Show summary even when no actions triggered
-                        summary = evaluation_details.get('summary', {})
-                        if summary.get('total_rules', 0) > 0:
-                            total_rules = summary.get('total_rules', 0)
-                            total_conditions = summary.get('total_conditions', 0)
-                            ui.label(f'Rules evaluated: {total_rules}, Conditions checked: {total_conditions}').classes('text-sm text-yellow-600 mt-2')
-            
+                # Use reusable component to display rule evaluations
+                # Combine results and evaluation_details for the component
+                evaluation_display_data = evaluation_details.copy()
+                evaluation_display_data['actions'] = results
+                render_rule_evaluations(evaluation_display_data, show_actions=True, compact=False)            
         except Exception as e:
             logger.error(f"Error displaying results: {e}", exc_info=True)
             with self.results_container:

@@ -165,6 +165,7 @@ class CompareCondition(TradeCondition):
         super().__init__(account, instrument_name, expert_recommendation, existing_order)
         self.operator_str = operator_str
         self.value = value
+        self.calculated_value = None  # Store the actual calculated value
         
         # Map operator strings to functions
         self.operator_map = {
@@ -180,6 +181,15 @@ class CompareCondition(TradeCondition):
             raise ValueError(f"Invalid operator: {operator_str}")
             
         self.operator_func = self.operator_map[operator_str]
+    
+    def get_calculated_value(self) -> Optional[float]:
+        """
+        Get the last calculated value from condition evaluation.
+        
+        Returns:
+            The calculated value or None if not yet evaluated
+        """
+        return self.calculated_value
 
 
 # Flag Condition Implementations
@@ -353,6 +363,11 @@ class NewTargetHigherCondition(FlagCondition):
     
     def evaluate(self) -> bool:
         try:
+            # Initialize tracking variables
+            self.current_tp_price = None
+            self.new_target_price = None
+            self.percent_diff = None
+            
             if not self.existing_order:
                 logger.debug(f"No existing order for new target higher evaluation")
                 return False
@@ -395,6 +410,11 @@ class NewTargetHigherCondition(FlagCondition):
             # Calculate percent difference (new_target vs current_tp)
             percent_diff = ((new_target_price - current_tp_price) / current_tp_price) * 100
             
+            # Store values for external access
+            self.current_tp_price = current_tp_price
+            self.new_target_price = new_target_price
+            self.percent_diff = percent_diff
+            
             # Check if new target is higher by more than tolerance
             is_higher = percent_diff > self.TOLERANCE_PERCENT
             
@@ -404,6 +424,10 @@ class NewTargetHigherCondition(FlagCondition):
             
         except Exception as e:
             logger.error(f"Error evaluating new target higher condition: {e}", exc_info=True)
+            # Clear tracking variables on error
+            self.current_tp_price = None
+            self.new_target_price = None
+            self.percent_diff = None
             return False
     
     def get_description(self) -> str:
@@ -418,6 +442,11 @@ class NewTargetLowerCondition(FlagCondition):
     
     def evaluate(self) -> bool:
         try:
+            # Initialize tracking variables
+            self.current_tp_price = None
+            self.new_target_price = None
+            self.percent_diff = None
+            
             if not self.existing_order:
                 logger.debug(f"No existing order for new target lower evaluation")
                 return False
@@ -460,6 +489,11 @@ class NewTargetLowerCondition(FlagCondition):
             # Calculate percent difference (new_target vs current_tp)
             percent_diff = ((new_target_price - current_tp_price) / current_tp_price) * 100
             
+            # Store values for external access
+            self.current_tp_price = current_tp_price
+            self.new_target_price = new_target_price
+            self.percent_diff = percent_diff
+            
             # Check if new target is lower by more than tolerance
             is_lower = percent_diff < -self.TOLERANCE_PERCENT
             
@@ -469,6 +503,10 @@ class NewTargetLowerCondition(FlagCondition):
             
         except Exception as e:
             logger.error(f"Error evaluating new target lower condition: {e}", exc_info=True)
+            # Clear tracking variables on error
+            self.current_tp_price = None
+            self.new_target_price = None
+            self.percent_diff = None
             return False
     
     def get_description(self) -> str:
@@ -579,8 +617,10 @@ class ExpectedProfitTargetPercentCondition(CompareCondition):
             # If no expected profit data, we cannot evaluate
             if expected_profit is None:
                 logger.debug(f"No expected profit data available for {self.instrument_name}")
+                self.calculated_value = None
                 return False
-                
+            
+            self.calculated_value = expected_profit  # Store calculated value
             return self.operator_func(expected_profit, self.value)
             
         except Exception as e:
@@ -599,12 +639,14 @@ class PercentToCurrentTargetCondition(CompareCondition):
         try:
             if not self.existing_order:
                 logger.debug(f"No existing order for percent to current target evaluation")
+                self.calculated_value = None
                 return False
             
             # Get current market price
             current_price = self.get_current_price()
             if current_price is None:
                 logger.error(f"Cannot get current price for {self.instrument_name}")
+                self.calculated_value = None
                 return False
             
             # Get current TP price from transaction or order
@@ -622,10 +664,13 @@ class PercentToCurrentTargetCondition(CompareCondition):
             # If no TP in transaction, we can't evaluate
             if current_tp_price is None:
                 logger.debug(f"No current TP price available for order {self.existing_order.id}")
+                self.calculated_value = None
                 return False
             
             # Calculate percent to current target
             percent_to_current_target = ((current_tp_price - current_price) / current_price) * 100
+            
+            self.calculated_value = percent_to_current_target  # Store calculated value
             
             logger.info(f"Percent to CURRENT target for {self.instrument_name}: current=${current_price:.2f}, TP=${current_tp_price:.2f}, distance={percent_to_current_target:+.2f}%")
             
@@ -633,6 +678,7 @@ class PercentToCurrentTargetCondition(CompareCondition):
             
         except Exception as e:
             logger.error(f"Error evaluating percent to current target condition: {e}", exc_info=True)
+            self.calculated_value = None
             return False
     
     def get_description(self) -> str:
@@ -647,21 +693,25 @@ class PercentToNewTargetCondition(CompareCondition):
         try:
             if not self.existing_order:
                 logger.debug(f"No existing order for percent to new target evaluation")
+                self.calculated_value = None
                 return False
             
             # Get current market price
             current_price = self.get_current_price()
             if current_price is None:
                 logger.error(f"Cannot get current price for {self.instrument_name}")
+                self.calculated_value = None
                 return False
             
             # Calculate new expert target price from current recommendation
             if not self.expert_recommendation:
                 logger.debug(f"No expert recommendation for new target evaluation")
+                self.calculated_value = None
                 return False
             
             if not hasattr(self.expert_recommendation, 'price_at_date') or not hasattr(self.expert_recommendation, 'expected_profit_percent'):
                 logger.error(f"Expert recommendation missing price_at_date or expected_profit_percent")
+                self.calculated_value = None
                 return False
             
             base_price = self.expert_recommendation.price_at_date
@@ -675,10 +725,13 @@ class PercentToNewTargetCondition(CompareCondition):
                 new_target_price = base_price * (1 - expected_profit / 100)
             else:
                 logger.debug(f"Recommendation action is HOLD, cannot calculate target")
+                self.calculated_value = None
                 return False
             
             # Calculate percent to new target
             percent_to_new_target = ((new_target_price - current_price) / current_price) * 100
+            
+            self.calculated_value = percent_to_new_target  # Store calculated value
             
             logger.info(f"Percent to NEW target for {self.instrument_name}: current=${current_price:.2f}, new_target=${new_target_price:.2f} (base=${base_price:.2f}, profit={expected_profit:.1f}%), distance={percent_to_new_target:+.2f}%")
             
@@ -686,6 +739,7 @@ class PercentToNewTargetCondition(CompareCondition):
             
         except Exception as e:
             logger.error(f"Error evaluating percent to new target condition: {e}", exc_info=True)
+            self.calculated_value = None
             return False
     
     def get_description(self) -> str:
@@ -699,10 +753,12 @@ class ProfitLossAmountCondition(CompareCondition):
     def evaluate(self) -> bool:
         try:
             if not self.existing_order:
+                self.calculated_value = None
                 return False
                 
             current_price = self.get_current_price()
             if current_price is None or not hasattr(self.existing_order, 'limit_price') or self.existing_order.limit_price is None:
+                self.calculated_value = None
                 return False
                 
             # Calculate P&L amount
@@ -713,11 +769,14 @@ class ProfitLossAmountCondition(CompareCondition):
             # Adjust for short positions
             if self.existing_order.side == "sell":
                 pl_amount = -pl_amount
+            
+            self.calculated_value = pl_amount  # Store calculated value
                 
             return self.operator_func(pl_amount, self.value)
             
         except Exception as e:
             logger.error(f"Error evaluating profit loss amount condition: {e}", exc_info=True)
+            self.calculated_value = None
             return False
     
     def get_description(self) -> str:
@@ -731,9 +790,11 @@ class ProfitLossPercentCondition(CompareCondition):
     def evaluate(self) -> bool:
         try:
             if not self.existing_order:
+                self.calculated_value = None
                 return False
             current_price = self.get_current_price()
             if current_price is None or not hasattr(self.existing_order, 'limit_price') or self.existing_order.limit_price is None:
+                self.calculated_value = None
                 return False
             # Calculate P&L percentage
             entry_price = self.existing_order.limit_price
@@ -741,9 +802,12 @@ class ProfitLossPercentCondition(CompareCondition):
             # Adjust for short positions
             if self.existing_order.side == "sell":
                 pl_percent = -pl_percent
+            
+            self.calculated_value = pl_percent  # Store calculated value
             return self.operator_func(pl_percent, self.value)
         except Exception as e:
             logger.error(f"Error evaluating profit loss percent condition: {e}", exc_info=True)
+            self.calculated_value = None
             return False
     def get_description(self) -> str:
         return f"Check if profit/loss percentage for {self.instrument_name} is {self.operator_str} {self.value}%"
@@ -756,7 +820,10 @@ class ConfidenceCondition(CompareCondition):
             confidence = getattr(self.expert_recommendation, 'confidence', None)
             if confidence is None:
                 logger.debug(f"No confidence value available for {self.instrument_name}")
+                self.calculated_value = None
                 return False
+            
+            self.calculated_value = confidence  # Store calculated value
             return self.operator_func(confidence, self.value)
         except Exception as e:
             logger.error(f"Error evaluating confidence condition: {e}", exc_info=True)
@@ -771,6 +838,7 @@ class DaysOpenedCondition(CompareCondition):
     def evaluate(self) -> bool:
         try:
             if not self.existing_order or not self.existing_order.created_at:
+                self.calculated_value = None
                 return False
                 
             # Calculate days since order was opened
@@ -782,10 +850,13 @@ class DaysOpenedCondition(CompareCondition):
             time_diff = now - created_at
             days_opened = time_diff.total_seconds() / 86400  # 86400 seconds in a day
             
+            self.calculated_value = days_opened  # Store calculated value
+            
             return self.operator_func(days_opened, self.value)
             
         except Exception as e:
             logger.error(f"Error evaluating days opened condition: {e}", exc_info=True)
+            self.calculated_value = None
             return False
     
     def get_description(self) -> str:
@@ -802,16 +873,20 @@ class InstrumentAccountShareCondition(CompareCondition):
             position_value = self._get_instrument_position_value()
             if position_value is None:
                 logger.debug(f"No position value available for {self.instrument_name}")
+                self.calculated_value = None
                 return False
             
             # Get expert virtual equity
             virtual_equity = self._get_expert_virtual_equity()
             if virtual_equity is None or virtual_equity <= 0:
                 logger.error(f"Invalid virtual equity for expert")
+                self.calculated_value = None
                 return False
             
             # Calculate share percentage
             share_percent = (position_value / virtual_equity) * 100.0
+            
+            self.calculated_value = share_percent  # Store calculated value
             
             logger.debug(f"Instrument {self.instrument_name} share: {share_percent:.2f}% "
                         f"(position_value=${position_value:.2f}, virtual_equity=${virtual_equity:.2f})")

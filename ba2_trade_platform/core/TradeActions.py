@@ -192,7 +192,6 @@ class TradeAction(ABC):
     
     def create_action_result(self, action_type: str, success: bool, message: str, 
                            data: Optional[Dict[str, Any]] = None,
-                           transaction_id: Optional[int] = None,
                            expert_recommendation_id: Optional[int] = None) -> "TradeActionResult":
         """
         Create a TradeActionResult instance for this action.
@@ -202,7 +201,6 @@ class TradeAction(ABC):
             success: Whether the action was successful
             message: Human-readable message about the result
             data: Additional data from the action
-            transaction_id: Optional transaction ID to link
             expert_recommendation_id: Optional expert recommendation ID to link
             
         Returns:
@@ -216,16 +214,13 @@ class TradeAction(ABC):
             success=success,
             message=message,
             data=data,
-            transaction_id=transaction_id,
             expert_recommendation_id=expert_recommendation_id
         )
         
         return result
     
     def create_and_save_action_result(self, action_type: str, success: bool, message: str, 
-                                       data: Optional[Dict[str, Any]] = None,
-                                       transaction_id: Optional[int] = None,
-                                       expert_recommendation_id: Optional[int] = None) -> Dict[str, Any]:
+                                       data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Create and save a TradeActionResult, returning a dictionary of attributes.
         
@@ -237,8 +232,6 @@ class TradeAction(ABC):
             success: Whether the action was successful
             message: Human-readable message about the result
             data: Additional data dictionary
-            transaction_id: Optional transaction ID
-            expert_recommendation_id: Optional expert recommendation ID
             
         Returns:
             Dictionary with result attributes (id, action_type, success, message, data)
@@ -246,13 +239,36 @@ class TradeAction(ABC):
         if data is None:
             data = {}
         
-        # Create the result object
+        # Get expert_recommendation_id from self.expert_recommendation if available
+        expert_recommendation_id = None
+        if self.expert_recommendation:
+            expert_recommendation_id = self.expert_recommendation.id
+        
+        # If this action has evaluation_details attached (from live execution), include them
+        if hasattr(self, 'evaluation_details') and self.evaluation_details:
+            data['evaluation_details'] = self.evaluation_details
+            logger.debug(f"Storing evaluation details in TradeActionResult for {action_type}")
+        
+        # Add calculation preview for TP/SL actions if available
+        if hasattr(self, 'get_calculation_preview'):
+            try:
+                calc_preview = self.get_calculation_preview()
+                data['calculation_preview'] = calc_preview
+                logger.debug(f"Storing calculation preview in TradeActionResult for {action_type}")
+            except Exception as e:
+                logger.debug(f"Could not get calculation preview: {e}")
+        
+        # Create the result object (only if we have expert_recommendation_id)
+        if not expert_recommendation_id:
+            logger.warning(f"Creating TradeActionResult without expert_recommendation_id for {action_type}")
+            # For backward compatibility during migration, allow creation without it
+            # TODO: Make expert_recommendation_id required after migration
+        
         result = TradeActionResult(
             action_type=action_type,
             success=success,
             message=message,
             data=data,
-            transaction_id=transaction_id,
             expert_recommendation_id=expert_recommendation_id
         )
         
@@ -266,7 +282,6 @@ class TradeAction(ABC):
             'success': success,
             'message': message,
             'data': data,
-            'transaction_id': transaction_id,
             'expert_recommendation_id': expert_recommendation_id
         }
 
@@ -641,14 +656,44 @@ class AdjustTakeProfitAction(TradeAction):
                     )
                 
                 # Calculate TP price based on reference price and percent
-                # For BUY orders: TP is above entry (positive percent)
-                # For SELL orders: TP is below entry (negative percent implied)
-                if self.existing_order.side.upper() == "BUY":
+                # Determine the order direction for TP calculation
+                # For enter_market: use order_recommendation (BUY/SELL from expert)
+                # For open_positions: use existing_order.side (direction of current position)
+                
+                # Determine if we're going LONG (BUY) or SHORT (SELL)
+                is_long_position = False
+                if self.order_recommendation == OrderRecommendation.BUY:
+                    # Expert recommends BUY = going LONG
+                    is_long_position = True
+                    logger.info(f"TP Direction: Using order_recommendation={self.order_recommendation.value} → LONG position")
+                elif self.order_recommendation == OrderRecommendation.SELL:
+                    # Expert recommends SELL = going SHORT
+                    is_long_position = False
+                    logger.info(f"TP Direction: Using order_recommendation={self.order_recommendation.value} → SHORT position")
+                elif self.existing_order:
+                    # Fallback to existing order side for open_positions rules
+                    is_long_position = (self.existing_order.side.upper() == "BUY")
+                    logger.info(f"TP Direction: Using existing_order.side={self.existing_order.side.upper()} → {'LONG' if is_long_position else 'SHORT'} position")
+                else:
+                    logger.error(f"Cannot determine order direction for TP calculation")
+                    return self.create_and_save_action_result(
+                        action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
+                        success=False,
+                        message="Cannot determine order direction for TP calculation",
+                        data={}
+                    )
+                
+                # Apply TP logic based on position direction
+                # LONG (BUY): TP is above entry → use positive percent
+                # SHORT (SELL): TP is below entry → invert the percent
+                if is_long_position:
+                    # LONG: TP above entry, profit when price increases
                     self.take_profit_price = reference_price * (1 + self.percent / 100)
-                    logger.info(f"TP Final (BUY): ${reference_price:.2f} * (1 + {self.percent:+.2f}/100) = ${self.take_profit_price:.2f}")
-                else:  # SELL order
+                    logger.info(f"TP Final (LONG/BUY): ${reference_price:.2f} * (1 + {self.percent:+.2f}/100) = ${self.take_profit_price:.2f}")
+                else:
+                    # SHORT: TP below entry, profit when price decreases  
                     self.take_profit_price = reference_price * (1 - self.percent / 100)
-                    logger.info(f"TP Final (SELL): ${reference_price:.2f} * (1 - {self.percent:+.2f}/100) = ${self.take_profit_price:.2f}")
+                    logger.info(f"TP Final (SHORT/SELL): ${reference_price:.2f} * (1 - {self.percent:+.2f}/100) = ${self.take_profit_price:.2f}")
                 
                 logger.info(f"TP Calculation COMPLETE for {self.instrument_name} - Final TP Price: ${self.take_profit_price:.2f}")
             
@@ -687,6 +732,61 @@ class AdjustTakeProfitAction(TradeAction):
         """Get description of adjust take profit action."""
         price_desc = f" at ${self.take_profit_price}" if self.take_profit_price else " (auto-calculated)"
         return f"Set or adjust take profit order for {self.instrument_name}{price_desc}"
+    
+    def get_calculation_preview(self) -> Dict[str, Any]:
+        """
+        Get a preview of TP calculation without executing.
+        
+        Returns:
+            Dictionary with reference_price, percent, calculated_price, reference_type
+        """
+        preview = {
+            "reference_type": self.reference_value,
+            "percent": self.percent,
+            "reference_price": None,
+            "calculated_price": self.take_profit_price
+        }
+        
+        # If price already set, return it
+        if self.take_profit_price is not None:
+            return preview
+        
+        # Try to calculate reference price
+        if self.reference_value and self.existing_order:
+            from .types import ReferenceValue
+            
+            try:
+                if self.reference_value == ReferenceValue.ORDER_OPEN_PRICE.value:
+                    preview["reference_price"] = self.existing_order.limit_price
+                elif self.reference_value == ReferenceValue.CURRENT_PRICE.value:
+                    preview["reference_price"] = self.get_current_price()
+                elif self.reference_value == ReferenceValue.EXPERT_TARGET_PRICE.value:
+                    if self.existing_order and self.existing_order.expert_recommendation_id:
+                        from .db import get_instance
+                        from .models import ExpertRecommendation
+                        expert_rec = get_instance(ExpertRecommendation, self.existing_order.expert_recommendation_id)
+                        if expert_rec and hasattr(expert_rec, 'price_at_date') and hasattr(expert_rec, 'expected_profit_percent'):
+                            base_price = expert_rec.price_at_date
+                            expected_profit = expert_rec.expected_profit_percent
+                            
+                            from .types import OrderRecommendation
+                            if expert_rec.recommended_action == OrderRecommendation.BUY:
+                                preview["reference_price"] = base_price * (1 + expected_profit / 100)
+                            elif expert_rec.recommended_action == OrderRecommendation.SELL:
+                                preview["reference_price"] = base_price * (1 - expected_profit / 100)
+                
+                # Calculate final price
+                if preview["reference_price"] and self.percent:
+                    # For BUY orders, TP is above entry; for SELL orders, TP is below entry
+                    if self.existing_order.side == "buy":
+                        preview["calculated_price"] = preview["reference_price"] * (1 + self.percent / 100)
+                    else:  # sell
+                        preview["calculated_price"] = preview["reference_price"] * (1 - self.percent / 100)
+                        
+            except Exception as e:
+                logger.debug(f"Error calculating TP preview: {e}")
+        
+        return preview
 
 
 class AdjustStopLossAction(TradeAction):
@@ -826,14 +926,44 @@ class AdjustStopLossAction(TradeAction):
                     )
                 
                 # Calculate SL price based on reference price and percent
-                # For BUY orders: SL is below entry (negative percent)
-                # For SELL orders: SL is above entry (positive percent implied)
-                if self.existing_order.side.upper() == "BUY":
+                # Determine the order direction for SL calculation
+                # For enter_market: use order_recommendation (BUY/SELL from expert)
+                # For open_positions: use existing_order.side (direction of current position)
+                
+                # Determine if we're going LONG (BUY) or SHORT (SELL)
+                is_long_position = False
+                if self.order_recommendation == OrderRecommendation.BUY:
+                    # Expert recommends BUY = going LONG
+                    is_long_position = True
+                    logger.info(f"SL Direction: Using order_recommendation={self.order_recommendation.value} → LONG position")
+                elif self.order_recommendation == OrderRecommendation.SELL:
+                    # Expert recommends SELL = going SHORT
+                    is_long_position = False
+                    logger.info(f"SL Direction: Using order_recommendation={self.order_recommendation.value} → SHORT position")
+                elif self.existing_order:
+                    # Fallback to existing order side for open_positions rules
+                    is_long_position = (self.existing_order.side.upper() == "BUY")
+                    logger.info(f"SL Direction: Using existing_order.side={self.existing_order.side.upper()} → {'LONG' if is_long_position else 'SHORT'} position")
+                else:
+                    logger.error(f"Cannot determine order direction for SL calculation")
+                    return self.create_and_save_action_result(
+                        action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
+                        success=False,
+                        message="Cannot determine order direction for SL calculation",
+                        data={}
+                    )
+                
+                # Apply SL logic based on position direction (INVERSE of TP)
+                # LONG (BUY): SL is below entry → use negative percent
+                # SHORT (SELL): SL is above entry → invert the percent
+                if is_long_position:
+                    # LONG: SL below entry, stop loss when price decreases
                     self.stop_loss_price = reference_price * (1 + self.percent / 100)
-                    logger.info(f"SL Final (BUY): ${reference_price:.2f} * (1 + {self.percent:+.2f}/100) = ${self.stop_loss_price:.2f}")
-                else:  # SELL order
+                    logger.info(f"SL Final (LONG/BUY): ${reference_price:.2f} * (1 + {self.percent:+.2f}/100) = ${self.stop_loss_price:.2f}")
+                else:
+                    # SHORT: SL above entry, stop loss when price increases  
                     self.stop_loss_price = reference_price * (1 - self.percent / 100)
-                    logger.info(f"SL Final (SELL): ${reference_price:.2f} * (1 - {self.percent:+.2f}/100) = ${self.stop_loss_price:.2f}")
+                    logger.info(f"SL Final (SHORT/SELL): ${reference_price:.2f} * (1 - {self.percent:+.2f}/100) = ${self.stop_loss_price:.2f}")
                 
                 logger.info(f"SL Calculation COMPLETE for {self.instrument_name} - Final SL Price: ${self.stop_loss_price:.2f}")
             
@@ -909,6 +1039,61 @@ class AdjustStopLossAction(TradeAction):
         """Get description of adjust stop loss action."""
         price_desc = f" at ${self.stop_loss_price}" if self.stop_loss_price else " (auto-calculated)"
         return f"Set or adjust stop loss order for {self.instrument_name}{price_desc}"
+    
+    def get_calculation_preview(self) -> Dict[str, Any]:
+        """
+        Get a preview of SL calculation without executing.
+        
+        Returns:
+            Dictionary with reference_price, percent, calculated_price, reference_type
+        """
+        preview = {
+            "reference_type": self.reference_value,
+            "percent": self.percent,
+            "reference_price": None,
+            "calculated_price": self.stop_loss_price
+        }
+        
+        # If price already set, return it
+        if self.stop_loss_price is not None:
+            return preview
+        
+        # Try to calculate reference price
+        if self.reference_value and self.existing_order:
+            from .types import ReferenceValue
+            
+            try:
+                if self.reference_value == ReferenceValue.ORDER_OPEN_PRICE.value:
+                    preview["reference_price"] = self.existing_order.limit_price
+                elif self.reference_value == ReferenceValue.CURRENT_PRICE.value:
+                    preview["reference_price"] = self.get_current_price()
+                elif self.reference_value == ReferenceValue.EXPERT_TARGET_PRICE.value:
+                    if self.existing_order and self.existing_order.expert_recommendation_id:
+                        from .db import get_instance
+                        from .models import ExpertRecommendation
+                        expert_rec = get_instance(ExpertRecommendation, self.existing_order.expert_recommendation_id)
+                        if expert_rec and hasattr(expert_rec, 'price_at_date') and hasattr(expert_rec, 'expected_profit_percent'):
+                            base_price = expert_rec.price_at_date
+                            expected_profit = expert_rec.expected_profit_percent
+                            
+                            from .types import OrderRecommendation
+                            if expert_rec.recommended_action == OrderRecommendation.BUY:
+                                preview["reference_price"] = base_price * (1 + expected_profit / 100)
+                            elif expert_rec.recommended_action == OrderRecommendation.SELL:
+                                preview["reference_price"] = base_price * (1 - expected_profit / 100)
+                
+                # Calculate final price
+                if preview["reference_price"] and self.percent:
+                    # For BUY orders, SL is below entry; for SELL orders, SL is above entry
+                    if self.existing_order.side.upper() == "BUY":
+                        preview["calculated_price"] = preview["reference_price"] * (1 + self.percent / 100)
+                    else:  # sell
+                        preview["calculated_price"] = preview["reference_price"] * (1 - self.percent / 100)
+                        
+            except Exception as e:
+                logger.debug(f"Error calculating SL preview: {e}")
+        
+        return preview
 
 
 class IncreaseInstrumentShareAction(TradeAction):

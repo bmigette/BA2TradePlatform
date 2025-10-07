@@ -14,11 +14,11 @@ ALPHA_VANTAGE_API_KEY=None
 
 DB_FILE = os.path.join(os.path.expanduser("~"), "Documents", "ba2_trade_platform", "db.sqlite")
 CACHE_FOLDER = os.path.join(os.path.expanduser("~"), "Documents", "ba2_trade_platform", "cache")
-# Default account refresh interval in minutes
-account_refresh_interval = 60  # Default to 60 minutes
+# Price cache duration in seconds
+PRICE_CACHE_TIME = 30  # Default to 30 seconds
 
 def load_config_from_env() -> None:
-    global FINNHUB_API_KEY, OPENAI_API_KEY, ALPHA_VANTAGE_API_KEY, FILE_LOGGING, account_refresh_interval
+    global FINNHUB_API_KEY, OPENAI_API_KEY, ALPHA_VANTAGE_API_KEY, FILE_LOGGING, PRICE_CACHE_TIME
     """Loads configuration from environment variables."""
 
     env_file = os.path.join(HOME_PARENT, '.env')
@@ -27,8 +27,8 @@ def load_config_from_env() -> None:
     OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', OPENAI_API_KEY)
     ALPHA_VANTAGE_API_KEY = os.getenv('ALPHA_VANTAGE_API_KEY', ALPHA_VANTAGE_API_KEY)
     
-    # Load account refresh interval from environment, default to 60 minutes
+    # Load price cache time from environment, default to 30 seconds
     try:
-        account_refresh_interval = int(os.getenv('ACCOUNT_REFRESH_INTERVAL', account_refresh_interval))
+        PRICE_CACHE_TIME = int(os.getenv('PRICE_CACHE_TIME', PRICE_CACHE_TIME))
     except ValueError:
-        account_refresh_interval = 60    
+        PRICE_CACHE_TIME = 30    

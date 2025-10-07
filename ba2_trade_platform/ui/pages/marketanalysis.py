@@ -1422,11 +1422,19 @@ class OrderRecommendationsTab:
                                    color="primary" 
                                    title="View Analysis"
                                    @click="$parent.$emit('view_analysis', props.row.analysis_id)" />
+                            <q-btn v-if="props.row.has_evaluation_data" 
+                                   icon="search" 
+                                   flat 
+                                   dense 
+                                   color="secondary" 
+                                   title="View Rule Evaluation Details"
+                                   @click="$parent.$emit('view_evaluation', props.row.id)" />
                         </q-td>
                     ''')
                     
                     rec_table.on('place_order_rec', self._handle_place_order_recommendation)
                     rec_table.on('view_analysis', self._handle_view_analysis)
+                    rec_table.on('view_evaluation', self._handle_view_evaluation)
                     
         except Exception as e:
             logger.error(f"Error loading symbol details: {e}", exc_info=True)
@@ -1465,6 +1473,20 @@ class OrderRecommendationsTab:
                     )
                     existing_orders = session.exec(order_statement).all()
                     
+                    # Check for TradeActionResult with evaluation details
+                    from ...core.models import TradeActionResult
+                    action_result_statement = select(TradeActionResult).where(
+                        TradeActionResult.expert_recommendation_id == recommendation.id
+                    )
+                    action_results = session.exec(action_result_statement).all()
+                    
+                    # Check if any action result has evaluation_details in data
+                    has_evaluation_data = False
+                    for result in action_results:
+                        if result.data and 'evaluation_details' in result.data:
+                            has_evaluation_data = True
+                            break
+                    
                     # Determine order status for this recommendation
                     has_non_pending_order = any(order.status != OrderStatus.PENDING for order in existing_orders)
                     has_pending_order = any(order.status == OrderStatus.PENDING for order in existing_orders)
@@ -1502,7 +1524,8 @@ class OrderRecommendationsTab:
                         'analysis_id': analysis.id if analysis else None,
                         'can_place_order': can_place_order,
                         'has_pending_order': has_pending_order,
-                        'existing_orders_count': len(existing_orders)
+                        'existing_orders_count': len(existing_orders),
+                        'has_evaluation_data': has_evaluation_data  # NEW: Flag for showing magnifying glass icon
                     })
                 
                 return recommendations
@@ -1619,6 +1642,51 @@ class OrderRecommendationsTab:
                 ui.navigate.to(f'/market_analysis/{analysis_id}')
         except Exception as e:
             logger.error(f"Error navigating to analysis detail: {e}", exc_info=True)
+
+    def _handle_view_evaluation(self, event_data):
+        """Handle view rule evaluation details click."""
+        try:
+            recommendation_id = event_data.args if hasattr(event_data, 'args') else event_data
+            if not recommendation_id:
+                return
+            
+            # Load TradeActionResult with evaluation details
+            from ...core.models import TradeActionResult
+            from ..components.RuleEvaluationDisplay import render_rule_evaluations
+            
+            with get_db() as session:
+                # Get action results for this recommendation
+                statement = select(TradeActionResult).where(
+                    TradeActionResult.expert_recommendation_id == recommendation_id
+                )
+                action_results = session.exec(statement).all()
+                
+                # Find the first result with evaluation_details
+                evaluation_data = None
+                for result in action_results:
+                    if result.data and 'evaluation_details' in result.data:
+                        evaluation_data = result.data['evaluation_details']
+                        break
+                
+                if not evaluation_data:
+                    ui.notify('No evaluation details found', type='warning')
+                    return
+                
+                # Show dialog with evaluation details
+                with ui.dialog() as eval_dialog, ui.card().classes('w-full max-w-4xl'):
+                    ui.label('🔍 Rule Evaluation Details').classes('text-h6 mb-4')
+                    
+                    # Use the reusable component to display evaluation details
+                    render_rule_evaluations(evaluation_data, show_actions=True, compact=False)
+                    
+                    with ui.row().classes('w-full justify-end mt-4'):
+                        ui.button('Close', on_click=eval_dialog.close).props('outline')
+                
+                eval_dialog.open()
+                
+        except Exception as e:
+            logger.error(f"Error viewing evaluation details: {e}", exc_info=True)
+            ui.notify(f'Error loading evaluation details: {str(e)}', type='negative')
 
     def _get_current_price(self, symbol):
         """Get current price for a symbol."""

@@ -9,8 +9,8 @@ from datetime import datetime as DateTime, timezone
 class RulesetEventActionLink(SQLModel, table=True):
     __tablename__ = "ruleset_eventaction_link"
     
-    ruleset_id: int = Field(foreign_key="ruleset.id", primary_key=True)
-    eventaction_id: int = Field(foreign_key="eventaction.id", primary_key=True)
+    ruleset_id: int = Field(foreign_key="ruleset.id", primary_key=True, ondelete="CASCADE")
+    eventaction_id: int = Field(foreign_key="eventaction.id", primary_key=True, ondelete="CASCADE")
     order_index: int = Field(default=0, description="Order of the rule in the ruleset (0-based)")
 
 class AppSetting(SQLModel, table=True):
@@ -157,9 +157,6 @@ class Transaction(SQLModel, table=True):
     
     # Relationship to trading orders (1:many - one transaction can have multiple orders)
     trading_orders: List["TradingOrder"] = Relationship(back_populates="transaction")
-    
-    # Relationship to trade action results (1:many - one transaction can have multiple action results)
-    trade_action_results: List["TradeActionResult"] = Relationship(back_populates="transaction")
 
     def as_string(self) -> str:
         return f"Transaction(id={self.id}, symbol={self.symbol}, quantity={self.quantity}, status={self.status}, open_price={self.open_price}, close_price={self.close_price})"
@@ -271,8 +268,8 @@ class Transaction(SQLModel, table=True):
             for order in orders:
                 # Only count filled orders
                 if order.status in OrderStatus.get_executed_statuses() and order.filled_qty:
-                    # Use open_price if available, otherwise use filled_avg_price
-                    price = order.open_price if order.open_price else order.filled_avg_price
+                    # Use open_price for filled orders
+                    price = order.open_price
                     
                     if price:
                         # Calculate value: quantity × price
@@ -280,7 +277,7 @@ class Transaction(SQLModel, table=True):
                         total_equity += equity
                         # logger.debug(f"  Order {order.id}: filled_qty={order.filled_qty}, price={price}, equity=${equity:.2f}")
                     # else:
-                    #     logger.debug(f"  Order {order.id}: No price available (open_price={order.open_price}, filled_avg_price={order.filled_avg_price})")
+                    #     logger.debug(f"  Order {order.id}: No price available (open_price={order.open_price})")
                 # else:
                 #     logger.debug(f"  Order {order.id}: Skipped (status={order.status}, filled_qty={order.filled_qty})")
             
@@ -365,7 +362,6 @@ class TradingOrder(SQLModel, table=True):
     good_for: str | None
     status: OrderStatus = OrderStatus.UNKNOWN
     filled_qty: float | None
-    filled_avg_price: float | None = Field(default=None, description="Average price at which the order was filled")
     open_price: float | None = Field(default=None, description="Price at which the order opened (for filled orders)")
     comment: str | None
     created_at: DateTime | None = Field(default_factory=lambda: DateTime.now(timezone.utc))
@@ -373,12 +369,12 @@ class TradingOrder(SQLModel, table=True):
     # New fields
     open_type: OrderOpenType = Field(default=OrderOpenType.AUTOMATIC)
     broker_order_id: str | None = Field(default=None, description="Broker-specific order ID for tracking")
-    expert_recommendation_id: int | None = Field(default=None, foreign_key="expertrecommendation.id", description="Expert recommendation that generated this order")
+    expert_recommendation_id: int | None = Field(default=None, foreign_key="expertrecommendation.id", ondelete="SET NULL", description="Expert recommendation that generated this order")
     limit_price: float | None = Field(default=None, description="Limit price for limit orders")
     stop_price: float | None = Field(default=None, description="Stop price for stop orders")
 
     # Dependency fields for order chaining
-    depends_on_order: int | None = Field(default=None, foreign_key="tradingorder.id", description="ID of another order this order depends on")
+    depends_on_order: int | None = Field(default=None, foreign_key="tradingorder.id", ondelete="SET NULL", description="ID of another order this order depends on")
     depends_order_status_trigger: OrderStatus | None = Field(default=None, description="Status that the depends_on_order must reach to trigger this order")
     
     # Many:1 relationship with Transaction (many orders can belong to one transaction)
@@ -478,10 +474,8 @@ class TradeActionResult(SQLModel, table=True):
     # Timestamps
     created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), description="When the action was executed")
     
-    # Foreign key relationships
-    transaction_id: int | None = Field(default=None, foreign_key="transaction.id")
-    expert_recommendation_id: int | None = Field(default=None, foreign_key="expertrecommendation.id")
+    # Foreign key relationships (expert_recommendation_id is required - all actions come from recommendations)
+    expert_recommendation_id: int = Field(foreign_key="expertrecommendation.id", nullable=False, ondelete="CASCADE", description="Expert recommendation that triggered this action")
     
     # Relationships
-    transaction: Optional["Transaction"] = Relationship(back_populates="trade_action_results")
-    expert_recommendation: Optional["ExpertRecommendation"] = Relationship(back_populates="trade_action_results")
+    expert_recommendation: "ExpertRecommendation" = Relationship(back_populates="trade_action_results")

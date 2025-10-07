@@ -10,7 +10,7 @@ from ...logger import logger
 from ...core.db import get_db, get_all_instances, delete_instance, add_instance, update_instance, get_instance
 from ...modules.accounts import providers
 from ...core.AccountInterface import AccountInterface
-from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, AnalysisUseCase, MarketAnalysisStatus
+from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, is_share_adjustment_action, AnalysisUseCase, MarketAnalysisStatus
 from ...core.cleanup import preview_cleanup, execute_cleanup, get_cleanup_statistics
 from yahooquery import Ticker, search as yq_search
 from nicegui.events import UploadEventArguments
@@ -2765,10 +2765,11 @@ class TradeSettingsTab:
                                         for use_case in doc['use_cases'][:2]:  # Show first 2 use cases
                                             ui.label(f"• {use_case}").classes('text-xs text-green-600 ml-2')
                 
-                # Value input (for ADJUST_ types)
+                # Value input (for ADJUST_ types and INCREASE/DECREASE_INSTRUMENT_SHARE)
                 value_row = ui.row().classes('w-full')
                 value_input = None
                 reference_select = None
+                target_percent_input = None
                 
                 def update_action_inputs():
                     value_row.clear()
@@ -2797,6 +2798,25 @@ class TradeSettingsTab:
                                     label='Reference Value',
                                     value=action_config.get('reference_value', 'current_price') if action_config else 'current_price'
                                 ).classes('w-full')
+                    elif selected_type and is_share_adjustment_action(selected_type):
+                        # Share adjustment action - show target_percent input
+                        with value_row:
+                            with ui.column().classes('w-full gap-2'):
+                                nonlocal target_percent_input
+                                
+                                # Target percent input
+                                target_percent_input = ui.number(
+                                    label='Target Percent of Account Equity (%)',
+                                    value=action_config.get('target_percent', 10.0) if action_config else 10.0,
+                                    min=0.0,
+                                    max=100.0,
+                                    step=0.1,
+                                    format='%.1f',
+                                    placeholder='e.g. 10.0 for 10%'
+                                ).classes('w-full')
+                                
+                                # Help text
+                                ui.label('Minimum: 1 share | Maximum: Respects max_virtual_equity_per_instrument_percent setting and available balance').classes('text-xs text-grey-6 mt-1')
                     else:
                         # Simple action - no additional inputs needed
                         with value_row:
@@ -2811,7 +2831,8 @@ class TradeSettingsTab:
                     'card': action_card,
                     'type_select': action_select,
                     'value_input': lambda: value_input,
-                    'reference_select': lambda: reference_select
+                    'reference_select': lambda: reference_select,
+                    'target_percent_input': lambda: target_percent_input
                 }
     
     def _remove_action_row(self, action_id, action_card):
@@ -2866,6 +2887,25 @@ class TradeSettingsTab:
                     # Save reference value (always save, even if value is empty)
                     if reference_select:
                         action_config['reference_value'] = reference_select.value
+                
+                elif is_share_adjustment_action(action_type):
+                    # Share adjustment action (INCREASE/DECREASE_INSTRUMENT_SHARE)
+                    target_percent_input = action_refs['target_percent_input']()
+                    
+                    if target_percent_input and target_percent_input.value is not None:
+                        try:
+                            target_percent = float(target_percent_input.value)
+                            # Validate range
+                            if target_percent < 0 or target_percent > 100:
+                                ui.notify(f'Target percent must be between 0 and 100 for action {action_type}', type='negative')
+                                return
+                            action_config['target_percent'] = target_percent
+                        except (ValueError, TypeError):
+                            ui.notify(f'Invalid target percent value for action {action_type}', type='negative')
+                            return
+                    else:
+                        ui.notify(f'Target percent is required for action {action_type}', type='negative')
+                        return
                 
                 actions_data[action_id] = action_config
             
