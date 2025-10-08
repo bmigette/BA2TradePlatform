@@ -11,7 +11,7 @@ from ..modules.accounts import get_account_class
 from sqlmodel import Session, select
 
 if TYPE_CHECKING:
-    from .MarketExpertInterface import MarketExpertInterface
+    from .interfaces import MarketExpertInterface
 
 
 def get_expert_instance_from_id(expert_instance_id: int) -> Optional["MarketExpertInterface"]:

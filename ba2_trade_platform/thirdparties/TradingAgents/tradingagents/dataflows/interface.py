@@ -2,8 +2,6 @@ from typing import Annotated, Dict
 from .reddit_utils import fetch_top_from_category
 from .yfin_utils import *
 from .stockstats_utils import *
-from .googlenews_utils import *
-from .finnhub_utils import get_data_in_range
 from dateutil.relativedelta import relativedelta
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -18,9 +16,7 @@ from .. import logger as ta_logger
 from ba2_trade_platform.modules.dataproviders import YFinanceDataProvider
 from ba2_trade_platform.config import CACHE_FOLDER
 
-# Import vendor-specific modules
-from .google import get_google_news
-from .openai import get_stock_news_openai, get_global_news_openai, get_fundamentals_openai
+# Import vendor-specific modules (for backward compatibility with direct imports)
 from .y_finance import (
     get_YFin_data_online,
     get_stock_stats_indicators_window,
@@ -29,165 +25,196 @@ from .y_finance import (
     get_income_statement as get_yfinance_income_statement,
     get_insider_transactions as get_yfinance_insider_transactions
 )
-from .alpha_vantage import (
-    get_stock as get_alpha_vantage_stock,
-    get_indicator as get_alpha_vantage_indicator,
-    get_fundamentals as get_alpha_vantage_fundamentals,
-    get_balance_sheet as get_alpha_vantage_balance_sheet,
-    get_cashflow as get_alpha_vantage_cashflow,
-    get_income_statement as get_alpha_vantage_income_statement,
-    get_insider_transactions as get_alpha_vantage_insider_transactions,
-    get_news as get_alpha_vantage_news
-)
-from .alpha_vantage_common import AlphaVantageRateLimitError
-from .macro_utils import get_economic_indicators_report, get_treasury_yield_curve, get_fed_calendar_and_minutes
 
-def get_finnhub_news(
-    ticker: Annotated[
-        str,
-        "Search query of a company's, e.g. 'AAPL, TSM, etc.",
-    ],
-    curr_date: Annotated[str, "Current date in yyyy-mm-dd format"],
-    look_back_days: Annotated[
-        int,
-        "Number of days to look back. If not provided, defaults to news_lookback_days from config (typically 7 days). You can specify a custom value to get more or less historical news."
-    ] = None,
-):
-    """
-    Retrieve news about a company within a time frame
+# BA2 Provider Integration
+from ba2_trade_platform.modules.dataproviders import get_provider
+from ba2_trade_platform.modules.dataproviders.alpha_vantage_common import AlphaVantageRateLimitError
+from ba2_trade_platform.core.ProviderWithPersistence import ProviderWithPersistence
+from ba2_trade_platform.logger import logger as ba2_logger
 
-    Args
-        ticker (str): ticker for the company you are interested in
-        curr_date (str): Current date in yyyy-mm-dd format
-        look_back_days (int, optional): Number of days to look back. Defaults to config value if None.
-    Returns
-        str: dataframe containing the news of the company in the time frame
+# Mapping of TradingAgents (method, vendor) to BA2 (category, provider_name)
+BA2_PROVIDER_MAP = {
+    # OHLCV data providers
+    ("get_stock_data", "alpha_vantage"): ("ohlcv", "alphavantage"),
+    ("get_stock_data", "yfinance"): ("ohlcv", "yfinance"),
+    
+    # News providers
+    ("get_news", "alpha_vantage"): ("news", "alphavantage"),
+    ("get_news", "google"): ("news", "google"),
+    ("get_news", "openai"): ("news", "openai"),
+    ("get_global_news", "openai"): ("news", "openai"),
+    
+    # Indicators providers
+    ("get_indicators", "alpha_vantage"): ("indicators", "alphavantage"),
+    ("get_indicators", "yfinance"): ("indicators", "yfinance"),
+    
+    # Fundamentals overview providers (company overview, key metrics)
+    ("get_fundamentals", "alpha_vantage"): ("fundamentals_overview", "alphavantage"),
+    ("get_fundamentals", "openai"): ("fundamentals_overview", "openai"),
+    
+    # Fundamentals details providers (financial statements)
+    ("get_balance_sheet", "alpha_vantage"): ("fundamentals_details", "alphavantage"),
+    ("get_cashflow", "alpha_vantage"): ("fundamentals_details", "alphavantage"),
+    ("get_income_statement", "alpha_vantage"): ("fundamentals_details", "alphavantage"),
+    ("get_balance_sheet", "yfinance"): ("fundamentals_details", "yfinance"),
+    ("get_cashflow", "yfinance"): ("fundamentals_details", "yfinance"),
+    ("get_income_statement", "yfinance"): ("fundamentals_details", "yfinance"),
+    
+    # Macro providers
+    ("get_economic_indicators", "fred"): ("macro", "fred"),
+    ("get_yield_curve", "fred"): ("macro", "fred"),
+    ("get_fed_calendar", "fred"): ("macro", "fred"),
+}
 
-    """
-    # Get lookback days from config if not provided
-    if look_back_days is None:
-        config = get_config()
-        look_back_days = config.get('news_lookback_days', 7)
-
-    start_date = datetime.strptime(curr_date, "%Y-%m-%d")
-    before = start_date - relativedelta(days=look_back_days)
-    before = before.strftime("%Y-%m-%d")
-
-    result = get_data_in_range(ticker, before, curr_date, "news_data", DATA_DIR)
-
-    if len(result) == 0:
-        return ""
-
-    combined_result = ""
-    for day, data in result.items():
-        if len(data) == 0:
-            continue
-        for entry in data:
-            current_news = (
-                "### " + entry["headline"] + f" ({day})" + "\n" + entry["summary"]
-            )
-            combined_result += current_news + "\n\n"
-
-    return f"## {ticker} News, from {before} to {curr_date}:\n" + str(combined_result)
-
-
-def get_finnhub_company_insider_sentiment(
-    ticker: Annotated[str, "ticker symbol for the company"],
-    curr_date: Annotated[
-        str,
-        "current date of you are trading at, yyyy-mm-dd",
-    ],
-    look_back_days: Annotated[
-        int,
-        "Number of days to look back for insider sentiment data. If not provided, defaults to market_history_days from config (typically 90 days). You can specify a custom value to analyze shorter or longer periods."
-    ] = None,
-):
-    """
-    Retrieve insider sentiment about a company (retrieved from public SEC information)
-    Args:
-        ticker (str): ticker symbol of the company
-        curr_date (str): current date you are trading on, yyyy-mm-dd
-        look_back_days (int, optional): Number of days to look back. Defaults to config value if None.
-    Returns:
-        str: a report of the insider sentiment starting at curr_date
-    """
-    # Get lookback days from config if not provided
-    if look_back_days is None:
-        config = get_config()
-        look_back_days = config.get('market_history_days', 90)
-
-    date_obj = datetime.strptime(curr_date, "%Y-%m-%d")
-    before = date_obj - relativedelta(days=look_back_days)
-    before = before.strftime("%Y-%m-%d")
-
-    data = get_data_in_range(ticker, before, curr_date, "insider_senti", DATA_DIR)
-
-    if len(data) == 0:
-        return ""
-
-    result_str = ""
-    seen_dicts = []
-    for date, senti_list in data.items():
-        for entry in senti_list:
-            if entry not in seen_dicts:
-                result_str += f"### {entry['year']}-{entry['month']}:\nChange: {entry['change']}\nMonthly Share Purchase Ratio: {entry['mspr']}\n\n"
-                seen_dicts.append(entry)
-
-    return (
-        f"## {ticker} Insider Sentiment Data for {before} to {curr_date}:\n"
-        + result_str
-        + "The change field refers to the net buying/selling from all insiders' transactions. The mspr field refers to monthly share purchase ratio."
-    )
+# DISABLED - finnhub_utils file doesn't exist
+# def get_finnhub_news(
+#     ticker: Annotated[
+#         str,
+#         "Search query of a company's, e.g. 'AAPL, TSM, etc.",
+#     ],
+#     curr_date: Annotated[str, "Current date in yyyy-mm-dd format"],
+#     look_back_days: Annotated[
+#         int,
+#         "Number of days to look back. If not provided, defaults to news_lookback_days from config (typically 7 days). You can specify a custom value to get more or less historical news."
+#     ] = None,
+# ):
+#     """
+#     Retrieve news about a company within a time frame
+# 
+#     Args
+#         ticker (str): ticker for the company you are interested in
+#         curr_date (str): Current date in yyyy-mm-dd format
+#         look_back_days (int, optional): Number of days to look back. Defaults to config value if None.
+#     Returns
+#         str: dataframe containing the news of the company in the time frame
+# 
+#     """
+#     # Get lookback days from config if not provided
+#     if look_back_days is None:
+#         config = get_config()
+#         look_back_days = config.get('news_lookback_days', 7)
+# 
+#     start_date = datetime.strptime(curr_date, "%Y-%m-%d")
+#     before = start_date - relativedelta(days=look_back_days)
+#     before = before.strftime("%Y-%m-%d")
+# 
+#     result = get_data_in_range(ticker, before, curr_date, "news_data", DATA_DIR)
+# 
+#     if len(result) == 0:
+#         return ""
+# 
+#     combined_result = ""
+#     for day, data in result.items():
+#         if len(data) == 0:
+#             continue
+#         for entry in data:
+#             current_news = (
+#                 "### " + entry["headline"] + f" ({day})" + "\n" + entry["summary"]
+#             )
+#             combined_result += current_news + "\n\n"
+# 
+#     return f"## {ticker} News, from {before} to {curr_date}:\n" + str(combined_result)
 
 
-def get_finnhub_company_insider_transactions(
-    ticker: Annotated[str, "ticker symbol"],
-    curr_date: Annotated[
-        str,
-        "current date you are trading at, yyyy-mm-dd",
-    ],
-    look_back_days: Annotated[
-        int,
-        "Number of days to look back for insider transactions. If not provided, defaults to market_history_days from config (typically 90 days). You can specify a custom value to analyze shorter or longer periods."
-    ] = None,
-):
-    """
-    Retrieve insider transaction information about a company (retrieved from public SEC information)
-    Args:
-        ticker (str): ticker symbol of the company
-        curr_date (str): current date you are trading at, yyyy-mm-dd
-        look_back_days (int, optional): Number of days to look back. Defaults to config value if None.
-    Returns:
-        str: a report of the company's insider transaction/trading information
-    """
-    # Get lookback days from config if not provided
-    if look_back_days is None:
-        config = get_config()
-        look_back_days = config.get('market_history_days', 90)
+# DISABLED - finnhub_utils file doesn't exist
+# def get_finnhub_company_insider_sentiment(
+#     ticker: Annotated[str, "ticker symbol for the company"],
+#     curr_date: Annotated[
+#         str,
+#         "current date of you are trading at, yyyy-mm-dd",
+#     ],
+#     look_back_days: Annotated[
+#         int,
+#         "Number of days to look back for insider sentiment data. If not provided, defaults to market_history_days from config (typically 90 days). You can specify a custom value to analyze shorter or longer periods."
+#     ] = None,
+# ):
+#     """
+#     Retrieve insider sentiment about a company (retrieved from public SEC information)
+#     Args:
+#         ticker (str): ticker symbol of the company
+#         curr_date (str): current date you are trading on, yyyy-mm-dd
+#         look_back_days (int, optional): Number of days to look back. Defaults to config value if None.
+#     Returns:
+#         str: a report of the insider sentiment starting at curr_date
+#     """
+#     # Get lookback days from config if not provided
+#     if look_back_days is None:
+#         config = get_config()
+#         look_back_days = config.get('market_history_days', 90)
+# 
+#     date_obj = datetime.strptime(curr_date, "%Y-%m-%d")
+#     before = date_obj - relativedelta(days=look_back_days)
+#     before = before.strftime("%Y-%m-%d")
+# 
+#     data = get_data_in_range(ticker, before, curr_date, "insider_senti", DATA_DIR)
+# 
+#     if len(data) == 0:
+#         return ""
+# 
+#     result_str = ""
+#     seen_dicts = []
+#     for date, senti_list in data.items():
+#         for entry in senti_list:
+#             if entry not in seen_dicts:
+#                 result_str += f"### {entry['year']}-{entry['month']}:\nChange: {entry['change']}\nMonthly Share Purchase Ratio: {entry['mspr']}\n\n"
+#                 seen_dicts.append(entry)
+# 
+#     return (
+#         f"## {ticker} Insider Sentiment Data for {before} to {curr_date}:\n"
+#         + result_str
+#         + "The change field refers to the net buying/selling from all insiders' transactions. The mspr field refers to monthly share purchase ratio."
+#     )
 
-    date_obj = datetime.strptime(curr_date, "%Y-%m-%d")
-    before = date_obj - relativedelta(days=look_back_days)
-    before = before.strftime("%Y-%m-%d")
 
-    data = get_data_in_range(ticker, before, curr_date, "insider_trans", DATA_DIR)
-
-    if len(data) == 0:
-        return ""
-
-    result_str = ""
-
-    seen_dicts = []
-    for date, senti_list in data.items():
-        for entry in senti_list:
-            if entry not in seen_dicts:
-                result_str += f"### Filing Date: {entry['filingDate']}, {entry['name']}:\nChange:{entry['change']}\nShares: {entry['share']}\nTransaction Price: {entry['transactionPrice']}\nTransaction Code: {entry['transactionCode']}\n\n"
-                seen_dicts.append(entry)
-
-    return (
-        f"## {ticker} insider transactions from {before} to {curr_date}:\n"
-        + result_str
-        + "The change field reflects the variation in share count—here a negative number indicates a reduction in holdings—while share specifies the total number of shares involved. The transactionPrice denotes the per-share price at which the trade was executed, and transactionDate marks when the transaction occurred. The name field identifies the insider making the trade, and transactionCode (e.g., S for sale) clarifies the nature of the transaction. FilingDate records when the transaction was officially reported, and the unique id links to the specific SEC filing, as indicated by the source. Additionally, the symbol ties the transaction to a particular company, isDerivative flags whether the trade involves derivative securities, and currency notes the currency context of the transaction."
-    )
+# DISABLED - finnhub_utils file doesn't exist
+# def get_finnhub_company_insider_transactions(
+#     ticker: Annotated[str, "ticker symbol"],
+#     curr_date: Annotated[
+#         str,
+#         "current date you are trading at, yyyy-mm-dd",
+#     ],
+#     look_back_days: Annotated[
+#         int,
+#         "Number of days to look back for insider transactions. If not provided, defaults to market_history_days from config (typically 90 days). You can specify a custom value to analyze shorter or longer periods."
+#     ] = None,
+# ):
+#     """
+#     Retrieve insider transaction information about a company (retrieved from public SEC information)
+#     Args:
+#         ticker (str): ticker symbol of the company
+#         curr_date (str): current date you are trading at, yyyy-mm-dd
+#         look_back_days (int, optional): Number of days to look back. Defaults to config value if None.
+#     Returns:
+#         str: a report of the company's insider transaction/trading information
+#     """
+#     # Get lookback days from config if not provided
+#     if look_back_days is None:
+#         config = get_config()
+#         look_back_days = config.get('market_history_days', 90)
+# 
+#     date_obj = datetime.strptime(curr_date, "%Y-%m-%d")
+#     before = date_obj - relativedelta(days=look_back_days)
+#     before = before.strftime("%Y-%m-%d")
+# 
+#     data = get_data_in_range(ticker, before, curr_date, "insider_trans", DATA_DIR)
+# 
+#     if len(data) == 0:
+#         return ""
+# 
+#     result_str = ""
+# 
+#     seen_dicts = []
+#     for date, senti_list in data.items():
+#         for entry in senti_list:
+#             if entry not in seen_dicts:
+#                 result_str += f"### Filing Date: {entry['filingDate']}, {entry['name']}:\nChange:{entry['change']}\nShares: {entry['share']}\nTransaction Price: {entry['transactionPrice']}\nTransaction Code: {entry['transactionCode']}\n\n"
+#                 seen_dicts.append(entry)
+# 
+#     return (
+#         f"## {ticker} insider transactions from {before} to {curr_date}:\n"
+#         + result_str
+#         + "The change field reflects the variation in share count—here a negative number indicates a reduction in holdings—while share specifies the total number of shares involved. The transactionPrice denotes the per-share price at which the trade was executed, and transactionDate marks when the transaction occurred. The name field identifies the insider making the trade, and transactionCode (e.g., S for sale) clarifies the nature of the transaction. FilingDate records when the transaction was officially reported, and the unique id links to the specific SEC filing, as indicated by the source. Additionally, the symbol ties the transaction to a particular company, isDerivative flags whether the trade involves derivative securities, and currency notes the currency context of the transaction."
+#     )
 
 
 def get_simfin_balance_sheet(
@@ -329,50 +356,6 @@ def get_simfin_income_statements(
         + str(latest_income)
         + "\n\nThis includes metadata like reporting dates and currency, share details, and a comprehensive breakdown of the company's financial performance. Starting with Revenue, it shows Cost of Revenue and resulting Gross Profit. Operating Expenses are detailed, including SG&A, R&D, and Depreciation. The statement then shows Operating Income, followed by non-operating items and Interest Expense, leading to Pretax Income. After accounting for Income Tax and any Extraordinary items, it concludes with Net Income, representing the company's bottom-line profit or loss for the period."
     )
-
-
-def get_google_news(
-    query: Annotated[str, "Query to search with"],
-    curr_date: Annotated[str, "Current date in yyyy-mm-dd format"],
-    look_back_days: Annotated[
-        int,
-        "Number of days to look back for news. If not provided, defaults to news_lookback_days from config (typically 7 days). You can specify a custom value to get more or less historical news."
-    ] = None,
-) -> str:
-    """Search for news using Google News.
-    
-    Args:
-        query: Query to search with
-        curr_date: Current date in yyyy-mm-dd format
-        look_back_days: Number of days to look back. Defaults to config value if None.
-        
-    Returns:
-        Formatted news results as string
-    """
-    # Get lookback days from config if not provided
-    if look_back_days is None:
-        config = get_config()
-        look_back_days = config.get('news_lookback_days', 7)
-        
-    query = query.replace(" ", "+")
-
-    start_date = datetime.strptime(curr_date, "%Y-%m-%d")
-    before = start_date - relativedelta(days=look_back_days)
-    before = before.strftime("%Y-%m-%d")
-
-    news_results = getNewsData(query, before, curr_date)
-
-    news_str = ""
-
-    for news in news_results:
-        news_str += (
-            f"### {news['title']} (source: {news['source']}) \n\n{news['snippet']}\n\n"
-        )
-
-    if len(news_results) == 0:
-        return ""
-
-    return f"## {query} Google News, from {before} to {curr_date}:\n\n{news_str}"
 
 
 def get_reddit_global_news(
@@ -897,250 +880,6 @@ def get_YFin_data(
     return filtered_data
 
 
-def get_stock_news_openai(
-    ticker: Annotated[str, "Ticker symbol of the company"],
-    curr_date: Annotated[str, "Current date in yyyy-mm-dd format"],
-    lookback_days: Annotated[
-        int,
-        "Number of days to look back for news and social sentiment. If not provided, defaults to social_sentiment_days from config (typically 3 days). You can specify a custom value to get more or less historical sentiment data."
-    ] = None
-):
-    """Get stock news and sentiment using OpenAI web search.
-    
-    Args:
-        ticker: Ticker symbol
-        curr_date: Current date in yyyy-mm-dd format
-        lookback_days: Number of days to look back. Defaults to social_sentiment_days from config if None.
-        
-    Returns:
-        News and sentiment analysis as string
-    """
-    from .config import get_openai_api_key
-    from .prompts import get_stock_news_prompt
-    
-    config = get_config()
-    api_key = get_openai_api_key()
-    client = OpenAI(base_url=config["backend_url"], api_key=api_key)
-
-    # Get lookback days from config if not provided
-    if lookback_days is None:
-        lookback_days = config.get("social_sentiment_days", 3)
-        
-    prompt_text = get_stock_news_prompt(ticker, curr_date, lookback_days)
-
-    response = client.responses.create(
-        model=config["quick_think_llm"],
-        input=[
-            {
-                "role": "system",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": prompt_text,
-                    }
-                ],
-            }
-        ],
-        text={"format": {"type": "text"}},
-        reasoning={},
-        tools=[
-            {
-                "type": "web_search_preview",
-                "user_location": {"type": "approximate"},
-                "search_context_size": "low",
-            }
-        ],
-        temperature=1,
-        max_output_tokens=4096,
-        top_p=1,
-        store=True,
-    )
-
-    # Handle different response formats
-    try:
-        # Try accessing response content
-        if hasattr(response, 'output') and len(response.output) > 1:
-            if hasattr(response.output[1], 'content') and len(response.output[1].content) > 0:
-                return response.output[1].content[0].text
-        
-        # Try alternative response format
-        if hasattr(response, 'choices') and len(response.choices) > 0:
-            return response.choices[0].message.content
-        
-        # Try direct content access
-        if hasattr(response, 'content'):
-            return response.content
-        
-        # Fallback - convert response to string
-        return str(response)
-        
-    except Exception as e:
-        return f"Error parsing response: {str(e)} - Response: {str(response)}"
-
-
-def get_global_news_openai(
-    curr_date: Annotated[str, "Current date in yyyy-mm-dd format"],
-    lookback_days: Annotated[
-        int,
-        "Number of days to look back for global news. If not provided, defaults to news_lookback_days from config (typically 7 days). You can specify a custom value to get more or less historical news."
-    ] = None
-):
-    """Get global news using OpenAI web search.
-    
-    Args:
-        curr_date: Current date in yyyy-mm-dd format
-        lookback_days: Number of days to look back. Defaults to news_lookback_days from config if None.
-        
-    Returns:
-        Global news as string
-    """
-    from .config import get_openai_api_key
-    from .prompts import get_global_news_prompt
-    
-    config = get_config()
-    api_key = get_openai_api_key()
-    client = OpenAI(base_url=config["backend_url"], api_key=api_key)
-
-    # Get lookback days from config if not provided
-    if lookback_days is None:
-        lookback_days = config.get("news_lookback_days", 7)
-        
-    prompt_text = get_global_news_prompt(curr_date, lookback_days)
-
-    response = client.responses.create(
-        model=config["quick_think_llm"],
-        input=[
-            {
-                "role": "system",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": prompt_text,
-                    }
-                ],
-            }
-        ],
-        text={"format": {"type": "text"}},
-        reasoning={},
-        tools=[
-            {
-                "type": "web_search_preview",
-                "user_location": {"type": "approximate"},
-                "search_context_size": "low",
-            }
-        ],
-        temperature=1,
-        max_output_tokens=4096,
-        top_p=1,
-        store=True,
-    )
-
-    # Handle different response formats
-    try:
-        ta_logger.debug(f"Global News OpenAI response: {response}")
-        # Try accessing response content
-        if hasattr(response, 'output') and len(response.output) > 1:
-            if hasattr(response.output[1], 'content') and len(response.output[1].content) > 0:
-                return response.output[1].content[0].text
-        
-        # Try alternative response format
-        if hasattr(response, 'choices') and len(response.choices) > 0:
-            return response.choices[0].message.content
-        
-        # Try direct content access
-        if hasattr(response, 'content'):
-            return response.content
-        
-        # Fallback - convert response to string
-        return str(response)
-        
-    except Exception as e:
-        return f"Error parsing response: {str(e)} - Response: {str(response)}"
-
-
-def get_fundamentals_openai(
-    ticker: Annotated[str, "Stock ticker symbol"],
-    curr_date: Annotated[str, "Current date in yyyy-mm-dd format"],
-    lookback_days: Annotated[
-        int,
-        "Number of days to look back for fundamental data. If not provided, defaults to economic_data_days from config (typically 90 days). You can specify a custom value to analyze shorter or longer periods."
-    ] = None
-):
-    """
-    Search for fundamental analysis and financial metrics using OpenAI web search.
-    
-    Args:
-        ticker: Stock ticker symbol
-        curr_date: Current date in YYYY-MM-DD format
-        lookback_days: Number of days to look back. Defaults to economic_data_days from config if None.
-        
-    Returns:
-        str: Formatted fundamental analysis with financial metrics in markdown table format
-    """
-    from .config import get_openai_api_key
-    from .prompts import get_fundamentals_prompt
-    
-    config = get_config()
-    api_key = get_openai_api_key()
-    client = OpenAI(base_url=config["backend_url"], api_key=api_key)
-
-    # Get lookback days from config if not provided
-    if lookback_days is None:
-        lookback_days = config.get('economic_data_days', 90)
-        
-    prompt_text = get_fundamentals_prompt(ticker, curr_date, lookback_days)
-
-    response = client.responses.create(
-        model=config["quick_think_llm"],
-        input=[
-            {
-                "role": "system",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": prompt_text,
-                    }
-                ],
-            }
-        ],
-        text={"format": {"type": "text"}},
-        reasoning={},
-        tools=[
-            {
-                "type": "web_search_preview",
-                "user_location": {"type": "approximate"},
-                "search_context_size": "low",
-            }
-        ],
-        temperature=1,
-        max_output_tokens=4096,
-        top_p=1,
-        store=True,
-    )
-
-    # Handle different response formats
-    try:
-        ta_logger.debug(f"Fundamentals OpenAI response: {response}")
-        # Try accessing response content
-        if hasattr(response, 'output') and len(response.output) > 1:
-            if hasattr(response.output[1], 'content') and len(response.output[1].content) > 0:
-                return response.output[1].content[0].text
-        
-        # Try alternative response format
-        if hasattr(response, 'choices') and len(response.choices) > 0:
-            return response.choices[0].message.content
-        
-        # Try direct content access
-        if hasattr(response, 'content'):
-            return response.content
-        
-        # Fallback - convert response to string
-        return str(response)
-        
-    except Exception as e:
-        return f"Error parsing response: {str(e)} - Response: {str(response)}"
-
-
 # Tools organized by category
 TOOLS_CATEGORIES = {
     "core_stock_apis": {
@@ -1193,67 +932,66 @@ VENDOR_LIST = [
 ]
 
 # Mapping of methods to their vendor-specific implementations
+# NOTE: For vendors with BA2 providers (see BA2_PROVIDER_MAP), try_ba2_provider() is called first
+# These legacy functions serve as fallbacks if BA2 providers fail
 VENDOR_METHODS = {
-    # core_stock_apis
+    # core_stock_apis - ALL via BA2 providers
     "get_stock_data": {
-        "alpha_vantage": get_alpha_vantage_stock,
-        "yfinance": get_YFin_data_online,
+        # BA2: ohlcv/alphavantage, ohlcv/yfinance
+        "yfinance": get_YFin_data_online,  # Legacy fallback
         "local": get_YFin_data,
     },
-    # technical_indicators
+    # technical_indicators - ALL via BA2 providers
     "get_indicators": {
-        "alpha_vantage": get_alpha_vantage_indicator,
-        "yfinance": get_stock_stats_indicators_window,
+        # BA2: indicators/alphavantage, indicators/yfinance
+        "yfinance": get_stock_stats_indicators_window,  # Legacy fallback
         "local": get_stock_stats_indicators_window
     },
-    # fundamental_data
+    # fundamental_data - ALL via BA2 providers
     "get_fundamentals": {
-        "alpha_vantage": get_alpha_vantage_fundamentals,
-        "openai": get_fundamentals_openai,
+        # BA2: fundamentals_overview/alphavantage, fundamentals_overview/openai
+        # No legacy functions - BA2 only
     },
     "get_balance_sheet": {
-        "alpha_vantage": get_alpha_vantage_balance_sheet,
+        # BA2: fundamentals_details/alphavantage
         "yfinance": get_yfinance_balance_sheet,
         "local": get_simfin_balance_sheet,
     },
     "get_cashflow": {
-        "alpha_vantage": get_alpha_vantage_cashflow,
+        # BA2: fundamentals_details/alphavantage  
         "yfinance": get_yfinance_cashflow,
         "local": get_simfin_cashflow,
     },
     "get_income_statement": {
-        "alpha_vantage": get_alpha_vantage_income_statement,
+        # BA2: fundamentals_details/alphavantage
         "yfinance": get_yfinance_income_statement,
         "local": get_simfin_income_statements,
     },
-    # news_data
+    # news_data - ALL via BA2 providers
     "get_news": {
-        "alpha_vantage": get_alpha_vantage_news,
-        "openai": get_stock_news_openai,
-        "google": get_google_news,
-        "local": [get_finnhub_news, get_reddit_company_news],
+        # BA2: news/alphavantage, news/openai, news/google
+        "local": get_reddit_company_news,  # Legacy fallback
     },
     "get_global_news": {
-        "openai": get_global_news_openai,
+        # BA2: news/openai
         "local": get_reddit_global_news
     },
     "get_insider_sentiment": {
-        "local": get_finnhub_company_insider_sentiment
+        # "local": get_finnhub_company_insider_sentiment  # Disabled - missing finnhub_utils
     },
     "get_insider_transactions": {
-        "alpha_vantage": get_alpha_vantage_insider_transactions,
         "yfinance": get_yfinance_insider_transactions,
-        "local": get_finnhub_company_insider_transactions,
+        # "local": get_finnhub_company_insider_transactions,  # Disabled - missing finnhub_utils
     },
     # macro_data
     "get_economic_indicators": {
-        "fred": get_economic_indicators_report,
+        # BA2: macro/fred - No legacy implementation
     },
     "get_yield_curve": {
-        "fred": get_treasury_yield_curve,
+        # BA2: macro/fred - No legacy implementation
     },
     "get_fed_calendar": {
-        "fred": get_fed_calendar_and_minutes,
+        # BA2: macro/fred - No legacy implementation
     },
 }
 
@@ -1278,6 +1016,254 @@ def get_vendor(category: str, method: str = None) -> str:
 
     # Fall back to category-level configuration
     return config.get("data_vendors", {}).get(category, "default")
+
+
+# BA2 Provider Integration Functions
+
+def _convert_args_to_ba2(method: str, vendor: str, *args, **kwargs) -> dict:
+    """
+    Convert TradingAgents method arguments to BA2 provider format.
+    
+    TradingAgents uses: (ticker, curr_date, look_back_days, ...)
+    BA2 uses: (symbol, end_date, lookback_days, format_type, ...)
+    """
+    ba2_kwargs = {}
+    config = get_config()
+    
+    # Common conversions for methods with symbol parameter
+    if method in ["get_news", "get_indicators", "get_fundamentals", "get_balance_sheet", "get_cashflow", "get_income_statement"]:
+        # Extract symbol/ticker
+        if args:
+            ba2_kwargs["symbol"] = args[0]  # ticker -> symbol
+        elif "ticker" in kwargs:
+            ba2_kwargs["symbol"] = kwargs["ticker"]
+        elif "symbol" in kwargs:
+            ba2_kwargs["symbol"] = kwargs["symbol"]
+        
+        # Date conversion: curr_date -> end_date
+        curr_date_str = None
+        if len(args) > 1:
+            curr_date_str = args[1]
+        elif "curr_date" in kwargs:
+            curr_date_str = kwargs["curr_date"]
+        elif "end_date" in kwargs:
+            curr_date_str = kwargs["end_date"]
+        
+        if curr_date_str:
+            if isinstance(curr_date_str, str):
+                ba2_kwargs["end_date"] = datetime.strptime(curr_date_str, "%Y-%m-%d")
+            else:
+                ba2_kwargs["end_date"] = curr_date_str
+        else:
+            ba2_kwargs["end_date"] = datetime.now()
+        
+        # Lookback conversion: look_back_days -> lookback_days
+        look_back_days = None
+        if len(args) > 2:
+            look_back_days = args[2]
+        elif "look_back_days" in kwargs:
+            look_back_days = kwargs["look_back_days"]
+        elif "lookback_days" in kwargs:
+            look_back_days = kwargs["lookback_days"]
+        
+        if look_back_days is not None:
+            ba2_kwargs["lookback_days"] = look_back_days
+        else:
+            # Default from config based on method type
+            if method in ["get_news"]:
+                ba2_kwargs["lookback_days"] = config.get('news_lookback_days', 7)
+            else:
+                ba2_kwargs["lookback_days"] = config.get('market_history_days', 90)
+    
+    # Global news - no symbol needed
+    elif method == "get_global_news":
+        # Date conversion
+        curr_date_str = None
+        if args:
+            curr_date_str = args[0]
+        elif "curr_date" in kwargs:
+            curr_date_str = kwargs["curr_date"]
+        
+        if curr_date_str:
+            if isinstance(curr_date_str, str):
+                ba2_kwargs["end_date"] = datetime.strptime(curr_date_str, "%Y-%m-%d")
+            else:
+                ba2_kwargs["end_date"] = curr_date_str
+        else:
+            ba2_kwargs["end_date"] = datetime.now()
+        
+        # Lookback days
+        look_back_days = None
+        if len(args) > 1:
+            look_back_days = args[1]
+        elif "look_back_days" in kwargs:
+            look_back_days = kwargs["look_back_days"]
+        elif "lookback_days" in kwargs:
+            look_back_days = kwargs["lookback_days"]
+        
+        ba2_kwargs["lookback_days"] = look_back_days if look_back_days is not None else config.get('news_lookback_days', 7)
+    
+    # Method-specific conversions
+    if method in ["get_news", "get_global_news"]:
+        ba2_kwargs["format_type"] = "markdown"  # TradingAgents expects text
+    
+    elif method == "get_indicators":
+        # Extract indicator name
+        if len(args) > 1:
+            ba2_kwargs["indicator"] = args[1]
+        elif "indicator" in kwargs:
+            ba2_kwargs["indicator"] = kwargs["indicator"]
+        
+        # Extract interval
+        if "interval" in kwargs:
+            ba2_kwargs["interval"] = kwargs["interval"]
+        else:
+            ba2_kwargs["interval"] = config.get("timeframe", "1d")
+        
+        ba2_kwargs["format_type"] = "markdown"  # TradingAgents expects text
+    
+    elif method == "get_fundamentals":
+        # Fundamentals overview - just needs symbol and format
+        ba2_kwargs["format_type"] = "markdown"
+    
+    elif method in ["get_balance_sheet", "get_cashflow", "get_income_statement"]:
+        # Fundamentals details methods: (ticker, freq, curr_date) -> (symbol, frequency, format_type)
+        # Frequency
+        if len(args) > 1:
+            ba2_kwargs["frequency"] = args[1]
+        elif "freq" in kwargs:
+            ba2_kwargs["frequency"] = kwargs["freq"]
+        else:
+            ba2_kwargs["frequency"] = "quarterly"
+        
+        ba2_kwargs["format_type"] = "markdown"
+    
+    elif method in ["get_economic_indicators", "get_yield_curve", "get_fed_calendar"]:
+        # Macro methods: (curr_date, lookback_days) -> (end_date, lookback_days, format_type)
+        # Date conversion
+        curr_date_str = None
+        if args:
+            curr_date_str = args[0]
+        elif "curr_date" in kwargs:
+            curr_date_str = kwargs["curr_date"]
+        
+        if curr_date_str:
+            if isinstance(curr_date_str, str):
+                ba2_kwargs["end_date"] = datetime.strptime(curr_date_str, "%Y-%m-%d")
+            else:
+                ba2_kwargs["end_date"] = curr_date_str
+        else:
+            ba2_kwargs["end_date"] = datetime.now()
+        
+        # Lookback days
+        look_back_days = None
+        if len(args) > 1:
+            look_back_days = args[1]
+        elif "look_back_days" in kwargs:
+            look_back_days = kwargs["look_back_days"]
+        elif "lookback_days" in kwargs:
+            look_back_days = kwargs["lookback_days"]
+        
+        ba2_kwargs["lookback_days"] = look_back_days if look_back_days is not None else config.get('economic_data_days', 90)
+        ba2_kwargs["format_type"] = "markdown"
+    
+    return ba2_kwargs
+
+
+def try_ba2_provider(method: str, vendor: str, *args, **kwargs):
+    """
+    Use BA2 provider system (no fallbacks - raises errors if provider fails).
+    
+    Returns:
+        result: Provider result (dict or markdown string)
+        
+    Raises:
+        ValueError: If provider is not configured or fails
+    """
+    # Check if this method+vendor combo has a BA2 provider
+    provider_key = (method, vendor)
+    if provider_key not in BA2_PROVIDER_MAP:
+        raise ValueError(f"No BA2 provider configured for {method}/{vendor}")
+    
+    category, provider_name = BA2_PROVIDER_MAP[provider_key]
+    
+    # Convert arguments to BA2 format
+    ba2_kwargs = _convert_args_to_ba2(method, vendor, *args, **kwargs)
+    
+    # Get the provider
+    provider = get_provider(category, provider_name)
+    
+    # Wrap with persistence
+    wrapper = ProviderWithPersistence(provider, category)
+    
+    # Determine cache key and method to call
+    symbol = ba2_kwargs.get("symbol", "unknown")
+    lookback = ba2_kwargs.get("lookback_days", 7)
+    
+    if method == "get_stock_data":
+        cache_key = f"{symbol}_ohlcv_{lookback}days"
+        ba2_method = "get_dataframe"  # MarketDataProvider method
+        max_age_hours = 24
+    elif method == "get_news":
+        cache_key = f"{symbol}_news_{lookback}days"
+        ba2_method = "get_company_news"
+        max_age_hours = 2  # News cache for 2 hours
+    elif method == "get_global_news":
+        cache_key = f"global_news_{lookback}days"
+        ba2_method = "get_global_news"
+        max_age_hours = 2  # News cache for 2 hours
+    elif method == "get_indicators":
+        indicator = ba2_kwargs.get("indicator", "unknown")
+        interval = ba2_kwargs.get("interval", "1d")
+        cache_key = f"{symbol}_{indicator}_{interval}_{lookback}days"
+        ba2_method = "get_indicator"
+        max_age_hours = 6  # Indicators cache for 6 hours
+    elif method == "get_fundamentals":
+        cache_key = f"{symbol}_fundamentals_overview"
+        ba2_method = "get_fundamentals_overview"
+        max_age_hours = 24  # Fundamentals cache for 24 hours
+    elif method == "get_balance_sheet":
+        frequency = ba2_kwargs.get("frequency", "quarterly")
+        cache_key = f"{symbol}_balance_sheet_{frequency}"
+        ba2_method = "get_balance_sheet"
+        max_age_hours = 24
+    elif method == "get_cashflow":
+        frequency = ba2_kwargs.get("frequency", "quarterly")
+        cache_key = f"{symbol}_cashflow_{frequency}"
+        ba2_method = "get_cashflow_statement"
+        max_age_hours = 24
+    elif method == "get_income_statement":
+        frequency = ba2_kwargs.get("frequency", "quarterly")
+        cache_key = f"{symbol}_income_statement_{frequency}"
+        ba2_method = "get_income_statement"
+        max_age_hours = 24
+    elif method == "get_economic_indicators":
+        cache_key = f"economic_indicators_{lookback}days"
+        ba2_method = "get_economic_indicators"
+        max_age_hours = 12  # Macro data cache for 12 hours
+    elif method == "get_yield_curve":
+        cache_key = f"yield_curve_{lookback}days"
+        ba2_method = "get_yield_curve"
+        max_age_hours = 12
+    elif method == "get_fed_calendar":
+        cache_key = f"fed_calendar_{lookback}days"
+        ba2_method = "get_fed_calendar"
+        max_age_hours = 12
+    else:
+        raise ValueError(f"Unknown method: {method}")
+    
+    # Call BA2 provider with caching
+    ba2_logger.debug(f"Calling BA2 provider: {category}/{provider_name}.{ba2_method}({symbol}, lookback={lookback})")
+    result = wrapper.fetch_with_cache(
+        ba2_method,
+        cache_key,
+        max_age_hours=max_age_hours,
+        **ba2_kwargs
+    )
+    
+    ba2_logger.debug(f"BA2 provider succeeded: {category}/{provider_name}")
+    return result
+
 
 def route_to_vendor(method: str, *args, **kwargs):
     """Route method calls to appropriate vendor implementation.
@@ -1333,6 +1319,35 @@ def route_to_vendor(method: str, *args, **kwargs):
         if is_primary_vendor:
             any_primary_vendor_attempted = True
 
+        # Use BA2 provider if available (no fallback - errors will propagate)
+        if (method, vendor) in BA2_PROVIDER_MAP:
+            print(f"DEBUG: Using BA2 provider for {method} with vendor '{vendor}'")
+            try:
+                result = try_ba2_provider(method, vendor, *args, **kwargs)
+                results.append(result)
+                successful_vendor = vendor
+                print(f"SUCCESS: BA2 provider for {method}/{vendor} completed (with database persistence)")
+                
+                # For single-vendor configs, stop after success
+                if not is_news_method and len(primary_vendors) == 1:
+                    print(f"DEBUG: Stopping after successful vendor '{vendor}' (single-vendor config)")
+                    break
+                # For news or multi-vendor, continue to collect from all vendors
+                continue
+            except AlphaVantageRateLimitError as e:
+                print(f"RATE_LIMIT: Alpha Vantage rate limit exceeded: {e}")
+                # Continue to next vendor
+                continue
+            except Exception as e:
+                print(f"FAILED: BA2 provider {method}/{vendor} failed: {e}")
+                # Continue to next vendor
+                continue
+        
+        # Legacy fallback for vendors without BA2 providers
+        if vendor not in VENDOR_METHODS[method]:
+            print(f"INFO: No provider available for {method}/{vendor}")
+            continue
+
         # Debug: Print current attempt
         if is_news_method:
             print(f"DEBUG: Collecting from vendor '{vendor}' for {method} (source #{vendor_attempt_count})")
@@ -1340,6 +1355,8 @@ def route_to_vendor(method: str, *args, **kwargs):
             vendor_type = "PRIMARY" if is_primary_vendor else "FALLBACK"
             print(f"DEBUG: Attempting {vendor_type} vendor '{vendor}' for {method} (attempt #{vendor_attempt_count})")
 
+        vendor_impl = VENDOR_METHODS[method][vendor]
+        
         # Handle list of methods for a vendor
         if isinstance(vendor_impl, list):
             vendor_methods = [(impl, vendor) for impl in vendor_impl]
@@ -1355,13 +1372,6 @@ def route_to_vendor(method: str, *args, **kwargs):
                 result = impl_func(*args, **kwargs)
                 vendor_results.append(result)
                 print(f"SUCCESS: {impl_func.__name__} from vendor '{vendor_name}' completed successfully")
-                    
-            except AlphaVantageRateLimitError as e:
-                if vendor == "alpha_vantage":
-                    print(f"RATE_LIMIT: Alpha Vantage rate limit exceeded, falling back to next available vendor")
-                    print(f"DEBUG: Rate limit details: {e}")
-                # Continue to next vendor for fallback
-                continue
             except Exception as e:
                 # Log error but continue with other implementations
                 print(f"FAILED: {impl_func.__name__} from vendor '{vendor_name}' failed: {e}")

@@ -66,11 +66,12 @@ Your analysis is configured to use **{timeframe}** timeframe data. This affects 
 All technical indicators, price data, and market analysis should be interpreted in the context of this **{timeframe}** timeframe. Consider how this timeframe affects signal significance, noise levels, and trading strategy implications.
 
 **IMPORTANT - Tool Usage Guidelines for Lookback Periods:**
-When calling tools that require lookback periods or date ranges, DO NOT specify look_back_days parameters unless you have a specific reason. The tools automatically use the appropriate configuration settings:
-- **News tools** (get_google_news, get_stock_news_openai, get_global_news_openai, get_finnhub_news): Automatically use news_lookback_days setting
-- **Social media/sentiment tools** (get_reddit_news, get_reddit_stock_info): Automatically use social_sentiment_days setting
-- **Technical/market data tools** (get_stockstats_indicators_report, get_YFin_data_window): Automatically use market_history_days and **{timeframe}** timeframe settings
-- **Fundamental/economic data tools** (get_fundamentals_openai, get_finnhub_company_insider_sentiment, get_finnhub_company_insider_transactions): Automatically use economic_data_days setting
+When calling tools that require lookback periods or date ranges, DO NOT specify lookback_days parameters unless you have a specific reason. The tools automatically use the appropriate configuration settings:
+- **News tools** (get_company_news, get_global_news): Automatically use news_lookback_days setting
+- **Market data tools** (get_ohlcv_data, get_indicator_data): Automatically use market_history_days and **{timeframe}** timeframe settings
+- **Fundamental data tools** (get_balance_sheet, get_income_statement, get_cashflow_statement): Automatically use economic_data_days setting via lookback_periods parameter
+- **Insider trading tools** (get_insider_transactions, get_insider_sentiment): Automatically use economic_data_days setting
+- **Macroeconomic tools** (get_economic_indicators, get_yield_curve, get_fed_calendar): Automatically use economic_data_days setting
 
 Only override the default lookback period if you have a specific analytical reason (e.g., comparing short-term vs long-term trends)."""
 

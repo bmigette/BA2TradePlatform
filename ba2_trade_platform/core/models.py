@@ -128,14 +128,33 @@ class MarketAnalysis(SQLModel, table=True):
 class AnalysisOutput(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc))
-    market_analysis_id: int = Field(foreign_key="marketanalysis.id", nullable=False, ondelete="CASCADE")
-    name: str
-    type: str
-    text: str | None = Field(default=None)
-    blob: bytes | None = Field(default=None)
+    
+    # Optional link to market analysis (nullable for standalone provider outputs)
+    market_analysis_id: int | None = Field(default=None, foreign_key="marketanalysis.id", nullable=True, ondelete="CASCADE")
+    
+    # Provider identification
+    provider_category: str | None = Field(default=None, description="Provider category (news, indicators, fundamentals, etc.)")
+    provider_name: str | None = Field(default=None, description="Provider name (alpaca, yfinance, alphavantage, etc.)")
+    
+    # Data identification
+    name: str = Field(description="Output name/identifier (e.g., 'AAPL_news_2025-10-08')")
+    type: str = Field(description="Output type (news, fundamentals, indicator, report, etc.)")
+    
+    # Data content
+    text: str | None = Field(default=None, description="Text content (markdown or JSON string)")
+    blob: bytes | None = Field(default=None, description="Binary data if needed")
+    
+    # Metadata for caching and reuse
+    symbol: str | None = Field(default=None, description="Stock symbol if applicable")
+    start_date: DateTime | None = Field(default=None, description="Date range start")
+    end_date: DateTime | None = Field(default=None, description="Date range end")
+    format_type: str | None = Field(default=None, description="Format type: 'dict' or 'markdown'")
+    
+    # Additional provider metadata (renamed from 'metadata' to avoid SQLAlchemy conflict)
+    provider_metadata: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict, description="Provider-specific metadata")
     
     # Relationship back to market analysis
-    market_analysis: MarketAnalysis = Relationship(back_populates="analysis_outputs")
+    market_analysis: Optional[MarketAnalysis] = Relationship(back_populates="analysis_outputs")
 
 
 
@@ -404,8 +423,8 @@ class TradingOrder(SQLModel, table=True):
 class Instrument(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     name: str 
-    company_name: str
-    instrument_type: InstrumentType
+    company_name: str | None = Field(default=None)
+    instrument_type: InstrumentType | None = Field(default=None)
     categories: list[str] = Field(sa_column=Column(JSON), default_factory=list)
     labels: list[str] = Field(sa_column=Column(JSON), default_factory=list)
     def __str__(self):

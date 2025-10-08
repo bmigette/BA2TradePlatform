@@ -20,9 +20,25 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     """Upgrade schema - remove filled_avg_price column from tradingorder table."""
-    # Remove filled_avg_price column from tradingorder table
-    with op.batch_alter_table('tradingorder', schema=None) as batch_op:
-        batch_op.drop_column('filled_avg_price')
+    # Check if column exists before trying to drop it
+    import sqlite3
+    import os
+    
+    # Get database path
+    db_path = os.path.expanduser('~/Documents/ba2_trade_platform/db.sqlite')
+    
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(tradingorder)")
+    columns = [col[1] for col in cursor.fetchall()]
+    conn.close()
+    
+    # Only drop if column exists
+    if 'filled_avg_price' in columns:
+        with op.batch_alter_table('tradingorder', schema=None) as batch_op:
+            batch_op.drop_column('filled_avg_price')
+    else:
+        print("INFO: Column 'filled_avg_price' does not exist, skipping drop operation")
 
 
 def downgrade() -> None:

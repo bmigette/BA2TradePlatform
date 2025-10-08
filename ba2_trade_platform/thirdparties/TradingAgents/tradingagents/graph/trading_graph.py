@@ -15,7 +15,7 @@ from langgraph.prebuilt import ToolNode
 from ..agents import *
 from ..default_config import DEFAULT_CONFIG
 from ..agents.utils.memory import FinancialSituationMemory
-from ..agents.utils.agent_utils import Toolkit
+from ..agents.utils.agent_utils_new import Toolkit  # Use new toolkit
 from ..agents.utils.agent_states import (
     AgentState,
     InvestDebateState,
@@ -44,6 +44,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         config: Dict[str, Any] = None,
         market_analysis_id: Optional[int] = None,
         expert_instance_id: Optional[int] = None,
+        provider_map: Optional[Dict[str, List[type]]] = None,
     ):
         """Initialize the trading agents graph and components.
 
@@ -53,12 +54,14 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             config: Configuration dictionary. If None, uses default config
             market_analysis_id: Existing MarketAnalysis ID to use (prevents creating a new one)
             expert_instance_id: Expert instance ID for persistent memory storage
+            provider_map: BA2 provider map for data access (required for new toolkit)
         """
         super().__init__()
         self.debug = debug
         self.config = config or DEFAULT_CONFIG
         self.market_analysis_id = market_analysis_id
         self.expert_instance_id = expert_instance_id
+        self.provider_map = provider_map or {}  # Store provider_map
 
         # Initialize logger
         # Use LOG_FOLDER from BA2 platform config
@@ -103,8 +106,10 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         else:
             raise ValueError(f"Unsupported LLM provider: {self.config['llm_provider']}")
         
-        
-        self.toolkit = Toolkit(config=self.config)
+        # Initialize new toolkit with provider_map
+        if not self.provider_map:
+            raise ValueError("provider_map is required for TradingAgentsGraph initialization")
+        self.toolkit = Toolkit(provider_map=self.provider_map)
 
         # Store market_analysis_id for state initialization
         self._market_analysis_id = market_analysis_id
@@ -288,62 +293,160 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                 return {'content': str(obj), 'type': obj.__class__.__name__}
 
     def _create_tool_nodes(self) -> Dict[str, ToolNode]:
-        """Create tool nodes for different data sources."""
+        """Create tool nodes for different data sources using new BA2 provider toolkit."""
         # Import LoggingToolNode for database logging
         from ..db_storage import LoggingToolNode
+        from langchain_core.tools import tool
+        
+        # Wrap toolkit methods with @tool decorator for LangChain compatibility
+        # This creates proper Tool objects from instance methods
+        
+        @tool
+        def get_ohlcv_data(
+            symbol: str,
+            start_date: str,
+            end_date: str,
+            interval: str = None
+        ) -> str:
+            """Get OHLCV stock price data."""
+            return self.toolkit.get_ohlcv_data(symbol, start_date, end_date, interval)
+        
+        @tool
+        def get_indicator_data(
+            symbol: str,
+            indicator: str,
+            start_date: str,
+            end_date: str,
+            interval: str = None
+        ) -> str:
+            """Get technical indicator data."""
+            return self.toolkit.get_indicator_data(symbol, indicator, start_date, end_date, interval)
+        
+        @tool
+        def get_company_news(
+            symbol: str,
+            end_date: str,
+            lookback_days: int = None
+        ) -> str:
+            """Get news articles about a specific company."""
+            return self.toolkit.get_company_news(symbol, end_date, lookback_days)
+        
+        @tool
+        def get_global_news(
+            end_date: str,
+            lookback_days: int = None
+        ) -> str:
+            """Get global market and macroeconomic news."""
+            return self.toolkit.get_global_news(end_date, lookback_days)
+        
+        @tool
+        def get_balance_sheet(
+            symbol: str,
+            frequency: str,
+            end_date: str,
+            lookback_periods: int = 4
+        ) -> str:
+            """Get company balance sheet data."""
+            return self.toolkit.get_balance_sheet(symbol, frequency, end_date, lookback_periods)
+        
+        @tool
+        def get_income_statement(
+            symbol: str,
+            frequency: str,
+            end_date: str,
+            lookback_periods: int = 4
+        ) -> str:
+            """Get company income statement data."""
+            return self.toolkit.get_income_statement(symbol, frequency, end_date, lookback_periods)
+        
+        @tool
+        def get_cashflow_statement(
+            symbol: str,
+            frequency: str,
+            end_date: str,
+            lookback_periods: int = 4
+        ) -> str:
+            """Get company cash flow statement data."""
+            return self.toolkit.get_cashflow_statement(symbol, frequency, end_date, lookback_periods)
+        
+        @tool
+        def get_insider_transactions(
+            symbol: str,
+            end_date: str,
+            lookback_days: int = None
+        ) -> str:
+            """Get insider trading transactions."""
+            return self.toolkit.get_insider_transactions(symbol, end_date, lookback_days)
+        
+        @tool
+        def get_insider_sentiment(
+            symbol: str,
+            end_date: str,
+            lookback_days: int = None
+        ) -> str:
+            """Get aggregated insider sentiment metrics."""
+            return self.toolkit.get_insider_sentiment(symbol, end_date, lookback_days)
+        
+        @tool
+        def get_economic_indicators(
+            end_date: str,
+            lookback_days: int = None,
+            indicators: list = None
+        ) -> str:
+            """Get economic indicators (GDP, unemployment, inflation, etc.)."""
+            return self.toolkit.get_economic_indicators(end_date, lookback_days, indicators)
+        
+        @tool
+        def get_yield_curve(
+            end_date: str,
+            lookback_days: int = None
+        ) -> str:
+            """Get Treasury yield curve data."""
+            return self.toolkit.get_yield_curve(end_date, lookback_days)
+        
+        @tool
+        def get_fed_calendar(
+            end_date: str,
+            lookback_days: int = None
+        ) -> str:
+            """Get Federal Reserve calendar and meetings."""
+            return self.toolkit.get_fed_calendar(end_date, lookback_days)
         
         return {
             "market": LoggingToolNode(
                 [
-                    # online tools
-                    self.toolkit.get_YFin_data_online,
-                    self.toolkit.get_stockstats_indicators_report_online,
-                    # offline tools
-                    self.toolkit.get_YFin_data,
-                    self.toolkit.get_stockstats_indicators_report,
+                    get_ohlcv_data,
+                    get_indicator_data,
                 ],
                 self.market_analysis_id
             ),
             "social": LoggingToolNode(
                 [
-                    # online tools
-                    self.toolkit.get_stock_news_openai,
-                    # offline tools
-                    self.toolkit.get_reddit_stock_info,
+                    get_company_news,  # For company-specific news
                 ],
                 self.market_analysis_id
             ),
             "news": LoggingToolNode(
                 [
-                    # online tools
-                    self.toolkit.get_global_news_openai,
-                    # offline tools
-                    self.toolkit.get_finnhub_news,
-                    self.toolkit.get_reddit_news,
+                    get_global_news,  # For global/macro news
                 ],
                 self.market_analysis_id
             ),
             "fundamentals": LoggingToolNode(
                 [
-                    # online tools
-                    self.toolkit.get_fundamentals_openai,
-                    # offline tools
-                    self.toolkit.get_finnhub_company_insider_sentiment,
-                    self.toolkit.get_finnhub_company_insider_transactions,
-                    self.toolkit.get_simfin_balance_sheet,
-                    self.toolkit.get_simfin_cashflow,
-                    self.toolkit.get_simfin_income_stmt,
+                    get_balance_sheet,
+                    get_income_statement,
+                    get_cashflow_statement,
+                    get_insider_transactions,
+                    get_insider_sentiment,
                 ],
                 self.market_analysis_id
             ),
             "macro": LoggingToolNode(
                 [
-                    # FRED economic data tools
-                    self.toolkit.get_fred_series_data,
-                    self.toolkit.get_economic_calendar,
-                    self.toolkit.get_treasury_yield_curve,
-                    self.toolkit.get_inflation_data,
-                    self.toolkit.get_employment_data,
+                    get_economic_indicators,
+                    get_yield_curve,
+                    get_fed_calendar,
                 ],
                 self.market_analysis_id
             ),

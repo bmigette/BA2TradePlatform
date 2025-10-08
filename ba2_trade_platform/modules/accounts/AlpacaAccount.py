@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from ...logger import logger
 from ...core.models import TradingOrder, Position, Transaction
 from ...core.types import OrderDirection, OrderStatus, OrderOpenType
-from ...core.AccountInterface import AccountInterface
+from ...core.interfaces import AccountInterface
 from ...core.db import get_db, get_instance, update_instance
 from sqlmodel import Session, select
 

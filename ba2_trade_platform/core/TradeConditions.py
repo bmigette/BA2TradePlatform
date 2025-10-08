@@ -10,7 +10,7 @@ from typing import List, Optional, Any, Dict
 from datetime import datetime, timezone, timedelta
 import operator
 
-from .AccountInterface import AccountInterface
+from .interfaces import AccountInterface
 from .models import TradingOrder, ExpertRecommendation, ExpertInstance
 from .types import OrderRecommendation, ExpertEventType, RiskLevel, TimeHorizon
 from .db import get_db

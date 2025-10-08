@@ -20,10 +20,25 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     """Upgrade schema."""
-    # Drop the transaction_id column from trade_action_result table
-    # SQLite will handle dropping the foreign key constraint automatically
-    with op.batch_alter_table('trade_action_result', schema=None) as batch_op:
-        batch_op.drop_column('transaction_id')
+    # Check if column exists before trying to drop it
+    import sqlite3
+    import os
+    
+    # Get database path
+    db_path = os.path.expanduser('~/Documents/ba2_trade_platform/db.sqlite')
+    
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(trade_action_result)")
+    columns = [col[1] for col in cursor.fetchall()]
+    conn.close()
+    
+    # Drop the transaction_id column from trade_action_result table if it exists
+    if 'transaction_id' in columns:
+        with op.batch_alter_table('trade_action_result', schema=None) as batch_op:
+            batch_op.drop_column('transaction_id')
+    else:
+        print("INFO: Column 'transaction_id' does not exist in trade_action_result, skipping drop operation")
     
     # Make expert_recommendation_id NOT NULL (all actions must be linked to recommendations)
     # First, we need to update any NULL values to a valid expert_recommendation_id

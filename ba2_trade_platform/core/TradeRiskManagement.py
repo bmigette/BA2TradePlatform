@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 import logging
 
-from .AccountInterface import AccountInterface
+from .interfaces import AccountInterface
 from ..logger import logger
 from .models import TradingOrder, ExpertRecommendation, ExpertInstance, Transaction
 from .types import OrderStatus, OrderDirection, TransactionStatus
@@ -18,7 +18,7 @@ from .db import get_instance, get_all_instances, update_instance, get_db
 from sqlmodel import select, Session
 
 if TYPE_CHECKING:
-    from .MarketExpertInterface import MarketExpertInterface
+    from .interfaces import MarketExpertInterface
 
 
 class TradeRiskManagement:

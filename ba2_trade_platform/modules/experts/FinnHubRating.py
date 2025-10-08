@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 import json
 import requests
 
-from ...core.MarketExpertInterface import MarketExpertInterface
+from ...core.interfaces import MarketExpertInterface
 from ...core.models import ExpertInstance, MarketAnalysis, AnalysisOutput, ExpertRecommendation
 from ...core.db import get_db, get_instance, update_instance, add_instance, get_setting
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, RiskLevel, TimeHorizon

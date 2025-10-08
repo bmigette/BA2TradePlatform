@@ -2,7 +2,7 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 import json
 
-from ...core.MarketExpertInterface import MarketExpertInterface
+from ...core.interfaces import MarketExpertInterface
 from ...core.models import ExpertInstance, MarketAnalysis, AnalysisOutput, ExpertRecommendation
 from ...core.db import get_db, get_instance, update_instance, add_instance
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, RiskLevel, TimeHorizon, AnalysisUseCase
@@ -262,6 +262,107 @@ class TradingAgents(MarketExpertInterface):
         
         return config
     
+    def _build_provider_map(self) -> Dict[str, List[type]]:
+        """
+        Build provider_map for new Toolkit from expert settings.
+        
+        Maps vendor settings to actual BA2 provider classes for each data category.
+        
+        Returns:
+            Dict mapping category names to lists of provider classes:
+            {
+                "news": [NewsProviderClass1, NewsProviderClass2, ...],
+                "insider": [InsiderProviderClass1, ...],
+                "macro": [MacroProviderClass1, ...],
+                "fundamentals_details": [FundProviderClass1, ...],
+                "ohlcv": [OHLCVProviderClass1, ...],
+                "indicators": [IndicatorProviderClass1, ...]
+            }
+        """
+        from ...modules.dataproviders import (
+            OHLCV_PROVIDERS,
+            INDICATORS_PROVIDERS,
+            FUNDAMENTALS_DETAILS_PROVIDERS,
+            NEWS_PROVIDERS,
+            MACRO_PROVIDERS,
+            INSIDER_PROVIDERS
+        )
+        
+        settings_def = self.get_settings_definitions()
+        
+        # Helper to get vendor list from settings
+        def _get_vendor_list(setting_key: str) -> List[str]:
+            """Get list of vendors from setting (handles both list and string formats)."""
+            value = self.settings.get(setting_key, settings_def[setting_key]['default'])
+            if isinstance(value, list):
+                return value
+            elif isinstance(value, str):
+                return [v.strip() for v in value.split(',') if v.strip()]
+            return []
+        
+        # Build provider_map by looking up provider classes from registries
+        provider_map = {}
+        
+        # News providers (aggregated)
+        news_vendors = _get_vendor_list('vendor_news')
+        provider_map['news'] = []
+        for vendor in news_vendors:
+            if vendor in NEWS_PROVIDERS:
+                provider_map['news'].append(NEWS_PROVIDERS[vendor])
+            else:
+                logger.warning(f"News provider '{vendor}' not found in NEWS_PROVIDERS registry")
+        
+        # Global news uses same providers as company news
+        # The toolkit will call get_global_news() on each provider
+        
+        # Insider providers (aggregated) - for both transactions and sentiment
+        insider_vendors = _get_vendor_list('vendor_insider_transactions')
+        provider_map['insider'] = []
+        for vendor in insider_vendors:
+            if vendor in INSIDER_PROVIDERS:
+                provider_map['insider'].append(INSIDER_PROVIDERS[vendor])
+            else:
+                logger.warning(f"Insider provider '{vendor}' not found in INSIDER_PROVIDERS registry")
+        
+        # Macro providers (aggregated) - for economic indicators, yield curve, Fed calendar
+        # Note: We don't have a vendor_macro setting yet, so we'll default to 'fred'
+        provider_map['macro'] = [MACRO_PROVIDERS['fred']] if 'fred' in MACRO_PROVIDERS else []
+        
+        # Fundamentals details providers (aggregated) - for balance sheet, income stmt, cash flow
+        # Map all three vendor settings to fundamentals_details category
+        fund_vendors = set()  # Use set to avoid duplicates
+        fund_vendors.update(_get_vendor_list('vendor_balance_sheet'))
+        fund_vendors.update(_get_vendor_list('vendor_cashflow'))
+        fund_vendors.update(_get_vendor_list('vendor_income_statement'))
+        
+        provider_map['fundamentals_details'] = []
+        for vendor in fund_vendors:
+            if vendor in FUNDAMENTALS_DETAILS_PROVIDERS:
+                provider_map['fundamentals_details'].append(FUNDAMENTALS_DETAILS_PROVIDERS[vendor])
+            else:
+                logger.warning(f"Fundamentals details provider '{vendor}' not found in FUNDAMENTALS_DETAILS_PROVIDERS registry")
+        
+        # OHLCV providers (fallback) - tries first, then second, etc.
+        ohlcv_vendors = _get_vendor_list('vendor_stock_data')
+        provider_map['ohlcv'] = []
+        for vendor in ohlcv_vendors:
+            if vendor in OHLCV_PROVIDERS:
+                provider_map['ohlcv'].append(OHLCV_PROVIDERS[vendor])
+            else:
+                logger.warning(f"OHLCV provider '{vendor}' not found in OHLCV_PROVIDERS registry")
+        
+        # Indicators providers (fallback) - tries first, then second, etc.
+        indicator_vendors = _get_vendor_list('vendor_indicators')
+        provider_map['indicators'] = []
+        for vendor in indicator_vendors:
+            if vendor in INDICATORS_PROVIDERS:
+                provider_map['indicators'].append(INDICATORS_PROVIDERS[vendor])
+            else:
+                logger.warning(f"Indicators provider '{vendor}' not found in INDICATORS_PROVIDERS registry")
+        
+        logger.debug(f"Built provider_map with {len(provider_map)} categories: {list(provider_map.keys())}")
+        return provider_map
+    
     def _extract_recommendation_data(self, final_state: Dict, processed_signal: str, symbol: str) -> Dict[str, Any]:
         """Extract recommendation data from TradingAgents analysis results."""
         expert_recommendation = final_state.get('expert_recommendation', {})
@@ -439,6 +540,9 @@ Analysis completed at: {self._get_current_timestamp()}"""
         # Create configuration
         config = self._create_tradingagents_config(subtype)
         
+        # Build provider_map for new toolkit
+        provider_map = self._build_provider_map()
+        
         # Initialize TradingAgents graph
         # Get debug mode from settings (defaults to True for detailed logging)
         debug_mode = self.settings.get('debug_mode', True)
@@ -447,7 +551,8 @@ Analysis completed at: {self._get_current_timestamp()}"""
             debug=debug_mode,
             config=config,
             market_analysis_id=market_analysis_id,
-            expert_instance_id=self.id  # Pass expert instance ID for persistent memory
+            expert_instance_id=self.id,  # Pass expert instance ID for persistent memory
+            provider_map=provider_map  # Pass provider_map for new toolkit
         )
         
         # Run analysis

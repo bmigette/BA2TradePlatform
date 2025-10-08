@@ -10,7 +10,7 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 import uuid
 
-from .AccountInterface import AccountInterface
+from .interfaces import AccountInterface
 from .models import TradingOrder, ExpertRecommendation, TradeActionResult
 from .types import OrderRecommendation, ExpertActionType, OrderDirection, OrderType, OrderStatus
 from .db import get_db, add_instance, update_instance, get_instance

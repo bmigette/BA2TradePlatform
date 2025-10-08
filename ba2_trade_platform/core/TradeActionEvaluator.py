@@ -8,7 +8,7 @@ and execute appropriate trading actions based on the evaluation results.
 from typing import List, Dict, Any, Optional, Tuple
 from .TradeConditions import TradeCondition, create_condition
 from .TradeActions import TradeAction, create_action
-from .AccountInterface import AccountInterface
+from .interfaces import AccountInterface
 from .models import Ruleset, EventAction, TradingOrder, TradeActionResult, ExpertRecommendation
 from .types import OrderRecommendation, ExpertEventType, ExpertActionType
 from .db import get_db, get_instance
