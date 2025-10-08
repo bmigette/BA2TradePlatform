@@ -119,8 +119,11 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         # Create tool nodes
         self.tool_nodes = self._create_tool_nodes()
 
-        # Initialize components
-        self.conditional_logic = ConditionalLogic()
+        # Initialize components with config values
+        self.conditional_logic = ConditionalLogic(
+            max_debate_rounds=self.config.get('max_debate_rounds', 1),
+            max_risk_discuss_rounds=self.config.get('max_risk_discuss_rounds', 1)
+        )
         
         # Store selected_analysts for later graph setup
         self.selected_analysts = selected_analysts

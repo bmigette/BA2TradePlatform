@@ -1414,7 +1414,13 @@ class OrderRecommendationsTab:
                                    color="green" 
                                    title="Place Order for this Recommendation"
                                    @click="$parent.$emit('place_order_rec', props.row.id)" />
-                            <span v-else class="text-grey-5">Order exists</span>
+                            <q-icon v-else 
+                                    name="send" 
+                                    size="sm" 
+                                    color="grey-5" 
+                                    class="q-ml-xs">
+                                <q-tooltip>Order already exists for this recommendation</q-tooltip>
+                            </q-icon>
                             <q-btn v-if="props.row.analysis_id" 
                                    icon="visibility" 
                                    flat 

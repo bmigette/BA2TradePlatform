@@ -69,11 +69,14 @@ class PerformanceTab:
         # Calculate metrics per expert
         expert_metrics = {}
         for expert_id, txns in expert_transactions.items():
-            # Get expert name
+            # Get expert name (use user_description if available, otherwise class name)
             session = get_db()
             try:
                 expert = session.get(ExpertInstance, expert_id)
-                expert_name = expert.expert if expert else f"Expert {expert_id}"
+                if expert:
+                    expert_name = expert.user_description if expert.user_description else expert.expert
+                else:
+                    expert_name = f"Expert {expert_id}"
             finally:
                 session.close()
             
@@ -139,7 +142,10 @@ class PerformanceTab:
                 session = get_db()
                 try:
                     expert = session.get(ExpertInstance, txn.expert_id)
-                    expert_name = expert.expert if expert else f"Expert {txn.expert_id}"
+                    if expert:
+                        expert_name = expert.user_description if expert.user_description else expert.expert
+                    else:
+                        expert_name = f"Expert {txn.expert_id}"
                 finally:
                     session.close()
                 
@@ -374,7 +380,11 @@ class PerformanceTab:
                     
                     if experts:
                         ui.label("Experts:").classes('self-center ml-8')
-                        expert_options = {expert.id: expert.expert for expert in experts}
+                        # Use user_description (shortname) if available, otherwise use expert class name
+                        expert_options = {
+                            expert.id: expert.user_description if expert.user_description else expert.expert 
+                            for expert in experts
+                        }
                         
                         def update_expert_filter(selected):
                             self.selected_experts = selected
