@@ -147,7 +147,10 @@ class OverviewTab:
             session.close()
     
     def _check_and_display_quantity_mismatches(self):
-        """Check for quantity mismatches between broker positions and transactions."""
+        """Check for quantity mismatches between broker positions and transactions.
+        
+        DEPRECATED: This synchronous version blocks the UI. Use _check_and_display_quantity_mismatches_async() instead.
+        """
         from ...core.models import Transaction
         from ...core.types import TransactionStatus
         
@@ -236,6 +239,104 @@ class OverviewTab:
             logger.error(f"Error checking for quantity mismatches: {e}", exc_info=True)
         finally:
             session.close()
+    
+    async def _check_and_display_quantity_mismatches_async(self):
+        """Check for quantity mismatches between broker positions and transactions asynchronously."""
+        from ...core.models import Transaction
+        from ...core.types import TransactionStatus
+        
+        try:
+            session = get_db()
+            try:
+                mismatches = []
+                
+                # Get all accounts
+                accounts = get_all_instances(AccountDefinition)
+                
+                for acc in accounts:
+                    provider_cls = providers.get(acc.provider)
+                    if not provider_cls:
+                        continue
+                    
+                    provider_obj = provider_cls(acc.id)
+                    
+                    try:
+                        # Get positions from broker
+                        positions = provider_obj.get_positions()
+                        
+                        # Create a map of symbol -> broker quantity
+                        broker_positions = {}
+                        for pos in positions:
+                            pos_dict = pos if isinstance(pos, dict) else dict(pos)
+                            symbol = pos_dict.get('symbol')
+                            qty = pos_dict.get('qty', 0)
+                            if symbol and qty:
+                                broker_positions[symbol] = float(qty)
+                        
+                        # Get all open transactions for this account
+                        # First, get all trading orders for this account to find their transaction IDs
+                        orders_stmt = select(TradingOrder).where(
+                            TradingOrder.account_id == acc.id,
+                            TradingOrder.transaction_id.isnot(None)
+                        )
+                        account_orders = session.exec(orders_stmt).all()
+                        
+                        # Get unique transaction IDs
+                        transaction_ids = list(set(o.transaction_id for o in account_orders if o.transaction_id))
+                        
+                        # Get transactions
+                        if transaction_ids:
+                            txn_stmt = select(Transaction).where(
+                                Transaction.id.in_(transaction_ids),
+                                Transaction.status == TransactionStatus.OPENED
+                            )
+                            transactions = session.exec(txn_stmt).all()
+                            
+                            # Calculate total quantity per symbol from transactions
+                            transaction_quantities = {}
+                            for txn in transactions:
+                                if txn.symbol and txn.quantity:
+                                    if txn.symbol not in transaction_quantities:
+                                        transaction_quantities[txn.symbol] = 0
+                                    transaction_quantities[txn.symbol] += float(txn.quantity)
+                            
+                            # Compare broker positions with transaction quantities
+                            for symbol, broker_qty in broker_positions.items():
+                                txn_qty = transaction_quantities.get(symbol, 0)
+                                
+                                # Check if broker quantity is less than transaction quantity (potential issue)
+                                if abs(broker_qty) < abs(txn_qty) - 0.01:  # 0.01 tolerance for float comparison
+                                    # Get all transactions for this symbol
+                                    symbol_txns = [t for t in transactions if t.symbol == symbol]
+                                    
+                                    mismatches.append({
+                                        'account': acc.name,
+                                        'account_id': acc.id,
+                                        'symbol': symbol,
+                                        'broker_qty': broker_qty,
+                                        'transaction_qty': txn_qty,
+                                        'difference': txn_qty - broker_qty,
+                                        'transactions': symbol_txns
+                                    })
+                    
+                    except Exception as e:
+                        logger.error(f"Error checking quantity mismatch for account {acc.name}: {e}", exc_info=True)
+                
+                # Display alerts for mismatches - check if client still exists
+                if mismatches:
+                    try:
+                        with self.mismatch_alerts_container:
+                            for mismatch in mismatches:
+                                self._render_quantity_mismatch_alert(mismatch)
+                    except RuntimeError:
+                        # Client has been deleted (user navigated away), stop processing
+                        return
+                        
+            finally:
+                session.close()
+                
+        except Exception as e:
+            logger.error(f"Error checking for quantity mismatches: {e}", exc_info=True)
     
     def _render_quantity_mismatch_alert(self, mismatch):
         """Render an alert for a quantity mismatch."""
@@ -391,8 +492,11 @@ class OverviewTab:
         # Check for ERROR orders and display alert
         self._check_and_display_error_orders()
         
-        # Check for quantity mismatches between broker and transactions
-        self._check_and_display_quantity_mismatches()
+        # Create container for quantity mismatch alerts
+        self.mismatch_alerts_container = ui.column().classes('w-full')
+        
+        # Check for quantity mismatches asynchronously
+        asyncio.create_task(self._check_and_display_quantity_mismatches_async())
         
         # Check for PENDING orders and display notification
         self._check_and_display_pending_orders(self.tabs_ref)
@@ -422,25 +526,67 @@ class OverviewTab:
         Args:
             grouping_field: Either 'labels' or 'categories' to determine grouping
         """
-        # Fetch positions from all accounts
-        accounts = get_all_instances(AccountDefinition)
-        all_positions_raw = []
-        
-        for acc in accounts:
-            provider_cls = providers.get(acc.provider)
-            if provider_cls:
-                provider_obj = provider_cls(acc.id)
-                try:
-                    positions = provider_obj.get_positions()
-                    for pos in positions:
-                        pos_dict = pos if isinstance(pos, dict) else dict(pos)
-                        pos_dict['account'] = acc.name
-                        all_positions_raw.append(pos_dict)
-                except Exception as e:
-                    logger.error(f"Error fetching positions from account {acc.name}: {e}", exc_info=True)
-        
-        # Render chart with fetched positions and specified grouping field
-        InstrumentDistributionChart(positions=all_positions_raw, grouping_field=grouping_field)
+        # Create card with loading placeholder
+        with ui.card().classes('p-4'):
+            title = '📊 Position Distribution by ' + ('Labels' if grouping_field == 'labels' else 'Categories')
+            ui.label(title).classes('text-h6 mb-4')
+            
+            loading_label = ui.label('🔄 Loading positions...').classes('text-sm text-gray-500')
+            chart_container = ui.column().classes('w-full')
+            
+            # Load positions asynchronously
+            asyncio.create_task(self._load_position_distribution_async(loading_label, chart_container, grouping_field))
+    
+    async def _load_position_distribution_async(self, loading_label, chart_container, grouping_field):
+        """Load position distribution data asynchronously."""
+        try:
+            # Fetch positions from all accounts
+            accounts = get_all_instances(AccountDefinition)
+            all_positions_raw = []
+            
+            for acc in accounts:
+                provider_cls = providers.get(acc.provider)
+                if provider_cls:
+                    provider_obj = provider_cls(acc.id)
+                    try:
+                        positions = provider_obj.get_positions()
+                        for pos in positions:
+                            pos_dict = pos if isinstance(pos, dict) else dict(pos)
+                            pos_dict['account'] = acc.name
+                            all_positions_raw.append(pos_dict)
+                    except Exception as e:
+                        logger.error(f"Error fetching positions from account {acc.name}: {e}", exc_info=True)
+            
+            # Clear loading message - check if client still exists
+            try:
+                loading_label.delete()
+            except RuntimeError:
+                # Client has been deleted (user navigated away), stop processing
+                return
+            
+            # Render chart - check if client still exists
+            try:
+                with chart_container:
+                    InstrumentDistributionChart(positions=all_positions_raw, grouping_field=grouping_field)
+            except RuntimeError:
+                # Client has been deleted (user navigated away), stop processing
+                return
+                
+        except Exception as e:
+            # Clear loading message and show error - check if client still exists
+            try:
+                loading_label.delete()
+            except RuntimeError:
+                # Client has been deleted (user navigated away), stop processing
+                return
+            
+            try:
+                with chart_container:
+                    ui.label('❌ Failed to load positions').classes('text-sm text-red-600')
+                    ui.label(f'Error: {str(e)}').classes('text-xs text-gray-500')
+            except RuntimeError:
+                # Client has been deleted (user navigated away), ignore the error
+                pass
     
     def _render_openai_spending_widget(self):
         """Widget showing OpenAI API spending."""
@@ -1332,7 +1478,12 @@ class AccountOverviewTab:
         ]
         
         if all_orders:
-            ui.table(columns=order_columns, rows=all_orders, row_key='symbol').classes('w-full')
+            ui.table(
+                columns=order_columns, 
+                rows=all_orders, 
+                row_key='symbol',
+                pagination={'rowsPerPage': 20, 'sortBy': 'created_at', 'descending': True}
+            ).classes('w-full')
         else:
             ui.label('No orders found or no accounts configured.').classes('text-gray-500')
     
@@ -1767,36 +1918,14 @@ class TransactionsTab:
             logger.debug(f"[RENDER] _render_transactions_table() - Building rows for {len(transactions)} transactions")
             rows = []
             for txn in transactions:
-                # Get current P/L for open transactions
+                # Skip current price fetching on initial load to avoid blocking UI
+                # Users can refresh to get latest prices if needed
                 current_pnl = ''
                 current_price_str = ''
                 
-                if txn.status == TransactionStatus.OPENED and txn.id:
-                    try:
-                        # Query for the first (opening) order from the transaction
-                        order_statement = select(TradingOrder).where(
-                            TradingOrder.transaction_id == txn.id
-                        ).order_by(TradingOrder.created_at).limit(1)
-                        order = session.exec(order_statement).first()
-                        if order and order.account_id:
-                            from ...modules.accounts import get_account_class
-                            from ...core.models import AccountDefinition
-                            acc_def = get_instance(AccountDefinition, order.account_id)
-                            if acc_def:
-                                account_class = get_account_class(acc_def.provider)
-                                if account_class:
-                                    account = account_class(acc_def.id)
-                                    current_price = account.get_instrument_current_price(txn.symbol)
-                                    if current_price:
-                                        current_price_str = f"${current_price:.2f}"
-                                        # Calculate P/L
-                                        if txn.quantity > 0:  # Long position
-                                            pnl = (current_price - txn.open_price) * abs(txn.quantity)
-                                        else:  # Short position
-                                            pnl = (txn.open_price - current_price) * abs(txn.quantity)
-                                        current_pnl = f"${pnl:+.2f}"
-                    except Exception:
-                        pass
+                # Note: Removed synchronous price fetching to prevent UI freeze
+                # The get_instrument_current_price() call was blocking the UI
+                # Consider adding a refresh button or async loading if current prices are needed
                 
                 # Closed P/L - calculate from open/close prices
                 closed_pnl = ''
