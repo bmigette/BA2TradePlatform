@@ -1221,39 +1221,61 @@ Please check back in a few minutes for results."""
             import os
             from ...config import CACHE_FOLDER
             
-            # Get the persist directory for this expert
-            persist_directory = os.path.join(CACHE_FOLDER, "chromadb", f"expert_{self.id}")
+            # Get the persist directory for this expert (check all symbol subdirectories)
+            expert_base_dir = os.path.join(CACHE_FOLDER, "chromadb", f"expert_{self.id}")
             
-            if not os.path.exists(persist_directory):
+            if not os.path.exists(expert_base_dir):
                 return {
                     "status": "info",
                     "message": "No memory collections found for this expert."
                 }
             
-            # Connect to the persistent client
-            client = chromadb.PersistentClient(path=persist_directory)
+            # Collect all collections from all symbol subdirectories
+            collection_info = []
             
-            # Get all collections
-            collections = client.list_collections()
+            # Check base directory (old format without symbol subdirs)
+            if os.path.isfile(os.path.join(expert_base_dir, "chroma.sqlite3")):
+                try:
+                    client = chromadb.PersistentClient(path=expert_base_dir)
+                    collections = client.list_collections()
+                    for collection in collections:
+                        count = collection.count()
+                        collection_info.append({
+                            "name": collection.name,
+                            "count": count,
+                            "path": expert_base_dir
+                        })
+                except Exception as e:
+                    logger.debug(f"Could not read collections from {expert_base_dir}: {e}")
             
-            if not collections:
+            # Check symbol subdirectories
+            for symbol_dir in os.listdir(expert_base_dir):
+                symbol_path = os.path.join(expert_base_dir, symbol_dir)
+                if os.path.isdir(symbol_path):
+                    try:
+                        client = chromadb.PersistentClient(path=symbol_path)
+                        collections = client.list_collections()
+                        for collection in collections:
+                            count = collection.count()
+                            collection_info.append({
+                                "name": f"{symbol_dir}/{collection.name}",
+                                "count": count,
+                                "path": symbol_path
+                            })
+                    except Exception as e:
+                        logger.debug(f"Could not read collections from {symbol_path}: {e}")
+            
+            if not collection_info:
                 return {
                     "status": "info",
                     "message": "No memory collections found for this expert."
                 }
             
             # Return list of collections for user to confirm
-            collection_info = []
-            for collection in collections:
-                count = collection.count()
-                collection_info.append({
-                    "name": collection.name,
-                    "count": count
-                })
-            
+            total_count = sum(c["count"] for c in collection_info)
             return {
                 "status": "confirm",
-                "message": f"Found {len(collections)} memory collection(s). This action will permanently delete all stored memories.",
+                "message": f"Found {len(collection_info)} memory collection(s) with {total_count} total memories. This action will permanently delete all stored memories.",
                 "collections": collection_info,
                 "action": "confirm_clear_memory"
             }
@@ -1281,45 +1303,73 @@ Please check back in a few minutes for results."""
             import shutil
             from ...config import CACHE_FOLDER
             
-            # Get the persist directory for this expert
-            persist_directory = os.path.join(CACHE_FOLDER, "chromadb", f"expert_{self.id}")
+            # Get the persist directory for this expert (base directory with symbol subdirs)
+            expert_base_dir = os.path.join(CACHE_FOLDER, "chromadb", f"expert_{self.id}")
             
-            if not os.path.exists(persist_directory):
+            if not os.path.exists(expert_base_dir):
                 return {
                     "status": "info",
                     "message": "No memory collections found."
                 }
             
-            # Connect to the persistent client
-            client = chromadb.PersistentClient(path=persist_directory)
-            
-            # Get all collections
-            all_collections = client.list_collections()
-            
             deleted_count = 0
             errors = []
             
-            for collection in all_collections:
-                # If collection_names is specified, only delete those
-                if collection_names and collection.name not in collection_names:
-                    continue
-                
+            # Delete from base directory (old format)
+            if os.path.isfile(os.path.join(expert_base_dir, "chroma.sqlite3")):
                 try:
-                    client.delete_collection(collection.name)
-                    deleted_count += 1
-                    logger.info(f"Deleted memory collection '{collection.name}' for expert {self.id}")
+                    client = chromadb.PersistentClient(path=expert_base_dir)
+                    all_collections = client.list_collections()
+                    
+                    for collection in all_collections:
+                        if collection_names and collection.name not in collection_names:
+                            continue
+                        try:
+                            client.delete_collection(collection.name)
+                            deleted_count += 1
+                            logger.info(f"Deleted memory collection '{collection.name}' for expert {self.id}")
+                        except Exception as e:
+                            errors.append(f"Failed to delete collection '{collection.name}': {str(e)}")
                 except Exception as e:
-                    error_msg = f"Failed to delete collection '{collection.name}': {str(e)}"
-                    errors.append(error_msg)
-                    logger.error(error_msg, exc_info=True)
+                    logger.debug(f"Could not access collections in {expert_base_dir}: {e}")
             
-            # If all collections deleted, remove the entire directory
-            if deleted_count == len(all_collections) and not errors:
+            # Delete from symbol subdirectories
+            for symbol_dir in os.listdir(expert_base_dir):
+                symbol_path = os.path.join(expert_base_dir, symbol_dir)
+                if os.path.isdir(symbol_path):
+                    try:
+                        client = chromadb.PersistentClient(path=symbol_path)
+                        all_collections = client.list_collections()
+                        
+                        for collection in all_collections:
+                            collection_full_name = f"{symbol_dir}/{collection.name}"
+                            if collection_names and collection_full_name not in collection_names:
+                                continue
+                            try:
+                                client.delete_collection(collection.name)
+                                deleted_count += 1
+                                logger.info(f"Deleted memory collection '{collection_full_name}' for expert {self.id}")
+                            except Exception as e:
+                                errors.append(f"Failed to delete collection '{collection_full_name}': {str(e)}")
+                        
+                        # If symbol directory is now empty, remove it
+                        remaining = client.list_collections()
+                        if not remaining:
+                            try:
+                                shutil.rmtree(symbol_path)
+                                logger.info(f"Removed empty symbol directory: {symbol_path}")
+                            except Exception as e:
+                                logger.warning(f"Could not remove symbol directory {symbol_path}: {e}")
+                    except Exception as e:
+                        logger.debug(f"Could not access collections in {symbol_path}: {e}")
+            
+            # If expert directory is now empty, remove it
+            if not os.listdir(expert_base_dir) or (len(os.listdir(expert_base_dir)) == 1 and os.listdir(expert_base_dir)[0] == 'chroma.sqlite3'):
                 try:
-                    shutil.rmtree(persist_directory)
+                    shutil.rmtree(expert_base_dir)
                     logger.info(f"Removed memory directory for expert {self.id}")
                 except Exception as e:
-                    logger.warning(f"Could not remove memory directory: {e}")
+                    logger.warning(f"Could not remove expert directory: {e}")
             
             # Build result message
             if errors:

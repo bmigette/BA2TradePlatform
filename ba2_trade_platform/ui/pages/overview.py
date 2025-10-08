@@ -2543,12 +2543,55 @@ class TransactionsTab:
         dialog.open()
 
 class PerformanceTab:
+    """Performance analytics tab showing comprehensive trading metrics."""
+    
     def __init__(self):
         self.render()
+    
     def render(self):
         logger.debug("[RENDER] PerformanceTab.render() - START")
-        with ui.card():
-            ui.label('Performance metrics and analytics will be displayed here.')
+        
+        # Get all accounts to allow filtering
+        accounts = get_all_instances(AccountDefinition)
+        
+        if not accounts:
+            with ui.card():
+                ui.label('No accounts configured. Please add an account first.').classes('text-gray-500')
+            return
+        
+        # Account selector
+        with ui.card().classes('w-full mb-4'):
+            ui.label('Account Selection').classes('text-lg font-bold mb-2')
+            
+            selected_account_id = accounts[0].id if accounts else None
+            
+            def render_performance_for_account(account_id: int):
+                """Render performance analytics for selected account."""
+                performance_container.clear()
+                with performance_container:
+                    # Import here to avoid circular dependency
+                    from .performance import PerformanceTab as PerformanceAnalytics
+                    analytics = PerformanceAnalytics(account_id)
+                    analytics.render()
+            
+            # Account dropdown
+            account_options = {acc.id: acc.name for acc in accounts}
+            
+            def on_account_change(e):
+                render_performance_for_account(e.value)
+            
+            ui.select(
+                options=account_options,
+                value=selected_account_id,
+                label='Select Account'
+            ).on_value_change(on_account_change).classes('w-64')
+        
+        # Performance content container
+        performance_container = ui.column().classes('w-full')
+        
+        # Initial render with first account
+        if selected_account_id:
+            render_performance_for_account(selected_account_id)
 
 def content() -> None:
     logger.debug("[RENDER] overview.content() - START")

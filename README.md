@@ -78,32 +78,134 @@ By using this software, you acknowledge that you understand and accept these ris
 
 ## 🛠️ Installation
 
+### Prerequisites
+- Python 3.11 or higher
+- Git
+- Windows/Linux/macOS
+
+### Step-by-Step Setup
+
 1. **Clone the repository**:
    ```bash
    git clone https://github.com/bmigette/BA2TradePlatform.git
    cd BA2TradePlatform
    ```
 
-2. **Create virtual environment**:
+2. **Create and activate virtual environment**:
+   
+   **Windows**:
+   ```powershell
+   python -m venv .venv
+   .venv\Scripts\Activate.ps1
+   ```
+   
+   **Linux/macOS**:
    ```bash
    python -m venv .venv
-   .venv\Scripts\activate  # Windows
-   # or
-   source .venv/bin/activate  # Linux/Mac
+   source .venv/bin/activate
    ```
 
 3. **Install dependencies**:
+   
+   **Using virtual environment Python** (recommended):
    ```bash
-   pip install -r requirements.txt
+   # Windows
+   .venv\Scripts\python.exe -m pip install -r requirements.txt
+   
+   # Linux/macOS
+   .venv/bin/python -m pip install -r requirements.txt
    ```
 
-4. **Run the application**:
-   ```bash
-   python main.py
+4. **Configure environment variables** (optional):
+   
+   Create a `.env` file in the project root:
+   ```env
+   # LLM Configuration
+   OPENAI_API_KEY=your_openai_key_here
+   
+   # Market Data (optional)
+   FINNHUB_API_KEY=your_finnhub_key_here
+   ALPHA_VANTAGE_API_KEY=your_alpha_vantage_key_here
+   FRED_API_KEY=your_fred_key_here
+   
+   # Trading Accounts
+   ALPACA_API_KEY=your_alpaca_key_here
+   ALPACA_SECRET_KEY=your_alpaca_secret_here
+   ALPACA_BASE_URL=https://paper-api.alpaca.markets  # Paper trading
+   
+   # Cache Settings
+   PRICE_CACHE_TIME=30  # Price cache duration in seconds
    ```
 
-5. **Access the web interface**:
-   Open http://localhost:8080 in your browser
+5. **Run the application**:
+   
+   **Windows**:
+   ```powershell
+   .venv\Scripts\python.exe main.py
+   ```
+   
+   **Linux/macOS**:
+   ```bash
+   .venv/bin/python main.py
+   ```
+
+6. **Access the web interface**:
+   
+   Open your browser and navigate to:
+   ```
+   http://localhost:8080
+   ```
+
+### First-Time Configuration
+
+After starting the application:
+
+1. **Navigate to Settings** (http://localhost:8080/settings)
+2. **Configure API Keys**: Enter your OpenAI, Finnhub, and other API keys
+3. **Add Trading Account**: Configure your Alpaca or other broker credentials
+4. **Create Expert Instance**: Set up your first AI trading expert
+5. **Configure Rulesets**: Define your trading rules and risk parameters
+
+### Database Location
+
+The SQLite database is automatically created at:
+```
+~/Documents/ba2_trade_platform/db.sqlite
+```
+
+Logs are stored in:
+```
+ba2_trade_platform/logs/
+```
+
+Cache (ChromaDB, price data) is stored in:
+```
+~/Documents/ba2_trade_platform/cache/
+```
+
+### Troubleshooting Installation
+
+**Virtual Environment Issues**:
+- Always use the virtual environment Python executable (`.venv\Scripts\python.exe` or `.venv/bin/python`)
+- Avoid using global `python` or `pip` commands
+
+**Dependency Installation Errors**:
+```bash
+# Upgrade pip first
+.venv\Scripts\python.exe -m pip install --upgrade pip
+
+# Then retry installation
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+**Port Already in Use**:
+- NiceGUI runs on port 8080 by default
+- Check for other applications using this port
+- Stop conflicting services or modify the port in `main.py`
+
+**Permission Errors**:
+- Ensure you have write permissions in `~/Documents/`
+- Run terminal/PowerShell with appropriate permissions
 
 ## 🏗️ Architecture
 
@@ -434,7 +536,7 @@ pip freeze > requirements.txt
 
 **Common Issues**:
 
-1. **Import Errors**: Ensure all dependencies installed with `pip install -r requirements.txt`
+1. **Import Errors**: Ensure all dependencies installed with `.venv\Scripts\python.exe -m pip install -r requirements.txt`
 
 2. **Database Issues**: Database auto-creates on first run. Check permissions in `~/Documents/`
 
@@ -442,12 +544,36 @@ pip freeze > requirements.txt
 
 4. **Unicode Console Errors**: Logger automatically falls back to ASCII on Windows
 
-5. **Memory Issues**: ChromaDB collections are created in memory - restart if needed
+5. **ChromaDB Instance Conflicts**: Fixed in latest version - each expert/symbol combination now gets isolated ChromaDB storage
+
+6. **AttributeError on TradingOrder**: Ensure database schema is up-to-date. The `filled_avg_price` field was removed in favor of `open_price`
 
 **Debug Mode**:
 ```python
 ta = TradingAgentsGraph(debug=True, config=DEFAULT_CONFIG)
 ```
+
+## 📋 Recent Updates
+
+### October 2025
+- **Fixed ChromaDB Instance Conflicts**: ChromaDB path now includes symbol to prevent conflicts when same expert analyzes multiple symbols
+- **Database Schema Improvements**: Added CASCADE foreign key constraints for proper cleanup when deleting accounts/experts
+- **Removed Redundant Fields**: Cleaned up `TradingOrder` model by removing `filled_avg_price` (now uses `open_price`)
+- **Trade Action Fixes**: 
+  - Fixed Take Profit/Stop Loss calculation to use correct order direction (from recommendation vs. existing order)
+  - Fixed increase/decrease instrument share actions to properly extract target percentage
+- **Rule Evaluation Traceability**: Added detailed tracking of trade action results linked to expert recommendations
+- **UI Enhancements**: Added magnifying glass icons for viewing detailed rule evaluation results
+
+### Key Features Added
+- **Async Price Loading**: Overview widgets load price information asynchronously to prevent UI blocking
+- **Performance Analytics**: New trade performance tab with comprehensive metrics:
+  - Average transaction time per expert
+  - Total and monthly profit analysis
+  - Sharpe ratio calculations
+  - Win/loss ratio tracking
+  - Average profit per transaction
+- **Reusable Chart Components**: Modular chart components for consistent visualization across the platform
 
 ## 📚 Documentation
 

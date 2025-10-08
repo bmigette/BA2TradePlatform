@@ -27,7 +27,11 @@ class FinancialSituationMemory:
         from ba2_trade_platform.config import CACHE_FOLDER
         
         if expert_instance_id:
-            persist_directory = os.path.join(CACHE_FOLDER, "chromadb", f"expert_{expert_instance_id}")
+            # Include symbol in path to avoid ChromaDB instance conflicts when same expert analyzes different symbols
+            if symbol:
+                persist_directory = os.path.join(CACHE_FOLDER, "chromadb", f"expert_{expert_instance_id}", symbol)
+            else:
+                persist_directory = os.path.join(CACHE_FOLDER, "chromadb", f"expert_{expert_instance_id}")
         else:
             # Fallback for backward compatibility
             persist_directory = os.path.join(CACHE_FOLDER, "chromadb", "default")
