@@ -24,7 +24,6 @@ from typing import Type, Dict
 from ba2_trade_platform.core.interfaces import (
     DataProviderInterface,
     MarketIndicatorsInterface,
-    MarketFundamentalsInterface,
     CompanyFundamentalsOverviewInterface,
     CompanyFundamentalsDetailsInterface,
     MarketNewsInterface,

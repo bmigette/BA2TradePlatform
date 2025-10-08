@@ -14,7 +14,7 @@ from ba2_trade_platform.core.types import MarketDataPoint
 from ba2_trade_platform.logger import logger
 
 
-class MarketDataProvider(ABC):
+class MarketDataProviderInterface(ABC):
     """
     Abstract base class for market data providers.
     

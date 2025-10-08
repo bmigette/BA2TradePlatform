@@ -10,7 +10,7 @@ from typing import Optional
 import pandas as pd
 from io import StringIO
 
-from ba2_trade_platform.core.interfaces.MarketDataProviderInterface import MarketDataProvider
+from ba2_trade_platform.core.interfaces.MarketDataProviderInterface import MarketDataProviderInterface
 from ba2_trade_platform.modules.dataproviders.alpha_vantage_common import (
     make_api_request,
     filter_csv_by_date_range,
@@ -20,7 +20,7 @@ from ba2_trade_platform.core.provider_utils import log_provider_call
 from ba2_trade_platform.logger import logger
 
 
-class AlphaVantageOHLCVProvider(MarketDataProvider):
+class AlphaVantageOHLCVProvider(MarketDataProviderInterface):
     """
     Alpha Vantage OHLCV Data Provider.
     

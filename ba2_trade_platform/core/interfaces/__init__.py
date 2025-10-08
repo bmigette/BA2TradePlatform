@@ -29,7 +29,7 @@ from .CompanyFundamentalsDetailsInterface import CompanyFundamentalsDetailsInter
 from .MarketNewsInterface import MarketNewsInterface
 from .MacroEconomicsInterface import MacroEconomicsInterface
 from .CompanyInsiderInterface import CompanyInsiderInterface
-from .MarketDataProviderInterface import MarketDataProvider
+from .MarketDataProviderInterface import MarketDataProviderInterface
 
 
 __all__ = [
@@ -46,5 +46,5 @@ __all__ = [
     "MarketNewsInterface",
     "MacroEconomicsInterface",
     "CompanyInsiderInterface",
-    "MarketDataProvider",
+    "MarketDataProviderInterface",
 ]

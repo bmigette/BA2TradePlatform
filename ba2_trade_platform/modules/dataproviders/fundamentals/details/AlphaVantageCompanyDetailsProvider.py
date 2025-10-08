@@ -24,11 +24,12 @@ class AlphaVantageCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
     income statements, and cash flow statements from Alpha Vantage API.
     """
     
+    
     API_BASE_URL = "https://www.alphavantage.co/query"
     
     def __init__(self):
         """Initialize Alpha Vantage company details provider."""
-                logger.debug("Initialized AlphaVantageCompanyDetailsProvider")
+        logger.debug("Initialized AlphaVantageCompanyDetailsProvider")
     
     def _make_api_request(self, function_name: str, params: dict) -> str:
         """

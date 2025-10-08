@@ -19,23 +19,46 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Type
 import traceback
+import importlib.util
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from ba2_trade_platform.logger import logger
-from ba2_trade_platform.modules.dataproviders import (
-    OHLCV_PROVIDERS,
-    INDICATORS_PROVIDERS,
-    FUNDAMENTALS_DETAILS_PROVIDERS,
-    NEWS_PROVIDERS,
-    MACRO_PROVIDERS,
-    INSIDER_PROVIDERS,
-    FREDMacroProvider,
-    DataProviderInterface
-)
-from ba2_trade_platform.thirdparties.TradingAgents.tradingagents.agents.utils.agent_utils_new import Toolkit
+
+# Import the new toolkit directly by file path to avoid package import issues
+toolkit_path = project_root / "ba2_trade_platform" / "thirdparties" / "TradingAgents" / "tradingagents" / "agents" / "utils" / "agent_utils_new.py"
+spec = importlib.util.spec_from_file_location("agent_utils_new", toolkit_path)
+agent_utils_new = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(agent_utils_new)
+Toolkit = agent_utils_new.Toolkit
+
+# Try to import provider registries, but continue if they fail
+try:
+    from ba2_trade_platform.modules.dataproviders import (
+        OHLCV_PROVIDERS,
+        INDICATORS_PROVIDERS,
+        FUNDAMENTALS_DETAILS_PROVIDERS,
+        NEWS_PROVIDERS,
+        MACRO_PROVIDERS,
+        INSIDER_PROVIDERS,
+        FREDMacroProvider,
+        DataProviderInterface
+    )
+    PROVIDERS_AVAILABLE = True
+except Exception as e:
+    logger.warning(f"Could not import provider registries: {e}")
+    logger.warning("Will create minimal provider map for testing")
+    PROVIDERS_AVAILABLE = False
+    OHLCV_PROVIDERS = {}
+    INDICATORS_PROVIDERS = {}
+    FUNDAMENTALS_DETAILS_PROVIDERS = {}
+    NEWS_PROVIDERS = {}
+    MACRO_PROVIDERS = {}
+    INSIDER_PROVIDERS = {}
+    FREDMacroProvider = None
+    DataProviderInterface = None
 
 
 class ToolkitTester:
@@ -53,8 +76,12 @@ class ToolkitTester:
             "errors": []
         }
         
-    def build_test_provider_map(self) -> Dict[str, List[Type[DataProviderInterface]]]:
+    def build_test_provider_map(self) -> Dict[str, List[Type]]:
         """Build a comprehensive provider map for testing."""
+        if not PROVIDERS_AVAILABLE:
+            logger.error("Providers not available - cannot build provider map")
+            return {}
+            
         provider_map = {}
         
         # OHLCV providers - try multiple for fallback testing

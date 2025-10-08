@@ -9,11 +9,11 @@ from datetime import datetime
 from typing import Optional
 import pandas as pd
 import yfinance as yf
-from ba2_trade_platform.core.MarketDataProvider import MarketDataProvider
+from ba2_trade_platform.core.interfaces.MarketDataProviderInterface import MarketDataProviderInterface
 from ba2_trade_platform.logger import logger
 
 
-class YFinanceDataProvider(MarketDataProvider):
+class YFinanceDataProvider(MarketDataProviderInterface):
     """
     Yahoo Finance data provider implementation.
     
