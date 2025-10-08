@@ -8,6 +8,7 @@ APScheduler
 alembic
 reportlab
 plotly
+fmpsdk
 
 # TradingAgents Tools
 typing-extensions
@@ -38,23 +39,3 @@ rich
 questionary
 langchain-anthropic
 langchain-google-genai
-
-# FinRobot Tools
-pyautogen>=0.2.19
-ipython
-huggingface_hub
-matplotlib
-mplfinance
-sec_api
-pyPDF2
-pandas_datareader
-pdfkit==1.0.0
-marker-pdf
-aiohttp
-nltk
-numpy
-ratelimit
-scikit_learn
-starlette
-tenacity
-unstructured
