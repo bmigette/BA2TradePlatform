@@ -5,6 +5,7 @@ import os
 from datetime import datetime, timedelta
 from .config import get_config
 from ba2_trade_platform.modules.dataproviders import YFinanceDataProvider
+from .. import logger
 
 
 class StockstatsUtils:
@@ -72,11 +73,11 @@ class StockstatsUtils:
             total_lookback_days = min(lookback_days + buffer_days, 730)
             
             if total_lookback_days >= 730:
-                from .. import logger as ta_logger
-                ta_logger.debug(f"Limiting total lookback to 730 days for {symbol} (Yahoo Finance limit)")
+                
+                logger.debug(f"Limiting total lookback to 730 days for {symbol} (Yahoo Finance limit)")
             
             # Get data via data provider (uses smart cache)
-            data = provider.get_dataframe(
+            data = provider.get_ohlcv_data(
                 symbol=symbol,
                 start_date=curr_date_dt - timedelta(days=total_lookback_days),
                 end_date=datetime.now(),
@@ -141,8 +142,8 @@ class StockstatsUtils:
             total_lookback_days = min(requested_days + buffer_days, 730)
             
             if total_lookback_days >= 730:
-                from .. import logger as ta_logger
-                ta_logger.debug(f"Limiting total lookback to 730 days for {symbol} (Yahoo Finance limit)")
+                
+                logger.debug(f"Limiting total lookback to 730 days for {symbol} (Yahoo Finance limit)")
             
             # Fetch more history for indicator calculation
             fetch_start = start_dt - timedelta(days=buffer_days)
@@ -150,10 +151,10 @@ class StockstatsUtils:
             max_start = end_dt - timedelta(days=730)
             if fetch_start < max_start:
                 fetch_start = max_start
-                from .. import logger as ta_logger
-                ta_logger.debug(f"Adjusted fetch_start to {fetch_start} to stay within 730-day limit")
+                
+                logger.debug(f"Adjusted fetch_start to {fetch_start} to stay within 730-day limit")
             
-            data = provider.get_dataframe(
+            data = provider.get_ohlcv_data(
                 symbol=symbol,
                 start_date=fetch_start,
                 end_date=datetime.now(),

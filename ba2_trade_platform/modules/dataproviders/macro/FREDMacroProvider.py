@@ -139,7 +139,7 @@ class FREDMacroProvider(MacroEconomicsInterface):
         start_date: Annotated[Optional[datetime], "Start date for indicators (mutually exclusive with lookback_days)"] = None,
         lookback_days: Annotated[Optional[int], "Days to look back from end_date (mutually exclusive with start_date)"] = None,
         indicators: Annotated[Optional[list[str]], "List of indicator names"] = None,
-        format_type: Literal["dict", "markdown"] = "markdown"
+        format_type: Literal["dict", "markdown", "both"] = "markdown"
     ) -> Dict[str, Any] | str:
         """
         Get economic indicators (GDP, unemployment, inflation, etc.).
@@ -214,7 +214,12 @@ class FREDMacroProvider(MacroEconomicsInterface):
         
         if format_type == "dict":
             return result_data
-        else:
+        elif format_type == "both":
+            return {
+                "text": result_md,
+                "data": result_data
+            }
+        else:  # markdown
             return result_md
     
     @log_provider_call
@@ -223,7 +228,7 @@ class FREDMacroProvider(MacroEconomicsInterface):
         end_date: Annotated[datetime, "End date for yield curve data (inclusive)"],
         start_date: Annotated[Optional[datetime], "Start date (mutually exclusive with lookback_days)"] = None,
         lookback_days: Annotated[Optional[int], "Days to look back from end_date (mutually exclusive with start_date)"] = None,
-        format_type: Literal["dict", "markdown"] = "markdown"
+        format_type: Literal["dict", "markdown", "both"] = "markdown"
     ) -> Dict[str, Any] | str:
         """
         Get Treasury yield curve data.
@@ -290,7 +295,7 @@ class FREDMacroProvider(MacroEconomicsInterface):
         end_date: Annotated[datetime, "End date for Fed events (inclusive)"],
         start_date: Annotated[Optional[datetime], "Start date for Fed events (mutually exclusive with lookback_days)"] = None,
         lookback_days: Annotated[Optional[int], "Days to look back from end_date (mutually exclusive with start_date)"] = None,
-        format_type: Literal["dict", "markdown"] = "markdown"
+        format_type: Literal["dict", "markdown", "both"] = "markdown"
     ) -> Dict[str, Any] | str:
         """
         Get Federal Reserve calendar and meeting minutes.

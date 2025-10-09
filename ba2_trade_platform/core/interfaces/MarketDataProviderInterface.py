@@ -13,6 +13,7 @@ import os
 from ba2_trade_platform.core.types import MarketDataPoint
 from ba2_trade_platform.logger import logger
 from ba2_trade_platform import config
+from ba2_trade_platform.core.provider_utils import log_provider_call
 
 
 class MarketDataProviderInterface(ABC):
@@ -98,7 +99,7 @@ class MarketDataProviderInterface(ABC):
             return dt.replace(second=0, microsecond=0)
     
     @abstractmethod
-    def _fetch_data_from_source(
+    def _get_ohlcv_data_impl(
         self,
         symbol: str,
         start_date: datetime,
@@ -106,9 +107,10 @@ class MarketDataProviderInterface(ABC):
         interval: str = '1d'
     ) -> pd.DataFrame:
         """
-        Fetch data from the actual data source (e.g., API, database).
+        Fetch OHLCV data from the actual data source (e.g., API, database).
         
-        This method must be implemented by subclasses.
+        This is an internal implementation method that must be implemented by subclasses.
+        External code should call get_ohlcv_data() instead.
         
         Args:
             symbol: Ticker symbol (e.g., 'AAPL', 'MSFT')
@@ -304,7 +306,7 @@ class MarketDataProviderInterface(ABC):
             
             fetch_end = end_date if end_date else datetime.now()
             
-            df = self._fetch_data_from_source(symbol, fetch_start, fetch_end, interval)
+            df = self._get_ohlcv_data_impl(symbol, fetch_start, fetch_end, interval)
             
             if df is None or df.empty:
                 raise Exception(f"Failed to fetch data for {symbol}")
@@ -341,7 +343,7 @@ class MarketDataProviderInterface(ABC):
         
         return datapoints
     
-    def get_dataframe(
+    def get_ohlcv_data(
         self,
         symbol: str,
         start_date: datetime,
@@ -351,10 +353,10 @@ class MarketDataProviderInterface(ABC):
         max_cache_age_hours: int = 24
     ) -> pd.DataFrame:
         """
-        Get market data as DataFrame (convenience method).
+        Get OHLCV (Open, High, Low, Close, Volume) market data as DataFrame.
         
-        Similar to get_data() but returns a DataFrame instead of MarketDataPoint objects.
-        Useful for technical analysis and calculations.
+        This is the main public method for retrieving market data with caching support.
+        Use this method instead of calling _get_ohlcv_data_impl() directly.
         
         Args:
             symbol: Ticker symbol
@@ -397,7 +399,7 @@ class MarketDataProviderInterface(ABC):
             
             fetch_end = datetime.now()
             
-            df = self._fetch_data_from_source(symbol, fetch_start, fetch_end, interval)
+            df = self._get_ohlcv_data_impl(symbol, fetch_start, fetch_end, interval)
             
             if df is None or df.empty:
                 raise Exception(f"Failed to fetch data for {symbol}")
@@ -449,3 +451,123 @@ class MarketDataProviderInterface(ABC):
                 if file.endswith('.csv'):
                     os.remove(os.path.join(self.cache_folder, file))
             logger.info(f"Cleared all cache files in {self.cache_folder}")
+    
+    def _format_ohlcv_as_markdown(self, data: dict) -> str:
+        """Format OHLCV data as markdown table."""
+        md = f"# OHLCV Data: {data['symbol']}\n\n"
+        md += f"**Interval:** {data['interval']}  \n"
+        md += f"**Period:** {data['start_date'][:10]} to {data['end_date'][:10]}  \n"
+        md += f"**Data Points:** {len(data['data'])}  \n\n"
+        
+        if data['data']:
+            md += "## Price Data\n\n"
+            md += "| Date | Open | High | Low | Close | Volume |\n"
+            md += "|------|------|------|-----|-------|--------|\n"
+            
+            # Show all data points
+            for point in data['data']:
+                md += (
+                    f"| {point['date'][:10]} | "
+                    f"${point['open']:.2f} | "
+                    f"${point['high']:.2f} | "
+                    f"${point['low']:.2f} | "
+                    f"${point['close']:.2f} | "
+                    f"{point['volume']:,} |\n"
+                )
+            
+            md += f"\n*Total data points: {len(data['data'])}*\n"
+        else:
+            md += "## Price Data\n\n"
+            md += "*No data available for the specified period*\n"
+        
+        return md
+    
+    @log_provider_call
+    def get_ohlcv_data_formatted(
+        self,
+        symbol: str,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        lookback_days: Optional[int] = None,
+        interval: str = "1d",
+        format_type: str = "markdown"
+    ) -> dict | str:
+        """
+        Get OHLCV data with flexible date parameters and formatting.
+        
+        This method handles:
+        - Date range calculation (start_date/end_date OR lookback_days)
+        - Data fetching via get_ohlcv_data()
+        - Formatting as dict, markdown, or both
+        - Logging via @log_provider_call decorator
+        
+        Subclasses should NOT override this method. Instead, implement _get_ohlcv_data_impl().
+        
+        Args:
+            symbol: Stock ticker symbol
+            start_date: Start date (use either this OR lookback_days, not both)
+            end_date: End date (defaults to now if not provided)
+            lookback_days: Days to look back from end_date (use either this OR start_date, not both)
+            interval: Data interval (1m, 5m, 15m, 1h, 1d)
+            format_type: Output format ('dict', 'markdown', or 'both')
+        
+        Returns:
+            If format_type='dict': Dictionary with OHLCV data
+            If format_type='markdown': Formatted markdown string
+            If format_type='both': Dict with keys 'text' (markdown) and 'data' (dict)
+        """
+        from ba2_trade_platform.core.provider_utils import calculate_date_range, validate_date_range
+        from datetime import timezone
+        
+        # Calculate actual_start_date based on parameters
+        if lookback_days:
+            if start_date:
+                raise ValueError("Provide either start_date OR lookback_days, not both")
+            if not end_date:
+                end_date = datetime.now(timezone.utc)
+            actual_start_date, end_date = calculate_date_range(end_date, lookback_days)
+        else:
+            if not start_date:
+                raise ValueError("Must provide either start_date or lookback_days")
+            if not end_date:
+                end_date = datetime.now(timezone.utc)
+            actual_start_date, end_date = validate_date_range(start_date, end_date)
+        
+        # Get data as DataFrame using caching-enabled method
+        df = self.get_ohlcv_data(
+            symbol=symbol,
+            start_date=actual_start_date,
+            end_date=end_date,
+            interval=interval
+        )
+        
+        # Convert to data points list
+        data_points = []
+        for _, row in df.iterrows():
+            data_points.append({
+                "date": row["Date"].isoformat(),
+                "open": round(float(row["Open"]), 2),
+                "high": round(float(row["High"]), 2),
+                "low": round(float(row["Low"]), 2),
+                "close": round(float(row["Close"]), 2),
+                "volume": int(row["Volume"])
+            })
+        
+        # Build response
+        response = {
+            "symbol": symbol.upper(),
+            "interval": interval,
+            "start_date": actual_start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "data": data_points
+        }
+        
+        if format_type == "dict":
+            return response
+        elif format_type == "both":
+            return {
+                "text": self._format_ohlcv_as_markdown(response),
+                "data": response
+            }
+        else:  # markdown
+            return self._format_ohlcv_as_markdown(response)

@@ -695,7 +695,7 @@ class TradingAgentsUI:
                 
                 # Fetch price data
                 try:
-                    price_data = provider.get_dataframe(
+                    price_data = provider.get_ohlcv_data(
                         symbol=self.market_analysis.symbol,
                         start_date=start_date,
                         end_date=end_date,

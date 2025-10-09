@@ -30,7 +30,9 @@ class TradeManager:
     
     def __init__(self):
         """Initialize the trade manager."""
-        self.logger = logger.getChild("TradeManager")
+        # Use the parent logger directly instead of getChild to avoid double logging
+        # The parent logger already has all necessary handlers configured
+        self.logger = logger
         # Lock dictionary for preventing concurrent processing of recommendations
         # Key format: "expert_{expert_id}_usecase_{use_case}"
         self._processing_locks: Dict[str, threading.Lock] = {}
@@ -165,6 +167,18 @@ class TradeManager:
                     
                     self.logger.debug(f"Checking dependent order {dependent_order.id}: parent order {parent_order_id} status is {current_status}, trigger status is {trigger_status}")
                     
+                    # Check if parent order is in a terminal status
+                    terminal_statuses = OrderStatus.get_terminal_statuses()
+                    if current_status in terminal_statuses:
+                        # If parent is in terminal state, sync the dependent order to the same terminal status
+                        self.logger.warning(
+                            f"Parent order {parent_order_id} is in terminal status {current_status}. "
+                            f"Syncing dependent order {dependent_order.id} from WAITING_TRIGGER to {current_status}"
+                        )
+                        dependent_order.status = current_status
+                        session.add(dependent_order)
+                        continue
+                    
                     # Check if parent order has reached the trigger status
                     # We don't check pre_status because the order might have already been in this status,
                     # or it might have transitioned through multiple states in a single refresh
@@ -264,6 +278,18 @@ class TradeManager:
                         current_status = parent_order.status
                         
                         self.logger.debug(f"Checking order {dependent_order.id}: parent {parent_order_id} status is {current_status}, trigger is {trigger_status}")
+                        
+                        # Check if parent order is in a terminal status
+                        terminal_statuses = OrderStatus.get_terminal_statuses()
+                        if current_status in terminal_statuses:
+                            # If parent is in terminal state, sync the dependent order to the same terminal status
+                            self.logger.warning(
+                                f"Parent order {parent_order_id} is in terminal status {current_status}. "
+                                f"Syncing dependent order {dependent_order.id} from WAITING_TRIGGER to {current_status}"
+                            )
+                            dependent_order.status = current_status
+                            session.add(dependent_order)
+                            continue
                         
                         # Check if parent order has reached the trigger status
                         if current_status == trigger_status:

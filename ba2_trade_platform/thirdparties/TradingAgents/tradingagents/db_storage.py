@@ -6,7 +6,7 @@ from typing import Optional, Dict, Any, Union, TYPE_CHECKING
 if TYPE_CHECKING:
     from ba2_trade_platform.core.types import MarketAnalysisStatus
 from datetime import datetime, timezone
-from . import logger as ta_logger
+from . import logger
 
 
 
@@ -41,7 +41,7 @@ def update_market_analysis_status(analysis_id: int, status: Union[str, 'MarketAn
                             analysis.status = enum_status
                             break
                     else:
-                        ta_logger.warning(f"Unknown status '{status}', using as-is")
+                        logger.warning(f"Unknown status '{status}', using as-is")
                         analysis.status = status
             else:
                 analysis.status = status
@@ -72,9 +72,9 @@ def update_market_analysis_status(analysis_id: int, status: Union[str, 'MarketAn
                 attributes.flag_modified(analysis, "state")
                 
             update_instance(analysis)
-            ta_logger.debug(f"Updated MarketAnalysis {analysis_id} status to {status}")
+            logger.debug(f"Updated MarketAnalysis {analysis_id} status to {status}")
     except Exception as e:
-        ta_logger.error(f"Error updating MarketAnalysis {analysis_id}: {e}", exc_info=True)
+        logger.error(f"Error updating MarketAnalysis {analysis_id}: {e}", exc_info=True)
 
 
 def get_market_analysis_status(analysis_id: int) -> Optional[str]:
@@ -97,7 +97,7 @@ def get_market_analysis_status(analysis_id: int) -> Optional[str]:
             return analysis.status.value if hasattr(analysis.status, 'value') else str(analysis.status)
         return None
     except Exception as e:
-        ta_logger.error(f"Error getting MarketAnalysis {analysis_id} status: {e}", exc_info=True)
+        logger.error(f"Error getting MarketAnalysis {analysis_id} status: {e}", exc_info=True)
         return None
 
 
@@ -129,7 +129,7 @@ def store_analysis_output(market_analysis_id: int, name: str, output_type: str, 
         
         return add_instance(output)
     except Exception as e:
-        ta_logger.error(f"Error storing AnalysisOutput: {e}", exc_info=True)
+        logger.error(f"Error storing AnalysisOutput: {e}", exc_info=True)
         return None
 
 
@@ -211,7 +211,7 @@ def create_logging_agent_wrapper(original_agent_func, agent_name: str, market_an
                     agent_type=agent_name,
                     report_content=result[report_key]
                 )
-                ta_logger.info(f"[AGENT_REPORT] Stored {agent_name} report to database")
+                logger.info(f"[AGENT_REPORT] Stored {agent_name} report to database")
         
         return result
     
@@ -237,7 +237,7 @@ def get_market_analysis_outputs(analysis_id: int):
             statement = select(AnalysisOutput).where(AnalysisOutput.market_analysis_id == analysis_id)
             return session.exec(statement).all()
     except Exception as e:
-        ta_logger.error(f"Error retrieving outputs for MarketAnalysis {analysis_id}: {e}", exc_info=True)
+        logger.error(f"Error retrieving outputs for MarketAnalysis {analysis_id}: {e}", exc_info=True)
         return []
 
 
@@ -271,7 +271,7 @@ class LoggingToolNode:
         def wrapped_func(**kwargs):
             """Wrapper that stores JSON and returns text for agent."""
             # Log tool call
-            ta_logger.info(f"[TOOL_CALL] Executing {tool_name} with args: {kwargs}")
+            logger.info(f"[TOOL_CALL] Executing {tool_name} with args: {kwargs}")
             
             if market_analysis_id:
                 store_analysis_output(
@@ -292,7 +292,7 @@ class LoggingToolNode:
                 
                 # Handle error
                 if is_error:
-                    ta_logger.error(f"[TOOL_ERROR] {tool_name} returned critical error")
+                    logger.error(f"[TOOL_ERROR] {tool_name} returned critical error")
                     if market_analysis_id:
                         update_market_analysis_status(
                             market_analysis_id,
@@ -300,7 +300,7 @@ class LoggingToolNode:
                             {"error": text_for_agent, "failed_tool": tool_name, "timestamp": datetime.now(timezone.utc).isoformat()}
                         )
                 else:
-                    ta_logger.info(f"[TOOL_RESULT] {tool_name} returned: {text_for_agent[:200]}...")
+                    logger.info(f"[TOOL_RESULT] {tool_name} returned: {text_for_agent[:500]}...")
                 
                 # Store outputs
                 if market_analysis_id:
@@ -321,13 +321,13 @@ class LoggingToolNode:
                             output_type="tool_call_output_json",
                             text=json.dumps(json_for_storage, indent=2)
                         )
-                        ta_logger.info(f"[JSON_STORED] Saved JSON parameters for {tool_name}")
+                        logger.info(f"[JSON_STORED] Saved JSON parameters for {tool_name}")
                 
                 # Return only text for agent
                 return text_for_agent
             else:
                 # Simple text result
-                ta_logger.info(f"[TOOL_RESULT] {tool_name} returned: {str(result)[:200]}...")
+                logger.info(f"[TOOL_RESULT] {tool_name} returned: {str(result)[:500]}...")
                 if market_analysis_id:
                     store_analysis_output(
                         market_analysis_id=market_analysis_id,
@@ -373,7 +373,7 @@ class DatabaseStorageMixin:
             )
         else:
             # Log to console if no market analysis available
-            ta_logger.info(f"[{agent_type}] Tool call: {tool_name}({inputs}) -> {output}")
+            logger.info(f"[{agent_type}] Tool call: {tool_name}({inputs}) -> {output}")
     
     def log_agent_report(self, agent_type: str, report_content: str):
         """Log an agent report to the database"""
@@ -385,7 +385,7 @@ class DatabaseStorageMixin:
             )
         else:
             # Log to console if no market analysis available
-            ta_logger.info(f"[{agent_type}] Report: {report_content}")
+            logger.info(f"[{agent_type}] Report: {report_content}")
     
     def store_analysis_output(self, market_analysis_id: int, name: str, output_type: str, text: str = None, blob: bytes = None):
         """
@@ -409,7 +409,7 @@ class DatabaseStorageMixin:
             update_market_analysis_status(self.market_analysis_id, status, state)
         else:
             # Log to console if no market analysis available
-            ta_logger.info(f"Analysis status: {status}" + (f" - {state}" if state else ""))
+            logger.info(f"Analysis status: {status}" + (f" - {state}" if state else ""))
     
     def finalize_analysis(self, final_status: Union[str, 'MarketAnalysisStatus'] = None):
         """Mark the analysis as completed"""
@@ -420,4 +420,4 @@ class DatabaseStorageMixin:
         if self.market_analysis_id:
             self.update_analysis_status(final_status)
         else:
-            ta_logger.info(f"Analysis completed with status: {final_status}")
+            logger.info(f"Analysis completed with status: {final_status}")

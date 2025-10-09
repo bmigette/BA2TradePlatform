@@ -79,7 +79,7 @@ class FMPNewsProvider(MarketNewsInterface):
         start_date: Optional[datetime] = None,
         lookback_days: Optional[int] = None,
         limit: int = 50,
-        format_type: Literal["dict", "markdown"] = "markdown"
+        format_type: Literal["dict", "markdown", "both"] = "markdown"
     ) -> Dict[str, Any] | str:
         """
         Get news articles for a specific company.
@@ -90,10 +90,12 @@ class FMPNewsProvider(MarketNewsInterface):
             start_date: Start date (use either this OR lookback_days, not both)
             lookback_days: Days to look back from end_date (use either this OR start_date, not both)
             limit: Maximum number of articles to return
-            format_type: Output format ('dict' or 'markdown')
+            format_type: Output format ('dict', 'markdown', or 'both')
         
         Returns:
-            News data in requested format
+            If format_type='dict': Dictionary with news data
+            If format_type='markdown': Formatted markdown string
+            If format_type='both': Dict with keys 'text' (markdown) and 'data' (dict)
         
         Raises:
             ValueError: If both start_date and lookback_days are provided, or if neither is provided
@@ -141,40 +143,49 @@ class FMPNewsProvider(MarketNewsInterface):
                         if len(filtered_articles) >= limit:
                             break
             
+            # Build dict response
+            dict_response = {
+                "symbol": symbol,
+                "start_date": actual_start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "article_count": len(filtered_articles),
+                "articles": [
+                    {
+                        "title": article.get("title", ""),
+                        "summary": article.get("text", ""),
+                        "source": article.get("site", ""),
+                        "published_at": article.get("publishedDate", ""),
+                        "url": article.get("url", ""),
+                        "image_url": article.get("image", ""),
+                        "symbol": article.get("symbol", symbol)
+                    }
+                    for article in filtered_articles
+                ]
+            }
+            
+            # Build markdown response
+            markdown = f"# News for {symbol}\n\n"
+            markdown += f"**Period:** {actual_start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}\n"
+            markdown += f"**Articles:** {len(filtered_articles)}\n\n"
+            
+            for i, article in enumerate(filtered_articles, 1):
+                markdown += f"## {i}. {article.get('title', 'No Title')}\n\n"
+                markdown += f"**Source:** {article.get('site', 'Unknown')} | "
+                markdown += f"**Published:** {article.get('publishedDate', 'Unknown')}\n\n"
+                markdown += f"{article.get('text', 'No summary available.')}\n\n"
+                if article.get('url'):
+                    markdown += f"[Read more]({article['url']})\n\n"
+                markdown += "---\n\n"
+            
+            # Return based on format_type
             if format_type == "dict":
+                return dict_response
+            elif format_type == "both":
                 return {
-                    "symbol": symbol,
-                    "start_date": actual_start_date.isoformat(),
-                    "end_date": end_date.isoformat(),
-                    "article_count": len(filtered_articles),
-                    "articles": [
-                        {
-                            "title": article.get("title", ""),
-                            "summary": article.get("text", ""),
-                            "source": article.get("site", ""),
-                            "published_at": article.get("publishedDate", ""),
-                            "url": article.get("url", ""),
-                            "image_url": article.get("image", ""),
-                            "symbol": article.get("symbol", symbol)
-                        }
-                        for article in filtered_articles
-                    ]
+                    "text": markdown,
+                    "data": dict_response
                 }
-            else:
-                # Markdown format
-                markdown = f"# News for {symbol}\n\n"
-                markdown += f"**Period:** {actual_start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}\n"
-                markdown += f"**Articles:** {len(filtered_articles)}\n\n"
-                
-                for i, article in enumerate(filtered_articles, 1):
-                    markdown += f"## {i}. {article.get('title', 'No Title')}\n\n"
-                    markdown += f"**Source:** {article.get('site', 'Unknown')} | "
-                    markdown += f"**Published:** {article.get('publishedDate', 'Unknown')}\n\n"
-                    markdown += f"{article.get('text', 'No summary available.')}\n\n"
-                    if article.get('url'):
-                        markdown += f"[Read more]({article['url']})\n\n"
-                    markdown += "---\n\n"
-                
+            else:  # markdown
                 return markdown
                 
         except Exception as e:
@@ -188,7 +199,7 @@ class FMPNewsProvider(MarketNewsInterface):
         start_date: Optional[datetime] = None,
         lookback_days: Optional[int] = None,
         limit: int = 50,
-        format_type: Literal["dict", "markdown"] = "markdown"
+        format_type: Literal["dict", "markdown", "both"] = "markdown"
     ) -> Dict[str, Any] | str:
         """
         Get global/market news (not specific to any company).
@@ -198,10 +209,12 @@ class FMPNewsProvider(MarketNewsInterface):
             start_date: Start date (use either this OR lookback_days, not both)
             lookback_days: Days to look back from end_date (use either this OR start_date, not both)
             limit: Maximum number of articles to return
-            format_type: Output format ('dict' or 'markdown')
+            format_type: Output format ('dict', 'markdown', or 'both')
         
         Returns:
-            News data in requested format
+            If format_type='dict': Dictionary with news data
+            If format_type='markdown': Formatted markdown string
+            If format_type='both': Dict with keys 'text' (markdown) and 'data' (dict)
         
         Raises:
             ValueError: If both start_date and lookback_days are provided, or if neither is provided
@@ -247,38 +260,47 @@ class FMPNewsProvider(MarketNewsInterface):
                         if len(filtered_articles) >= limit:
                             break
             
+            # Build dict response
+            dict_response = {
+                "start_date": actual_start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "article_count": len(filtered_articles),
+                "articles": [
+                    {
+                        "title": article.get("title", ""),
+                        "summary": article.get("text", ""),
+                        "source": article.get("site", ""),
+                        "published_at": article.get("publishedDate", ""),
+                        "url": article.get("url", ""),
+                        "image_url": article.get("image", "")
+                    }
+                    for article in filtered_articles
+                ]
+            }
+            
+            # Build markdown response
+            markdown = f"# General Market News\n\n"
+            markdown += f"**Period:** {actual_start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}\n"
+            markdown += f"**Articles:** {len(filtered_articles)}\n\n"
+            
+            for i, article in enumerate(filtered_articles, 1):
+                markdown += f"## {i}. {article.get('title', 'No Title')}\n\n"
+                markdown += f"**Source:** {article.get('site', 'Unknown')} | "
+                markdown += f"**Published:** {article.get('publishedDate', 'Unknown')}\n\n"
+                markdown += f"{article.get('text', 'No summary available.')}\n\n"
+                if article.get('url'):
+                    markdown += f"[Read more]({article['url']})\n\n"
+                markdown += "---\n\n"
+            
+            # Return based on format_type
             if format_type == "dict":
+                return dict_response
+            elif format_type == "both":
                 return {
-                    "start_date": actual_start_date.isoformat(),
-                    "end_date": end_date.isoformat(),
-                    "article_count": len(filtered_articles),
-                    "articles": [
-                        {
-                            "title": article.get("title", ""),
-                            "summary": article.get("text", ""),
-                            "source": article.get("site", ""),
-                            "published_at": article.get("publishedDate", ""),
-                            "url": article.get("url", ""),
-                            "image_url": article.get("image", "")
-                        }
-                        for article in filtered_articles
-                    ]
+                    "text": markdown,
+                    "data": dict_response
                 }
-            else:
-                # Markdown format
-                markdown = f"# General Market News\n\n"
-                markdown += f"**Period:** {actual_start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}\n"
-                markdown += f"**Articles:** {len(filtered_articles)}\n\n"
-                
-                for i, article in enumerate(filtered_articles, 1):
-                    markdown += f"## {i}. {article.get('title', 'No Title')}\n\n"
-                    markdown += f"**Source:** {article.get('site', 'Unknown')} | "
-                    markdown += f"**Published:** {article.get('publishedDate', 'Unknown')}\n\n"
-                    markdown += f"{article.get('text', 'No summary available.')}\n\n"
-                    if article.get('url'):
-                        markdown += f"[Read more]({article['url']})\n\n"
-                    markdown += "---\n\n"
-                
+            else:  # markdown
                 return markdown
                 
         except Exception as e:

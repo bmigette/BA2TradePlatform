@@ -19,7 +19,6 @@ def initialize_system():
     
     # Initialize database
     init_db()
-    
     # Force sync all transactions based on current order states
     # This ensures transaction states are correct after restart
     logger.info("Force syncing all transactions based on order states...")

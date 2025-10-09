@@ -7,7 +7,7 @@ from langgraph.prebuilt import ToolNode
 
 from ..agents import *
 from ..agents.utils.agent_states import AgentState
-from ..agents.utils.agent_utils import Toolkit
+from ..agents.utils.agent_utils_new import Toolkit
 
 from .conditional_logic import ConditionalLogic
 

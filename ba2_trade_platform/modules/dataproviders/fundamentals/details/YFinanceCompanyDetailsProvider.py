@@ -55,7 +55,7 @@ class YFinanceCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
         self,
         symbol: str,
         frequency: Literal["quarterly", "annual"] = "quarterly",
-        format_type: Literal["dict", "markdown"] = "markdown"
+        format_type: Literal["dict", "markdown", "both"] = "markdown"
     ) -> Dict[str, Any] | str:
         """
         Get balance sheet data for a company.
@@ -63,7 +63,7 @@ class YFinanceCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
         Args:
             symbol: Stock ticker symbol
             frequency: Data frequency ('quarterly' or 'annual')
-            format_type: Output format ('dict' or 'markdown')
+            format_type: Output format ('dict', 'markdown', or 'both')
         
         Returns:
             Balance sheet data in requested format
@@ -111,7 +111,12 @@ class YFinanceCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             # Format output
             if format_type == "dict":
                 return result
-            else:
+            elif format_type == "both":
+                return {
+                    "text": self._format_balance_sheet_markdown(result),
+                    "data": result
+                }
+            else:  # markdown
                 return self._format_balance_sheet_markdown(result)
                 
         except Exception as e:
@@ -125,7 +130,7 @@ class YFinanceCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
         self,
         symbol: str,
         frequency: Literal["quarterly", "annual"] = "quarterly",
-        format_type: Literal["dict", "markdown"] = "markdown"
+        format_type: Literal["dict", "markdown", "both"] = "markdown"
     ) -> Dict[str, Any] | str:
         """
         Get income statement data for a company.
@@ -133,7 +138,7 @@ class YFinanceCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
         Args:
             symbol: Stock ticker symbol
             frequency: Data frequency ('quarterly' or 'annual')
-            format_type: Output format ('dict' or 'markdown')
+            format_type: Output format ('dict', 'markdown', or 'both')
         
         Returns:
             Income statement data in requested format
@@ -181,7 +186,12 @@ class YFinanceCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             # Format output
             if format_type == "dict":
                 return result
-            else:
+            elif format_type == "both":
+                return {
+                    "text": self._format_income_statement_markdown(result),
+                    "data": result
+                }
+            else:  # markdown
                 return self._format_income_statement_markdown(result)
                 
         except Exception as e:
@@ -195,7 +205,7 @@ class YFinanceCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
         self,
         symbol: str,
         frequency: Literal["quarterly", "annual"] = "quarterly",
-        format_type: Literal["dict", "markdown"] = "markdown"
+        format_type: Literal["dict", "markdown", "both"] = "markdown"
     ) -> Dict[str, Any] | str:
         """
         Get cash flow statement data for a company.
@@ -203,7 +213,7 @@ class YFinanceCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
         Args:
             symbol: Stock ticker symbol
             frequency: Data frequency ('quarterly' or 'annual')
-            format_type: Output format ('dict' or 'markdown')
+            format_type: Output format ('dict', 'markdown', or 'both')
         
         Returns:
             Cash flow statement data in requested format
@@ -251,7 +261,12 @@ class YFinanceCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             # Format output
             if format_type == "dict":
                 return result
-            else:
+            elif format_type == "both":
+                return {
+                    "text": self._format_cashflow_markdown(result),
+                    "data": result
+                }
+            else:  # markdown
                 return self._format_cashflow_markdown(result)
                 
         except Exception as e:

@@ -35,7 +35,9 @@ class TradeRiskManagement:
     
     def __init__(self):
         """Initialize the risk management system."""
-        self.logger = logger.getChild("TradeRiskManagement")
+        # Use the parent logger directly instead of getChild to avoid double logging
+        # The parent logger already has all necessary handlers configured
+        self.logger = logger
     
     def review_and_prioritize_pending_orders(self, expert_instance_id: int) -> List[TradingOrder]:
         """

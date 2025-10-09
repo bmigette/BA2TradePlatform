@@ -784,7 +784,7 @@ class OverviewTab:
             
             counts = {'BUY': buy_count, 'SELL': sell_count, 'HOLD': hold_count}
         except Exception as e:
-            print(f"Error getting recommendation counts: {e}")
+            logger.error(f"Error getting recommendation counts: {e}", exc_info=True)
         
         return counts
     

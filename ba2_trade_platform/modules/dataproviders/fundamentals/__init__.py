@@ -8,16 +8,19 @@ Contains providers for company fundamentals data, organized by detail level:
 Available Providers:
 - AlphaVantageCompanyOverviewProvider: Company overview from Alpha Vantage
 - OpenAICompanyOverviewProvider: Company overview from OpenAI
+- FMPCompanyOverviewProvider: Company overview from Financial Modeling Prep
 - AlphaVantageCompanyDetailsProvider: Financial statements from Alpha Vantage
 - YFinanceCompanyDetailsProvider: Financial statements from Yahoo Finance
+- FMPCompanyDetailsProvider: Financial statements from Financial Modeling Prep
 """
 
-from .overview import AlphaVantageCompanyOverviewProvider, OpenAICompanyOverviewProvider
+from .overview import AlphaVantageCompanyOverviewProvider, OpenAICompanyOverviewProvider, FMPCompanyOverviewProvider
 from .details import AlphaVantageCompanyDetailsProvider, YFinanceCompanyDetailsProvider, FMPCompanyDetailsProvider
 
 __all__ = [
     "AlphaVantageCompanyOverviewProvider",
     "OpenAICompanyOverviewProvider",
+    "FMPCompanyOverviewProvider",
     "AlphaVantageCompanyDetailsProvider",
     "YFinanceCompanyDetailsProvider",
     "FMPCompanyDetailsProvider",

@@ -125,9 +125,9 @@ class TradingAgents(MarketExpertInterface):
             "vendor_stock_data": {
                 "type": "list", "required": True, "default": ["yfinance"],
                 "description": "Data vendor(s) for OHLCV stock price data",
-                "valid_values": ["yfinance", "alpaca", "alpha_vantage"],
+                "valid_values": ["yfinance", "alpaca", "alpha_vantage", "fmp"],
                 "multiple": True,
-                "tooltip": "Select one or more data providers for historical stock prices (Open, High, Low, Close, Volume). Multiple vendors enable automatic fallback. Order matters: first vendor is tried first. YFinance is free and reliable. Alpaca provides real-time and historical data. Alpha Vantage requires API key."
+                "tooltip": "Select one or more data providers for historical stock prices (Open, High, Low, Close, Volume). Multiple vendors enable automatic fallback. Order matters: first vendor is tried first. YFinance is free and reliable. Alpaca provides real-time and historical data. Alpha Vantage requires API key. FMP provides daily and intraday data (1min to 4hour intervals)."
             },
             "vendor_indicators": {
                 "type": "list", "required": True, "default": ["pandas"],
@@ -137,11 +137,11 @@ class TradingAgents(MarketExpertInterface):
                 "tooltip": "Select one or more data providers for technical indicators (RSI, MACD, Bollinger Bands, etc.). Multiple vendors enable automatic fallback. Pandas calculates indicators locally using configured OHLCV provider. Alpha Vantage provides pre-calculated indicators."
             },
             "vendor_fundamentals": {
-                "type": "list", "required": True, "default": ["openai"],
-                "description": "Data vendor(s) for fundamental analysis",
-                "valid_values": ["openai", "alpha_vantage"],
+                "type": "list", "required": True, "default": ["alpha_vantage"],
+                "description": "Data vendor(s) for company fundamentals overview",
+                "valid_values": ["alpha_vantage", "openai", "fmp"],
                 "multiple": True,
-                "tooltip": "Select one or more data providers for fundamental analysis (P/E ratio, earnings, cash flow, etc.). Multiple vendors enable automatic fallback. OpenAI searches web for latest data. Alpha Vantage provides structured financial statements."
+                "tooltip": "Select one or more data providers for company overview and key metrics (market cap, P/E ratio, beta, industry, sector, etc.). Multiple vendors enable automatic fallback. Alpha Vantage provides comprehensive company overviews. OpenAI searches for latest company information. FMP provides detailed company profiles including valuation metrics and company information."
             },
             "vendor_fundamentals_details": {
                 "type": "list", "required": True, "default": ["yfinance"],
@@ -268,6 +268,7 @@ class TradingAgents(MarketExpertInterface):
         from ...modules.dataproviders import (
             OHLCV_PROVIDERS,
             INDICATORS_PROVIDERS,
+            FUNDAMENTALS_OVERVIEW_PROVIDERS,
             FUNDAMENTALS_DETAILS_PROVIDERS,
             NEWS_PROVIDERS,
             MACRO_PROVIDERS,
@@ -335,6 +336,17 @@ class TradingAgents(MarketExpertInterface):
                 provider_map['fundamentals_details'].append(FUNDAMENTALS_DETAILS_PROVIDERS[vendor])
             else:
                 logger.warning(f"Fundamentals details provider '{vendor}' not found in FUNDAMENTALS_DETAILS_PROVIDERS registry")
+        
+        # Fundamentals overview providers (aggregated) - for company overview, key metrics
+        # Use vendor_fundamentals setting (merged with old vendor_fundamentals_overview)
+        overview_vendors = _get_vendor_list('vendor_fundamentals')
+        
+        provider_map['fundamentals_overview'] = []
+        for vendor in overview_vendors:
+            if vendor in FUNDAMENTALS_OVERVIEW_PROVIDERS:
+                provider_map['fundamentals_overview'].append(FUNDAMENTALS_OVERVIEW_PROVIDERS[vendor])
+            else:
+                logger.warning(f"Fundamentals overview provider '{vendor}' not found in FUNDAMENTALS_OVERVIEW_PROVIDERS registry")
         
         # OHLCV providers (fallback) - tries first, then second, etc.
         ohlcv_vendors = _get_vendor_list('vendor_stock_data')

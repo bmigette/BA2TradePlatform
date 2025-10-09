@@ -21,7 +21,7 @@ from ..agents.utils.agent_states import (
     InvestDebateState,
     RiskDebateState,
 )
-from ..dataflows.interface import set_config
+from ..dataflows.config import set_config  # Use config module instead of deprecated interface
 
 from .conditional_logic import ConditionalLogic
 from .setup import GraphSetup
@@ -31,7 +31,7 @@ from .signal_processing import SignalProcessor
 
 # Import our new modules
 from ..db_storage import DatabaseStorageMixin, update_market_analysis_status
-from .. import logger as ta_logger
+from .. import logger  # Import the TradingAgents logger module with per-expert file logging
 
 
 class TradingAgentsGraph(DatabaseStorageMixin):
@@ -80,10 +80,11 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                 if market_analysis and hasattr(market_analysis, 'expert_instance_id'):
                     expert_instance_id_for_logging = market_analysis.expert_instance_id
             except Exception as e:
-                ta_logger.warning(f"Could not get expert_instance_id from market_analysis: {e}")
+                logger.warning(f"Could not get expert_instance_id from market_analysis: {e}")
         
-        ta_logger.init_logger(expert_instance_id_for_logging, ba2_config.LOG_FOLDER)
-        ta_logger.info(f"Initializing TradingAgentsGraph with market_analysis_id={market_analysis_id}, expert_instance_id={expert_instance_id_for_logging}")
+        # Initialize TradingAgents logger
+        logger.init_logger(expert_instance_id_for_logging, ba2_config.LOG_FOLDER)
+        logger.info(f"Initializing TradingAgentsGraph with market_analysis_id={market_analysis_id}, expert_instance_id={expert_instance_id_for_logging}")
 
         # Update the interface's config
         set_config(self.config)
@@ -149,7 +150,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         self.ticker = None
         self.log_states_dict = {}  # date to full state dict
 
-        ta_logger.info("TradingAgentsGraph initialization completed")
+        logger.info("TradingAgentsGraph initialization completed")
 
     def _sync_state_to_market_analysis(self, graph_state: Dict[str, Any], step_name: str = None):
         """Synchronize current graph state to MarketAnalysis database record.
@@ -228,10 +229,10 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                 state=cleaned_state_snapshot
             )
             
-            ta_logger.debug(f"Synced graph state to MarketAnalysis {self.market_analysis_id} at step: {step_name}")
+            logger.debug(f"Synced graph state to MarketAnalysis {self.market_analysis_id} at step: {step_name}")
             
         except Exception as e:
-            ta_logger.error(f"Failed to sync state to MarketAnalysis {self.market_analysis_id}: {e}", exc_info=True)
+            logger.error(f"Failed to sync state to MarketAnalysis {self.market_analysis_id}: {e}", exc_info=True)
 
     def _clean_message_list(self, messages: list) -> list:
         """Clean a list of messages to make them JSON serializable.
@@ -482,7 +483,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         # Now create the graph with properly initialized memories
         self.graph = self.graph_setup.setup_graph(self.selected_analysts)
         
-        ta_logger.debug(f"Initialized memory collections and graph for symbol: {symbol}, market_analysis_id: {self.market_analysis_id}")
+        logger.debug(f"Initialized memory collections and graph for symbol: {symbol}, market_analysis_id: {self.market_analysis_id}")
 
     def propagate(self, company_name, trade_date):
         """Run the trading agents graph for a company on a specific date."""
@@ -494,12 +495,12 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             self._initialize_memories_and_graph(company_name)
         
         if self.market_analysis_id:
-            ta_logger.info(f"Starting analysis for {company_name} on {trade_date}")
-            ta_logger.info(f"Using existing MarketAnalysis record with ID: {self.market_analysis_id}")
+            logger.info(f"Starting analysis for {company_name} on {trade_date}")
+            logger.info(f"Using existing MarketAnalysis record with ID: {self.market_analysis_id}")
         else:
             # Running without database - use terminal output
-            ta_logger.info(f"Starting standalone analysis for {company_name} on {trade_date}")
-            ta_logger.info("No market analysis ID provided - results will be shown in terminal only")
+            logger.info(f"Starting standalone analysis for {company_name} on {trade_date}")
+            logger.info("No market analysis ID provided - results will be shown in terminal only")
 
         # Initialize state
         init_agent_state = self.propagator.create_initial_state(
@@ -523,7 +524,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                         from ..db_storage import get_market_analysis_status
                         current_status = get_market_analysis_status(self.market_analysis_id)
                         if current_status == "FAILED":
-                            ta_logger.error(f"Analysis {self.market_analysis_id} marked as FAILED, stopping graph execution")
+                            logger.error(f"Analysis {self.market_analysis_id} marked as FAILED, stopping graph execution")
                             raise Exception("Analysis failed due to critical tool error - stopping graph execution")
                     
                     if len(chunk["messages"]) == 0:
@@ -562,15 +563,15 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             # Update analysis status to completed
             if self.market_analysis_id:
                 self.update_analysis_status("completed", {"final_state": "success"})
-                ta_logger.info(f"Analysis for {company_name} completed successfully")
+                logger.info(f"Analysis for {company_name} completed successfully")
             else:
-                ta_logger.info(f"Standalone analysis for {company_name} completed successfully")
+                logger.info(f"Standalone analysis for {company_name} completed successfully")
 
             # Return decision and processed signal
             return final_state, self.process_signal(final_state["final_trade_decision"])
             
         except Exception as e:
-            ta_logger.error(f"Error during analysis for {company_name}: {str(e)}", exc_info=True)
+            logger.error(f"Error during analysis for {company_name}: {str(e)}", exc_info=True)
             if self.market_analysis_id:
                 # Sync error state to MarketAnalysis
                 error_state = {
@@ -590,12 +591,12 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             recommendation = final_state.get("expert_recommendation")
             
             if not recommendation:
-                ta_logger.warning(f"No expert_recommendation found in final_state for {symbol}")
+                logger.warning(f"No expert_recommendation found in final_state for {symbol}")
                 return
                 
             # Log the complete JSON recommendation for debugging and audit trail
             import json
-            ta_logger.info(f"Graph-Generated Recommendation JSON for {symbol}: {json.dumps(recommendation, indent=2)}")
+            logger.info(f"Graph-Generated Recommendation JSON for {symbol}: {json.dumps(recommendation, indent=2)}")
             
             # Store recommendation in database
             # Note: ExpertRecommendation creation is handled by the higher-level TradingAgents.py
@@ -612,12 +613,12 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                     if market_analysis and hasattr(market_analysis, 'expert_instance_id'):
                         expert_instance_id = market_analysis.expert_instance_id
                 except Exception as e:
-                    ta_logger.warning(f"Could not get expert_instance_id from market_analysis: {e}")
+                    logger.warning(f"Could not get expert_instance_id from market_analysis: {e}")
             
             if expert_instance_id:
-                ta_logger.info(f"Expert recommendation data will be processed by TradingAgents.py for expert_instance_id: {expert_instance_id}")
+                logger.info(f"Expert recommendation data will be processed by TradingAgents.py for expert_instance_id: {expert_instance_id}")
             else:
-                ta_logger.warning("No expert_instance_id available, ExpertRecommendation creation will be handled by TradingAgents.py")
+                logger.warning("No expert_instance_id available, ExpertRecommendation creation will be handled by TradingAgents.py")
                 
             # Also store as analysis output
             if self.market_analysis_id:
@@ -629,7 +630,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                 )
                 
         except Exception as e:
-            ta_logger.error(f"Error storing expert recommendation from graph: {str(e)}", exc_info=True)
+            logger.error(f"Error storing expert recommendation from graph: {str(e)}", exc_info=True)
 
     def _print_terminal_summary_from_graph(self, final_state: Dict[str, Any], symbol: str):
         """Print formatted summary using recommendation generated by the Final Summarization agent"""
@@ -640,75 +641,75 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             if recommendation:
                 # Log the complete JSON recommendation for debugging and audit trail
                 import json
-                ta_logger.info(f"Graph-Generated Recommendation JSON for {symbol}: {json.dumps(recommendation, indent=2)}")
+                logger.info(f"Graph-Generated Recommendation JSON for {symbol}: {json.dumps(recommendation, indent=2)}")
                 
                 # Print formatted summary to terminal
-                ta_logger.info("="*70)
-                ta_logger.info(f"TRADING ANALYSIS SUMMARY FOR {symbol}")
-                ta_logger.info("="*70)
-                ta_logger.info(f"Recommended Action: {recommendation['recommended_action']}")
-                ta_logger.info(f"Expected Profit: {recommendation['expected_profit_percent']:.2f}%")
-                ta_logger.info(f"Price at Analysis: ${recommendation['price_at_date']:.2f}")
-                ta_logger.info(f"Confidence Level: {recommendation['confidence']:.1f}%")
-                ta_logger.info(f"Risk Level: {recommendation.get('risk_level', 'UNKNOWN')}")
-                ta_logger.info(f"Time Horizon: {recommendation.get('time_horizon', 'UNKNOWN')}")
+                logger.info("="*70)
+                logger.info(f"TRADING ANALYSIS SUMMARY FOR {symbol}")
+                logger.info("="*70)
+                logger.info(f"Recommended Action: {recommendation['recommended_action']}")
+                logger.info(f"Expected Profit: {recommendation['expected_profit_percent']:.2f}%")
+                logger.info(f"Price at Analysis: ${recommendation['price_at_date']:.2f}")
+                logger.info(f"Confidence Level: {recommendation['confidence']:.1f}%")
+                logger.info(f"Risk Level: {recommendation.get('risk_level', 'UNKNOWN')}")
+                logger.info(f"Time Horizon: {recommendation.get('time_horizon', 'UNKNOWN')}")
                 
                 # Print key factors if available
                 key_factors = recommendation.get('key_factors', [])
                 if key_factors:
-                    ta_logger.info("Key Factors:")
+                    logger.info("Key Factors:")
                     for factor in key_factors:
-                        ta_logger.info(f"   • {factor}")
+                        logger.info(f"   • {factor}")
                 
-                ta_logger.info("Analysis Details:")
-                ta_logger.info(f"   {recommendation['details']}")
-                ta_logger.info("="*70)
+                logger.info("Analysis Details:")
+                logger.info(f"   {recommendation['details']}")
+                logger.info("="*70)
                 
                 # Print analysis summary if available
                 analysis_summary = recommendation.get('analysis_summary', {})
                 if analysis_summary:
-                    ta_logger.info("Analysis Summary:")
-                    ta_logger.info(f"   Market Trend: {analysis_summary.get('market_trend', 'Unknown')}")
-                    ta_logger.info(f"   Fundamental Strength: {analysis_summary.get('fundamental_strength', 'Unknown')}")
-                    ta_logger.info(f"   Sentiment Score: {analysis_summary.get('sentiment_score', 0)}")
-                    ta_logger.info(f"   Macro Environment: {analysis_summary.get('macro_environment', 'Unknown')}")
-                    ta_logger.info(f"   Technical Signals: {analysis_summary.get('technical_signals', 'Unknown')}")
-                    ta_logger.info("="*70)
+                    logger.info("Analysis Summary:")
+                    logger.info(f"   Market Trend: {analysis_summary.get('market_trend', 'Unknown')}")
+                    logger.info(f"   Fundamental Strength: {analysis_summary.get('fundamental_strength', 'Unknown')}")
+                    logger.info(f"   Sentiment Score: {analysis_summary.get('sentiment_score', 0)}")
+                    logger.info(f"   Macro Environment: {analysis_summary.get('macro_environment', 'Unknown')}")
+                    logger.info(f"   Technical Signals: {analysis_summary.get('technical_signals', 'Unknown')}")
+                    logger.info("="*70)
             else:
                 # Fallback to basic summary if no recommendation available  
-                ta_logger.warning(f"No expert_recommendation found in final_state for {symbol}")
+                logger.warning(f"No expert_recommendation found in final_state for {symbol}")
                 self._print_basic_terminal_summary(final_state, symbol)
                 
         except Exception as e:
-            ta_logger.error(f"Error printing terminal summary from graph: {str(e)}", exc_info=True)
+            logger.error(f"Error printing terminal summary from graph: {str(e)}", exc_info=True)
             self._print_basic_terminal_summary(final_state, symbol)
 
     def _print_basic_terminal_summary(self, final_state: Dict[str, Any], symbol: str):
         """Print basic terminal summary as fallback"""
-        ta_logger.info("="*70)
-        ta_logger.info(f"BASIC TRADING ANALYSIS SUMMARY FOR {symbol}")
-        ta_logger.info("="*70)
-        ta_logger.info(f"Final Decision: {final_state.get('final_trade_decision', 'Unknown')}")
-        ta_logger.info(f"Investment Plan: {final_state.get('investment_plan', 'Unknown')}")
+        logger.info("="*70)
+        logger.info(f"BASIC TRADING ANALYSIS SUMMARY FOR {symbol}")
+        logger.info("="*70)
+        logger.info(f"Final Decision: {final_state.get('final_trade_decision', 'Unknown')}")
+        logger.info(f"Investment Plan: {final_state.get('investment_plan', 'Unknown')}")
         
         # Print key reports if available
         if final_state.get("market_report"):
-            ta_logger.info("Market Analysis:")
-            ta_logger.info(f"   {final_state['market_report'][:200]}...")
+            logger.info("Market Analysis:")
+            logger.info(f"   {final_state['market_report'][:200]}...")
         
         if final_state.get("news_report"):
-            ta_logger.info("News Analysis:")
-            ta_logger.info(f"   {final_state['news_report'][:200]}...")
+            logger.info("News Analysis:")
+            logger.info(f"   {final_state['news_report'][:200]}...")
         
         if final_state.get("fundamentals_report"):
-            ta_logger.info("Fundamentals Analysis:")
-            ta_logger.info(f"   {final_state['fundamentals_report'][:200]}...")
+            logger.info("Fundamentals Analysis:")
+            logger.info(f"   {final_state['fundamentals_report'][:200]}...")
             
         if final_state.get("macro_report"):
-            ta_logger.info("Macro Economic Analysis:")
-            ta_logger.info(f"   {final_state['macro_report'][:200]}...")
+            logger.info("Macro Economic Analysis:")
+            logger.info(f"   {final_state['macro_report'][:200]}...")
         
-        ta_logger.info("="*70)
+        logger.info("="*70)
 
     def _log_state(self, trade_date, final_state):
         """Store the final state in database if MarketAnalysis is available, otherwise just log it."""
@@ -761,15 +762,15 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                     output_type="analysis_state",
                     text=json.dumps(state_data, indent=2)
                 )
-                ta_logger.info(f"Stored final state in database for analysis ID: {self.market_analysis_id}")
+                logger.info(f"Stored final state in database for analysis ID: {self.market_analysis_id}")
             except Exception as e:
-                ta_logger.error(f"Error storing final state in database: {str(e)}", exc_info=True)
+                logger.error(f"Error storing final state in database: {str(e)}", exc_info=True)
                 # Fallback to logging only
-                ta_logger.info(f"Final state data: {json.dumps(state_data, indent=2)}")
+                logger.info(f"Final state data: {json.dumps(state_data, indent=2)}")
         else:
             # No MarketAnalysis - just log the state data
             import json
-            ta_logger.info(f"Final state for {trade_date}: {json.dumps(state_data, indent=2)}")
+            logger.info(f"Final state for {trade_date}: {json.dumps(state_data, indent=2)}")
             
         # Keep state in memory for potential reflection operations
         self.log_states_dict[str(trade_date)] = state_data

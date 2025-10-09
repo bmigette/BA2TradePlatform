@@ -109,11 +109,11 @@ except Exception as e:
 print()
 
 print("=" * 80)
-print("TEST 4: YFinanceDataProvider - get_dataframe()")
+print("TEST 4: YFinanceDataProvider - get_ohlcv_data()")
 print("=" * 80)
 
 try:
-    df = provider.get_dataframe(
+    df = provider.get_ohlcv_data(
         symbol="AAPL",
         start_date=start_date,
         end_date=end_date,

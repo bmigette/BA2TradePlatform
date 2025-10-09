@@ -752,20 +752,25 @@ class Toolkit:
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Trying OHLCV provider {provider_name} for {symbol}")
-                    df = provider.get_dataframe(
+                    
+                    # Call provider's get_ohlcv_data_formatted method with format_type="both"
+                    # This returns {"text": markdown, "data": dict} for loggingToolNode optimization
+                    result = provider.get_ohlcv_data_formatted(
                         symbol=symbol,
                         start_date=start_dt,
                         end_date=end_dt,
-                        interval=interval
+                        interval=interval,
+                        format_type="both"
                     )
                     
-                    # Convert DataFrame to markdown format
-                    if df is not None and not df.empty:
+                    # Extract both text and data
+                    if isinstance(result, dict) and "text" in result and "data" in result:
                         logger.info(f"Successfully retrieved OHLCV data from {provider_name}")
-                        ohlcv_markdown = df.to_markdown(index=True)
-                        return f"## OHLCV Data from {provider_name.upper()}\n\n{ohlcv_markdown}"
+                        # Return markdown text for LLM consumption
+                        # (The data dict can be logged by loggingToolNode)
+                        return result["text"]
                     else:
-                        raise ValueError("Empty DataFrame returned")
+                        raise ValueError("Provider did not return expected format")
                     
                 except Exception as e:
                     logger.warning(f"OHLCV provider {provider_class.__name__} failed: {e}, trying next provider...")
@@ -845,6 +850,7 @@ class Toolkit:
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Trying indicator provider {provider_name} for {symbol} - {indicator}")
+                    # Note: Interface signature is (symbol, indicator, start_date, end_date, ...)
                     indicator_data = provider.get_indicator(
                         symbol=symbol,
                         indicator=indicator,
@@ -1084,3 +1090,26 @@ class Toolkit:
         except Exception as e:
             logger.error(f"Error in get_fed_calendar: {e}")
             return f"Error retrieving Fed calendar: {str(e)}"
+
+
+def create_msg_delete():
+    """
+    Create a function to clear messages and add placeholder for Anthropic compatibility.
+    
+    This is used in the agent graph to manage message history and avoid context overflow.
+    """
+    from langchain_core.messages import RemoveMessage, HumanMessage
+    
+    def delete_messages(state):
+        """Clear messages and add placeholder for Anthropic compatibility"""
+        messages = state["messages"]
+        
+        # Remove all messages
+        removal_operations = [RemoveMessage(id=m.id) for m in messages]
+        
+        # Add a minimal placeholder message
+        placeholder = HumanMessage(content="Continue")
+        
+        return {"messages": removal_operations + [placeholder]}
+    
+    return delete_messages

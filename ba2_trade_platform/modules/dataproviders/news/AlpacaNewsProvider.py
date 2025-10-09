@@ -87,7 +87,7 @@ class AlpacaNewsProvider(MarketNewsInterface):
         start_date: Optional[datetime] = None,
         lookback_days: Optional[int] = None,
         limit: int = 50,
-        format_type: Literal["dict", "markdown"] = "markdown"
+        format_type: Literal["dict", "markdown", "both"] = "markdown"
     ) -> Dict[str, Any] | str:
         """
         Get news articles for a specific company.
@@ -98,7 +98,7 @@ class AlpacaNewsProvider(MarketNewsInterface):
             start_date: Start date (use either this OR lookback_days, not both)
             lookback_days: Days to look back from end_date (use either this OR start_date, not both)
             limit: Maximum number of articles to return (max: 50 per request)
-            format_type: Output format ('dict' or 'markdown')
+            format_type: Output format ('dict', 'markdown', or 'both')
         
         Returns:
             News data in requested format
@@ -167,7 +167,12 @@ class AlpacaNewsProvider(MarketNewsInterface):
             # Format output
             if format_type == "dict":
                 return result
-            else:
+            elif format_type == "both":
+                return {
+                    "text": self._format_as_markdown(result, is_company_news=True),
+                    "data": result
+                }
+            else:  # markdown
                 return self._format_as_markdown(result, is_company_news=True)
             
         except Exception as e:
@@ -181,7 +186,7 @@ class AlpacaNewsProvider(MarketNewsInterface):
         start_date: Optional[datetime] = None,
         lookback_days: Optional[int] = None,
         limit: int = 50,
-        format_type: Literal["dict", "markdown"] = "markdown"
+        format_type: Literal["dict", "markdown", "both"] = "markdown"
     ) -> Dict[str, Any] | str:
         """
         Get global/market news (not specific to any company).
@@ -191,7 +196,7 @@ class AlpacaNewsProvider(MarketNewsInterface):
             start_date: Start date (use either this OR lookback_days, not both)
             lookback_days: Days to look back from end_date (use either this OR start_date, not both)
             limit: Maximum number of articles to return (max: 50 per request)
-            format_type: Output format ('dict' or 'markdown')
+            format_type: Output format ('dict', 'markdown', or 'both')
         
         Returns:
             News data in requested format
@@ -258,7 +263,12 @@ class AlpacaNewsProvider(MarketNewsInterface):
             # Format output
             if format_type == "dict":
                 return result
-            else:
+            elif format_type == "both":
+                return {
+                    "text": self._format_as_markdown(result, is_company_news=False),
+                    "data": result
+                }
+            else:  # markdown
                 return self._format_as_markdown(result, is_company_news=False)
             
         except Exception as e:

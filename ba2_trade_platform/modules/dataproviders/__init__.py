@@ -37,6 +37,7 @@ from ba2_trade_platform.core.interfaces import (
 from .ohlcv.YFinanceDataProvider import YFinanceDataProvider
 from .ohlcv.AlphaVantageOHLCVProvider import AlphaVantageOHLCVProvider
 from .ohlcv.AlpacaOHLCVProvider import AlpacaOHLCVProvider
+from .ohlcv.FMPOHLCVProvider import FMPOHLCVProvider
 
 # Import provider implementations
 from .news import AlpacaNewsProvider, AlphaVantageNewsProvider, GoogleNewsProvider, OpenAINewsProvider, FMPNewsProvider
@@ -44,6 +45,7 @@ from .indicators import PandasIndicatorCalc, AlphaVantageIndicatorsProvider
 from .fundamentals import (
     AlphaVantageCompanyOverviewProvider,
     OpenAICompanyOverviewProvider,
+    FMPCompanyOverviewProvider,
     AlphaVantageCompanyDetailsProvider,
     YFinanceCompanyDetailsProvider,
     FMPCompanyDetailsProvider
@@ -56,6 +58,7 @@ OHLCV_PROVIDERS: Dict[str, Type[DataProviderInterface]] = {
     "yfinance": YFinanceDataProvider,
     "alphavantage": AlphaVantageOHLCVProvider,
     "alpaca": AlpacaOHLCVProvider,
+    "fmp": FMPOHLCVProvider,
 }
 INDICATORS_PROVIDERS: Dict[str, Type[MarketIndicatorsInterface]] = {
     "pandas": PandasIndicatorCalc,
@@ -65,6 +68,7 @@ INDICATORS_PROVIDERS: Dict[str, Type[MarketIndicatorsInterface]] = {
 FUNDAMENTALS_OVERVIEW_PROVIDERS: Dict[str, Type[CompanyFundamentalsOverviewInterface]] = {
     "alphavantage": AlphaVantageCompanyOverviewProvider,
     "openai": OpenAICompanyOverviewProvider,
+    "fmp": FMPCompanyOverviewProvider,
 }
 
 FUNDAMENTALS_DETAILS_PROVIDERS: Dict[str, Type[CompanyFundamentalsDetailsInterface]] = {
@@ -196,6 +200,7 @@ __all__ = [
     "YFinanceDataProvider",
     "AlphaVantageOHLCVProvider",
     "AlpacaOHLCVProvider",
+    "FMPOHLCVProvider",
     "AlpacaNewsProvider",
     "AlphaVantageNewsProvider",
     "GoogleNewsProvider",
@@ -205,6 +210,7 @@ __all__ = [
     "AlphaVantageIndicatorsProvider",
     "AlphaVantageCompanyOverviewProvider",
     "OpenAICompanyOverviewProvider",
+    "FMPCompanyOverviewProvider",
     "AlphaVantageCompanyDetailsProvider",
     "YFinanceCompanyDetailsProvider",
     "FMPCompanyDetailsProvider",

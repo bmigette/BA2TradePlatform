@@ -62,7 +62,7 @@ class YFinanceDataProvider(MarketDataProviderInterface):
         super().__init__()
         logger.debug("YFinanceDataProvider initialized")
     
-    def _fetch_data_from_source(
+    def _get_ohlcv_data_impl(
         self,
         symbol: str,
         start_date: datetime,
@@ -70,7 +70,7 @@ class YFinanceDataProvider(MarketDataProviderInterface):
         interval: str = '1d'
     ) -> pd.DataFrame:
         """
-        Fetch data from Yahoo Finance API.
+        Fetch OHLCV data from Yahoo Finance API (internal implementation).
         
         Args:
             symbol: Ticker symbol (e.g., 'AAPL', 'MSFT')
@@ -208,7 +208,7 @@ class YFinanceDataProvider(MarketDataProviderInterface):
             end_date = datetime.now()
             start_date = end_date - pd.Timedelta(days=5)  # Look back 5 days to account for weekends
             
-            data = self._fetch_data_from_source(
+            data = self._get_ohlcv_data_impl(
                 symbol=symbol,
                 start_date=start_date,
                 end_date=end_date,

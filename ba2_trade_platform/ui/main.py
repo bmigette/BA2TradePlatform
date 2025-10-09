@@ -11,10 +11,10 @@ try:
     # Try to set javascript timeout on Client class
     if hasattr(Client, 'javascript_timeout'):
         Client.javascript_timeout = 5.0
-        print("Set Client.javascript_timeout to 5.0 seconds")
+        logger.info("Set Client.javascript_timeout to 5.0 seconds")
     
 except Exception as e:
-    print(f"Warning: Could not set JavaScript timeout: {e}")
+    logger.warning(f"Could not set JavaScript timeout: {e}")
 
 # Patch the JavaScriptRequest class to use a longer default timeout
 try:
@@ -29,10 +29,10 @@ try:
     
     # Replace the __init__ method
     JavaScriptRequest.__init__ = new_init
-    print("Successfully patched JavaScriptRequest timeout to 5.0 seconds")
+    logger.info("Successfully patched JavaScriptRequest timeout to 5.0 seconds")
     
 except Exception as e:
-    print(f"Warning: Could not patch JavaScript request timeout: {e}")
+    logger.warning(f"Could not patch JavaScript request timeout: {e}")
 
 # Also patch the client's run_javascript method to use higher timeout by default
 try:
@@ -43,10 +43,10 @@ try:
         return await original_run_javascript(self, code, timeout=timeout)
     
     Client.run_javascript = new_run_javascript
-    print("Successfully patched Client.run_javascript timeout to 5.0 seconds")
+    logger.info("Successfully patched Client.run_javascript timeout to 5.0 seconds")
     
 except Exception as e:
-    print(f"Warning: Could not patch Client.run_javascript timeout: {e}")
+    logger.warning(f"Could not patch Client.run_javascript timeout: {e}")
 
 
 

@@ -2,7 +2,7 @@ import chromadb
 from chromadb.config import Settings
 from openai import OpenAI
 import numpy as np
-from ... import logger as ta_logger
+from ... import logger
 import os
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
@@ -53,7 +53,7 @@ class FinancialSituationMemory:
                 settings=chroma_settings
             )
         except Exception as e:
-            ta_logger.warning(f"Failed to create PersistentClient with settings: {e}, falling back to simple initialization")
+            logger.warning(f"Failed to create PersistentClient with settings: {e}, falling back to simple initialization")
             # Fallback: try without settings
             self.chroma_client = chromadb.PersistentClient(path=persist_directory)
         
@@ -69,10 +69,10 @@ class FinancialSituationMemory:
         # Try to get existing collection or create new one
         try:
             self.situation_collection = self.chroma_client.get_collection(name=collection_name)
-            ta_logger.debug(f"Retrieved existing ChromaDB collection: {collection_name}")
+            logger.debug(f"Retrieved existing ChromaDB collection: {collection_name}")
         except:
             self.situation_collection = self.chroma_client.create_collection(name=collection_name)
-            ta_logger.debug(f"Created new ChromaDB collection: {collection_name}")
+            logger.debug(f"Created new ChromaDB collection: {collection_name}")
 
     def get_embedding(self, text):
         """Get OpenAI embeddings for a text, using RecursiveCharacterTextSplitter for long texts.
@@ -92,7 +92,7 @@ class FinancialSituationMemory:
             return [response.data[0].embedding]
         
         # Text is too long, use RecursiveCharacterTextSplitter
-        ta_logger.info(f"Text length {len(text)} exceeds limit, splitting into chunks for embedding")
+        logger.info(f"Text length {len(text)} exceeds limit, splitting into chunks for embedding")
         
         # Use RecursiveCharacterTextSplitter for intelligent chunking
         text_splitter = RecursiveCharacterTextSplitter(
@@ -103,7 +103,7 @@ class FinancialSituationMemory:
         )
         
         chunks = text_splitter.split_text(text)
-        ta_logger.info(f"Split text into {len(chunks)} chunks for embedding")
+        logger.info(f"Split text into {len(chunks)} chunks for embedding")
         
         # Get embeddings for all chunks
         chunk_embeddings = []
@@ -114,7 +114,7 @@ class FinancialSituationMemory:
                 )
                 chunk_embeddings.append(response.data[0].embedding)
             except Exception as e:
-                ta_logger.error(f"Failed to get embedding for chunk {i}: {e}", exc_info=True)
+                logger.error(f"Failed to get embedding for chunk {i}: {e}", exc_info=True)
                 continue
         
         if not chunk_embeddings:
@@ -169,7 +169,7 @@ class FinancialSituationMemory:
         
         if len(query_embeddings) > 1 and not aggregate_chunks:
             # Query with each chunk separately and merge results
-            ta_logger.debug(f"Querying with {len(query_embeddings)} chunks separately")
+            logger.debug(f"Querying with {len(query_embeddings)} chunks separately")
             all_matches = {}  # Use dict to deduplicate by ID
             
             for chunk_idx, query_embedding in enumerate(query_embeddings):
@@ -199,7 +199,7 @@ class FinancialSituationMemory:
         else:
             # Average embeddings if multiple chunks (original behavior)
             if len(query_embeddings) > 1:
-                ta_logger.debug(f"Averaging {len(query_embeddings)} chunk embeddings")
+                logger.debug(f"Averaging {len(query_embeddings)} chunk embeddings")
                 query_embedding = np.mean(query_embeddings, axis=0).tolist()
             else:
                 query_embedding = query_embeddings[0]

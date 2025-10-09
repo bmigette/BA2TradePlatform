@@ -125,9 +125,9 @@ class MarketIndicatorsInterface(DataProviderInterface):
         self,
         symbol: Annotated[str, "Stock ticker symbol"],
         indicator: Annotated[str, "Indicator name (e.g., 'rsi', 'macd', 'close_50_sma')"],
-        end_date: Annotated[datetime, "End date for data (inclusive)"],
         start_date: Annotated[Optional[datetime], "Start date for data (mutually exclusive with lookback_days)"] = None,
-        lookback_days: Annotated[Optional[int], "Days to look back from end_date (mutually exclusive with start_date)"] = None,
+        end_date: Annotated[Optional[datetime], "End date for data (inclusive, mutually exclusive with lookback_days)"] = None,
+        lookback_days: Annotated[Optional[int], "Days to look back from end_date (mutually exclusive with start_date/end_date)"] = None,
         interval: Annotated[str, "Data interval (1d, 1h, etc.)"] = "1d",
         format_type: Literal["dict", "markdown"] = "markdown"
     ) -> Dict[str, Any] | str:
@@ -137,9 +137,9 @@ class MarketIndicatorsInterface(DataProviderInterface):
         Args:
             symbol: Stock ticker symbol (e.g., 'AAPL', 'MSFT')
             indicator: Indicator name (e.g., 'rsi', 'macd', 'close_50_sma')
-            end_date: End date for data (inclusive)
-            start_date: Start date (use either this OR lookback_days, not both)
-            lookback_days: Number of days to look back from end_date (use either this OR start_date, not both)
+            start_date: Start date (use either start_date+end_date OR lookback_days, not both)
+            end_date: End date for data (use either start_date+end_date OR lookback_days, not both)
+            lookback_days: Number of days to look back from end_date (use either this OR start_date+end_date, not both)
             interval: Data interval (e.g., '1d' for daily, '1h' for hourly)
             format_type: Output format ('dict' or 'markdown')
         

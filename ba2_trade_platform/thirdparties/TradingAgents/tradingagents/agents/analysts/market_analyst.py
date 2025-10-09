@@ -1,4 +1,5 @@
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.tools import tool
 import time
 import json
 from ...prompts import format_analyst_prompt, get_prompt
@@ -11,10 +12,21 @@ def create_market_analyst(llm, toolkit):
         ticker = state["company_of_interest"]
         company_name = state["company_of_interest"]
 
-        # Use new toolkit methods for market data
+        # Wrap toolkit methods with @tool decorator
+        @tool
+        def get_ohlcv_data(symbol: str, start_date: str, end_date: str, interval: str = None) -> str:
+            """Get OHLCV stock price data."""
+            return toolkit.get_ohlcv_data(symbol, start_date, end_date, interval)
+        
+        @tool
+        def get_indicator_data(symbol: str, indicator: str, start_date: str, end_date: str, interval: str = None) -> str:
+            """Get technical indicator data."""
+            return toolkit.get_indicator_data(symbol, indicator, start_date, end_date, interval)
+
+        # Use wrapped tools
         tools = [
-            toolkit.get_ohlcv_data,
-            toolkit.get_indicator_data,
+            get_ohlcv_data,
+            get_indicator_data,
         ]
 
         # Get system prompt from centralized prompts

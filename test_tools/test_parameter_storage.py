@@ -180,7 +180,7 @@ if isinstance(result, dict) and result.get('_internal'):
         provider = YFinanceDataProvider()
         
         # Reconstruct price data from cache (exactly as UI does)
-        reconstructed_data = provider.get_dataframe(
+        reconstructed_data = provider.get_ohlcv_data(
             symbol=params['symbol'],
             start_date=datetime.strptime(params['start_date'], '%Y-%m-%d'),
             end_date=datetime.strptime(params['end_date'], '%Y-%m-%d'),

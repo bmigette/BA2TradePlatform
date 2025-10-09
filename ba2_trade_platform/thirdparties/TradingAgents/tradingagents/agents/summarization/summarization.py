@@ -10,7 +10,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser, PydanticOutputParser
 
 from ...prompts import get_prompt
-from ... import logger as ta_logger
+from ... import logger
 
 
 # Pydantic models for structured output
@@ -55,18 +55,18 @@ def create_final_summarization_agent(llm):
         # Try to use with_structured_output if available (newer LangChain versions)
         structured_llm = llm.with_structured_output(ExpertRecommendation)
         use_structured_output = True
-        ta_logger.debug("Using LangChain structured output with Pydantic")
+        logger.debug("Using LangChain structured output with Pydantic")
     except AttributeError:
         # Fallback to PydanticOutputParser for older versions
         parser = PydanticOutputParser(pydantic_object=ExpertRecommendation)
         use_structured_output = False
-        ta_logger.debug("Using PydanticOutputParser fallback")
+        logger.debug("Using PydanticOutputParser fallback")
     
     def summarization_agent_node(state: Dict[str, Any]) -> Dict[str, Any]:
         """
         LangGraph node that creates structured final recommendation
         """
-        ta_logger.log_step_start("Final Summarization Agent", f"Symbol: {state.get('company_of_interest', 'Unknown')}")
+        logger.log_step_start("Final Summarization Agent", f"Symbol: {state.get('company_of_interest', 'Unknown')}")
         
         try:
             symbol = state.get("company_of_interest", "UNKNOWN")
@@ -109,15 +109,15 @@ def create_final_summarization_agent(llm):
             state["expert_recommendation"] = recommendation_dict
             state["final_analysis_summary"] = recommendation_dict.get("analysis_summary", {})
             
-            ta_logger.info(f"Generated structured recommendation: {recommendation_dict['recommended_action']} for {symbol} with {recommendation_dict['confidence']:.1f}% confidence")
-            ta_logger.debug(f"Full recommendation: {json.dumps(recommendation_dict, indent=4)}")
-            ta_logger.log_step_complete("Final Summarization Agent", True)
+            logger.info(f"Generated structured recommendation: {recommendation_dict['recommended_action']} for {symbol} with {recommendation_dict['confidence']:.1f}% confidence")
+            logger.debug(f"Full recommendation: {json.dumps(recommendation_dict, indent=4)}")
+            logger.log_step_complete("Final Summarization Agent", True)
             
             return state
             
         except Exception as e:
-            ta_logger.error(f"Error in summarization agent: {str(e)}", exc_info=True)
-            ta_logger.log_step_complete("Final Summarization Agent", False)
+            logger.error(f"Error in summarization agent: {str(e)}", exc_info=True)
+            logger.log_step_complete("Final Summarization Agent", False)
             
             # Return state with fallback recommendation
             fallback_recommendation = _create_fallback_recommendation(state, symbol, current_price, str(e))
@@ -250,7 +250,7 @@ def create_langgraph_summarization_node(config: Dict[str, Any]):
     DEPRECATED: Use create_final_summarization_agent instead
     Kept for backward compatibility
     """
-    ta_logger.warning("create_langgraph_summarization_node is deprecated. Use create_final_summarization_agent instead.")
+    logger.warning("create_langgraph_summarization_node is deprecated. Use create_final_summarization_agent instead.")
     
     # Try to get LLM from config
     try:
@@ -258,7 +258,7 @@ def create_langgraph_summarization_node(config: Dict[str, Any]):
         llm = ChatOpenAI(model=config.get("quick_think_llm", "gpt-3.5-turbo"))
         return create_final_summarization_agent(llm)
     except Exception as e:
-        ta_logger.error(f"Could not create summarization agent: {e}", exc_info=True)
+        logger.error(f"Could not create summarization agent: {e}", exc_info=True)
         
         def error_node(state: Dict[str, Any]) -> Dict[str, Any]:
             state["expert_recommendation"] = _create_fallback_recommendation(

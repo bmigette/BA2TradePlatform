@@ -12,7 +12,7 @@ from tqdm import tqdm
 import yfinance as yf
 from openai import OpenAI
 from .config import get_config, set_config, DATA_DIR
-from .. import logger as ta_logger
+from .. import logger
 from ba2_trade_platform.modules.dataproviders import YFinanceDataProvider
 
 # Import vendor-specific modules (for backward compatibility with direct imports)
@@ -607,7 +607,7 @@ def get_stock_stats_indicators_window(
             interval=interval,
         )
     except Exception as e:
-        ta_logger.error(f"Error getting indicator {indicator} for {symbol}: {e}", exc_info=True)
+        logger.error(f"Error getting indicator {indicator} for {symbol}: {e}", exc_info=True)
         return f"Error calculating {indicator}: {str(e)}"
     
     # Build text format for LangGraph agent
@@ -773,7 +773,7 @@ def get_YFin_data_online(
     
     try:
         # Get data via data provider (uses smart cache)
-        data = provider.get_dataframe(
+        data = provider.get_ohlcv_data(
             symbol=symbol,
             start_date=start_dt,
             end_date=end_dt,
@@ -826,7 +826,7 @@ def get_YFin_data_online(
             "json_for_storage": json_data
         }
     except Exception as e:
-        ta_logger.error(f"Error fetching data for {symbol}: {e}", exc_info=True)
+        logger.error(f"Error fetching data for {symbol}: {e}", exc_info=True)
         # Return error that will stop graph flow
         error_msg = f"CRITICAL ERROR: Failed to fetch market data for {symbol}. {str(e)}"
         return {
@@ -1201,7 +1201,7 @@ def try_ba2_provider(method: str, vendor: str, *args, **kwargs):
     
     if method == "get_stock_data":
         cache_key = f"{symbol}_ohlcv_{lookback}days"
-        ba2_method = "get_dataframe"  # MarketDataProvider method
+        ba2_method = "get_ohlcv_data"  # MarketDataProvider method (renamed from get_dataframe)
         max_age_hours = 24
     elif method == "get_news":
         cache_key = f"{symbol}_news_{lookback}days"

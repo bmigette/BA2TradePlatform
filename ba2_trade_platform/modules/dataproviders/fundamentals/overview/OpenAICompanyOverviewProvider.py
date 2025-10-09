@@ -46,7 +46,7 @@ class OpenAICompanyOverviewProvider(CompanyFundamentalsOverviewInterface):
         self,
         symbol: Annotated[str, "Stock ticker symbol"],
         as_of_date: Annotated[datetime, "Date for fundamentals (uses most recent data as of this date)"],
-        format_type: Literal["dict", "markdown"] = "markdown"
+        format_type: Literal["dict", "markdown", "both"] = "markdown"
     ) -> Dict[str, Any] | str:
         """
         Get company fundamentals overview using OpenAI web search.
@@ -105,30 +105,39 @@ class OpenAICompanyOverviewProvider(CompanyFundamentalsOverviewInterface):
             # Extract the response text
             fundamentals_text = response.output[1].content[0].text
             
-            if format_type == "dict":
-                # Return structured format
-                response_data = {
-                    "symbol": symbol.upper(),
-                    "company_name": None,  # OpenAI doesn't provide structured name
-                    "as_of_date": as_of_date.isoformat(),
-                    "data_date": as_of_date.isoformat(),
-                    "metrics": {
-                        "content": fundamentals_text,
-                        "source": "OpenAI Web Search",
-                        "search_period": f"{start_str} to {end_str}"
-                    }
+            # Build dict response (always build it for "both" format support)
+            dict_response = {
+                "symbol": symbol.upper(),
+                "company_name": None,  # OpenAI doesn't provide structured name
+                "as_of_date": as_of_date.isoformat(),
+                "data_date": as_of_date.isoformat(),
+                "metrics": {
+                    "content": fundamentals_text,
+                    "source": "OpenAI Web Search",
+                    "search_period": f"{start_str} to {end_str}"
                 }
-                return response_data
-            else:
-                # Return as markdown
-                lines = []
-                lines.append(f"# Company Fundamentals Overview for {symbol}")
-                lines.append(f"**As of Date:** {as_of_date.date()}")
-                lines.append(f"**Search Period:** {start_str} to {end_str}")
-                lines.append(f"**Source:** OpenAI Web Search")
-                lines.append("")
-                lines.append(fundamentals_text)
-                return "\n".join(lines)
+            }
+            
+            # Build markdown response
+            lines = []
+            lines.append(f"# Company Fundamentals Overview for {symbol}")
+            lines.append(f"**As of Date:** {as_of_date.date()}")
+            lines.append(f"**Search Period:** {start_str} to {end_str}")
+            lines.append(f"**Source:** OpenAI Web Search")
+            lines.append("")
+            lines.append(fundamentals_text)
+            markdown = "\n".join(lines)
+            
+            # Return based on format_type
+            if format_type == "dict":
+                return dict_response
+            elif format_type == "both":
+                return {
+                    "text": markdown,
+                    "data": dict_response
+                }
+            else:  # markdown
+                return markdown
                 
         except Exception as e:
             logger.error(f"Failed to get company overview for {symbol} from OpenAI: {e}", exc_info=True)

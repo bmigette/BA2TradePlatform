@@ -8,10 +8,15 @@ from Alpha Vantage API.
 from typing import Dict, Any, Literal, Optional, Annotated
 from datetime import datetime
 import json
+import requests
 
 from ba2_trade_platform.core.interfaces import CompanyFundamentalsDetailsInterface
 from ba2_trade_platform.core.provider_utils import log_provider_call
 from ba2_trade_platform.logger import logger
+from ba2_trade_platform.config import get_app_setting
+from ba2_trade_platform.modules.dataproviders.alpha_vantage_common import make_api_request
+
+
 class AlphaVantageRateLimitError(Exception):
     """Exception raised when Alpha Vantage API rate limit is exceeded."""
     pass
@@ -30,46 +35,13 @@ class AlphaVantageCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
     
     def __init__(self):
         """Initialize Alpha Vantage company details provider."""
+        super().__init__()
+        self.api_key = get_app_setting("alpha_vantage_api_key")
+        if not self.api_key:
+            raise ValueError("Alpha Vantage API key not configured. Please set 'alpha_vantage_api_key' in app settings.")
         logger.debug("Initialized AlphaVantageCompanyDetailsProvider")
     
-    def _make_api_request(self, function_name: str, params: dict) -> str:
-        """
-        Make API request to Alpha Vantage.
-        
-        Args:
-            function_name: Alpha Vantage function name (e.g., 'BALANCE_SHEET', 'INCOME_STATEMENT', 'CASH_FLOW')
-            params: Additional parameters for the API request
-            
-        Returns:
-            API response as string
-            
-        Raises:
-            AlphaVantageRateLimitError: When API rate limit is exceeded
-        """
-        api_params = params.copy()
-        api_params.update({
-            "function": function_name,
-            "apikey": ALPHA_VANTAGE_API_KEY,
-            "source": "ba2_trade_platform",
-        })
-        
-        response = requests.get(self.API_BASE_URL, params=api_params)
-        response.raise_for_status()
-        
-        response_text = response.text
-        
-        # Check for rate limit error
-        try:
-            response_json = json.loads(response_text)
-            if "Information" in response_json:
-                info_message = response_json["Information"]
-                if "rate limit" in info_message.lower() or "api key" in info_message.lower():
-                    raise AlphaVantageRateLimitError(f"Alpha Vantage rate limit exceeded: {info_message}")
-        except json.JSONDecodeError:
-            # Response is not JSON (likely CSV data), which is normal
-            pass
-        
-        return response_text
+    # Removed _make_api_request - using shared alpha_vantage_common.make_api_request instead
     
     @log_provider_call
     def get_balance_sheet(
@@ -79,7 +51,7 @@ class AlphaVantageCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
         end_date: Annotated[datetime, "End date for statement range (inclusive)"],
         start_date: Annotated[Optional[datetime], "Start date for statement range (mutually exclusive with lookback_periods)"] = None,
         lookback_periods: Annotated[Optional[int], "Number of periods to look back from end_date (mutually exclusive with start_date)"] = None,
-        format_type: Literal["dict", "markdown"] = "markdown"
+        format_type: Literal["dict", "markdown", "both"] = "markdown"
     ) -> Dict[str, Any] | str:
         """
         Get balance sheet(s) for a company.
@@ -107,28 +79,35 @@ class AlphaVantageCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             params = {"symbol": symbol}
             result = make_api_request("BALANCE_SHEET", params)
             
+            # Build dict response (always build it for "both" format support)
+            data = json.loads(result)
+            
+            # Filter statements based on frequency and date range
+            key = "annualReports" if frequency == "annual" else "quarterlyReports"
+            statements = data.get(key, [])
+            
+            # Filter by date range
+            filtered_statements = self._filter_statements_by_date(
+                statements, end_date, start_date, lookback_periods
+            )
+            
+            dict_response = {
+                "symbol": symbol.upper(),
+                "frequency": frequency,
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat(),
+                "statements": filtered_statements
+            }
+            
+            # Return based on format_type
             if format_type == "dict":
-                data = json.loads(result)
-                
-                # Filter statements based on frequency and date range
-                key = "annualReports" if frequency == "annual" else "quarterlyReports"
-                statements = data.get(key, [])
-                
-                # Filter by date range
-                filtered_statements = self._filter_statements_by_date(
-                    statements, end_date, start_date, lookback_periods
-                )
-                
-                response = {
-                    "symbol": symbol.upper(),
-                    "frequency": frequency,
-                    "start_date": start_date.isoformat() if start_date else None,
-                    "end_date": end_date.isoformat(),
-                    "statements": filtered_statements
+                return dict_response
+            elif format_type == "both":
+                return {
+                    "text": result,
+                    "data": dict_response
                 }
-                return response
-            else:
-                # Return as markdown
+            else:  # markdown
                 return result
                 
         except Exception as e:
@@ -143,7 +122,7 @@ class AlphaVantageCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
         end_date: Annotated[datetime, "End date for statement range (inclusive)"],
         start_date: Annotated[Optional[datetime], "Start date for statement range (mutually exclusive with lookback_periods)"] = None,
         lookback_periods: Annotated[Optional[int], "Number of periods to look back from end_date (mutually exclusive with start_date)"] = None,
-        format_type: Literal["dict", "markdown"] = "markdown"
+        format_type: Literal["dict", "markdown", "both"] = "markdown"
     ) -> Dict[str, Any] | str:
         """
         Get income statement(s) for a company.
@@ -171,29 +150,37 @@ class AlphaVantageCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             params = {"symbol": symbol}
             result = make_api_request("INCOME_STATEMENT", params)
             
+            # Build dict response (always build it for "both" format support)
+            data = json.loads(result)
+            
+            # Filter statements based on frequency and date range
+            key = "annualReports" if frequency == "annual" else "quarterlyReports"
+            statements = data.get(key, [])
+            
+            # Filter by date range
+            filtered_statements = self._filter_statements_by_date(
+                statements, end_date, start_date, lookback_periods
+            )
+            
+            dict_response = {
+                "symbol": symbol.upper(),
+                "frequency": frequency,
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat(),
+                "statements": filtered_statements
+            }
+            
+            # Return based on format_type
             if format_type == "dict":
-                data = json.loads(result)
-                
-                # Filter statements based on frequency and date range
-                key = "annualReports" if frequency == "annual" else "quarterlyReports"
-                statements = data.get(key, [])
-                
-                # Filter by date range
-                filtered_statements = self._filter_statements_by_date(
-                    statements, end_date, start_date, lookback_periods
-                )
-                
-                response = {
-                    "symbol": symbol.upper(),
-                    "frequency": frequency,
-                    "start_date": start_date.isoformat() if start_date else None,
-                    "end_date": end_date.isoformat(),
-                    "statements": filtered_statements
+                return dict_response
+            elif format_type == "both":
+                return {
+                    "text": result,
+                    "data": dict_response
                 }
-                return response
-            else:
-                # Return as markdown
+            else:  # markdown
                 return result
+
                 
         except Exception as e:
             logger.error(f"Failed to get income statement for {symbol}: {e}")
@@ -207,7 +194,7 @@ class AlphaVantageCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
         end_date: Annotated[datetime, "End date for statement range (inclusive)"],
         start_date: Annotated[Optional[datetime], "Start date for statement range (mutually exclusive with lookback_periods)"] = None,
         lookback_periods: Annotated[Optional[int], "Number of periods to look back from end_date (mutually exclusive with start_date)"] = None,
-        format_type: Literal["dict", "markdown"] = "markdown"
+        format_type: Literal["dict", "markdown", "both"] = "markdown"
     ) -> Dict[str, Any] | str:
         """
         Get cash flow statement(s) for a company.
@@ -235,27 +222,36 @@ class AlphaVantageCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             params = {"symbol": symbol}
             result = make_api_request("CASH_FLOW", params)
             
+            # Build dict response (always build it for "both" format support)
+            data = json.loads(result)
+            
+            # Filter statements based on frequency and date range
+            key = "annualReports" if frequency == "annual" else "quarterlyReports"
+            statements = data.get(key, [])
+            
+            # Filter by date range
+            filtered_statements = self._filter_statements_by_date(
+                statements, end_date, start_date, lookback_periods
+            )
+            
+            dict_response = {
+                "symbol": symbol.upper(),
+                "frequency": frequency,
+                "start_date": start_date.isoformat() if start_date else None,
+                "end_date": end_date.isoformat(),
+                "statements": filtered_statements
+            }
+            
+            # Return based on format_type
             if format_type == "dict":
-                data = json.loads(result)
-                
-                # Filter statements based on frequency and date range
-                key = "annualReports" if frequency == "annual" else "quarterlyReports"
-                statements = data.get(key, [])
-                
-                # Filter by date range
-                filtered_statements = self._filter_statements_by_date(
-                    statements, end_date, start_date, lookback_periods
-                )
-                
-                response = {
-                    "symbol": symbol.upper(),
-                    "frequency": frequency,
-                    "start_date": start_date.isoformat() if start_date else None,
-                    "end_date": end_date.isoformat(),
-                    "statements": filtered_statements
+                return dict_response
+            elif format_type == "both":
+                return {
+                    "text": result,
+                    "data": dict_response
                 }
-                return response
-            else:
+            else:  # markdown
+                return result
                 # Return as markdown
                 return result
                 

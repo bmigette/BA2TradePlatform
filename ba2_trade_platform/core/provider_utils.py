@@ -24,7 +24,7 @@ def log_provider_call(func: Callable) -> Callable:
     Logs at DEBUG level:
     - Function name
     - Arguments (excluding 'self')
-    - Result summary (type and size for large results)
+    - Full result for markdown/both formats, summary for dict
     
     Usage:
         @log_provider_call
@@ -51,13 +51,23 @@ def log_provider_call(func: Callable) -> Callable:
             # Execute function
             result = func(*args, **kwargs)
             
-            # Log result summary
+            # Log result based on format
             if isinstance(result, dict):
-                logger.debug(f"{provider_name}.{func.__name__} returned dict with {len(result)} keys")
+                # Check if it's a "both" format dict with "text" and "data" keys
+                if "text" in result and "data" in result:
+                    logger.debug(f"{provider_name}.{func.__name__} returned 'both' format")
+                    logger.debug(f"--- Markdown Output ({len(result['text'])} chars) ---\n{result['text'][:1000]}\n--- End Markdown ---")
+                    logger.debug(f"Data dict has {len(result['data'])} keys")
+                else:
+                    logger.debug(f"{provider_name}.{func.__name__} returned dict with {len(result)} keys")
             elif isinstance(result, str):
-                logger.debug(f"{provider_name}.{func.__name__} returned string ({len(result)} chars)")
+                # Markdown or plain string result - log the full content
+                logger.debug(f"{provider_name}.{func.__name__} returned markdown ({len(result)} chars)")
+                logger.debug(f"--- Markdown Output ---\n{result[:1000]}\n--- End Markdown ---")
             elif isinstance(result, list):
                 logger.debug(f"{provider_name}.{func.__name__} returned list with {len(result)} items")
+            elif isinstance(result, tuple):
+                logger.debug(f"{provider_name}.{func.__name__} returned tuple with {len(result)} elements")
             else:
                 logger.debug(f"{provider_name}.{func.__name__} returned {type(result).__name__}")
             

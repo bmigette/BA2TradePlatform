@@ -140,7 +140,7 @@ class AlphaVantageIndicatorsProvider(MarketIndicatorsInterface):
         start_date: Annotated[Optional[datetime], "Start date for data (mutually exclusive with lookback_days)"] = None,
         lookback_days: Annotated[Optional[int], "Days to look back from end_date (mutually exclusive with start_date)"] = None,
         interval: Annotated[str, "Data interval (1d, 1h, etc.)"] = "1d",
-        format_type: Literal["dict", "markdown"] = "markdown"
+        format_type: Literal["dict", "markdown", "both"] = "markdown"
     ) -> Dict[str, Any] | str:
         """
         Get technical indicator data for a symbol using Alpha Vantage API.
@@ -220,7 +220,12 @@ class AlphaVantageIndicatorsProvider(MarketIndicatorsInterface):
             
             if format_type == "dict":
                 return response
-            else:
+            elif format_type == "both":
+                return {
+                    "text": self._format_markdown(response),
+                    "data": response
+                }
+            else:  # markdown
                 return self._format_markdown(response)
                 
         except Exception as e:

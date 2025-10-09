@@ -81,7 +81,6 @@ class TradingAgentsLogger:
             log_dir: Directory to store log files (uses LOG_FOLDER from config.py)
         """
         self.expert_id = expert_id
-        
         # Use LOG_FOLDER from BA2 platform config
         if log_dir is None:
             self.log_dir = ba2_config.LOG_FOLDER
@@ -92,26 +91,32 @@ class TradingAgentsLogger:
         logger_name = f"tradingagents_exp{expert_id}" if expert_id else "tradingagents"
         self.logger = logging.getLogger(logger_name)
         
-        # Prevent duplicate handlers
-        if self.logger.handlers:
-            return
+        # CRITICAL: Set propagate to False BEFORE clearing handlers
+        # This prevents any logs from going to parent/root loggers
+        self.logger.propagate = False
+        
+        # Clear any existing handlers to prevent duplicates
+        self.logger.handlers.clear()
             
         self.logger.setLevel(logging.DEBUG)
         
-        # Create formatters
-        console_formatter = ColoredFormatter(
-            '%(asctime)s - %(name)s - %(levelname_colored)s - %(message_colored)s'
+        # Create formatters - use same format as main app logger
+        # Main app format: '%(asctime)s - %(name)s - %(module)s - %(levelname)s - %(message)s'
+        console_formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(module)s - %(levelname)s - %(message)s'
         )
         file_formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
+            '%(asctime)s - %(name)s - %(module)s - %(levelname)s - %(message)s'
         )
         
         # Console handler (respects STDOUT setting) with colors
-        if self._should_log_to_console():
-            console_handler = logging.StreamHandler(sys.stdout)
-            console_handler.setLevel(logging.INFO)
-            console_handler.setFormatter(console_formatter)
-            self.logger.addHandler(console_handler)
+        # DISABLED: Console logging handled by BA2 platform logger to avoid duplicates
+        # The BA2 logger already captures all logs from the tradingagents namespace
+        # if self._should_log_to_console():
+        #     console_handler = logging.StreamHandler(sys.stdout)
+        #     console_handler.setLevel(logging.INFO)
+        #     console_handler.setFormatter(console_formatter)
+        #     self.logger.addHandler(console_handler)
         
         # File handler (always enabled for file logging)
         if self._should_log_to_file():
@@ -298,7 +303,6 @@ def get_logger(expert_id: Optional[int] = None, log_dir: str = None) -> TradingA
         TradingAgentsLogger instance
     """
     global _global_logger
-    
     # Create new logger if needed or if parameters changed
     if (_global_logger is None or 
         _global_logger.expert_id != expert_id or 

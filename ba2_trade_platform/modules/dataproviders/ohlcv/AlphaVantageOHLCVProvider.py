@@ -76,7 +76,7 @@ class AlphaVantageOHLCVProvider(MarketDataProviderInterface):
         logger.debug("AlphaVantageOHLCVProvider initialized")
     
     @log_provider_call
-    def _fetch_data_from_source(
+    def _get_ohlcv_data_impl(
         self,
         symbol: str,
         start_date: datetime,
@@ -84,7 +84,7 @@ class AlphaVantageOHLCVProvider(MarketDataProviderInterface):
         interval: str = '1d'
     ) -> pd.DataFrame:
         """
-        Fetch data from Alpha Vantage API.
+        Fetch OHLCV data from Alpha Vantage API (internal implementation).
         
         Args:
             symbol: Ticker symbol (e.g., 'AAPL', 'MSFT')
@@ -187,7 +187,7 @@ class AlphaVantageOHLCVProvider(MarketDataProviderInterface):
             end_date = datetime.now()
             start_date = end_date - timedelta(days=5)
             
-            df = self.get_dataframe(
+            df = self.get_ohlcv_data(
                 symbol=symbol,
                 start_date=start_date,
                 end_date=end_date,
