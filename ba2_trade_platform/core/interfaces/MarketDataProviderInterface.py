@@ -413,15 +413,32 @@ class MarketDataProviderInterface(DataProviderInterface):
         if 'Date' in df.columns:
             df['Date'] = pd.to_datetime(df['Date'])
         
-        # Make start_date and end_date timezone-aware if df['Date'] is timezone-aware
+        # Handle timezone compatibility between DataFrame and filter dates
+        from datetime import timezone as tz
+        
+        # Check if DataFrame has timezone-aware dates
+        df_has_tz = hasattr(df['Date'], 'dt') and df['Date'].dt.tz is not None
+        
+        # Check if filter dates have timezone info
+        start_has_tz = normalized_start.tzinfo is not None
+        end_has_tz = end_date.tzinfo is not None
+        
         filter_start = normalized_start
         filter_end = end_date
-        if hasattr(df['Date'], 'dt') and df['Date'].dt.tz is not None:
-            # DataFrame has timezone-aware dates, convert filter dates to match
-            from datetime import timezone as tz
-            if normalized_start.tzinfo is None:
+        
+        if df_has_tz and not (start_has_tz and end_has_tz):
+            # DataFrame is tz-aware, make filter dates tz-aware to match
+            if not start_has_tz:
                 filter_start = normalized_start.replace(tzinfo=tz.utc)
-            if end_date.tzinfo is None:
+            if not end_has_tz:
+                filter_end = end_date.replace(tzinfo=tz.utc)
+        elif not df_has_tz and (start_has_tz or end_has_tz):
+            # DataFrame is tz-naive, make it tz-aware to match filter dates
+            df['Date'] = df['Date'].dt.tz_localize(tz.utc)
+            # Also update filter dates if they weren't timezone-aware
+            if not start_has_tz:
+                filter_start = normalized_start.replace(tzinfo=tz.utc)
+            if not end_has_tz:
                 filter_end = end_date.replace(tzinfo=tz.utc)
         
         # Filter to requested date range (using normalized start)
@@ -455,20 +472,33 @@ class MarketDataProviderInterface(DataProviderInterface):
     
     def _format_ohlcv_as_markdown(self, data: dict) -> str:
         """Format OHLCV data as markdown table."""
-        md = f"# OHLCV Data: {data['symbol']}\n\n"
-        md += f"**Interval:** {data['interval']}  \n"
-        md += f"**Period:** {data['start_date'][:10]} to {data['end_date'][:10]}  \n"
-        md += f"**Data Points:** {len(data['data'])}  \n\n"
+        interval = data.get('interval', '1d')
         
-        if data['data']:
+        md = f"# OHLCV Data: {data['symbol']}\n\n"
+        md += f"**Interval:** {interval}  \n"
+        
+        # Format period dates based on interval
+        start_display = self.format_datetime_for_markdown(data.get('start_date'), interval)
+        end_display = self.format_datetime_for_markdown(data.get('end_date'), interval)
+        md += f"**Period:** {start_display} to {end_display}  \n"
+        md += f"**Data Points:** {len(data.get('data', []))}  \n\n"
+        
+        if data.get('data'):
             md += "## Price Data\n\n"
-            md += "| Date | Open | High | Low | Close | Volume |\n"
+            
+            # Determine date column header based on interval
+            date_header = "Date" if any(interval.endswith(s) for s in ['d', 'wk', 'mo']) else "DateTime"
+            
+            md += f"| {date_header} | Open | High | Low | Close | Volume |\n"
             md += "|------|------|------|-----|-------|--------|\n"
             
             # Show all data points
             for point in data['data']:
+                # Format date based on interval
+                date_str = self.format_datetime_for_markdown(point.get('date'), interval)
+                
                 md += (
-                    f"| {point['date'][:10]} | "
+                    f"| {date_str} | "
                     f"${point['open']:.2f} | "
                     f"${point['high']:.2f} | "
                     f"${point['low']:.2f} | "

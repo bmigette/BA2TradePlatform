@@ -9,7 +9,7 @@ API Documentation:
 - Historical Daily: https://site.financialmodelingprep.com/developer/docs#historical-price-eod-full
 """
 
-from typing import Annotated, Optional
+from typing import Annotated, Optional, Dict, Any
 from datetime import datetime, timedelta
 import pandas as pd
 import requests

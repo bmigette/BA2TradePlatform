@@ -111,9 +111,22 @@ class PandasIndicatorCalc(MarketIndicatorsInterface):
             interval=interval
         )
         
+        # Check if original data has timezone info
+        has_tz = False
+        if 'Date' in data.columns:
+            has_tz = hasattr(data['Date'], 'dt') and data['Date'].dt.tz is not None
+            logger.debug(f"Data has timezone: {has_tz}, dtype: {data['Date'].dtype}")
+        
         # Wrap data with stockstats for indicator calculation
         df = wrap(data)
-        df["Date"] = pd.to_datetime(df["Date"])
+        
+        # Preserve timezone info when converting Date
+        if has_tz:
+            # Data has timezone, preserve it
+            df["Date"] = pd.to_datetime(df["Date"], utc=True)
+            logger.debug(f"After wrap, preserved timezone: {df['Date'].dt.tz}")
+        else:
+            df["Date"] = pd.to_datetime(df["Date"])
         
         # Calculate indicator for all dates (triggers stockstats calculation)
         df[indicator]
@@ -124,11 +137,20 @@ class PandasIndicatorCalc(MarketIndicatorsInterface):
         
         # Make start_dt and end_dt timezone-aware if df['Date'] is timezone-aware
         if hasattr(df["Date"], 'dt') and df["Date"].dt.tz is not None:
-            from datetime import timezone as tz
+            # DataFrame dates are timezone-aware, make filter dates match
             if start_dt.tzinfo is None:
-                start_dt = start_dt.replace(tzinfo=tz.utc)
+                # Timestamp is naive, localize it
+                start_dt = start_dt.tz_localize('UTC')
+            elif start_dt.tz != df["Date"].dt.tz:
+                # Timestamp has different timezone, convert it
+                start_dt = start_dt.tz_convert(df["Date"].dt.tz)
+            
             if end_dt.tzinfo is None:
-                end_dt = end_dt.replace(tzinfo=tz.utc)
+                # Timestamp is naive, localize it
+                end_dt = end_dt.tz_localize('UTC')
+            elif end_dt.tz != df["Date"].dt.tz:
+                # Timestamp has different timezone, convert it
+                end_dt = end_dt.tz_convert(df["Date"].dt.tz)
         
         mask = (df["Date"] >= start_dt) & (df["Date"] <= end_dt)
         filtered_df = df.loc[mask, ["Date", indicator]].copy()
@@ -266,8 +288,15 @@ class PandasIndicatorCalc(MarketIndicatorsInterface):
             md += "|------|-------|\n"
             
             # CRITICAL: Always return FULL data, never truncate
+            # Use interval-aware datetime formatting
+            interval = data.get('interval', '1d')
             for point in data['data']:
-                md += f"| {point['date'][:10]} | {point['value']} |\n"
+                # Parse the ISO date string
+                from datetime import datetime
+                date_obj = datetime.fromisoformat(point['date'])
+                # Format using interval-aware helper
+                date_str = self.format_datetime_for_markdown(date_obj, interval)
+                md += f"| {date_str} | {point['value']} |\n"
             
             md += f"\n*Total data points: {len(data['data'])}*\n"
         else:

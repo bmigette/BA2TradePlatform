@@ -6,7 +6,7 @@ TIME_SERIES_DAILY_ADJUSTED API. Includes adjusted close and split/dividend event
 """
 
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Dict, Any
 import pandas as pd
 from io import StringIO
 

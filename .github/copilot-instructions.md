@@ -195,5 +195,7 @@ print(f"Confidence: {confidence:.1%}")  # Expects 0-1, we have 1-100!
 
 ### Testing
 - Manual testing through web UI at http://localhost:8080
-- Test file: `test.py` (basic testing utilities)
+- **Test Files**: All test scripts should be created in the `test_files/` directory
+- Basic testing utilities: `test.py`
+- Run tests with: `.venv\Scripts\python.exe test_files/test_name.py` (Windows) or `.venv/bin/python test_files/test_name.py` (Unix)
 
