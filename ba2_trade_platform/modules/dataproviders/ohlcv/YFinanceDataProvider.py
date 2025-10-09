@@ -227,3 +227,81 @@ class YFinanceDataProvider(MarketDataProviderInterface):
         except Exception as e:
             logger.error(f"Symbol validation failed for {symbol}: {e}", exc_info=True)
             return False
+    
+    def get_provider_name(self) -> str:
+        """Get the provider name."""
+        return "yfinance"
+    
+    def get_supported_features(self) -> list[str]:
+        """Get supported features of this provider."""
+        return ["ohlcv", "intraday", "daily", "weekly", "monthly"]
+    
+    def validate_config(self) -> bool:
+        """
+        Validate provider configuration.
+        
+        Returns:
+            bool: Always True (Yahoo Finance doesn't require API keys)
+        """
+        return True
+    
+    def _format_as_dict(self, data: any) -> dict:
+        """
+        Format data as a structured dictionary.
+        
+        Args:
+            data: OHLCV data (DataFrame or dict)
+            
+        Returns:
+            dict: Structured dictionary
+        """
+        if isinstance(data, pd.DataFrame):
+            # Convert DataFrame to dict format
+            return {
+                "data": data.to_dict(orient='records'),
+                "count": len(data)
+            }
+        elif isinstance(data, dict):
+            return data
+        return {"data": data}
+    
+    def _format_as_markdown(self, data: any) -> str:
+        """
+        Format data as markdown for LLM consumption.
+        
+        Args:
+            data: OHLCV data (DataFrame or dict)
+            
+        Returns:
+            str: Markdown-formatted string
+        """
+        if isinstance(data, pd.DataFrame):
+            # Use existing _format_ohlcv_as_markdown if data has required structure
+            if 'symbol' in data.columns or len(data) > 0:
+                # Convert to the expected dict format
+                data_dict = {
+                    "symbol": data.get('symbol', ['UNKNOWN'])[0] if 'symbol' in data.columns else "UNKNOWN",
+                    "interval": "1d",
+                    "start_date": data['Date'].min().isoformat() if 'Date' in data.columns and len(data) > 0 else "",
+                    "end_date": data['Date'].max().isoformat() if 'Date' in data.columns and len(data) > 0 else "",
+                    "data": []
+                }
+                
+                for _, row in data.iterrows():
+                    data_dict["data"].append({
+                        "date": row['Date'].isoformat() if 'Date' in data.columns else "",
+                        "open": float(row['Open']) if 'Open' in data.columns else 0.0,
+                        "high": float(row['High']) if 'High' in data.columns else 0.0,
+                        "low": float(row['Low']) if 'Low' in data.columns else 0.0,
+                        "close": float(row['Close']) if 'Close' in data.columns else 0.0,
+                        "volume": int(row['Volume']) if 'Volume' in data.columns else 0
+                    })
+                
+                return self._format_ohlcv_as_markdown(data_dict)
+        
+        # Fallback for dict data
+        if isinstance(data, dict) and 'data' in data:
+            return self._format_ohlcv_as_markdown(data)
+        
+        # Generic fallback
+        return f"# Market Data\n\n```\n{str(data)}\n```"

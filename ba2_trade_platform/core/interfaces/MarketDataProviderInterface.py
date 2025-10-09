@@ -7,16 +7,17 @@ All data providers should extend this class and implement the fetch methods.
 
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, time
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import pandas as pd
 import os
 from ba2_trade_platform.core.types import MarketDataPoint
 from ba2_trade_platform.logger import logger
 from ba2_trade_platform import config
 from ba2_trade_platform.core.provider_utils import log_provider_call
+from ba2_trade_platform.core.interfaces.DataProviderInterface import DataProviderInterface
 
 
-class MarketDataProviderInterface(ABC):
+class MarketDataProviderInterface(DataProviderInterface):
     """
     Abstract base class for market data providers.
     

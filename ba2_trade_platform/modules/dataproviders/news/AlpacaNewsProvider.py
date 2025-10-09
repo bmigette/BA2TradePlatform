@@ -63,21 +63,85 @@ class AlpacaNewsProvider(MarketNewsInterface):
         """Get the provider name."""
         return "alpaca"
     
-    def get_supported_features(self) -> Dict[str, Any]:
+    def get_supported_features(self) -> list[str]:
         """Get supported features of this provider."""
-        return {
-            "company_news": True,
-            "global_news": True,
-            "sentiment_analysis": False,  # Alpaca doesn't provide sentiment by default
-            "full_article_content": False,  # Only summaries available
-            "image_urls": True,
-            "source_attribution": True,
-            "max_lookback_days": 365,  # Alpaca allows up to 1 year of historical news
-            "rate_limits": {
-                "requests_per_minute": 200,  # Free tier limit
-                "notes": "Rate limits depend on your Alpaca subscription tier"
-            }
-        }
+        return ["company_news", "global_news"]
+    
+    def validate_config(self) -> bool:
+        """
+        Validate provider configuration.
+        
+        Returns:
+            bool: True if API credentials are configured and client is initialized
+        """
+        return self.client is not None and self.api_key is not None and self.api_secret is not None
+    
+    def _format_as_dict(self, data: Any) -> Dict[str, Any]:
+        """
+        Format data as a structured dictionary.
+        
+        Args:
+            data: News data (already in dict format)
+            
+        Returns:
+            Dict[str, Any]: Structured dictionary
+        """
+        if isinstance(data, dict):
+            return data
+        return {"data": data}
+    
+    def _format_as_markdown(self, data: Dict[str, Any]) -> str:
+        """
+        Format news data as markdown.
+        
+        Args:
+            data: News data dictionary
+        
+        Returns:
+            Markdown-formatted string
+        """
+        # Detect if this is company-specific news by checking for 'symbol' key
+        is_company_news = "symbol" in data
+        
+        lines = []
+        
+        # Header
+        if is_company_news:
+            lines.append(f"# News for {data['symbol']}")
+        else:
+            lines.append("# Global Market News")
+        
+        lines.append(f"**Period:** {data['start_date'][:10]} to {data['end_date'][:10]}")
+        lines.append(f"**Articles:** {data['article_count']}")
+        lines.append("")
+        
+        # Articles
+        for i, article in enumerate(data["articles"], 1):
+            lines.append(f"## {i}. {article['title']}")
+            lines.append(f"**Source:** {article['source']}")
+            
+            if article.get('author'):
+                lines.append(f"**Author:** {article['author']}")
+            
+            if article.get('published_at'):
+                pub_date = article['published_at'][:19].replace('T', ' ')
+                lines.append(f"**Published:** {pub_date}")
+            
+            if article.get('symbols'):
+                symbols_str = ", ".join(article['symbols'])
+                lines.append(f"**Symbols:** {symbols_str}")
+            
+            lines.append("")
+            lines.append(article['summary'])
+            
+            if article.get('url'):
+                lines.append(f"\n[Read more]({article['url']})")
+            
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+        
+        return "\n".join(lines)
     
     @log_provider_call
     def get_company_news(
@@ -169,11 +233,11 @@ class AlpacaNewsProvider(MarketNewsInterface):
                 return result
             elif format_type == "both":
                 return {
-                    "text": self._format_as_markdown(result, is_company_news=True),
+                    "text": self._format_as_markdown(result),
                     "data": result
                 }
             else:  # markdown
-                return self._format_as_markdown(result, is_company_news=True)
+                return self._format_as_markdown(result)
             
         except Exception as e:
             logger.error(f"Error fetching company news for {symbol}: {e}", exc_info=True)
@@ -265,63 +329,12 @@ class AlpacaNewsProvider(MarketNewsInterface):
                 return result
             elif format_type == "both":
                 return {
-                    "text": self._format_as_markdown(result, is_company_news=False),
+                    "text": self._format_as_markdown(result),
                     "data": result
                 }
             else:  # markdown
-                return self._format_as_markdown(result, is_company_news=False)
+                return self._format_as_markdown(result)
             
         except Exception as e:
             logger.error(f"Error fetching global news: {e}", exc_info=True)
             raise
-    
-    def _format_as_markdown(self, data: Dict[str, Any], is_company_news: bool) -> str:
-        """
-        Format news data as markdown.
-        
-        Args:
-            data: News data dictionary
-            is_company_news: Whether this is company-specific news
-        
-        Returns:
-            Markdown-formatted string
-        """
-        lines = []
-        
-        # Header
-        if is_company_news:
-            lines.append(f"# News for {data['symbol']}")
-        else:
-            lines.append("# Global Market News")
-        
-        lines.append(f"**Period:** {data['start_date'][:10]} to {data['end_date'][:10]}")
-        lines.append(f"**Articles:** {data['article_count']}")
-        lines.append("")
-        
-        # Articles
-        for i, article in enumerate(data["articles"], 1):
-            lines.append(f"## {i}. {article['title']}")
-            lines.append(f"**Source:** {article['source']}")
-            
-            if article.get('author'):
-                lines.append(f"**Author:** {article['author']}")
-            
-            if article.get('published_at'):
-                pub_date = article['published_at'][:19].replace('T', ' ')
-                lines.append(f"**Published:** {pub_date}")
-            
-            if article.get('symbols'):
-                symbols_str = ", ".join(article['symbols'])
-                lines.append(f"**Symbols:** {symbols_str}")
-            
-            lines.append("")
-            lines.append(article['summary'])
-            
-            if article.get('url'):
-                lines.append(f"\n[Read more]({article['url']})")
-            
-            lines.append("")
-            lines.append("---")
-            lines.append("")
-        
-        return "\n".join(lines)

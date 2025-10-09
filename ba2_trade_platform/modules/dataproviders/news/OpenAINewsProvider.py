@@ -159,11 +159,11 @@ class OpenAINewsProvider(MarketNewsInterface):
                 return result
             elif format_type == "both":
                 return {
-                    "text": self._format_as_markdown(result, is_company_news=True),
+                    "text": self._format_as_markdown(result),
                     "data": result
                 }
             else:  # markdown
-                return self._format_as_markdown(result, is_company_news=True)
+                return self._format_as_markdown(result)
             
         except Exception as e:
             logger.error(f"Error fetching company news for {symbol} from OpenAI: {e}", exc_info=True)
@@ -261,29 +261,53 @@ class OpenAINewsProvider(MarketNewsInterface):
                 return result
             elif format_type == "both":
                 return {
-                    "text": self._format_as_markdown(result, is_company_news=False),
+                    "text": self._format_as_markdown(result),
                     "data": result
                 }
             else:  # markdown
-                return self._format_as_markdown(result, is_company_news=False)
+                return self._format_as_markdown(result)
             
         except Exception as e:
             logger.error(f"Error fetching global news from OpenAI: {e}", exc_info=True)
             raise
     
-    def _format_as_markdown(self, data: Dict[str, Any], is_company_news: bool) -> str:
-        """Format news data as markdown."""
+    def validate_config(self) -> bool:
+        """Validate provider configuration."""
+        try:
+            # Check if OpenAI client is properly initialized
+            return self.client is not None and bool(self.model)
+        except Exception:
+            return False
+    
+    def _format_as_dict(self, data: Any) -> Dict[str, Any]:
+        """Format data as structured dictionary."""
+        if isinstance(data, dict):
+            return data
+        return {"content": str(data)}
+    
+    def _format_as_markdown(self, data: Any) -> str:
+        """Format data as markdown."""
+        # Handle the standard interface signature
+        if isinstance(data, str):
+            return data
+        
+        if not isinstance(data, dict):
+            return str(data)
+        
+        # Determine if it's company or global news
+        is_company_news = 'symbol' in data
+        
         lines = []
         
         # Header
         if is_company_news:
-            lines.append(f"# News for {data['symbol']}")
+            lines.append(f"# News for {data.get('symbol', 'Unknown')}")
         else:
             lines.append("# Global Market News")
         
-        lines.append(f"**Period:** {data['start_date'][:10]} to {data['end_date'][:10]}")
-        lines.append(f"**Source:** {data['source']}")
+        lines.append(f"**Period:** {data.get('start_date', 'N/A')[:10]} to {data.get('end_date', 'N/A')[:10]}")
+        lines.append(f"**Source:** {data.get('source', 'OpenAI Web Search')}")
         lines.append("")
-        lines.append(data['content'])
+        lines.append(data.get('content', ''))
         
         return "\n".join(lines)

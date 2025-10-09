@@ -41,21 +41,88 @@ class AlphaVantageNewsProvider(MarketNewsInterface):
         """Get the provider name."""
         return "alphavantage"
     
-    def get_supported_features(self) -> Dict[str, Any]:
+    def get_supported_features(self) -> list[str]:
         """Get supported features of this provider."""
-        return {
-            "company_news": True,
-            "global_news": False,  # Alpha Vantage focuses on company-specific news
-            "sentiment_analysis": True,  # Alpha Vantage provides sentiment scores
-            "full_article_content": False,  # Only summaries available
-            "image_urls": True,
-            "source_attribution": True,
-            "max_lookback_days": 365,
-            "rate_limits": {
-                "requests_per_minute": 5,  # Free tier: 25 requests/day
-                "notes": "Free tier very limited. Consider premium plan for production use."
-            }
-        }
+        return ["company_news", "sentiment_analysis"]
+    
+    def validate_config(self) -> bool:
+        """
+        Validate provider configuration.
+        
+        Returns:
+            bool: True if configuration is valid (Alpha Vantage handled by common module)
+        """
+        # Alpha Vantage API key is managed by alpha_vantage_common.make_api_request
+        # which validates the key on each request
+        return True
+    
+    def _format_as_dict(self, data: Any) -> Dict[str, Any]:
+        """
+        Format data as a structured dictionary.
+        
+        Args:
+            data: News data (already in dict format)
+            
+        Returns:
+            Dict[str, Any]: Structured dictionary
+        """
+        if isinstance(data, dict):
+            return data
+        return {"data": data}
+    
+    def _format_as_markdown(self, data: Dict[str, Any]) -> str:
+        """
+        Format news data as markdown.
+        
+        Args:
+            data: News data dictionary
+        
+        Returns:
+            Markdown-formatted string
+        """
+        lines = []
+        
+        # Header
+        if "symbol" in data:
+            lines.append(f"# News for {data['symbol']}")
+        else:
+            lines.append("# News")
+        
+        lines.append(f"**Period:** {data['start_date'][:10]} to {data['end_date'][:10]}")
+        lines.append(f"**Articles:** {data['article_count']}")
+        lines.append("")
+        
+        # Articles
+        for i, article in enumerate(data.get("articles", []), 1):
+            lines.append(f"## {i}. {article['title']}")
+            lines.append(f"**Source:** {article['source']}")
+            
+            if article.get('authors'):
+                lines.append(f"**Authors:** {', '.join(article['authors'])}")
+            
+            if article.get('published_at'):
+                pub_date = article['published_at'][:19].replace('T', ' ')
+                lines.append(f"**Published:** {pub_date}")
+            
+            if article.get('sentiment'):
+                sentiment = article['sentiment']
+                lines.append(f"**Sentiment:** {sentiment['label']} (score: {sentiment['score']:.2f})")
+            
+            if article.get('topics'):
+                topics_str = ", ".join([f"{t['topic']} ({t['relevance']:.1%})" for t in article['topics'][:3]])
+                lines.append(f"**Topics:** {topics_str}")
+            
+            lines.append("")
+            lines.append(article['summary'])
+            
+            if article.get('url'):
+                lines.append(f"\n[Read more]({article['url']})")
+            
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+        
+        return "\n".join(lines)
     
     @log_provider_call
     def get_company_news(
@@ -150,11 +217,11 @@ class AlphaVantageNewsProvider(MarketNewsInterface):
                 return result
             elif format_type == "both":
                 return {
-                    "text": self._format_as_markdown(result, is_company_news=True),
+                    "text": self._format_as_markdown(result),
                     "data": result
                 }
             else:  # markdown
-                return self._format_as_markdown(result, is_company_news=True)
+                return self._format_as_markdown(result)
             
         except Exception as e:
             logger.error(f"Error fetching company news for {symbol}: {e}", exc_info=True)
@@ -239,11 +306,11 @@ class AlphaVantageNewsProvider(MarketNewsInterface):
                 return result
             elif format_type == "both":
                 return {
-                    "text": self._format_as_markdown(result, is_company_news=False),
+                    "text": self._format_as_markdown(result),
                     "data": result
                 }
             else:  # markdown
-                return self._format_as_markdown(result, is_company_news=False)
+                return self._format_as_markdown(result)
             
         except Exception as e:
             logger.error(f"Error fetching global news: {e}", exc_info=True)
@@ -261,50 +328,3 @@ class AlphaVantageNewsProvider(MarketNewsInterface):
             return "negative"
         else:
             return "neutral"
-    
-    def _format_as_markdown(self, data: Dict[str, Any], is_company_news: bool) -> str:
-        """Format news data as markdown."""
-        lines = []
-        
-        # Header
-        if is_company_news:
-            lines.append(f"# News for {data['symbol']}")
-        else:
-            lines.append("# Global Market News")
-        
-        lines.append(f"**Period:** {data['start_date'][:10]} to {data['end_date'][:10]}")
-        lines.append(f"**Articles:** {data['article_count']}")
-        lines.append("")
-        
-        # Articles
-        for i, article in enumerate(data["articles"], 1):
-            lines.append(f"## {i}. {article['title']}")
-            lines.append(f"**Source:** {article['source']}")
-            
-            if article.get('author'):
-                lines.append(f"**Author:** {article['author']}")
-            
-            if article.get('published_at'):
-                lines.append(f"**Published:** {article['published_at']}")
-            
-            if article.get('sentiment'):
-                sentiment_str = article['sentiment'].upper()
-                if article.get('sentiment_score') is not None:
-                    sentiment_str += f" ({article['sentiment_score']:.3f})"
-                lines.append(f"**Sentiment:** {sentiment_str}")
-            
-            if article.get('symbols'):
-                symbols_str = ", ".join(article['symbols'])
-                lines.append(f"**Symbols:** {symbols_str}")
-            
-            lines.append("")
-            lines.append(article['summary'])
-            
-            if article.get('url'):
-                lines.append(f"\n[Read more]({article['url']})")
-            
-            lines.append("")
-            lines.append("---")
-            lines.append("")
-        
-        return "\n".join(lines)

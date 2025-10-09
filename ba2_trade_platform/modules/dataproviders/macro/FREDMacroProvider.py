@@ -348,3 +348,29 @@ class FREDMacroProvider(MacroEconomicsInterface):
                 result_md += "\n"
         
         return result_md
+    
+    def get_provider_name(self) -> str:
+        """Return the provider name."""
+        return "fred"
+    
+    def get_supported_features(self) -> list[str]:
+        """Return list of supported features."""
+        return ["economic_indicators", "yield_curve", "fed_calendar"]
+    
+    def validate_config(self) -> bool:
+        """Validate provider configuration."""
+        return bool(self._api_key)
+    
+    def _format_as_dict(self, data: Any) -> Dict[str, Any]:
+        """Format data as structured dictionary."""
+        # FRED provider already returns dict format directly from methods
+        if isinstance(data, dict):
+            return data
+        return {"content": str(data)}
+    
+    def _format_as_markdown(self, data: Any) -> str:
+        """Format data as markdown."""
+        # FRED provider already returns markdown format directly from methods
+        if isinstance(data, str):
+            return data
+        return str(data)

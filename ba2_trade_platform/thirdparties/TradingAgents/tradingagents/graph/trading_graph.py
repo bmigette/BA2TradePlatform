@@ -344,6 +344,15 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             return self.toolkit.get_global_news(end_date, lookback_days)
         
         @tool
+        def get_social_media_sentiment(
+            symbol: str,
+            end_date: str,
+            lookback_days: int = None
+        ) -> str:
+            """Retrieve social media sentiment and discussions about a specific company."""
+            return self.toolkit.get_social_media_sentiment(symbol, end_date, lookback_days)
+        
+        @tool
         def get_balance_sheet(
             symbol: str,
             frequency: str,
@@ -426,7 +435,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             ),
             "social": LoggingToolNode(
                 [
-                    get_company_news,  # For company-specific news
+                    get_social_media_sentiment,  # For social media sentiment and discussions
                 ],
                 self.market_analysis_id
             ),
