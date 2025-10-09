@@ -84,48 +84,29 @@ class ToolkitTester:
             
         provider_map = {}
         
-        # OHLCV providers - try multiple for fallback testing
-        ohlcv_providers = []
-        for vendor_name in ["eodhd", "polygon", "fmp", "yfinance"]:
-            if vendor_name in OHLCV_PROVIDERS:
-                ohlcv_providers.append(OHLCV_PROVIDERS[vendor_name])
-        if ohlcv_providers:
-            provider_map["ohlcv"] = ohlcv_providers
+        # OHLCV providers - use all available
+        if OHLCV_PROVIDERS:
+            provider_map["ohlcv"] = list(OHLCV_PROVIDERS.values())
             
-        # Indicator providers
-        indicator_providers = []
-        for vendor_name in ["eodhd", "fmp"]:
-            if vendor_name in INDICATORS_PROVIDERS:
-                indicator_providers.append(INDICATORS_PROVIDERS[vendor_name])
-        if indicator_providers:
-            provider_map["indicators"] = indicator_providers
+        # Indicator providers - use all available
+        if INDICATORS_PROVIDERS:
+            provider_map["indicators"] = list(INDICATORS_PROVIDERS.values())
             
-        # News providers - use all available for aggregation testing
-        news_providers = []
-        for vendor_name in ["eodhd", "polygon", "finnhub", "fmp"]:
-            if vendor_name in NEWS_PROVIDERS:
-                news_providers.append(NEWS_PROVIDERS[vendor_name])
-        if news_providers:
-            provider_map["news"] = news_providers
+        # News providers - use all available (includes FMP)
+        if NEWS_PROVIDERS:
+            provider_map["news"] = list(NEWS_PROVIDERS.values())
             
-        # Fundamentals providers
-        fundamentals_providers = []
-        for vendor_name in ["eodhd", "fmp", "alphavantage"]:
-            if vendor_name in FUNDAMENTALS_DETAILS_PROVIDERS:
-                fundamentals_providers.append(FUNDAMENTALS_DETAILS_PROVIDERS[vendor_name])
-        if fundamentals_providers:
-            provider_map["fundamentals_details"] = fundamentals_providers
+        # Fundamentals details providers - use all available (includes FMP)
+        if FUNDAMENTALS_DETAILS_PROVIDERS:
+            provider_map["fundamentals_details"] = list(FUNDAMENTALS_DETAILS_PROVIDERS.values())
             
-        # Insider providers
-        insider_providers = []
-        for vendor_name in ["eodhd", "fmp"]:
-            if vendor_name in INSIDER_PROVIDERS:
-                insider_providers.append(INSIDER_PROVIDERS[vendor_name])
-        if insider_providers:
-            provider_map["insider"] = insider_providers
+        # Insider providers - use all available
+        if INSIDER_PROVIDERS:
+            provider_map["insider"] = list(INSIDER_PROVIDERS.values())
             
-        # Macro providers - default to FRED
-        provider_map["macro"] = [FREDMacroProvider]
+        # Macro providers - use all available
+        if MACRO_PROVIDERS:
+            provider_map["macro"] = list(MACRO_PROVIDERS.values())
         
         logger.info(f"Built test provider map with {len(provider_map)} categories")
         for category, providers in provider_map.items():

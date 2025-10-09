@@ -101,7 +101,7 @@ class Toolkit:
             for provider_class in self.provider_map["news"]:
                 try:
                     provider = provider_class()
-                    provider_name = provider.get_provider_name()
+                    provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching company news from {provider_name} for {symbol}")
                     news_data = provider.get_company_news(
@@ -166,7 +166,7 @@ class Toolkit:
             for provider_class in self.provider_map["news"]:
                 try:
                     provider = provider_class()
-                    provider_name = provider.get_provider_name()
+                    provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching global news from {provider_name}")
                     news_data = provider.get_global_news(
@@ -236,7 +236,7 @@ class Toolkit:
             for provider_class in self.provider_map["insider"]:
                 try:
                     provider = provider_class()
-                    provider_name = provider.get_provider_name()
+                    provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching insider transactions from {provider_name} for {symbol}")
                     insider_data = provider.get_insider_transactions(
@@ -303,7 +303,7 @@ class Toolkit:
             for provider_class in self.provider_map["insider"]:
                 try:
                     provider = provider_class()
-                    provider_name = provider.get_provider_name()
+                    provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching insider sentiment from {provider_name} for {symbol}")
                     sentiment_data = provider.get_insider_sentiment(
@@ -377,7 +377,7 @@ class Toolkit:
             for provider_class in self.provider_map["fundamentals_details"]:
                 try:
                     provider = provider_class()
-                    provider_name = provider.get_provider_name()
+                    provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching balance sheet from {provider_name} for {symbol}")
                     balance_data = provider.get_balance_sheet(
@@ -449,7 +449,7 @@ class Toolkit:
             for provider_class in self.provider_map["fundamentals_details"]:
                 try:
                     provider = provider_class()
-                    provider_name = provider.get_provider_name()
+                    provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching income statement from {provider_name} for {symbol}")
                     income_data = provider.get_income_statement(
@@ -521,7 +521,7 @@ class Toolkit:
             for provider_class in self.provider_map["fundamentals_details"]:
                 try:
                     provider = provider_class()
-                    provider_name = provider.get_provider_name()
+                    provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching cash flow statement from {provider_name} for {symbol}")
                     cashflow_data = provider.get_cashflow_statement(
@@ -603,19 +603,23 @@ class Toolkit:
             for provider_class in self.provider_map["ohlcv"]:
                 try:
                     provider = provider_class()
-                    provider_name = provider.get_provider_name()
+                    provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Trying OHLCV provider {provider_name} for {symbol}")
-                    ohlcv_data = provider.get_ohlcv(
+                    df = provider.get_dataframe(
                         symbol=symbol,
                         start_date=start_dt,
                         end_date=end_dt,
-                        interval=interval,
-                        format_type="markdown"
+                        interval=interval
                     )
                     
-                    logger.info(f"Successfully retrieved OHLCV data from {provider_name}")
-                    return f"## OHLCV Data from {provider_name.upper()}\n\n{ohlcv_data}"
+                    # Convert DataFrame to markdown format
+                    if df is not None and not df.empty:
+                        logger.info(f"Successfully retrieved OHLCV data from {provider_name}")
+                        ohlcv_markdown = df.to_markdown(index=True)
+                        return f"## OHLCV Data from {provider_name.upper()}\n\n{ohlcv_markdown}"
+                    else:
+                        raise ValueError("Empty DataFrame returned")
                     
                 except Exception as e:
                     logger.warning(f"OHLCV provider {provider_class.__name__} failed: {e}, trying next provider...")
@@ -692,7 +696,7 @@ class Toolkit:
             for provider_class in self.provider_map["indicators"]:
                 try:
                     provider = provider_class()
-                    provider_name = provider.get_provider_name()
+                    provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Trying indicator provider {provider_name} for {symbol} - {indicator}")
                     indicator_data = provider.get_indicator(
@@ -776,7 +780,7 @@ class Toolkit:
             for provider_class in self.provider_map["macro"]:
                 try:
                     provider = provider_class()
-                    provider_name = provider.get_provider_name()
+                    provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching economic indicators from {provider_name}")
                     econ_data = provider.get_economic_indicators(
@@ -845,7 +849,7 @@ class Toolkit:
             for provider_class in self.provider_map["macro"]:
                 try:
                     provider = provider_class()
-                    provider_name = provider.get_provider_name()
+                    provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching yield curve from {provider_name}")
                     yield_data = provider.get_yield_curve(
@@ -914,7 +918,7 @@ class Toolkit:
             for provider_class in self.provider_map["macro"]:
                 try:
                     provider = provider_class()
-                    provider_name = provider.get_provider_name()
+                    provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching Fed calendar from {provider_name}")
                     fed_data = provider.get_fed_calendar(

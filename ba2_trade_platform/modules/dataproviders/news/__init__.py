@@ -16,6 +16,7 @@ from .AlpacaNewsProvider import AlpacaNewsProvider
 from .AlphaVantageNewsProvider import AlphaVantageNewsProvider
 from .OpenAINewsProvider import OpenAINewsProvider
 from .GoogleNewsProvider import GoogleNewsProvider
+from .FMPNewsProvider import FMPNewsProvider
 # from .FinnhubNewsProvider import FinnhubNewsProvider
 # from .RedditNewsProvider import RedditNewsProvider
 
@@ -24,4 +25,5 @@ __all__ = [
     "AlphaVantageNewsProvider",
     "OpenAINewsProvider",
     "GoogleNewsProvider",
+    "FMPNewsProvider",
 ]

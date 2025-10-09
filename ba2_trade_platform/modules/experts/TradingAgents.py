@@ -139,51 +139,51 @@ class TradingAgents(MarketExpertInterface):
             "vendor_balance_sheet": {
                 "type": "list", "required": True, "default": ["yfinance"],
                 "description": "Data vendor(s) for balance sheet data",
-                "valid_values": ["yfinance", "alpha_vantage", "local"],
+                "valid_values": ["yfinance", "fmp", "alpha_vantage", "local"],
                 "multiple": True,
-                "tooltip": "Select one or more data providers for balance sheet data (assets, liabilities, equity). Multiple vendors enable automatic fallback. YFinance provides quarterly/annual data. Alpha Vantage offers similar data. Local uses SimFin pre-downloaded data."
+                "tooltip": "Select one or more data providers for balance sheet data (assets, liabilities, equity). Multiple vendors enable automatic fallback. YFinance provides quarterly/annual data. FMP provides detailed balance sheet statements. Alpha Vantage offers similar data. Local uses SimFin pre-downloaded data."
             },
             "vendor_cashflow": {
                 "type": "list", "required": True, "default": ["yfinance"],
                 "description": "Data vendor(s) for cash flow statement data",
-                "valid_values": ["yfinance", "alpha_vantage", "local"],
+                "valid_values": ["yfinance", "fmp", "alpha_vantage", "local"],
                 "multiple": True,
-                "tooltip": "Select one or more data providers for cash flow statements (operating, investing, financing activities). Multiple vendors enable automatic fallback. YFinance provides quarterly/annual data. Alpha Vantage offers similar data. Local uses SimFin data."
+                "tooltip": "Select one or more data providers for cash flow statements (operating, investing, financing activities). Multiple vendors enable automatic fallback. YFinance provides quarterly/annual data. FMP provides detailed cash flow statements. Alpha Vantage offers similar data. Local uses SimFin data."
             },
             "vendor_income_statement": {
                 "type": "list", "required": True, "default": ["yfinance"],
                 "description": "Data vendor(s) for income statement data",
-                "valid_values": ["yfinance", "alpha_vantage", "local"],
+                "valid_values": ["yfinance", "fmp", "alpha_vantage", "local"],
                 "multiple": True,
-                "tooltip": "Select one or more data providers for income statements (revenue, expenses, net income). Multiple vendors enable automatic fallback. YFinance provides quarterly/annual data. Alpha Vantage offers similar data. Local uses SimFin data."
+                "tooltip": "Select one or more data providers for income statements (revenue, expenses, net income). Multiple vendors enable automatic fallback. YFinance provides quarterly/annual data. FMP provides detailed income statements. Alpha Vantage offers similar data. Local uses SimFin data."
             },
             "vendor_news": {
                 "type": "list", "required": True, "default": ["openai", "alpha_vantage"],
                 "description": "Data vendor(s) for company news",
-                "valid_values": ["openai", "alpha_vantage", "local"],
+                "valid_values": ["openai", "alpha_vantage", "fmp", "local"],
                 "multiple": True,
-                "tooltip": "Select one or more data providers for company news articles. Multiple vendors enable automatic fallback. OpenAI searches social media/news. Alpha Vantage provides news sentiment API. Local uses Finnhub/Reddit cached data. Note: Google News scraping is unreliable due to bot detection."
+                "tooltip": "Select one or more data providers for company news articles. Multiple vendors enable automatic fallback. OpenAI searches social media/news. Alpha Vantage provides news sentiment API. FMP provides company-specific news articles. Local uses Finnhub/Reddit cached data. Note: Google News scraping is unreliable due to bot detection."
             },
             "vendor_global_news": {
                 "type": "list", "required": True, "default": ["openai"],
                 "description": "Data vendor(s) for global/macro news",
-                "valid_values": ["openai", "local"],
+                "valid_values": ["openai", "fmp", "local"],
                 "multiple": True,
-                "tooltip": "Select one or more data providers for global macroeconomic news (interest rates, inflation, geopolitics, etc.). Multiple vendors enable automatic fallback. OpenAI searches web for latest news. Local uses Reddit cached data."
+                "tooltip": "Select one or more data providers for global macroeconomic news (interest rates, inflation, geopolitics, etc.). Multiple vendors enable automatic fallback. OpenAI searches web for latest news. FMP provides general market news. Local uses Reddit cached data."
             },
             "vendor_insider_sentiment": {
-                "type": "list", "required": True, "default": ["local"],
+                "type": "list", "required": True, "default": ["fmp"],
                 "description": "Data vendor(s) for insider sentiment data",
-                "valid_values": ["local"],
+                "valid_values": ["fmp", "local"],
                 "multiple": True,
-                "tooltip": "Insider sentiment data (SEC filings) from company insiders. Currently only available through local Finnhub cached data."
+                "tooltip": "Insider sentiment data (SEC filings) from company insiders. FMP provides calculated sentiment scores from insider transactions. Local uses Finnhub cached data."
             },
             "vendor_insider_transactions": {
-                "type": "list", "required": True, "default": ["yfinance"],
+                "type": "list", "required": True, "default": ["fmp"],
                 "description": "Data vendor(s) for insider transaction data",
-                "valid_values": ["yfinance", "alpha_vantage", "local"],
+                "valid_values": ["fmp", "yfinance", "alpha_vantage", "local"],
                 "multiple": True,
-                "tooltip": "Select one or more data providers for insider trading transactions (buys/sells by executives). Multiple vendors enable automatic fallback. YFinance provides free data. Alpha Vantage offers similar data. Local uses Finnhub cached data."
+                "tooltip": "Select one or more data providers for insider trading transactions (buys/sells by executives). Multiple vendors enable automatic fallback. FMP provides detailed insider trading data with transaction types. YFinance provides free data. Alpha Vantage offers similar data. Local uses Finnhub cached data."
             },
             
             "debug_mode": {

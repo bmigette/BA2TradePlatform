@@ -45,10 +45,9 @@ class AlphaVantageOHLCVProvider(MarketDataProviderInterface):
     - If cache is stale or missing: fetch from API and update cache
     
     Usage:
-        from ba2_trade_platform.config import CACHE_FOLDER
         from ba2_trade_platform.modules.dataproviders.ohlcv import AlphaVantageOHLCVProvider
         
-        provider = AlphaVantageOHLCVProvider(CACHE_FOLDER)
+        provider = AlphaVantageOHLCVProvider()
         
         # Get data as MarketDataPoint objects
         datapoints = provider.get_data(
@@ -67,15 +66,14 @@ class AlphaVantageOHLCVProvider(MarketDataProviderInterface):
         )
     """
     
-    def __init__(self, cache_folder: str):
+    def __init__(self):
         """
         Initialize Alpha Vantage OHLCV provider.
         
-        Args:
-            cache_folder: Directory path where cache files will be stored
+        Caching is automatically configured using config.CACHE_FOLDER.
         """
-        super().__init__(cache_folder)
-        logger.info(f"AlphaVantageOHLCVProvider initialized with cache folder: {cache_folder}")
+        super().__init__()
+        logger.debug("AlphaVantageOHLCVProvider initialized")
     
     @log_provider_call
     def _fetch_data_from_source(
@@ -95,8 +93,8 @@ class AlphaVantageOHLCVProvider(MarketDataProviderInterface):
             interval: Data interval (only '1d' supported for Alpha Vantage)
         
         Returns:
-            DataFrame with columns: timestamp, open, high, low, close, volume, 
-                                   adjusted_close, dividend_amount, split_coefficient
+            DataFrame with columns: Date, Open, High, Low, Close, Volume, 
+                                   Adjusted_Close, Dividend_Amount, Split_Coefficient
         
         Raises:
             ValueError: If interval is not '1d'
@@ -136,27 +134,28 @@ class AlphaVantageOHLCVProvider(MarketDataProviderInterface):
             df = pd.read_csv(StringIO(filtered_csv))
             
             # Rename columns to match our standard format
+            # Base class expects: Date, Open, High, Low, Close, Volume
             column_mapping = {
-                'timestamp': 'timestamp',
-                'open': 'open',
-                'high': 'high',
-                'low': 'low',
-                'close': 'close',
-                'volume': 'volume',
-                'adjusted_close': 'adjusted_close',
-                'dividend_amount': 'dividend_amount',
-                'split_coefficient': 'split_coefficient'
+                'timestamp': 'Date',  # Standardize to 'Date' for base class compatibility
+                'open': 'Open',
+                'high': 'High',
+                'low': 'Low',
+                'close': 'Close',
+                'volume': 'Volume',
+                'adjusted_close': 'Adjusted_Close',
+                'dividend_amount': 'Dividend_Amount',
+                'split_coefficient': 'Split_Coefficient'
             }
             
             # Only rename columns that exist
             existing_mapping = {k: v for k, v in column_mapping.items() if k in df.columns}
             df = df.rename(columns=existing_mapping)
             
-            # Convert timestamp to datetime
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            # Convert Date to datetime
+            df['Date'] = pd.to_datetime(df['Date'])
             
-            # Sort by timestamp (oldest first)
-            df = df.sort_values('timestamp')
+            # Sort by Date (oldest first)
+            df = df.sort_values('Date')
             
             logger.info(
                 f"Fetched {len(df)} data points for {symbol} from Alpha Vantage "
@@ -199,7 +198,7 @@ class AlphaVantageOHLCVProvider(MarketDataProviderInterface):
                 logger.warning(f"No data available for {symbol}")
                 return None
             
-            latest_price = float(df.iloc[-1]['close'])
+            latest_price = float(df.iloc[-1]['Close'])
             logger.debug(f"Latest price for {symbol}: ${latest_price:.2f}")
             return latest_price
             

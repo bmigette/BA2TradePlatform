@@ -4,14 +4,18 @@ Company Insider Trading Data Providers
 Providers for insider transactions and sentiment analysis
 
 Available Providers:
-    - AlphaVantage: Insider transactions from Alpha Vantage API
-    - YFinance: Insider transactions from Yahoo Finance
-    - Finnhub: Insider trading from Finnhub API
+    - FMP: Financial Modeling Prep insider trading data
+    - AlphaVantage: Insider transactions from Alpha Vantage API (Not yet implemented)
+    - YFinance: Insider transactions from Yahoo Finance (Not yet implemented)
+    - Finnhub: Insider trading from Finnhub API (Not yet implemented)
 """
 
-# TODO: Import provider implementations as they are created
+# Import provider implementations
+from .FMPInsiderProvider import FMPInsiderProvider
 # from .AlphaVantageInsiderProvider import AlphaVantageInsiderProvider
 # from .YFinanceInsiderProvider import YFinanceInsiderProvider
 # from .FinnhubInsiderProvider import FinnhubInsiderProvider
 
-__all__ = []
+__all__ = [
+    "FMPInsiderProvider",
+]

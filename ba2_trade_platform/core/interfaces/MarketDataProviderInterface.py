@@ -12,6 +12,7 @@ import pandas as pd
 import os
 from ba2_trade_platform.core.types import MarketDataPoint
 from ba2_trade_platform.logger import logger
+from ba2_trade_platform import config
 
 
 class MarketDataProviderInterface(ABC):
@@ -25,16 +26,18 @@ class MarketDataProviderInterface(ABC):
         - _fetch_data_from_source(): Fetch data from the actual data source
     """
     
-    def __init__(self, cache_folder: str):
+    def __init__(self):
         """
         Initialize the market data provider.
         
-        Args:
-            cache_folder: Directory path where cache files will be stored
+        Caching is automatically configured using:
+        - CACHE_FOLDER from config module
+        - Provider class name for organizing cache files
         """
-        self.cache_folder = cache_folder
-        os.makedirs(cache_folder, exist_ok=True)
-        logger.debug(f"{self.__class__.__name__} initialized with cache folder: {cache_folder}")
+        # Use CACHE_FOLDER from config + class name for provider-specific subfolder
+        self.cache_folder = os.path.join(config.CACHE_FOLDER, self.__class__.__name__)
+        os.makedirs(self.cache_folder, exist_ok=True)
+        logger.debug(f"{self.__class__.__name__} initialized with cache folder: {self.cache_folder}")
     
     @staticmethod
     def normalize_time_to_interval(dt: datetime, interval: str) -> datetime:

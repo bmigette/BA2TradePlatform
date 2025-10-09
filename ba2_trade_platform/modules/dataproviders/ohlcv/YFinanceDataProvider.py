@@ -31,10 +31,9 @@ class YFinanceDataProvider(MarketDataProviderInterface):
     - If cache is stale or missing: fetch from API and update cache
     
     Usage:
-        from ba2_trade_platform.config import CACHE_FOLDER
         from ba2_trade_platform.modules.dataproviders import YFinanceDataProvider
         
-        provider = YFinanceDataProvider(CACHE_FOLDER)
+        provider = YFinanceDataProvider()
         
         # Get data as MarketDataPoint objects
         datapoints = provider.get_data(
@@ -53,15 +52,14 @@ class YFinanceDataProvider(MarketDataProviderInterface):
         )
     """
     
-    def __init__(self, cache_folder: str):
+    def __init__(self):
         """
         Initialize YFinance data provider.
         
-        Args:
-            cache_folder: Directory path where cache files will be stored
+        Caching is automatically configured using config.CACHE_FOLDER.
         """
-        super().__init__(cache_folder)
-        logger.info(f"YFinanceDataProvider initialized with cache folder: {cache_folder}")
+        super().__init__()
+        logger.debug("YFinanceDataProvider initialized")
     
     def _fetch_data_from_source(
         self,

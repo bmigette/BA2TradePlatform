@@ -13,11 +13,12 @@ Available Providers:
 """
 
 from .overview import AlphaVantageCompanyOverviewProvider, OpenAICompanyOverviewProvider
-from .details import AlphaVantageCompanyDetailsProvider, YFinanceCompanyDetailsProvider
+from .details import AlphaVantageCompanyDetailsProvider, YFinanceCompanyDetailsProvider, FMPCompanyDetailsProvider
 
 __all__ = [
     "AlphaVantageCompanyOverviewProvider",
     "OpenAICompanyOverviewProvider",
     "AlphaVantageCompanyDetailsProvider",
     "YFinanceCompanyDetailsProvider",
+    "FMPCompanyDetailsProvider",
 ]

@@ -11,6 +11,7 @@ Available Providers:
 
 from .AlphaVantageCompanyDetailsProvider import AlphaVantageCompanyDetailsProvider
 from .YFinanceCompanyDetailsProvider import YFinanceCompanyDetailsProvider
+from .FMPCompanyDetailsProvider import FMPCompanyDetailsProvider
 
 # TODO: Import additional provider implementations as they are created
 # from .SimFinFundamentalsDetailsProvider import SimFinFundamentalsDetailsProvider
@@ -18,4 +19,5 @@ from .YFinanceCompanyDetailsProvider import YFinanceCompanyDetailsProvider
 __all__ = [
     "AlphaVantageCompanyDetailsProvider",
     "YFinanceCompanyDetailsProvider",
+    "FMPCompanyDetailsProvider",
 ]

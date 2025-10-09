@@ -36,15 +36,17 @@ from .ohlcv.YFinanceDataProvider import YFinanceDataProvider
 from .ohlcv.AlphaVantageOHLCVProvider import AlphaVantageOHLCVProvider
 
 # Import provider implementations
-from .news import AlpacaNewsProvider, AlphaVantageNewsProvider, GoogleNewsProvider, OpenAINewsProvider
+from .news import AlpacaNewsProvider, AlphaVantageNewsProvider, GoogleNewsProvider, OpenAINewsProvider, FMPNewsProvider
 from .indicators import YFinanceIndicatorsProvider, AlphaVantageIndicatorsProvider
 from .fundamentals import (
     AlphaVantageCompanyOverviewProvider,
     OpenAICompanyOverviewProvider,
     AlphaVantageCompanyDetailsProvider,
-    YFinanceCompanyDetailsProvider
+    YFinanceCompanyDetailsProvider,
+    FMPCompanyDetailsProvider
 )
 from .macro import FREDMacroProvider
+from .insider import FMPInsiderProvider
 
 # Provider registries - will be populated as providers are implemented
 OHLCV_PROVIDERS: Dict[str, Type[DataProviderInterface]] = {
@@ -64,6 +66,7 @@ FUNDAMENTALS_OVERVIEW_PROVIDERS: Dict[str, Type[CompanyFundamentalsOverviewInter
 FUNDAMENTALS_DETAILS_PROVIDERS: Dict[str, Type[CompanyFundamentalsDetailsInterface]] = {
     "alphavantage": AlphaVantageCompanyDetailsProvider,
     "yfinance": YFinanceCompanyDetailsProvider,
+    "fmp": FMPCompanyDetailsProvider,
     # "simfin": SimFinFundamentalsDetailsProvider,
 }
 
@@ -72,6 +75,7 @@ NEWS_PROVIDERS: Dict[str, Type[MarketNewsInterface]] = {
     "alphavantage": AlphaVantageNewsProvider,
     "google": GoogleNewsProvider,
     "openai": OpenAINewsProvider,
+    "fmp": FMPNewsProvider,
     # "finnhub": FinnhubNewsProvider,
     # "reddit": RedditNewsProvider,
 }
@@ -81,6 +85,7 @@ MACRO_PROVIDERS: Dict[str, Type[MacroEconomicsInterface]] = {
 }
 
 INSIDER_PROVIDERS: Dict[str, Type[CompanyInsiderInterface]] = {
+    "fmp": FMPInsiderProvider,
     # "alphavantage": AlphaVantageInsiderProvider,
     # "yfinance": YFinanceInsiderProvider,
     # "finnhub": FinnhubInsiderProvider,
@@ -183,13 +188,40 @@ def list_providers(category: str = None) -> Dict[str, list[str]]:
 
 
 __all__ = [
-    "YFinanceDataProvider",  # Legacy
+    # Provider classes
+    "YFinanceDataProvider",
     "AlphaVantageOHLCVProvider",
+    "AlpacaNewsProvider",
+    "AlphaVantageNewsProvider",
+    "GoogleNewsProvider",
+    "OpenAINewsProvider",
+    "FMPNewsProvider",
+    "YFinanceIndicatorsProvider",
+    "AlphaVantageIndicatorsProvider",
+    "AlphaVantageCompanyOverviewProvider",
+    "OpenAICompanyOverviewProvider",
+    "AlphaVantageCompanyDetailsProvider",
+    "YFinanceCompanyDetailsProvider",
+    "FMPCompanyDetailsProvider",
+    "FREDMacroProvider",
+    "FMPInsiderProvider",
+    
+    # Interfaces
+    "DataProviderInterface",
+    "MarketIndicatorsInterface",
+    "CompanyFundamentalsOverviewInterface",
+    "CompanyFundamentalsDetailsInterface",
+    "MarketNewsInterface",
+    "MacroEconomicsInterface",
+    "CompanyInsiderInterface",
+    
+    # Helper functions
     "get_provider",
     "list_providers",
+    
+    # Provider registries
     "OHLCV_PROVIDERS",
     "INDICATORS_PROVIDERS",
-    "FUNDAMENTALS_PROVIDERS",
     "FUNDAMENTALS_OVERVIEW_PROVIDERS",
     "FUNDAMENTALS_DETAILS_PROVIDERS",
     "NEWS_PROVIDERS",
