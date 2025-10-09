@@ -254,11 +254,12 @@ class FMPSenateTrade(MarketExpertInterface):
         for trade in trades:
             # Parse dates
             try:
-                disclose_date_str = trade.get('disclosureDate', '')
+                # FMP API uses 'dateRecieved' for disclosure date and 'transactionDate' for execution date
+                disclose_date_str = trade.get('dateRecieved', '')
                 exec_date_str = trade.get('transactionDate', '')
                 
                 if not disclose_date_str or not exec_date_str:
-                    logger.debug(f"Trade missing dates, skipping")
+                    logger.debug(f"Trade missing dates, skipping: {trade.get('representative', 'Unknown')}")
                     continue
                 
                 # Parse dates (FMP returns YYYY-MM-DD format)
@@ -291,6 +292,8 @@ class FMPSenateTrade(MarketExpertInterface):
                     trade['price_delta_pct'] = (current_price - exec_price) / exec_price * 100
                     trade['days_since_disclose'] = days_since_disclose
                     trade['days_since_exec'] = days_since_exec
+                    trade['disclose_date'] = disclose_date_str
+                    trade['exec_date'] = exec_date_str
                 
                 filtered_trades.append(trade)
                 
@@ -437,7 +440,11 @@ class FMPSenateTrade(MarketExpertInterface):
                 'expected_profit_percent': 0.0,
                 'details': 'No relevant senate/house trades found within configured parameters',
                 'trades': [],
-                'trade_count': 0
+                'trade_count': 0,
+                'buy_count': 0,
+                'sell_count': 0,
+                'total_buy_amount': 0.0,
+                'total_sell_amount': 0.0
             }
         
         # Aggregate trade information
@@ -467,8 +474,8 @@ class FMPSenateTrade(MarketExpertInterface):
                 'trader': trader_name,
                 'type': transaction_type,
                 'amount': trade.get('amount', 'N/A'),
-                'exec_date': trade.get('transactionDate', 'N/A'),
-                'disclose_date': trade.get('disclosureDate', 'N/A'),
+                'exec_date': trade.get('exec_date', trade.get('transactionDate', 'N/A')),
+                'disclose_date': trade.get('disclose_date', trade.get('dateRecieved', 'N/A')),
                 'exec_price': trade.get('exec_price'),
                 'current_price': trade.get('current_price'),
                 'price_delta_pct': trade.get('price_delta_pct', 0),

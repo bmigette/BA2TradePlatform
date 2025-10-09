@@ -304,7 +304,15 @@ Final Confidence = {confidence:.1f}%
             'target_median': target_median,
             'analyst_count': analyst_count,
             'base_confidence': base_confidence,
-            'analyst_confidence_boost': analyst_confidence_boost
+            'analyst_confidence_boost': analyst_confidence_boost,
+            # Add analyst breakdown
+            'strong_buy': strong_buy if 'strong_buy' in locals() else 0,
+            'buy': buy if 'buy' in locals() else 0,
+            'hold': hold if 'hold' in locals() else 0,
+            'sell': sell if 'sell' in locals() else 0,
+            'strong_sell': strong_sell if 'strong_sell' in locals() else 0,
+            'consensus_spread_pct': ((target_high - target_low) / target_consensus * 100) if (target_high and target_low and target_consensus) else 0,
+            'target_price': target_price if 'target_price' in locals() else target_consensus
         }
     
     def _create_expert_recommendation(self, recommendation_data: Dict[str, Any], 
@@ -432,8 +440,8 @@ Final Confidence = {confidence:.1f}%
             update_instance(market_analysis)
             
             # Get settings
-            profit_ratio = self.settings.get('profit_ratio', 1.0)
-            min_analysts = self.settings.get('min_analysts', 3)
+            profit_ratio = float(self.settings.get('profit_ratio', 1.0))
+            min_analysts = int(self.settings.get('min_analysts', 3))
             
             # Get current price first (needed for calculation)
             current_price = self._get_current_price(symbol)
@@ -480,6 +488,18 @@ Final Confidence = {confidence:.1f}%
                         'low': recommendation_data['target_low'],
                         'median': recommendation_data['target_median'],
                         'analyst_count': recommendation_data['analyst_count']
+                    },
+                    'analyst_breakdown': {
+                        'strong_buy': recommendation_data.get('strong_buy', 0),
+                        'buy': recommendation_data.get('buy', 0),
+                        'hold': recommendation_data.get('hold', 0),
+                        'sell': recommendation_data.get('sell', 0),
+                        'strong_sell': recommendation_data.get('strong_sell', 0)
+                    },
+                    'confidence_breakdown': {
+                        'base_confidence': recommendation_data.get('base_confidence', 0),
+                        'analyst_confidence_boost': recommendation_data.get('analyst_confidence_boost', 0),
+                        'consensus_spread_pct': recommendation_data.get('consensus_spread_pct', 0)
                     },
                     'consensus_data': consensus_data,
                     'upgrade_data': upgrade_data,
@@ -712,19 +732,114 @@ Final Confidence = {confidence:.1f}%
                             
                             # Current price marker
                             with ui.element('div').classes('absolute top-0 bottom-0 w-1 bg-blue-600').style(f'left: {current_pos}%'):
-                                ui.element('div').classes('absolute -top-6 left-1/2 transform -translate-x-1/2 text-xs font-bold text-blue-600').text('Current')
+                                with ui.element('div').classes('absolute -top-6 left-1/2 transform -translate-x-1/2'):
+                                    ui.label('Current').classes('text-xs font-bold text-blue-600')
                             
                             # Consensus marker
                             with ui.element('div').classes('absolute top-0 bottom-0 w-1 bg-orange-600').style(f'left: {consensus_pos}%'):
-                                ui.element('div').classes('absolute -bottom-6 left-1/2 transform -translate-x-1/2 text-xs font-bold text-orange-600').text('Target')
+                                with ui.element('div').classes('absolute -bottom-6 left-1/2 transform -translate-x-1/2'):
+                                    ui.label('Target').classes('text-xs font-bold text-orange-600')
                         
                         with ui.row().classes('w-full justify-between mt-8'):
                             ui.label(f'${low:.2f}').classes('text-xs text-grey-6')
                             ui.label(f'${high:.2f}').classes('text-xs text-grey-6')
             
+            # Analyst Recommendations Breakdown
+            analyst_breakdown = state.get('analyst_breakdown', {})
+            if analyst_breakdown and analyst_count > 0:
+                strong_buy = analyst_breakdown.get('strong_buy', 0)
+                buy = analyst_breakdown.get('buy', 0)
+                hold = analyst_breakdown.get('hold', 0)
+                sell = analyst_breakdown.get('sell', 0)
+                strong_sell = analyst_breakdown.get('strong_sell', 0)
+                
+                with ui.card_section().classes('bg-grey-1'):
+                    ui.label('Analyst Recommendations Breakdown').classes('text-subtitle1 text-weight-medium mb-3')
+                    
+                    # Create a visual bar chart - show all categories
+                    with ui.column().classes('w-full gap-2'):
+                        # Strong Buy
+                        pct = (strong_buy / analyst_count * 100) if analyst_count > 0 else 0
+                        with ui.row().classes('w-full items-center gap-2'):
+                            ui.label('Strong Buy').classes('w-24 text-right text-sm')
+                            ui.label(str(strong_buy)).classes('w-8 text-sm font-bold text-green-700')
+                            with ui.element('div').classes('flex-grow bg-grey-3 rounded overflow-hidden h-6'):
+                                if pct > 0:
+                                    ui.element('div').classes('bg-green-600 h-full').style(f'width: {pct}%')
+                            ui.label(f'{pct:.0f}%').classes('w-12 text-xs text-grey-6')
+                        
+                        # Buy
+                        pct = (buy / analyst_count * 100) if analyst_count > 0 else 0
+                        with ui.row().classes('w-full items-center gap-2'):
+                            ui.label('Buy').classes('w-24 text-right text-sm')
+                            ui.label(str(buy)).classes('w-8 text-sm font-bold text-green-600')
+                            with ui.element('div').classes('flex-grow bg-grey-3 rounded overflow-hidden h-6'):
+                                if pct > 0:
+                                    ui.element('div').classes('bg-green-400 h-full').style(f'width: {pct}%')
+                            ui.label(f'{pct:.0f}%').classes('w-12 text-xs text-grey-6')
+                        
+                        # Hold
+                        pct = (hold / analyst_count * 100) if analyst_count > 0 else 0
+                        with ui.row().classes('w-full items-center gap-2'):
+                            ui.label('Hold').classes('w-24 text-right text-sm')
+                            ui.label(str(hold)).classes('w-8 text-sm font-bold text-grey-700')
+                            with ui.element('div').classes('flex-grow bg-grey-3 rounded overflow-hidden h-6'):
+                                if pct > 0:
+                                    ui.element('div').classes('bg-grey-500 h-full').style(f'width: {pct}%')
+                            ui.label(f'{pct:.0f}%').classes('w-12 text-xs text-grey-6')
+                        
+                        # Sell
+                        pct = (sell / analyst_count * 100) if analyst_count > 0 else 0
+                        with ui.row().classes('w-full items-center gap-2'):
+                            ui.label('Sell').classes('w-24 text-right text-sm')
+                            ui.label(str(sell)).classes('w-8 text-sm font-bold text-red-600')
+                            with ui.element('div').classes('flex-grow bg-grey-3 rounded overflow-hidden h-6'):
+                                if pct > 0:
+                                    ui.element('div').classes('bg-red-400 h-full').style(f'width: {pct}%')
+                            ui.label(f'{pct:.0f}%').classes('w-12 text-xs text-grey-6')
+                        
+                        # Strong Sell
+                        pct = (strong_sell / analyst_count * 100) if analyst_count > 0 else 0
+                        with ui.row().classes('w-full items-center gap-2'):
+                            ui.label('Strong Sell').classes('w-24 text-right text-sm')
+                            ui.label(str(strong_sell)).classes('w-8 text-sm font-bold text-red-700')
+                            with ui.element('div').classes('flex-grow bg-grey-3 rounded overflow-hidden h-6'):
+                                if pct > 0:
+                                    ui.element('div').classes('bg-red-600 h-full').style(f'width: {pct}%')
+                            ui.label(f'{pct:.0f}%').classes('w-12 text-xs text-grey-6')
+                    
+                    ui.separator().classes('my-2')
+                    ui.label(f'Total Analysts: {analyst_count}').classes('text-sm text-grey-7')
+            
+            # Confidence Breakdown
+            confidence_breakdown = state.get('confidence_breakdown', {})
+            if confidence_breakdown:
+                base_confidence = confidence_breakdown.get('base_confidence', 0)
+                analyst_boost = confidence_breakdown.get('analyst_confidence_boost', 0)
+                spread_pct = confidence_breakdown.get('consensus_spread_pct', 0)
+                
+                with ui.card_section():
+                    ui.label('Confidence Score Breakdown').classes('text-subtitle1 text-weight-medium mb-2')
+                    
+                    with ui.grid(columns=3).classes('w-full gap-4'):
+                        with ui.card().classes('bg-blue-50'):
+                            ui.label('Base Confidence').classes('text-caption text-grey-7')
+                            ui.label(f'{base_confidence:.1f}%').classes('text-h5 text-blue-700')
+                            ui.label(f'From {spread_pct:.1f}% spread').classes('text-xs text-grey-6')
+                        
+                        with ui.card().classes('bg-green-50'):
+                            ui.label('Analyst Boost').classes('text-caption text-grey-7')
+                            ui.label(f'+{analyst_boost:.1f}%').classes('text-h5 text-green-700')
+                            ui.label(f'{analyst_count} analysts').classes('text-xs text-grey-6')
+                        
+                        with ui.card().classes('bg-purple-50'):
+                            ui.label('Final Confidence').classes('text-caption text-grey-7')
+                            ui.label(f'{confidence:.1f}%').classes('text-h5 text-purple-700')
+                            ui.label('Combined score').classes('text-xs text-grey-6')
+            
             # Settings
-            profit_ratio = settings.get('profit_ratio', 1.0)
-            min_analysts = settings.get('min_analysts', 3)
+            profit_ratio = float(settings.get('profit_ratio', 1.0))
+            min_analysts = int(settings.get('min_analysts', 3))
             
             with ui.card_section():
                 ui.label('Analysis Settings').classes('text-subtitle1 text-weight-medium mb-2')
@@ -736,26 +851,64 @@ Final Confidence = {confidence:.1f}%
             # Methodology
             with ui.expansion('Calculation Methodology', icon='info').classes('w-full'):
                 with ui.card_section().classes('bg-grey-1'):
+                    confidence_breakdown = state.get('confidence_breakdown', {})
+                    base_conf = confidence_breakdown.get('base_confidence', 0)
+                    analyst_boost = confidence_breakdown.get('analyst_confidence_boost', 0)
+                    spread_pct = confidence_breakdown.get('consensus_spread_pct', 0)
+                    
                     ui.markdown(f'''
+**Signal Determination:**
+
+The recommendation signal is based on the price delta from current price to consensus target:
+- **BUY**: Consensus target is >5% above current price (uses High target for profit calc)
+- **SELL**: Consensus target is >5% below current price (uses Low target for profit calc)
+- **HOLD**: Consensus target is within ±5% of current price
+
+---
+
+**Confidence Score Calculation:**
+
+1. **Base Confidence** = 100 - Target Spread %
+   - Target Spread % = (High Target - Low Target) / Consensus × 100
+   - Current Spread: {spread_pct:.1f}%
+   - Base Score: {base_conf:.1f}%
+   - **Logic**: Tighter analyst agreement (lower spread) = Higher confidence
+
+2. **Analyst Coverage Boost** = min(20, (Analyst Count - Min Required) × 2)
+   - Analyst Count: {analyst_count}
+   - Min Required: {min_analysts}
+   - Coverage Boost: +{analyst_boost:.1f}%
+   - **Logic**: More analyst coverage = Higher reliability (capped at +20%)
+
+3. **Final Confidence** = Base Confidence + Analyst Boost
+   - Result: {base_conf:.1f}% + {analyst_boost:.1f}% = **{confidence:.1f}%**
+
+---
+
 **Expected Profit Calculation:**
 
 For **BUY** signals:
 1. **Price Delta** = High Target - Current Price
-2. **Weighted Delta** = Price Delta × Confidence × Profit Ratio
-3. **Expected Profit %** = Weighted Delta / Current Price × 100
+2. **Weighted Delta** = Price Delta × (Confidence / 100) × Profit Ratio
+3. **Expected Profit %** = (Weighted Delta / Current Price) × 100
 
 For **SELL** signals:
 1. **Price Delta** = Current Price - Low Target
-2. **Weighted Delta** = Price Delta × Confidence × Profit Ratio
-3. **Expected Profit %** = Weighted Delta / Current Price × 100
+2. **Weighted Delta** = Price Delta × (Confidence / 100) × Profit Ratio
+3. **Expected Profit %** = (Weighted Delta / Current Price) × 100
 
-**Confidence Calculation:**
-1. **Base Confidence** = 100 - Target Spread %
-   - Target Spread % = (High - Low) / Consensus × 100
-   - Tighter analyst agreement → Higher confidence
-2. **Analyst Boost** = min(20, (Analyst Count - Min Analysts) × 2)
-   - More analysts → Higher confidence boost (max +20%)
-3. **Final Confidence** = Base Confidence + Analyst Boost
+**Profit Ratio Setting**: Adjusts expected profit based on risk tolerance (current: {profit_ratio}x)
+
+---
+
+**Analyst Recommendations:**
+
+The breakdown shows how many analysts rate the stock as:
+- **Strong Buy / Buy**: Bullish ratings (expecting price increase)
+- **Hold**: Neutral rating (price expected to stay stable)
+- **Sell / Strong Sell**: Bearish ratings (expecting price decrease)
+
+This distribution helps validate the consensus target and signal strength.
 
 **Signal Logic:**
 - **BUY**: Consensus > Current Price + 5%
