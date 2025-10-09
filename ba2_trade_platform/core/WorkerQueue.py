@@ -517,6 +517,12 @@ class WorkerQueue:
             # Run the analysis - this updates the market_analysis object
             expert.run_analysis(task.symbol, market_analysis)
             
+            # Add 2-second sleep after analysis for all experts except TradingAgents
+            expert_instance_record = get_instance(ExpertInstance, task.expert_instance_id)
+            if expert_instance_record and expert_instance_record.expert != "TradingAgents":
+                logger.debug(f"Adding 2-second sleep after {expert_instance_record.expert} analysis")
+                time.sleep(2)
+            
             # Update task with success
             with self._task_lock:
                 task.status = WorkerTaskStatus.COMPLETED

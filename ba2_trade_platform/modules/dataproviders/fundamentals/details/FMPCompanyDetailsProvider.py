@@ -362,7 +362,14 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             return statements[:lookback_periods]
         
         # Otherwise filter by date
-        actual_start_date = validate_date_range(end_date, start_date, lookback_periods) if start_date else None
+        if start_date:
+            # validate_date_range returns tuple (start_date, end_date)
+            actual_start_date, actual_end_date = validate_date_range(start_date, end_date, lookback_periods)
+            # Use validated end_date if provided
+            if actual_end_date:
+                end_date = actual_end_date
+        else:
+            actual_start_date = None
         
         if not actual_start_date:
             return statements

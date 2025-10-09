@@ -155,8 +155,12 @@ class AlphaVantageIndicatorsProvider(MarketIndicatorsInterface):
                 f"Supported indicators: {self.SUPPORTED_INDICATOR_KEYS}"
             )
         
-        # Validate date range
-        actual_start_date = validate_date_range(end_date, start_date, lookback_days)
+        # Validate date range - returns tuple (start_date, end_date)
+        actual_start_date, actual_end_date = validate_date_range(start_date, end_date, lookback_days)
+        
+        # Use validated end_date if provided
+        if actual_end_date:
+            end_date = actual_end_date
         
         # Format dates for Alpha Vantage
         curr_date_str = end_date.strftime("%Y-%m-%d")

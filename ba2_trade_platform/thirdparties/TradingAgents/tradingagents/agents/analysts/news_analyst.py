@@ -1,4 +1,5 @@
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.tools import tool
 import time
 import json
 from ...prompts import format_analyst_prompt, get_prompt
@@ -9,9 +10,15 @@ def create_news_analyst(llm, toolkit):
         current_date = state["trade_date"]
         ticker = state["company_of_interest"]
 
-        # Use new toolkit methods for news data
+        # Wrap toolkit method with @tool decorator
+        @tool
+        def get_global_news(symbol: str, end_date: str, lookback_days: int = None) -> str:
+            """Get global news articles about a company."""
+            return toolkit.get_global_news(symbol, end_date, lookback_days)
+
+        # Use wrapped tools
         tools = [
-            toolkit.get_global_news,
+            get_global_news,
         ]
 
         # Get system prompt from centralized prompts

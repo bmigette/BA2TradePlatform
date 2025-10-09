@@ -91,7 +91,40 @@ By using this software, you acknowledge that you understand and accept these ris
    cd BA2TradePlatform
    ```
 
-2. **Create and activate virtual environment**:
+2. **Choose your package manager**:
+
+   #### Option A: Using `uv` (⚡ RECOMMENDED - Much Faster!)
+   
+   `uv` is a blazingly fast Python package installer and resolver, written in Rust. It's **10-100x faster** than pip for installing packages.
+   
+   **Install uv** (if not already installed):
+   ```bash
+   # Windows (PowerShell)
+   powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+   
+   # Linux/macOS
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   ```
+   
+   **Create virtual environment and install dependencies**:
+   ```bash
+   # Create venv and install dependencies in one command
+   uv venv
+   uv pip install -r requirements.txt
+   ```
+   
+   **Activate the virtual environment**:
+   ```bash
+   # Windows
+   .venv\Scripts\Activate.ps1
+   
+   # Linux/macOS
+   source .venv/bin/activate
+   ```
+
+   #### Option B: Using standard `pip` (Traditional Method)
+   
+   **Create and activate virtual environment**:
    
    **Windows**:
    ```powershell
@@ -105,9 +138,7 @@ By using this software, you acknowledge that you understand and accept these ris
    source .venv/bin/activate
    ```
 
-3. **Install dependencies**:
-   
-   **Using virtual environment Python** (recommended):
+   **Install dependencies**:
    ```bash
    # Windows
    .venv\Scripts\python.exe -m pip install -r requirements.txt
@@ -116,7 +147,7 @@ By using this software, you acknowledge that you understand and accept these ris
    .venv/bin/python -m pip install -r requirements.txt
    ```
 
-4. **Configure environment variables** (optional):
+3. **Configure environment variables** (optional):
    
    Create a `.env` file in the project root:
    ```env
@@ -137,7 +168,7 @@ By using this software, you acknowledge that you understand and accept these ris
    PRICE_CACHE_TIME=30  # Price cache duration in seconds
    ```
 
-5. **Run the application**:
+4. **Run the application**:
    
    **Windows**:
    ```powershell
@@ -149,7 +180,7 @@ By using this software, you acknowledge that you understand and accept these ris
    .venv/bin/python main.py
    ```
 
-6. **Access the web interface**:
+5. **Access the web interface**:
    
    Open your browser and navigate to:
    ```
@@ -191,10 +222,11 @@ Cache (ChromaDB, price data) is stored in:
 
 **Dependency Installation Errors**:
 ```bash
-# Upgrade pip first
-.venv\Scripts\python.exe -m pip install --upgrade pip
+# With uv (recommended - much faster)
+uv pip install -r requirements.txt
 
-# Then retry installation
+# Or with pip (upgrade first)
+.venv\Scripts\python.exe -m pip install --upgrade pip
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
@@ -520,6 +552,11 @@ python test.py
 
 **Adding Dependencies**:
 ```bash
+# With uv (recommended)
+uv pip install new_package
+uv pip freeze > requirements.txt
+
+# Or with pip
 pip install new_package
 pip freeze > requirements.txt
 ```
