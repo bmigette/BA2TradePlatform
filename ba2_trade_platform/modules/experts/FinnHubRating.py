@@ -570,9 +570,9 @@ Confidence = Dominant Score / Total × 100 = {dominant_score:.1f} / {total_weigh
                             pct = (hold / total * 100) if total > 0 else 0
                             with ui.row().classes('w-full items-center gap-2'):
                                 ui.label('Hold').classes('w-24 text-right text-sm')
-                                ui.label(str(hold)).classes('w-8 text-sm font-bold')
+                                ui.label(str(hold)).classes('w-8 text-sm font-bold text-amber-700')
                                 with ui.element('div').classes('flex-grow bg-grey-3 rounded overflow-hidden h-6'):
-                                    ui.element('div').classes('bg-grey-500 h-full').style(f'width: {pct}%')
+                                    ui.element('div').classes('bg-amber-400 h-full').style(f'width: {pct}%')
                         
                         # Sell
                         if sell > 0:
