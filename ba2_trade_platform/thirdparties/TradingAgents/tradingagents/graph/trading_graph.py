@@ -45,6 +45,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         market_analysis_id: Optional[int] = None,
         expert_instance_id: Optional[int] = None,
         provider_map: Optional[Dict[str, List[type]]] = None,
+        provider_args: Optional[Dict[str, Any]] = None,
     ):
         """Initialize the trading agents graph and components.
 
@@ -55,6 +56,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             market_analysis_id: Existing MarketAnalysis ID to use (prevents creating a new one)
             expert_instance_id: Expert instance ID for persistent memory storage
             provider_map: BA2 provider map for data access (required for new toolkit)
+            provider_args: Optional arguments for provider instantiation (e.g., {"openai_model": "gpt-5"})
         """
         super().__init__()
         self.debug = debug
@@ -62,6 +64,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         self.market_analysis_id = market_analysis_id
         self.expert_instance_id = expert_instance_id
         self.provider_map = provider_map or {}  # Store provider_map
+        self.provider_args = provider_args or {}  # Store provider_args
 
         # Initialize logger
         # Use LOG_FOLDER from BA2 platform config
@@ -109,7 +112,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         # Initialize new toolkit with provider_map
         if not self.provider_map:
             raise ValueError("provider_map is required for TradingAgentsGraph initialization")
-        self.toolkit = Toolkit(provider_map=self.provider_map)
+        self.toolkit = Toolkit(provider_map=self.provider_map, provider_args=self.provider_args)
 
         # Store market_analysis_id for state initialization
         self._market_analysis_id = market_analysis_id

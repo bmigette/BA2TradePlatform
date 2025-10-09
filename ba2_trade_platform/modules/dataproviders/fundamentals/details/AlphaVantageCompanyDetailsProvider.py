@@ -10,6 +10,7 @@ from datetime import datetime
 import json
 
 from ba2_trade_platform.core.interfaces import CompanyFundamentalsDetailsInterface
+from ba2_trade_platform.core.provider_utils import log_provider_call
 from ba2_trade_platform.logger import logger
 class AlphaVantageRateLimitError(Exception):
     """Exception raised when Alpha Vantage API rate limit is exceeded."""
@@ -70,6 +71,7 @@ class AlphaVantageCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
         
         return response_text
     
+    @log_provider_call
     def get_balance_sheet(
         self,
         symbol: Annotated[str, "Stock ticker symbol"],
@@ -133,6 +135,7 @@ class AlphaVantageCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             logger.error(f"Failed to get balance sheet for {symbol}: {e}")
             raise
     
+    @log_provider_call
     def get_income_statement(
         self,
         symbol: Annotated[str, "Stock ticker symbol"],
@@ -196,6 +199,7 @@ class AlphaVantageCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             logger.error(f"Failed to get income statement for {symbol}: {e}")
             raise
     
+    @log_provider_call
     def get_cashflow_statement(
         self,
         symbol: Annotated[str, "Stock ticker symbol"],

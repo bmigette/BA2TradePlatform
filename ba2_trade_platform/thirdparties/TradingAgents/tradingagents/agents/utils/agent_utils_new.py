@@ -9,6 +9,10 @@ This module provides a completely rewritten toolkit that:
 5. Maintains comprehensive Annotated type hints for LLM tool usage
 
 The Toolkit class methods are designed to be wrapped with @tool decorator by the graph.
+
+IMPORTANT: This toolkit does NOT use ProviderWithPersistence wrapper. All tool calls
+and results are logged by LoggingToolNode in db_storage.py, which creates AnalysisOutput
+entries. Using both would create duplicate database records.
 """
 
 from typing import Annotated, Dict, Type, List, Optional
@@ -41,17 +45,78 @@ class Toolkit:
         "ohlcv": [OHLCVProviderClass1, OHLCVProviderClass2, ...],    # Fallback: try first, then second, etc.
         "indicators": [IndProviderClass1, IndProviderClass2, ...]     # Fallback: try first, then second, etc.
     }
+    
+    Provider Args Structure (optional):
+    {
+        "openai_model": "gpt-5"  # Model to use for OpenAI providers
+    }
     """
     
-    def __init__(self, provider_map: Dict[str, List[Type[DataProviderInterface]]]):
+    def __init__(self, provider_map: Dict[str, List[Type[DataProviderInterface]]], provider_args: Dict[str, any] = None):
         """
         Initialize toolkit with provider configuration.
         
         Args:
             provider_map: Dictionary mapping provider categories to list of provider classes
+            provider_args: Optional dictionary with arguments for provider instantiation
+                          (e.g., {"openai_model": "gpt-5"})
         """
         self.provider_map = provider_map
+        self.provider_args = provider_args or {}
         logger.debug(f"Toolkit initialized with provider_map keys: {list(provider_map.keys())}")
+        if self.provider_args:
+            logger.debug(f"Provider args: {self.provider_args}")
+    
+    def _instantiate_provider(self, provider_class: Type[DataProviderInterface]) -> DataProviderInterface:
+        """
+        Instantiate a provider with appropriate arguments.
+        
+        Args:
+            provider_class: Provider class to instantiate
+            
+        Returns:
+            Instantiated provider
+        """
+        provider_name = provider_class.__name__
+        
+        # Check if this is a MarketIndicatorsInterface that needs OHLCV provider
+        from ba2_trade_platform.core.interfaces import MarketIndicatorsInterface
+        if issubclass(provider_class, MarketIndicatorsInterface):
+            # Get the first OHLCV provider from the provider_map
+            ohlcv_provider = self._get_ohlcv_provider()
+            if ohlcv_provider is None:
+                raise ValueError(f"Cannot instantiate {provider_name}: No OHLCV provider configured")
+            logger.debug(f"Instantiating {provider_name} with OHLCV provider: {ohlcv_provider.__class__.__name__}")
+            return provider_class(ohlcv_provider=ohlcv_provider)
+        
+        # Check if this is an OpenAI provider that needs model argument
+        elif 'OpenAI' in provider_name and 'openai_model' in self.provider_args:
+            model = self.provider_args['openai_model']
+            logger.debug(f"Instantiating {provider_name} with model={model}")
+            return provider_class(model=model)
+        else:
+            # Standard instantiation with no arguments
+            return provider_class()
+    
+    def _get_ohlcv_provider(self) -> Optional[DataProviderInterface]:
+        """
+        Get the first available OHLCV provider instance.
+        
+        Returns:
+            Instantiated OHLCV provider or None if not configured
+        """
+        if "ohlcv" not in self.provider_map or not self.provider_map["ohlcv"]:
+            return None
+        
+        # Instantiate the first OHLCV provider
+        ohlcv_provider_class = self.provider_map["ohlcv"][0]
+        
+        # Check if OpenAI provider needs model argument
+        if 'OpenAI' in ohlcv_provider_class.__name__ and 'openai_model' in self.provider_args:
+            model = self.provider_args['openai_model']
+            return ohlcv_provider_class(model=model)
+        else:
+            return ohlcv_provider_class()
     
     # ========================================================================
     # NEWS PROVIDERS - Aggregate results from all providers
@@ -86,7 +151,8 @@ class Toolkit:
             >>> # Returns news from all configured providers about Apple
         """
         if "news" not in self.provider_map or not self.provider_map["news"]:
-            return "Error: No news providers configured"
+            logger.warning(f"No news providers configured for get_company_news")
+            return "**No Provider Available**\n\nNo news providers are currently configured. Please configure at least one news provider in the expert settings to retrieve company news."
         
         try:
             end_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -100,7 +166,7 @@ class Toolkit:
             results = []
             for provider_class in self.provider_map["news"]:
                 try:
-                    provider = provider_class()
+                    provider = self._instantiate_provider(provider_class)
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching company news from {provider_name} for {symbol}")
@@ -151,7 +217,8 @@ class Toolkit:
             >>> # Returns macro/market news from all configured providers
         """
         if "news" not in self.provider_map or not self.provider_map["news"]:
-            return "Error: No news providers configured"
+            logger.warning(f"No news providers configured for get_global_news")
+            return "**No Provider Available**\n\nNo news providers are currently configured. Please configure at least one news provider in the expert settings to retrieve global news."
         
         try:
             end_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -165,7 +232,7 @@ class Toolkit:
             results = []
             for provider_class in self.provider_map["news"]:
                 try:
-                    provider = provider_class()
+                    provider = self._instantiate_provider(provider_class)
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching global news from {provider_name}")
@@ -186,6 +253,85 @@ class Toolkit:
         except Exception as e:
             logger.error(f"Error in get_global_news: {e}")
             return f"Error retrieving global news: {str(e)}"
+    
+    # ========================================================================
+    # SOCIAL MEDIA PROVIDERS - Aggregate results from all providers
+    # ========================================================================
+    
+    def get_social_media_sentiment(
+        self,
+        symbol: Annotated[str, "Stock ticker symbol (e.g., 'AAPL', 'MSFT', 'TSLA')"],
+        end_date: Annotated[str, "End date for social media data in YYYY-MM-DD format (e.g., '2024-03-15')"],
+        lookback_days: Annotated[
+            Optional[int],
+            "Number of days to look back for social media sentiment and discussions. If not provided, defaults to news_lookback_days from config (typically 7 days). "
+            "You can specify a custom value for different time horizons (e.g., 3 for recent buzz, 14 for trend analysis)."
+        ] = None
+    ) -> str:
+        """
+        Retrieve social media sentiment and discussions about a specific company.
+        
+        This function aggregates social media data, community discussions, and sentiment
+        from platforms like Reddit, Twitter/X, and other sources. It provides insights into
+        retail investor sentiment, trending topics, and community perception.
+        
+        NOTE: This uses the 'social_media' provider category, which should be mapped to
+        specific news providers in the expert configuration (e.g., Reddit-focused providers,
+        social sentiment APIs, etc.).
+        
+        Args:
+            symbol: Stock ticker symbol for the company
+            end_date: End date in YYYY-MM-DD format
+            lookback_days: How many days of social media history to analyze (default from config)
+        
+        Returns:
+            str: Aggregated markdown-formatted social media sentiment from all providers
+        
+        Example:
+            >>> sentiment = get_social_media_sentiment("TSLA", "2024-03-15", lookback_days=7)
+            >>> # Returns social media discussions and sentiment about Tesla
+        """
+        if "social_media" not in self.provider_map or not self.provider_map["social_media"]:
+            logger.warning(f"No social_media providers configured for get_social_media_sentiment")
+            return "**No Provider Available**\n\nNo social media providers are currently configured. Please configure at least one social media provider in the expert settings to retrieve sentiment data."
+        
+        try:
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+            
+            # Default lookback_days from config if not provided
+            if lookback_days is None:
+                from ...dataflows.config import get_config
+                config = get_config()
+                lookback_days = config.get("news_lookback_days", 7)
+            
+            results = []
+            for provider_class in self.provider_map["social_media"]:
+                try:
+                    provider = self._instantiate_provider(provider_class)
+                    provider_name = provider.__class__.__name__
+                    
+                    logger.debug(f"Fetching social media sentiment from {provider_name} for {symbol}")
+                    
+                    # Use get_company_news method from the news provider
+                    # This allows reusing existing news providers for social media analysis
+                    sentiment_data = provider.get_company_news(
+                        symbol=symbol,
+                        end_date=end_dt,
+                        lookback_days=lookback_days,
+                        format_type="markdown"
+                    )
+                    
+                    results.append(f"## Social Media Sentiment from {provider_name.upper()}\n\n{sentiment_data}")
+                    
+                except Exception as e:
+                    logger.error(f"Error fetching social media sentiment from {provider_class.__name__}: {e}")
+                    results.append(f"## {provider_class.__name__} - Error\n\nFailed to fetch sentiment: {str(e)}")
+            
+            return "\n\n---\n\n".join(results) if results else "No social media sentiment data available"
+            
+        except Exception as e:
+            logger.error(f"Error in get_social_media_sentiment: {e}")
+            return f"Error retrieving social media sentiment: {str(e)}"
     
     # ========================================================================
     # INSIDER PROVIDERS - Aggregate results from all providers
@@ -235,7 +381,7 @@ class Toolkit:
             results = []
             for provider_class in self.provider_map["insider"]:
                 try:
-                    provider = provider_class()
+                    provider = self._instantiate_provider(provider_class)
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching insider transactions from {provider_name} for {symbol}")
@@ -302,7 +448,7 @@ class Toolkit:
             results = []
             for provider_class in self.provider_map["insider"]:
                 try:
-                    provider = provider_class()
+                    provider = self._instantiate_provider(provider_class)
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching insider sentiment from {provider_name} for {symbol}")
@@ -376,7 +522,7 @@ class Toolkit:
             results = []
             for provider_class in self.provider_map["fundamentals_details"]:
                 try:
-                    provider = provider_class()
+                    provider = self._instantiate_provider(provider_class)
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching balance sheet from {provider_name} for {symbol}")
@@ -448,7 +594,7 @@ class Toolkit:
             results = []
             for provider_class in self.provider_map["fundamentals_details"]:
                 try:
-                    provider = provider_class()
+                    provider = self._instantiate_provider(provider_class)
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching income statement from {provider_name} for {symbol}")
@@ -520,7 +666,7 @@ class Toolkit:
             results = []
             for provider_class in self.provider_map["fundamentals_details"]:
                 try:
-                    provider = provider_class()
+                    provider = self._instantiate_provider(provider_class)
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching cash flow statement from {provider_name} for {symbol}")
@@ -602,7 +748,7 @@ class Toolkit:
             # Try each provider in order until one succeeds (fallback logic)
             for provider_class in self.provider_map["ohlcv"]:
                 try:
-                    provider = provider_class()
+                    provider = self._instantiate_provider(provider_class)
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Trying OHLCV provider {provider_name} for {symbol}")
@@ -695,7 +841,7 @@ class Toolkit:
             # Try each provider in order until one succeeds (fallback logic)
             for provider_class in self.provider_map["indicators"]:
                 try:
-                    provider = provider_class()
+                    provider = self._instantiate_provider(provider_class)
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Trying indicator provider {provider_name} for {symbol} - {indicator}")
@@ -779,7 +925,7 @@ class Toolkit:
             results = []
             for provider_class in self.provider_map["macro"]:
                 try:
-                    provider = provider_class()
+                    provider = self._instantiate_provider(provider_class)
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching economic indicators from {provider_name}")
@@ -848,7 +994,7 @@ class Toolkit:
             results = []
             for provider_class in self.provider_map["macro"]:
                 try:
-                    provider = provider_class()
+                    provider = self._instantiate_provider(provider_class)
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching yield curve from {provider_name}")
@@ -917,7 +1063,7 @@ class Toolkit:
             results = []
             for provider_class in self.provider_map["macro"]:
                 try:
-                    provider = provider_class()
+                    provider = self._instantiate_provider(provider_class)
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching Fed calendar from {provider_name}")

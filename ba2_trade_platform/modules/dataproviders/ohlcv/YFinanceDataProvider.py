@@ -10,6 +10,7 @@ from typing import Optional
 import pandas as pd
 import yfinance as yf
 from ba2_trade_platform.core.interfaces.MarketDataProviderInterface import MarketDataProviderInterface
+from ba2_trade_platform.core.provider_utils import log_provider_call
 from ba2_trade_platform.logger import logger
 
 
@@ -152,6 +153,7 @@ class YFinanceDataProvider(MarketDataProviderInterface):
             logger.error(f"Failed to fetch data from Yahoo Finance for {symbol}: {e}", exc_info=True)
             raise Exception(f"Yahoo Finance data fetch failed for {symbol}: {str(e)}")
     
+    @log_provider_call
     def get_current_price(self, symbol: str) -> Optional[float]:
         """
         Get the current/latest price for a symbol.

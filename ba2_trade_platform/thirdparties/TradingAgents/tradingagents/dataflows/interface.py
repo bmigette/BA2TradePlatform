@@ -14,7 +14,6 @@ from openai import OpenAI
 from .config import get_config, set_config, DATA_DIR
 from .. import logger as ta_logger
 from ba2_trade_platform.modules.dataproviders import YFinanceDataProvider
-from ba2_trade_platform.config import CACHE_FOLDER
 
 # Import vendor-specific modules (for backward compatibility with direct imports)
 from .y_finance import (
@@ -770,7 +769,7 @@ def get_YFin_data_online(
         start_dt = datetime.strptime(start_date, "%Y-%m-%d")
 
     # Use YFinanceDataProvider for smart caching
-    provider = YFinanceDataProvider(CACHE_FOLDER)
+    provider = YFinanceDataProvider()
     
     try:
         # Get data via data provider (uses smart cache)

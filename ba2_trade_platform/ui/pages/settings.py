@@ -9,7 +9,7 @@ from ...core.models import AccountDefinition, AccountSetting, AppSetting, Instru
 from ...logger import logger
 from ...core.db import get_db, get_all_instances, delete_instance, add_instance, update_instance, get_instance
 from ...modules.accounts import providers
-from ...core.AccountInterface import AccountInterface
+from ...core.interfaces import AccountInterface
 from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, is_share_adjustment_action, AnalysisUseCase, MarketAnalysisStatus
 from ...core.cleanup import preview_cleanup, execute_cleanup, get_cleanup_statistics
 from yahooquery import Ticker, search as yq_search
@@ -375,6 +375,9 @@ class AppSettingsTab:
         self.finnhub_input = None
         self.fred_input = None
         self.alpha_vantage_input = None
+        self.fmp_input = None
+        self.alpaca_key_input = None
+        self.alpaca_secret_input = None
         self.worker_count_input = None
         self.account_refresh_interval_input = None
         self.render()
@@ -386,6 +389,9 @@ class AppSettingsTab:
         finnhub = session.exec(select(AppSetting).where(AppSetting.key == 'finnhub_api_key')).first()
         fred = session.exec(select(AppSetting).where(AppSetting.key == 'fred_api_key')).first()
         alpha_vantage = session.exec(select(AppSetting).where(AppSetting.key == 'alpha_vantage_api_key')).first()
+        fmp = session.exec(select(AppSetting).where(AppSetting.key == 'FMP_API_KEY')).first()
+        alpaca_key = session.exec(select(AppSetting).where(AppSetting.key == 'alpaca_api_key')).first()
+        alpaca_secret = session.exec(select(AppSetting).where(AppSetting.key == 'alpaca_api_secret')).first()
         worker_count = session.exec(select(AppSetting).where(AppSetting.key == 'worker_count')).first()
         account_refresh_interval = session.exec(select(AppSetting).where(AppSetting.key == 'account_refresh_interval')).first()
         
@@ -397,6 +403,14 @@ class AppSettingsTab:
             self.finnhub_input = ui.input(label='Finnhub API Key', value=finnhub.value_str if finnhub else '').classes('w-full')
             self.fred_input = ui.input(label='FRED API Key', value=fred.value_str if fred else '').classes('w-full')
             self.alpha_vantage_input = ui.input(label='Alpha Vantage API Key', value=alpha_vantage.value_str if alpha_vantage else '').classes('w-full')
+            with ui.row().classes('w-full items-center gap-2 mt-2 mb-2'):
+                self.fmp_input = ui.input(label='Financial Modeling Prep (FMP) API Key', value=fmp.value_str if fmp else '').classes('flex-1')
+                ui.link('Get FMP Key', 'https://site.financialmodelingprep.com/developer/docs', new_tab=True).classes('text-sm text-blue-600 underline')
+            ui.label('Alpaca API Keys').classes('text-lg font-semibold mt-4')
+            with ui.row().classes('w-full items-center gap-2'):
+                self.alpaca_key_input = ui.input(label='Alpaca API Key', value=alpaca_key.value_str if alpaca_key else '').classes('flex-1')
+                ui.link('Get Alpaca Keys', 'https://alpaca.markets/docs/trading/getting-started/', new_tab=True).classes('text-sm text-blue-600 underline')
+            self.alpaca_secret_input = ui.input(label='Alpaca API Secret', value=alpaca_secret.value_str if alpaca_secret else '', password=True, password_toggle_button=True).classes('w-full')
             self.worker_count_input = ui.number(
                 label='Worker Count', 
                 value=int(worker_count.value_str) if worker_count and worker_count.value_str else 4,
@@ -466,6 +480,33 @@ class AppSettingsTab:
             else:
                 alpha_vantage = AppSetting(key='alpha_vantage_api_key', value_str=self.alpha_vantage_input.value)
                 add_instance(alpha_vantage, session)
+            
+            # FMP (Financial Modeling Prep)
+            fmp = session.exec(select(AppSetting).where(AppSetting.key == 'FMP_API_KEY')).first()
+            if fmp:
+                fmp.value_str = self.fmp_input.value
+                update_instance(fmp, session)
+            else:
+                fmp = AppSetting(key='FMP_API_KEY', value_str=self.fmp_input.value)
+                add_instance(fmp, session)
+            
+            # Alpaca API Key
+            alpaca_key = session.exec(select(AppSetting).where(AppSetting.key == 'alpaca_api_key')).first()
+            if alpaca_key:
+                alpaca_key.value_str = self.alpaca_key_input.value
+                update_instance(alpaca_key, session)
+            else:
+                alpaca_key = AppSetting(key='alpaca_api_key', value_str=self.alpaca_key_input.value)
+                add_instance(alpaca_key, session)
+            
+            # Alpaca API Secret
+            alpaca_secret = session.exec(select(AppSetting).where(AppSetting.key == 'alpaca_api_secret')).first()
+            if alpaca_secret:
+                alpaca_secret.value_str = self.alpaca_secret_input.value
+                update_instance(alpaca_secret, session)
+            else:
+                alpaca_secret = AppSetting(key='alpaca_api_secret', value_str=self.alpaca_secret_input.value)
+                add_instance(alpaca_secret, session)
             
             # Worker Count
             worker_count = session.exec(select(AppSetting).where(AppSetting.key == 'worker_count')).first()

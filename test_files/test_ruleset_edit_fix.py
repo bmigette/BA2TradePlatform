@@ -5,7 +5,7 @@ import sys
 import os
 
 # Add the project directory to Python path
-project_dir = os.path.dirname(os.path.abspath(__file__))
+project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_dir)
 
 from ba2_trade_platform.core.db import get_instance, get_db, get_all_instances

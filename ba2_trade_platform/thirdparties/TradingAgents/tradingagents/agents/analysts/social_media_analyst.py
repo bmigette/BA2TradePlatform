@@ -10,12 +10,10 @@ def create_social_media_analyst(llm, toolkit):
         ticker = state["company_of_interest"]
         company_name = state["company_of_interest"]
 
-        if toolkit.config["online_tools"]:
-            tools = [toolkit.get_stock_news_openai]
-        else:
-            tools = [
-                toolkit.get_reddit_stock_info,
-            ]
+        # Use dedicated social media sentiment function
+        tools = [
+            toolkit.get_social_media_sentiment,
+        ]
 
         # Get system prompt from centralized prompts
         system_message = get_prompt("social_media_analyst")

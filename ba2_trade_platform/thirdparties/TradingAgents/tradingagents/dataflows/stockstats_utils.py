@@ -5,7 +5,6 @@ import os
 from datetime import datetime, timedelta
 from .config import get_config
 from ba2_trade_platform.modules.dataproviders import YFinanceDataProvider
-from ba2_trade_platform.config import CACHE_FOLDER
 
 
 class StockstatsUtils:
@@ -16,7 +15,7 @@ class StockstatsUtils:
     def _get_data_provider(cls):
         """Get or create the data provider instance."""
         if cls._data_provider is None:
-            cls._data_provider = YFinanceDataProvider(CACHE_FOLDER)
+            cls._data_provider = YFinanceDataProvider()
         return cls._data_provider
     
     @staticmethod

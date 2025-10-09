@@ -28,6 +28,7 @@ class JobMonitoringTab:
         self.total_pages = 1
         self.total_records = 0
         self.status_filter = 'all'
+        self.expert_filter = 'all'  # Filter by expert
         self.render()
     
     def _get_worker_queue(self):
@@ -58,6 +59,15 @@ class JobMonitoringTab:
                         label='Status Filter'
                     ).classes('w-40')
                     self.status_select.on_value_change(self._on_status_filter_change)
+                    
+                    # Expert filter
+                    expert_options = self._get_expert_options()
+                    self.expert_select = ui.select(
+                        options=expert_options,
+                        value='all',
+                        label='Expert Filter'
+                    ).classes('w-48')
+                    self.expert_select.on_value_change(self._on_expert_filter_change)
                     
                     # Symbol filter
                     self.symbol_input = ui.input(
@@ -189,11 +199,16 @@ class JobMonitoringTab:
                 if self.status_filter != 'all':
                     statement = statement.where(MarketAnalysis.status == MarketAnalysisStatus(self.status_filter))
                 
+                # Apply expert filter
+                if self.expert_filter != 'all':
+                    statement = statement.where(MarketAnalysis.expert_instance_id == int(self.expert_filter))
           
                 # Get total count for pagination
                 count_statement = select(func.count(MarketAnalysis.id))
                 if self.status_filter != 'all':
                     count_statement = count_statement.where(MarketAnalysis.status == MarketAnalysisStatus(self.status_filter))
+                if self.expert_filter != 'all':
+                    count_statement = count_statement.where(MarketAnalysis.expert_instance_id == int(self.expert_filter))
  
                 total_count = session.exec(count_statement).first() or 0
                 
@@ -337,19 +352,46 @@ class JobMonitoringTab:
         except ValueError:
             pass
     
+    def _get_expert_options(self) -> dict:
+        """Get available expert instances for filtering."""
+        try:
+            with get_db() as session:
+                # Get all expert instances
+                expert_instances = session.exec(select(ExpertInstance)).all()
+                
+                # Build options dictionary
+                options = {'all': 'All Experts'}
+                for expert in expert_instances:
+                    # Use user_description if available, otherwise expert name
+                    display_name = expert.user_description or expert.expert
+                    options[str(expert.id)] = display_name
+                
+                return options
+        except Exception as e:
+            logger.error(f"Error getting expert options: {e}", exc_info=True)
+            return {'all': 'All Experts'}
+    
     def _on_status_filter_change(self, event):
         """Handle status filter change."""
         self.status_filter = event.value
         self.current_page = 1  # Reset to first page when filtering
         self.refresh_data()
     
+    def _on_expert_filter_change(self, event):
+        """Handle expert filter change."""
+        self.expert_filter = event.value
+        self.current_page = 1  # Reset to first page when filtering
+        self.refresh_data()
 
     def _clear_filters(self):
         """Clear all filters."""
         self.status_filter = 'all'
+        self.expert_filter = 'all'
         self.current_page = 1
         if hasattr(self, 'status_select'):
             self.status_select.value = 'all'
+        if hasattr(self, 'expert_select'):
+            self.expert_select.value = 'all'
         if hasattr(self, 'symbol_input'):
             self.symbol_input.value = ''
         self.refresh_data()

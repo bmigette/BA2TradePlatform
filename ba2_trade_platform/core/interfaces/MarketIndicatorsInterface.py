@@ -18,7 +18,21 @@ class MarketIndicatorsInterface(DataProviderInterface):
     
     Providers implementing this interface can supply technical analysis indicators
     for stocks and other instruments.
+    
+    All indicator providers must accept an OHLCV data provider in their constructor
+    to retrieve price data for indicator calculation.
     """
+    
+    @abstractmethod
+    def __init__(self, ohlcv_provider: DataProviderInterface):
+        """
+        Initialize the indicator provider with an OHLCV data provider.
+        
+        Args:
+            ohlcv_provider: Data provider implementing MarketDataProviderInterface
+                           for retrieving OHLCV (Open, High, Low, Close, Volume) data
+        """
+        pass
     
     # Centralized indicator metadata - all providers share this catalog
     ALL_INDICATORS = {

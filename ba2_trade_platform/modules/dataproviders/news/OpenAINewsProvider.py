@@ -12,8 +12,10 @@ from ba2_trade_platform.core.interfaces import MarketNewsInterface
 from ba2_trade_platform.core.provider_utils import (
     validate_date_range,
     validate_lookback_days,
-    calculate_date_range
+    calculate_date_range,
+    log_provider_call,
 )
+from ba2_trade_platform import config
 from ba2_trade_platform.config import get_app_setting
 from ba2_trade_platform.logger import logger
 
@@ -26,16 +28,22 @@ class OpenAINewsProvider(MarketNewsInterface):
     and social media discussions about companies and global markets.
     """
     
-    def __init__(self):
-        """Initialize the OpenAI News Provider."""
+    def __init__(self, model: str = None):
+        """
+        Initialize the OpenAI News Provider.
+        
+        Args:
+            model: OpenAI model to use (e.g., 'gpt-4', 'gpt-4o-mini').
+                   If not provided, uses OPENAI_QUICK_THINK_LLM from app settings (default: 'gpt-4')
+        """
         super().__init__()
         
         # Get OpenAI configuration
-        self.backend_url = get_app_setting("OPENAI_BACKEND_URL", "https://api.openai.com/v1")
-        self.model = get_app_setting("OPENAI_QUICK_THINK_LLM", "gpt-4")
+        self.backend_url = config.OPENAI_BACKEND_URL
+        self.model = model or get_app_setting("OPENAI_QUICK_THINK_LLM", "gpt-4")
         
         self.client = OpenAI(base_url=self.backend_url)
-        logger.info("OpenAINewsProvider initialized successfully")
+        logger.info(f"OpenAINewsProvider initialized with model={self.model}, backend_url={self.backend_url}")
     
     def get_provider_name(self) -> str:
         """Get the provider name."""
@@ -57,6 +65,7 @@ class OpenAINewsProvider(MarketNewsInterface):
             }
         }
     
+    @log_provider_call
     def get_company_news(
         self,
         symbol: str,
@@ -155,6 +164,7 @@ class OpenAINewsProvider(MarketNewsInterface):
             logger.error(f"Error fetching company news for {symbol} from OpenAI: {e}", exc_info=True)
             raise
     
+    @log_provider_call
     def get_global_news(
         self,
         end_date: datetime,

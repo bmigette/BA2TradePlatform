@@ -9,6 +9,7 @@ from datetime import datetime
 import json
 
 from ba2_trade_platform.core.interfaces import CompanyFundamentalsOverviewInterface
+from ba2_trade_platform.core.provider_utils import log_provider_call
 from ba2_trade_platform.logger import logger
 class AlphaVantageRateLimitError(Exception):
     """Exception raised when Alpha Vantage API rate limit is exceeded."""
@@ -68,6 +69,7 @@ class AlphaVantageCompanyOverviewProvider(CompanyFundamentalsOverviewInterface):
         
         return response_text
     
+    @log_provider_call
     def get_fundamentals_overview(
         self,
         symbol: Annotated[str, "Stock ticker symbol"],

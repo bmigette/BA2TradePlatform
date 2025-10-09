@@ -11,7 +11,7 @@ import requests
 import os
 
 from ba2_trade_platform.core.interfaces import MacroEconomicsInterface
-from ba2_trade_platform.core.provider_utils import validate_date_range
+from ba2_trade_platform.core.provider_utils import validate_date_range, log_provider_call
 from ba2_trade_platform.logger import logger
 
 
@@ -132,6 +132,7 @@ class FREDMacroProvider(MacroEconomicsInterface):
         except Exception as e:
             return {"error": f"Failed to fetch FRED data for {series_id}: {str(e)}"}
     
+    @log_provider_call
     def get_economic_indicators(
         self,
         end_date: Annotated[datetime, "End date for indicators (inclusive)"],
@@ -216,6 +217,7 @@ class FREDMacroProvider(MacroEconomicsInterface):
         else:
             return result_md
     
+    @log_provider_call
     def get_yield_curve(
         self,
         end_date: Annotated[datetime, "End date for yield curve data (inclusive)"],
@@ -282,6 +284,7 @@ class FREDMacroProvider(MacroEconomicsInterface):
         
         return result_md
     
+    @log_provider_call
     def get_fed_calendar(
         self,
         end_date: Annotated[datetime, "End date for Fed events (inclusive)"],

@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 import fmpsdk
 
 from ba2_trade_platform.core.interfaces import CompanyInsiderInterface
-from ba2_trade_platform.core.provider_utils import calculate_date_range
+from ba2_trade_platform.core.provider_utils import calculate_date_range, log_provider_call
 from ba2_trade_platform.config import get_app_setting
 from ba2_trade_platform.logger import logger
 
@@ -70,6 +70,7 @@ class FMPInsiderProvider(CompanyInsiderInterface):
             return data["markdown"]
         return str(data)
     
+    @log_provider_call
     def get_insider_transactions(
         self,
         symbol: str,
@@ -220,6 +221,7 @@ class FMPInsiderProvider(CompanyInsiderInterface):
             logger.error(f"Error fetching FMP insider transactions for {symbol}: {e}")
             return f"Error fetching insider transactions: {str(e)}"
     
+    @log_provider_call
     def get_insider_sentiment(
         self,
         symbol: str,

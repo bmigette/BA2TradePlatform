@@ -10,13 +10,11 @@ def create_macro_analyst(llm, toolkit):
         ticker = state["company_of_interest"]
         company_name = state["company_of_interest"]
 
-        # Use macro tools for FRED data and economic indicators
+        # Use new toolkit methods for macro/economic data
         tools = [
-            toolkit.get_fred_series_data,
-            toolkit.get_economic_calendar,
-            toolkit.get_treasury_yield_curve,
-            toolkit.get_inflation_data,
-            toolkit.get_employment_data,
+            toolkit.get_economic_indicators,
+            toolkit.get_yield_curve,
+            toolkit.get_fed_calendar,
         ]
 
         # Get system prompt from centralized prompts

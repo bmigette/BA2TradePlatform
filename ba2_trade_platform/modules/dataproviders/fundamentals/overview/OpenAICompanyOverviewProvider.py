@@ -9,7 +9,9 @@ from datetime import datetime, timedelta
 from openai import OpenAI
 
 from ba2_trade_platform.core.interfaces import CompanyFundamentalsOverviewInterface
+from ba2_trade_platform.core.provider_utils import log_provider_call
 from ba2_trade_platform.logger import logger
+from ba2_trade_platform import config
 from ba2_trade_platform.config import get_app_setting
 
 
@@ -21,18 +23,25 @@ class OpenAICompanyOverviewProvider(CompanyFundamentalsOverviewInterface):
     including P/E ratio, P/S ratio, cash flow, and other key metrics.
     """
     
-    def __init__(self):
-        """Initialize OpenAI company overview provider."""
+    def __init__(self, model: str = None):
+        """
+        Initialize OpenAI company overview provider.
+        
+        Args:
+            model: OpenAI model to use (e.g., 'gpt-4', 'gpt-4o-mini').
+                   If not provided, uses OPENAI_QUICK_THINK_LLM from app settings (default: 'gpt-4')
+        """
         super().__init__()
         
         # Get OpenAI configuration
-        self.backend_url = get_app_setting("OPENAI_BACKEND_URL", "https://api.openai.com/v1")
-        self.model = get_app_setting("OPENAI_QUICK_THINK_LLM", "gpt-4")
+        self.backend_url = config.OPENAI_BACKEND_URL
+        self.model = model or get_app_setting("OPENAI_QUICK_THINK_LLM", "gpt-4")
         self.default_lookback_days = int(get_app_setting("ECONOMIC_DATA_DAYS", "90"))
         
         self.client = OpenAI(base_url=self.backend_url)
-        logger.debug("Initialized OpenAICompanyOverviewProvider")
+        logger.debug(f"Initialized OpenAICompanyOverviewProvider with model={self.model}, backend_url={self.backend_url}")
     
+    @log_provider_call
     def get_fundamentals_overview(
         self,
         symbol: Annotated[str, "Stock ticker symbol"],

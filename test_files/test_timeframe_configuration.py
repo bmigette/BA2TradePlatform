@@ -4,6 +4,11 @@ Test script for TradingAgents timeframe functionality
 This script tests that the TradingAgents tools honor the timeframe setting.
 """
 
+import sys
+import os
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 def test_timeframe_configuration():
     """Test that timeframe setting is properly used by TradingAgents tools."""
     print("=" * 60)

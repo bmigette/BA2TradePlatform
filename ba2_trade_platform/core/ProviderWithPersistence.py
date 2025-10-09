@@ -16,6 +16,7 @@ from ba2_trade_platform.core.db import get_db, add_instance
 from ba2_trade_platform.logger import logger
 from sqlmodel import Session, select
 
+# NOT USED ATP
 
 class ProviderWithPersistence:
     """

@@ -91,6 +91,13 @@ class TradingAgents(MarketExpertInterface):
                 "help": "For more information on available models, see [OpenAI Models Documentation](https://platform.openai.com/docs/models)",
                 "tooltip": "The AI model used for faster analysis tasks like technical indicators and quick data summarization. Nano/mini models are cost-effective for these simpler tasks. The o4-mini-deep-research variant provides enhanced analytical capabilities."
             },
+            "openai_provider_model": {
+                "type": "str", "required": True, "default": "gpt-5",
+                "description": "OpenAI model for data provider web searches",
+                "valid_values": ["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "o4-mini", "o4-mini-deep-research"],
+                "help": "For more information on available models, see [OpenAI Models Documentation](https://platform.openai.com/docs/models)",
+                "tooltip": "The OpenAI model used by OpenAI data providers (news, fundamentals) for web search and data gathering. Higher-tier models (gpt-5) provide better search results and data extraction. Use mini/nano for cost savings. This setting only affects OpenAI-based data providers."
+            },
             
             # Data Lookback Periods
             "news_lookback_days": {
@@ -118,16 +125,16 @@ class TradingAgents(MarketExpertInterface):
             "vendor_stock_data": {
                 "type": "list", "required": True, "default": ["yfinance"],
                 "description": "Data vendor(s) for OHLCV stock price data",
-                "valid_values": ["yfinance", "alpha_vantage", "local"],
+                "valid_values": ["yfinance", "alpaca", "alpha_vantage"],
                 "multiple": True,
-                "tooltip": "Select one or more data providers for historical stock prices (Open, High, Low, Close, Volume). Multiple vendors enable automatic fallback. Order matters: first vendor is tried first. YFinance is free and reliable. Alpha Vantage requires API key. Local uses pre-downloaded data."
+                "tooltip": "Select one or more data providers for historical stock prices (Open, High, Low, Close, Volume). Multiple vendors enable automatic fallback. Order matters: first vendor is tried first. YFinance is free and reliable. Alpaca provides real-time and historical data. Alpha Vantage requires API key."
             },
             "vendor_indicators": {
-                "type": "list", "required": True, "default": ["yfinance"],
+                "type": "list", "required": True, "default": ["pandas"],
                 "description": "Data vendor(s) for technical indicators",
-                "valid_values": ["yfinance", "alpha_vantage", "local"],
+                "valid_values": ["pandas", "alpha_vantage"],
                 "multiple": True,
-                "tooltip": "Select one or more data providers for technical indicators (RSI, MACD, Bollinger Bands, etc.). Multiple vendors enable automatic fallback. YFinance calculates indicators locally. Alpha Vantage provides pre-calculated indicators. Local uses cached data."
+                "tooltip": "Select one or more data providers for technical indicators (RSI, MACD, Bollinger Bands, etc.). Multiple vendors enable automatic fallback. Pandas calculates indicators locally using configured OHLCV provider. Alpha Vantage provides pre-calculated indicators."
             },
             "vendor_fundamentals": {
                 "type": "list", "required": True, "default": ["openai"],
@@ -136,54 +143,33 @@ class TradingAgents(MarketExpertInterface):
                 "multiple": True,
                 "tooltip": "Select one or more data providers for fundamental analysis (P/E ratio, earnings, cash flow, etc.). Multiple vendors enable automatic fallback. OpenAI searches web for latest data. Alpha Vantage provides structured financial statements."
             },
-            "vendor_balance_sheet": {
+            "vendor_fundamentals_details": {
                 "type": "list", "required": True, "default": ["yfinance"],
-                "description": "Data vendor(s) for balance sheet data",
-                "valid_values": ["yfinance", "fmp", "alpha_vantage", "local"],
+                "description": "Data vendor(s) for company fundamentals details (balance sheet, cash flow, income statement)",
+                "valid_values": ["yfinance", "fmp", "alpha_vantage"],
                 "multiple": True,
-                "tooltip": "Select one or more data providers for balance sheet data (assets, liabilities, equity). Multiple vendors enable automatic fallback. YFinance provides quarterly/annual data. FMP provides detailed balance sheet statements. Alpha Vantage offers similar data. Local uses SimFin pre-downloaded data."
-            },
-            "vendor_cashflow": {
-                "type": "list", "required": True, "default": ["yfinance"],
-                "description": "Data vendor(s) for cash flow statement data",
-                "valid_values": ["yfinance", "fmp", "alpha_vantage", "local"],
-                "multiple": True,
-                "tooltip": "Select one or more data providers for cash flow statements (operating, investing, financing activities). Multiple vendors enable automatic fallback. YFinance provides quarterly/annual data. FMP provides detailed cash flow statements. Alpha Vantage offers similar data. Local uses SimFin data."
-            },
-            "vendor_income_statement": {
-                "type": "list", "required": True, "default": ["yfinance"],
-                "description": "Data vendor(s) for income statement data",
-                "valid_values": ["yfinance", "fmp", "alpha_vantage", "local"],
-                "multiple": True,
-                "tooltip": "Select one or more data providers for income statements (revenue, expenses, net income). Multiple vendors enable automatic fallback. YFinance provides quarterly/annual data. FMP provides detailed income statements. Alpha Vantage offers similar data. Local uses SimFin data."
+                "tooltip": "Select one or more data providers for detailed financial statements (balance sheet, cash flow statement, income statement). Multiple vendors enable automatic fallback. YFinance provides quarterly/annual data. FMP provides comprehensive financial data. Alpha Vantage offers similar data."
             },
             "vendor_news": {
-                "type": "list", "required": True, "default": ["openai", "alpha_vantage"],
+                "type": "list", "required": True, "default": ["openai", "alpaca"],
                 "description": "Data vendor(s) for company news",
-                "valid_values": ["openai", "alpha_vantage", "fmp", "local"],
+                "valid_values": ["openai", "alpaca", "alpha_vantage", "fmp"],
                 "multiple": True,
-                "tooltip": "Select one or more data providers for company news articles. Multiple vendors enable automatic fallback. OpenAI searches social media/news. Alpha Vantage provides news sentiment API. FMP provides company-specific news articles. Local uses Finnhub/Reddit cached data. Note: Google News scraping is unreliable due to bot detection."
+                "tooltip": "Select one or more data providers for company news articles. Multiple vendors enable automatic fallback. OpenAI searches social media/news. Alpaca provides news from multiple sources. Alpha Vantage provides news sentiment API. FMP provides company-specific news articles."
             },
             "vendor_global_news": {
                 "type": "list", "required": True, "default": ["openai"],
                 "description": "Data vendor(s) for global/macro news",
-                "valid_values": ["openai", "fmp", "local"],
+                "valid_values": ["openai", "fmp"],
                 "multiple": True,
-                "tooltip": "Select one or more data providers for global macroeconomic news (interest rates, inflation, geopolitics, etc.). Multiple vendors enable automatic fallback. OpenAI searches web for latest news. FMP provides general market news. Local uses Reddit cached data."
+                "tooltip": "Select one or more data providers for global macroeconomic news (interest rates, inflation, geopolitics, etc.). Multiple vendors enable automatic fallback. OpenAI searches web for latest news. FMP provides general market news."
             },
-            "vendor_insider_sentiment": {
+            "vendor_insider": {
                 "type": "list", "required": True, "default": ["fmp"],
-                "description": "Data vendor(s) for insider sentiment data",
-                "valid_values": ["fmp", "local"],
+                "description": "Data vendor(s) for insider trading data (transactions and sentiment)",
+                "valid_values": ["fmp"],
                 "multiple": True,
-                "tooltip": "Insider sentiment data (SEC filings) from company insiders. FMP provides calculated sentiment scores from insider transactions. Local uses Finnhub cached data."
-            },
-            "vendor_insider_transactions": {
-                "type": "list", "required": True, "default": ["fmp"],
-                "description": "Data vendor(s) for insider transaction data",
-                "valid_values": ["fmp", "yfinance", "alpha_vantage", "local"],
-                "multiple": True,
-                "tooltip": "Select one or more data providers for insider trading transactions (buys/sells by executives). Multiple vendors enable automatic fallback. FMP provides detailed insider trading data with transaction types. YFinance provides free data. Alpha Vantage offers similar data. Local uses Finnhub cached data."
+                "tooltip": "Select one or more data providers for insider trading data. FMP provides both insider transactions (buys/sells by executives) and calculated sentiment scores from SEC filings."
             },
             
             "debug_mode": {
@@ -237,13 +223,13 @@ class TradingAgents(MarketExpertInterface):
             'get_stock_data': _get_vendor_string('vendor_stock_data'),
             'get_indicators': _get_vendor_string('vendor_indicators'),
             'get_fundamentals': _get_vendor_string('vendor_fundamentals'),
-            'get_balance_sheet': _get_vendor_string('vendor_balance_sheet'),
-            'get_cashflow': _get_vendor_string('vendor_cashflow'),
-            'get_income_statement': _get_vendor_string('vendor_income_statement'),
+            'get_balance_sheet': _get_vendor_string('vendor_fundamentals_details'),
+            'get_cashflow': _get_vendor_string('vendor_fundamentals_details'),
+            'get_income_statement': _get_vendor_string('vendor_fundamentals_details'),
             'get_news': _get_vendor_string('vendor_news'),
             'get_global_news': _get_vendor_string('vendor_global_news'),
-            'get_insider_sentiment': _get_vendor_string('vendor_insider_sentiment'),
-            'get_insider_transactions': _get_vendor_string('vendor_insider_transactions'),
+            'get_insider_sentiment': _get_vendor_string('vendor_insider'),
+            'get_insider_transactions': _get_vendor_string('vendor_insider'),
         }
         
         # Apply user settings with defaults from settings definitions
@@ -312,11 +298,22 @@ class TradingAgents(MarketExpertInterface):
             else:
                 logger.warning(f"News provider '{vendor}' not found in NEWS_PROVIDERS registry")
         
+        # Social media providers (aggregated)
+        # Uses same providers as news, but allows separate configuration in the future
+        # For now, maps to the same vendor_news setting
+        social_media_vendors = _get_vendor_list('vendor_news')  # Can be changed to 'vendor_social_media' later
+        provider_map['social_media'] = []
+        for vendor in social_media_vendors:
+            if vendor in NEWS_PROVIDERS:
+                provider_map['social_media'].append(NEWS_PROVIDERS[vendor])
+            else:
+                logger.warning(f"Social media provider '{vendor}' not found in NEWS_PROVIDERS registry")
+        
         # Global news uses same providers as company news
         # The toolkit will call get_global_news() on each provider
         
         # Insider providers (aggregated) - for both transactions and sentiment
-        insider_vendors = _get_vendor_list('vendor_insider_transactions')
+        insider_vendors = _get_vendor_list('vendor_insider')
         provider_map['insider'] = []
         for vendor in insider_vendors:
             if vendor in INSIDER_PROVIDERS:
@@ -329,11 +326,8 @@ class TradingAgents(MarketExpertInterface):
         provider_map['macro'] = [MACRO_PROVIDERS['fred']] if 'fred' in MACRO_PROVIDERS else []
         
         # Fundamentals details providers (aggregated) - for balance sheet, income stmt, cash flow
-        # Map all three vendor settings to fundamentals_details category
-        fund_vendors = set()  # Use set to avoid duplicates
-        fund_vendors.update(_get_vendor_list('vendor_balance_sheet'))
-        fund_vendors.update(_get_vendor_list('vendor_cashflow'))
-        fund_vendors.update(_get_vendor_list('vendor_income_statement'))
+        # Use consolidated vendor_fundamentals_details setting
+        fund_vendors = _get_vendor_list('vendor_fundamentals_details')
         
         provider_map['fundamentals_details'] = []
         for vendor in fund_vendors:
@@ -543,6 +537,21 @@ Analysis completed at: {self._get_current_timestamp()}"""
         # Build provider_map for new toolkit
         provider_map = self._build_provider_map()
         
+        # Build provider_args for OpenAI providers
+        settings_def = self.get_settings_definitions()
+        openai_model = self.settings.get('openai_provider_model', settings_def['openai_provider_model']['default'])
+        provider_args = {
+            'openai_model': openai_model
+        }
+        
+        # Log provider_map configuration
+        logger.info(f"=== TradingAgents Provider Configuration ===")
+        for category, providers in provider_map.items():
+            provider_names = [p.__name__ for p in providers] if providers else ["None"]
+            logger.info(f"  {category}: {', '.join(provider_names)}")
+        logger.info(f"  provider_args: {provider_args}")
+        logger.info(f"============================================")
+        
         # Initialize TradingAgents graph
         # Get debug mode from settings (defaults to True for detailed logging)
         debug_mode = self.settings.get('debug_mode', True)
@@ -552,7 +561,8 @@ Analysis completed at: {self._get_current_timestamp()}"""
             config=config,
             market_analysis_id=market_analysis_id,
             expert_instance_id=self.id,  # Pass expert instance ID for persistent memory
-            provider_map=provider_map  # Pass provider_map for new toolkit
+            provider_map=provider_map,  # Pass provider_map for new toolkit
+            provider_args=provider_args  # Pass provider_args for provider instantiation
         )
         
         # Run analysis

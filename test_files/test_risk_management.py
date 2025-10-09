@@ -4,6 +4,12 @@ Test script for the Trade Risk Management system
 This script demonstrates the risk management functionality with mock data.
 """
 
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 def test_risk_management_system():
     """Test the risk management system with mock data."""
     print("=" * 60)

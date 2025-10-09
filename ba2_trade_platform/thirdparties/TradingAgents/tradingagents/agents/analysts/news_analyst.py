@@ -9,13 +9,10 @@ def create_news_analyst(llm, toolkit):
         current_date = state["trade_date"]
         ticker = state["company_of_interest"]
 
-        if toolkit.config["online_tools"]:
-            tools = [toolkit.get_global_news_openai]
-        else:
-            tools = [
-                toolkit.get_finnhub_news,
-                toolkit.get_reddit_news,
-            ]
+        # Use new toolkit methods for news data
+        tools = [
+            toolkit.get_global_news,
+        ]
 
         # Get system prompt from centralized prompts
         system_message = get_prompt("news_analyst")

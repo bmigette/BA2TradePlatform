@@ -690,9 +690,8 @@ class TradingAgentsUI:
                 
                 # Initialize data provider
                 from ba2_trade_platform.modules.dataproviders import YFinanceDataProvider
-                from ba2_trade_platform.config import CACHE_FOLDER
                 
-                provider = YFinanceDataProvider(CACHE_FOLDER)
+                provider = YFinanceDataProvider()
                 
                 # Fetch price data
                 try:

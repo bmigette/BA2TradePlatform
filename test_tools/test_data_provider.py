@@ -39,7 +39,7 @@ print("=" * 80)
 
 # Initialize data provider
 print(f"Cache folder: {CACHE_FOLDER}")
-provider = YFinanceDataProvider(CACHE_FOLDER)
+provider = YFinanceDataProvider()
 print(f"✅ Initialized YFinanceDataProvider")
 print()
 

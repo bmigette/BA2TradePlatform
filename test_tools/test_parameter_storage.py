@@ -177,7 +177,7 @@ if isinstance(result, dict) and result.get('_internal'):
     print(f"2. Reconstructing data from cache using these parameters...")
     
     try:
-        provider = YFinanceDataProvider(CACHE_FOLDER)
+        provider = YFinanceDataProvider()
         
         # Reconstruct price data from cache (exactly as UI does)
         reconstructed_data = provider.get_dataframe(

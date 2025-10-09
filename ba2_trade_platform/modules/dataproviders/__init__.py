@@ -15,9 +15,11 @@ Usage:
     alpaca_news = get_provider("news", "alpaca")
     news = alpaca_news.get_company_news("AAPL", end_date=datetime.now(), lookback_days=7)
     
-    # Get an indicators provider
-    yfinance_indicators = get_provider("indicators", "yfinance")
-    rsi = yfinance_indicators.get_indicator("AAPL", "rsi", end_date=datetime.now(), lookback_days=30)
+    # Get an indicators provider (requires OHLCV provider)
+    from ba2_trade_platform.modules.dataproviders import YFinanceDataProvider
+    ohlcv_provider = YFinanceDataProvider()
+    pandas_indicators = get_provider("indicators", "pandas")(ohlcv_provider)
+    rsi = pandas_indicators.get_indicator("AAPL", "rsi", end_date=datetime.now(), lookback_days=30)
 """
 
 from typing import Type, Dict
@@ -34,10 +36,11 @@ from ba2_trade_platform.core.interfaces import (
 # Legacy data provider (to be migrated)
 from .ohlcv.YFinanceDataProvider import YFinanceDataProvider
 from .ohlcv.AlphaVantageOHLCVProvider import AlphaVantageOHLCVProvider
+from .ohlcv.AlpacaOHLCVProvider import AlpacaOHLCVProvider
 
 # Import provider implementations
 from .news import AlpacaNewsProvider, AlphaVantageNewsProvider, GoogleNewsProvider, OpenAINewsProvider, FMPNewsProvider
-from .indicators import YFinanceIndicatorsProvider, AlphaVantageIndicatorsProvider
+from .indicators import PandasIndicatorCalc, AlphaVantageIndicatorsProvider
 from .fundamentals import (
     AlphaVantageCompanyOverviewProvider,
     OpenAICompanyOverviewProvider,
@@ -52,9 +55,10 @@ from .insider import FMPInsiderProvider
 OHLCV_PROVIDERS: Dict[str, Type[DataProviderInterface]] = {
     "yfinance": YFinanceDataProvider,
     "alphavantage": AlphaVantageOHLCVProvider,
+    "alpaca": AlpacaOHLCVProvider,
 }
 INDICATORS_PROVIDERS: Dict[str, Type[MarketIndicatorsInterface]] = {
-    "yfinance": YFinanceIndicatorsProvider,
+    "pandas": PandasIndicatorCalc,
     "alphavantage": AlphaVantageIndicatorsProvider,
 }
 
@@ -191,12 +195,13 @@ __all__ = [
     # Provider classes
     "YFinanceDataProvider",
     "AlphaVantageOHLCVProvider",
+    "AlpacaOHLCVProvider",
     "AlpacaNewsProvider",
     "AlphaVantageNewsProvider",
     "GoogleNewsProvider",
     "OpenAINewsProvider",
     "FMPNewsProvider",
-    "YFinanceIndicatorsProvider",
+    "PandasIndicatorCalc",
     "AlphaVantageIndicatorsProvider",
     "AlphaVantageCompanyOverviewProvider",
     "OpenAICompanyOverviewProvider",

@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 import fmpsdk
 
 from ba2_trade_platform.core.interfaces import MarketNewsInterface
-from ba2_trade_platform.core.provider_utils import calculate_date_range
+from ba2_trade_platform.core.provider_utils import calculate_date_range, log_provider_call
 from ba2_trade_platform.config import get_app_setting
 from ba2_trade_platform.logger import logger
 
@@ -71,6 +71,7 @@ class FMPNewsProvider(MarketNewsInterface):
             return data["markdown"]
         return str(data)
     
+    @log_provider_call
     def get_company_news(
         self,
         symbol: str,
@@ -180,6 +181,7 @@ class FMPNewsProvider(MarketNewsInterface):
             logger.error(f"Error fetching FMP company news for {symbol}: {e}")
             return f"Error fetching news: {str(e)}"
     
+    @log_provider_call
     def get_global_news(
         self,
         end_date: datetime,

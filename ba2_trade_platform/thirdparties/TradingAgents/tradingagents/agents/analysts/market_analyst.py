@@ -11,16 +11,11 @@ def create_market_analyst(llm, toolkit):
         ticker = state["company_of_interest"]
         company_name = state["company_of_interest"]
 
-        if toolkit.config["online_tools"]:
-            tools = [
-                toolkit.get_YFin_data_online,
-                toolkit.get_stockstats_indicators_report_online,
-            ]
-        else:
-            tools = [
-                toolkit.get_YFin_data,
-                toolkit.get_stockstats_indicators_report,
-            ]
+        # Use new toolkit methods for market data
+        tools = [
+            toolkit.get_ohlcv_data,
+            toolkit.get_indicator_data,
+        ]
 
         # Get system prompt from centralized prompts
         system_message = get_prompt("market_analyst")

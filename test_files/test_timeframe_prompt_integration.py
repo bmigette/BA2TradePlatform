@@ -7,6 +7,11 @@ This script verifies that:
 3. Configuration flow works end-to-end
 """
 
+import sys
+import os
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 def test_timeframe_prompt_integration():
     """Test complete timeframe integration in prompts and tools."""
     print("=" * 70)

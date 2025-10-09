@@ -21,6 +21,7 @@ from ba2_trade_platform.core.interfaces import MarketNewsInterface
 from ba2_trade_platform.core.provider_utils import (
     validate_date_range,
     validate_lookback_days,
+    log_provider_call,
     calculate_date_range
 )
 from ba2_trade_platform.logger import logger
@@ -210,6 +211,7 @@ class GoogleNewsProvider(MarketNewsInterface):
             }
         }
     
+    @log_provider_call
     def get_company_news(
         self,
         symbol: str,
@@ -295,6 +297,7 @@ class GoogleNewsProvider(MarketNewsInterface):
             logger.error(f"Error fetching Google News for {symbol}: {e}", exc_info=True)
             raise
     
+    @log_provider_call
     def get_global_news(
         self,
         end_date: datetime,

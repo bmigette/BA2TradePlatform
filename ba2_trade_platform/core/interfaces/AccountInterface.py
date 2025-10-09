@@ -543,7 +543,7 @@ class AccountInterface(ExtendableSettingsInterface):
         Returns:
             Optional[float]: The current price if available, None if not found or error occurred
         """
-        from .. import config
+        from ... import config
         
         # Check if we have a cached price
         if symbol in self._price_cache:
@@ -668,7 +668,7 @@ class AccountInterface(ExtendableSettingsInterface):
         """
         try:
             from sqlmodel import select, Session
-            from .db import get_db
+            from ..db import get_db
             
             # Get terminal and executed order states from OrderStatus
             terminal_statuses = OrderStatus.get_terminal_statuses()
@@ -942,8 +942,8 @@ class AccountInterface(ExtendableSettingsInterface):
                 - close_order_id: int (closing order ID if created/retried)
         """
         from sqlmodel import select, Session
-        from .db import get_db, delete_instance
-        from .types import OrderDirection, OrderType, TransactionStatus, OrderStatus
+        from ..db import get_db, delete_instance
+        from ..types import OrderDirection, OrderType, TransactionStatus, OrderStatus
         
         result = {
             'success': False,
