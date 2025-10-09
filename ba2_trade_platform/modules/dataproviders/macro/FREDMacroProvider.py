@@ -11,7 +11,12 @@ import requests
 import os
 
 from ba2_trade_platform.core.interfaces import MacroEconomicsInterface
-from ba2_trade_platform.core.provider_utils import validate_date_range, log_provider_call
+from ba2_trade_platform.core.provider_utils import (
+    validate_date_range,
+    validate_lookback_days,
+    calculate_date_range,
+    log_provider_call
+)
 from ba2_trade_platform.logger import logger
 
 
@@ -308,14 +313,20 @@ class FREDMacroProvider(MacroEconomicsInterface):
         """
         Get Federal Reserve calendar and meeting minutes.
         """
-        # Validate date range - returns tuple (start_date, end_date)
-        actual_start_date, actual_end_date = validate_date_range(start_date, end_date, lookback_days)
+        # Validate date parameters
+        if start_date and lookback_days:
+            raise ValueError("Provide either start_date OR lookback_days, not both")
+        if not start_date and not lookback_days:
+            raise ValueError("Must provide either start_date or lookback_days")
         
-        # Use validated end_date if provided
-        if actual_end_date:
-            end_date = actual_end_date
+        # Calculate date range
+        if lookback_days:
+            lookback_days = validate_lookback_days(lookback_days, max_lookback=365)
+            start_date, end_date = calculate_date_range(end_date, lookback_days)
+        else:
+            start_date, end_date = validate_date_range(start_date, end_date, max_days=365)
         
-        start_str = actual_start_date.strftime("%Y-%m-%d")
+        start_str = start_date.strftime("%Y-%m-%d")
         end_str = end_date.strftime("%Y-%m-%d")
         
         logger.debug(f"Fetching Fed calendar from {start_str} to {end_str}")

@@ -1418,8 +1418,8 @@ class AccountOverviewTab:
                 # Get expert name with ID if available
                 expert_name = ""
                 if expert_instance:
-                    # Format: ExpertType-ID (e.g., "TradingAgents-1")
-                    base_name = expert_instance.user_description or expert_instance.expert
+                    # Format: Alias-ID or ExpertType-ID (e.g., "TradingAgents-1")
+                    base_name = expert_instance.alias or expert_instance.expert
                     expert_name = f"{base_name}-{expert_instance.id}"
                 elif not recommendation:
                     expert_name = "Manual"  # No recommendation means manual order

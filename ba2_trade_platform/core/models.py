@@ -25,7 +25,8 @@ class ExpertInstance(SQLModel, table=True):
     account_id: int = Field(foreign_key="accountdefinition.id", nullable=False, ondelete="CASCADE")
     expert: str     
     enabled: bool = Field(default=True)
-    user_description: str | None = Field(default=None)
+    alias: str | None = Field(default=None, max_length=100, description="Short display name for the expert (max 100 chars)")
+    user_description: str | None = Field(default=None, description="Detailed notes about this expert instance")
     virtual_equity_pct: float = Field(default=100.0)
     enter_market_ruleset_id: int | None = Field(default=None, foreign_key="ruleset.id", nullable=True, ondelete="SET NULL")
     open_positions_ruleset_id: int | None = Field(default=None, foreign_key="ruleset.id", nullable=True, ondelete="SET NULL")

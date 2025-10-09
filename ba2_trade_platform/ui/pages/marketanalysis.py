@@ -223,7 +223,7 @@ class JobMonitoringTab:
                 for analysis in market_analyses:
                     # Get expert instance info
                     expert_instance = get_instance(ExpertInstance, analysis.expert_instance_id)
-                    expert_name = expert_instance.user_description or expert_instance.expert if expert_instance else "Unknown"
+                    expert_name = expert_instance.alias or expert_instance.expert if expert_instance else "Unknown"
                     
                     # Convert UTC to local time for display
                     local_time = analysis.created_at.replace(tzinfo=timezone.utc).astimezone() if analysis.created_at else None
@@ -891,9 +891,9 @@ class ScheduledJobsTab:
             
             for instance in expert_instances:
                 if instance.enabled:
-                    label = f"{instance.expert} (ID: {instance.id})"
-                    if instance.user_description:
-                        label += f" - {instance.user_description}"
+                    # Use alias if available, otherwise expert type
+                    display_name = instance.alias or instance.expert
+                    label = f"{display_name} (ID: {instance.id})"
                     options[str(instance.id)] = label
             
             return options
@@ -1032,7 +1032,7 @@ class ScheduledJobsTab:
                             jobs_by_combination[combination_key] = {
                                 'id': combination_key,
                                 'symbol': symbol,
-                                'expert_name': f"{expert_instance.expert}",
+                                'expert_name': expert_instance.alias or expert_instance.expert,
                                 'expert_instance_id': expert_instance.id,
                                 'job_type': job_type_display,
                                 'subtype': subtype.value,
@@ -1567,7 +1567,7 @@ class OrderRecommendationsTab:
                         'price_at_date': f"${recommendation.price_at_date:.2f}" if recommendation.price_at_date else 'N/A',
                         'risk_level': recommendation.risk_level.value.title() if hasattr(recommendation.risk_level, 'value') else (recommendation.risk_level.name.title() if hasattr(recommendation.risk_level, 'name') else str(recommendation.risk_level)),
                         'time_horizon': recommendation.time_horizon.value.replace('_', ' ').title() if hasattr(recommendation.time_horizon, 'value') else str(recommendation.time_horizon),
-                        'expert_name': expert_instance.user_description or expert_instance.expert,
+                        'expert_name': expert_instance.alias or expert_instance.expert,
                         'created_at': created_at,
                         'analysis_id': analysis.id if analysis else None,
                         'can_place_order': can_place_order,

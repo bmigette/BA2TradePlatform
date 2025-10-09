@@ -141,14 +141,47 @@ class OpenAINewsProvider(MarketNewsInterface):
                 store=True,
             )
             
-            # Extract the response text
-            news_text = response.output[1].content[0].text
+            # Extract the response text - handle different response structures
+            news_text = ""
+            
+            try:
+                # Try to get the output from the response
+                if hasattr(response, 'output') and response.output:
+                    # Iterate through output items to find text content
+                    for item in response.output:
+                        # Check if item has content attribute
+                        if hasattr(item, 'content'):
+                            if isinstance(item.content, list):
+                                for content_item in item.content:
+                                    if hasattr(content_item, 'text'):
+                                        news_text += content_item.text + "\n\n"
+                            elif hasattr(item.content, 'text'):
+                                news_text += item.content.text + "\n\n"
+                        # Check if item has text attribute directly
+                        elif hasattr(item, 'text'):
+                            news_text += item.text + "\n\n"
+                        # Check if item is a string
+                        elif isinstance(item, str):
+                            news_text += item + "\n\n"
+                
+                # If no text found, try to get reasoning or other content
+                if not news_text:
+                    if hasattr(response, 'reasoning') and response.reasoning:
+                        news_text = str(response.reasoning)
+                    else:
+                        # Last resort - convert entire response to string
+                        news_text = f"Response received but could not extract text content. Raw response type: {type(response)}"
+                        logger.warning(f"Could not extract text from OpenAI response for {symbol}. Response attributes: {dir(response)}")
+                
+            except Exception as extract_error:
+                logger.error(f"Error extracting text from OpenAI response: {extract_error}")
+                news_text = f"Error extracting news content: {extract_error}"
             
             result = {
                 "symbol": symbol,
                 "start_date": start_date.isoformat(),
                 "end_date": end_date.isoformat(),
-                "content": news_text,
+                "content": news_text.strip(),
                 "source": "OpenAI Web Search"
             }
             
@@ -244,13 +277,46 @@ class OpenAINewsProvider(MarketNewsInterface):
                 store=True,
             )
             
-            # Extract the response text
-            news_text = response.output[1].content[0].text
+            # Extract the response text - handle different response structures
+            news_text = ""
+            
+            try:
+                # Try to get the output from the response
+                if hasattr(response, 'output') and response.output:
+                    # Iterate through output items to find text content
+                    for item in response.output:
+                        # Check if item has content attribute
+                        if hasattr(item, 'content'):
+                            if isinstance(item.content, list):
+                                for content_item in item.content:
+                                    if hasattr(content_item, 'text'):
+                                        news_text += content_item.text + "\n\n"
+                            elif hasattr(item.content, 'text'):
+                                news_text += item.content.text + "\n\n"
+                        # Check if item has text attribute directly
+                        elif hasattr(item, 'text'):
+                            news_text += item.text + "\n\n"
+                        # Check if item is a string
+                        elif isinstance(item, str):
+                            news_text += item + "\n\n"
+                
+                # If no text found, try to get reasoning or other content
+                if not news_text:
+                    if hasattr(response, 'reasoning') and response.reasoning:
+                        news_text = str(response.reasoning)
+                    else:
+                        # Last resort - convert entire response to string
+                        news_text = f"Response received but could not extract text content. Raw response type: {type(response)}"
+                        logger.warning(f"Could not extract text from OpenAI response for global news. Response attributes: {dir(response)}")
+                
+            except Exception as extract_error:
+                logger.error(f"Error extracting text from OpenAI response: {extract_error}")
+                news_text = f"Error extracting news content: {extract_error}"
             
             result = {
                 "start_date": start_date.isoformat(),
                 "end_date": end_date.isoformat(),
-                "content": news_text,
+                "content": news_text.strip(),
                 "source": "OpenAI Web Search"
             }
             

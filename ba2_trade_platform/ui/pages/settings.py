@@ -787,6 +787,7 @@ class ExpertSettingsTab:
             self.experts_table = ui.table(
                 columns=[
                     {'name': 'expert', 'label': 'Expert Type', 'field': 'expert', 'sortable': True},
+                    {'name': 'alias', 'label': 'Alias', 'field': 'alias', 'sortable': True},
                     {'name': 'user_description', 'label': 'User Notes', 'field': 'user_description'},
                     {'name': 'enabled', 'label': 'Enabled', 'field': 'enabled', 'align': 'center'},
                     {'name': 'virtual_equity_pct', 'label': 'Virtual Equity %', 'field': 'virtual_equity_pct', 'align': 'right'},
@@ -826,6 +827,9 @@ class ExpertSettingsTab:
             rows = []
             for instance in instances:
                 row = dict(instance)
+                
+                # Ensure alias is displayed (no truncation needed, max 100 chars)
+                row['alias'] = instance.alias or ''
                 
                 # Ensure user_description is displayed properly (truncate if too long for table)
                 user_desc = instance.user_description or ''
@@ -985,6 +989,12 @@ class ExpertSettingsTab:
                     # Description as read-only display
                     self.description_label = ui.label('').classes('text-grey-7 mb-2')
                     
+                    # Alias as short display name
+                    self.alias_input = ui.input(
+                        label='Alias (max 100 chars)',
+                        placeholder='Short display name for this expert...'
+                    ).classes('w-full').props('maxlength=100')
+                    
                     # User description as editable textarea
                     self.user_description_textarea = ui.textarea(
                         label='User Notes',
@@ -1007,6 +1017,7 @@ class ExpertSettingsTab:
                 # Fill values if editing
                 if is_edit:
                     self.expert_select.value = expert_instance.expert
+                    self.alias_input.value = expert_instance.alias or ''
                     self.user_description_textarea.value = expert_instance.user_description or ''
                     self.enabled_checkbox.value = expert_instance.enabled
                     self.virtual_equity_input.value = str(expert_instance.virtual_equity_pct)
@@ -2157,6 +2168,7 @@ class ExpertSettingsTab:
             if is_edit:
                 # Update existing instance
                 expert_instance.expert = self.expert_select.value
+                expert_instance.alias = self.alias_input.value or None
                 expert_instance.user_description = self.user_description_textarea.value or None
                 expert_instance.enabled = self.enabled_checkbox.value
                 expert_instance.virtual_equity_pct = float(self.virtual_equity_input.value)
@@ -2187,6 +2199,7 @@ class ExpertSettingsTab:
                 
                 new_instance = ExpertInstance(
                     expert=self.expert_select.value,
+                    alias=self.alias_input.value or None,
                     user_description=self.user_description_textarea.value or None,
                     enabled=self.enabled_checkbox.value,
                     virtual_equity_pct=float(self.virtual_equity_input.value),

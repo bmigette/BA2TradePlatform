@@ -127,7 +127,8 @@ def content(analysis_id: int) -> None:
                             ui.label(f'Labels: {labels_text}').classes('text-subtitle2 text-grey-7')
                     
                     # Analysis details
-                    ui.label(f'Expert: {expert_instance.expert} (ID: {expert_instance.id})').classes('text-subtitle1 text-grey-7 mt-2')
+                    expert_display = expert_instance.alias or expert_instance.expert
+                    ui.label(f'Expert: {expert_display} (ID: {expert_instance.id})').classes('text-subtitle1 text-grey-7 mt-2')
                     ui.label(f'Status: {market_analysis.status.value if market_analysis.status else "Unknown"}').classes('text-subtitle2')
                     
                     # Convert UTC to local time for display
