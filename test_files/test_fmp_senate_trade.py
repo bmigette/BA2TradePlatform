@@ -253,9 +253,10 @@ def test_fmp_senate_trade(symbol: str = "AAPL"):
                     logger.info(f"    Amount: {trade.get('amount', 'N/A')}")
                     logger.info(f"    Exec Date: {trade.get('exec_date', 'N/A')} ({trade.get('days_since_exec', 0)} days ago)")
                     logger.info(f"    Confidence: {trade.get('confidence', 0):.1f}%")
-                    logger.info(f"    Trader Pattern Modifier: {trade.get('trader_confidence_modifier', 0):+.1f}%")
+                    logger.info(f"    Symbol Focus: {trade.get('symbol_focus_pct', 0):.1f}% (of trader's portfolio)")
                     logger.info(f"    Trader Recent Activity: {trade.get('trader_recent_buys', 'N/A')} buys, {trade.get('trader_recent_sells', 'N/A')} sells")
                     logger.info(f"    Trader Yearly Activity: {trade.get('trader_yearly_buys', 'N/A')} buys, {trade.get('trader_yearly_sells', 'N/A')} sells")
+                    logger.info(f"    Yearly Symbol Activity: {trade.get('yearly_symbol_buys', 'N/A')} buys, {trade.get('yearly_symbol_sells', 'N/A')} sells")
                 
                 if len(trades) > 5:
                     logger.info(f"\n  ... and {len(trades) - 5} more trades")

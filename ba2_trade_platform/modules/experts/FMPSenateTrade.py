@@ -62,6 +62,13 @@ class FMPSenateTrade(MarketExpertInterface):
     def get_settings_definitions(cls) -> Dict[str, Any]:
         """Define configurable settings for FMPSenateTrade expert."""
         return {
+            "copy_trade_names": {
+                "type": "str",
+                "required": False,
+                "default": "",
+                "description": "Copy trade specific traders (comma-separated)",
+                "tooltip": "Enter names of senators/representatives to copy trade (e.g., 'Nancy Pelosi, Josh Gottheimer'). Any trade by these people will generate 100% confidence BUY/SELL recommendation with 50% expected profit, bypassing the weighted algorithm. Leave empty to use normal weighted algorithm for all traders."
+            },
             "max_disclose_date_days": {
                 "type": "int", 
                 "required": True, 
@@ -82,6 +89,13 @@ class FMPSenateTrade(MarketExpertInterface):
                 "default": 10.0,
                 "description": "Maximum price change since trade (%)",
                 "tooltip": "Trades where the price has already moved more than this percentage will be filtered out (opportunity may be gone)."
+            },
+            "growth_confidence_multiplier": {
+                "type": "float",
+                "required": True,
+                "default": 5.0,
+                "description": "Growth to confidence multiplier",
+                "tooltip": "Multiplier applied to trader's average growth on the symbol to calculate confidence. Formula: 50 + (avg_growth * multiplier). Higher values increase confidence for successful traders. Example: 10% growth * 5.0 = 50% bonus confidence."
             }
         }
     
@@ -377,26 +391,32 @@ class FMPSenateTrade(MarketExpertInterface):
     
     def _calculate_trader_confidence(self, trader_history: List[Dict[str, Any]], 
                                      current_trade_type: str,
+                                     current_symbol: str,
+                                     current_price: float,
                                      max_exec_days: int = 60) -> Dict[str, Any]:
         """
-        Calculate confidence based on trader's overall trading pattern.
+        Calculate confidence based on trader's portfolio allocation to the current symbol.
         
         Logic:
-        - Traders who consistently buy (accumulate) signal bullish confidence
-        - Traders who consistently sell (distribute) signal bearish confidence
-        - Use trade amounts to weight the signal strength
+        - Calculate % of money spent on current symbol vs total portfolio (yearly)
+        - Higher % = stronger conviction/focus on this specific stock
+        - Cap at 10% to avoid extreme confidence values
+        - Use this allocation % to determine confidence level
         
         Args:
             trader_history: List of all trades by this person (all symbols, all time)
             current_trade_type: Type of the current trade ('purchase' or 'sale')
+            current_symbol: The symbol being analyzed
+            current_price: Current price of the symbol (not used in this calculation)
             max_exec_days: Days to look back for recent activity
             
         Returns:
-            Dictionary with confidence modifier and trading statistics
+            Dictionary with confidence modifier, symbol focus %, and trading statistics
         """
         if not trader_history:
             return {
                 'confidence_modifier': 0.0,
+                'symbol_focus_pct': 0.0,
                 'recent_buy_amount': 0.0,
                 'recent_sell_amount': 0.0,
                 'recent_buy_count': 0,
@@ -424,6 +444,10 @@ class FMPSenateTrade(MarketExpertInterface):
         yearly_sell_amount = 0.0
         yearly_buy_count = 0
         yearly_sell_count = 0
+        
+        # Symbol-specific tracking (yearly)
+        yearly_symbol_buy_amount = 0.0
+        yearly_symbol_sell_amount = 0.0
         
         for trade in trader_history:
             try:
@@ -457,6 +481,10 @@ class FMPSenateTrade(MarketExpertInterface):
                 is_buy = 'purchase' in transaction_type or 'buy' in transaction_type
                 is_sell = 'sale' in transaction_type or 'sell' in transaction_type
                 
+                # Get trade symbol
+                trade_symbol = trade.get('symbol', '').upper()
+                is_current_symbol = (trade_symbol == current_symbol.upper())
+                
                 # Count for recent period (max_exec_days)
                 if exec_date >= recent_threshold:
                     if is_buy:
@@ -471,21 +499,31 @@ class FMPSenateTrade(MarketExpertInterface):
                     if is_buy:
                         yearly_buy_amount += amount
                         yearly_buy_count += 1
+                        # Track symbol-specific buys
+                        if is_current_symbol:
+                            yearly_symbol_buy_amount += amount
                     elif is_sell:
                         yearly_sell_amount += amount
                         yearly_sell_count += 1
+                        # Track symbol-specific sells
+                        if is_current_symbol:
+                            yearly_symbol_sell_amount += amount
                     
             except Exception as e:
                 logger.debug(f"Error parsing trade: {e}")
                 continue
         
-        # Calculate net trading direction based on yearly data
-        net_amount = yearly_buy_amount - yearly_sell_amount
+        # Calculate symbol focus percentage
+        # What % of the trader's buys/sells (by dollar amount) are focused on this specific symbol?
+        current_is_buy = 'purchase' in current_trade_type.lower() or 'buy' in current_trade_type.lower()
+        
+        symbol_focus_pct = 0.0
         total_volume = yearly_buy_amount + yearly_sell_amount
         
         if total_volume == 0:
             return {
                 'confidence_modifier': 0.0,
+                'symbol_focus_pct': 0.0,
                 'recent_buy_amount': recent_buy_amount,
                 'recent_sell_amount': recent_sell_amount,
                 'recent_buy_count': recent_buy_count,
@@ -493,39 +531,38 @@ class FMPSenateTrade(MarketExpertInterface):
                 'yearly_buy_amount': yearly_buy_amount,
                 'yearly_sell_amount': yearly_sell_amount,
                 'yearly_buy_count': yearly_buy_count,
-                'yearly_sell_count': yearly_sell_count
+                'yearly_sell_count': yearly_sell_count,
+                'yearly_symbol_buy_amount': yearly_symbol_buy_amount,
+                'yearly_symbol_sell_amount': yearly_symbol_sell_amount
             }
         
-        # Calculate directional bias (-1 to +1, where +1 = all buying, -1 = all selling)
-        directional_bias = net_amount / total_volume
-        
-        # Convert to confidence modifier (-30 to +30)
-        # Strong buying pattern = +30% confidence
-        # Strong selling pattern = -30% confidence
-        base_modifier = directional_bias * 30.0
-        
-        # If current trade aligns with pattern, increase confidence
-        # If current trade contradicts pattern, decrease confidence
-        current_is_buy = 'purchase' in current_trade_type.lower() or 'buy' in current_trade_type.lower()
-        
-        if current_is_buy and directional_bias > 0:
-            # Buying and trader is accumulating = boost confidence
-            confidence_modifier = abs(base_modifier)
-        elif not current_is_buy and directional_bias < 0:
-            # Selling and trader is distributing = boost confidence
-            confidence_modifier = abs(base_modifier)
+        # Calculate what % of their trading activity (by dollar) is focused on this symbol
+        if current_is_buy:
+            # For buy trades, calculate % of total buys spent on this symbol
+            if yearly_buy_amount > 0:
+                symbol_focus_pct = (yearly_symbol_buy_amount / yearly_buy_amount) * 100
         else:
-            # Trade contradicts pattern = reduce confidence
-            confidence_modifier = base_modifier * 0.5
+            # For sell trades, calculate % of total sells from this symbol
+            if yearly_sell_amount > 0:
+                symbol_focus_pct = (yearly_symbol_sell_amount / yearly_sell_amount) * 100
+        
+        # Cap symbol focus at 10% to avoid extreme confidence values
+        symbol_focus_pct = min(10.0, symbol_focus_pct)
+        
+        # Use symbol focus % as confidence modifier (capped at 10%)
+        confidence_modifier = symbol_focus_pct
         
         logger.debug(f"Trader pattern (yearly): {yearly_buy_count} buys (${yearly_buy_amount:,.0f}), "
-                    f"{yearly_sell_count} sells (${yearly_sell_amount:,.0f}) -> "
-                    f"bias: {directional_bias:.2f}, modifier: {confidence_modifier:.1f}%")
+                    f"{yearly_sell_count} sells (${yearly_sell_amount:,.0f})")
+        logger.debug(f"Symbol {current_symbol} (yearly): ${yearly_symbol_buy_amount:,.0f} buys, "
+                    f"${yearly_symbol_sell_amount:,.0f} sells")
+        logger.debug(f"Symbol focus: {symbol_focus_pct:.1f}% of trader's {'buys' if current_is_buy else 'sells'} (capped at 10%, confidence modifier)")
         logger.debug(f"Trader pattern (recent {max_exec_days}d): {recent_buy_count} buys (${recent_buy_amount:,.0f}), "
                     f"{recent_sell_count} sells (${recent_sell_amount:,.0f})")
         
         return {
             'confidence_modifier': confidence_modifier,
+            'symbol_focus_pct': symbol_focus_pct,
             'recent_buy_amount': recent_buy_amount,
             'recent_sell_amount': recent_sell_amount,
             'recent_buy_count': recent_buy_count,
@@ -533,7 +570,9 @@ class FMPSenateTrade(MarketExpertInterface):
             'yearly_buy_amount': yearly_buy_amount,
             'yearly_sell_amount': yearly_sell_amount,
             'yearly_buy_count': yearly_buy_count,
-            'yearly_sell_count': yearly_sell_count
+            'yearly_sell_count': yearly_sell_count,
+            'yearly_symbol_buy_amount': yearly_symbol_buy_amount,
+            'yearly_symbol_sell_amount': yearly_symbol_sell_amount
         }
     
     def _calculate_confidence(self, trade: Dict[str, Any], 
@@ -617,6 +656,110 @@ class FMPSenateTrade(MarketExpertInterface):
                 'total_sell_amount': 0.0
             }
         
+        # Check for copy trade mode
+        copy_trade_names_setting = self.settings.get('copy_trade_names', '').strip()
+        copy_trade_names = []
+        if copy_trade_names_setting:
+            # Parse comma-separated names and normalize
+            copy_trade_names = [name.strip().lower() for name in copy_trade_names_setting.split(',') if name.strip()]
+        
+        # Check if any filtered trade is from a copy trade target
+        if copy_trade_names:
+            for trade in filtered_trades:
+                first_name = trade.get('firstName', '').lower()
+                last_name = trade.get('lastName', '').lower()
+                full_name = f"{first_name} {last_name}".strip()
+                trader_name = f"{trade.get('firstName', '')} {trade.get('lastName', '')}".strip() or 'Unknown'
+                
+                # Check if this trader matches any copy trade name (partial match)
+                is_copy_trade_target = False
+                for target_name in copy_trade_names:
+                    if target_name in full_name or target_name in first_name or target_name in last_name:
+                        is_copy_trade_target = True
+                        break
+                
+                if is_copy_trade_target:
+                    # Copy trade mode: Generate immediate recommendation
+                    transaction_type = trade.get('type', '').lower()
+                    is_buy = 'purchase' in transaction_type or 'buy' in transaction_type
+                    is_sell = 'sale' in transaction_type or 'sell' in transaction_type
+                    
+                    if is_buy:
+                        signal = OrderRecommendation.BUY
+                    elif is_sell:
+                        signal = OrderRecommendation.SELL
+                    else:
+                        signal = OrderRecommendation.HOLD
+                    
+                    # Copy trade: 100% confidence, 50% expected profit
+                    confidence = 100.0
+                    expected_profit = 50.0 if signal == OrderRecommendation.BUY else -50.0
+                    
+                    details = f"""FMP Senate/House Trading Analysis - COPY TRADE MODE
+
+Current Price: ${current_price:.2f}
+
+🎯 COPY TRADING: {trader_name}
+
+Trade Details:
+- Trader: {trader_name}
+- Type: {transaction_type}
+- Amount: {trade.get('amount', 'N/A')}
+- Execution Date: {trade.get('exec_date', 'N/A')} ({trade.get('days_since_exec', 0)} days ago)
+- Disclosure Date: {trade.get('disclose_date', 'N/A')} ({trade.get('days_since_disclose', 0)} days ago)
+- Execution Price: ${trade.get('exec_price', 0):.2f}
+- Current Price: ${current_price:.2f}
+- Price Change: {trade.get('price_delta_pct', 0):+.1f}%
+
+Overall Signal: {signal.value}
+Confidence: {confidence:.1f}% (Copy Trade - Maximum Confidence)
+Expected Profit: {expected_profit:+.1f}%
+
+Copy Trade Mode Active:
+This trader is in your copy trade list. Recommendations are generated immediately
+with 100% confidence and 50% expected profit target, bypassing the weighted algorithm.
+
+Note: Only the first matching trade from your copy trade list is used.
+Other trades are ignored in copy trade mode.
+"""
+                    
+                    trade_info = {
+                        'trader': trader_name,
+                        'type': transaction_type,
+                        'amount': trade.get('amount', 'N/A'),
+                        'exec_date': trade.get('exec_date', 'N/A'),
+                        'disclose_date': trade.get('disclose_date', 'N/A'),
+                        'exec_price': trade.get('exec_price', 0),
+                        'current_price': current_price,
+                        'price_delta_pct': trade.get('price_delta_pct', 0),
+                        'trader_confidence_modifier': 100.0,
+                        'symbol_focus_pct': 100.0,
+                        'confidence': confidence,
+                        'days_since_exec': trade.get('days_since_exec', 0),
+                        'days_since_disclose': trade.get('days_since_disclose', 0),
+                        'trader_recent_buys': 'N/A (Copy Trade)',
+                        'trader_recent_sells': 'N/A (Copy Trade)',
+                        'trader_yearly_buys': 'N/A (Copy Trade)',
+                        'trader_yearly_sells': 'N/A (Copy Trade)',
+                        'yearly_symbol_buys': 'N/A (Copy Trade)',
+                        'yearly_symbol_sells': 'N/A (Copy Trade)'
+                    }
+                    
+                    return {
+                        'signal': signal,
+                        'confidence': confidence,
+                        'expected_profit_percent': expected_profit,
+                        'details': details,
+                        'trades': [trade_info],
+                        'trade_count': 1,
+                        'buy_count': 1 if is_buy else 0,
+                        'sell_count': 1 if is_sell else 0,
+                        'total_buy_amount': 0.0,
+                        'total_sell_amount': 0.0,
+                        'copy_trade_mode': True,
+                        'copy_trade_target': trader_name
+                    }
+        
         # Aggregate trade information
         buy_count = 0
         sell_count = 0
@@ -640,10 +783,11 @@ class FMPSenateTrade(MarketExpertInterface):
             trader_history = self._fetch_trader_history(trader_name)
             logger.debug(f"Found {len(trader_history or [])} total trades by {trader_name}")
             
-            # Calculate confidence modifier based on trader's overall trading pattern
-            # This looks at buy/sell amounts across all their trades to gauge conviction
-            trader_stats = self._calculate_trader_confidence(trader_history or [], transaction_type, max_exec_days)
+            # Calculate confidence modifier based on trader's portfolio allocation to this symbol
+            # This looks at what % of their money is focused on the current symbol
+            trader_stats = self._calculate_trader_confidence(trader_history or [], transaction_type, symbol, current_price, max_exec_days)
             trader_confidence_modifier = trader_stats['confidence_modifier']
+            symbol_focus_pct = trader_stats.get('symbol_focus_pct', 0.0)
             
             # Calculate confidence for this specific trade
             trade_confidence = self._calculate_confidence(trade, trader_confidence_modifier)
@@ -659,6 +803,7 @@ class FMPSenateTrade(MarketExpertInterface):
                 'current_price': trade.get('current_price'),
                 'price_delta_pct': trade.get('price_delta_pct', 0),
                 'trader_confidence_modifier': trader_confidence_modifier,
+                'symbol_focus_pct': symbol_focus_pct,
                 'confidence': trade_confidence,
                 'days_since_exec': trade.get('days_since_exec', 0),
                 'days_since_disclose': trade.get('days_since_disclose', 0),
@@ -666,7 +811,9 @@ class FMPSenateTrade(MarketExpertInterface):
                 'trader_recent_buys': f"{trader_stats['recent_buy_count']} (${trader_stats['recent_buy_amount']:,.0f})",
                 'trader_recent_sells': f"{trader_stats['recent_sell_count']} (${trader_stats['recent_sell_amount']:,.0f})",
                 'trader_yearly_buys': f"{trader_stats['yearly_buy_count']} (${trader_stats['yearly_buy_amount']:,.0f})",
-                'trader_yearly_sells': f"{trader_stats['yearly_sell_count']} (${trader_stats['yearly_sell_amount']:,.0f})"
+                'trader_yearly_sells': f"{trader_stats['yearly_sell_count']} (${trader_stats['yearly_sell_amount']:,.0f})",
+                'yearly_symbol_buys': f"${trader_stats.get('yearly_symbol_buy_amount', 0):,.0f}",
+                'yearly_symbol_sells': f"${trader_stats.get('yearly_symbol_sell_amount', 0):,.0f}"
             }
             trade_details.append(trade_info)
             
@@ -704,53 +851,40 @@ class FMPSenateTrade(MarketExpertInterface):
                 except:
                     pass
         
-        # Determine overall signal based on dollar-weighted consensus
-        # If dollar amounts differ significantly (>2x), use amount-based signal
-        # Otherwise use count-based signal
-        total_amount = total_buy_amount + total_sell_amount
+        # Determine overall signal based on net portfolio allocation
+        # Compare the total symbol focus % for buy trades vs sell trades
+        # This weighs traders by how much of their portfolio they're allocating to this symbol
         
-        if total_amount > 0:
-            buy_weight = total_buy_amount / total_amount
-            sell_weight = total_sell_amount / total_amount
-            
-            # If one side has >66% of the dollars, that's the signal
-            if buy_weight > 0.66:
-                signal = OrderRecommendation.BUY
-                dominant_count = buy_count
-                dominant_amount = total_buy_amount
-            elif sell_weight > 0.66:
-                signal = OrderRecommendation.SELL
-                dominant_count = sell_count
-                dominant_amount = total_sell_amount
-            # Otherwise, fall back to count-based
-            elif buy_count > sell_count:
-                signal = OrderRecommendation.BUY
-                dominant_count = buy_count
-                dominant_amount = total_buy_amount
-            elif sell_count > buy_count:
-                signal = OrderRecommendation.SELL
-                dominant_count = sell_count
-                dominant_amount = total_sell_amount
-            else:
-                signal = OrderRecommendation.HOLD
-                dominant_count = buy_count + sell_count
-                dominant_amount = total_buy_amount + total_sell_amount
+        # Calculate total symbol focus for buy and sell sides
+        buy_symbol_focus_total = sum(t['symbol_focus_pct'] for t in trade_details 
+                                     if 'purchase' in t['type'].lower() or 'buy' in t['type'].lower())
+        sell_symbol_focus_total = sum(t['symbol_focus_pct'] for t in trade_details 
+                                      if 'sale' in t['type'].lower() or 'sell' in t['type'].lower())
+        
+        net_trades = buy_count - sell_count
+        net_amount = total_buy_amount - total_sell_amount
+        net_symbol_focus = buy_symbol_focus_total - sell_symbol_focus_total
+        
+        # Use net portfolio allocation (symbol focus) to determine signal
+        # This considers both the number of traders AND how much they're allocating
+        if net_symbol_focus > 0:
+            # More portfolio allocation to buys = BUY signal
+            signal = OrderRecommendation.BUY
+            dominant_count = buy_count
+            dominant_amount = total_buy_amount
+        elif net_symbol_focus < 0:
+            # More portfolio allocation to sells = SELL signal
+            signal = OrderRecommendation.SELL
+            dominant_count = sell_count
+            dominant_amount = total_sell_amount
         else:
-            # No valid amounts, fall back to count
-            if buy_count > sell_count:
-                signal = OrderRecommendation.BUY
-                dominant_count = buy_count
-                dominant_amount = total_buy_amount
-            elif sell_count > buy_count:
-                signal = OrderRecommendation.SELL
-                dominant_count = sell_count
-                dominant_amount = total_sell_amount
-            else:
-                signal = OrderRecommendation.HOLD
-                dominant_count = buy_count + sell_count
-                dominant_amount = total_buy_amount + total_sell_amount
+            # Equal portfolio allocation = HOLD (they cancel out)
+            signal = OrderRecommendation.HOLD
+            dominant_count = buy_count + sell_count
+            dominant_amount = total_buy_amount + total_sell_amount
         
-        # Calculate overall confidence (average of individual trade confidences weighted by dominance)
+        # Calculate overall confidence and expected profit based on symbol focus percentage
+        # Filter trades by signal direction for symbol focus calculation
         if signal == OrderRecommendation.BUY:
             relevant_trades = [t for t in trade_details if 'purchase' in t['type'].lower() or 'buy' in t['type'].lower()]
         elif signal == OrderRecommendation.SELL:
@@ -758,14 +892,30 @@ class FMPSenateTrade(MarketExpertInterface):
         else:
             relevant_trades = trade_details
         
-        if relevant_trades:
-            overall_confidence = sum(t['confidence'] for t in relevant_trades) / len(relevant_trades)
-        else:
-            overall_confidence = 50.0
+        # Get growth confidence multiplier from settings
+        growth_multiplier = self.settings.get('growth_confidence_multiplier')
+        if growth_multiplier is None:
+            growth_multiplier = 5.0  # Default value
         
-        # Calculate expected profit based on average price delta
-        avg_price_delta = sum(t['price_delta_pct'] for t in trade_details) / len(trade_details) if trade_details else 0
-        expected_profit = avg_price_delta if signal == OrderRecommendation.BUY else -avg_price_delta
+        # Calculate average symbol focus percentage across relevant trades
+        if relevant_trades:
+            avg_symbol_focus_pct = sum(t['symbol_focus_pct'] for t in relevant_trades) / len(relevant_trades)
+        else:
+            avg_symbol_focus_pct = 0.0
+        
+        # Apply symbol focus-based formula
+        # Confidence: 50 + (symbol_focus_pct * multiplier)
+        # Logic: symbol_focus_pct is capped at 10%, so with default multiplier 5.0:
+        #   10% portfolio allocation * 5.0 = 50% bonus = 100% total confidence
+        #   0% portfolio allocation * 5.0 = 0% bonus = 50% total confidence
+        overall_confidence = min(100.0, max(0.0, 50.0 + avg_symbol_focus_pct * growth_multiplier))
+        
+        # Expected Profit: Same formula
+        expected_profit = min(100.0, max(0.0, 50.0 + avg_symbol_focus_pct * growth_multiplier))
+        
+        # For sell signals, negate expected profit
+        if signal == OrderRecommendation.SELL:
+            expected_profit = -expected_profit
         
         # Build detailed report
         details = f"""FMP Senate/House Trading Analysis
@@ -795,22 +945,53 @@ Trade #{i}:
 - Execution Price: ${trade_info['exec_price']:.2f}
 - Current Price: ${trade_info['current_price']:.2f}
 - Price Change: {trade_info['price_delta_pct']:+.1f}%
-- Trader Pattern Modifier: {trade_info['trader_confidence_modifier']:+.1f}%
+- Symbol Focus: {trade_info['symbol_focus_pct']:.1f}% (of trader's portfolio, capped at 10%)
 - Trade Confidence: {trade_info['confidence']:.1f}%
-- Trader Recent Activity: {trade_info['trader_recent_buys']} buys, {trade_info['trader_recent_sells']} sells
-- Trader Yearly Activity: {trade_info['trader_yearly_buys']} buys, {trade_info['trader_yearly_sells']} sells
+- Trader Recent Activity (last {max_exec_days}d): {trade_info['trader_recent_buys']} buys, {trade_info['trader_recent_sells']} sells
+- Trader Yearly Activity (all symbols): {trade_info['trader_yearly_buys']} buys, {trade_info['trader_yearly_sells']} sells
+- Trader Yearly {symbol} Activity (used for portfolio focus %): {trade_info['yearly_symbol_buys']} buys, {trade_info['yearly_symbol_sells']} sells
 """
         
         details += f"""
-Confidence Calculation Method:
-1. Base Confidence: 50%
-2. + Trader Pattern Modifier (-30 to +30, based on buy/sell history across all symbols)
-   - Strong accumulation (buying) = positive modifier
-   - Strong distribution (selling) = negative modifier (but positive for sell trades)
-3. + Investment Size Boost (up to +20% for very large trades)
-4. Final range: 0-100%
 
-Expected Profit is based on the average price movement since execution.
+📊 Note on Trade Data:
+- The {len(filtered_trades)} trades shown above are FILTERED trades (recent, price hasn't moved too much)
+- "Yearly Symbol Activity" shows ALL {symbol} trades by that trader in the past year (not just filtered)
+- Portfolio focus % is calculated from yearly activity to understand their true allocation
+- Only filtered trades are used to generate the BUY/SELL signal
+
+Signal Determination:
+- Buy Trades: {buy_count} trades (${total_buy_amount:,.0f}) with {buy_symbol_focus_total:.1f}% total portfolio focus
+- Sell Trades: {sell_count} trades (${total_sell_amount:,.0f}) with {sell_symbol_focus_total:.1f}% total portfolio focus
+- Net Portfolio Focus: {net_symbol_focus:+.1f}% (buy focus - sell focus)
+- Signal is determined by net portfolio allocation, not just trade count
+- More portfolio focus on buys = BUY, more on sells = SELL, equal = HOLD
+
+Confidence Calculation Method:
+1. Calculate Symbol Focus % for each trader:
+   - Look at all their trades in the past year
+   - Calculate: ($ spent on {symbol} / $ spent on all symbols) × 100
+   - This shows what % of their portfolio is allocated to {symbol}
+   - Cap at 10% to avoid extreme values
+2. Average Symbol Focus across relevant {signal.value} traders: {avg_symbol_focus_pct:.1f}%
+3. Confidence Formula: 50 + (Avg Symbol Focus % × {growth_multiplier}) = {overall_confidence:.1f}%
+   - 10% portfolio allocation × {growth_multiplier} = {10 * growth_multiplier:.0f}% bonus = {50 + 10 * growth_multiplier:.0f}% confidence
+   - 0% portfolio allocation × {growth_multiplier} = 0% bonus = 50% confidence
+4. Expected Profit: Uses same formula = {abs(expected_profit):.1f}%
+
+Symbol Focus Analysis:
+This measures how much conviction/focus the trader has on {symbol}.
+Higher allocation % = trader is putting significant money into this stock → higher confidence
+Lower allocation % = trader is just dabbling or diversifying → lower confidence
+Focus is capped at 10% to represent maximum conviction.
+
+Example: If trader bought $100k of {symbol} and $1M total stocks → 10% focus → maximum confidence
+
+Settings:
+- Growth Confidence Multiplier: {growth_multiplier} (configurable, controls sensitivity)
+
+Note: Only {signal.value} trades are used for confidence calculation.
+All {len(trade_details)} trades shown above for transparency.
 """
         
         return {
