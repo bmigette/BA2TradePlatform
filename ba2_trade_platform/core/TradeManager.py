@@ -850,7 +850,7 @@ class TradeManager:
                         # SAFETY CHECK: For enter_market, check if there's already an open/waiting transaction
                         # for this symbol and expert to prevent duplicate positions
                         existing_txn_statement = select(Transaction).where(
-                            Transaction.expert_instance_id == expert_instance_id,
+                            Transaction.expert_id == expert_instance_id,
                             Transaction.symbol == recommendation.symbol,
                             Transaction.status.in_([TransactionStatus.OPENED, TransactionStatus.WAITING])
                         )
