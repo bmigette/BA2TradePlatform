@@ -221,9 +221,14 @@ class JobMonitoringTab:
                 
                 analysis_data = []
                 for analysis in market_analyses:
-                    # Get expert instance info
-                    expert_instance = get_instance(ExpertInstance, analysis.expert_instance_id)
-                    expert_name = expert_instance.alias or expert_instance.expert if expert_instance else "Unknown"
+                    # Get expert instance info (handle missing instances gracefully)
+                    try:
+                        expert_instance = get_instance(ExpertInstance, analysis.expert_instance_id)
+                        expert_name = expert_instance.alias or expert_instance.expert if expert_instance else "Unknown"
+                    except Exception as e:
+                        logger.warning(f"Expert instance {analysis.expert_instance_id} not found for analysis {analysis.id}: {e}")
+                        expert_name = f"[Deleted Expert {analysis.expert_instance_id}]"
+                        expert_instance = None
                     
                     # Convert UTC to local time for display
                     local_time = analysis.created_at.replace(tzinfo=timezone.utc).astimezone() if analysis.created_at else None
@@ -841,7 +846,6 @@ class ScheduledJobsTab:
         self.total_pages = 1
         self.total_records = 0
         self.expert_filter = 'all'  # Filter by expert instance ID
-        self.selected_jobs = []  # Track selected jobs for bulk operations
         self.render()
 
     def render(self):
@@ -936,11 +940,11 @@ class ScheduledJobsTab:
             # Header with bulk action button
             with ui.row().classes('w-full justify-between items-center mb-2'):
                 ui.label('Current Week Scheduled Jobs').classes('text-md font-bold')
-                ui.button('Start Selected Jobs', 
+                self.start_selected_btn = ui.button('Start Selected Jobs', 
                          on_click=self._start_selected_jobs, 
                          icon='play_arrow',
-                         color='primary').props('outline').bind_enabled_from(self, 'selected_jobs', 
-                                                                             lambda jobs: len(jobs) > 0)
+                         color='primary').props('outline')
+                self.start_selected_btn.enabled = False  # Disabled by default
             
             self.scheduled_jobs_table = ui.table(
                 columns=columns, 
@@ -949,8 +953,15 @@ class ScheduledJobsTab:
                 selection='multiple'
             ).classes('w-full')
             
-            # Bind selected rows to instance variable
-            self.scheduled_jobs_table.bind_value_to(self, 'selected_jobs')
+            # Initialize selected property (NiceGUI tables automatically track selection in .selected property)
+            self.scheduled_jobs_table.selected = []
+            
+            # Bind the button's enabled state to the table's selection
+            self.start_selected_btn.bind_enabled_from(
+                self.scheduled_jobs_table, 
+                'selected', 
+                lambda selected: len(selected) > 0
+            )
             
             # Add action buttons
             self.scheduled_jobs_table.add_slot('body-cell-actions', '''
@@ -1174,7 +1185,8 @@ class ScheduledJobsTab:
     def _start_selected_jobs(self):
         """Start all selected jobs from the scheduled jobs table."""
         try:
-            if not self.selected_jobs:
+            selected = self.scheduled_jobs_table.selected if hasattr(self, 'scheduled_jobs_table') else []
+            if not selected:
                 ui.notify("No jobs selected", type='warning')
                 return
             
@@ -1187,7 +1199,7 @@ class ScheduledJobsTab:
             failed_submissions = 0
             
             # Submit each selected job
-            for job in self.selected_jobs:
+            for job in selected:
                 try:
                     expert_instance_id = int(job['expert_instance_id'])
                     symbol = str(job['symbol'])
@@ -1226,7 +1238,6 @@ class ScheduledJobsTab:
                 ui.notify(f"Failed to start any jobs ({failed_submissions} failed)", type='negative')
             
             # Clear selection after starting jobs
-            self.selected_jobs = []
             if self.scheduled_jobs_table:
                 self.scheduled_jobs_table.selected = []
                 
@@ -2122,7 +2133,13 @@ class OrderRecommendationsTab:
             from ...core.utils import get_account_instance_from_id
             
             # Get account instance for price lookups
-            expert_instance = get_instance(ExpertInstance, expert_id)
+            try:
+                expert_instance = get_instance(ExpertInstance, expert_id)
+            except Exception as e:
+                logger.error(f"Expert instance {expert_id} not found: {e}")
+                ui.notify(f'Error: Expert instance {expert_id} not found', type='negative')
+                return
+            
             if not expert_instance:
                 ui.notify(f'Error: Expert instance {expert_id} not found', type='negative')
                 return
@@ -2284,7 +2301,13 @@ class OrderRecommendationsTab:
             from ...core.db import get_instance
             
             # Get the expert instance
-            expert_instance = get_instance(ExpertInstance, expert_id)
+            try:
+                expert_instance = get_instance(ExpertInstance, expert_id)
+            except Exception as e:
+                logger.error(f"Expert instance {expert_id} not found: {e}")
+                ui.notify(f'Expert instance {expert_id} not found', type='negative')
+                return
+            
             if not expert_instance:
                 ui.notify(f'Expert instance {expert_id} not found', type='negative')
                 return
