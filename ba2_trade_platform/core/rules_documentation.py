@@ -31,16 +31,28 @@ def get_event_type_documentation() -> dict:
             "example": "Use with BUY actions when market turns bullish"
         },
         ExpertEventType.F_HAS_NO_POSITION.value: {
-            "name": "No Position Exists",
-            "description": "Triggers when there is NO open position for this symbol and expert combination.",
+            "name": "No Expert Position Exists",
+            "description": "Triggers when this expert has NO open position for this symbol (based on transactions).",
             "type": "boolean",
-            "example": "Useful for enter_market rules to prevent duplicate entries"
+            "example": "Useful for enter_market rules to prevent duplicate expert entries"
         },
         ExpertEventType.F_HAS_POSITION.value: {
-            "name": "Position Exists",
-            "description": "Triggers when there IS an open position for this symbol and expert combination.",
+            "name": "Expert Position Exists",
+            "description": "Triggers when this expert HAS an open position for this symbol (based on transactions).",
             "type": "boolean",
-            "example": "Useful for open_positions rules to manage existing holdings"
+            "example": "Useful for open_positions rules to manage this expert's existing holdings"
+        },
+        ExpertEventType.F_HAS_NO_POSITION_ACCOUNT.value: {
+            "name": "No Account Position Exists",
+            "description": "Triggers when the account has NO open position for this symbol (any expert).",
+            "type": "boolean",
+            "example": "Useful to prevent any new position when account already holds the symbol"
+        },
+        ExpertEventType.F_HAS_POSITION_ACCOUNT.value: {
+            "name": "Account Position Exists",
+            "description": "Triggers when the account HAS an open position for this symbol (any expert).",
+            "type": "boolean",
+            "example": "Useful for account-level position management across all experts"
         },
         
         # Rating Change Events

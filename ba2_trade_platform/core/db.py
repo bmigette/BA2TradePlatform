@@ -59,8 +59,9 @@ def set_sqlite_pragma(dbapi_conn, connection_record):
 def retry_on_lock(func):
     """Decorator to retry database operations on lock errors with exponential backoff."""
     def wrapper(*args, **kwargs):
-        max_retries = 5
-        base_delay = 0.1  # Start with 100ms
+        max_retries = 8  # Increased from 5 to 8 for better resilience
+        base_delay = 1.0  # Start with 1 second (increased from 0.1s)
+        max_delay = 30.0  # Cap maximum delay at 30 seconds
         
         for attempt in range(max_retries):
             try:
@@ -69,17 +70,61 @@ def retry_on_lock(func):
                 # Check if it's a database lock error
                 if "database is locked" in str(e).lower():
                     if attempt < max_retries - 1:
-                        delay = base_delay * (2 ** attempt)  # Exponential backoff
+                        # Exponential backoff with jitter to prevent thundering herd
+                        delay = min(base_delay * (2 ** attempt), max_delay)
+                        # Add small random jitter (±10%) to prevent synchronized retries
+                        import random
+                        jitter = delay * 0.1 * (random.random() * 2 - 1)  # ±10% jitter
+                        actual_delay = max(0.5, delay + jitter)  # Minimum 0.5s delay
+                        
                         # Only show warning without stack trace for retry attempts
-                        logger.warning(f"Database locked, retrying in {delay:.2f}s (attempt {attempt + 1}/{max_retries})")
-                        time.sleep(delay)
+                        logger.warning(f"Database locked, retrying in {actual_delay:.2f}s (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(actual_delay)
                     else:
-                        # Show full error with stack trace only on final attempt (5/5)
-                        logger.error(f"Database locked after {max_retries} attempts", exc_info=True)
+                        # Show full error with stack trace only on final attempt
+                        logger.error(f"Database locked after {max_retries} attempts with up to {max_delay}s delays", exc_info=True)
                         raise
                 else:
                     # Not a lock error, raise immediately with stack trace
                     logger.error(f"Error in {func.__name__}: {e}", exc_info=True)
+                    raise
+        
+    return wrapper
+
+
+def retry_on_lock_critical(func):
+    """
+    Enhanced decorator for critical operations like order status updates.
+    Uses longer delays and more aggressive retry strategy.
+    """
+    def wrapper(*args, **kwargs):
+        max_retries = 12  # Even more attempts for critical operations
+        base_delay = 2.0  # Start with 2 seconds for critical operations
+        max_delay = 60.0  # Allow up to 1 minute delay for critical operations
+        
+        for attempt in range(max_retries):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                # Check if it's a database lock error
+                if "database is locked" in str(e).lower():
+                    if attempt < max_retries - 1:
+                        # More aggressive exponential backoff for critical operations
+                        delay = min(base_delay * (1.5 ** attempt), max_delay)
+                        # Add jitter to prevent thundering herd
+                        import random
+                        jitter = delay * 0.15 * (random.random() * 2 - 1)  # ±15% jitter
+                        actual_delay = max(1.0, delay + jitter)  # Minimum 1s delay
+                        
+                        logger.warning(f"CRITICAL: Database locked during {func.__name__}, retrying in {actual_delay:.2f}s (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(actual_delay)
+                    else:
+                        # Critical operation failed - this is serious
+                        logger.error(f"CRITICAL: Database locked after {max_retries} attempts in {func.__name__} - ORDER STATUS MAY BE LOST", exc_info=True)
+                        raise
+                else:
+                    # Not a lock error, raise immediately with stack trace
+                    logger.error(f"CRITICAL: Error in {func.__name__}: {e}", exc_info=True)
                     raise
         
     return wrapper
@@ -196,6 +241,44 @@ def update_instance(instance, session: Session | None = None):
             return True
         except Exception as e:
             # Let the retry decorator handle logging with appropriate detail level
+            raise
+
+
+@retry_on_lock_critical
+def update_order_status_critical(order_instance, new_status, session: Session | None = None):
+    """
+    Critical function to update order status with enhanced retry logic.
+    Use this for order status updates where data loss would be catastrophic.
+    
+    Args:
+        order_instance: The order instance to update
+        new_status: The new status to set
+        session (Session, optional): An existing SQLModel session. If not provided, a new session is created.
+    
+    Returns:
+        True if update was successful.
+    """
+    with _db_write_lock:
+        try:
+            # Store original status for logging
+            original_status = getattr(order_instance, 'status', 'UNKNOWN')
+            order_instance.status = new_status
+            
+            if session:
+                session.add(order_instance)
+                session.commit()
+                session.refresh(order_instance)
+            else:
+                with Session(engine) as session:
+                    session.add(order_instance)
+                    session.commit()
+                    session.refresh(order_instance)
+            
+            logger.info(f"CRITICAL UPDATE SUCCESS: Order {getattr(order_instance, 'id', 'Unknown')} status changed from {original_status} to {new_status}")
+            return True
+        except Exception as e:
+            logger.error(f"CRITICAL UPDATE FAILED: Order status update failed - {e}")
+            # Let the retry decorator handle the retry logic
             raise
 
 def delete_instance(instance, session: Session | None = None):

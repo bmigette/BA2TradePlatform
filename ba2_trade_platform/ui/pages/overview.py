@@ -1565,9 +1565,14 @@ class AccountOverviewTab:
             table = ui.table(columns=columns, rows=rows, row_key='order_id', selection='multiple').classes('w-full')
             table.selected = []  # Initialize selected list
             
-            # Add delete button above table (after table is created so we can bind to it)
+            # Add buttons above table (after table is created so we can bind to it)
             with table.add_slot('top-left'):
                 with ui.row().classes('items-center gap-4'):
+                    ui.button('Retry Selected Orders', 
+                             icon='refresh', 
+                             on_click=lambda: self._handle_retry_selected_orders(table.selected))\
+                        .props('color=orange')\
+                        .bind_enabled_from(table, 'selected', backward=lambda val: len(val) > 0)
                     ui.button('Delete Selected Orders', 
                              icon='delete', 
                              on_click=lambda: self._handle_delete_selected_orders(table.selected))\
@@ -1657,6 +1662,117 @@ class AccountOverviewTab:
         except Exception as e:
             logger.error(f"Error handling submit order: {e}", exc_info=True)
             ui.notify(f'Error: {str(e)}', type='negative')
+    
+    def _handle_retry_selected_orders(self, selected_rows):
+        """Handle retrying selected orders."""
+        try:
+            if not selected_rows:
+                ui.notify('No orders selected', type='warning')
+                return
+            
+            # Get order IDs from selected rows
+            order_ids = [row['order_id'] for row in selected_rows]
+            
+            # Filter to only ERROR orders
+            error_order_ids = []
+            for row in selected_rows:
+                if row.get('status') == 'ERROR':
+                    error_order_ids.append(row['order_id'])
+            
+            if not error_order_ids:
+                ui.notify('Only orders with ERROR status can be retried', type='warning')
+                return
+            
+            # Confirmation dialog
+            with ui.dialog() as dialog, ui.card():
+                ui.label(f'Retry {len(error_order_ids)} ERROR order(s)?').classes('text-h6 mb-4')
+                ui.label('This will resubmit the orders to the broker. Orders that succeed will change to PENDING status.').classes('mb-4')
+                
+                if len(error_order_ids) < len(order_ids):
+                    ui.label(f'Note: {len(order_ids) - len(error_order_ids)} non-ERROR orders will be skipped.').classes('mb-4 text-orange-600')
+                
+                with ui.row().classes('w-full justify-end gap-2'):
+                    ui.button('Cancel', on_click=dialog.close).props('flat')
+                    ui.button('Retry Orders', on_click=lambda: self._confirm_retry_orders(error_order_ids, dialog)).props('color=orange')
+            
+            dialog.open()
+            
+        except Exception as e:
+            logger.error(f"Error handling retry selected orders: {e}", exc_info=True)
+            ui.notify(f'Error: {str(e)}', type='negative')
+    
+    def _confirm_retry_orders(self, order_ids, dialog):
+        """Confirm and execute order retry."""
+        try:
+            retried_count = 0
+            errors = []
+            
+            for order_id in order_ids:
+                try:
+                    # Get the order
+                    order = get_instance(TradingOrder, order_id)
+                    if not order:
+                        errors.append(f"Order {order_id} not found")
+                        continue
+                    
+                    # Only retry ERROR orders
+                    if order.status != OrderStatus.ERROR:
+                        errors.append(f"Order {order_id} is not in ERROR status (status: {order.status.value})")
+                        continue
+                    
+                    # Get the account
+                    account = get_instance(AccountDefinition, order.account_id)
+                    if not account:
+                        errors.append(f"Account for order {order_id} not found")
+                        continue
+                    
+                    # Submit the order through the account provider
+                    from ...modules.accounts import providers
+                    provider_cls = providers.get(account.provider)
+                    if not provider_cls:
+                        errors.append(f"No provider found for {account.provider}")
+                        continue
+                        
+                    try:
+                        provider_obj = provider_cls(account.id)
+                        submitted_order = provider_obj.submit_order(order)
+                        
+                        if submitted_order:
+                            retried_count += 1
+                            logger.info(f"Successfully retried order {order_id}: {order.symbol} {order.side} {order.quantity}")
+                        else:
+                            errors.append(f"Order {order_id}: Failed to resubmit to broker")
+                            
+                    except Exception as e:
+                        logger.error(f"Error retrying order {order_id}: {e}", exc_info=True)
+                        errors.append(f"Order {order_id}: {str(e)}")
+                        
+                except Exception as e:
+                    logger.error(f"Error processing retry for order {order_id}: {e}", exc_info=True)
+                    errors.append(f"Order {order_id}: {str(e)}")
+            
+            # Show results
+            if retried_count > 0:
+                ui.notify(f'Successfully retried {retried_count} order(s)', type='positive')
+            
+            if errors:
+                error_msg = '; '.join(errors[:3])  # Show first 3 errors
+                if len(errors) > 3:
+                    error_msg += f'... and {len(errors) - 3} more errors'
+                ui.notify(f'Errors: {error_msg}', type='warning')
+            
+            # Close dialog and refresh the table
+            dialog.close()
+            
+            # Refresh the pending orders table
+            if hasattr(self, 'pending_orders_container'):
+                self.pending_orders_container.clear()
+                with self.pending_orders_container:
+                    self._render_pending_orders_content()
+            
+        except Exception as e:
+            logger.error(f"Error confirming retry orders: {e}", exc_info=True)
+            ui.notify(f'Error retrying orders: {str(e)}', type='negative')
     
     def _handle_delete_selected_orders(self, selected_rows):
         """Handle deletion of selected pending orders."""

@@ -134,6 +134,47 @@ class TradeCondition(ABC):
         """
         position = self.get_current_position()
         return position is not None and position != 0
+    
+    def has_expert_position(self) -> bool:
+        """
+        Check if this expert has an open position for this instrument by checking transactions.
+        
+        Returns:
+            True if expert has open transactions for this instrument, False otherwise
+        """
+        try:
+            from .db import get_db
+            from .models import Transaction
+            from .types import TransactionStatus
+            from sqlmodel import select
+            
+            expert_id = self.expert_recommendation.instance_id
+            
+            with get_db() as session:
+                # Check for open transactions for this expert and instrument
+                statement = select(Transaction).where(
+                    Transaction.expert_id == expert_id,
+                    Transaction.symbol == self.instrument_name,
+                    Transaction.status == TransactionStatus.OPENED
+                )
+                open_transactions = session.exec(statement).all()
+                
+                return len(open_transactions) > 0
+                
+        except Exception as e:
+            logger.error(f"Error checking expert position for {self.instrument_name}: {e}", exc_info=True)
+            return False
+    
+    def has_account_position(self) -> bool:
+        """
+        Check if there's an open position for this instrument at the account level.
+        This is the original account-level position check behavior.
+        
+        Returns:
+            True if account has position exists, False otherwise
+        """
+        position = self.get_current_position()
+        return position is not None and position != 0
 
 
 class FlagCondition(TradeCondition):
@@ -229,23 +270,41 @@ class BullishCondition(FlagCondition):
 
 
 class HasNoPositionCondition(FlagCondition):
-    """Check if there's no open position for the instrument."""
+    """Check if this expert has no open position for the instrument (expert-level check based on transactions)."""
     
     def evaluate(self) -> bool:
-        return not self.has_position()
+        return not self.has_expert_position()
     
     def get_description(self) -> str:
         """Get description of no position condition."""
-        return f"Check if there is no open position for {self.instrument_name}"
+        return f"Check if this expert has no open position for {self.instrument_name} (based on transactions)"
 
 
 
 class HasPositionCondition(FlagCondition):
-    """Check if there's an open position for the instrument."""
+    """Check if this expert has an open position for the instrument (expert-level check based on transactions)."""
     def evaluate(self) -> bool:
-        return self.has_position()
+        return self.has_expert_position()
     def get_description(self) -> str:
-        return f"Check if there is an open position for {self.instrument_name}"
+        return f"Check if this expert has an open position for {self.instrument_name} (based on transactions)"
+
+# Account-level Position Conditions
+class HasNoPositionAccountCondition(FlagCondition):
+    """Check if there's no open position for the instrument at the account level."""
+    
+    def evaluate(self) -> bool:
+        return not self.has_account_position()
+    
+    def get_description(self) -> str:
+        """Get description of account-level no position condition."""
+        return f"Check if account has no open position for {self.instrument_name} (account-level)"
+
+class HasPositionAccountCondition(FlagCondition):
+    """Check if there's an open position for the instrument at the account level."""
+    def evaluate(self) -> bool:
+        return self.has_account_position()
+    def get_description(self) -> str:
+        return f"Check if account has an open position for {self.instrument_name} (account-level)"
 
 # Time Horizon Flag Conditions
 class LongTermCondition(FlagCondition):
@@ -977,6 +1036,8 @@ def create_condition(event_type: ExpertEventType, account: AccountInterface,
         ExpertEventType.F_BULLISH: BullishCondition,
         ExpertEventType.F_HAS_NO_POSITION: HasNoPositionCondition,
         ExpertEventType.F_HAS_POSITION: HasPositionCondition,
+        ExpertEventType.F_HAS_NO_POSITION_ACCOUNT: HasNoPositionAccountCondition,
+        ExpertEventType.F_HAS_POSITION_ACCOUNT: HasPositionAccountCondition,
         ExpertEventType.F_LONG_TERM: LongTermCondition,
         ExpertEventType.F_MEDIUM_TERM: MediumTermCondition,
         ExpertEventType.F_SHORT_TERM: ShortTermCondition,
