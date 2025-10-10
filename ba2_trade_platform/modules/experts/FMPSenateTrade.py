@@ -691,9 +691,9 @@ class FMPSenateTrade(MarketExpertInterface):
                     else:
                         signal = OrderRecommendation.HOLD
                     
-                    # Copy trade: 100% confidence, 50% expected profit
+                    # Copy trade: 100% confidence, 50% expected profit (always positive)
                     confidence = 100.0
-                    expected_profit = 50.0 if signal == OrderRecommendation.BUY else -50.0
+                    expected_profit = 50.0  # Always positive regardless of BUY/SELL
                     
                     details = f"""FMP Senate/House Trading Analysis - COPY TRADE MODE
 
@@ -910,12 +910,8 @@ Other trades are ignored in copy trade mode.
         #   0% portfolio allocation * 5.0 = 0% bonus = 50% total confidence
         overall_confidence = min(100.0, max(0.0, 50.0 + avg_symbol_focus_pct * growth_multiplier))
         
-        # Expected Profit: Same formula
+        # Expected Profit: Same formula (always positive regardless of BUY/SELL)
         expected_profit = min(100.0, max(0.0, 50.0 + avg_symbol_focus_pct * growth_multiplier))
-        
-        # For sell signals, negate expected profit
-        if signal == OrderRecommendation.SELL:
-            expected_profit = -expected_profit
         
         # Build detailed report
         details = f"""FMP Senate/House Trading Analysis

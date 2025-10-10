@@ -1853,18 +1853,16 @@ class TransactionsTab:
         try:
             # Populate expert filter options if not already done
             if hasattr(self, 'expert_filter'):
-                # Get all unique experts from transactions
-                expert_statement = select(ExpertInstance).join(
-                    Transaction, Transaction.expert_id == ExpertInstance.id
-                ).distinct()
+                # Get ALL expert instances, not just those with transactions
+                expert_statement = select(ExpertInstance)
                 experts = list(session.exec(expert_statement).all())
                 
                 # Build expert options list with shortnames
                 expert_options = ['All']
                 expert_map = {'All': 'All'}
                 for expert in experts:
-                    # Create shortname: "expert_name-id" or use user_description if available
-                    shortname = expert.user_description if expert.user_description else f"{expert.expert}-{expert.id}"
+                    # Create shortname: "expert_name-id" or use alias/user_description if available
+                    shortname = expert.alias or expert.user_description or f"{expert.expert}-{expert.id}"
                     expert_options.append(shortname)
                     expert_map[shortname] = expert.id
                 

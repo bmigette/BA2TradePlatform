@@ -524,6 +524,7 @@ class AdjustTakeProfitAction(TradeAction):
     
     def __init__(self, instrument_name: str, account: AccountInterface, 
                  order_recommendation: OrderRecommendation, existing_order: Optional[TradingOrder] = None,
+                 expert_recommendation: Optional[ExpertRecommendation] = None,
                  take_profit_price: Optional[float] = None,
                  reference_value: Optional[str] = None, percent: Optional[float] = None):
         """
@@ -534,11 +535,12 @@ class AdjustTakeProfitAction(TradeAction):
             account: Account interface
             order_recommendation: Order recommendation
             existing_order: Existing order to adjust (required - from enter_market or open position)
+            expert_recommendation: Optional expert recommendation for linking
             take_profit_price: New take profit price (if provided directly)
             reference_value: Reference price type ('order_open_price', 'current_price', 'expert_target_price')
             percent: Percentage to apply to reference value (e.g., 5.0 for +5%)
         """
-        super().__init__(instrument_name, account, order_recommendation, existing_order, expert_recommendation=None)
+        super().__init__(instrument_name, account, order_recommendation, existing_order, expert_recommendation)
         self.take_profit_price = take_profit_price
         self.reference_value = reference_value
         self.percent = percent
@@ -794,6 +796,7 @@ class AdjustStopLossAction(TradeAction):
     
     def __init__(self, instrument_name: str, account: AccountInterface, 
                  order_recommendation: OrderRecommendation, existing_order: Optional[TradingOrder] = None,
+                 expert_recommendation: Optional[ExpertRecommendation] = None,
                  stop_loss_price: Optional[float] = None,
                  reference_value: Optional[str] = None, percent: Optional[float] = None):
         """
@@ -804,11 +807,12 @@ class AdjustStopLossAction(TradeAction):
             account: Account interface
             order_recommendation: Order recommendation
             existing_order: Existing order to adjust (required - from enter_market or open position)
+            expert_recommendation: Optional expert recommendation for linking
             stop_loss_price: New stop loss price (if provided directly)
             reference_value: Reference price type ('order_open_price', 'current_price', 'expert_target_price')
             percent: Percentage to apply to reference value (e.g., -3.0 for -3%)
         """
-        super().__init__(instrument_name, account, order_recommendation, existing_order, expert_recommendation=None)
+        super().__init__(instrument_name, account, order_recommendation, existing_order, expert_recommendation)
         self.stop_loss_price = stop_loss_price
         self.reference_value = reference_value
         self.percent = percent
@@ -1497,13 +1501,8 @@ def create_action(action_type: ExpertActionType, instrument_name: str, account: 
         raise ValueError(f"Unknown action type: {action_type}")
     
     # Create action with appropriate arguments
-    # Only pass expert_recommendation to order-creating actions (BUY, SELL, CLOSE, INCREASE/DECREASE_SHARE)
-    # AdjustTP/SL actions only need existing_order from enter_market or open positions
-    if action_type in [ExpertActionType.ADJUST_TAKE_PROFIT, ExpertActionType.ADJUST_STOP_LOSS]:
-        return action_class(instrument_name, account, order_recommendation, existing_order, **kwargs)
-    else:
-        # BUY, SELL, CLOSE, INCREASE/DECREASE_SHARE actions get expert_recommendation for order linking
-        return action_class(instrument_name, account, order_recommendation, existing_order, expert_recommendation, **kwargs)
+    # All actions need expert_recommendation for TradeActionResult linking
+    return action_class(instrument_name, account, order_recommendation, existing_order, expert_recommendation, **kwargs)
 
 
 # TODO: Implement sequence management for complex trading scenarios

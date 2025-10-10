@@ -2014,8 +2014,8 @@ class OrderRecommendationsTab:
             logger.error(f"Error handling process recommendations: {e}", exc_info=True)
             ui.notify('Error processing recommendations', type='negative')
     
-    def _execute_process_recommendations(self, expert_id: int, days: int, config_dialog):
-        """Execute the recommendation processing with the specified days lookback."""
+    async def _execute_process_recommendations(self, expert_id: int, days: int, config_dialog):
+        """Execute the recommendation processing with the specified days lookback (async to avoid UI blocking)."""
         try:
             config_dialog.close()
             
@@ -2028,11 +2028,24 @@ class OrderRecommendationsTab:
                 ui.label('Processing Recommendations...').classes('text-h6')
                 ui.spinner(size='lg')
                 ui.label(f'Processing recommendations from the last {days} day(s)').classes('text-sm text-gray-600')
+                ui.label('This may take a few moments...').classes('text-xs text-gray-500 mt-2')
             
             processing_dialog.open()
             
             try:
-                created_orders = trade_manager.process_expert_recommendations_after_analysis(expert_id, lookback_days=days)
+                # Run the processing in a separate thread to avoid blocking the UI
+                import asyncio
+                from concurrent.futures import ThreadPoolExecutor
+                
+                # Function to run in thread
+                def process_recommendations():
+                    return trade_manager.process_expert_recommendations_after_analysis(expert_id, lookback_days=days)
+                
+                # Run in thread pool to avoid blocking UI
+                loop = asyncio.get_event_loop()
+                with ThreadPoolExecutor() as executor:
+                    created_orders = await loop.run_in_executor(executor, process_recommendations)
+                
                 processing_dialog.close()
                 
                 if created_orders:

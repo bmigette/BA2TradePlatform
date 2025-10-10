@@ -70,13 +70,16 @@ def retry_on_lock(func):
                 if "database is locked" in str(e).lower():
                     if attempt < max_retries - 1:
                         delay = base_delay * (2 ** attempt)  # Exponential backoff
+                        # Only show warning without stack trace for retry attempts
                         logger.warning(f"Database locked, retrying in {delay:.2f}s (attempt {attempt + 1}/{max_retries})")
                         time.sleep(delay)
                     else:
-                        logger.error(f"Database locked after {max_retries} attempts")
+                        # Show full error with stack trace only on final attempt (5/5)
+                        logger.error(f"Database locked after {max_retries} attempts", exc_info=True)
                         raise
                 else:
-                    # Not a lock error, raise immediately
+                    # Not a lock error, raise immediately with stack trace
+                    logger.error(f"Error in {func.__name__}: {e}", exc_info=True)
                     raise
         
     return wrapper
@@ -160,12 +163,7 @@ def add_instance(instance, session: Session | None = None, expunge_after_flush: 
                     logger.info(f"Added instance: {instance_class} (id={instance_id})")
                     return instance_id
         except Exception as e:
-            # Try to get ID safely, may not be available if instance is detached
-            try:
-                instance_id = instance.id
-                logger.error(f"Error adding instance {instance_class} (id={instance_id}): {e}", exc_info=True)
-            except:
-                logger.error(f"Error adding instance {instance_class}: {e}", exc_info=True)
+            # Let the retry decorator handle logging with appropriate detail level
             raise
 
 @retry_on_lock
@@ -197,7 +195,7 @@ def update_instance(instance, session: Session | None = None):
                     session.refresh(instance)
             return True
         except Exception as e:
-            logger.error(f"Error updating instance: {e}", exc_info=True)
+            # Let the retry decorator handle logging with appropriate detail level
             raise
 
 def delete_instance(instance, session: Session | None = None):
