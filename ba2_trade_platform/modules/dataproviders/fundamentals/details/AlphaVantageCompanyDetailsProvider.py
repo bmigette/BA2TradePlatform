@@ -14,15 +14,13 @@ from ba2_trade_platform.core.interfaces import CompanyFundamentalsDetailsInterfa
 from ba2_trade_platform.core.provider_utils import log_provider_call
 from ba2_trade_platform.logger import logger
 from ba2_trade_platform.config import get_app_setting
-from ba2_trade_platform.modules.dataproviders.alpha_vantage_common import make_api_request
+from ba2_trade_platform.modules.dataproviders.alpha_vantage_common import (
+    AlphaVantageBaseProvider,
+    AlphaVantageRateLimitError
+)
 
 
-class AlphaVantageRateLimitError(Exception):
-    """Exception raised when Alpha Vantage API rate limit is exceeded."""
-    pass
-
-
-class AlphaVantageCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
+class AlphaVantageCompanyDetailsProvider(AlphaVantageBaseProvider, CompanyFundamentalsDetailsInterface):
     """
     Alpha Vantage company details provider.
     
@@ -33,13 +31,19 @@ class AlphaVantageCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
     
     API_BASE_URL = "https://www.alphavantage.co/query"
     
-    def __init__(self):
-        """Initialize Alpha Vantage company details provider."""
-        super().__init__()
+    def __init__(self, source: str = "ba2_trade_platform"):
+        """
+        Initialize Alpha Vantage company details provider.
+        
+        Args:
+            source: Source identifier for API tracking (e.g., 'ba2_trade_platform', 'trading_agents')
+        """
+        AlphaVantageBaseProvider.__init__(self, source)
+        CompanyFundamentalsDetailsInterface.__init__(self)
         self.api_key = get_app_setting("alpha_vantage_api_key")
         if not self.api_key:
             raise ValueError("Alpha Vantage API key not configured. Please set 'alpha_vantage_api_key' in app settings.")
-        logger.debug("Initialized AlphaVantageCompanyDetailsProvider")
+        logger.debug(f"Initialized AlphaVantageCompanyDetailsProvider with source: {source}")
     
     # Removed _make_api_request - using shared alpha_vantage_common.make_api_request instead
     
@@ -77,7 +81,7 @@ class AlphaVantageCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
         
         try:
             params = {"symbol": symbol}
-            result = make_api_request("BALANCE_SHEET", params)
+            result = self.make_api_request("BALANCE_SHEET", params)
             
             # Build dict response (always build it for "both" format support)
             data = json.loads(result)
@@ -148,7 +152,7 @@ class AlphaVantageCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
         
         try:
             params = {"symbol": symbol}
-            result = make_api_request("INCOME_STATEMENT", params)
+            result = self.make_api_request("INCOME_STATEMENT", params)
             
             # Build dict response (always build it for "both" format support)
             data = json.loads(result)
@@ -220,7 +224,7 @@ class AlphaVantageCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
         
         try:
             params = {"symbol": symbol}
-            result = make_api_request("CASH_FLOW", params)
+            result = self.make_api_request("CASH_FLOW", params)
             
             # Build dict response (always build it for "both" format support)
             data = json.loads(result)

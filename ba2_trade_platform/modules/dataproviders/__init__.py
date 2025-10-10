@@ -22,6 +22,8 @@ Usage:
     rsi = pandas_indicators.get_indicator("AAPL", "rsi", end_date=datetime.now(), lookback_days=30)
 """
 
+from ba2_trade_platform.logger import logger
+
 from typing import Type, Dict
 from ba2_trade_platform.core.interfaces import (
     DataProviderInterface,
@@ -100,7 +102,7 @@ INSIDER_PROVIDERS: Dict[str, Type[CompanyInsiderInterface]] = {
 }
 
 
-def get_provider(category: str, provider_name: str) -> DataProviderInterface:
+def get_provider(category: str, provider_name: str, **kwargs) -> DataProviderInterface:
     """
     Get a provider instance by category and name.
     
@@ -115,6 +117,8 @@ def get_provider(category: str, provider_name: str) -> DataProviderInterface:
                  - 'macro': Macroeconomic data
                  - 'insider': Insider trading data
         provider_name: Provider name (e.g., 'alpaca', 'yfinance', 'alphavantage')
+        **kwargs: Additional arguments to pass to the provider constructor
+                 (e.g., source='trading_agents' for Alpha Vantage providers)
     
     Returns:
         DataProviderInterface: Instantiated provider
@@ -125,6 +129,9 @@ def get_provider(category: str, provider_name: str) -> DataProviderInterface:
     Example:
         >>> news_provider = get_provider("news", "alpaca")
         >>> news = news_provider.get_company_news("AAPL", end_date=datetime.now(), lookback_days=7)
+        
+        >>> # With custom source for Alpha Vantage
+        >>> av_news = get_provider("news", "alphavantage", source="trading_agents")
     """
     registries = {
         "ohlcv": OHLCV_PROVIDERS,
@@ -150,7 +157,17 @@ def get_provider(category: str, provider_name: str) -> DataProviderInterface:
             f"Available providers: {available}"
         )
     
-    return provider_class()
+    # Try to instantiate with kwargs, fall back to no-arg constructor for compatibility
+    try:
+        return provider_class(**kwargs)
+    except TypeError:
+        # Provider doesn't accept these kwargs, use default constructor
+        if kwargs:
+            logger.warning(
+                f"Provider {provider_name} in category {category} doesn't accept "
+                f"constructor arguments: {list(kwargs.keys())}. Using default constructor."
+            )
+        return provider_class()
 
 
 def list_providers(category: str = None) -> Dict[str, list[str]]:

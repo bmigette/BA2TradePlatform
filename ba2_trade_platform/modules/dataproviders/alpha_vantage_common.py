@@ -11,6 +11,7 @@ import pandas as pd
 import json
 from datetime import datetime
 from io import StringIO
+from typing import Optional
 
 from ba2_trade_platform.config import ALPHA_VANTAGE_API_KEY
 from ba2_trade_platform.logger import logger
@@ -21,6 +22,46 @@ API_BASE_URL = "https://www.alphavantage.co/query"
 class AlphaVantageRateLimitError(Exception):
     """Exception raised when Alpha Vantage API rate limit is exceeded."""
     pass
+
+
+class AlphaVantageBaseProvider:
+    """
+    Base class for all Alpha Vantage data providers.
+    
+    This class provides common functionality for Alpha Vantage API calls,
+    including source tracking for better usage analytics.
+    
+    Child classes should call super().__init__(source) in their constructors.
+    """
+    
+    def __init__(self, source: str = "ba2_trade_platform"):
+        """
+        Initialize the Alpha Vantage base provider.
+        
+        Args:
+            source: Source identifier for API tracking (e.g., 'ba2_trade_platform', 'trading_agents')
+        """
+        self.source = source
+        logger.debug(f"AlphaVantageBaseProvider initialized with source: {source}")
+    
+    def make_api_request(self, function_name: str, params: dict) -> dict | str:
+        """
+        Make API request to Alpha Vantage with source tracking.
+        
+        This is an instance method that uses the provider's configured source.
+        
+        Args:
+            function_name: Alpha Vantage function name (e.g., 'TIME_SERIES_DAILY_ADJUSTED')
+            params: Additional parameters for the API request
+            
+        Returns:
+            API response as string (CSV) or dict (JSON)
+            
+        Raises:
+            AlphaVantageRateLimitError: When API rate limit is exceeded
+            requests.HTTPError: When HTTP request fails
+        """
+        return make_api_request(function_name, params, source=self.source)
 
 
 def get_api_key() -> str:
@@ -63,13 +104,14 @@ def format_datetime_for_api(date_input) -> str:
         raise ValueError(f"Date must be string or datetime object, got {type(date_input)}")
 
 
-def make_api_request(function_name: str, params: dict) -> dict | str:
+def make_api_request(function_name: str, params: dict, source: str = "ba2_trade_platform") -> dict | str:
     """
     Make API request to Alpha Vantage.
     
     Args:
         function_name: Alpha Vantage function name (e.g., 'TIME_SERIES_DAILY_ADJUSTED')
         params: Additional parameters for the API request
+        source: Source identifier for API tracking (default: 'ba2_trade_platform')
         
     Returns:
         API response as string (CSV) or dict (JSON)
@@ -83,7 +125,7 @@ def make_api_request(function_name: str, params: dict) -> dict | str:
     api_params.update({
         "function": function_name,
         "apikey": get_api_key(),
-        "source": "ba2_trade_platform",
+        "source": source,
     })
     
     # Log the request

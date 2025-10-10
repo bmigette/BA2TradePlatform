@@ -12,13 +12,13 @@ import json
 from ba2_trade_platform.core.interfaces import MarketIndicatorsInterface
 from ba2_trade_platform.core.provider_utils import validate_date_range, log_provider_call
 from ba2_trade_platform.modules.dataproviders.alpha_vantage_common import (
-    make_api_request,
+    AlphaVantageBaseProvider,
     AlphaVantageRateLimitError
 )
 from ba2_trade_platform.logger import logger
 
 
-class AlphaVantageIndicatorsProvider(MarketIndicatorsInterface):
+class AlphaVantageIndicatorsProvider(AlphaVantageBaseProvider, MarketIndicatorsInterface):
     """
     Alpha Vantage technical indicators provider.
     
@@ -46,9 +46,16 @@ class AlphaVantageIndicatorsProvider(MarketIndicatorsInterface):
         # Note: Alpha Vantage doesn't support vwma or mfi
     ]
     
-    def __init__(self):
-        """Initialize Alpha Vantage indicators provider."""
-        logger.debug("Initialized AlphaVantageIndicatorsProvider")
+    def __init__(self, source: str = "ba2_trade_platform"):
+        """
+        Initialize Alpha Vantage indicators provider.
+        
+        Args:
+            source: Source identifier for API tracking (e.g., 'ba2_trade_platform', 'trading_agents')
+        """
+        AlphaVantageBaseProvider.__init__(self, source)
+        MarketIndicatorsInterface.__init__(self)
+        logger.debug(f"Initialized AlphaVantageIndicatorsProvider with source: {source}")
     
     def _fetch_indicator_data(
         self,
@@ -73,7 +80,7 @@ class AlphaVantageIndicatorsProvider(MarketIndicatorsInterface):
         """
         # Map internal indicator names to Alpha Vantage functions and parameters
         if indicator == "close_50_sma":
-            data = make_api_request("SMA", {
+            data = self.make_api_request("SMA", {
                 "symbol": symbol,
                 "interval": interval,
                 "time_period": "50",
@@ -81,7 +88,7 @@ class AlphaVantageIndicatorsProvider(MarketIndicatorsInterface):
                 "datatype": "csv"
             })
         elif indicator == "close_200_sma":
-            data = make_api_request("SMA", {
+            data = self.make_api_request("SMA", {
                 "symbol": symbol,
                 "interval": interval,
                 "time_period": "200",
@@ -89,7 +96,7 @@ class AlphaVantageIndicatorsProvider(MarketIndicatorsInterface):
                 "datatype": "csv"
             })
         elif indicator == "close_10_ema":
-            data = make_api_request("EMA", {
+            data = self.make_api_request("EMA", {
                 "symbol": symbol,
                 "interval": interval,
                 "time_period": "10",
@@ -97,14 +104,14 @@ class AlphaVantageIndicatorsProvider(MarketIndicatorsInterface):
                 "datatype": "csv"
             })
         elif indicator in ["macd", "macds", "macdh"]:
-            data = make_api_request("MACD", {
+            data = self.make_api_request("MACD", {
                 "symbol": symbol,
                 "interval": interval,
                 "series_type": series_type,
                 "datatype": "csv"
             })
         elif indicator == "rsi":
-            data = make_api_request("RSI", {
+            data = self.make_api_request("RSI", {
                 "symbol": symbol,
                 "interval": interval,
                 "time_period": str(time_period),
@@ -112,7 +119,7 @@ class AlphaVantageIndicatorsProvider(MarketIndicatorsInterface):
                 "datatype": "csv"
             })
         elif indicator in ["boll", "boll_ub", "boll_lb"]:
-            data = make_api_request("BBANDS", {
+            data = self.make_api_request("BBANDS", {
                 "symbol": symbol,
                 "interval": interval,
                 "time_period": "20",
@@ -120,7 +127,7 @@ class AlphaVantageIndicatorsProvider(MarketIndicatorsInterface):
                 "datatype": "csv"
             })
         elif indicator == "atr":
-            data = make_api_request("ATR", {
+            data = self.make_api_request("ATR", {
                 "symbol": symbol,
                 "interval": interval,
                 "time_period": str(time_period),

@@ -172,6 +172,40 @@ class TradingAgents(MarketExpertInterface):
                 "tooltip": "Select one or more data providers for insider trading data. FMP provides both insider transactions (buys/sells by executives) and calculated sentiment scores from SEC filings."
             },
             
+            # Provider Configuration
+            "alpha_vantage_source": {
+                "type": "str", "required": True, "default": "trading_agents",
+                "description": "Source identifier for Alpha Vantage API calls",
+                "tooltip": "This identifier is sent with Alpha Vantage API requests for usage tracking and analytics. Default 'trading_agents' helps differentiate TradingAgents usage from other platform components. Can be customized for advanced tracking scenarios."
+            },
+            
+            # Analyst Selection
+            "enable_market_analyst": {
+                "type": "bool", "required": True, "default": True,
+                "description": "Enable Market/Technical Analyst",
+                "tooltip": "The Market Analyst analyzes price charts, technical indicators (RSI, MACD, Moving Averages, etc.), and trading patterns. Essential for technical analysis and timing entry/exit points. Highly recommended to keep enabled."
+            },
+            "enable_social_analyst": {
+                "type": "bool", "required": True, "default": True,
+                "description": "Enable Social Media Analyst",
+                "tooltip": "The Social Media Analyst monitors sentiment from Reddit, Twitter, and other social platforms. Useful for gauging retail investor sentiment and detecting trending stocks. Can be disabled if social sentiment is not relevant to your strategy."
+            },
+            "enable_news_analyst": {
+                "type": "bool", "required": True, "default": True,
+                "description": "Enable News Analyst",
+                "tooltip": "The News Analyst gathers and analyzes recent company news, press releases, and media coverage. Critical for event-driven trading and understanding market-moving catalysts. Recommended to keep enabled."
+            },
+            "enable_fundamentals_analyst": {
+                "type": "bool", "required": True, "default": True,
+                "description": "Enable Fundamentals Analyst",
+                "tooltip": "The Fundamentals Analyst evaluates company financials, earnings reports, valuation metrics (P/E, P/B, ROE), and business health. Essential for value investing and long-term positions. Highly recommended to keep enabled."
+            },
+            "enable_macro_analyst": {
+                "type": "bool", "required": True, "default": True,
+                "description": "Enable Macro/Economic Analyst",
+                "tooltip": "The Macro Analyst monitors economic indicators (inflation, GDP, interest rates, unemployment), Federal Reserve policy, and global economic trends. Important for understanding market-wide forces. Can be disabled for pure stock-picking strategies."
+            },
+            
             "debug_mode": {
                 "type": "bool", "required": True, "default": True,
                 "description": "Enable debug mode with detailed console output",
@@ -541,6 +575,38 @@ Analysis completed at: {self._get_current_timestamp()}"""
             self._handle_analysis_error(market_analysis, symbol, str(e))
             raise
     
+    def _build_selected_analysts(self) -> List[str]:
+        """Build list of selected analysts based on settings.
+        
+        Returns:
+            List of analyst names (e.g., ["market", "news", "fundamentals"])
+        """
+        settings_def = self.get_settings_definitions()
+        selected_analysts = []
+        
+        # Check each analyst setting and add to list if enabled
+        analyst_mapping = {
+            'enable_market_analyst': 'market',
+            'enable_social_analyst': 'social',
+            'enable_news_analyst': 'news',
+            'enable_fundamentals_analyst': 'fundamentals',
+            'enable_macro_analyst': 'macro'
+        }
+        
+        for setting_key, analyst_name in analyst_mapping.items():
+            # Get setting value, default to True (all enabled by default)
+            is_enabled = self.settings.get(setting_key, settings_def[setting_key]['default'])
+            if is_enabled:
+                selected_analysts.append(analyst_name)
+        
+        # Ensure at least one analyst is selected
+        if not selected_analysts:
+            logger.warning("No analysts selected! Defaulting to all analysts enabled.")
+            selected_analysts = ['market', 'social', 'news', 'fundamentals', 'macro']
+        
+        logger.info(f"Selected analysts: {', '.join(selected_analysts)}")
+        return selected_analysts
+    
     def _execute_tradingagents_analysis(self, symbol: str, market_analysis_id: int, subtype: str) -> tuple:
         """Execute the core TradingAgents analysis."""
         # Create configuration
@@ -549,11 +615,13 @@ Analysis completed at: {self._get_current_timestamp()}"""
         # Build provider_map for new toolkit
         provider_map = self._build_provider_map()
         
-        # Build provider_args for OpenAI providers
+        # Build provider_args for OpenAI and Alpha Vantage providers
         settings_def = self.get_settings_definitions()
         openai_model = self.settings.get('openai_provider_model', settings_def['openai_provider_model']['default'])
+        alpha_vantage_source = self.settings.get('alpha_vantage_source', settings_def['alpha_vantage_source']['default'])
         provider_args = {
-            'openai_model': openai_model
+            'openai_model': openai_model,
+            'alpha_vantage_source': alpha_vantage_source
         }
         
         # Log provider_map configuration
@@ -568,7 +636,11 @@ Analysis completed at: {self._get_current_timestamp()}"""
         # Get debug mode from settings (defaults to True for detailed logging)
         debug_mode = self.settings.get('debug_mode', True)
         
+        # Build selected_analysts list based on settings
+        selected_analysts = self._build_selected_analysts()
+        
         ta_graph = TradingAgentsGraph(
+            selected_analysts=selected_analysts,
             debug=debug_mode,
             config=config,
             market_analysis_id=market_analysis_id,

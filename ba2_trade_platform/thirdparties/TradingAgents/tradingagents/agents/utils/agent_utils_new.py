@@ -94,6 +94,12 @@ class Toolkit:
             model = self.provider_args['openai_model']
             logger.debug(f"Instantiating {provider_name} with model={model}")
             return provider_class(model=model)
+        
+        # Check if this is an Alpha Vantage provider that needs source argument
+        elif 'AlphaVantage' in provider_name and 'alpha_vantage_source' in self.provider_args:
+            source = self.provider_args['alpha_vantage_source']
+            logger.debug(f"Instantiating {provider_name} with source={source}")
+            return provider_class(source=source)
         else:
             # Standard instantiation with no arguments
             return provider_class()
@@ -110,11 +116,16 @@ class Toolkit:
         
         # Instantiate the first OHLCV provider
         ohlcv_provider_class = self.provider_map["ohlcv"][0]
+        provider_name = ohlcv_provider_class.__name__
         
         # Check if OpenAI provider needs model argument
-        if 'OpenAI' in ohlcv_provider_class.__name__ and 'openai_model' in self.provider_args:
+        if 'OpenAI' in provider_name and 'openai_model' in self.provider_args:
             model = self.provider_args['openai_model']
             return ohlcv_provider_class(model=model)
+        # Check if Alpha Vantage provider needs source argument
+        elif 'AlphaVantage' in provider_name and 'alpha_vantage_source' in self.provider_args:
+            source = self.provider_args['alpha_vantage_source']
+            return ohlcv_provider_class(source=source)
         else:
             return ohlcv_provider_class()
     

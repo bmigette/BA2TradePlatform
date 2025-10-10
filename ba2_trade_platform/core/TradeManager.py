@@ -147,7 +147,7 @@ class TradeManager:
                 
                 for dependent_order in dependent_orders:
                     if dependent_order.status != OrderStatus.WAITING_TRIGGER:
-                        self.logger.debug(f"Skipping order {dependent_order.id} - status is {dependent_order.status}, not WAITING_TRIGGER")
+                        #self.logger.debug(f"Skipping order {dependent_order.id} - status is {dependent_order.status}, not WAITING_TRIGGER")
                         continue  # Only process orders waiting for triggers
                         
                     parent_order_id = dependent_order.depends_on_order

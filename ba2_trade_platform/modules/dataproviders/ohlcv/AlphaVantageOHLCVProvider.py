@@ -12,7 +12,7 @@ from io import StringIO
 
 from ba2_trade_platform.core.interfaces.MarketDataProviderInterface import MarketDataProviderInterface
 from ba2_trade_platform.modules.dataproviders.alpha_vantage_common import (
-    make_api_request,
+    AlphaVantageBaseProvider,
     filter_csv_by_date_range,
     AlphaVantageRateLimitError
 )
@@ -20,7 +20,7 @@ from ba2_trade_platform.core.provider_utils import log_provider_call
 from ba2_trade_platform.logger import logger
 
 
-class AlphaVantageOHLCVProvider(MarketDataProviderInterface):
+class AlphaVantageOHLCVProvider(AlphaVantageBaseProvider, MarketDataProviderInterface):
     """
     Alpha Vantage OHLCV Data Provider.
     
@@ -66,14 +66,18 @@ class AlphaVantageOHLCVProvider(MarketDataProviderInterface):
         )
     """
     
-    def __init__(self):
+    def __init__(self, source: str = "ba2_trade_platform"):
         """
         Initialize Alpha Vantage OHLCV provider.
         
+        Args:
+            source: Source identifier for API tracking (e.g., 'ba2_trade_platform', 'trading_agents')
+        
         Caching is automatically configured using config.CACHE_FOLDER.
         """
-        super().__init__()
-        logger.debug("AlphaVantageOHLCVProvider initialized")
+        AlphaVantageBaseProvider.__init__(self, source)
+        MarketDataProviderInterface.__init__(self)
+        logger.debug(f"AlphaVantageOHLCVProvider initialized with source: {source}")
     
     @log_provider_call
     def _get_ohlcv_data_impl(
@@ -121,7 +125,7 @@ class AlphaVantageOHLCVProvider(MarketDataProviderInterface):
         
         try:
             # Make API request
-            csv_data = make_api_request("TIME_SERIES_DAILY_ADJUSTED", params)
+            csv_data = self.make_api_request("TIME_SERIES_DAILY_ADJUSTED", params)
             
             # Filter by date range
             filtered_csv = filter_csv_by_date_range(

@@ -87,7 +87,7 @@ class FMPSenateTrade(MarketExpertInterface):
     
     def _fetch_senate_trades(self, symbol: str) -> Optional[List[Dict[str, Any]]]:
         """
-        Fetch senate/house trades from FMP API for a specific symbol.
+        Fetch senate trades from FMP API for a specific symbol.
         
         Args:
             symbol: Stock symbol to query
@@ -100,14 +100,14 @@ class FMPSenateTrade(MarketExpertInterface):
             return None
         
         try:
-            url = f"https://financialmodelingprep.com/api/v4/senate-trading"
+            url = f"https://financialmodelingprep.com/stable/senate-trades"
             params = {
                 "symbol": symbol.upper(),
                 "apikey": self._api_key
             }
             
             logger.debug(f"Fetching FMP senate trades for {symbol}")
-            response = requests.get(url, params=params, timeout=10)
+            response = requests.get(url, params=params, timeout=30)
             response.raise_for_status()
             
             data = response.json()
@@ -122,12 +122,49 @@ class FMPSenateTrade(MarketExpertInterface):
             logger.error(f"Unexpected error fetching senate trades for {symbol}: {e}", exc_info=True)
             return None
     
-    def _fetch_trader_history(self, trader_name: str) -> Optional[List[Dict[str, Any]]]:
+    def _fetch_house_trades(self, symbol: str) -> Optional[List[Dict[str, Any]]]:
         """
-        Fetch all previous trades by a specific senator/representative.
+        Fetch house trades from FMP API for a specific symbol.
         
         Args:
-            trader_name: Name of the government official
+            symbol: Stock symbol to query
+            
+        Returns:
+            List of trade records or None if error
+        """
+        if not self._api_key:
+            logger.error("Cannot fetch house trades: FMP API key not configured")
+            return None
+        
+        try:
+            url = f"https://financialmodelingprep.com/stable/house-trades"
+            params = {
+                "symbol": symbol.upper(),
+                "apikey": self._api_key
+            }
+            
+            logger.debug(f"Fetching FMP house trades for {symbol}")
+            response = requests.get(url, params=params, timeout=30)
+            response.raise_for_status()
+            
+            data = response.json()
+            logger.debug(f"Received {len(data) if isinstance(data, list) else 0} house trade records for {symbol}")
+            
+            return data if isinstance(data, list) else []
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to fetch FMP house trades for {symbol}: {e}", exc_info=True)
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error fetching house trades for {symbol}: {e}", exc_info=True)
+            return None
+    
+    def _fetch_trader_history(self, trader_name: str) -> Optional[List[Dict[str, Any]]]:
+        """
+        Fetch all previous trades by a specific senator/representative using name-based search.
+        
+        Args:
+            trader_name: Name of the government official (first or last name)
             
         Returns:
             List of all trades by this person or None if error
@@ -136,38 +173,54 @@ class FMPSenateTrade(MarketExpertInterface):
             logger.error("Cannot fetch trader history: FMP API key not configured")
             return None
         
+        all_trades = []
+        
         try:
-            # FMP API doesn't have name-based search, so we need to fetch recent trades
-            # and filter by name (not ideal but works for the use case)
-            url = f"https://financialmodelingprep.com/api/v4/senate-trading"
-            params = {
+            # Fetch senate trades by name
+            senate_url = f"https://financialmodelingprep.com/stable/senate-trades-by-name"
+            senate_params = {
+                "name": trader_name,
                 "apikey": self._api_key
             }
             
-            logger.debug(f"Fetching trade history for {trader_name}")
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
+            logger.debug(f"Fetching senate trade history for {trader_name}")
+            senate_response = requests.get(senate_url, params=senate_params, timeout=10)
+            senate_response.raise_for_status()
             
-            data = response.json()
-            
-            if not isinstance(data, list):
-                return []
-            
-            # Filter for this specific trader
-            trader_history = [
-                trade for trade in data 
-                if trade.get('representative', '').lower() == trader_name.lower()
-            ]
-            
-            logger.debug(f"Found {len(trader_history)} previous trades by {trader_name}")
-            return trader_history
+            senate_data = senate_response.json()
+            if isinstance(senate_data, list):
+                all_trades.extend(senate_data)
+                logger.debug(f"Found {len(senate_data)} senate trades by {trader_name}")
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to fetch trader history for {trader_name}: {e}", exc_info=True)
-            return None
+            logger.error(f"Failed to fetch senate trader history for {trader_name}: {e}", exc_info=True)
         except Exception as e:
-            logger.error(f"Unexpected error fetching trader history for {trader_name}: {e}", exc_info=True)
-            return None
+            logger.error(f"Unexpected error fetching senate trader history for {trader_name}: {e}", exc_info=True)
+        
+        try:
+            # Fetch house trades by name
+            house_url = f"https://financialmodelingprep.com/stable/house-trades-by-name"
+            house_params = {
+                "name": trader_name,
+                "apikey": self._api_key
+            }
+            
+            logger.debug(f"Fetching house trade history for {trader_name}")
+            house_response = requests.get(house_url, params=house_params, timeout=10)
+            house_response.raise_for_status()
+            
+            house_data = house_response.json()
+            if isinstance(house_data, list):
+                all_trades.extend(house_data)
+                logger.debug(f"Found {len(house_data)} house trades by {trader_name}")
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to fetch house trader history for {trader_name}: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Unexpected error fetching house trader history for {trader_name}: {e}", exc_info=True)
+        
+        logger.debug(f"Found total of {len(all_trades)} trades by {trader_name} (senate + house)")
+        return all_trades if all_trades else None
     
     def _get_price_at_date(self, symbol: str, date: datetime) -> Optional[float]:
         """
@@ -234,7 +287,8 @@ class FMPSenateTrade(MarketExpertInterface):
                       max_disclose_days: int, 
                       max_exec_days: int,
                       max_price_delta_pct: float,
-                      current_price: float) -> List[Dict[str, Any]]:
+                      current_price: float,
+                      symbol: str) -> List[Dict[str, Any]]:
         """
         Filter trades based on configured settings.
         
@@ -244,147 +298,257 @@ class FMPSenateTrade(MarketExpertInterface):
             max_exec_days: Maximum days since execution
             max_price_delta_pct: Maximum price change percentage
             current_price: Current stock price
+            symbol: Stock symbol to filter for
             
         Returns:
             Filtered list of trades
         """
         now = datetime.now(timezone.utc)
         filtered_trades = []
-        
+        max_exec_days = int(max_exec_days)
+        max_price_delta_pct = int (max_price_delta_pct)
+        max_disclose_days = int(max_disclose_days)
         for trade in trades:
             # Parse dates
             try:
-                # FMP API uses 'dateRecieved' for disclosure date and 'transactionDate' for execution date
-                disclose_date_str = trade.get('dateRecieved', '')
+                # FMP API uses 'disclosureDate' for disclosure date and 'transactionDate' for execution date
+                disclose_date_str = trade.get('disclosureDate', '')
                 exec_date_str = trade.get('transactionDate', '')
                 
+                trader_name = f"{trade.get('firstName', '')} {trade.get('lastName', '')}".strip() or 'Unknown'
+
                 if not disclose_date_str or not exec_date_str:
-                    logger.debug(f"Trade missing dates, skipping: {trade.get('representative', 'Unknown')}")
+                    # Build trader name for logging
+                    logger.debug(f"Trade missing dates, skipping: {trader_name}")
                     continue
                 
                 # Parse dates (FMP returns YYYY-MM-DD format)
                 disclose_date = datetime.strptime(disclose_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
                 exec_date = datetime.strptime(exec_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                
+                # Build trader name for logging
+
+                # Check if this is the correct symbol (case insensitive)
+                trade_symbol = trade.get('symbol', '').upper()
+                if trade_symbol != symbol.upper():
+                    #logger.debug(f"Trade symbol {trade_symbol} doesn't match requested symbol {symbol}, filtering out")
+                    continue
                 # Check disclose date
                 days_since_disclose = (now - disclose_date).days
                 if days_since_disclose > max_disclose_days:
-                    logger.debug(f"Trade disclosed {days_since_disclose} days ago (max: {max_disclose_days}), filtering out")
+                    #logger.debug(f"Trade disclosed {days_since_disclose} days ago (max: {max_disclose_days}), filtering out")
                     continue
                 
                 # Check execution date
                 days_since_exec = (now - exec_date).days
                 if days_since_exec > max_exec_days:
-                    logger.debug(f"Trade executed {days_since_exec} days ago (max: {max_exec_days}), filtering out")
+                    #logger.debug(f"Trade executed {days_since_exec} days ago (max: {max_exec_days}), filtering out")
+                    continue
+                
+                # Only fetch price if trade passed all date filters
+                # This avoids unnecessary API calls for old trades
+                exec_price = self._get_price_at_date(trade.get('symbol', ''), exec_date)
+                if not exec_price:
+                    logger.debug(f"Could not get execution price for {trader_name}'s trade, skipping")
                     continue
                 
                 # Check price delta
-                exec_price = self._get_price_at_date(trade.get('symbol', ''), exec_date)
-                if exec_price:
-                    price_delta_pct = abs((current_price - exec_price) / exec_price * 100)
-                    if price_delta_pct > max_price_delta_pct:
-                        logger.debug(f"Price moved {price_delta_pct:.1f}% (max: {max_price_delta_pct}%), filtering out")
-                        continue
-                    
-                    # Add calculated fields to trade
-                    trade['exec_price'] = exec_price
-                    trade['current_price'] = current_price
-                    trade['price_delta_pct'] = (current_price - exec_price) / exec_price * 100
-                    trade['days_since_disclose'] = days_since_disclose
-                    trade['days_since_exec'] = days_since_exec
-                    trade['disclose_date'] = disclose_date_str
-                    trade['exec_date'] = exec_date_str
+                price_delta_pct = abs((current_price - exec_price) / exec_price * 100)
+                if price_delta_pct > max_price_delta_pct:
+                    logger.debug(f"Price moved {price_delta_pct:.1f}% (max: {max_price_delta_pct}%), filtering out")
+                    continue
+                
+                # Add calculated fields to trade
+                trade['exec_price'] = exec_price
+                trade['current_price'] = current_price
+                trade['price_delta_pct'] = (current_price - exec_price) / exec_price * 100
+                trade['days_since_disclose'] = days_since_disclose
+                trade['days_since_exec'] = days_since_exec
+                trade['disclose_date'] = disclose_date_str
+                trade['exec_date'] = exec_date_str
                 
                 filtered_trades.append(trade)
                 
             except Exception as e:
-                logger.warning(f"Error processing trade: {e}")
+                logger.error(f"Error processing trade: {e}", exc_info=True)
                 continue
         
         logger.info(f"Filtered {len(filtered_trades)} trades from {len(trades)} total")
         return filtered_trades
     
-    def _calculate_trader_performance(self, trader_history: List[Dict[str, Any]], 
-                                     current_trade_symbol: str) -> float:
+    def _calculate_trader_confidence(self, trader_history: List[Dict[str, Any]], 
+                                     current_trade_type: str,
+                                     max_exec_days: int = 60) -> Dict[str, Any]:
         """
-        Calculate the historical performance growth for a trader.
+        Calculate confidence based on trader's overall trading pattern.
+        
+        Logic:
+        - Traders who consistently buy (accumulate) signal bullish confidence
+        - Traders who consistently sell (distribute) signal bearish confidence
+        - Use trade amounts to weight the signal strength
         
         Args:
-            trader_history: List of previous trades by this person
-            current_trade_symbol: Symbol of current trade (to exclude it)
+            trader_history: List of all trades by this person (all symbols, all time)
+            current_trade_type: Type of the current trade ('purchase' or 'sale')
+            max_exec_days: Days to look back for recent activity
             
         Returns:
-            Average growth percentage across all completed trades
+            Dictionary with confidence modifier and trading statistics
         """
         if not trader_history:
-            return 0.0
+            return {
+                'confidence_modifier': 0.0,
+                'recent_buy_amount': 0.0,
+                'recent_sell_amount': 0.0,
+                'recent_buy_count': 0,
+                'recent_sell_count': 0,
+                'yearly_buy_amount': 0.0,
+                'yearly_sell_amount': 0.0,
+                'yearly_buy_count': 0,
+                'yearly_sell_count': 0
+            }
         
-        growth_values = []
+        # Time thresholds
+        now = datetime.now(timezone.utc)
+        max_exec_days = int(max_exec_days)  # Ensure it's an integer
+        recent_threshold = now - timedelta(days=max_exec_days)
+        yearly_threshold = now - timedelta(days=365)
+        
+        # Recent period (max_exec_days)
+        recent_buy_amount = 0.0
+        recent_sell_amount = 0.0
+        recent_buy_count = 0
+        recent_sell_count = 0
+        
+        # Yearly period
+        yearly_buy_amount = 0.0
+        yearly_sell_amount = 0.0
+        yearly_buy_count = 0
+        yearly_sell_count = 0
         
         for trade in trader_history:
-            # Skip the current symbol to avoid circular logic
-            if trade.get('symbol', '').upper() == current_trade_symbol.upper():
-                continue
-            
             try:
+                transaction_type = trade.get('type', '').lower()
+                amount_str = trade.get('amount', '0')
                 exec_date_str = trade.get('transactionDate', '')
+                
+                # Skip if no date
                 if not exec_date_str:
                     continue
                 
-                exec_date = datetime.strptime(exec_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                symbol = trade.get('symbol', '')
-                
-                if not symbol:
+                # Parse date
+                try:
+                    exec_date = datetime.strptime(exec_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                except:
                     continue
                 
-                # Get execution price and current price
-                exec_price = self._get_price_at_date(symbol, exec_date)
-                if not exec_price:
-                    continue
+                # Parse amount (remove $, commas, extract numeric value)
+                # Format is typically "$15,001 - $50,000" or similar
+                if '-' in amount_str:
+                    # Take the average of the range
+                    parts = amount_str.split('-')
+                    low = ''.join(c for c in parts[0] if c.isdigit() or c == '.')
+                    high = ''.join(c for c in parts[1] if c.isdigit() or c == '.')
+                    amount = (float(low) + float(high)) / 2 if low and high else 0
+                else:
+                    amount_str = ''.join(c for c in amount_str if c.isdigit() or c == '.')
+                    amount = float(amount_str) if amount_str else 0
                 
-                current_price_hist = self._get_current_price(symbol)
-                if not current_price_hist:
-                    continue
+                # Classify as buy or sell
+                is_buy = 'purchase' in transaction_type or 'buy' in transaction_type
+                is_sell = 'sale' in transaction_type or 'sell' in transaction_type
                 
-                # Calculate growth
-                growth_pct = ((current_price_hist - exec_price) / exec_price) * 100
+                # Count for recent period (max_exec_days)
+                if exec_date >= recent_threshold:
+                    if is_buy:
+                        recent_buy_amount += amount
+                        recent_buy_count += 1
+                    elif is_sell:
+                        recent_sell_amount += amount
+                        recent_sell_count += 1
                 
-                # For purchases, positive growth is good
-                # For sales, we inverse the logic (selling before a drop is good)
-                transaction_type = trade.get('type', '').lower()
-                if 'sale' in transaction_type or 'sell' in transaction_type:
-                    growth_pct = -growth_pct
-                
-                growth_values.append(growth_pct)
-                
+                # Count for yearly period
+                if exec_date >= yearly_threshold:
+                    if is_buy:
+                        yearly_buy_amount += amount
+                        yearly_buy_count += 1
+                    elif is_sell:
+                        yearly_sell_amount += amount
+                        yearly_sell_count += 1
+                    
             except Exception as e:
-                logger.debug(f"Error calculating growth for historical trade: {e}")
+                logger.debug(f"Error parsing trade: {e}")
                 continue
         
-        if not growth_values:
-            return 0.0
+        # Calculate net trading direction based on yearly data
+        net_amount = yearly_buy_amount - yearly_sell_amount
+        total_volume = yearly_buy_amount + yearly_sell_amount
         
-        # Calculate average growth
-        avg_growth = sum(growth_values) / len(growth_values)
-        logger.debug(f"Calculated average growth: {avg_growth:.1f}% from {len(growth_values)} trades")
+        if total_volume == 0:
+            return {
+                'confidence_modifier': 0.0,
+                'recent_buy_amount': recent_buy_amount,
+                'recent_sell_amount': recent_sell_amount,
+                'recent_buy_count': recent_buy_count,
+                'recent_sell_count': recent_sell_count,
+                'yearly_buy_amount': yearly_buy_amount,
+                'yearly_sell_amount': yearly_sell_amount,
+                'yearly_buy_count': yearly_buy_count,
+                'yearly_sell_count': yearly_sell_count
+            }
         
-        return avg_growth
+        # Calculate directional bias (-1 to +1, where +1 = all buying, -1 = all selling)
+        directional_bias = net_amount / total_volume
+        
+        # Convert to confidence modifier (-30 to +30)
+        # Strong buying pattern = +30% confidence
+        # Strong selling pattern = -30% confidence
+        base_modifier = directional_bias * 30.0
+        
+        # If current trade aligns with pattern, increase confidence
+        # If current trade contradicts pattern, decrease confidence
+        current_is_buy = 'purchase' in current_trade_type.lower() or 'buy' in current_trade_type.lower()
+        
+        if current_is_buy and directional_bias > 0:
+            # Buying and trader is accumulating = boost confidence
+            confidence_modifier = abs(base_modifier)
+        elif not current_is_buy and directional_bias < 0:
+            # Selling and trader is distributing = boost confidence
+            confidence_modifier = abs(base_modifier)
+        else:
+            # Trade contradicts pattern = reduce confidence
+            confidence_modifier = base_modifier * 0.5
+        
+        logger.debug(f"Trader pattern (yearly): {yearly_buy_count} buys (${yearly_buy_amount:,.0f}), "
+                    f"{yearly_sell_count} sells (${yearly_sell_amount:,.0f}) -> "
+                    f"bias: {directional_bias:.2f}, modifier: {confidence_modifier:.1f}%")
+        logger.debug(f"Trader pattern (recent {max_exec_days}d): {recent_buy_count} buys (${recent_buy_amount:,.0f}), "
+                    f"{recent_sell_count} sells (${recent_sell_amount:,.0f})")
+        
+        return {
+            'confidence_modifier': confidence_modifier,
+            'recent_buy_amount': recent_buy_amount,
+            'recent_sell_amount': recent_sell_amount,
+            'recent_buy_count': recent_buy_count,
+            'recent_sell_count': recent_sell_count,
+            'yearly_buy_amount': yearly_buy_amount,
+            'yearly_sell_amount': yearly_sell_amount,
+            'yearly_buy_count': yearly_buy_count,
+            'yearly_sell_count': yearly_sell_count
+        }
     
     def _calculate_confidence(self, trade: Dict[str, Any], 
-                             trader_performance: float,
-                             max_confidence: float = 80.0) -> float:
+                             trader_confidence_modifier: float) -> float:
         """
         Calculate confidence for a trade recommendation.
         
         Formula:
         1. Start at 50% base confidence
-        2. Add trader performance (growth), capped at max_confidence
-        3. Add 5% per $100k invested
+        2. Add trader pattern modifier (-30 to +30)
+        3. Add investment size boost (up to +20%)
         
         Args:
             trade: Trade record with amount information
-            trader_performance: Historical growth percentage
-            max_confidence: Maximum confidence cap (default 80%)
+            trader_confidence_modifier: Confidence adjustment based on trader's pattern (-30 to +30)
             
         Returns:
             Confidence percentage (0-100)
@@ -392,36 +556,41 @@ class FMPSenateTrade(MarketExpertInterface):
         # Base confidence
         confidence = 50.0
         
-        # Add historical performance (can be positive or negative)
-        confidence += trader_performance
+        # Add trader pattern modifier
+        confidence += trader_confidence_modifier
         
-        # Cap at max_confidence before adding investment boost
-        confidence = min(max_confidence, max(0, confidence))
-        
-        # Add investment size boost (+5% per $100k)
+        # Add investment size boost (up to +20% for very large trades)
         try:
             amount_str = trade.get('amount', '0')
-            # Remove non-numeric characters (like $, commas)
-            amount_str = ''.join(c for c in amount_str if c.isdigit() or c == '.')
-            amount = float(amount_str) if amount_str else 0
             
-            # Calculate boost: +5% per $100k
-            investment_boost = (amount / 100000) * 5.0
+            # Parse amount (handle ranges like "$15,001 - $50,000")
+            if '-' in amount_str:
+                parts = amount_str.split('-')
+                low = ''.join(c for c in parts[0] if c.isdigit() or c == '.')
+                high = ''.join(c for c in parts[1] if c.isdigit() or c == '.')
+                amount = (float(low) + float(high)) / 2 if low and high else 0
+            else:
+                amount_str = ''.join(c for c in amount_str if c.isdigit() or c == '.')
+                amount = float(amount_str) if amount_str else 0
+            
+            # Calculate boost: +10% per $500k, capped at +20%
+            investment_boost = min(20.0, (amount / 500000) * 10.0)
             confidence += investment_boost
             
-            logger.debug(f"Investment amount: ${amount:,.2f} -> boost: +{investment_boost:.1f}%")
+            logger.debug(f"Trade amount: ${amount:,.0f} -> boost: +{investment_boost:.1f}%")
             
         except Exception as e:
             logger.debug(f"Error parsing trade amount: {e}")
         
-        # Final cap at 100%
-        confidence = min(100.0, max(0, confidence))
+        # Final cap at 100%, floor at 0%
+        confidence = min(100.0, max(0.0, confidence))
         
         return confidence
     
     def _calculate_recommendation(self, filtered_trades: List[Dict[str, Any]],
                                   symbol: str,
-                                  current_price: float) -> Dict[str, Any]:
+                                  current_price: float,
+                                  max_exec_days: int) -> Dict[str, Any]:
         """
         Calculate trading recommendation from filtered senate trades.
         
@@ -429,6 +598,7 @@ class FMPSenateTrade(MarketExpertInterface):
             filtered_trades: List of relevant trades after filtering
             symbol: Stock symbol
             current_price: Current stock price
+            max_exec_days: Maximum days since execution (for filtering trader history)
             
         Returns:
             Dictionary with recommendation details
@@ -455,19 +625,28 @@ class FMPSenateTrade(MarketExpertInterface):
         trade_details = []
         
         for trade in filtered_trades:
-            trader_name = trade.get('representative', 'Unknown')
+            # Build trader name from firstName and lastName
+            first_name = trade.get('firstName', '')
+            last_name = trade.get('lastName', '')
+            trader_name = f"{first_name} {last_name}".strip() or 'Unknown'
+            
             transaction_type = trade.get('type', '').lower()
             
             # Determine if it's a buy or sell
             is_buy = 'purchase' in transaction_type or 'buy' in transaction_type
             is_sell = 'sale' in transaction_type or 'sell' in transaction_type
             
-            # Get trader history and calculate performance
+            # Get trader's full history (all symbols, all time) to assess trading pattern
             trader_history = self._fetch_trader_history(trader_name)
-            trader_performance = self._calculate_trader_performance(trader_history or [], symbol)
+            logger.debug(f"Found {len(trader_history or [])} total trades by {trader_name}")
+            
+            # Calculate confidence modifier based on trader's overall trading pattern
+            # This looks at buy/sell amounts across all their trades to gauge conviction
+            trader_stats = self._calculate_trader_confidence(trader_history or [], transaction_type, max_exec_days)
+            trader_confidence_modifier = trader_stats['confidence_modifier']
             
             # Calculate confidence for this specific trade
-            trade_confidence = self._calculate_confidence(trade, trader_performance)
+            trade_confidence = self._calculate_confidence(trade, trader_confidence_modifier)
             
             # Store trade details
             trade_info = {
@@ -475,14 +654,19 @@ class FMPSenateTrade(MarketExpertInterface):
                 'type': transaction_type,
                 'amount': trade.get('amount', 'N/A'),
                 'exec_date': trade.get('exec_date', trade.get('transactionDate', 'N/A')),
-                'disclose_date': trade.get('disclose_date', trade.get('dateRecieved', 'N/A')),
+                'disclose_date': trade.get('disclose_date', trade.get('disclosureDate', 'N/A')),
                 'exec_price': trade.get('exec_price'),
                 'current_price': trade.get('current_price'),
                 'price_delta_pct': trade.get('price_delta_pct', 0),
-                'trader_performance': trader_performance,
+                'trader_confidence_modifier': trader_confidence_modifier,
                 'confidence': trade_confidence,
                 'days_since_exec': trade.get('days_since_exec', 0),
-                'days_since_disclose': trade.get('days_since_disclose', 0)
+                'days_since_disclose': trade.get('days_since_disclose', 0),
+                # Trader statistics
+                'trader_recent_buys': f"{trader_stats['recent_buy_count']} (${trader_stats['recent_buy_amount']:,.0f})",
+                'trader_recent_sells': f"{trader_stats['recent_sell_count']} (${trader_stats['recent_sell_amount']:,.0f})",
+                'trader_yearly_buys': f"{trader_stats['yearly_buy_count']} (${trader_stats['yearly_buy_amount']:,.0f})",
+                'trader_yearly_sells': f"{trader_stats['yearly_sell_count']} (${trader_stats['yearly_sell_amount']:,.0f})"
             }
             trade_details.append(trade_info)
             
@@ -491,32 +675,80 @@ class FMPSenateTrade(MarketExpertInterface):
                 buy_count += 1
                 try:
                     amount_str = trade.get('amount', '0')
-                    amount_str = ''.join(c for c in amount_str if c.isdigit() or c == '.')
-                    total_buy_amount += float(amount_str) if amount_str else 0
+                    # Parse amount range (e.g., "$15,001 - $50,000")
+                    if '-' in amount_str:
+                        parts = amount_str.split('-')
+                        low = ''.join(c for c in parts[0] if c.isdigit() or c == '.')
+                        high = ''.join(c for c in parts[1] if c.isdigit() or c == '.')
+                        amount = (float(low) + float(high)) / 2 if low and high else 0
+                    else:
+                        amount_str = ''.join(c for c in amount_str if c.isdigit() or c == '.')
+                        amount = float(amount_str) if amount_str else 0
+                    total_buy_amount += amount
                 except:
                     pass
             elif is_sell:
                 sell_count += 1
                 try:
                     amount_str = trade.get('amount', '0')
-                    amount_str = ''.join(c for c in amount_str if c.isdigit() or c == '.')
-                    total_sell_amount += float(amount_str) if amount_str else 0
+                    # Parse amount range (e.g., "$15,001 - $50,000")
+                    if '-' in amount_str:
+                        parts = amount_str.split('-')
+                        low = ''.join(c for c in parts[0] if c.isdigit() or c == '.')
+                        high = ''.join(c for c in parts[1] if c.isdigit() or c == '.')
+                        amount = (float(low) + float(high)) / 2 if low and high else 0
+                    else:
+                        amount_str = ''.join(c for c in amount_str if c.isdigit() or c == '.')
+                        amount = float(amount_str) if amount_str else 0
+                    total_sell_amount += amount
                 except:
                     pass
         
-        # Determine overall signal based on trade consensus
-        if buy_count > sell_count:
-            signal = OrderRecommendation.BUY
-            dominant_count = buy_count
-            dominant_amount = total_buy_amount
-        elif sell_count > buy_count:
-            signal = OrderRecommendation.SELL
-            dominant_count = sell_count
-            dominant_amount = total_sell_amount
+        # Determine overall signal based on dollar-weighted consensus
+        # If dollar amounts differ significantly (>2x), use amount-based signal
+        # Otherwise use count-based signal
+        total_amount = total_buy_amount + total_sell_amount
+        
+        if total_amount > 0:
+            buy_weight = total_buy_amount / total_amount
+            sell_weight = total_sell_amount / total_amount
+            
+            # If one side has >66% of the dollars, that's the signal
+            if buy_weight > 0.66:
+                signal = OrderRecommendation.BUY
+                dominant_count = buy_count
+                dominant_amount = total_buy_amount
+            elif sell_weight > 0.66:
+                signal = OrderRecommendation.SELL
+                dominant_count = sell_count
+                dominant_amount = total_sell_amount
+            # Otherwise, fall back to count-based
+            elif buy_count > sell_count:
+                signal = OrderRecommendation.BUY
+                dominant_count = buy_count
+                dominant_amount = total_buy_amount
+            elif sell_count > buy_count:
+                signal = OrderRecommendation.SELL
+                dominant_count = sell_count
+                dominant_amount = total_sell_amount
+            else:
+                signal = OrderRecommendation.HOLD
+                dominant_count = buy_count + sell_count
+                dominant_amount = total_buy_amount + total_sell_amount
         else:
-            signal = OrderRecommendation.HOLD
-            dominant_count = buy_count + sell_count
-            dominant_amount = total_buy_amount + total_sell_amount
+            # No valid amounts, fall back to count
+            if buy_count > sell_count:
+                signal = OrderRecommendation.BUY
+                dominant_count = buy_count
+                dominant_amount = total_buy_amount
+            elif sell_count > buy_count:
+                signal = OrderRecommendation.SELL
+                dominant_count = sell_count
+                dominant_amount = total_sell_amount
+            else:
+                signal = OrderRecommendation.HOLD
+                dominant_count = buy_count + sell_count
+                dominant_amount = total_buy_amount + total_sell_amount
         
         # Calculate overall confidence (average of individual trade confidences weighted by dominance)
         if signal == OrderRecommendation.BUY:
@@ -563,16 +795,20 @@ Trade #{i}:
 - Execution Price: ${trade_info['exec_price']:.2f}
 - Current Price: ${trade_info['current_price']:.2f}
 - Price Change: {trade_info['price_delta_pct']:+.1f}%
-- Trader Historical Performance: {trade_info['trader_performance']:+.1f}%
+- Trader Pattern Modifier: {trade_info['trader_confidence_modifier']:+.1f}%
 - Trade Confidence: {trade_info['confidence']:.1f}%
+- Trader Recent Activity: {trade_info['trader_recent_buys']} buys, {trade_info['trader_recent_sells']} sells
+- Trader Yearly Activity: {trade_info['trader_yearly_buys']} buys, {trade_info['trader_yearly_sells']} sells
 """
         
         details += f"""
 Confidence Calculation Method:
 1. Base Confidence: 50%
-2. + Trader Historical Performance (average across past trades)
-3. + Investment Size Boost (+5% per $100k invested)
-4. Cap: Max 80% before investment boost, 100% final
+2. + Trader Pattern Modifier (-30 to +30, based on buy/sell history across all symbols)
+   - Strong accumulation (buying) = positive modifier
+   - Strong distribution (selling) = negative modifier (but positive for sell trades)
+3. + Investment Size Boost (up to +20% for very large trades)
+4. Final range: 0-100%
 
 Expected Profit is based on the average price movement since execution.
 """
@@ -717,21 +953,32 @@ Expected Profit is based on the average price movement since execution.
             if not current_price:
                 raise ValueError(f"Unable to get current price for {symbol}")
             
-            # Fetch senate trades
-            all_trades = self._fetch_senate_trades(symbol)
+            # Fetch both senate and house trades
+            senate_trades = self._fetch_senate_trades(symbol)
+            house_trades = self._fetch_house_trades(symbol)
             
-            if all_trades is None:
-                raise ValueError("Failed to fetch senate trades from FMP API")
+            if senate_trades is None and house_trades is None:
+                raise ValueError("Failed to fetch trades from FMP API (both senate and house failed)")
+            
+            # Combine trades from both sources
+            all_trades = []
+            if senate_trades:
+                all_trades.extend(senate_trades)
+            if house_trades:
+                all_trades.extend(house_trades)
+            
+            logger.info(f"Fetched {len(senate_trades) if senate_trades else 0} senate trades and "
+                       f"{len(house_trades) if house_trades else 0} house trades for {symbol}")
             
             # Filter trades based on settings
             filtered_trades = self._filter_trades(
                 all_trades, max_disclose_days, max_exec_days, 
-                max_price_delta_pct, current_price
+                max_price_delta_pct, current_price, symbol
             )
             
             # Calculate recommendation
             recommendation_data = self._calculate_recommendation(
-                filtered_trades, symbol, current_price
+                filtered_trades, symbol, current_price, max_exec_days
             )
             
             # Create ExpertRecommendation record
@@ -987,6 +1234,11 @@ Expected Profit is based on the average price movement since execution.
                                     with ui.row().classes('gap-4 mt-2 text-xs'):
                                         ui.label(f'Exec: {trade.get("exec_date", "N/A")} ({trade.get("days_since_exec", 0)}d ago)')
                                         ui.label(f'Disclosed: {trade.get("disclose_date", "N/A")} ({trade.get("days_since_disclose", 0)}d ago)')
+                                    
+                                    # Trader activity statistics
+                                    with ui.column().classes('mt-2 text-xs text-grey-6'):
+                                        ui.label(f'Recent: {trade.get("trader_recent_buys", "N/A")} buys, {trade.get("trader_recent_sells", "N/A")} sells')
+                                        ui.label(f'Yearly: {trade.get("trader_yearly_buys", "N/A")} buys, {trade.get("trader_yearly_sells", "N/A")} sells')
                                 
                                 with ui.column().classes('text-right'):
                                     ui.label(f'Confidence: {trade.get("confidence", 0):.1f}%').classes('text-sm text-weight-medium')
@@ -998,10 +1250,10 @@ Expected Profit is based on the average price movement since execution.
                                         ui.label(f'${exec_price:.2f} → ${trade.get("current_price", 0):.2f}').classes('text-xs text-grey-7')
                                         ui.label(f'{price_delta:+.1f}%').classes(f'text-sm text-{delta_color}')
                                     
-                                    perf = trade.get('trader_performance', 0)
-                                    if perf != 0:
-                                        perf_color = 'positive' if perf > 0 else 'negative'
-                                        ui.label(f'Trader Hist: {perf:+.1f}%').classes(f'text-xs text-{perf_color}')
+                                    modifier = trade.get('trader_confidence_modifier', 0)
+                                    if modifier != 0:
+                                        modifier_color = 'positive' if modifier > 0 else 'negative'
+                                        ui.label(f'Pattern: {modifier:+.1f}%').classes(f'text-xs text-{modifier_color}')
                     
                     if len(trades) > 5:
                         ui.label(f'+ {len(trades) - 5} more trades').classes('text-sm text-grey-6 mt-2')

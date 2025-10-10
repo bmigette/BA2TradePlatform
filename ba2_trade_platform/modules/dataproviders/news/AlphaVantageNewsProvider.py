@@ -16,14 +16,14 @@ from ba2_trade_platform.core.provider_utils import (
     log_provider_call
 )
 from ba2_trade_platform.modules.dataproviders.alpha_vantage_common import (
-    make_api_request,
+    AlphaVantageBaseProvider,
     format_datetime_for_api,
     AlphaVantageRateLimitError
 )
 from ba2_trade_platform.logger import logger
 
 
-class AlphaVantageNewsProvider(MarketNewsInterface):
+class AlphaVantageNewsProvider(AlphaVantageBaseProvider, MarketNewsInterface):
     """
     Alpha Vantage News Sentiment Provider.
     
@@ -32,10 +32,16 @@ class AlphaVantageNewsProvider(MarketNewsInterface):
     and topics like fiscal policy, mergers & acquisitions, IPOs.
     """
     
-    def __init__(self):
-        """Initialize the Alpha Vantage News Provider with API credentials."""
-        super().__init__()
-        logger.info("AlphaVantageNewsProvider initialized successfully")
+    def __init__(self, source: str = "ba2_trade_platform"):
+        """
+        Initialize the Alpha Vantage News Provider with API credentials.
+        
+        Args:
+            source: Source identifier for API tracking (e.g., 'ba2_trade_platform', 'trading_agents')
+        """
+        AlphaVantageBaseProvider.__init__(self, source)
+        MarketNewsInterface.__init__(self)
+        logger.info(f"AlphaVantageNewsProvider initialized successfully with source: {source}")
     
     def get_provider_name(self) -> str:
         """Get the provider name."""
@@ -176,7 +182,7 @@ class AlphaVantageNewsProvider(MarketNewsInterface):
                 "limit": str(min(limit, 50)),
             }
             
-            raw_data = make_api_request("NEWS_SENTIMENT", params)
+            raw_data = self.make_api_request("NEWS_SENTIMENT", params)
             
             # Parse the response
             if isinstance(raw_data, str):
@@ -260,13 +266,13 @@ class AlphaVantageNewsProvider(MarketNewsInterface):
         
         try:
             params = {
-                "time_from": self._format_datetime_for_api(start_date),
-                "time_to": self._format_datetime_for_api(end_date),
+                "time_from": format_datetime_for_api(start_date),
+                "time_to": format_datetime_for_api(end_date),
                 "sort": "LATEST",
                 "limit": str(min(limit, 50)),
             }
             
-            raw_data = self._make_api_request("NEWS_SENTIMENT", params)
+            raw_data = self.make_api_request("NEWS_SENTIMENT", params)
             
             # Parse the response
             if isinstance(raw_data, str):

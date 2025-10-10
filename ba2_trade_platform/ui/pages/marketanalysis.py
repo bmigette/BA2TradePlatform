@@ -841,6 +841,7 @@ class ScheduledJobsTab:
         self.total_pages = 1
         self.total_records = 0
         self.expert_filter = 'all'  # Filter by expert instance ID
+        self.selected_jobs = []  # Track selected jobs for bulk operations
         self.render()
 
     def render(self):
@@ -932,12 +933,24 @@ class ScheduledJobsTab:
         scheduled_data = self._get_scheduled_jobs_data()
         
         with ui.card().classes('w-full'):
-            ui.label('Current Week Scheduled Jobs').classes('text-md font-bold mb-2')
+            # Header with bulk action button
+            with ui.row().classes('w-full justify-between items-center mb-2'):
+                ui.label('Current Week Scheduled Jobs').classes('text-md font-bold')
+                ui.button('Start Selected Jobs', 
+                         on_click=self._start_selected_jobs, 
+                         icon='play_arrow',
+                         color='primary').props('outline').bind_enabled_from(self, 'selected_jobs', 
+                                                                             lambda jobs: len(jobs) > 0)
+            
             self.scheduled_jobs_table = ui.table(
                 columns=columns, 
                 rows=scheduled_data, 
-                row_key='id'
+                row_key='id',
+                selection='multiple'
             ).classes('w-full')
+            
+            # Bind selected rows to instance variable
+            self.scheduled_jobs_table.bind_value_to(self, 'selected_jobs')
             
             # Add action buttons
             self.scheduled_jobs_table.add_slot('body-cell-actions', '''
@@ -1157,6 +1170,69 @@ class ScheduledJobsTab:
         except Exception as e:
             logger.error(f"Error running analysis now: {e}", exc_info=True)
             ui.notify(f"Error starting analysis: {str(e)}", type='negative')
+
+    def _start_selected_jobs(self):
+        """Start all selected jobs from the scheduled jobs table."""
+        try:
+            if not self.selected_jobs:
+                ui.notify("No jobs selected", type='warning')
+                return
+            
+            from ...core.JobManager import get_job_manager
+            job_manager = get_job_manager()
+            
+            # Track submission results
+            successful_submissions = 0
+            duplicate_submissions = 0
+            failed_submissions = 0
+            
+            # Submit each selected job
+            for job in self.selected_jobs:
+                try:
+                    expert_instance_id = int(job['expert_instance_id'])
+                    symbol = str(job['symbol'])
+                    subtype = str(job['subtype'])
+                    
+                    success = job_manager.submit_market_analysis(
+                        expert_instance_id,
+                        symbol,
+                        subtype=subtype,
+                        bypass_balance_check=True,  # Manual analysis bypasses balance check
+                        bypass_transaction_check=True  # Manual analysis bypasses transaction checks
+                    )
+                    
+                    if success:
+                        successful_submissions += 1
+                        logger.debug(f"Successfully submitted analysis for {symbol} ({subtype}) with expert {expert_instance_id}")
+                    else:
+                        duplicate_submissions += 1
+                        logger.debug(f"Analysis already pending for {symbol} ({subtype}) with expert {expert_instance_id}")
+                        
+                except Exception as e:
+                    failed_submissions += 1
+                    logger.error(f"Failed to submit analysis for job {job}: {e}", exc_info=True)
+            
+            # Show summary notification
+            if successful_submissions > 0:
+                message = f"Successfully started {successful_submissions} analysis job{'s' if successful_submissions > 1 else ''}"
+                if duplicate_submissions > 0:
+                    message += f" ({duplicate_submissions} already pending)"
+                if failed_submissions > 0:
+                    message += f" ({failed_submissions} failed)"
+                ui.notify(message, type='positive')
+            elif duplicate_submissions > 0:
+                ui.notify(f"All {duplicate_submissions} selected job{'s' if duplicate_submissions > 1 else ''} are already pending", type='warning')
+            else:
+                ui.notify(f"Failed to start any jobs ({failed_submissions} failed)", type='negative')
+            
+            # Clear selection after starting jobs
+            self.selected_jobs = []
+            if self.scheduled_jobs_table:
+                self.scheduled_jobs_table.selected = []
+                
+        except Exception as e:
+            logger.error(f"Error starting selected jobs: {e}", exc_info=True)
+            ui.notify(f"Error starting jobs: {str(e)}", type='negative')
 
     def refresh_data(self):
         """Refresh the scheduled jobs data."""
