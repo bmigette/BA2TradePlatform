@@ -312,7 +312,7 @@ class AlphaVantageCompanyDetailsProvider(AlphaVantageBaseProvider, CompanyFundam
     
     def get_supported_features(self) -> list[str]:
         """Get supported features of this provider."""
-        return ["balance_sheet", "income_statement", "cashflow_statement"]
+        return ["balance_sheet", "income_statement", "cashflow_statement", "past_earnings", "earnings_estimates"]
     
     def validate_config(self) -> bool:
         """
@@ -357,4 +357,307 @@ class AlphaVantageCompanyDetailsProvider(AlphaVantageBaseProvider, CompanyFundam
                     md += f"**{key}**: {value}\n"
             return md
         return str(data)
+    
+    @log_provider_call
+    def get_past_earnings(
+        self,
+        symbol: Annotated[str, "Stock ticker symbol"],
+        frequency: Annotated[Literal["annual", "quarterly"], "Reporting frequency"],
+        end_date: Annotated[datetime, "End date for earnings range (inclusive)"],
+        lookback_periods: Annotated[int, "Number of periods to look back from end_date"] = 8,
+        format_type: Literal["dict", "markdown"] = "markdown"
+    ) -> Dict[str, Any] | str:
+        """
+        Get historical earnings data for a company from Alpha Vantage.
+        
+        Uses Alpha Vantage's EARNINGS function which provides quarterly and annual earnings.
+        
+        Args:
+            symbol: Stock ticker symbol
+            frequency: Data frequency ('quarterly' or 'annual')
+            end_date: End date (inclusive) - gets most recent earnings as of this date
+            lookback_periods: Number of periods to look back (default 8 quarters = 2 years)
+            format_type: Output format ('dict' or 'markdown')
+        
+        Returns:
+            Historical earnings data in requested format
+        """
+        logger.debug(f"Fetching AlphaVantage past earnings for {symbol} ({frequency})")
+        
+        try:
+            # Call Alpha Vantage EARNINGS endpoint
+            params = {"symbol": symbol}
+            result = self.make_api_request("EARNINGS", params)
+            
+            data = json.loads(result)
+            
+            # Determine which earnings data to use based on frequency
+            key = "annualEarnings" if frequency == "annual" else "quarterlyEarnings"
+            earnings_list = data.get(key, [])
+            
+            if not earnings_list:
+                logger.warning(f"No earnings data found for {symbol}")
+                if format_type == "dict":
+                    return {
+                        "symbol": symbol,
+                        "frequency": frequency,
+                        "end_date": end_date.isoformat(),
+                        "lookback_periods": lookback_periods,
+                        "earnings": [],
+                        "retrieved_at": datetime.now().isoformat()
+                    }
+                else:
+                    return f"# Past Earnings for {symbol}\n\nNo earnings data available.\n"
+            
+            # Filter and process earnings data
+            result_dict = {
+                "symbol": symbol.upper(),
+                "frequency": frequency,
+                "end_date": end_date.isoformat(),
+                "lookback_periods": lookback_periods,
+                "earnings": [],
+                "retrieved_at": datetime.now().isoformat()
+            }
+            
+            filtered_earnings = []
+            for earning in earnings_list:
+                # Parse the fiscal date ending
+                fiscal_date_str = earning.get("fiscalDateEnding", "")
+                if not fiscal_date_str:
+                    continue
+                
+                try:
+                    fiscal_date = datetime.strptime(fiscal_date_str, "%Y-%m-%d")
+                except:
+                    continue
+                
+                # Filter by end_date
+                if fiscal_date > end_date:
+                    continue
+                
+                # AlphaVantage provides reportedEPS and estimatedEPS in EARNINGS endpoint
+                reported_eps = earning.get("reportedEPS", "None")
+                estimated_eps = earning.get("estimatedEPS", "None")
+                
+                # Handle "None" string values from API
+                reported_eps_val = float(reported_eps) if reported_eps and reported_eps != "None" else 0
+                estimated_eps_val = float(estimated_eps) if estimated_eps and estimated_eps != "None" else 0
+                
+                earnings_entry = {
+                    "fiscal_date_ending": fiscal_date.strftime("%Y-%m-%d"),
+                    "report_date": earning.get("reportedDate", fiscal_date_str),
+                    "reported_eps": reported_eps_val,
+                    "estimated_eps": estimated_eps_val
+                }
+                
+                # Calculate surprise if both values available
+                if reported_eps_val and estimated_eps_val:
+                    earnings_entry["surprise"] = reported_eps_val - estimated_eps_val
+                    if estimated_eps_val != 0:
+                        earnings_entry["surprise_percent"] = (earnings_entry["surprise"] / abs(estimated_eps_val)) * 100
+                    else:
+                        earnings_entry["surprise_percent"] = 0
+                else:
+                    earnings_entry["surprise"] = None
+                    earnings_entry["surprise_percent"] = None
+                
+                filtered_earnings.append((fiscal_date, earnings_entry))
+            
+            # Sort by date descending (most recent first)
+            filtered_earnings.sort(key=lambda x: x[0], reverse=True)
+            
+            # Apply lookback_periods limit
+            filtered_earnings = filtered_earnings[:lookback_periods]
+            
+            # Extract just the earnings data
+            result_dict["earnings"] = [e[1] for e in filtered_earnings]
+            
+            logger.info(f"Retrieved {len(result_dict['earnings'])} past earnings periods for {symbol}")
+            
+            # Format output
+            if format_type == "dict":
+                return result_dict
+            else:
+                return self._format_past_earnings_markdown(result_dict)
+        
+        except Exception as e:
+            logger.error(f"Error retrieving past earnings for {symbol}: {e}")
+            if format_type == "dict":
+                return {"error": str(e), "symbol": symbol}
+            return f"Error retrieving past earnings for {symbol}: {str(e)}"
+    
+    @log_provider_call
+    def get_earnings_estimates(
+        self,
+        symbol: Annotated[str, "Stock ticker symbol"],
+        frequency: Annotated[Literal["annual", "quarterly"], "Reporting frequency"],
+        as_of_date: Annotated[datetime, "Date for estimates (uses most recent estimates as of this date)"],
+        lookback_periods: Annotated[int, "Number of future periods to retrieve estimates for"] = 4,
+        format_type: Literal["dict", "markdown"] = "markdown"
+    ) -> Dict[str, Any] | str:
+        """
+        Get future earnings estimates for a company from Alpha Vantage.
+        
+        Note: Alpha Vantage's EARNINGS endpoint provides limited forward-looking estimates.
+        This method attempts to extract future estimates from the earnings data.
+        
+        Args:
+            symbol: Stock ticker symbol
+            frequency: Data frequency ('quarterly' or 'annual')
+            as_of_date: Date for estimates (returns most recent estimates as of this date)
+            lookback_periods: Number of future periods to retrieve estimates for (default 4)
+            format_type: Output format ('dict' or 'markdown')
+        
+        Returns:
+            Future earnings estimates in requested format (limited data from Alpha Vantage)
+        """
+        logger.debug(f"Fetching AlphaVantage earnings estimates for {symbol} ({frequency})")
+        
+        try:
+            # Call Alpha Vantage EARNINGS endpoint
+            params = {"symbol": symbol}
+            result = self.make_api_request("EARNINGS", params)
+            
+            data = json.loads(result)
+            
+            # Determine which earnings data to use based on frequency
+            key = "annualEarnings" if frequency == "annual" else "quarterlyEarnings"
+            earnings_list = data.get(key, [])
+            
+            if not earnings_list:
+                logger.warning(f"No earnings estimates found for {symbol}")
+                if format_type == "dict":
+                    return {
+                        "symbol": symbol,
+                        "frequency": frequency,
+                        "as_of_date": as_of_date.isoformat(),
+                        "estimates": [],
+                        "retrieved_at": datetime.now().isoformat()
+                    }
+                else:
+                    return f"# Earnings Estimates for {symbol}\n\nNo estimates available.\n"
+            
+            # Filter and process estimates data
+            result_dict = {
+                "symbol": symbol.upper(),
+                "frequency": frequency,
+                "as_of_date": as_of_date.isoformat(),
+                "estimates": [],
+                "retrieved_at": datetime.now().isoformat()
+            }
+            
+            filtered_estimates = []
+            for earning in earnings_list:
+                # Parse the fiscal date ending
+                fiscal_date_str = earning.get("fiscalDateEnding", "")
+                if not fiscal_date_str:
+                    continue
+                
+                try:
+                    fiscal_date = datetime.strptime(fiscal_date_str, "%Y-%m-%d")
+                except:
+                    continue
+                
+                # Only include future dates (after as_of_date)
+                if fiscal_date < as_of_date:
+                    continue
+                
+                # Extract estimated EPS (Alpha Vantage provides this in EARNINGS endpoint)
+                estimated_eps = earning.get("estimatedEPS", "None")
+                
+                # Handle "None" string values from API
+                if estimated_eps and estimated_eps != "None":
+                    estimated_eps_val = float(estimated_eps)
+                else:
+                    # Skip entries without estimates
+                    continue
+                
+                estimate_entry = {
+                    "fiscal_date_ending": fiscal_date.strftime("%Y-%m-%d"),
+                    "estimated_eps_avg": estimated_eps_val,
+                    "estimated_eps_high": estimated_eps_val,  # Alpha Vantage doesn't provide high/low, use avg
+                    "estimated_eps_low": estimated_eps_val,
+                    "number_of_analysts": 0  # Alpha Vantage doesn't provide analyst count
+                }
+                
+                filtered_estimates.append((fiscal_date, estimate_entry))
+            
+            # Sort by date ascending (earliest future period first)
+            filtered_estimates.sort(key=lambda x: x[0])
+            
+            # Apply lookback_periods limit (here it means "forward periods")
+            filtered_estimates = filtered_estimates[:lookback_periods]
+            
+            # Extract just the estimates data
+            result_dict["estimates"] = [e[1] for e in filtered_estimates]
+            
+            logger.info(f"Retrieved {len(result_dict['estimates'])} earnings estimates for {symbol}")
+            
+            # Format output
+            if format_type == "dict":
+                return result_dict
+            else:
+                return self._format_earnings_estimates_markdown(result_dict)
+        
+        except Exception as e:
+            logger.error(f"Error retrieving earnings estimates for {symbol}: {e}")
+            if format_type == "dict":
+                return {"error": str(e), "symbol": symbol}
+            return f"Error retrieving earnings estimates for {symbol}: {str(e)}"
+    
+    def _format_past_earnings_markdown(self, data: Dict[str, Any]) -> str:
+        """Format past earnings data as markdown."""
+        md = f"# Past Earnings: {data['symbol']} ({data['frequency']})\n\n"
+        md += f"**Retrieved**: {data['retrieved_at']}\n"
+        md += f"**Lookback Periods**: {data['lookback_periods']}\n\n"
+        
+        if "error" in data:
+            md += f"**Error**: {data['error']}\n"
+            return md
+        
+        if not data["earnings"]:
+            md += "*No earnings data available*\n"
+            return md
+        
+        md += "| Date | Reported EPS | Estimated EPS | Surprise | Surprise % |\n"
+        md += "|------|--------------|---------------|----------|------------|\n"
+        
+        for earning in data["earnings"]:
+            date = earning["fiscal_date_ending"]
+            reported = f"${earning['reported_eps']:.2f}" if earning["reported_eps"] else "N/A"
+            estimated = f"${earning['estimated_eps']:.2f}" if earning["estimated_eps"] else "N/A"
+            surprise = f"${earning['surprise']:.2f}" if earning["surprise"] is not None else "N/A"
+            surprise_pct = f"{earning['surprise_percent']:.1f}%" if earning["surprise_percent"] is not None else "N/A"
+            
+            md += f"| {date} | {reported} | {estimated} | {surprise} | {surprise_pct} |\n"
+        
+        return md
+    
+    def _format_earnings_estimates_markdown(self, data: Dict[str, Any]) -> str:
+        """Format earnings estimates data as markdown."""
+        md = f"# Earnings Estimates: {data['symbol']} ({data['frequency']})\n\n"
+        md += f"**Retrieved**: {data['retrieved_at']}\n"
+        md += f"**As of Date**: {data['as_of_date']}\n\n"
+        
+        if "error" in data:
+            md += f"**Error**: {data['error']}\n"
+            return md
+        
+        if not data["estimates"]:
+            md += "*No earnings estimates available*\n"
+            return md
+        
+        md += "| Date | Avg Estimate | High Estimate | Low Estimate | # Analysts |\n"
+        md += "|------|--------------|---------------|--------------|------------|\n"
+        
+        for estimate in data["estimates"]:
+            date = estimate["fiscal_date_ending"]
+            avg = f"${estimate['estimated_eps_avg']:.2f}" if estimate["estimated_eps_avg"] else "N/A"
+            high = f"${estimate['estimated_eps_high']:.2f}" if estimate["estimated_eps_high"] else "N/A"
+            low = f"${estimate['estimated_eps_low']:.2f}" if estimate["estimated_eps_low"] else "N/A"
+            analysts = estimate["number_of_analysts"]
+            
+            md += f"| {date} | {avg} | {high} | {low} | {analysts} |\n"
+        
+        return md
 

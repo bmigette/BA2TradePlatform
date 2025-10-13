@@ -10,6 +10,7 @@ from typing import Dict, Any, Literal, Optional
 from datetime import datetime
 
 import fmpsdk
+import requests
 
 from ba2_trade_platform.core.interfaces import CompanyFundamentalsDetailsInterface
 from ba2_trade_platform.core.provider_utils import validate_date_range
@@ -50,7 +51,7 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
     
     def get_supported_features(self) -> list[str]:
         """Get supported features of this provider."""
-        return ["balance_sheet", "income_statement", "cashflow_statement"]
+        return ["balance_sheet", "income_statement", "cashflow_statement", "past_earnings", "earnings_estimates"]
     
     def validate_config(self) -> bool:
         """Validate provider configuration."""
@@ -479,3 +480,293 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
         else:
             statement_label = statement_type.replace("_", " ").title()
             return f"# {statement_label} for {symbol}\n\nNo statements found.\n"
+    
+    def get_past_earnings(
+        self,
+        symbol: str,
+        frequency: Literal["annual", "quarterly"],
+        end_date: datetime,
+        lookback_periods: int = 8,
+        format_type: Literal["dict", "markdown"] = "markdown"
+    ) -> Dict[str, Any] | str:
+        """
+        Get historical earnings data for a company from FMP.
+        
+        Uses FMP's historical earnings endpoint which provides actual vs estimated EPS.
+        
+        Args:
+            symbol: Stock ticker symbol
+            frequency: Data frequency ('quarterly' or 'annual')
+            end_date: End date (inclusive) - gets most recent earnings as of this date
+            lookback_periods: Number of periods to look back (default 8 quarters = 2 years)
+            format_type: Output format ('dict' or 'markdown')
+        
+        Returns:
+            Historical earnings data in requested format
+        """
+        logger.debug(f"Fetching FMP past earnings for {symbol} ({frequency})")
+        
+        try:
+            # FMP uses 'quarter' and 'annual' for the period parameter
+            period = "quarter" if frequency.lower() == "quarterly" else "annual"
+            
+            # Fetch earnings data using FMP SDK
+            # Note: FMP earnings endpoint returns actual vs estimated EPS
+            earnings_data = fmpsdk.historical_earning_calendar(
+                apikey=self.api_key,
+                symbol=symbol
+            )
+            
+            if not earnings_data:
+                logger.warning(f"No earnings data found for {symbol}")
+                if format_type == "dict":
+                    return {
+                        "symbol": symbol,
+                        "frequency": frequency,
+                        "end_date": end_date.isoformat(),
+                        "lookback_periods": lookback_periods,
+                        "earnings": [],
+                        "retrieved_at": datetime.now().isoformat()
+                    }
+                else:
+                    return f"# Past Earnings for {symbol}\n\nNo earnings data available.\n"
+            
+            # Filter and process earnings data
+            result = {
+                "symbol": symbol.upper(),
+                "frequency": frequency,
+                "end_date": end_date.isoformat(),
+                "lookback_periods": lookback_periods,
+                "earnings": [],
+                "retrieved_at": datetime.now().isoformat()
+            }
+            
+            filtered_earnings = []
+            for earning in earnings_data:
+                # Parse the date from the earning record
+                earning_date_str = earning.get("date", "")
+                if not earning_date_str:
+                    continue
+                
+                try:
+                    earning_date = datetime.strptime(earning_date_str, "%Y-%m-%d")
+                except:
+                    continue
+                
+                # Filter by end_date
+                if earning_date > end_date:
+                    continue
+                
+                # Build earnings entry
+                reported_eps = earning.get("eps", 0)
+                estimated_eps = earning.get("epsEstimated", 0)
+                
+                earnings_entry = {
+                    "fiscal_date_ending": earning_date.strftime("%Y-%m-%d"),
+                    "report_date": earning_date_str,
+                    "reported_eps": float(reported_eps) if reported_eps else 0,
+                    "estimated_eps": float(estimated_eps) if estimated_eps else 0
+                }
+                
+                # Calculate surprise
+                if reported_eps and estimated_eps:
+                    earnings_entry["surprise"] = earnings_entry["reported_eps"] - earnings_entry["estimated_eps"]
+                    if earnings_entry["estimated_eps"] != 0:
+                        earnings_entry["surprise_percent"] = (earnings_entry["surprise"] / abs(earnings_entry["estimated_eps"])) * 100
+                    else:
+                        earnings_entry["surprise_percent"] = 0
+                else:
+                    earnings_entry["surprise"] = None
+                    earnings_entry["surprise_percent"] = None
+                
+                filtered_earnings.append((earning_date, earnings_entry))
+            
+            # Sort by date descending (most recent first)
+            filtered_earnings.sort(key=lambda x: x[0], reverse=True)
+            
+            # Apply lookback_periods limit
+            filtered_earnings = filtered_earnings[:lookback_periods]
+            
+            # Extract just the earnings data
+            result["earnings"] = [e[1] for e in filtered_earnings]
+            
+            logger.info(f"Retrieved {len(result['earnings'])} past earnings periods for {symbol}")
+            
+            # Format output
+            if format_type == "dict":
+                return result
+            else:
+                return self._format_past_earnings_markdown(result)
+        
+        except Exception as e:
+            logger.error(f"Error retrieving past earnings for {symbol}: {e}")
+            if format_type == "dict":
+                return {"error": str(e), "symbol": symbol}
+            return f"Error retrieving past earnings for {symbol}: {str(e)}"
+    
+    def get_earnings_estimates(
+        self,
+        symbol: str,
+        frequency: Literal["annual", "quarterly"],
+        as_of_date: datetime,
+        lookback_periods: int = 4,
+        format_type: Literal["dict", "markdown"] = "markdown"
+    ) -> Dict[str, Any] | str:
+        """
+        Get future earnings estimates for a company from FMP.
+        
+        Uses FMP's analyst estimates endpoint for forward-looking EPS estimates.
+        Note: FMP SDK doesn't have analyst_estimates method, so we use direct API call.
+        
+        Args:
+            symbol: Stock ticker symbol
+            frequency: Data frequency ('quarterly' or 'annual')
+            as_of_date: Date for estimates (returns most recent estimates as of this date)
+            lookback_periods: Number of future periods to retrieve estimates for (default 4)
+            format_type: Output format ('dict' or 'markdown')
+        
+        Returns:
+            Future earnings estimates in requested format
+        """
+        logger.debug(f"Fetching FMP earnings estimates for {symbol} ({frequency})")
+        
+        try:
+            # Use direct API call since fmpsdk doesn't have analyst_estimates method
+            # FMP API: https://financialmodelingprep.com/api/v3/analyst-estimates/{symbol}
+            url = f"https://financialmodelingprep.com/api/v3/analyst-estimates/{symbol}"
+            params = {
+                "apikey": self.api_key,
+                "limit": 20  # Get extra to ensure we have enough future estimates
+            }
+            
+            response = requests.get(url, params=params, timeout=30)
+            response.raise_for_status()
+            estimates_data = response.json()
+            
+            if not estimates_data:
+                logger.warning(f"No earnings estimates found for {symbol}")
+                if format_type == "dict":
+                    return {
+                        "symbol": symbol,
+                        "frequency": frequency,
+                        "as_of_date": as_of_date.isoformat(),
+                        "estimates": [],
+                        "retrieved_at": datetime.now().isoformat()
+                    }
+                else:
+                    return f"# Earnings Estimates for {symbol}\n\nNo estimates available.\n"
+            
+            # Filter and process estimates data
+            result = {
+                "symbol": symbol.upper(),
+                "frequency": frequency,
+                "as_of_date": as_of_date.isoformat(),
+                "estimates": [],
+                "retrieved_at": datetime.now().isoformat()
+            }
+            
+            filtered_estimates = []
+            for estimate in estimates_data:
+                # Parse the date from the estimate record
+                estimate_date_str = estimate.get("date", "")
+                if not estimate_date_str:
+                    continue
+                
+                try:
+                    estimate_date = datetime.strptime(estimate_date_str, "%Y-%m-%d")
+                except:
+                    continue
+                
+                # Only include future estimates (after as_of_date)
+                if estimate_date < as_of_date:
+                    continue
+                
+                # Build estimate entry
+                estimate_entry = {
+                    "fiscal_date_ending": estimate_date.strftime("%Y-%m-%d"),
+                    "estimated_eps_avg": float(estimate.get("estimatedEpsAvg", 0)),
+                    "estimated_eps_high": float(estimate.get("estimatedEpsHigh", 0)),
+                    "estimated_eps_low": float(estimate.get("estimatedEpsLow", 0)),
+                    "number_of_analysts": int(estimate.get("numberAnalystEstimatedEps", 0))
+                }
+                
+                filtered_estimates.append((estimate_date, estimate_entry))
+            
+            # Sort by date ascending (earliest future period first)
+            filtered_estimates.sort(key=lambda x: x[0])
+            
+            # Apply lookback_periods limit (here it means "forward periods")
+            filtered_estimates = filtered_estimates[:lookback_periods]
+            
+            # Extract just the estimates data
+            result["estimates"] = [e[1] for e in filtered_estimates]
+            
+            logger.info(f"Retrieved {len(result['estimates'])} earnings estimates for {symbol}")
+            
+            # Format output
+            if format_type == "dict":
+                return result
+            else:
+                return self._format_earnings_estimates_markdown(result)
+        
+        except Exception as e:
+            logger.error(f"Error retrieving earnings estimates for {symbol}: {e}")
+            if format_type == "dict":
+                return {"error": str(e), "symbol": symbol}
+            return f"Error retrieving earnings estimates for {symbol}: {str(e)}"
+    
+    def _format_past_earnings_markdown(self, data: Dict[str, Any]) -> str:
+        """Format past earnings data as markdown."""
+        md = f"# Past Earnings: {data['symbol']} ({data['frequency']})\n\n"
+        md += f"**Retrieved**: {data['retrieved_at']}\n"
+        md += f"**Lookback Periods**: {data['lookback_periods']}\n\n"
+        
+        if "error" in data:
+            md += f"**Error**: {data['error']}\n"
+            return md
+        
+        if not data["earnings"]:
+            md += "*No earnings data available*\n"
+            return md
+        
+        md += "| Date | Reported EPS | Estimated EPS | Surprise | Surprise % |\n"
+        md += "|------|--------------|---------------|----------|------------|\n"
+        
+        for earning in data["earnings"]:
+            date = earning["fiscal_date_ending"]
+            reported = f"${earning['reported_eps']:.2f}" if earning["reported_eps"] else "N/A"
+            estimated = f"${earning['estimated_eps']:.2f}" if earning["estimated_eps"] else "N/A"
+            surprise = f"${earning['surprise']:.2f}" if earning["surprise"] is not None else "N/A"
+            surprise_pct = f"{earning['surprise_percent']:.1f}%" if earning["surprise_percent"] is not None else "N/A"
+            
+            md += f"| {date} | {reported} | {estimated} | {surprise} | {surprise_pct} |\n"
+        
+        return md
+    
+    def _format_earnings_estimates_markdown(self, data: Dict[str, Any]) -> str:
+        """Format earnings estimates data as markdown."""
+        md = f"# Earnings Estimates: {data['symbol']} ({data['frequency']})\n\n"
+        md += f"**Retrieved**: {data['retrieved_at']}\n"
+        md += f"**As of Date**: {data['as_of_date']}\n\n"
+        
+        if "error" in data:
+            md += f"**Error**: {data['error']}\n"
+            return md
+        
+        if not data["estimates"]:
+            md += "*No earnings estimates available*\n"
+            return md
+        
+        md += "| Date | Avg Estimate | High Estimate | Low Estimate | # Analysts |\n"
+        md += "|------|--------------|---------------|--------------|------------|\n"
+        
+        for estimate in data["estimates"]:
+            date = estimate["fiscal_date_ending"]
+            avg = f"${estimate['estimated_eps_avg']:.2f}" if estimate["estimated_eps_avg"] else "N/A"
+            high = f"${estimate['estimated_eps_high']:.2f}" if estimate["estimated_eps_high"] else "N/A"
+            low = f"${estimate['estimated_eps_low']:.2f}" if estimate["estimated_eps_low"] else "N/A"
+            analysts = estimate["number_of_analysts"]
+            
+            md += f"| {date} | {avg} | {high} | {low} | {analysts} |\n"
+        
+        return md

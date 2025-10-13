@@ -38,7 +38,7 @@ class YFinanceCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
     
     def get_supported_features(self) -> list[str]:
         """Get supported features of this provider."""
-        return ["balance_sheet", "income_statement", "cashflow_statement"]
+        return ["balance_sheet", "income_statement", "cashflow_statement", "past_earnings", "earnings_estimates"]
     
     def validate_config(self) -> bool:
         """
@@ -545,5 +545,276 @@ class YFinanceCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
                 for key, value in financing.items():
                     md += f"- **{key}**: ${value:,.0f}\n"
                 md += "\n"
+        
+        return md
+    
+    @log_provider_call
+    def get_past_earnings(
+        self,
+        symbol: str,
+        frequency: Literal["quarterly", "annual"] = "quarterly",
+        end_date: datetime = None,
+        lookback_periods: int = 8,
+        format_type: Literal["dict", "markdown"] = "markdown"
+    ) -> Dict[str, Any] | str:
+        """
+        Get historical earnings data for a company.
+        
+        Args:
+            symbol: Stock ticker symbol
+            frequency: Data frequency ('quarterly' or 'annual')
+            end_date: End date (inclusive) - gets most recent earnings as of this date
+            lookback_periods: Number of periods to look back (default 8 quarters = 2 years)
+            format_type: Output format ('dict' or 'markdown')
+        
+        Returns:
+            Historical earnings data in requested format
+        """
+        # Default end_date to now if not provided
+        if end_date is None:
+            end_date = datetime.now()
+        
+        try:
+            ticker_obj = yf.Ticker(symbol.upper())
+            
+            # Get earnings history using the new yfinance method
+            if frequency.lower() == "quarterly":
+                data = ticker_obj.get_earnings(freq='quarterly')
+            else:
+                data = ticker_obj.get_earnings(freq='yearly')
+            
+            if data is None or data.empty:
+                error_msg = f"No earnings data found for symbol '{symbol}'"
+                logger.warning(error_msg)
+                if format_type == "dict":
+                    return {"error": error_msg, "symbol": symbol}
+                return error_msg
+            
+            # Convert DataFrame to dict format
+            result = {
+                "symbol": symbol.upper(),
+                "frequency": frequency,
+                "end_date": end_date.isoformat(),
+                "lookback_periods": lookback_periods,
+                "earnings": [],
+                "retrieved_at": datetime.now().isoformat()
+            }
+            
+            # Filter and process earnings data
+            filtered_earnings = []
+            for idx, row in data.iterrows():
+                # Convert index to datetime for comparison
+                if hasattr(idx, 'to_pydatetime'):
+                    period_dt = idx.to_pydatetime()
+                elif hasattr(idx, 'date'):
+                    period_dt = datetime.combine(idx.date(), datetime.min.time())
+                else:
+                    try:
+                        period_dt = pd.to_datetime(idx).to_pydatetime()
+                    except:
+                        continue
+                
+                # Filter by end_date
+                if period_dt > end_date:
+                    continue
+                
+                earnings_data = {
+                    "fiscal_date_ending": period_dt.strftime("%Y-%m-%d"),
+                    "reported_eps": float(row.get('Reported EPS', row.get('reported_eps', 0))),
+                    "estimated_eps": float(row.get('Estimated EPS', row.get('estimated_eps', 0)))
+                }
+                
+                # Calculate surprise if both values available
+                if earnings_data["reported_eps"] and earnings_data["estimated_eps"]:
+                    earnings_data["surprise"] = earnings_data["reported_eps"] - earnings_data["estimated_eps"]
+                    if earnings_data["estimated_eps"] != 0:
+                        earnings_data["surprise_percent"] = (earnings_data["surprise"] / abs(earnings_data["estimated_eps"])) * 100
+                    else:
+                        earnings_data["surprise_percent"] = 0
+                else:
+                    earnings_data["surprise"] = None
+                    earnings_data["surprise_percent"] = None
+                
+                filtered_earnings.append((period_dt, earnings_data))
+            
+            # Sort by date descending (most recent first)
+            filtered_earnings.sort(key=lambda x: x[0], reverse=True)
+            
+            # Apply lookback_periods limit
+            filtered_earnings = filtered_earnings[:lookback_periods]
+            
+            # Extract just the earnings data
+            result["earnings"] = [e[1] for e in filtered_earnings]
+            
+            logger.info(f"Retrieved past earnings for {symbol}: {len(result['earnings'])} periods")
+            
+            # Format output
+            if format_type == "dict":
+                return result
+            else:  # markdown
+                return self._format_past_earnings_markdown(result)
+                
+        except Exception as e:
+            logger.error(f"Error retrieving past earnings for {symbol}: {e}")
+            if format_type == "dict":
+                return {"error": str(e), "symbol": symbol}
+            return f"Error retrieving past earnings for {symbol}: {str(e)}"
+    
+    @log_provider_call
+    def get_earnings_estimates(
+        self,
+        symbol: str,
+        frequency: Literal["quarterly", "annual"] = "quarterly",
+        as_of_date: datetime = None,
+        lookback_periods: int = 4,
+        format_type: Literal["dict", "markdown"] = "markdown"
+    ) -> Dict[str, Any] | str:
+        """
+        Get future earnings estimates for a company.
+        
+        Args:
+            symbol: Stock ticker symbol
+            frequency: Data frequency ('quarterly' or 'annual')
+            as_of_date: Date for estimates (returns most recent estimates as of this date)
+            lookback_periods: Number of future periods to retrieve estimates for (default 4)
+            format_type: Output format ('dict' or 'markdown')
+        
+        Returns:
+            Future earnings estimates in requested format
+        """
+        # Default as_of_date to now if not provided
+        if as_of_date is None:
+            as_of_date = datetime.now()
+        
+        try:
+            ticker_obj = yf.Ticker(symbol.upper())
+            
+            # Get earnings estimates
+            if frequency.lower() == "quarterly":
+                data = ticker_obj.get_earnings_estimate()
+            else:
+                # For annual, we use the earnings estimate with yearly aggregation
+                data = ticker_obj.get_earnings_estimate()
+            
+            if data is None or data.empty:
+                error_msg = f"No earnings estimates found for symbol '{symbol}'"
+                logger.warning(error_msg)
+                if format_type == "dict":
+                    return {"error": error_msg, "symbol": symbol}
+                return error_msg
+            
+            # Convert DataFrame to dict format
+            result = {
+                "symbol": symbol.upper(),
+                "frequency": frequency,
+                "as_of_date": as_of_date.isoformat(),
+                "estimates": [],
+                "retrieved_at": datetime.now().isoformat()
+            }
+            
+            # Filter and process estimates data (limit to future periods)
+            filtered_estimates = []
+            for idx, row in data.iterrows():
+                # Convert index to datetime for comparison
+                if hasattr(idx, 'to_pydatetime'):
+                    period_dt = idx.to_pydatetime()
+                elif hasattr(idx, 'date'):
+                    period_dt = datetime.combine(idx.date(), datetime.min.time())
+                else:
+                    try:
+                        period_dt = pd.to_datetime(idx).to_pydatetime()
+                    except:
+                        continue
+                
+                # Only include future estimates (after as_of_date)
+                if period_dt < as_of_date:
+                    continue
+                
+                estimate_data = {
+                    "fiscal_date_ending": period_dt.strftime("%Y-%m-%d"),
+                    "estimated_eps_avg": float(row.get('Avg. Estimate', row.get('avg_estimate', 0))),
+                    "estimated_eps_high": float(row.get('High Estimate', row.get('high_estimate', 0))),
+                    "estimated_eps_low": float(row.get('Low Estimate', row.get('low_estimate', 0))),
+                    "number_of_analysts": int(row.get('Number of Analysts', row.get('number_of_analysts', 0)))
+                }
+                
+                filtered_estimates.append((period_dt, estimate_data))
+            
+            # Sort by date ascending (earliest future period first)
+            filtered_estimates.sort(key=lambda x: x[0])
+            
+            # Apply lookback_periods limit (here it means "forward periods")
+            filtered_estimates = filtered_estimates[:lookback_periods]
+            
+            # Extract just the estimates data
+            result["estimates"] = [e[1] for e in filtered_estimates]
+            
+            logger.info(f"Retrieved earnings estimates for {symbol}: {len(result['estimates'])} periods")
+            
+            # Format output
+            if format_type == "dict":
+                return result
+            else:  # markdown
+                return self._format_earnings_estimates_markdown(result)
+                
+        except Exception as e:
+            logger.error(f"Error retrieving earnings estimates for {symbol}: {e}")
+            if format_type == "dict":
+                return {"error": str(e), "symbol": symbol}
+            return f"Error retrieving earnings estimates for {symbol}: {str(e)}"
+    
+    def _format_past_earnings_markdown(self, data: Dict[str, Any]) -> str:
+        """Format past earnings data as markdown."""
+        md = f"# Past Earnings: {data['symbol']} ({data['frequency']})\n\n"
+        md += f"**Retrieved**: {data['retrieved_at']}\n"
+        md += f"**Lookback Periods**: {data['lookback_periods']}\n\n"
+        
+        if "error" in data:
+            md += f"**Error**: {data['error']}\n"
+            return md
+        
+        if not data["earnings"]:
+            md += "*No earnings data available*\n"
+            return md
+        
+        md += "| Date | Reported EPS | Estimated EPS | Surprise | Surprise % |\n"
+        md += "|------|--------------|---------------|----------|------------|\n"
+        
+        for earning in data["earnings"]:
+            date = earning["fiscal_date_ending"]
+            reported = f"${earning['reported_eps']:.2f}" if earning["reported_eps"] else "N/A"
+            estimated = f"${earning['estimated_eps']:.2f}" if earning["estimated_eps"] else "N/A"
+            surprise = f"${earning['surprise']:.2f}" if earning["surprise"] is not None else "N/A"
+            surprise_pct = f"{earning['surprise_percent']:.1f}%" if earning["surprise_percent"] is not None else "N/A"
+            
+            md += f"| {date} | {reported} | {estimated} | {surprise} | {surprise_pct} |\n"
+        
+        return md
+    
+    def _format_earnings_estimates_markdown(self, data: Dict[str, Any]) -> str:
+        """Format earnings estimates data as markdown."""
+        md = f"# Earnings Estimates: {data['symbol']} ({data['frequency']})\n\n"
+        md += f"**Retrieved**: {data['retrieved_at']}\n"
+        md += f"**As of Date**: {data['as_of_date']}\n\n"
+        
+        if "error" in data:
+            md += f"**Error**: {data['error']}\n"
+            return md
+        
+        if not data["estimates"]:
+            md += "*No earnings estimates available*\n"
+            return md
+        
+        md += "| Date | Avg Estimate | High Estimate | Low Estimate | # Analysts |\n"
+        md += "|------|--------------|---------------|--------------|------------|\n"
+        
+        for estimate in data["estimates"]:
+            date = estimate["fiscal_date_ending"]
+            avg = f"${estimate['estimated_eps_avg']:.2f}" if estimate["estimated_eps_avg"] else "N/A"
+            high = f"${estimate['estimated_eps_high']:.2f}" if estimate["estimated_eps_high"] else "N/A"
+            low = f"${estimate['estimated_eps_low']:.2f}" if estimate["estimated_eps_low"] else "N/A"
+            analysts = estimate["number_of_analysts"]
+            
+            md += f"| {date} | {avg} | {high} | {low} | {analysts} |\n"
         
         return md

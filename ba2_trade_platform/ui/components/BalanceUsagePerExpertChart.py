@@ -215,7 +215,8 @@ class BalanceUsagePerExpertChart:
                     'trigger': 'axis',
                     'axisPointer': {
                         'type': 'shadow'
-                    }
+                    },
+                    'formatter': 'function(params) { var total = params[0].value + params[1].value; return params[0].name + "<br/>" + params[0].marker + " " + params[0].seriesName + ": $" + params[0].value.toFixed(2) + "<br/>" + params[1].marker + " " + params[1].seriesName + ": $" + params[1].value.toFixed(2) + "<br/>" + "<b>Total: $" + total.toFixed(2) + "</b>"; }'
                 },
                 'legend': {
                     'data': ['Filled Orders', 'Pending Orders'],
@@ -225,7 +226,7 @@ class BalanceUsagePerExpertChart:
                     'left': '3%',
                     'right': '4%',
                     'bottom': '15%',
-                    'top': '10%',
+                    'top': '15%',  # Increased to make room for labels
                     'containLabel': True
                 },
                 'xAxis': {
@@ -261,18 +262,30 @@ class BalanceUsagePerExpertChart:
                         'name': 'Pending Orders',
                         'type': 'bar',
                         'stack': 'total',
-                        'data': [
-                            {'value': round(pending_values[i], 2), 'total': total_per_expert[i]}
-                            for i in range(len(pending_values))
-                        ],
+                        'data': [round(v, 2) for v in pending_values],
                         'itemStyle': {
                             'color': '#FF9800'  # Orange for pending
                         },
                         'label': {
-                            'show': True,
-                            'position': 'top',
-                            'formatter': '${@total}',
-                            'fontSize': 10
+                            'show': False  # Disable default label, use markPoint instead
+                        },
+                        'markPoint': {
+                            'symbol': 'rect',
+                            'symbolSize': [60, 20],
+                            'symbolOffset': [0, -10],
+                            'itemStyle': {
+                                'color': 'rgba(255, 255, 255, 0.9)',
+                                'borderColor': '#666',
+                                'borderWidth': 1
+                            },
+                            'label': {
+                                'show': True,
+                                'fontSize': 10,
+                                'fontWeight': 'bold',
+                                'color': '#333',
+                                'formatter': 'function(params) { return "$" + params.value.toFixed(2); }'
+                            },
+                            'data': [{'coord': [i, total_per_expert[i]], 'value': total_per_expert[i]} for i in range(len(expert_names))]
                         }
                     }
                 ]
@@ -303,8 +316,6 @@ class BalanceUsagePerExpertChart:
                 
                 self.chart.options['xAxis']['data'] = expert_names
                 self.chart.options['series'][0]['data'] = [round(v, 2) for v in filled_values]
-                self.chart.options['series'][1]['data'] = [
-                    {'value': round(pending_values[i], 2), 'total': total_per_expert[i]}
-                    for i in range(len(pending_values))
-                ]
+                self.chart.options['series'][1]['data'] = [round(v, 2) for v in pending_values]
+                self.chart.options['series'][1]['markPoint']['data'] = [{'coord': [i, total_per_expert[i]], 'value': total_per_expert[i]} for i in range(len(expert_names))]
                 self.chart.update()

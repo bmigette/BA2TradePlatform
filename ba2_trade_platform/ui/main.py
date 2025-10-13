@@ -1,6 +1,6 @@
 import logging
 from nicegui import ui, Client, app
-from .pages import overview, settings, marketanalysis, market_analysis_detail, rulesettest
+from .pages import overview, settings, marketanalysis, market_analysis_detail, rulesettest, marketanalysishistory
 from .layout import layout_render
 from pathlib import Path
 from ..logger import logger
@@ -91,6 +91,12 @@ def rulesettest_page() -> None:
     
     with layout_render('Ruleset Test'):
         rulesettest.content(ruleset_id)
+
+@ui.page('/marketanalysishistory/{symbol}')
+def market_analysis_history_page(symbol: str) -> None:
+    logger.debug(f"[ROUTE] /marketanalysishistory/{symbol} - Loading market analysis history page")
+    with layout_render(f'Market Analysis History - {symbol}'):
+        marketanalysishistory.render_market_analysis_history(symbol)
 
 STATICPATH = Path(__file__).parent / 'static'
 FAVICO = (STATICPATH / 'favicon.ico')

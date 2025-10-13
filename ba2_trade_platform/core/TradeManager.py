@@ -185,6 +185,25 @@ class TradeManager:
                     if current_status == trigger_status:
                         self.logger.info(f"Order {parent_order_id} is in status {trigger_status}, triggering dependent order {dependent_order.id}")
                         
+                        # Copy quantity from parent order if dependent order quantity is 0
+                        if dependent_order.quantity == 0:
+                            if parent_order.quantity > 0:
+                                self.logger.info(
+                                    f"Copying quantity {parent_order.quantity} from parent order {parent_order_id} "
+                                    f"(symbol: {parent_order.symbol}) to dependent order {dependent_order.id} (symbol: {dependent_order.symbol})"
+                                )
+                                dependent_order.quantity = parent_order.quantity
+                                session.add(dependent_order)
+                            else:
+                                self.logger.error(
+                                    f"Cannot submit dependent order {dependent_order.id} (symbol: {dependent_order.symbol}): "
+                                    f"quantity is 0 and parent order {parent_order_id} (symbol: {parent_order.symbol}) "
+                                    f"also has quantity 0. Setting dependent order to ERROR status."
+                                )
+                                dependent_order.status = OrderStatus.ERROR
+                                session.add(dependent_order)
+                                continue
+                        
                         # Get the account for this dependent order using its account_id
                         from ..modules.accounts import get_account_class
                         from .models import AccountDefinition
@@ -202,8 +221,25 @@ class TradeManager:
                             
                         account = account_class(account_def.id)
                         
+                        # Double-check quantity one more time before submit
+                        if dependent_order.quantity <= 0:
+                            self.logger.error(
+                                f"Dependent order {dependent_order.id} (symbol: {dependent_order.symbol}) "
+                                f"still has invalid quantity {dependent_order.quantity} after parent copy attempt. "
+                                f"Parent order {parent_order_id} (symbol: {parent_order.symbol}) quantity: {parent_order.quantity}. "
+                                f"Setting to ERROR status."
+                            )
+                            dependent_order.status = OrderStatus.ERROR
+                            session.add(dependent_order)
+                            continue
+                        
                         # Submit the dependent order
                         try:
+                            self.logger.info(
+                                f"Submitting dependent order {dependent_order.id}: {dependent_order.direction.value} "
+                                f"{dependent_order.quantity} {dependent_order.symbol} @ {dependent_order.order_type.value} "
+                                f"(triggered by parent order {parent_order_id})"
+                            )
                             submitted_order = account.submit_order(dependent_order)
                             
                             if submitted_order:
@@ -213,12 +249,19 @@ class TradeManager:
                                 self.logger.info(f"Successfully submitted dependent order {dependent_order.id} triggered by parent order {parent_order_id}")
                                 triggered_orders.append(dependent_order.id)
                             else:
-                                self.logger.error(f"Failed to submit dependent order {dependent_order.id} - setting to ERROR status")
+                                self.logger.error(
+                                    f"Failed to submit dependent order {dependent_order.id} (symbol: {dependent_order.symbol}) - "
+                                    f"setting to ERROR status"
+                                )
                                 # Set to ERROR status so it doesn't stay stuck
                                 dependent_order.status = OrderStatus.ERROR
                                 session.add(dependent_order)
                         except Exception as submit_error:
-                            self.logger.error(f"Exception submitting dependent order {dependent_order.id}: {submit_error}", exc_info=True)
+                            self.logger.error(
+                                f"Exception submitting dependent order {dependent_order.id} (symbol: {dependent_order.symbol}, "
+                                f"qty: {dependent_order.quantity}): {submit_error}",
+                                exc_info=True
+                            )
                             # Set to ERROR status on exception
                             dependent_order.status = OrderStatus.ERROR
                             session.add(dependent_order)
@@ -315,14 +358,44 @@ class TradeManager:
                             
                             account = account_class(account_def.id)
                             
-                            # Set quantity based on parent order's filled quantity (for TP/SL orders)
-                            if dependent_order.quantity == 0 and parent_order.quantity > 0:
-                                self.logger.info(f"Setting dependent order {dependent_order.id} quantity to {parent_order.quantity} (matching parent order)")
-                                dependent_order.quantity = parent_order.quantity
+                            # Copy quantity from parent order if dependent order quantity is 0
+                            if dependent_order.quantity == 0:
+                                if parent_order.quantity > 0:
+                                    self.logger.info(
+                                        f"Copying quantity {parent_order.quantity} from parent order {parent_order_id} "
+                                        f"(symbol: {parent_order.symbol}) to dependent order {dependent_order.id} (symbol: {dependent_order.symbol})"
+                                    )
+                                    dependent_order.quantity = parent_order.quantity
+                                    session.add(dependent_order)
+                                else:
+                                    self.logger.error(
+                                        f"Cannot submit dependent order {dependent_order.id} (symbol: {dependent_order.symbol}): "
+                                        f"quantity is 0 and parent order {parent_order_id} (symbol: {parent_order.symbol}) "
+                                        f"also has quantity 0. Setting dependent order to ERROR status."
+                                    )
+                                    dependent_order.status = OrderStatus.ERROR
+                                    session.add(dependent_order)
+                                    continue
+                            
+                            # Double-check quantity one more time before submit
+                            if dependent_order.quantity <= 0:
+                                self.logger.error(
+                                    f"Dependent order {dependent_order.id} (symbol: {dependent_order.symbol}) "
+                                    f"still has invalid quantity {dependent_order.quantity} after parent copy attempt. "
+                                    f"Parent order {parent_order_id} (symbol: {parent_order.symbol}) quantity: {parent_order.quantity}. "
+                                    f"Setting to ERROR status."
+                                )
+                                dependent_order.status = OrderStatus.ERROR
                                 session.add(dependent_order)
+                                continue
                             
                             # Submit the dependent order
                             try:
+                                self.logger.info(
+                                    f"Submitting dependent order {dependent_order.id}: {dependent_order.direction.value} "
+                                    f"{dependent_order.quantity} {dependent_order.symbol} @ {dependent_order.order_type.value} "
+                                    f"(triggered by parent order {parent_order_id})"
+                                )
                                 submitted_order = account.submit_order(dependent_order)
                                 
                                 if submitted_order:
@@ -332,11 +405,18 @@ class TradeManager:
                                     self.logger.info(f"Successfully submitted dependent order {dependent_order.id}")
                                     triggered_orders.append(dependent_order.id)
                                 else:
-                                    self.logger.error(f"Failed to submit dependent order {dependent_order.id} - setting to ERROR status")
+                                    self.logger.error(
+                                        f"Failed to submit dependent order {dependent_order.id} (symbol: {dependent_order.symbol}) - "
+                                        f"setting to ERROR status"
+                                    )
                                     dependent_order.status = OrderStatus.ERROR
                                     session.add(dependent_order)
                             except Exception as submit_error:
-                                self.logger.error(f"Exception submitting dependent order {dependent_order.id}: {submit_error}", exc_info=True)
+                                self.logger.error(
+                                    f"Exception submitting dependent order {dependent_order.id} (symbol: {dependent_order.symbol}, "
+                                    f"qty: {dependent_order.quantity}): {submit_error}",
+                                    exc_info=True
+                                )
                                 dependent_order.status = OrderStatus.ERROR
                                 session.add(dependent_order)
                     
@@ -397,10 +477,8 @@ class TradeManager:
                 self.logger.info(f"Automatic trading disabled for expert {expert_instance.id}, recommendation logged only")
                 return None
                 
-            # Apply rulesets for the recommendation type
-            if not self._apply_rulesets(recommendation, expert_instance):
-                self.logger.info(f"Recommendation rejected by rulesets for expert {expert_instance.id}")
-                return None
+            # Note: Ruleset evaluation is handled by TradeActionEvaluator in process_expert_recommendations_after_analysis()
+            # This method (_process_recommendation) is a legacy path and should eventually be deprecated
                 
             # Create the order. Do npt place it yet.
             order = self._create_order_from_recommendation(recommendation, expert_instance)
@@ -467,25 +545,6 @@ class TradeManager:
         else:
             return False  # ERROR and unknown actions are not allowed
             
-    def _apply_rulesets(self, recommendation: ExpertRecommendation, expert_instance: ExpertInstance) -> bool:
-        """
-        DEPRECATED: This method is no longer used. Ruleset evaluation is now handled by TradeActionEvaluator.
-        See process_expert_recommendations_after_analysis() for the new implementation.
-        
-        Apply rulesets to determine if a recommendation should be executed.
-        
-        Args:
-            recommendation: The expert recommendation
-            expert_instance: The expert instance
-            
-        Returns:
-            True (always allows - deprecated method)
-        """
-        # This method is deprecated and no longer evaluates rulesets
-        # Ruleset evaluation is now done by TradeActionEvaluator in process_expert_recommendations_after_analysis
-        self.logger.warning("_apply_rulesets called but is deprecated - returning True (allow)")
-        return True
-    
     def _get_ruleset_with_relations(self, ruleset_id: int) -> Optional[Ruleset]:
         """
         Get a ruleset with its event_actions relationship eagerly loaded.

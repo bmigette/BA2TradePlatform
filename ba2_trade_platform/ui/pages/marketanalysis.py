@@ -1552,19 +1552,10 @@ class OrderRecommendationsTab:
             ui.label('Order Recommendations').classes('text-lg font-bold')
             ui.label('Expert recommendations and generated orders').classes('text-sm text-gray-600 mb-4')
             
-            # Controls
-            with ui.row().classes('w-full justify-between items-center mb-4 gap-4'):
+            # Controls Row 1: Action Buttons
+            with ui.row().classes('w-full justify-between items-center mb-2 gap-4'):
                 with ui.row().classes('items-center gap-2'):
                     ui.button('Refresh', on_click=self.refresh_data).props('color=primary outline')
-                    
-                    # Expert selector for processing recommendations
-                    expert_options = self._get_expert_options()
-                    self.expert_select = ui.select(
-                        options=expert_options,
-                        label='Select Expert',
-                        value='all'  # Default to 'all'
-                    ).classes('w-64').props('dense outlined')
-                    self.expert_select.on_value_change(self._on_expert_filter_change)
                     
                     ui.button(
                         'Process Recommendations', 
@@ -1577,6 +1568,40 @@ class OrderRecommendationsTab:
                         on_click=self._handle_risk_management_and_submit,
                         icon='assessment'
                     ).props('color=secondary').tooltip('Run risk management on pending orders and submit them to broker')
+            
+            # Controls Row 2: Filters
+            with ui.row().classes('w-full items-center mb-4 gap-2'):
+                # Expert filter
+                expert_options = self._get_expert_options()
+                self.expert_select = ui.select(
+                    options=expert_options,
+                    label='Expert Filter',
+                    value='all'  # Default to 'all'
+                ).classes('w-48').props('dense outlined')
+                self.expert_select.on_value_change(self._on_expert_filter_change)
+                
+                # Symbol search filter
+                self.symbol_search = ui.input(
+                    label='Symbol',
+                    placeholder='Filter by symbol...'
+                ).classes('w-40').props('dense outlined')
+                self.symbol_search.on_value_change(lambda: self.refresh_data())
+                
+                # Action filter
+                self.action_filter = ui.select(
+                    options=['All', 'BUY', 'SELL', 'HOLD'],
+                    label='Action',
+                    value='All'
+                ).classes('w-32').props('dense outlined')
+                self.action_filter.on_value_change(lambda: self.refresh_data())
+                
+                # Show/Hide filter for orders
+                self.order_status_filter = ui.select(
+                    options=['All', 'With Orders', 'Without Orders'],
+                    label='Order Status',
+                    value='All'
+                ).classes('w-48').props('dense outlined')
+                self.order_status_filter.on_value_change(lambda: self.refresh_data())
             
             # Summary table container
             self.summary_container = ui.element('div').classes('w-full mb-4')
@@ -1640,6 +1665,12 @@ class OrderRecommendationsTab:
                                    color="primary" 
                                    title="View Details"
                                    @click="$parent.$emit('view_details', props.row.symbol)" />
+                            <q-btn icon="history" 
+                                   flat 
+                                   dense 
+                                   color="purple" 
+                                   title="View Analysis History"
+                                   @click="$parent.$emit('view_history', props.row.symbol)" />
                             <q-btn icon="send" 
                                    flat 
                                    dense 
@@ -1651,6 +1682,7 @@ class OrderRecommendationsTab:
                     
                     # Handle events
                     self.summary_table.on('view_details', self._handle_view_details)
+                    self.summary_table.on('view_history', self._handle_view_history)
                     self.summary_table.on('place_order', self._handle_place_order)
             
             # Clear detail container if no symbol selected
@@ -1692,8 +1724,18 @@ class OrderRecommendationsTab:
                     except (ValueError, IndexError):
                         pass  # If parsing fails, show all
                 
-                statement = statement.group_by(ExpertRecommendation.symbol).order_by(func.max(ExpertRecommendation.created_at).desc())
+                # Apply symbol search filter if provided
+                if hasattr(self, 'symbol_search') and self.symbol_search.value:
+                    search_term = self.symbol_search.value.strip().upper()
+                    if search_term:
+                        statement = statement.where(ExpertRecommendation.symbol.like(f'%{search_term}%'))
                 
+                # Apply action filter if not 'All'
+                if hasattr(self, 'action_filter') and self.action_filter.value != 'All':
+                    action = OrderRecommendation[self.action_filter.value]
+                    statement = statement.where(ExpertRecommendation.recommended_action == action)
+                
+                statement = statement.group_by(ExpertRecommendation.symbol).order_by(func.max(ExpertRecommendation.created_at).desc())
                 
                 results = session.exec(statement).all()
                 
@@ -1707,6 +1749,13 @@ class OrderRecommendationsTab:
                         TradingOrder.transaction_id.is_not(None)
                     )
                     orders_count = session.exec(orders_statement).first() or 0
+                    
+                    # Apply order status filter
+                    if hasattr(self, 'order_status_filter') and self.order_status_filter.value != 'All':
+                        if self.order_status_filter.value == 'With Orders' and orders_count == 0:
+                            continue  # Skip symbols without orders
+                        elif self.order_status_filter.value == 'Without Orders' and orders_count > 0:
+                            continue  # Skip symbols with orders
                     
                     summary_data.append({
                         'symbol': symbol,
@@ -1733,6 +1782,15 @@ class OrderRecommendationsTab:
             self._load_symbol_details(symbol)
         except Exception as e:
             logger.error(f"Error viewing details for symbol: {e}", exc_info=True)
+
+    def _handle_view_history(self, event_data):
+        """Handle view market analysis history for a symbol."""
+        try:
+            symbol = event_data.args if hasattr(event_data, 'args') else event_data
+            logger.info(f"Navigating to market analysis history for {symbol}")
+            ui.navigate.to(f'/marketanalysishistory/{symbol}')
+        except Exception as e:
+            logger.error(f"Error navigating to market analysis history: {e}", exc_info=True)
 
     def _handle_place_order(self, event_data):
         """Handle place order for a symbol."""
@@ -1878,8 +1936,8 @@ class OrderRecommendationsTab:
                     if hasattr(recommendation.recommended_action, 'value'):
                         action_raw = recommendation.recommended_action.value
                     else:
-                        # Fallback for non-enum values
-                        action_raw = str(recommendation.recommended_action)
+                        # Fallback for non-enum values - use .name to avoid "EnumName.VALUE" format
+                        action_raw = recommendation.recommended_action.name if hasattr(recommendation.recommended_action, 'name') else str(recommendation.recommended_action)
                         
                     # Convert enum values to readable text
                     action_mapping = {
@@ -2104,8 +2162,8 @@ class OrderRecommendationsTab:
                     if hasattr(recommendation.recommended_action, 'value'):
                         action_raw = recommendation.recommended_action.value
                     else:
-                        # Fallback for non-enum values
-                        action_raw = str(recommendation.recommended_action)
+                        # Fallback for non-enum values - use .name to avoid "EnumName.VALUE" format
+                        action_raw = recommendation.recommended_action.name if hasattr(recommendation.recommended_action, 'name') else str(recommendation.recommended_action)
                         
                     # Convert enum values to readable text
                     action_mapping = {

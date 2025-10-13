@@ -14,6 +14,8 @@ from ...core.utils import get_expert_instance_from_id, get_market_analysis_id_fr
 from ...modules.accounts import providers
 from ...logger import logger
 from ..components import ProfitPerExpertChart, InstrumentDistributionChart, BalanceUsagePerExpertChart
+from ..components.FloatingPLPerExpertWidget import FloatingPLPerExpertWidget
+from ..components.FloatingPLPerAccountWidget import FloatingPLPerAccountWidget
 
 class OverviewTab:
     def __init__(self, tabs_ref=None):
@@ -508,7 +510,11 @@ class OverviewTab:
             with ui.column().classes(''):
                 self._render_order_recommendations_widget()
             
-            # Row 2: Profit Per Expert and Balance Usage Per Expert
+            # Row 2: Floating P/L widgets
+            FloatingPLPerExpertWidget()
+            FloatingPLPerAccountWidget()
+            
+            # Row 3: Profit Per Expert and Balance Usage Per Expert
             ProfitPerExpertChart()
             BalanceUsagePerExpertChart()
             
@@ -1427,6 +1433,7 @@ class AccountOverviewTab:
                 
                 # Format the order data
                 order_dict = {
+                    'order_id': order.id,
                     'account': account.name,
                     'provider': account.provider,
                     'symbol': order.symbol,
@@ -1464,6 +1471,7 @@ class AccountOverviewTab:
         
         # Define columns for orders table
         order_columns = [
+            {'name': 'order_id', 'label': 'Order ID', 'field': 'order_id', 'align': 'left'},
             {'name': 'created_at', 'label': 'Date', 'field': 'created_at', 'align': 'left'},
             {'name': 'account', 'label': 'Account', 'field': 'account', 'align': 'left'},
             {'name': 'provider', 'label': 'Provider', 'field': 'provider', 'align': 'left'},
@@ -1500,39 +1508,40 @@ class AccountOverviewTab:
         """Render the actual pending orders table content."""
         session = get_db()
         try:
-            # Get orders with PENDING, WAITING_TRIGGER, or ERROR status
+            # Get orders with PENDING, WAITING_TRIGGER, or ERROR status with expert information
             pending_statuses = [OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER, OrderStatus.ERROR]
             statement = (
-                select(TradingOrder)
+                select(TradingOrder, AccountDefinition, ExpertRecommendation, ExpertInstance)
+                .join(AccountDefinition, TradingOrder.account_id == AccountDefinition.id)
+                .outerjoin(ExpertRecommendation, TradingOrder.expert_recommendation_id == ExpertRecommendation.id)
+                .outerjoin(ExpertInstance, ExpertRecommendation.instance_id == ExpertInstance.id)
                 .where(TradingOrder.status.in_(pending_statuses))
                 .order_by(TradingOrder.created_at.desc())
             )
-            orders_tuples = session.exec(statement).all()
-            # Unpack tuples to get actual order objects
-            orders = [order[0] if isinstance(order, tuple) else order for order in orders_tuples if order]
+            results = session.exec(statement).all()
             
-            if not orders:
+            if not results:
                 ui.label('No pending orders found.').classes('text-gray-500')
                 return
             
             # Prepare data for table
             rows = []
-            for order in orders:
-                # Get account name
-                account_name = ""
-                try:
-                    account = get_instance(AccountDefinition, order.account_id)
-                    if account:
-                        account_name = account.name
-                except Exception:
-                    account_name = f"Account {order.account_id}"
+            for order, account, recommendation, expert_instance in results:
+                # Get expert name with ID if available
+                expert_name = ""
+                if expert_instance:
+                    # Format: Alias-ID or ExpertType-ID (e.g., "TradingAgents-1")
+                    base_name = expert_instance.alias or expert_instance.expert
+                    expert_name = f"{base_name}-{expert_instance.id}"
+                elif not recommendation:
+                    expert_name = "Manual"  # No recommendation means manual order
                 
                 # Format dates
                 created_at_str = order.created_at.strftime('%Y-%m-%d %H:%M:%S') if order.created_at else ''
                 
                 row = {
                     'order_id': order.id,
-                    'account': account_name,
+                    'account': account.name,
                     'symbol': order.symbol,
                     'side': order.side,
                     'quantity': f"{order.quantity:.2f}" if order.quantity else '',
@@ -1541,6 +1550,7 @@ class AccountOverviewTab:
                     'limit_price': f"${order.limit_price:.2f}" if order.limit_price else '',
                     'comment': order.comment or '',
                     'created_at': created_at_str,
+                    'expert': expert_name,
                     'waited_status': order.depends_order_status_trigger if order.status == OrderStatus.WAITING_TRIGGER else '',
                     'can_submit': order.status == OrderStatus.PENDING and not order.broker_order_id
                 }
@@ -1556,6 +1566,7 @@ class AccountOverviewTab:
                 {'name': 'order_type', 'label': 'Order Type', 'field': 'order_type'},
                 {'name': 'status', 'label': 'Status', 'field': 'status'},
                 {'name': 'limit_price', 'label': 'Limit Price', 'field': 'limit_price'},
+                {'name': 'expert', 'label': 'Expert', 'field': 'expert'},
                 {'name': 'comment', 'label': 'Comment', 'field': 'comment'},
                 {'name': 'created_at', 'label': 'Created', 'field': 'created_at'},
                 {'name': 'waited_status', 'label': 'Waited Status', 'field': 'waited_status'},
@@ -2191,6 +2202,11 @@ class TransactionsTab:
     def render(self):
         """Render the transactions tab with filtering and control options."""
         logger.debug("[RENDER] TransactionsTab.render() - START")
+        
+        # Pre-populate expert options before creating the UI
+        expert_options, expert_map = self._get_expert_options()
+        self.expert_id_map = expert_map
+        
         with ui.card().classes('w-full'):
             with ui.row().classes('w-full items-center justify-between mb-4'):
                 ui.label('💼 Transactions').classes('text-h6')
@@ -2204,10 +2220,10 @@ class TransactionsTab:
                         on_change=lambda: self._refresh_transactions()
                     ).classes('w-32')
                     
-                    # Expert filter - will be populated dynamically
+                    # Expert filter - populated with all experts
                     self.expert_filter = ui.select(
                         label='Expert',
-                        options=['All'],
+                        options=expert_options,
                         value='All',
                         on_change=lambda: self._refresh_transactions()
                     ).classes('w-48')
@@ -2220,15 +2236,12 @@ class TransactionsTab:
                     
                     ui.button('Refresh', icon='refresh', on_click=lambda: self._refresh_transactions()).props('outline')
             
-            # Populate expert filter options
-            self._populate_expert_filter()
-            
             # Transactions table container
             self.transactions_container = ui.column().classes('w-full')
             self._render_transactions_table()
     
-    def _populate_expert_filter(self):
-        """Populate the expert filter dropdown with all available experts."""
+    def _get_expert_options(self):
+        """Get list of expert options and ID mapping."""
         from ...core.models import ExpertInstance
         
         session = get_db()
@@ -2246,23 +2259,32 @@ class TransactionsTab:
                 expert_options.append(shortname)
                 expert_map[shortname] = expert.id
             
-            # Store the map for filtering
-            self.expert_id_map = expert_map
-            
-            # Update expert filter options
-            if hasattr(self, 'expert_filter'):
-                current_value = self.expert_filter.value
-                self.expert_filter.options = expert_options
-                # Reset to 'All' if current value is not in the new options
-                if current_value not in expert_options:
-                    self.expert_filter.value = 'All'
-            
-            logger.debug(f"[POPULATE] Populated expert filter with {len(expert_options)} options")
+            logger.debug(f"[GET_EXPERT_OPTIONS] Built {len(expert_options)} expert options")
+            return expert_options, expert_map
         
         except Exception as e:
-            logger.error(f"Error populating expert filter: {e}", exc_info=True)
+            logger.error(f"Error getting expert options: {e}", exc_info=True)
+            return ['All'], {'All': 'All'}
         finally:
             session.close()
+    
+    def _populate_expert_filter(self):
+        """Populate the expert filter dropdown with all available experts."""
+        # Get fresh expert options
+        expert_options, expert_map = self._get_expert_options()
+        self.expert_id_map = expert_map
+        
+        # Update expert filter options
+        if hasattr(self, 'expert_filter'):
+            current_value = self.expert_filter.value
+            self.expert_filter.options = expert_options
+            # Reset to 'All' if current value is not in the new options
+            if current_value not in expert_options:
+                self.expert_filter.value = 'All'
+            # Force update of the select component
+            self.expert_filter.update()
+        
+        logger.debug(f"[POPULATE] Populated expert filter with {len(expert_options)} options")
     
     def _refresh_transactions(self):
         """Refresh the transactions table."""

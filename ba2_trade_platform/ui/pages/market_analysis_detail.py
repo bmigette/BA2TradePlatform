@@ -330,7 +330,8 @@ def _render_order_recommendations_tab(market_analysis: MarketAnalysis) -> None:
                         if hasattr(rec.recommended_action, 'value'):
                             action = rec.recommended_action.value
                         else:
-                            action = str(rec.recommended_action)
+                            # Use .name to avoid "EnumName.VALUE" format
+                            action = rec.recommended_action.name if hasattr(rec.recommended_action, 'name') else str(rec.recommended_action)
                         rec_counts[action] = rec_counts.get(action, 0) + 1
                     
                     for action, count in rec_counts.items():
@@ -382,7 +383,8 @@ def _render_order_recommendations_tab(market_analysis: MarketAnalysis) -> None:
                 
                 rec_rows = []
                 for rec in recommendations:
-                    action = rec.recommended_action.value if hasattr(rec.recommended_action, 'value') else str(rec.recommended_action)
+                    # Use .name to avoid "EnumName.VALUE" format
+                    action = rec.recommended_action.value if hasattr(rec.recommended_action, 'value') else (rec.recommended_action.name if hasattr(rec.recommended_action, 'name') else str(rec.recommended_action))
                     created_at = rec.created_at.strftime('%Y-%m-%d %H:%M:%S') if rec.created_at else ''
                     
                     rec_rows.append({

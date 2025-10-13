@@ -40,7 +40,7 @@ class OpenAINewsProvider(MarketNewsInterface):
         
         # Get OpenAI configuration
         self.backend_url = config.OPENAI_BACKEND_URL
-        self.model = model or get_app_setting("OPENAI_QUICK_THINK_LLM", "gpt-4")
+        self.model = model 
         
         self.client = OpenAI(base_url=self.backend_url)
         logger.info(f"OpenAINewsProvider initialized with model={self.model}, backend_url={self.backend_url}")

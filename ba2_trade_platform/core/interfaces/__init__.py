@@ -30,6 +30,7 @@ from .MarketNewsInterface import MarketNewsInterface
 from .MacroEconomicsInterface import MacroEconomicsInterface
 from .CompanyInsiderInterface import CompanyInsiderInterface
 from .MarketDataProviderInterface import MarketDataProviderInterface
+from .SocialMediaDataProviderInterface import SocialMediaDataProviderInterface
 
 
 __all__ = [
@@ -47,4 +48,5 @@ __all__ = [
     "MacroEconomicsInterface",
     "CompanyInsiderInterface",
     "MarketDataProviderInterface",
+    "SocialMediaDataProviderInterface",
 ]

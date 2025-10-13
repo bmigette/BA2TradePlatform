@@ -32,7 +32,8 @@ from ba2_trade_platform.core.interfaces import (
     CompanyFundamentalsDetailsInterface,
     MarketNewsInterface,
     MacroEconomicsInterface,
-    CompanyInsiderInterface
+    CompanyInsiderInterface,
+    SocialMediaDataProviderInterface
 )
 
 # Legacy data provider (to be migrated)
@@ -54,6 +55,7 @@ from .fundamentals import (
 )
 from .macro import FREDMacroProvider
 from .insider import FMPInsiderProvider
+from .socialmedia import OpenAISocialMediaSentiment
 
 # Provider registries - will be populated as providers are implemented
 OHLCV_PROVIDERS: Dict[str, Type[DataProviderInterface]] = {
@@ -101,6 +103,10 @@ INSIDER_PROVIDERS: Dict[str, Type[CompanyInsiderInterface]] = {
     # "finnhub": FinnhubInsiderProvider,
 }
 
+SOCIALMEDIA_PROVIDERS: Dict[str, Type[SocialMediaDataProviderInterface]] = {
+    "openai": OpenAISocialMediaSentiment,
+}
+
 
 def get_provider(category: str, provider_name: str, **kwargs) -> DataProviderInterface:
     """
@@ -116,7 +122,8 @@ def get_provider(category: str, provider_name: str, **kwargs) -> DataProviderInt
                  - 'news': Market and company news
                  - 'macro': Macroeconomic data
                  - 'insider': Insider trading data
-        provider_name: Provider name (e.g., 'alpaca', 'yfinance', 'alphavantage')
+                 - 'socialmedia': Social media sentiment analysis
+        provider_name: Provider name (e.g., 'alpaca', 'yfinance', 'alphavantage', 'openai')
         **kwargs: Additional arguments to pass to the provider constructor
                  (e.g., source='trading_agents' for Alpha Vantage providers)
     
@@ -141,6 +148,7 @@ def get_provider(category: str, provider_name: str, **kwargs) -> DataProviderInt
         "news": NEWS_PROVIDERS,
         "macro": MACRO_PROVIDERS,
         "insider": INSIDER_PROVIDERS,
+        "socialmedia": SOCIALMEDIA_PROVIDERS,
     }
     
     if category not in registries:
@@ -199,6 +207,7 @@ def list_providers(category: str = None) -> Dict[str, list[str]]:
         "news": NEWS_PROVIDERS,
         "macro": MACRO_PROVIDERS,
         "insider": INSIDER_PROVIDERS,
+        "socialmedia": SOCIALMEDIA_PROVIDERS,
     }
     
     if category:
@@ -233,6 +242,7 @@ __all__ = [
     "FMPCompanyDetailsProvider",
     "FREDMacroProvider",
     "FMPInsiderProvider",
+    "OpenAISocialMediaSentiment",
     
     # Interfaces
     "DataProviderInterface",
@@ -240,6 +250,7 @@ __all__ = [
     "CompanyFundamentalsOverviewInterface",
     "CompanyFundamentalsDetailsInterface",
     "MarketNewsInterface",
+    "SocialMediaDataProviderInterface",
     "MacroEconomicsInterface",
     "CompanyInsiderInterface",
     
@@ -255,4 +266,5 @@ __all__ = [
     "NEWS_PROVIDERS",
     "MACRO_PROVIDERS",
     "INSIDER_PROVIDERS",
+    "SOCIALMEDIA_PROVIDERS",
 ]

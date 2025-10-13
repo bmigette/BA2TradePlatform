@@ -171,6 +171,13 @@ class TradingAgents(MarketExpertInterface):
                 "multiple": True,
                 "tooltip": "Select one or more data providers for insider trading data. FMP provides both insider transactions (buys/sells by executives) and calculated sentiment scores from SEC filings."
             },
+            "vendor_social_media": {
+                "type": "list", "required": True, "default": ["openai"],
+                "description": "Data vendor(s) for social media sentiment analysis",
+                "valid_values": ["openai"],
+                "multiple": True,
+                "tooltip": "Select one or more data providers for social media sentiment analysis. Crawls Twitter/X, Reddit, StockTwits, forums, and other public sources. OpenAI uses web search to analyze sentiment across multiple platforms."
+            },
             
             # Provider Configuration
             "alpha_vantage_source": {
@@ -306,7 +313,8 @@ class TradingAgents(MarketExpertInterface):
             FUNDAMENTALS_DETAILS_PROVIDERS,
             NEWS_PROVIDERS,
             MACRO_PROVIDERS,
-            INSIDER_PROVIDERS
+            INSIDER_PROVIDERS,
+            SOCIALMEDIA_PROVIDERS
         )
         
         settings_def = self.get_settings_definitions()
@@ -334,15 +342,14 @@ class TradingAgents(MarketExpertInterface):
                 logger.warning(f"News provider '{vendor}' not found in NEWS_PROVIDERS registry")
         
         # Social media providers (aggregated)
-        # Uses same providers as news, but allows separate configuration in the future
-        # For now, maps to the same vendor_news setting
-        social_media_vendors = _get_vendor_list('vendor_news')  # Can be changed to 'vendor_social_media' later
+        # Uses dedicated social media providers with sentiment analysis capabilities
+        social_media_vendors = _get_vendor_list('vendor_social_media')
         provider_map['social_media'] = []
         for vendor in social_media_vendors:
-            if vendor in NEWS_PROVIDERS:
-                provider_map['social_media'].append(NEWS_PROVIDERS[vendor])
+            if vendor in SOCIALMEDIA_PROVIDERS:
+                provider_map['social_media'].append(SOCIALMEDIA_PROVIDERS[vendor])
             else:
-                logger.warning(f"Social media provider '{vendor}' not found in NEWS_PROVIDERS registry")
+                logger.warning(f"Social media provider '{vendor}' not found in SOCIALMEDIA_PROVIDERS registry")
         
         # Global news uses same providers as company news
         # The toolkit will call get_global_news() on each provider
@@ -408,23 +415,59 @@ class TradingAgents(MarketExpertInterface):
         expert_recommendation = final_state.get('expert_recommendation', {})
         
         if expert_recommendation:
+            # Get price_at_date from recommendation, fallback to fetching current price
+            price_at_date = expert_recommendation.get('price_at_date', 0.0)
+            
+            # If price is 0 or missing, fetch current market price from account
+            if price_at_date <= 0:
+                try:
+                    from ...core.utils import get_account_instance_from_id
+                    account = get_account_instance_from_id(self.instance.account_id)
+                    if account:
+                        current_price = account.get_instrument_current_price(symbol)
+                        if current_price and current_price > 0:
+                            price_at_date = current_price
+                            logger.info(f"Fetched current market price for {symbol}: ${price_at_date:.2f} (price_at_date was missing from analysis)")
+                        else:
+                            logger.warning(f"Could not fetch current price for {symbol}, price_at_date will be 0")
+                    else:
+                        logger.error(f"Could not get account instance for account_id {self.instance.account_id}")
+                except Exception as e:
+                    logger.error(f"Error fetching current price for {symbol}: {e}")
+            
             return {
                 'signal': expert_recommendation.get('recommended_action', OrderRecommendation.ERROR),
                 'confidence': expert_recommendation.get('confidence', 0.0),
                 'expected_profit': expert_recommendation.get('expected_profit_percent', 0.0),
                 'details': expert_recommendation.get('details', 'TradingAgents analysis completed'),
-                'price_at_date': expert_recommendation.get('price_at_date', 0.0),
+                'price_at_date': price_at_date,
                 'risk_level': expert_recommendation.get('risk_level', RiskLevel.MEDIUM),
                 'time_horizon': expert_recommendation.get('time_horizon', TimeHorizon.SHORT_TERM)
             }
         else:
-            # Fallback to processed signal
+            # Fallback to processed signal - also fetch current price from account
+            price_at_date = 0.0
+            try:
+                from ...core.utils import get_account_instance_from_id
+                account = get_account_instance_from_id(self.instance.account_id)
+                if account:
+                    current_price = account.get_instrument_current_price(symbol)
+                    if current_price and current_price > 0:
+                        price_at_date = current_price
+                        logger.info(f"Fetched current market price for {symbol}: ${price_at_date:.2f} (fallback path)")
+                    else:
+                        logger.warning(f"Could not fetch current price for {symbol} in fallback path")
+                else:
+                    logger.error(f"Could not get account instance for account_id {self.instance.account_id} in fallback path")
+            except Exception as e:
+                logger.error(f"Error fetching current price for {symbol} in fallback path: {e}")
+            
             return {
                 'signal': processed_signal if processed_signal in ['BUY', 'SELL', 'HOLD'] else OrderRecommendation.ERROR,
                 'confidence': 0.0,
                 'expected_profit': 0.0,
                 'details': f"TradingAgents analysis: {processed_signal}",
-                'price_at_date': 0.0,
+                'price_at_date': price_at_date,
                 'risk_level': RiskLevel.MEDIUM,
                 'time_horizon': TimeHorizon.SHORT_TERM
             }

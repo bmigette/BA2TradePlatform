@@ -237,3 +237,83 @@ class CompanyFundamentalsDetailsInterface(DataProviderInterface):
             ValueError: If both start_date and lookback_periods are provided, or if neither is provided
         """
         pass
+    
+    @abstractmethod
+    def get_past_earnings(
+        self,
+        symbol: Annotated[str, "Stock ticker symbol"],
+        frequency: Annotated[Literal["annual", "quarterly"], "Reporting frequency"],
+        end_date: Annotated[datetime, "End date for earnings range (inclusive)"],
+        lookback_periods: Annotated[int, "Number of periods to look back from end_date"] = 8,
+        format_type: Literal["dict", "markdown"] = "markdown"
+    ) -> Dict[str, Any] | str:
+        """
+        Get historical earnings data for a company.
+        
+        Args:
+            symbol: Stock ticker symbol (e.g., 'AAPL', 'MSFT')
+            frequency: Annual or quarterly reporting
+            end_date: End date (inclusive) - gets most recent earnings as of this date
+            lookback_periods: Number of periods to look back (default 8 quarters = 2 years)
+            format_type: Output format ('dict' or 'markdown')
+        
+        Returns:
+            Historical earnings data.
+            
+            If format_type='dict': {
+                "symbol": str,
+                "frequency": str,
+                "end_date": str (ISO format),
+                "lookback_periods": int,
+                "earnings": [{
+                    "fiscal_date_ending": str (ISO format),
+                    "report_date": str (ISO format),
+                    "reported_eps": float,
+                    "estimated_eps": float,
+                    "surprise": float,
+                    "surprise_percent": float,
+                    # Additional fields as available from provider
+                }]
+            }
+            If format_type='markdown': Formatted markdown table with earnings data
+        """
+        pass
+    
+    @abstractmethod
+    def get_earnings_estimates(
+        self,
+        symbol: Annotated[str, "Stock ticker symbol"],
+        frequency: Annotated[Literal["annual", "quarterly"], "Reporting frequency"],
+        as_of_date: Annotated[datetime, "Date for estimates (uses most recent estimates as of this date)"],
+        lookback_periods: Annotated[int, "Number of future periods to retrieve estimates for"] = 4,
+        format_type: Literal["dict", "markdown"] = "markdown"
+    ) -> Dict[str, Any] | str:
+        """
+        Get future earnings estimates for a company.
+        
+        Args:
+            symbol: Stock ticker symbol (e.g., 'AAPL', 'MSFT')
+            frequency: Annual or quarterly reporting
+            as_of_date: Date for estimates (returns most recent estimates as of this date)
+            lookback_periods: Number of future periods to retrieve estimates for (default 4)
+            format_type: Output format ('dict' or 'markdown')
+        
+        Returns:
+            Future earnings estimates.
+            
+            If format_type='dict': {
+                "symbol": str,
+                "frequency": str,
+                "as_of_date": str (ISO format),
+                "estimates": [{
+                    "fiscal_date_ending": str (ISO format),
+                    "estimated_eps_avg": float,
+                    "estimated_eps_high": float,
+                    "estimated_eps_low": float,
+                    "number_of_analysts": int,
+                    # Additional fields as available from provider
+                }]
+            }
+            If format_type='markdown': Formatted markdown table with earnings estimates
+        """
+        pass

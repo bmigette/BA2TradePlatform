@@ -323,9 +323,8 @@ class Toolkit:
                     
                     logger.debug(f"Fetching social media sentiment from {provider_name} for {symbol}")
                     
-                    # Use get_company_news method from the news provider
-                    # This allows reusing existing news providers for social media analysis
-                    sentiment_data = provider.get_company_news(
+                    # Use get_social_media_sentiment method from the social media provider
+                    sentiment_data = provider.get_social_media_sentiment(
                         symbol=symbol,
                         end_date=end_dt,
                         lookback_days=lookback_days,
@@ -700,6 +699,140 @@ class Toolkit:
         except Exception as e:
             logger.error(f"Error in get_cashflow_statement: {e}")
             return f"Error retrieving cash flow statement: {str(e)}"
+    
+    def get_past_earnings(
+        self,
+        symbol: Annotated[str, "Stock ticker symbol"],
+        end_date: Annotated[str, "End date in YYYY-MM-DD format"],
+        lookback_periods: Annotated[int, "Number of periods to look back (default 8 quarters = 2 years)"] = 8,
+        frequency: Annotated[str, "Reporting frequency: 'quarterly' or 'annual'"] = "quarterly"
+    ) -> str:
+        """
+        Retrieve historical earnings data showing actual vs estimated EPS.
+        
+        Earnings data helps assess:
+        - Earnings quality and consistency
+        - Whether company beats/misses analyst estimates
+        - Earnings surprise trends (positive surprises indicate strength)
+        - EPS growth trajectory over time
+        
+        The surprise percentage shows how much the company outperformed or underperformed
+        analyst expectations - a key indicator of company performance vs market expectations.
+        
+        Aggregates data from all configured providers for comprehensive coverage.
+        
+        Args:
+            symbol: Stock ticker symbol
+            end_date: End date in YYYY-MM-DD format
+            lookback_periods: Number of periods to look back (default 8 quarters = 2 years)
+            frequency: 'quarterly' or 'annual'
+        
+        Returns:
+            str: Aggregated markdown-formatted past earnings data
+        
+        Example:
+            >>> earnings = get_past_earnings("AAPL", "2024-03-15", lookback_periods=8)
+            >>> # Shows Apple's last 8 quarters of earnings (2 years)
+        """
+        if "fundamentals_details" not in self.provider_map or not self.provider_map["fundamentals_details"]:
+            return "Error: No fundamentals details providers configured"
+        
+        try:
+            end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+            
+            results = []
+            for provider_class in self.provider_map["fundamentals_details"]:
+                try:
+                    provider = self._instantiate_provider(provider_class)
+                    provider_name = provider.__class__.__name__
+                    
+                    logger.debug(f"Fetching past earnings from {provider_name} for {symbol}")
+                    earnings_data = provider.get_past_earnings(
+                        symbol=symbol,
+                        frequency=frequency,
+                        end_date=end_dt,
+                        lookback_periods=lookback_periods,
+                        format_type="markdown"
+                    )
+                    
+                    results.append(f"## Past Earnings from {provider_name.upper()}\n\n{earnings_data}")
+                    
+                except Exception as e:
+                    logger.error(f"Error fetching past earnings from {provider_class.__name__}: {e}")
+                    results.append(f"## {provider_class.__name__} - Error\n\nFailed to fetch past earnings: {str(e)}")
+            
+            return "\n\n---\n\n".join(results) if results else "No past earnings data available"
+            
+        except Exception as e:
+            logger.error(f"Error in get_past_earnings: {e}")
+            return f"Error retrieving past earnings: {str(e)}"
+    
+    def get_earnings_estimates(
+        self,
+        symbol: Annotated[str, "Stock ticker symbol"],
+        as_of_date: Annotated[str, "Date for estimates in YYYY-MM-DD format"],
+        lookback_periods: Annotated[int, "Number of future periods to retrieve (default 4 quarters)"] = 4,
+        frequency: Annotated[str, "Reporting frequency: 'quarterly' or 'annual'"] = "quarterly"
+    ) -> str:
+        """
+        Retrieve forward-looking earnings estimates from analysts.
+        
+        Earnings estimates help assess:
+        - Future growth expectations
+        - Analyst consensus and confidence (tight range = high confidence)
+        - Potential for earnings surprises (compare to actual results later)
+        - Market expectations for the company's performance
+        
+        The number of analysts provides confidence: more analysts = more reliable estimates.
+        A wide range (high - low) suggests uncertainty about future performance.
+        
+        Aggregates data from all configured providers for comprehensive coverage.
+        
+        Args:
+            symbol: Stock ticker symbol
+            as_of_date: Date for estimates in YYYY-MM-DD format
+            lookback_periods: Number of future periods to retrieve (default 4 quarters)
+            frequency: 'quarterly' or 'annual'
+        
+        Returns:
+            str: Aggregated markdown-formatted earnings estimates
+        
+        Example:
+            >>> estimates = get_earnings_estimates("AAPL", "2024-03-15", lookback_periods=4)
+            >>> # Shows next 4 quarters of analyst EPS estimates for Apple
+        """
+        if "fundamentals_details" not in self.provider_map or not self.provider_map["fundamentals_details"]:
+            return "Error: No fundamentals details providers configured"
+        
+        try:
+            as_of_dt = datetime.strptime(as_of_date, "%Y-%m-%d")
+            
+            results = []
+            for provider_class in self.provider_map["fundamentals_details"]:
+                try:
+                    provider = self._instantiate_provider(provider_class)
+                    provider_name = provider.__class__.__name__
+                    
+                    logger.debug(f"Fetching earnings estimates from {provider_name} for {symbol}")
+                    estimates_data = provider.get_earnings_estimates(
+                        symbol=symbol,
+                        frequency=frequency,
+                        as_of_date=as_of_dt,
+                        lookback_periods=lookback_periods,
+                        format_type="markdown"
+                    )
+                    
+                    results.append(f"## Earnings Estimates from {provider_name.upper()}\n\n{estimates_data}")
+                    
+                except Exception as e:
+                    logger.error(f"Error fetching earnings estimates from {provider_class.__name__}: {e}")
+                    results.append(f"## {provider_class.__name__} - Error\n\nFailed to fetch earnings estimates: {str(e)}")
+            
+            return "\n\n---\n\n".join(results) if results else "No earnings estimates available"
+            
+        except Exception as e:
+            logger.error(f"Error in get_earnings_estimates: {e}")
+            return f"Error retrieving earnings estimates: {str(e)}"
     
     # ========================================================================
     # OHLCV PROVIDERS - Fallback logic (try first, then second, etc.)

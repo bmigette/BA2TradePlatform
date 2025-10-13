@@ -2,6 +2,8 @@ from abc import abstractmethod
 from typing import Any, Dict, Optional
 from unittest import result
 from datetime import datetime, timezone
+from threading import Lock
+import time
 from ba2_trade_platform.logger import logger
 from ...core.models import AccountSetting, TradingOrder, Transaction, ExpertRecommendation, ExpertInstance
 from ...core.types import OrderOpenType, OrderDirection, OrderType, OrderStatus, TransactionStatus
@@ -12,6 +14,16 @@ from ...core.db import add_instance, get_instance, update_instance
 class AccountInterface(ExtendableSettingsInterface):
     SETTING_MODEL = AccountSetting
     SETTING_LOOKUP_FIELD = "account_id"
+    
+    # Class-level price cache shared across all instances
+    # Structure: {account_id: {symbol: {'price': float, 'timestamp': datetime, 'fetching': bool}}}
+    _GLOBAL_PRICE_CACHE: Dict[int, Dict[str, Dict[str, Any]]] = {}
+    _CACHE_LOCK = Lock()  # Thread-safe access to cache structure
+    
+    # Per-symbol locks to prevent duplicate API calls for the same symbol
+    # Structure: {(account_id, symbol): Lock}
+    _SYMBOL_LOCKS: Dict[tuple, Lock] = {}
+    _SYMBOL_LOCKS_LOCK = Lock()  # Lock for managing the locks dict itself
     
     """
     Abstract base class for trading account interfaces.
@@ -29,8 +41,10 @@ class AccountInterface(ExtendableSettingsInterface):
             id (int): The unique identifier for the account.
         """
         self.id = id
-        # Instance-level price cache: {symbol: {'price': float, 'timestamp': datetime}}
-        self._price_cache: Dict[str, Dict[str, Any]] = {}
+        # Ensure this account has an entry in the global cache
+        with self._CACHE_LOCK:
+            if self.id not in self._GLOBAL_PRICE_CACHE:
+                self._GLOBAL_PRICE_CACHE[self.id] = {}
 
 
 
@@ -529,13 +543,34 @@ class AccountInterface(ExtendableSettingsInterface):
         """
         pass
     
+    def _get_symbol_lock(self, symbol: str) -> Lock:
+        """
+        Get or create a lock for a specific symbol to prevent duplicate API calls.
+        
+        Args:
+            symbol (str): The asset symbol
+            
+        Returns:
+            Lock: A lock specific to this account and symbol combination
+        """
+        lock_key = (self.id, symbol)
+        
+        with self._SYMBOL_LOCKS_LOCK:
+            if lock_key not in self._SYMBOL_LOCKS:
+                self._SYMBOL_LOCKS[lock_key] = Lock()
+            return self._SYMBOL_LOCKS[lock_key]
+    
     def get_instrument_current_price(self, symbol: str) -> Optional[float]:
         """
         Get the current market price for a given instrument/symbol with caching.
         
-        This method implements a cache with configurable TTL (PRICE_CACHE_TIME in config.py).
-        If a price was fetched recently (within PRICE_CACHE_TIME seconds), the cached value
-        is returned. Otherwise, the implementation method is called to fetch a fresh price.
+        This method implements a thread-safe global cache with configurable TTL (PRICE_CACHE_TIME in config.py).
+        The cache is shared across all instances of the same account and persists between instance creations.
+        
+        **Duplicate API Call Prevention:**
+        Uses per-symbol locks to ensure only ONE thread fetches a price when multiple threads
+        request the same uncached symbol simultaneously. Other threads wait for the first fetch
+        to complete and then use the cached value.
         
         Args:
             symbol (str): The asset symbol to get the price for
@@ -545,32 +580,60 @@ class AccountInterface(ExtendableSettingsInterface):
         """
         from ... import config
         
-        # Check if we have a cached price
-        if symbol in self._price_cache:
-            cached_data = self._price_cache[symbol]
-            cached_time = cached_data['timestamp']
-            current_time = datetime.now(timezone.utc)
-            time_diff = (current_time - cached_time).total_seconds()
+        # Quick cache check (no symbol lock needed for cache hits)
+        with self._CACHE_LOCK:
+            account_cache = self._GLOBAL_PRICE_CACHE.get(self.id, {})
             
-            # If cache is still valid, return cached price
-            if time_diff < config.PRICE_CACHE_TIME:
-                logger.debug(f"Returning cached price for {symbol}: ${cached_data['price']} (age: {time_diff:.1f}s)")
-                return cached_data['price']
+            if symbol in account_cache:
+                cached_data = account_cache[symbol]
+                cached_time = cached_data['timestamp']
+                current_time = datetime.now(timezone.utc)
+                time_diff = (current_time - cached_time).total_seconds()
+                
+                # If cache is still valid, return immediately
+                if time_diff < config.PRICE_CACHE_TIME:
+                    logger.debug(f"[Account {self.id}] Returning cached price for {symbol}: ${cached_data['price']} (age: {time_diff:.1f}s)")
+                    return cached_data['price']
+                else:
+                    logger.debug(f"[Account {self.id}] Cache expired for {symbol} (age: {time_diff:.1f}s > {config.PRICE_CACHE_TIME}s)")
+        
+        # Cache miss or expired - need to fetch
+        # Use per-symbol lock to prevent duplicate API calls
+        symbol_lock = self._get_symbol_lock(symbol)
+        
+        with symbol_lock:
+            # Double-check cache after acquiring lock (another thread may have just fetched it)
+            with self._CACHE_LOCK:
+                account_cache = self._GLOBAL_PRICE_CACHE.get(self.id, {})
+                
+                if symbol in account_cache:
+                    cached_data = account_cache[symbol]
+                    cached_time = cached_data['timestamp']
+                    current_time = datetime.now(timezone.utc)
+                    time_diff = (current_time - cached_time).total_seconds()
+                    
+                    if time_diff < config.PRICE_CACHE_TIME:
+                        logger.debug(f"[Account {self.id}] Another thread cached {symbol} while waiting: ${cached_data['price']} (age: {time_diff:.1f}s)")
+                        return cached_data['price']
+            
+            # Still need to fetch - we hold the symbol lock, so only this thread will fetch
+            logger.debug(f"[Account {self.id}] Fetching fresh price for {symbol} (holding symbol lock)")
+            price = self._get_instrument_current_price_impl(symbol)
+            
+            # Update cache if we got a valid price
+            if price is not None:
+                with self._CACHE_LOCK:
+                    if self.id not in self._GLOBAL_PRICE_CACHE:
+                        self._GLOBAL_PRICE_CACHE[self.id] = {}
+                    self._GLOBAL_PRICE_CACHE[self.id][symbol] = {
+                        'price': price,
+                        'timestamp': datetime.now(timezone.utc)
+                    }
+                    logger.debug(f"[Account {self.id}] Cached new price for {symbol}: ${price}")
             else:
-                logger.debug(f"Cache expired for {symbol} (age: {time_diff:.1f}s > {config.PRICE_CACHE_TIME}s)")
-        
-        # Cache miss or expired - fetch fresh price
-        price = self._get_instrument_current_price_impl(symbol)
-        
-        # Update cache if we got a valid price
-        if price is not None:
-            self._price_cache[symbol] = {
-                'price': price,
-                'timestamp': datetime.now(timezone.utc)
-            }
-            logger.debug(f"Cached new price for {symbol}: ${price}")
-        
-        return price
+                logger.warning(f"[Account {self.id}] Failed to fetch price for {symbol}")
+            
+            return price
 
     @abstractmethod
     def _set_order_tp_impl(self, trading_order: TradingOrder, tp_price: float) -> Any:
