@@ -209,10 +209,10 @@ class ExtendableSettingsInterface(ABC):
         lk_field = type(self).SETTING_LOOKUP_FIELD
         try:
             definitions = type(self).get_merged_settings_definitions()
-            session = get_db()
-            statement = select(setting_model).filter_by(**{lk_field: self.id})
-            results = session.exec(statement)
-            settings_value_from_db = results.all()
+            with get_db() as session:
+                statement = select(setting_model).filter_by(**{lk_field: self.id})
+                results = session.exec(statement)
+                settings_value_from_db = results.all()
             
             # Initialize with definitions (set to None if not found in DB)
             settings = {k : None for k in definitions.keys()}

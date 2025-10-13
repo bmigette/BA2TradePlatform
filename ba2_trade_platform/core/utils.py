@@ -214,7 +214,7 @@ def get_orders_for_expert_and_symbol(expert_instance_id: int, symbol: str = None
         return []
 
 
-def get_account_instance_from_id(account_id: int):
+def get_account_instance_from_id(account_id: int, session=None):
     """
     Get an account instance with the appropriate class instantiated from the database.
     
@@ -226,6 +226,7 @@ def get_account_instance_from_id(account_id: int):
     
     Args:
         account_id (int): The ID of the account definition in the database
+        session (Session, optional): An existing database session to reuse. If not provided, creates a new one.
         
     Returns:
         Optional[AccountInterface]: The instantiated account instance, or None if not found
@@ -235,11 +236,16 @@ def get_account_instance_from_id(account_id: int):
         >>> if account:
         ...     account_info = account.get_account_info()
         ...     orders = account.list_orders()
+        
+        >>> # Better: Reuse existing session in a loop
+        >>> with get_db() as session:
+        ...     for account_id in account_ids:
+        ...         account = get_account_instance_from_id(account_id, session=session)
     """
     from .models import AccountDefinition
     
-    # Get the account definition record from database
-    account_def = get_instance(AccountDefinition, account_id)
+    # Get the account definition record from database (reuse session if provided)
+    account_def = get_instance(AccountDefinition, account_id, session=session)
     if not account_def:
         return None
     

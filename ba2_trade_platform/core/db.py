@@ -348,25 +348,32 @@ def delete_instance(instance, session: Session | None = None):
             logger.error(f"Error deleting instance: {e}", exc_info=True)
             raise
 
-def get_instance(model_class, instance_id):
+def get_instance(model_class, instance_id, session: Session | None = None):
     """
     Retrieve a single instance by model class and primary key ID.
 
     Args:
         model_class: The SQLModel class to query.
         instance_id: The primary key value of the instance.
+        session (Session, optional): An existing SQLModel session. If not provided, a new session is created.
 
     Returns:
         The instance if found, otherwise None.
     """
     try:
-        with Session(engine) as session:
+        if session:
             instance = session.get(model_class, instance_id)
             if not instance:
                 logger.error(f"Instance with id {instance_id}/{model_class} not found.")
                 raise Exception(f"Instance with id {instance_id}/{model_class} not found.")
-            #logger.debug(f"Retrieved instance: {instance}")
             return instance
+        else:
+            with Session(engine) as new_session:
+                instance = new_session.get(model_class, instance_id)
+                if not instance:
+                    logger.error(f"Instance with id {instance_id}/{model_class} not found.")
+                    raise Exception(f"Instance with id {instance_id}/{model_class} not found.")
+                return instance
     except Exception as e:
         logger.error(f"Error retrieving instance: {e}", exc_info=True)
         raise

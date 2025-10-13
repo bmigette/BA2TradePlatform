@@ -64,7 +64,7 @@ class FloatingPLPerExpertWidget:
                     ).first()
                     
                     if first_order and first_order.account_id:
-                        account = get_account_instance_from_id(first_order.account_id)
+                        account = get_account_instance_from_id(first_order.account_id, session=session)
                     
                     # Get current market price
                     current_price = None

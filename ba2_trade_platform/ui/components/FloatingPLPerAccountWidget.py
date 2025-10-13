@@ -65,7 +65,7 @@ class FloatingPLPerAccountWidget:
                     account_name = account_def.name
                     
                     # Get account interface for current price
-                    account = get_account_instance_from_id(first_order.account_id)
+                    account = get_account_instance_from_id(first_order.account_id, session=session)
                     if not account:
                         continue
                     
