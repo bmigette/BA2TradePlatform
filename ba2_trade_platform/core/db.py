@@ -36,10 +36,10 @@ engine = create_engine(
         "check_same_thread": False,
         "timeout": 30.0,  # SQLite busy timeout in seconds
     },
-    pool_size=20,           # Increased from default 5 to 20
-    max_overflow=40,        # Increased from default 10 to 40 (total max connections: 60)
-    pool_timeout=60,        # Increased from default 30 to 60 seconds
-    pool_recycle=3600,      # Recycle connections after 1 hour
+    pool_size=20,           # Reduced from 20 to 10 (fewer idle connections)
+    max_overflow=40,        # Reduced from 40 to 20 (total max connections: 30)
+    pool_timeout=10,        # Reduced from 60 to 10 seconds (fail faster on exhaustion)
+    pool_recycle=600,       # Reduced from 3600 to 600 (10 min - recycle more frequently)
     pool_pre_ping=True,     # Test connections before use
     echo=False              # Disable SQL echo for performance
 )
@@ -160,11 +160,32 @@ def get_db_gen():
 def get_db():
     """
     Returns a new database session. Caller is responsible for closing the session.
+    
+    ⚠️ WARNING: Always close the session when done to prevent connection pool exhaustion!
+    
+    **RECOMMENDED USAGE** (automatically closes session):
+    ```python
+    with get_db() as session:
+        # Use session here
+        results = session.exec(select(Model)).all()
+    # Session automatically closed
+    ```
+    
+    **DISCOURAGED USAGE** (manual close required):
+    ```python
+    session = get_db()
+    try:
+        results = session.exec(select(Model)).all()
+    finally:
+        session.close()  # ⚠️ MUST close manually!
+    ```
 
     Returns:
         Session: An active SQLModel session.
     """
-    return Session(engine)
+    session = Session(engine)
+    logger.debug(f"Database session created (id={id(session)})")
+    return session
 
 @retry_on_lock
 def add_instance(instance, session: Session | None = None, expunge_after_flush: bool = False):

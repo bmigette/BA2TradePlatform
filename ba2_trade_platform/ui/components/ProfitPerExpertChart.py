@@ -27,10 +27,9 @@ class ProfitPerExpertChart:
         Returns:
             Dict mapping expert names to their total profit/loss
         """
-        session = get_db()
         profits = {}
         
-        try:
+        with get_db() as session:
             # Get all closed transactions with expert_id
             closed_transactions = session.exec(
                 select(Transaction)
@@ -74,11 +73,6 @@ class ProfitPerExpertChart:
             profits = dict(sorted(profits.items(), key=lambda x: x[1], reverse=True))
             
             logger.info(f"Calculated profits for {len(profits)} experts")
-            
-        except Exception as e:
-            logger.error(f"Error calculating expert profits: {e}", exc_info=True)
-        finally:
-            session.close()
         
         return profits
     

@@ -83,7 +83,7 @@ class FloatingPLPerAccountWidget:
                     account_pl[account_name] += pl
                     
                 except Exception as e:
-                    logger.error(f"Error calculating P/L for transaction {trans.id}: {e}")
+                    logger.error(f"Error calculating P/L for transaction {trans.id}: {e}", exc_info=True)
                     continue
             
         finally:

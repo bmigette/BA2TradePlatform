@@ -38,10 +38,9 @@ class InstrumentDistributionChart:
         Returns:
             Dict mapping labels/categories to their total market value
         """
-        session = get_db()
         distribution = defaultdict(float)
         
-        try:
+        with get_db() as session:
             logger.debug(f"Processing {len(self.positions)} positions for distribution by {self.grouping_field}")
             
             if not self.positions:
@@ -106,11 +105,6 @@ class InstrumentDistributionChart:
             distribution = dict(sorted(distribution.items(), key=lambda x: x[1], reverse=True))
             
             logger.info(f"Calculated distribution across {len(distribution)} {self.grouping_field}")
-            
-        except Exception as e:
-            logger.error(f"Error calculating position distribution: {e}", exc_info=True)
-        finally:
-            session.close()
         
         return distribution
     

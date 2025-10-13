@@ -36,10 +36,9 @@ class BalanceUsagePerExpertChart:
                 }
             }
         """
-        session = get_db()
         balance_usage = {}
         
-        try:
+        with get_db() as session:
             # Get all transactions with expert_id (both OPENED and WAITING status)
             from ...core.types import TransactionStatus
             
@@ -159,11 +158,6 @@ class BalanceUsagePerExpertChart:
             ))
             
             # logger.info(f"Final result: {len(balance_usage)} experts with active balance usage")
-            
-        except Exception as e:
-            logger.error(f"Error calculating expert balance usage: {e}", exc_info=True)
-        finally:
-            session.close()
         
         return balance_usage
     
@@ -215,8 +209,9 @@ class BalanceUsagePerExpertChart:
                     'trigger': 'axis',
                     'axisPointer': {
                         'type': 'shadow'
-                    },
-                    'formatter': 'function(params) { var total = params[0].value + params[1].value; return params[0].name + "<br/>" + params[0].marker + " " + params[0].seriesName + ": $" + params[0].value.toFixed(2) + "<br/>" + params[1].marker + " " + params[1].seriesName + ": $" + params[1].value.toFixed(2) + "<br/>" + "<b>Total: $" + total.toFixed(2) + "</b>"; }'
+                    }
+                    # Note: Complex tooltip with total calculation would require JavaScript
+                    # Using default tooltip which shows series values separately
                 },
                 'legend': {
                     'data': ['Filled Orders', 'Pending Orders'],
@@ -283,7 +278,7 @@ class BalanceUsagePerExpertChart:
                                 'fontSize': 10,
                                 'fontWeight': 'bold',
                                 'color': '#333',
-                                'formatter': 'function(params) { return "$" + params.value.toFixed(2); }'
+                                'formatter': '${c}'  # ECharts template string: {c} = value
                             },
                             'data': [{'coord': [i, total_per_expert[i]], 'value': total_per_expert[i]} for i in range(len(expert_names))]
                         }
