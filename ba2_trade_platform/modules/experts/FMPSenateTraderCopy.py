@@ -32,13 +32,15 @@ class FMPSenateTraderCopy(MarketExpertInterface):
     """
     FMPSenateTraderCopy Expert Implementation
     
-    Expert that copies trades from specific government officials.
-    When a trade is found from a followed senator/representative within
-    the age criteria, generates immediate BUY/SELL recommendation with
-    100% confidence and 50% expected profit.
+    Expert that copies trades from specific government officials across multiple instruments.
+    Operates in multi-instrument mode: fetches all trades from followed traders and 
+    generates separate ExpertRecommendation records for each symbol they traded.
     
-    This expert can recommend its own instruments and does not expand
-    instrument jobs to avoid duplication.
+    When a trade is found from a followed senator/representative within the age criteria, 
+    generates immediate BUY/SELL recommendation with 100% confidence and 50% expected profit.
+    
+    Does not expand instrument jobs to avoid duplication - processes all instruments 
+    in a single analysis run.
     """
     
     @classmethod
@@ -54,8 +56,11 @@ class FMPSenateTraderCopy(MarketExpertInterface):
             Dict[str, Any]: Dictionary containing expert properties and capabilities
         """
         return {
-            "can_recommend_instruments": True,  # This expert can select its own instruments
+            "can_recommend_instruments": True,  # Reserved for future job expansion functionality
+            "should_expand_instrument_jobs": False,  # Prevent job duplication - expert processes all instruments at once
         }
+    
+
     
     def __init__(self, id: int):
         """Initialize FMPSenateTraderCopy expert with database instance."""
@@ -102,21 +107,15 @@ class FMPSenateTraderCopy(MarketExpertInterface):
                 "description": "Maximum days since trade execution",
                 "tooltip": "Trades executed more than this many days ago will be filtered out. Helps focus on recent trading activity."
             },
-            "should_expand_instrument_jobs": {
-                "type": "bool",
-                "required": False,
-                "default": False,
-                "description": "Expand instrument jobs",
-                "tooltip": "When false, prevents job duplication by running analysis as-is without expanding to additional instruments. Recommended: False for copy trading to avoid excessive API calls."
-            }
+
         }
     
-    def _fetch_senate_trades(self, symbol: str) -> Optional[List[Dict[str, Any]]]:
+    def _fetch_senate_trades(self, symbol: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
         """
-        Fetch senate trades from FMP API for a specific symbol.
+        Fetch senate trades from FMP API for a specific symbol or all trades.
         
         Args:
-            symbol: Stock symbol to query
+            symbol: Optional stock symbol to query. If None, fetches all trades.
             
         Returns:
             List of trade records or None if error
@@ -126,34 +125,49 @@ class FMPSenateTraderCopy(MarketExpertInterface):
             return None
         
         try:
-            url = f"https://financialmodelingprep.com/stable/senate-trades"
-            params = {
-                "symbol": symbol.upper(),
-                "apikey": self._api_key
-            }
+            # Use different endpoints based on whether symbol is provided
+            if symbol:
+                # Use symbol-specific endpoint
+                url = f"https://financialmodelingprep.com/stable/senate-trades"
+                params = {
+                    "apikey": self._api_key,
+                    "symbol": symbol.upper()
+                }
+                logger.debug(f"Fetching FMP senate trades for {symbol}")
+            else:
+                # Use latest disclosures endpoint with pagination for all trades
+                url = f"https://financialmodelingprep.com/stable/senate-latest"
+                params = {
+                    "apikey": self._api_key,
+                    "page": 0,
+                    "limit": 1000  # Maximum allowed per request
+                }
+                logger.debug("Fetching all FMP senate trades (latest disclosures)")
             
-            logger.debug(f"Fetching FMP senate trades for {symbol}")
             response = requests.get(url, params=params, timeout=30)
             response.raise_for_status()
             
             data = response.json()
-            logger.debug(f"Received {len(data) if isinstance(data, list) else 0} senate trade records for {symbol}")
+            symbol_text = f" for {symbol}" if symbol else " (all)"
+            logger.debug(f"Received {len(data) if isinstance(data, list) else 0} senate trade records{symbol_text}")
             
             return data if isinstance(data, list) else []
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to fetch FMP senate trades for {symbol}: {e}", exc_info=True)
+            symbol_text = f" for {symbol}" if symbol else " (all)"
+            logger.error(f"Failed to fetch FMP senate trades{symbol_text}: {e}", exc_info=True)
             return None
         except Exception as e:
-            logger.error(f"Unexpected error fetching senate trades for {symbol}: {e}", exc_info=True)
+            symbol_text = f" for {symbol}" if symbol else " (all)"
+            logger.error(f"Unexpected error fetching senate trades{symbol_text}: {e}", exc_info=True)
             return None
     
-    def _fetch_house_trades(self, symbol: str) -> Optional[List[Dict[str, Any]]]:
+    def _fetch_house_trades(self, symbol: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
         """
-        Fetch house trades from FMP API for a specific symbol.
+        Fetch house trades from FMP API for a specific symbol or all trades.
         
         Args:
-            symbol: Stock symbol to query
+            symbol: Optional stock symbol to query. If None, fetches all trades.
             
         Returns:
             List of trade records or None if error
@@ -163,26 +177,41 @@ class FMPSenateTraderCopy(MarketExpertInterface):
             return None
         
         try:
-            url = f"https://financialmodelingprep.com/stable/house-trades"
-            params = {
-                "symbol": symbol.upper(),
-                "apikey": self._api_key
-            }
+            # Use different endpoints based on whether symbol is provided
+            if symbol:
+                # Use symbol-specific endpoint
+                url = f"https://financialmodelingprep.com/stable/house-trades"
+                params = {
+                    "apikey": self._api_key,
+                    "symbol": symbol.upper()
+                }
+                logger.debug(f"Fetching FMP house trades for {symbol}")
+            else:
+                # Use latest disclosures endpoint with pagination for all trades
+                url = f"https://financialmodelingprep.com/stable/house-latest"
+                params = {
+                    "apikey": self._api_key,
+                    "page": 0,
+                    "limit": 1000  # Maximum allowed per request
+                }
+                logger.debug("Fetching all FMP house trades (latest disclosures)")
             
-            logger.debug(f"Fetching FMP house trades for {symbol}")
             response = requests.get(url, params=params, timeout=30)
             response.raise_for_status()
             
             data = response.json()
-            logger.debug(f"Received {len(data) if isinstance(data, list) else 0} house trade records for {symbol}")
+            symbol_text = f" for {symbol}" if symbol else " (all)"
+            logger.debug(f"Received {len(data) if isinstance(data, list) else 0} house trade records{symbol_text}")
             
             return data if isinstance(data, list) else []
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to fetch FMP house trades for {symbol}: {e}", exc_info=True)
+            symbol_text = f" for {symbol}" if symbol else " (all)"
+            logger.error(f"Failed to fetch FMP house trades{symbol_text}: {e}", exc_info=True)
             return None
         except Exception as e:
-            logger.error(f"Unexpected error fetching house trades for {symbol}: {e}", exc_info=True)
+            symbol_text = f" for {symbol}" if symbol else " (all)"
+            logger.error(f"Unexpected error fetching house trades{symbol_text}: {e}", exc_info=True)
             return None
     
     def _get_current_price(self, symbol: str) -> Optional[float]:
@@ -269,6 +298,66 @@ class FMPSenateTraderCopy(MarketExpertInterface):
                 continue
         
         logger.info(f"Filtered {len(filtered_trades)} trades from {len(trades)} total based on age criteria")
+        return filtered_trades
+    
+    def _filter_trades_by_age_multi(self, trades: List[Dict[str, Any]], 
+                                   max_disclose_days: int, 
+                                   max_exec_days: int) -> List[Dict[str, Any]]:
+        """
+        Filter trades based on age criteria without symbol filtering.
+        
+        Args:
+            trades: List of trade records
+            max_disclose_days: Maximum days since disclosure
+            max_exec_days: Maximum days since execution
+            
+        Returns:
+            Filtered list of trades
+        """
+        now = datetime.now(timezone.utc)
+        filtered_trades = []
+        max_exec_days = int(max_exec_days)
+        max_disclose_days = int(max_disclose_days)
+        
+        for trade in trades:
+            try:
+                # Parse dates
+                disclose_date_str = trade.get('disclosureDate', '')
+                exec_date_str = trade.get('transactionDate', '')
+                
+                trader_name = f"{trade.get('firstName', '')} {trade.get('lastName', '')}".strip() or 'Unknown'
+
+                if not disclose_date_str or not exec_date_str:
+                    logger.debug(f"Trade missing dates, skipping: {trader_name}")
+                    continue
+                
+                # Parse dates (FMP returns YYYY-MM-DD format)
+                disclose_date = datetime.strptime(disclose_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                exec_date = datetime.strptime(exec_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
+                # Check disclose date
+                days_since_disclose = (now - disclose_date).days
+                if days_since_disclose > max_disclose_days:
+                    continue
+                
+                # Check execution date
+                days_since_exec = (now - exec_date).days
+                if days_since_exec > max_exec_days:
+                    continue
+                
+                # Add calculated fields to trade
+                trade['days_since_disclose'] = days_since_disclose
+                trade['days_since_exec'] = days_since_exec
+                trade['disclose_date'] = disclose_date_str
+                trade['exec_date'] = exec_date_str
+                
+                filtered_trades.append(trade)
+                
+            except Exception as e:
+                logger.error(f"Error processing trade: {e}", exc_info=True)
+                continue
+        
+        logger.info(f"Filtered {len(filtered_trades)} trades from {len(trades)} total based on age criteria (multi-symbol)")
         return filtered_trades
     
     def _find_copy_trades(self, filtered_trades: List[Dict[str, Any]], 
@@ -439,7 +528,8 @@ Note: If multiple trades exist for the same instrument, the most recent trade de
             'details': details,
             'trades': trade_details,
             'trade_count': len(symbol_trades),
-            'copy_trades_found': len(copy_trades)
+            'copy_trades_found': len(copy_trades),
+            'trader_name': trader_name  # Primary trader for this recommendation
         }
     
     def _create_expert_recommendation(self, recommendation_data: Dict[str, Any], 
@@ -551,15 +641,106 @@ Note: If multiple trades exist for the same instrument, the most recent trade de
         finally:
             session.close()
     
+    def _store_multi_symbol_analysis_outputs(self, market_analysis_id: int,
+                                           all_trades: List[Dict[str, Any]],
+                                           filtered_trades: List[Dict[str, Any]],
+                                           copy_trades: List[Dict[str, Any]],
+                                           trades_by_symbol: Dict[str, List[Dict[str, Any]]],
+                                           symbol_recommendations: Dict[str, Dict[str, Any]]) -> None:
+        """Store comprehensive analysis outputs for multi-symbol analysis."""
+        session = get_db()
+        
+        try:
+            # Store main analysis summary
+            summary_text = f"""Multi-Instrument Copy Trade Analysis Summary:
+
+Total Trades Found: {len(all_trades)}
+Trades After Age Filter: {len(filtered_trades)}
+Copy Trades Found: {len(copy_trades)}
+Symbols with Copy Trades: {len(trades_by_symbol)}
+
+Symbols Analyzed: {', '.join(sorted(trades_by_symbol.keys()))}
+
+Recommendations Generated:"""
+            
+            for symbol, rec_data in symbol_recommendations.items():
+                summary_text += f"\n- {symbol}: {rec_data['signal']} ({rec_data['confidence']:.1f}% confidence, "
+                summary_text += f"{rec_data['trade_count']} trades)"
+            
+            summary_output = AnalysisOutput(
+                market_analysis_id=market_analysis_id,
+                name="Multi-Symbol Copy Trade Summary",
+                type="multi_symbol_summary",
+                text=summary_text
+            )
+            session.add(summary_output)
+            
+            # Store detailed breakdown by symbol
+            for symbol, symbol_trades in trades_by_symbol.items():
+                symbol_details = {
+                    'symbol': symbol,
+                    'trade_count': len(symbol_trades),
+                    'recommendation': symbol_recommendations.get(symbol, {}),
+                    'trades': symbol_trades
+                }
+                
+                symbol_output = AnalysisOutput(
+                    market_analysis_id=market_analysis_id,
+                    name=f"Copy Trades for {symbol}",
+                    type="symbol_copy_trades",
+                    text=json.dumps(symbol_details, indent=2)
+                )
+                session.add(symbol_output)
+            
+            # Store all raw trades
+            all_trades_output = AnalysisOutput(
+                market_analysis_id=market_analysis_id,
+                name="All Raw Trades",
+                type="all_trades_raw",
+                text=json.dumps(all_trades, indent=2)
+            )
+            session.add(all_trades_output)
+            
+            # Store filtered trades
+            filtered_trades_output = AnalysisOutput(
+                market_analysis_id=market_analysis_id,
+                name="Age-Filtered Trades",
+                type="filtered_trades",
+                text=json.dumps(filtered_trades, indent=2)
+            )
+            session.add(filtered_trades_output)
+            
+            # Store copy trades
+            copy_trades_output = AnalysisOutput(
+                market_analysis_id=market_analysis_id,
+                name="All Copy Trades Found",
+                type="copy_trades",
+                text=json.dumps(copy_trades, indent=2)
+            )
+            session.add(copy_trades_output)
+            
+            session.commit()
+            
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Failed to store multi-symbol analysis outputs: {e}", exc_info=True)
+            raise
+        finally:
+            session.close()
+    
     def run_analysis(self, symbol: str, market_analysis: MarketAnalysis) -> None:
         """
-        Run FMPSenateTraderCopy analysis for a symbol and create ExpertRecommendation.
+        Run FMPSenateTraderCopy analysis across all instruments from followed traders.
+        
+        This expert analyzes per trader, not per symbol. It fetches all trades from 
+        followed traders and creates separate ExpertRecommendation records for each 
+        symbol traded by those traders.
         
         Args:
-            symbol: Financial instrument symbol to analyze
+            symbol: Placeholder symbol (typically "MULTI" for multi-instrument analysis)
             market_analysis: MarketAnalysis instance to update with results
         """
-        logger.info(f"Starting FMPSenateTraderCopy analysis for {symbol} (Analysis ID: {market_analysis.id})")
+        logger.info(f"Starting FMPSenateTraderCopy multi-instrument analysis (Analysis ID: {market_analysis.id})")
         
         try:
             # Update status to running
@@ -579,14 +760,9 @@ Note: If multiple trades exist for the same instrument, the most recent trade de
             max_disclose_days = self.settings.get('max_disclose_date_days', 30)
             max_exec_days = self.settings.get('max_trade_exec_days', 60)
             
-            # Get current price first
-            current_price = self._get_current_price(symbol)
-            if not current_price:
-                raise ValueError(f"Unable to get current price for {symbol}")
-            
-            # Fetch both senate and house trades
-            senate_trades = self._fetch_senate_trades(symbol)
-            house_trades = self._fetch_house_trades(symbol)
+            # Fetch all trades (no symbol filter)
+            senate_trades = self._fetch_senate_trades(symbol=None)
+            house_trades = self._fetch_house_trades(symbol=None)
             
             if senate_trades is None and house_trades is None:
                 raise ValueError("Failed to fetch trades from FMP API (both senate and house failed)")
@@ -599,56 +775,100 @@ Note: If multiple trades exist for the same instrument, the most recent trade de
                 all_trades.extend(house_trades)
             
             logger.info(f"Fetched {len(senate_trades) if senate_trades else 0} senate trades and "
-                       f"{len(house_trades) if house_trades else 0} house trades for {symbol}")
+                       f"{len(house_trades) if house_trades else 0} house trades for all symbols")
             
-            # Filter trades by age
-            filtered_trades = self._filter_trades_by_age(
-                all_trades, max_disclose_days, max_exec_days, symbol
+            # Filter trades by age (no symbol filter)
+            filtered_trades = self._filter_trades_by_age_multi(
+                all_trades, max_disclose_days, max_exec_days
             )
             
             # Find copy trades from followed traders
             copy_trades = self._find_copy_trades(filtered_trades, copy_trade_names)
             
-            # Generate recommendations
-            recommendation_data = self._generate_recommendations(
-                copy_trades, symbol, current_price
-            )
+            # Group copy trades by symbol
+            trades_by_symbol = {}
+            for trade in copy_trades:
+                trade_symbol = trade.get('symbol', '').upper().strip()
+                if trade_symbol:
+                    if trade_symbol not in trades_by_symbol:
+                        trades_by_symbol[trade_symbol] = []
+                    trades_by_symbol[trade_symbol].append(trade)
             
-            # Create ExpertRecommendation record
-            recommendation_id = self._create_expert_recommendation(
-                recommendation_data, symbol, market_analysis.id, current_price
-            )
+            logger.info(f"Found copy trades for {len(trades_by_symbol)} symbols: {sorted(trades_by_symbol.keys())}")
             
-            # Store analysis outputs
-            self._store_analysis_outputs(
-                market_analysis.id, symbol, recommendation_data, 
-                all_trades, filtered_trades, copy_trades
-            )
+            # Create recommendations for each symbol
+            recommendation_ids = []
+            symbol_recommendations = {}
             
-            # Store analysis state
-            market_analysis.state = {
-                'copy_trade': {
-                    'recommendation': {
+            for trade_symbol, symbol_trades in trades_by_symbol.items():
+                try:
+                    # Get current price for this symbol
+                    current_price = self._get_current_price(trade_symbol)
+                    if not current_price:
+                        logger.warning(f"Unable to get current price for {trade_symbol}, using 0.0")
+                        current_price = 0.0
+                    
+                    # Generate recommendations for this symbol
+                    recommendation_data = self._generate_recommendations(
+                        symbol_trades, trade_symbol, current_price
+                    )
+                    
+                    # Create ExpertRecommendation record for this symbol
+                    recommendation_id = self._create_expert_recommendation(
+                        recommendation_data, trade_symbol, market_analysis.id, current_price
+                    )
+                    
+                    recommendation_ids.append(recommendation_id)
+                    symbol_recommendations[trade_symbol] = {
+                        'recommendation_id': recommendation_id,
                         'signal': recommendation_data['signal'].value,
                         'confidence': recommendation_data['confidence'],
                         'expected_profit_percent': recommendation_data['expected_profit_percent'],
-                        'details': recommendation_data['details']
-                    },
+                        'current_price': current_price,
+                        'trade_count': len(symbol_trades),
+                        'trader_name': recommendation_data.get('trader_name', 'Unknown')  # Include trader name
+                    }
+                    
+                    logger.info(f"Created recommendation for {trade_symbol}: {recommendation_data['signal'].value} "
+                               f"({recommendation_data['confidence']:.1f}% confidence)")
+                    
+                except Exception as e:
+                    logger.error(f"Error creating recommendation for {trade_symbol}: {e}", exc_info=True)
+                    # Continue with other symbols
+            
+            # Store comprehensive analysis outputs
+            self._store_multi_symbol_analysis_outputs(
+                market_analysis.id, all_trades, filtered_trades, copy_trades, 
+                trades_by_symbol, symbol_recommendations
+            )
+            
+            # Store analysis state with multi-symbol information
+            # Include trader names per symbol for UI display
+            traders_by_symbol = {}
+            for trade_symbol, recs in symbol_recommendations.items():
+                if recs and 'trader_name' in recs:
+                    traders_by_symbol[trade_symbol] = recs['trader_name']
+            
+            market_analysis.state = {
+                'copy_trade_multi': {
+                    'analysis_type': 'multi_instrument',
+                    'total_symbols': len(trades_by_symbol),
+                    'symbols_analyzed': sorted(trades_by_symbol.keys()),
+                    'symbol_recommendations': symbol_recommendations,
+                    'traders_by_symbol': traders_by_symbol,  # Store trader names for UI
                     'trade_statistics': {
                         'total_trades': len(all_trades),
                         'filtered_trades': len(filtered_trades),
                         'copy_trades_found': len(copy_trades),
-                        'symbol_trades': recommendation_data['trade_count']
+                        'symbols_with_trades': len(trades_by_symbol)
                     },
-                    'trades': recommendation_data['trades'],
                     'settings': {
                         'copy_trade_names': copy_trade_names_setting,
                         'max_disclose_date_days': max_disclose_days,
                         'max_trade_exec_days': max_exec_days
                     },
-                    'expert_recommendation_id': recommendation_id,
-                    'analysis_timestamp': datetime.now(timezone.utc).isoformat(),
-                    'current_price': current_price
+                    'expert_recommendation_ids': recommendation_ids,
+                    'analysis_timestamp': datetime.now(timezone.utc).isoformat()
                 }
             }
             
@@ -751,13 +971,188 @@ Note: If multiple trades exist for the same instrument, the most recent trade de
                 ui.label(f'Error: {error_msg}').classes('text-grey-8')
     
     def _render_completed(self, market_analysis: MarketAnalysis) -> None:
-        """Render completed analysis with detailed UI."""
+        """Render completed multi-symbol analysis with detailed UI."""
         from nicegui import ui
         
+        # Check if this is the new multi-symbol analysis
+        if (market_analysis.state and 'copy_trade_multi' in market_analysis.state):
+            self._render_multi_symbol_completed(market_analysis)
+            return
+        
+        # Legacy single-symbol analysis fallback
         if not market_analysis.state or 'copy_trade' not in market_analysis.state:
             with ui.card().classes('w-full p-4'):
                 ui.label('No analysis data available').classes('text-grey-7')
             return
+        
+        self._render_single_symbol_completed(market_analysis)
+    
+    def _render_multi_symbol_completed(self, market_analysis: MarketAnalysis) -> None:
+        """Render completed multi-symbol analysis."""
+        from nicegui import ui
+        
+        state = market_analysis.state['copy_trade_multi']
+        symbol_recommendations = state.get('symbol_recommendations', {})
+        stats = state.get('trade_statistics', {})
+        settings = state.get('settings', {})
+        symbols_analyzed = state.get('symbols_analyzed', [])
+        
+        # Main card
+        with ui.card().classes('w-full'):
+            # Header
+            with ui.card_section().classes('bg-orange-1'):
+                ui.label('Multi-Instrument Copy Trading Analysis').classes('text-h5 text-weight-bold')
+                ui.label(f'Following Specific Traders Across {len(symbols_analyzed)} Instruments').classes('text-grey-7')
+            
+            # Overall Statistics
+            total_trades = stats.get('total_trades', 0)
+            filtered_trades = stats.get('filtered_trades', 0)
+            copy_trades_found = stats.get('copy_trades_found', 0)
+            symbols_with_trades = stats.get('symbols_with_trades', 0)
+            
+            with ui.card_section().classes('bg-grey-1'):
+                ui.label('Copy Trade Activity Summary').classes('text-subtitle1 text-weight-medium mb-3')
+                
+                with ui.grid(columns=2).classes('w-full gap-4'):
+                    # Total Trades
+                    with ui.card().classes('bg-blue-50'):
+                        ui.label('Total Trades Found').classes('text-caption text-grey-7')
+                        ui.label(str(total_trades)).classes('text-h5 text-blue-700')
+                        ui.label(f'{filtered_trades} after age filter').classes('text-xs text-blue-600')
+                    
+                    # Copy Trades
+                    with ui.card().classes('bg-orange-50'):
+                        ui.label('Copy Trades Found').classes('text-caption text-grey-7')
+                        ui.label(str(copy_trades_found)).classes('text-h5 text-orange-700')
+                        ui.label('from followed traders').classes('text-xs text-orange-600')
+                    
+                    # Symbols
+                    with ui.card().classes('bg-purple-50'):
+                        ui.label('Instruments Analyzed').classes('text-caption text-grey-7')
+                        ui.label(str(symbols_with_trades)).classes('text-h5 text-purple-700')
+                        ui.label('with copy trades').classes('text-xs text-purple-600')
+                    
+                    # Status
+                    status_color = 'green' if copy_trades_found > 0 else 'grey'
+                    with ui.card().classes(f'bg-{status_color}-50'):
+                        ui.label('Copy Trade Status').classes('text-caption text-grey-7')
+                        status_text = 'ACTIVE' if copy_trades_found > 0 else 'NO MATCHES'
+                        ui.label(status_text).classes(f'text-h5 text-{status_color}-700')
+                        ui.label('multi-instrument mode').classes(f'text-xs text-{status_color}-600')
+            
+            # Recommendations by Symbol
+            if symbol_recommendations:
+                with ui.card_section():
+                    ui.label(f'Recommendations Generated ({len(symbol_recommendations)})').classes('text-subtitle1 text-weight-medium mb-3')
+                    
+                    for symbol, rec_data in sorted(symbol_recommendations.items()):
+                        signal = rec_data.get('signal', 'HOLD')
+                        confidence = rec_data.get('confidence', 0.0)
+                        expected_profit = rec_data.get('expected_profit_percent', 0.0)
+                        current_price = rec_data.get('current_price', 0.0)
+                        trade_count = rec_data.get('trade_count', 0)
+                        
+                        # Signal colors
+                        if signal == 'BUY':
+                            signal_color = 'positive'
+                            signal_icon = 'trending_up'
+                            bg_color = 'bg-green-50'
+                        elif signal == 'SELL':
+                            signal_color = 'negative'
+                            signal_icon = 'trending_down'
+                            bg_color = 'bg-red-50'
+                        else:
+                            signal_color = 'grey'
+                            signal_icon = 'trending_flat'
+                            bg_color = 'bg-grey-50'
+                        
+                        with ui.card().classes(f'w-full {bg_color} mb-2'):
+                            with ui.row().classes('w-full items-center justify-between p-2'):
+                                # Symbol and Signal
+                                with ui.column():
+                                    ui.label(symbol).classes('text-h6 text-weight-bold')
+                                    with ui.row().classes('items-center gap-2'):
+                                        ui.icon(signal_icon, color=signal_color, size='1.2rem')
+                                        ui.label(signal).classes(f'text-weight-medium text-{signal_color}')
+                                
+                                # Stats
+                                with ui.column().classes('text-center'):
+                                    ui.label(f'{confidence:.1f}%').classes('text-weight-medium')
+                                    ui.label('Confidence').classes('text-xs text-grey-6')
+                                
+                                with ui.column().classes('text-center'):
+                                    profit_color = 'positive' if expected_profit > 0 else 'negative' if expected_profit < 0 else 'grey'
+                                    ui.label(f'{expected_profit:+.1f}%').classes(f'text-weight-medium text-{profit_color}')
+                                    ui.label('Expected').classes('text-xs text-grey-6')
+                                
+                                with ui.column().classes('text-center'):
+                                    ui.label(f'${current_price:.2f}' if current_price > 0 else 'N/A').classes('text-weight-medium')
+                                    ui.label('Price').classes('text-xs text-grey-6')
+                                
+                                with ui.column().classes('text-center'):
+                                    ui.label(str(trade_count)).classes('text-weight-medium text-orange-600')
+                                    ui.label('Trades').classes('text-xs text-grey-6')
+            
+            # Followed Traders
+            copy_trade_names = settings.get('copy_trade_names', '')
+            if copy_trade_names:
+                with ui.card_section():
+                    ui.label('Followed Traders').classes('text-subtitle1 text-weight-medium mb-2')
+                    ui.label(copy_trade_names).classes('text-sm text-grey-7 bg-grey-2 rounded p-2')
+            
+            # Settings
+            max_disclose = settings.get('max_disclose_date_days', 30)
+            max_exec = settings.get('max_trade_exec_days', 60)
+            
+            with ui.card_section():
+                ui.label('Filter Settings').classes('text-subtitle1 text-weight-medium mb-2')
+                
+                with ui.row().classes('gap-4'):
+                    ui.label(f'Max Disclose Age: {max_disclose} days').classes('text-sm text-grey-7')
+                    ui.label(f'Max Exec Age: {max_exec} days').classes('text-sm text-grey-7')
+            
+            # Methodology
+            with ui.expansion('Multi-Instrument Copy Trading Methodology', icon='info').classes('w-full'):
+                with ui.card_section().classes('bg-grey-1'):
+                    ui.markdown(f'''
+**Multi-Instrument Copy Trading Logic:**
+
+1. **Multi-Symbol Analysis**: Analyzes all trades from followed traders across all instruments
+2. **Per-Symbol Recommendations**: Creates separate recommendations for each instrument traded
+3. **Target Selection**: Follow specific senators/representatives by name
+4. **Age Filtering**: Only consider trades within configured age limits
+5. **Signal Generation**: 
+   - **BUY** if followed trader bought the instrument
+   - **SELL** if followed trader sold the instrument
+   - **HOLD** if no relevant trades found
+6. **Confidence**: Always **100%** for copy trades
+7. **Expected Profit**: Always **50%** (fixed target)
+
+**Multi-Instrument Benefits:**
+- **Comprehensive Coverage**: Captures all trading activity from followed traders
+- **No Symbol Bias**: Doesn't require pre-selecting instruments to analyze
+- **Efficient Processing**: Single API call fetches all trades, multiple recommendations generated
+- **Real-time Discovery**: Automatically finds new instruments being traded
+
+**Age Filtering:**
+- Trades disclosed more than **{max_disclose}** days ago are ignored
+- Trades executed more than **{max_exec}** days ago are ignored
+
+**Followed Traders:**
+```
+{copy_trade_names}
+```
+
+**Expert Properties:**
+- **can_recommend_instruments**: True (selects instruments based on trader activity)
+- **should_expand_instrument_jobs**: False (prevents job duplication)
+
+**Note**: This expert operates in multi-instrument mode, analyzing per trader rather than per symbol. Each qualifying trade generates a separate high-confidence recommendation for that specific instrument.
+                    ''').classes('text-sm')
+    
+    def _render_single_symbol_completed(self, market_analysis: MarketAnalysis) -> None:
+        """Render completed single-symbol analysis (legacy)."""
+        from nicegui import ui
         
         state = market_analysis.state['copy_trade']
         rec = state.get('recommendation', {})
@@ -869,56 +1264,3 @@ Note: If multiple trades exist for the same instrument, the most recent trade de
                                 with ui.column().classes('text-right'):
                                     ui.label('100% Confidence').classes('text-sm text-weight-medium text-positive')
                                     ui.label('Copy Trade').classes('text-xs text-orange-600')
-            
-            # Followed Traders
-            copy_trade_names = settings.get('copy_trade_names', '')
-            if copy_trade_names:
-                with ui.card_section():
-                    ui.label('Followed Traders').classes('text-subtitle1 text-weight-medium mb-2')
-                    ui.label(copy_trade_names).classes('text-sm text-grey-7 bg-grey-2 rounded p-2')
-            
-            # Settings
-            max_disclose = settings.get('max_disclose_date_days', 30)
-            max_exec = settings.get('max_trade_exec_days', 60)
-            
-            with ui.card_section():
-                ui.label('Filter Settings').classes('text-subtitle1 text-weight-medium mb-2')
-                
-                with ui.row().classes('gap-4'):
-                    ui.label(f'Max Disclose Age: {max_disclose} days').classes('text-sm text-grey-7')
-                    ui.label(f'Max Exec Age: {max_exec} days').classes('text-sm text-grey-7')
-            
-            # Methodology
-            with ui.expansion('Copy Trading Methodology', icon='info').classes('w-full'):
-                with ui.card_section().classes('bg-grey-1'):
-                    ui.markdown(f'''
-**Copy Trading Logic:**
-
-1. **Target Selection**: Follow specific senators/representatives by name
-2. **Age Filtering**: Only consider trades within configured age limits
-3. **Signal Generation**: 
-   - **BUY** if followed trader bought the instrument
-   - **SELL** if followed trader sold the instrument
-   - **HOLD** if no relevant trades found
-4. **Confidence**: Always **100%** for copy trades
-5. **Expected Profit**: Always **50%** (fixed target)
-
-**Multiple Trades Handling:**
-- If multiple trades exist for the same instrument, the **most recent trade** determines the signal
-- Only one recommendation per instrument to avoid conflicts
-
-**Age Filtering:**
-- Trades disclosed more than **{max_disclose}** days ago are ignored
-- Trades executed more than **{max_exec}** days ago are ignored
-
-**Followed Traders:**
-```
-{copy_trade_names}
-```
-
-**Expert Properties:**
-- **can_recommend_instruments**: True (can select its own instruments)
-- **should_expand_instrument_jobs**: False (no job duplication)
-
-**Note**: This expert prioritizes simplicity and speed. When a followed trader makes a qualifying trade, it immediately generates a high-confidence recommendation without complex analysis.
-                    ''').classes('text-sm')

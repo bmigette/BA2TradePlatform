@@ -121,7 +121,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             Dict[str, Any]: Dictionary containing expert properties and capabilities
         """
         return {
-            "can_select_instruments": False,  # Default: expert cannot select its own instruments
+            "can_recommend_instruments": False,  # Default: expert cannot recommend its own instruments
         }
     
     @abstractmethod
@@ -157,13 +157,33 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         """
         Get a list of all enabled instruments for this expert instance.
         
+        This method handles three instrument selection methods:
+        - 'static': Returns instruments from enabled_instruments setting
+        - 'dynamic': Returns ['DYNAMIC'] to indicate AI-powered selection
+        - 'expert': Returns ['EXPERT'] to indicate expert-driven selection
+        
         Returns:
-            List[str]: List of enabled instrument symbols/identifiers.
+            List[str]: List of enabled instrument symbols/identifiers, or special symbols ['EXPERT'] or ['DYNAMIC']
         """
         #logger.debug('Getting enabled instruments from settings')
         
         try:
-            # Get enabled instruments from expert settings
+            # Check instrument selection method
+            instrument_selection_method = self.settings.get('instrument_selection_method', 'static')
+            
+            # Get expert properties to check capabilities
+            expert_properties = self.__class__.get_expert_properties()
+            can_recommend_instruments = expert_properties.get('can_recommend_instruments', False)
+            
+            # Handle special instrument selection methods
+            if instrument_selection_method == 'expert' and can_recommend_instruments:
+                # Expert-driven selection - return EXPERT symbol
+                return ["EXPERT"]
+            elif instrument_selection_method == 'dynamic':
+                # Dynamic AI selection - return DYNAMIC symbol
+                return ["DYNAMIC"]
+            
+            # Static method (default) - get from enabled_instruments setting
             enabled_instruments_setting = self.settings.get('enabled_instruments')
             
             if enabled_instruments_setting:
@@ -496,7 +516,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
     def get_recommended_instruments(self) -> Optional[List[str]]:
         """
         Get expert-recommended instruments for analysis.
-        This method is only called if the expert's can_select_instruments property is True
+        This method is only called if the expert's can_recommend_instruments property is True
         and instrument_selection_method is set to "expert".
         
         Returns:

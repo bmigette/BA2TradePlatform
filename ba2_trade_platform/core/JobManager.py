@@ -524,52 +524,33 @@ class JobManager:
             
             # Get expert properties to check capabilities
             expert_properties = expert.__class__.get_expert_properties()
-            can_select_instruments = expert_properties.get('can_select_instruments', False)
+            can_recommend_instruments = expert_properties.get('can_recommend_instruments', False)
             
-            # Check should_expand_instrument_jobs setting for experts that can recommend instruments
-            if can_select_instruments:
-                should_expand = expert.settings.get('should_expand_instrument_jobs', True)  # Default to True for backward compatibility
+            # Check for special instrument selection methods - always create jobs with special symbols
+            if instrument_selection_method == 'expert' and can_recommend_instruments:
+                # Expert-driven selection - create job with EXPERT symbol
+                # At execution time, JobManager will check should_expand_instrument_jobs to decide whether to:
+                # - expand into individual instrument jobs (if True)
+                # - pass EXPERT symbol directly to expert (if False)
+                logger.info(f"Expert {instance_id} uses expert-driven instrument selection - creating EXPERT job")
+                return ["EXPERT"]
+            elif instrument_selection_method == 'dynamic':
+                # Dynamic AI selection - create job with DYNAMIC symbol
+                # At execution time, JobManager will always expand into individual instrument jobs
+                logger.info(f"Expert {instance_id} uses dynamic instrument selection - creating DYNAMIC job")
+                return ["DYNAMIC"]
+            
+            # For static methods, check should_expand_instrument_jobs property
+            if can_recommend_instruments:
+                should_expand = expert_properties.get('should_expand_instrument_jobs', True)  # Default to True for backward compatibility
                 if not should_expand:
-                    logger.info(f"Expert {instance_id} has should_expand_instrument_jobs=False, skipping instrument job expansion")
-                    # Return empty list to avoid creating duplicate jobs
+                    logger.info(f"Expert {instance_id} has should_expand_instrument_jobs=False, skipping static instrument job expansion")
+                    # Return empty list to avoid creating duplicate jobs for static method
                     return []
-            
-            if instrument_selection_method == 'expert' and can_select_instruments:
-                # Expert-driven selection - call expert's get_recommended_instruments method
-                try:
-                    expert_instruments = expert.get_recommended_instruments()
-                    if expert_instruments:
-                        logger.info(f"Expert {instance_id} recommended {len(expert_instruments)} instruments: {expert_instruments}")
-                        
-                        # Auto-add instruments to database if they don't exist
-                        try:
-                            from .InstrumentAutoAdder import get_instrument_auto_adder
-                            auto_adder = get_instrument_auto_adder()
-                            auto_adder.queue_instruments_for_addition(
-                                symbols=expert_instruments,
-                                expert_shortname=expert.shortname,
-                                source='expert'
-                            )
-                        except Exception as e:
-                            logger.warning(f"Could not queue instruments for auto-addition: {e}")
-                        
-                        return expert_instruments
-                    else:
-                        logger.warning(f"Expert {instance_id} returned no instrument recommendations")
-                        return []
-                except Exception as e:
-                    logger.error(f"Error getting expert instrument recommendations for instance {instance_id}: {e}", exc_info=True)
-                    # Fall back to static method on error
-                    logger.warning(f"Falling back to static instrument selection for expert {instance_id}")
             
             # Static method (default) - get from enabled_instruments setting
             enabled_symbols = self._get_expert_setting(instance_id, "enabled_instruments")
             enabled_symbols = list(enabled_symbols.keys()) if enabled_symbols else []
-            
-            if instrument_selection_method == 'dynamic':
-                # Dynamic method requires manual UI selection - no automatic scheduling
-                logger.debug(f"Expert {instance_id} uses dynamic instrument selection - no automatic scheduling")
-                return []
             
             return enabled_symbols
             
@@ -673,6 +654,15 @@ class JobManager:
         try:
             logger.info(f"Executing scheduled analysis: expert={expert_instance_id}, symbol={symbol}, subtype={subtype}")
             
+            # Handle special symbols for dynamic and expert-driven selection
+            if symbol == "DYNAMIC":
+                self._execute_dynamic_analysis(expert_instance_id, subtype)
+                return
+            elif symbol == "EXPERT":
+                self._execute_expert_driven_analysis(expert_instance_id, subtype)
+                return
+            
+            # Regular symbol processing
             # For OPEN_POSITIONS analysis, only proceed if there are actual open transactions for this symbol
             if subtype == AnalysisUseCase.OPEN_POSITIONS:
                 if not self._has_open_transactions_for_symbol(expert_instance_id, symbol):
@@ -697,6 +687,156 @@ class JobManager:
                 logger.error(f"ValueError in scheduled analysis for expert {expert_instance_id}, symbol {symbol}, subtype {subtype}: {e}", exc_info=True)
         except Exception as e:
             logger.error(f"Error executing scheduled analysis for expert {expert_instance_id}, symbol {symbol}, subtype {subtype}: {e}", exc_info=True)
+
+    def _execute_dynamic_analysis(self, expert_instance_id: int, subtype: str):
+        """Execute dynamic AI-driven instrument selection and analysis."""
+        try:
+            logger.info(f"Executing dynamic analysis for expert {expert_instance_id}")
+            
+            from .utils import get_expert_instance_from_id
+            expert = get_expert_instance_from_id(expert_instance_id)
+            if not expert:
+                logger.error(f"Expert instance {expert_instance_id} not found for dynamic analysis")
+                return
+            
+            # Get AI prompt from expert settings
+            ai_prompt = expert.settings.get('ai_instrument_prompt')
+            if not ai_prompt:
+                logger.warning(f"No AI prompt found for expert {expert_instance_id} - using default")
+                ai_prompt = None
+            
+            # Use AI to select instruments
+            from .AIInstrumentSelector import AIInstrumentSelector
+            ai_selector = AIInstrumentSelector()
+            selected_instruments = ai_selector.select_instruments(ai_prompt)
+            
+            if not selected_instruments:
+                logger.warning(f"AI selection returned no instruments for expert {expert_instance_id}")
+                return
+            
+            logger.info(f"AI selected {len(selected_instruments)} instruments for expert {expert_instance_id}: {selected_instruments[:10]}{'...' if len(selected_instruments) > 10 else ''}")
+            
+            # Auto-add instruments to database if they don't exist
+            try:
+                from .InstrumentAutoAdder import get_instrument_auto_adder
+                auto_adder = get_instrument_auto_adder()
+                auto_adder.queue_instruments_for_addition(
+                    symbols=selected_instruments,
+                    expert_shortname=expert.shortname,
+                    source='ai_dynamic'
+                )
+            except Exception as e:
+                logger.warning(f"Could not queue instruments for auto-addition: {e}")
+            
+            # Submit analysis jobs for selected instruments
+            for instrument in selected_instruments:
+                try:
+                    # Check if this is OPEN_POSITIONS and if there are open transactions
+                    if subtype == AnalysisUseCase.OPEN_POSITIONS:
+                        if not self._has_open_transactions_for_symbol(expert_instance_id, instrument):
+                            logger.debug(f"Skipping OPEN_POSITIONS analysis for expert {expert_instance_id}, symbol {instrument}: no open transactions")
+                            continue
+                    
+                    task_id = self.submit_market_analysis(
+                        expert_instance_id=expert_instance_id,
+                        symbol=instrument,
+                        subtype=subtype,
+                        priority=10
+                    )
+                    logger.debug(f"Submitted dynamic analysis for {instrument}: {task_id}")
+                    
+                except Exception as e:
+                    logger.error(f"Error submitting dynamic analysis for {instrument}: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Error in dynamic analysis for expert {expert_instance_id}: {e}", exc_info=True)
+
+    def _execute_expert_driven_analysis(self, expert_instance_id: int, subtype: str):
+        """Execute expert-driven instrument selection and analysis."""
+        try:
+            logger.info(f"Executing expert-driven analysis for expert {expert_instance_id}")
+            
+            from .utils import get_expert_instance_from_id
+            expert = get_expert_instance_from_id(expert_instance_id)
+            if not expert:
+                logger.error(f"Expert instance {expert_instance_id} not found for expert-driven analysis")
+                return
+            
+            # Get expert properties to verify capability and expansion setting
+            expert_properties = expert.__class__.get_expert_properties()
+            can_recommend_instruments = expert_properties.get('can_recommend_instruments', False)
+            should_expand = expert_properties.get('should_expand_instrument_jobs', True)
+            
+            if not can_recommend_instruments:
+                logger.error(f"Expert {expert_instance_id} does not support instrument recommendation")
+                return
+            
+            # Check if we should expand jobs or pass EXPERT symbol directly
+            if not should_expand:
+                # Expert handles EXPERT symbol directly - execute single analysis with EXPERT as symbol
+                logger.info(f"Expert {expert_instance_id} has should_expand_instrument_jobs=False - executing analysis with EXPERT symbol")
+                try:
+                    task_id = self.submit_market_analysis(
+                        expert_instance_id=expert_instance_id,
+                        symbol="EXPERT",
+                        subtype=subtype,
+                        priority=10
+                    )
+                    logger.info(f"Submitted expert-driven analysis with EXPERT symbol: {task_id}")
+                except Exception as e:
+                    logger.error(f"Error submitting expert-driven analysis with EXPERT symbol: {e}")
+                return
+            
+            # should_expand=True: Get recommended instruments and create individual jobs
+            logger.info(f"Expert {expert_instance_id} has should_expand_instrument_jobs=True - expanding into individual instrument jobs")
+            
+            # Call expert's get_recommended_instruments method
+            try:
+                recommended_instruments = expert.get_recommended_instruments() if hasattr(expert, 'get_recommended_instruments') else []
+            except Exception as e:
+                logger.error(f"Error getting expert instrument recommendations: {e}", exc_info=True)
+                return
+            
+            if not recommended_instruments:
+                logger.warning(f"Expert {expert_instance_id} returned no instrument recommendations")
+                return
+            
+            logger.info(f"Expert {expert_instance_id} recommended {len(recommended_instruments)} instruments: {recommended_instruments[:10]}{'...' if len(recommended_instruments) > 10 else ''}")
+            
+            # Auto-add instruments to database if they don't exist
+            try:
+                from .InstrumentAutoAdder import get_instrument_auto_adder
+                auto_adder = get_instrument_auto_adder()
+                auto_adder.queue_instruments_for_addition(
+                    symbols=recommended_instruments,
+                    expert_shortname=expert.shortname,
+                    source='expert_driven'
+                )
+            except Exception as e:
+                logger.warning(f"Could not queue instruments for auto-addition: {e}")
+            
+            # Submit analysis jobs for recommended instruments
+            for instrument in recommended_instruments:
+                try:
+                    # Check if this is OPEN_POSITIONS and if there are open transactions
+                    if subtype == AnalysisUseCase.OPEN_POSITIONS:
+                        if not self._has_open_transactions_for_symbol(expert_instance_id, instrument):
+                            logger.debug(f"Skipping OPEN_POSITIONS analysis for expert {expert_instance_id}, symbol {instrument}: no open transactions")
+                            continue
+                    
+                    task_id = self.submit_market_analysis(
+                        expert_instance_id=expert_instance_id,
+                        symbol=instrument,
+                        subtype=subtype,
+                        priority=10
+                    )
+                    logger.debug(f"Submitted expert-driven analysis for {instrument}: {task_id}")
+                    
+                except Exception as e:
+                    logger.error(f"Error submitting expert-driven analysis for {instrument}: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Error in expert-driven analysis for expert {expert_instance_id}: {e}", exc_info=True)
     
     def _has_open_transactions_for_symbol(self, expert_instance_id: int, symbol: str) -> bool:
         """Check if there are open transactions for a specific expert and symbol."""

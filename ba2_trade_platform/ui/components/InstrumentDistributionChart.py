@@ -187,8 +187,8 @@ class InstrumentDistributionChart:
                 }]
             }
             
-            # Create the chart
-            self.chart = ui.echart(options).classes('w-full h-96')
+            # Create the chart - use w-full for responsive width and h-96 for consistent height
+            self.chart = ui.echart(options).classes('w-full').style('height: 400px; min-height: 400px;')
             
             # Add summary statistics
             with ui.row().classes('w-full justify-between mt-4 text-sm'):

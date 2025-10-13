@@ -206,6 +206,9 @@ class BalanceUsagePerExpertChart:
             total_filled = sum(filled_values)
             total_usage = total_pending + total_filled
             
+            # Calculate total values per expert for top label display
+            total_per_expert = [round(pending_values[i] + filled_values[i], 2) for i in range(len(expert_names))]
+            
             # Create echart options for stacked bar chart
             options = {
                 'tooltip': {
@@ -258,14 +261,17 @@ class BalanceUsagePerExpertChart:
                         'name': 'Pending Orders',
                         'type': 'bar',
                         'stack': 'total',
-                        'data': [round(v, 2) for v in pending_values],
+                        'data': [
+                            {'value': round(pending_values[i], 2), 'total': total_per_expert[i]}
+                            for i in range(len(pending_values))
+                        ],
                         'itemStyle': {
                             'color': '#FF9800'  # Orange for pending
                         },
                         'label': {
                             'show': True,
                             'position': 'top',
-                            'formatter': '${c}',
+                            'formatter': '${@total}',
                             'fontSize': 10
                         }
                     }
@@ -292,7 +298,13 @@ class BalanceUsagePerExpertChart:
                 pending_values = [balance_data[name]['pending'] for name in expert_names]
                 filled_values = [balance_data[name]['filled'] for name in expert_names]
                 
+                # Calculate total values per expert for top label display
+                total_per_expert = [round(pending_values[i] + filled_values[i], 2) for i in range(len(expert_names))]
+                
                 self.chart.options['xAxis']['data'] = expert_names
                 self.chart.options['series'][0]['data'] = [round(v, 2) for v in filled_values]
-                self.chart.options['series'][1]['data'] = [round(v, 2) for v in pending_values]
+                self.chart.options['series'][1]['data'] = [
+                    {'value': round(pending_values[i], 2), 'total': total_per_expert[i]}
+                    for i in range(len(pending_values))
+                ]
                 self.chart.update()

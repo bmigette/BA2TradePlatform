@@ -6,8 +6,9 @@ import json
 from typing import List, Optional
 from openai import OpenAI
 from ..logger import logger
-from .db import get_instance
+from .db import get_instance, get_db
 from .models import AppSetting
+from .. import config
 
 
 class AIInstrumentSelector:
@@ -25,16 +26,25 @@ class AIInstrumentSelector:
         """Initialize OpenAI client with API key from database settings."""
         try:
             # Get OpenAI API key from database
-            openai_key_setting = get_instance(AppSetting, "openai_api_key")
-            if not openai_key_setting or not openai_key_setting.value:
-                logger.error("OpenAI API key not found in settings. Please configure it in the settings page.")
+            from sqlmodel import select
+            session = get_db()
+            openai_key_setting = session.exec(select(AppSetting).where(AppSetting.key == 'openai_api_key')).first()
+            session.close()
+            
+            if not openai_key_setting or not openai_key_setting.value_str:
+                # API key not configured - this is expected in some cases
+                logger.debug("OpenAI API key not found in settings. AI selection will not be available.")
                 return
 
-            self.client = OpenAI(api_key=openai_key_setting.value)
-            logger.debug("OpenAI client initialized successfully")
+            self.client = OpenAI(api_key=openai_key_setting.value_str)
+            logger.debug(f"OpenAI client initialized successfully with model: {config.OPENAI_MODEL}")
 
         except Exception as e:
-            logger.error(f"Failed to initialize OpenAI client: {e}", exc_info=True)
+            # Check if this is just a missing API key (expected) vs other errors (unexpected)
+            if "openai_api_key" in str(e) and "not found" in str(e):
+                logger.debug("OpenAI API key not configured - AI selection will be unavailable")
+            else:
+                logger.error(f"Failed to initialize OpenAI client: {e}")
             self.client = None
 
     def get_default_prompt(self) -> str:
@@ -44,19 +54,21 @@ class AIInstrumentSelector:
         Returns:
             str: Default prompt for financial instrument selection
         """
-        return """You are a financial advisor specializing in stock analysis. Search recent news on the web and give me a list of 20 symbols that you think have medium risk and high profit potential.
+        return """You are a financial advisor specializing in stock analysis. Give me a list of 20 stock symbols that have medium risk and high profit potential.
 
-Please follow these guidelines:
+REQUIREMENTS:
 - Focus on well-established companies with good liquidity
-- Consider recent market trends and news developments
+- Consider recent market trends and developments  
 - Include a mix of different sectors for diversification
 - Prioritize stocks with medium risk profiles (avoid penny stocks and highly volatile assets)
 - Look for companies with strong fundamentals and growth potential
 
-Return your response as a JSON array of stock symbols only, like this:
-["AAPL", "GOOGL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "NFLX", "AMD", "CRM"]
+CRITICAL: You MUST respond with ONLY a valid JSON array of stock symbols. Do not include any explanations, commentary, or additional text.
 
-Do not include any explanations or additional text - just the JSON array of symbols."""
+EXAMPLE FORMAT (respond exactly like this):
+["AAPL", "GOOGL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "NFLX", "AMD", "CRM", "JPM", "JNJ", "PG", "KO", "DIS", "V", "MA", "UNH", "HD", "PFE"]
+
+Your response:"""
 
     def select_instruments(self, prompt: Optional[str] = None) -> Optional[List[str]]:
         """
@@ -70,20 +82,22 @@ Do not include any explanations or additional text - just the JSON array of symb
             Optional[List[str]]: List of selected instrument symbols, or None if failed
         """
         if not self.client:
-            logger.error("OpenAI client not initialized. Cannot select instruments.")
-            return None
+            raise Exception("OpenAI API key not configured. Please set up your OpenAI API key in the application settings.")
 
         try:
             # Use provided prompt or default
             selection_prompt = prompt if prompt else self.get_default_prompt()
             
-            logger.info("Requesting AI instrument selection...")
+            logger.info(f"Requesting AI instrument selection using model: {config.OPENAI_MODEL}")
             logger.debug(f"Using prompt: {selection_prompt[:200]}...")
 
-            # Make request to OpenAI
-            response = self.client.chat.completions.create(
-                model="gpt-4",
-                messages=[
+            # Make request to OpenAI using configured model
+            # Use appropriate parameters based on model
+            is_gpt5 = "gpt-5" in config.OPENAI_MODEL.lower()
+            
+            request_params = {
+                "model": config.OPENAI_MODEL,
+                "messages": [
                     {
                         "role": "system",
                         "content": "You are a professional financial advisor with expertise in stock market analysis and portfolio construction."
@@ -92,18 +106,47 @@ Do not include any explanations or additional text - just the JSON array of symb
                         "role": "user", 
                         "content": selection_prompt
                     }
-                ],
-                temperature=0.7,
-                max_tokens=1000
-            )
+                ]
+            }
+            
+            # Add model-specific parameters
+            if is_gpt5:
+                # GPT-5 only supports default temperature (1) and uses max_completion_tokens
+                request_params["max_completion_tokens"] = 50000
+                # Don't set temperature for GPT-5 (uses default 1)
+            else:
+                # Other models support custom temperature and use max_tokens
+                request_params["temperature"] = 0.3
+                request_params["max_tokens"] = 50000
+            
+            response = self.client.chat.completions.create(**request_params)
 
             # Extract response content
-            response_content = response.choices[0].message.content.strip()
+            response_content = response.choices[0].message.content
+            if not response_content:
+                logger.error("AI returned empty response")
+                return None
+                
+            response_content = response_content.strip()
             logger.debug(f"AI response: {response_content}")
+
+            # Check for empty response after stripping
+            if not response_content:
+                logger.error("AI returned empty response after stripping whitespace")
+                return None
 
             # Parse JSON response
             try:
-                instruments = json.loads(response_content)
+                # Handle markdown-wrapped JSON responses
+                json_content = response_content
+                if response_content.startswith("```json") and response_content.endswith("```"):
+                    # Extract JSON from markdown code block
+                    json_content = response_content[7:-3].strip()
+                elif response_content.startswith("```") and response_content.endswith("```"):
+                    # Extract from generic code block
+                    json_content = response_content[3:-3].strip()
+                
+                instruments = json.loads(json_content)
                 
                 # Validate response format
                 if not isinstance(instruments, list):
@@ -138,7 +181,55 @@ Do not include any explanations or additional text - just the JSON array of symb
                 return self._extract_symbols_from_text(response_content)
 
         except Exception as e:
-            logger.error(f"Error during AI instrument selection: {e}", exc_info=True)
+            logger.error(f"Error during AI instrument selection with {config.OPENAI_MODEL}: {e}")
+            
+            # Try fallback model if primary model fails and it's not already the fallback
+            if hasattr(config, 'OPENAI_FALLBACK_MODEL') and config.OPENAI_MODEL != config.OPENAI_FALLBACK_MODEL:
+                logger.info(f"Trying fallback model: {config.OPENAI_FALLBACK_MODEL}")
+                try:
+                    fallback_params = {
+                        "model": config.OPENAI_FALLBACK_MODEL,
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": "You are a professional financial advisor with expertise in stock market analysis and portfolio construction."
+                            },
+                            {
+                                "role": "user", 
+                                "content": selection_prompt
+                            }
+                        ],
+                        "temperature": 0.3,
+                        "max_tokens": 1000
+                    }
+                    
+                    fallback_response = self.client.chat.completions.create(**fallback_params)
+                    response_content = fallback_response.choices[0].message.content
+                    
+                    if response_content:
+                        response_content = response_content.strip()
+                        logger.debug(f"Fallback AI response: {response_content}")
+                        
+                        try:
+                            instruments = json.loads(response_content)
+                            if isinstance(instruments, list):
+                                valid_instruments = []
+                                for item in instruments:
+                                    if isinstance(item, str) and len(item) > 0:
+                                        symbol = item.strip().upper()
+                                        if symbol.isalpha() and len(symbol) <= 10:
+                                            valid_instruments.append(symbol)
+                                
+                                if valid_instruments:
+                                    logger.info(f"Fallback model selected {len(valid_instruments)} instruments: {valid_instruments}")
+                                    return valid_instruments
+                        except json.JSONDecodeError:
+                            logger.warning("Fallback model also returned invalid JSON, trying text extraction")
+                            return self._extract_symbols_from_text(response_content)
+                            
+                except Exception as fallback_e:
+                    logger.error(f"Fallback model also failed: {fallback_e}")
+            
             return None
 
     def _extract_symbols_from_text(self, text: str) -> Optional[List[str]]:
@@ -220,11 +311,23 @@ Do not include any explanations or additional text - just the JSON array of symb
             return False
             
         try:
-            response = self.client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": "Hello"}],
-                max_tokens=10
-            )
+            # Use appropriate parameters based on model
+            is_gpt5 = "gpt-5" in config.OPENAI_MODEL.lower()
+            
+            request_params = {
+                "model": config.OPENAI_MODEL,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }
+            
+            # Add model-specific parameters
+            if is_gpt5:
+                request_params["max_completion_tokens"] = 10
+                # Don't set temperature for GPT-5
+            else:
+                request_params["max_tokens"] = 10
+                request_params["temperature"] = 0.3
+            
+            response = self.client.chat.completions.create(**request_params)
             return True
         except Exception as e:
             logger.error(f"OpenAI connection test failed: {e}")

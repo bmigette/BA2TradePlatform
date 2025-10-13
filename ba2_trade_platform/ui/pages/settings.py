@@ -803,10 +803,45 @@ class AccountDefinitionsTab:
         account_id = row['id']
         account = get_instance(AccountDefinition, account_id)
         if account:
-            self.delete_account(account)
+            self._show_delete_confirmation_dialog(account)
         else:
             ui.notify("Account not found", type="error")
             logger.warning(f"Account with id {account_id} not found")
+
+    def _show_delete_confirmation_dialog(self, account: AccountDefinition) -> None:
+        """Show confirmation dialog before deleting an account."""
+        logger.debug(f'Showing delete confirmation dialog for account: {account.name}')
+        
+        def confirm_delete():
+            logger.info(f'User confirmed deletion of account: {account.name}')
+            self.delete_account(account)
+            confirmation_dialog.close()
+        
+        def cancel_delete():
+            logger.debug(f'User cancelled deletion of account: {account.name}')
+            confirmation_dialog.close()
+        
+        # Create the confirmation dialog
+        confirmation_dialog = ui.dialog()
+        with confirmation_dialog:
+            with ui.card().classes('w-full max-w-md'):
+                with ui.row().classes('w-full items-center mb-4'):
+                    ui.icon('warning', size='lg').classes('text-orange-600 mr-3')
+                    ui.label('Delete Account').classes('text-h6 text-gray-800')
+                
+                ui.label(f'Are you sure you want to delete the account "{account.name}" ({account.provider})?').classes('text-body1 mb-2')
+                ui.label('This action cannot be undone and will permanently remove:').classes('text-body2 text-gray-600 mb-2')
+                
+                with ui.column().classes('ml-4 mb-4'):
+                    ui.label('• All account settings and credentials').classes('text-body2 text-gray-600')
+                    ui.label('• Associated trading configurations').classes('text-body2 text-gray-600')
+                    ui.label('• Connection to trading platform').classes('text-body2 text-gray-600')
+                
+                with ui.row().classes('w-full justify-end gap-2 mt-4'):
+                    ui.button('Cancel', on_click=cancel_delete).props('flat').classes('text-gray-600')
+                    ui.button('Delete Account', on_click=confirm_delete).props('color=negative')
+        
+        confirmation_dialog.open()
 
     def account_settings(self) -> None:
         logger.debug('Loading account settings')
@@ -1117,7 +1152,8 @@ class ExpertSettingsTab:
                         self.instrument_selection_method_select = ui.select(
                             options=["static", "dynamic", "expert"],
                             label='Instrument Selection Method',
-                            value="static"
+                            value="static",
+                            on_change=self._on_instrument_selection_method_change
                         ).classes('flex-1').tooltip(
                             "How instruments are selected: Static (manual selection), Dynamic (AI prompt), Expert (expert-driven selection)"
                         )
@@ -1155,8 +1191,9 @@ class ExpertSettingsTab:
                 self.expert_select.on('update:model-value', 
                                     lambda e: self._on_expert_type_change_dialog(e, expert_instance))
                 
-                # Set initial description
+                # Set initial description and instrument selection options
                 self._update_expert_description()
+                self._update_instrument_selection_options()
                 
                 # Tabs for different settings sections
                 with ui.tabs() as settings_tabs:
@@ -1325,15 +1362,11 @@ class ExpertSettingsTab:
                     with ui.tab_panel('Instruments'):
                         ui.label('Select and configure instruments for this expert:').classes('text-subtitle1 mb-4')
                         
-                        # Create instrument selector
-                        self.instrument_selector = InstrumentSelector(
-                            on_selection_change=self._on_instrument_selection_change
-                        )
-                        self.instrument_selector.render()
+                        # Container for dynamic instrument UI content
+                        self.instruments_content_container = ui.column().classes('w-full')
                         
-                        # Load current instrument configuration if editing
-                        if is_edit:
-                            self._load_expert_instrument_config(expert_instance)
+                        # Initialize with static content
+                        self._render_instrument_content(expert_instance, is_edit)
                     
                     # Expert-specific settings tab  
                     with ui.tab_panel('Expert Settings'):
@@ -1895,7 +1928,195 @@ class ExpertSettingsTab:
         """Handle expert type change in the dialog."""
         logger.debug(f'Expert type changed in dialog to: {event.value if hasattr(event, "value") else event}')
         self._update_expert_description()
+        self._update_instrument_selection_options()
         self._render_expert_settings(expert_instance)
+    
+    def _update_instrument_selection_options(self):
+        """Update instrument selection method options based on selected expert's capabilities."""
+        if not hasattr(self, 'instrument_selection_method_select'):
+            return
+            
+        expert_type = self.expert_select.value if hasattr(self, 'expert_select') else None
+        if not expert_type:
+            return
+            
+        expert_class = self._get_expert_class(expert_type)
+        if not expert_class:
+            return
+            
+        try:
+            # Get expert properties to check capabilities
+            expert_properties = expert_class.get_expert_properties()
+            can_recommend_instruments = expert_properties.get('can_recommend_instruments', False)
+            
+            # Base options
+            options = ["static", "dynamic"]
+            
+            # Add "expert" option only if the expert can recommend instruments
+            if can_recommend_instruments:
+                options.append("expert")
+            
+            # Update the select options
+            current_value = self.instrument_selection_method_select.value
+            self.instrument_selection_method_select.options = options
+            
+            # Reset value if current value is no longer valid
+            if current_value not in options:
+                self.instrument_selection_method_select.value = "static"
+                
+            logger.debug(f'Updated instrument selection options for {expert_type}: {options}')
+            
+        except Exception as e:
+            logger.debug(f'Could not update instrument selection options: {e}')
+
+    def _on_instrument_selection_method_change(self, event):
+        """Handle instrument selection method change."""
+        try:
+            selection_method = event.value if hasattr(event, 'value') else event
+            logger.debug(f'Instrument selection method changed to: {selection_method}')
+            
+            # Update instruments tab content
+            if hasattr(self, 'instruments_content_container'):
+                self._render_instrument_content(None, False)
+                
+        except Exception as e:
+            logger.error(f'Error handling instrument selection method change: {e}', exc_info=True)
+
+    def _render_instrument_content(self, expert_instance, is_edit):
+        """Render instrument tab content based on current selection method."""
+        if not hasattr(self, 'instruments_content_container'):
+            return
+        
+        # Clear current content
+        self.instruments_content_container.clear()
+        
+        # Get current selection method
+        selection_method = getattr(self.instrument_selection_method_select, 'value', 'static')
+        
+        # Get expert properties to check capabilities
+        expert_type = getattr(self.expert_select, 'value', None) if hasattr(self, 'expert_select') else None
+        can_recommend_instruments = False
+        if expert_type:
+            expert_class = self._get_expert_class(expert_type)
+            if expert_class:
+                expert_properties = expert_class.get_expert_properties()
+                can_recommend_instruments = expert_properties.get('can_recommend_instruments', False)
+        
+        with self.instruments_content_container:
+            if selection_method == 'expert':
+                if can_recommend_instruments:
+                    # Expert will select instruments - show message
+                    with ui.card().classes('w-full p-4 bg-blue-50 border-l-4 border-blue-400'):
+                        with ui.row():
+                            ui.icon('auto_awesome').classes('text-blue-600 text-xl mr-3')
+                            with ui.column():
+                                ui.label('Expert-Driven Instrument Selection').classes('text-lg font-semibold text-blue-800')
+                                ui.label('This expert will automatically select the instruments for analysis. No manual selection required.').classes('text-blue-600')
+                    self.instrument_selector = None  # No manual selector needed
+                else:
+                    # Expert doesn't support instrument selection - fall back to static
+                    with ui.card().classes('w-full p-4 bg-orange-50 border-l-4 border-orange-400'):
+                        with ui.row():
+                            ui.icon('warning').classes('text-orange-600 text-xl mr-3')
+                            with ui.column():
+                                ui.label('Expert Selection Not Supported').classes('text-lg font-semibold text-orange-800')
+                                ui.label('This expert does not support automatic instrument selection. Using manual selection instead.').classes('text-orange-600')
+                    self._render_static_instrument_selector(expert_instance, is_edit)
+                    
+            elif selection_method == 'dynamic':
+                # AI-driven dynamic selection - show prompt input
+                with ui.card().classes('w-full p-4 bg-green-50 border-l-4 border-green-400'):
+                    with ui.row():
+                        ui.icon('psychology').classes('text-green-600 text-xl mr-3')
+                        with ui.column():
+                            ui.label('AI-Powered Dynamic Instrument Selection').classes('text-lg font-semibold text-green-800')
+                            ui.label('Enter a prompt to let AI select instruments based on your criteria.').classes('text-green-600')
+
+                with ui.column().classes('w-full mt-4'):
+                    ui.label('AI Selection Prompt:').classes('text-sm font-medium mb-2')
+                    
+                    # Get default prompt from AIInstrumentSelector
+                    from ...core.AIInstrumentSelector import AIInstrumentSelector
+                    ai_selector = AIInstrumentSelector()
+                    default_prompt = ai_selector.get_default_prompt()
+                    
+                    self.ai_prompt_textarea = ui.textarea(
+                        value=default_prompt,
+                        placeholder='Enter your prompt for AI instrument selection...'
+                    ).classes('w-full').props('rows=6')
+                    
+                    with ui.row().classes('w-full justify-between mt-2'):
+                        ui.button('Reset to Default', on_click=lambda: self.ai_prompt_textarea.set_value(default_prompt), icon='refresh').classes('bg-gray-500')
+                        ui.button('Test AI Selection', on_click=self._test_ai_selection, icon='auto_awesome').classes('bg-green-600')
+
+                self.instrument_selector = None  # Will be created after AI selection
+                
+            else:  # static (default)
+                self._render_static_instrument_selector(expert_instance, is_edit)
+
+    def _render_static_instrument_selector(self, expert_instance, is_edit):
+        """Render the traditional static instrument selector."""
+        self.instrument_selector = InstrumentSelector(
+            on_selection_change=self._on_instrument_selection_change
+        )
+        self.instrument_selector.render()
+        
+        # Load current instrument configuration if editing
+        if is_edit and expert_instance:
+            self._load_expert_instrument_config(expert_instance)
+
+    def _test_ai_selection(self):
+        """Test AI instrument selection with current prompt."""
+        try:
+            prompt = self.ai_prompt_textarea.value
+            if not prompt.strip():
+                ui.notify('Please enter a prompt for AI selection', type='warning')
+                return
+            
+            # Show loading notification
+            with ui.dialog() as test_dialog, ui.card():
+                ui.label('Testing AI Selection...').classes('text-lg font-semibold mb-4')
+                ui.spinner(size='lg')
+                ui.label('This may take a few seconds...').classes('text-sm text-gray-600')
+            
+            test_dialog.open()
+            
+            from ...core.AIInstrumentSelector import AIInstrumentSelector
+            ai_selector = AIInstrumentSelector()
+            
+            # Use a simple synchronous approach since OpenAI requests are typically fast
+            # and we handle the "not found" case gracefully
+            try:
+                result = ai_selector.select_instruments(prompt)
+                test_dialog.close()
+                
+                if result:
+                    with ui.dialog() as result_dialog, ui.card().classes('w-96'):
+                        ui.label('AI Selection Results').classes('text-lg font-semibold mb-4')
+                        ui.label(f'Selected {len(result)} instruments:').classes('mb-2')
+                        
+                        # Show results in a scrollable area
+                        with ui.scroll_area().classes('h-48 w-full'):
+                            for symbol in result:
+                                ui.chip(symbol, color='green')
+                        
+                        with ui.row().classes('w-full justify-end mt-4'):
+                            ui.button('Close', on_click=result_dialog.close)
+                    result_dialog.open()
+                else:
+                    ui.notify('AI selection failed. Please check your OpenAI API key configuration.', type='warning')
+                    
+            except Exception as ai_error:
+                test_dialog.close()
+                logger.error(f'AI selection test failed: {ai_error}')
+                if "openai_api_key" in str(ai_error):
+                    ui.notify('OpenAI API key not configured. Please set up your API key in the application settings.', type='warning')
+                else:
+                    ui.notify(f'AI selection test failed: {str(ai_error)}', type='negative')
+            
+        except Exception as e:
+            logger.error(f'Error testing AI selection: {e}', exc_info=True)
+            ui.notify(f'Error testing AI selection: {str(e)}', type='negative')
     
     def _render_expert_settings(self, expert_instance=None):
         """Render expert-specific settings based on the selected expert type."""
@@ -2333,11 +2554,25 @@ class ExpertSettingsTab:
             # Save expert-specific settings
             self._save_expert_settings(expert_id)
             
-            # Check if any instruments are enabled
+            # Check if instruments are properly configured based on selection method
+            selection_method = getattr(self.instrument_selection_method_select, 'value', 'static')
             has_instruments = False
-            if self.instrument_selector:
-                selected_instruments = self.instrument_selector.get_selected_instruments()
-                has_instruments = len(selected_instruments) > 0
+            
+            if selection_method == 'static':
+                # Static method - check if instruments are selected
+                if self.instrument_selector:
+                    selected_instruments = self.instrument_selector.get_selected_instruments()
+                    has_instruments = len(selected_instruments) > 0
+            elif selection_method == 'dynamic':
+                # Dynamic method - instruments are selected by AI, always considered configured
+                has_instruments = True
+            elif selection_method == 'expert':
+                # Expert method - instruments are selected by expert logic, always considered configured
+                expert_class = self._get_expert_class(self.expert_select.value)
+                if expert_class:
+                    expert_properties = expert_class.get_expert_properties()
+                    can_recommend = expert_properties.get('can_recommend_instruments', False)
+                    has_instruments = can_recommend
             
             # Save instrument configuration
             self._save_instrument_configuration(expert_id)
@@ -2428,26 +2663,47 @@ class ExpertSettingsTab:
     
     def _save_instrument_configuration(self, expert_id):
         """Save instrument selection and configuration."""
-        if not self.instrument_selector:
-            return
-        
-        selected_instruments = self.instrument_selector.get_selected_instruments()
-        
-        # Convert to format expected by expert
-        instrument_configs = {}
-        for inst in selected_instruments:
-            instrument_configs[inst['name']] = {
-                'enabled': True,
-                'weight': inst['weight']
-            }
-        
-        # Get expert and save configuration
         expert_class = self._get_expert_class(self.expert_select.value)
-        if expert_class:
-            expert = expert_class(expert_id)
-            expert.set_enabled_instruments(instrument_configs)
+        if not expert_class:
+            return
             
-        logger.debug(f'Saved instrument configuration for expert {expert_id}: {len(instrument_configs)} instruments')
+        expert = expert_class(expert_id)
+        selection_method = getattr(self.instrument_selection_method_select, 'value', 'static')
+        
+        if selection_method == 'dynamic':
+            # Save AI prompt for dynamic selection
+            if hasattr(self, 'ai_prompt_textarea'):
+                ai_prompt = self.ai_prompt_textarea.value
+                expert.save_setting('ai_instrument_prompt', ai_prompt, setting_type="str")
+                logger.debug(f'Saved AI instrument prompt for expert {expert_id}')
+            
+            # For dynamic selection, we don't save static instrument configuration
+            # The instruments will be selected dynamically when creating jobs
+            return
+            
+        elif selection_method == 'expert':
+            # For expert-driven selection, no instrument configuration needed
+            # The expert will determine instruments automatically
+            logger.debug(f'Expert {expert_id} uses expert-driven instrument selection - no static configuration saved')
+            return
+            
+        else:  # static
+            # Traditional static instrument selection
+            if not self.instrument_selector:
+                return
+            
+            selected_instruments = self.instrument_selector.get_selected_instruments()
+            
+            # Convert to format expected by expert
+            instrument_configs = {}
+            for inst in selected_instruments:
+                instrument_configs[inst['name']] = {
+                    'enabled': True,
+                    'weight': inst['weight']
+                }
+            
+            expert.set_enabled_instruments(instrument_configs)
+            logger.debug(f'Saved instrument configuration for expert {expert_id}: {len(instrument_configs)} instruments')
     
     def _on_table_edit_click(self, msg):
         """Handle edit button click from table."""
@@ -2467,19 +2723,63 @@ class ExpertSettingsTab:
         row = msg.args['row']
         expert_id = row['id']
         expert_instance = get_instance(ExpertInstance, expert_id)
+        
         if expert_instance:
-            try:
-                logger.debug(f'Deleting expert instance {expert_id}')
-                delete_instance(expert_instance)
-                logger.info(f'Expert instance {expert_id} deleted')
-                ui.notify('Expert instance deleted', type='positive')
-                self._update_table_rows()
-            except Exception as e:
-                logger.error(f'Error deleting expert instance {expert_id}: {e}', exc_info=True)
-                ui.notify(f'Error deleting expert instance: {e}', type='negative')
+            # Show confirmation dialog before deletion
+            self._show_delete_confirmation(expert_instance, row)
         else:
             logger.warning(f'Expert instance with id {expert_id} not found')
             ui.notify('Expert instance not found', type='error')
+    
+    def _show_delete_confirmation(self, expert_instance, row):
+        """Show confirmation dialog before deleting expert."""
+        expert_name = expert_instance.expert
+        expert_alias = expert_instance.alias or "No alias"
+        expert_id = expert_instance.id
+        
+        with ui.dialog() as delete_dialog, ui.card().classes('w-96'):
+            with ui.row().classes('items-center mb-4'):
+                ui.icon('warning', size='2rem', color='orange')
+                ui.label('Confirm Expert Deletion').classes('text-h6 ml-2')
+            
+            ui.label('Are you sure you want to delete this expert?').classes('text-body1 mb-2')
+            
+            # Show expert details
+            with ui.card().classes('w-full bg-grey-1 mb-4'):
+                ui.label(f'Expert Type: {expert_name}').classes('text-weight-medium')
+                ui.label(f'Alias: {expert_alias}').classes('text-grey-7')
+                ui.label(f'ID: {expert_id}').classes('text-grey-7')
+                if expert_instance.enabled:
+                    ui.label('Status: Enabled').classes('text-positive')
+                else:
+                    ui.label('Status: Disabled').classes('text-grey-7')
+            
+            ui.label('⚠️ This action cannot be undone. All expert settings, analysis history, and recommendations will be permanently deleted.').classes('text-negative text-body2 mb-4')
+            
+            with ui.row().classes('w-full justify-end gap-2'):
+                ui.button('Cancel', on_click=delete_dialog.close).props('flat')
+                ui.button('Delete Expert', 
+                         on_click=lambda: self._confirm_delete_expert(expert_instance, delete_dialog),
+                         color='negative').props('unelevated')
+        
+        delete_dialog.open()
+    
+    def _confirm_delete_expert(self, expert_instance, dialog):
+        """Actually delete the expert after confirmation."""
+        expert_id = expert_instance.id
+        expert_name = expert_instance.expert
+        expert_alias = expert_instance.alias or "No alias"
+        
+        try:
+            logger.debug(f'Deleting expert instance {expert_id} ({expert_name} - {expert_alias})')
+            delete_instance(expert_instance)
+            logger.info(f'Expert instance {expert_id} ({expert_name} - {expert_alias}) deleted')
+            ui.notify(f'Expert "{expert_name}" deleted successfully', type='positive')
+            self._update_table_rows()
+            dialog.close()
+        except Exception as e:
+            logger.error(f'Error deleting expert instance {expert_id}: {e}', exc_info=True)
+            ui.notify(f'Error deleting expert: {e}', type='negative')
 
 
 class TradeSettingsTab:

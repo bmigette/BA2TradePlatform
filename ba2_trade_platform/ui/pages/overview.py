@@ -2220,13 +2220,56 @@ class TransactionsTab:
                     
                     ui.button('Refresh', icon='refresh', on_click=lambda: self._refresh_transactions()).props('outline')
             
+            # Populate expert filter options
+            self._populate_expert_filter()
+            
             # Transactions table container
             self.transactions_container = ui.column().classes('w-full')
             self._render_transactions_table()
     
+    def _populate_expert_filter(self):
+        """Populate the expert filter dropdown with all available experts."""
+        from ...core.models import ExpertInstance
+        
+        session = get_db()
+        try:
+            # Get ALL expert instances
+            expert_statement = select(ExpertInstance)
+            experts = list(session.exec(expert_statement).all())
+            
+            # Build expert options list with shortnames
+            expert_options = ['All']
+            expert_map = {'All': 'All'}
+            for expert in experts:
+                # Create shortname: use alias, user_description, or fallback to "expert_name-id"
+                shortname = expert.alias or expert.user_description or f"{expert.expert}-{expert.id}"
+                expert_options.append(shortname)
+                expert_map[shortname] = expert.id
+            
+            # Store the map for filtering
+            self.expert_id_map = expert_map
+            
+            # Update expert filter options
+            if hasattr(self, 'expert_filter'):
+                current_value = self.expert_filter.value
+                self.expert_filter.options = expert_options
+                # Reset to 'All' if current value is not in the new options
+                if current_value not in expert_options:
+                    self.expert_filter.value = 'All'
+            
+            logger.debug(f"[POPULATE] Populated expert filter with {len(expert_options)} options")
+        
+        except Exception as e:
+            logger.error(f"Error populating expert filter: {e}", exc_info=True)
+        finally:
+            session.close()
+    
     def _refresh_transactions(self):
         """Refresh the transactions table."""
         logger.debug("[REFRESH] _refresh_transactions() - Updating table rows")
+        
+        # Refresh expert filter options (in case new experts were added)
+        self._populate_expert_filter()
         
         # If table doesn't exist yet, create it
         if not self.transactions_table:
@@ -2268,30 +2311,6 @@ class TransactionsTab:
         
         session = get_db()
         try:
-            # Populate expert filter options if not already done
-            if hasattr(self, 'expert_filter'):
-                # Get ALL expert instances, not just those with transactions
-                expert_statement = select(ExpertInstance)
-                experts = list(session.exec(expert_statement).all())
-                
-                # Build expert options list with shortnames
-                expert_options = ['All']
-                expert_map = {'All': 'All'}
-                for expert in experts:
-                    # Create shortname: "expert_name-id" or use alias/user_description if available
-                    shortname = expert.alias or expert.user_description or f"{expert.expert}-{expert.id}"
-                    expert_options.append(shortname)
-                    expert_map[shortname] = expert.id
-                
-                # Store the map for filtering
-                self.expert_id_map = expert_map
-                
-                # Update expert filter options
-                current_value = self.expert_filter.value
-                self.expert_filter.options = expert_options
-                if current_value not in expert_options:
-                    self.expert_filter.value = 'All'
-            
             # Build query based on filters - join with ExpertInstance for expert info
             statement = select(Transaction, ExpertInstance).outerjoin(
                 ExpertInstance, Transaction.expert_id == ExpertInstance.id
@@ -2309,9 +2328,11 @@ class TransactionsTab:
             
             # Apply expert filter
             if hasattr(self, 'expert_filter') and self.expert_filter.value != 'All':
-                expert_id = self.expert_id_map.get(self.expert_filter.value)
-                if expert_id and expert_id != 'All':
-                    statement = statement.where(Transaction.expert_id == expert_id)
+                # Ensure expert_id_map exists
+                if hasattr(self, 'expert_id_map'):
+                    expert_id = self.expert_id_map.get(self.expert_filter.value)
+                    if expert_id and expert_id != 'All':
+                        statement = statement.where(Transaction.expert_id == expert_id)
             
             # Apply symbol filter
             if hasattr(self, 'symbol_filter') and self.symbol_filter.value:

@@ -256,32 +256,87 @@ class JobMonitoringTab:
                     recommendation_display = '-'
                     confidence_display = '-'
                     expected_profit_display = '-'
+                    
                     if analysis.expert_recommendations and len(analysis.expert_recommendations) > 0:
-                        # Get the first (most recent) recommendation
-                        rec = analysis.expert_recommendations[0]
-                        if rec.recommended_action:
-                            # Add icons for BUY/SELL
-                            action_icons = {
-                                'BUY': '📈',
-                                'SELL': '📉',
-                                'HOLD': '⏸️',
-                                'ERROR': '❌'
-                            }
-                            action_value = rec.recommended_action.value
-                            action_icon = action_icons.get(action_value, '')
-                            recommendation_display = f'{action_icon} {action_value}'
+                        recommendations = analysis.expert_recommendations
                         
-                        if rec.confidence is not None:
-                            confidence_display = f'{rec.confidence:.1f}%'
-                        
-                        if rec.expected_profit_percent is not None:
-                            # Format with + or - sign and color indicator
-                            sign = '+' if rec.expected_profit_percent >= 0 else ''
-                            expected_profit_display = f'{sign}{rec.expected_profit_percent:.2f}%'
+                        if len(recommendations) == 1:
+                            # Single recommendation - show as before
+                            rec = recommendations[0]
+                            if rec.recommended_action:
+                                # Add icons for BUY/SELL
+                                action_icons = {
+                                    'BUY': '📈',
+                                    'SELL': '📉',
+                                    'HOLD': '⏸️',
+                                    'ERROR': '❌'
+                                }
+                                action_value = rec.recommended_action.value
+                                action_icon = action_icons.get(action_value, '')
+                                recommendation_display = f'{action_icon} {action_value}'
+                            
+                            if rec.confidence is not None:
+                                confidence_display = f'{rec.confidence:.1f}%'
+                            
+                            if rec.expected_profit_percent is not None:
+                                # Format with + or - sign and color indicator
+                                sign = '+' if rec.expected_profit_percent >= 0 else ''
+                                expected_profit_display = f'{sign}{rec.expected_profit_percent:.2f}%'
+                        else:
+                            # Multiple recommendations - show summary
+                            action_counts = {}
+                            confidences = []
+                            profits = []
+                            symbols = []
+                            
+                            for rec in recommendations:
+                                if rec.recommended_action:
+                                    action = rec.recommended_action.value
+                                    action_counts[action] = action_counts.get(action, 0) + 1
+                                
+                                if rec.confidence is not None:
+                                    confidences.append(rec.confidence)
+                                
+                                if rec.expected_profit_percent is not None:
+                                    profits.append(rec.expected_profit_percent)
+                                
+                                if rec.symbol:
+                                    symbols.append(rec.symbol)
+                            
+                            # Format recommendation summary
+                            if action_counts:
+                                action_summary = []
+                                action_icons = {'BUY': '📈', 'SELL': '📉', 'HOLD': '⏸️', 'ERROR': '❌'}
+                                for action, count in sorted(action_counts.items()):
+                                    icon = action_icons.get(action, '')
+                                    action_summary.append(f'{icon}{count}')
+                                recommendation_display = ' '.join(action_summary) + f' ({len(recommendations)} symbols)'
+                            
+                            # Format confidence summary
+                            if confidences:
+                                avg_confidence = sum(confidences) / len(confidences)
+                                confidence_display = f'{avg_confidence:.1f}% avg'
+                            
+                            # Format profit summary
+                            if profits:
+                                avg_profit = sum(profits) / len(profits)
+                                sign = '+' if avg_profit >= 0 else ''
+                                expected_profit_display = f'{sign}{avg_profit:.2f}% avg'
+                    
+                    # Determine symbol display - show actual traded symbols for multi-instrument analysis
+                    symbol_display = analysis.symbol
+                    if analysis.expert_recommendations and len(analysis.expert_recommendations) > 1:
+                        # Multi-instrument analysis - show list of symbols
+                        rec_symbols = [rec.symbol for rec in analysis.expert_recommendations if rec.symbol]
+                        if rec_symbols:
+                            if len(rec_symbols) <= 3:
+                                symbol_display = ', '.join(rec_symbols)
+                            else:
+                                symbol_display = f'{", ".join(rec_symbols[:3])}... (+{len(rec_symbols)-3})'
                     
                     analysis_data.append({
                         'id': analysis.id,
-                        'symbol': analysis.symbol,
+                        'symbol': symbol_display,
                         'expert_name': expert_name,
                         'status': status_value,
                         'status_display': status_display,
@@ -734,11 +789,11 @@ class ManualAnalysisTab:
                 
                 # Get expert properties to check capabilities
                 expert_properties = expert.__class__.get_expert_properties()
-                can_select_instruments = expert_properties.get('can_select_instruments', False)
+                can_recommend_instruments = expert_properties.get('can_recommend_instruments', False)
                 
                 # Clear and recreate instrument selector based on selection method
                 self.instrument_selector_container.clear()
-                self._render_instrument_selection_ui(expert, instrument_selection_method, can_select_instruments)
+                self._render_instrument_selection_ui(expert, instrument_selection_method, can_recommend_instruments)
                 
                 # Enable analysis type selection
                 self.analysis_type_select.enable()
@@ -749,11 +804,11 @@ class ManualAnalysisTab:
             logger.error(f"Error loading expert instruments: {e}", exc_info=True)
             ui.notify(f"Error loading expert: {str(e)}", type='negative')
     
-    def _render_instrument_selection_ui(self, expert, selection_method: str, can_select_instruments: bool):
+    def _render_instrument_selection_ui(self, expert, selection_method: str, can_recommend_instruments: bool):
         """Render the appropriate instrument selection UI based on method."""
         with self.instrument_selector_container:
             if selection_method == 'expert':
-                if can_select_instruments:
+                if can_recommend_instruments:
                     # Expert will select instruments - show message
                     with ui.card().classes('w-full p-4 bg-blue-50 border-l-4 border-blue-400'):
                         with ui.row():
@@ -932,10 +987,10 @@ class ManualAnalysisTab:
             # Get instrument selection method
             instrument_selection_method = expert.settings.get('instrument_selection_method', 'static')
             expert_properties = expert.__class__.get_expert_properties()
-            can_select_instruments = expert_properties.get('can_select_instruments', False)
+            can_recommend_instruments = expert_properties.get('can_recommend_instruments', False)
             
             # Get instruments based on selection method
-            if instrument_selection_method == 'expert' and can_select_instruments:
+            if instrument_selection_method == 'expert' and can_recommend_instruments:
                 # Expert-driven selection
                 try:
                     instruments_to_analyze = expert.get_recommended_instruments()
