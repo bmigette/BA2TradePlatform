@@ -2,9 +2,23 @@
 
 A sophisticated Python-based algorithmic trading platform featuring AI-driven market analysis, multi-agent trading strategies, and a comprehensive plugin architecture for accounts and market experts.
 
+## 🚧 ALPHA SOFTWARE - UNSTABLE
+
+**⚠️ THIS PROJECT IS CURRENTLY IN ALPHA STAGE AND CONSIDERED UNSTABLE ⚠️**
+
+- 🧪 **Experimental Release**: This is pre-beta software with active development and breaking changes
+- 🔄 **Frequent Updates**: APIs, database schema, and core functionality may change without notice
+- 🐛 **Expect Bugs**: Known and unknown issues exist throughout the platform
+- 📝 **Incomplete Features**: Some functionality may be partially implemented or missing
+- 🔧 **Developer Focused**: Currently intended for developers and advanced users willing to troubleshoot
+- 💾 **No Migration Guarantees**: Database schema changes may require fresh installations
+- 📋 **Documentation Gaps**: Some features may lack complete documentation
+
+**USE ONLY FOR TESTING AND DEVELOPMENT - NOT SUITABLE FOR PRODUCTION TRADING**
+
 ## ⚠️ IMPORTANT DISCLAIMER
 
-**THIS SOFTWARE IS IN BETA AND PROVIDED "AS-IS" WITHOUT WARRANTY OF ANY KIND.**
+**THIS SOFTWARE IS PROVIDED "AS-IS" WITHOUT WARRANTY OF ANY KIND.**
 
 - 🚨 **Trading involves substantial risk of loss** and is not suitable for all investors
 - 🧪 **This software is experimental** and should be thoroughly tested in paper trading mode before considering live trading
@@ -36,10 +50,12 @@ By using this software, you acknowledge that you understand and accept these ris
 - **Centralized Logging**: Comprehensive logging with file rotation and colored output
 
 ### AI Trading Agents
-- **Multiple Expert Support**: Extensible plugin architecture supporting multiple expert types (currently TradingAgents)
+- **Multiple Expert Support**: Extensible plugin architecture supporting multiple expert types ([see EXPERTS.md](EXPERTS.md) for complete list)
 - **Parallel Market Analysis**: Simultaneous analysis across multiple symbols for efficient processing
 - **Multi-Agent Analysis**: Market, news, fundamentals, social media, and macro-economic analysts
 - **TradingAgents Integration**: Advanced multi-agent LLM framework for financial trading
+- **Government Trading Data**: FMP Senate/House trading analysis with both weighted algorithms and simple copy trading
+- **Analyst Consensus**: Finnhub and FMP analyst rating aggregation and price target analysis
 - **FRED API Integration**: Real-time macroeconomic data analysis
 - **Debate-Based Decision Making**: Bull vs bear researcher debates with research manager oversight
 - **Risk Management**: Multi-layered risk analysis and management
@@ -69,12 +85,98 @@ By using this software, you acknowledge that you understand and accept these ris
 - **Alpaca Integration**: Paper and live trading support
 - **Extensible Architecture**: Easy addition of new brokers via AccountInterface
 
+## 🤖 Available Trading Experts
+
+The platform includes multiple AI trading experts with different strategies and capabilities:
+
+| Expert | Description | Data Sources | Special Features |
+|--------|-------------|--------------|------------------|
+| **TradingAgents** | Multi-agent AI system with debate-based analysis | Market data, news, fundamentals | Complex AI analysis, agent debates |
+| **FinnHubRating** | Analyst consensus tracker | Finnhub analyst ratings | Weighted consensus scoring |
+| **FMPRating** | Price target analyzer | FMP analyst data | Profit potential calculation |
+| **FMPSenateTraderWeight** | Government trading tracker (sophisticated) | FMP Senate/House data | Portfolio allocation analysis |
+| **FMPSenateTraderCopy** | Government trading tracker (simple copy) | FMP Senate/House data | 100% confidence copy trading, can recommend instruments |
+
+📖 **For detailed documentation on all experts, their settings, and configuration options, see [EXPERTS.md](EXPERTS.md)**
+
 ## 📋 Requirements
 
 - Python 3.11+
 - SQLite (included)
 - OpenAI API Key (or compatible LLM provider)
-- Optional: Alpaca API Key, Finnhub API Key, FRED API Key
+- Optional: Alpaca API Key, Finnhub API Key, FRED API Key, FMP API Key
+
+## 🔑 API Keys Configuration
+
+The platform requires certain API keys to function properly. Configure all API keys through the **Settings** page at `http://localhost:8080/settings`.
+
+### 🟥 Mandatory API Keys
+
+**OpenAI API Key** (Required)
+- **Purpose**: Powers all AI trading experts and analysis
+- **Used by**: TradingAgents multi-agent framework, market analysis, recommendation generation
+- **Get it**: [OpenAI API Platform](https://platform.openai.com/api-keys)
+- **Configure**: Settings → Application Settings → OpenAI API Key
+- **Without this**: Platform cannot generate trading recommendations or perform AI analysis
+
+### 🟡 Conditional API Keys (Required based on configuration)
+
+**Alpaca API Keys** (Required if using Alpaca account provider)
+- **Purpose**: Live and paper trading through Alpaca
+- **Used by**: AlpacaAccount provider for order execution, position tracking, market data
+- **Get it**: [Alpaca Markets](https://app.alpaca.markets/signup)
+- **Configure**: Settings → Accounts → Add Alpaca Account
+- **Keys needed**: API Key + Secret Key
+- **Without this**: Cannot trade through Alpaca (but can still use other providers)
+
+### 🟢 Optional API Keys (Enhance functionality)
+
+**Finnhub API Key** (Optional - enhances market data)
+- **Purpose**: Additional market data, news, and fundamental analysis
+- **Used by**: TradingAgents news analyst, fundamental analysis
+- **Get it**: [Finnhub API](https://finnhub.io/register)
+- **Configure**: Settings → Application Settings → Finnhub API Key
+- **Without this**: Uses alternative data sources, reduced analysis depth
+
+**FRED API Key** (Optional - enhances macro analysis)
+- **Purpose**: Federal Reserve economic data for macro analysis
+- **Used by**: TradingAgents macro analyst for economic indicators
+- **Get it**: [FRED API](https://fred.stlouisfed.org/docs/api/api_key.html)
+- **Configure**: Settings → Application Settings → FRED API Key
+- **Without this**: Macro analysis uses limited economic data
+
+**FMP API Key** (Optional - enhances fundamental data)
+- **Purpose**: Financial Modeling Prep API for company fundamentals
+- **Used by**: TradingAgents fundamental analyst for detailed financial metrics
+- **Get it**: [Financial Modeling Prep](https://financialmodelingprep.com/developer/docs)
+- **Configure**: Settings → Application Settings → FMP API Key
+- **Without this**: Limited fundamental analysis capabilities
+
+### 🔧 Configuration Methods
+
+1. **Web Interface** (Recommended):
+   - Navigate to `http://localhost:8080/settings`
+   - Enter API keys in respective sections
+   - Keys are encrypted and stored in database
+
+2. **Environment Variables**:
+   ```env
+   # Create .env file in project root
+   OPENAI_API_KEY=your_openai_key_here
+   ALPACA_API_KEY=your_alpaca_key_here
+   ALPACA_SECRET_KEY=your_alpaca_secret_here
+   FINNHUB_API_KEY=your_finnhub_key_here
+   FRED_API_KEY=your_fred_key_here
+   FMP_API_KEY=your_fmp_key_here
+   ```
+
+### 🛡️ Security Notes
+
+- All API keys are stored encrypted in the local SQLite database
+- Keys are never transmitted except to their respective API endpoints
+- Use paper trading accounts for testing (Alpaca provides free paper trading)
+- Keep your API keys secure and never share them publicly
+- Regularly rotate API keys as a security best practice
 
 ## 🛠️ Installation
 
@@ -147,28 +249,7 @@ By using this software, you acknowledge that you understand and accept these ris
    .venv/bin/python -m pip install -r requirements.txt
    ```
 
-3. **Configure environment variables** (optional):
-   
-   Create a `.env` file in the project root:
-   ```env
-   # LLM Configuration
-   OPENAI_API_KEY=your_openai_key_here
-   
-   # Market Data (optional)
-   FINNHUB_API_KEY=your_finnhub_key_here
-   ALPHA_VANTAGE_API_KEY=your_alpha_vantage_key_here
-   FRED_API_KEY=your_fred_key_here
-   
-   # Trading Accounts
-   ALPACA_API_KEY=your_alpaca_key_here
-   ALPACA_SECRET_KEY=your_alpaca_secret_here
-   ALPACA_BASE_URL=https://paper-api.alpaca.markets  # Paper trading
-   
-   # Cache Settings
-   PRICE_CACHE_TIME=30  # Price cache duration in seconds
-   ```
-
-4. **Run the application**:
+5. **Run the application**:
    
    **Windows**:
    ```powershell
@@ -180,7 +261,7 @@ By using this software, you acknowledge that you understand and accept these ris
    .venv/bin/python main.py
    ```
 
-5. **Access the web interface**:
+6. **Access the web interface**:
    
    Open your browser and navigate to:
    ```
@@ -446,6 +527,8 @@ FILE_LOGGING = True     # File logging with rotation
 ```
 
 ## 🔌 Extending the Platform
+
+> 📖 **For detailed information about existing experts and their implementation patterns, see [EXPERTS.md](EXPERTS.md)**
 
 ### Adding New Account Provider
 

@@ -26,14 +26,18 @@ if STDOUT_LOGGING:
     logger.addHandler(handler)
 
 if FILE_LOGGING:
+    # Ensure logs directory exists
+    logs_dir = os.path.join(HOME_PARENT, "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    
     handlerfile = RotatingFileHandler(
-        os.path.join(HOME_PARENT, "logs", "app.debug.log"), maxBytes=(1024*1024*10), backupCount=7, encoding='utf-8'
+        os.path.join(logs_dir, "app.debug.log"), maxBytes=(1024*1024*10), backupCount=7, encoding='utf-8'
     )
     handlerfile.setFormatter(formatter)
     handlerfile.setLevel(logging.DEBUG)
     logger.addHandler(handlerfile)
     handlerfile2 = RotatingFileHandler(
-        os.path.join(HOME_PARENT, "logs", "app.log"), maxBytes=(1024*1024*10), backupCount=7, encoding='utf-8'
+        os.path.join(logs_dir, "app.log"), maxBytes=(1024*1024*10), backupCount=7, encoding='utf-8'
     )
     handlerfile2.setFormatter(formatter)
     handlerfile2.setLevel(logging.INFO)

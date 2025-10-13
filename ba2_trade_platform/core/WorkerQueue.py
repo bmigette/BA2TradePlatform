@@ -485,6 +485,34 @@ class WorkerQueue:
                     logger.debug(f"Analysis task '{task.id}' skipped due to insufficient balance in {execution_time:.2f}s")
                     return
 
+            # Check symbol price and balance constraints for ENTER_MARKET analysis (unless bypassed)
+            if task.subtype == AnalysisUseCase.ENTER_MARKET.value and not task.bypass_balance_check:
+                should_skip, skip_reason = expert.should_skip_analysis_for_symbol(task.symbol)
+                if should_skip:
+                    # Skip analysis due to symbol price/balance constraints
+                    logger.info(f"Skipping ENTER_MARKET analysis for expert {task.expert_instance_id}, symbol {task.symbol}: {skip_reason}")
+                    
+                    # Create analysis record marked as skipped
+                    market_analysis = MarketAnalysis(
+                        symbol=task.symbol,
+                        expert_instance_id=task.expert_instance_id,
+                        status=MarketAnalysisStatus.CANCELLED,
+                        subtype=AnalysisUseCase(task.subtype),
+                        state={"reason": "symbol_price_balance_check", "message": f"Skipped: {skip_reason}"}
+                    )
+                    market_analysis_id = add_instance(market_analysis)
+                    task.market_analysis_id = market_analysis_id
+                    
+                    # Update task as completed (but skipped)
+                    with self._task_lock:
+                        task.status = WorkerTaskStatus.COMPLETED
+                        task.result = {"market_analysis_id": market_analysis_id, "status": "skipped", "reason": "symbol_price_balance_check"}
+                        task.completed_at = time.time()
+                    
+                    execution_time = task.completed_at - task.started_at
+                    logger.debug(f"Analysis task '{task.id}' skipped due to symbol price/balance constraints in {execution_time:.2f}s")
+                    return
+
             # Create or reuse MarketAnalysis record
             if task.market_analysis_id:
                 # Reusing existing MarketAnalysis for retry

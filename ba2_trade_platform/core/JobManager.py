@@ -510,13 +510,69 @@ class JobManager:
             return None
             
     def _get_enabled_instruments(self, instance_id: int) -> List[str]:
-        """Get list of enabled instruments for an expert instance."""
+        """Get list of enabled instruments for an expert instance based on instrument selection method."""
         try:
-            # Look for instrument settings (assuming pattern like "instrument_{symbol}_enabled")
+            from .utils import get_expert_instance_from_id
+            expert = get_expert_instance_from_id(instance_id)
             
+            if not expert:
+                logger.warning(f"Expert instance {instance_id} not found")
+                return []
+            
+            # Get instrument selection method
+            instrument_selection_method = expert.settings.get('instrument_selection_method', 'static')
+            
+            # Get expert properties to check capabilities
+            expert_properties = expert.__class__.get_expert_properties()
+            can_select_instruments = expert_properties.get('can_select_instruments', False)
+            
+            # Check should_expand_instrument_jobs setting for experts that can recommend instruments
+            if can_select_instruments:
+                should_expand = expert.settings.get('should_expand_instrument_jobs', True)  # Default to True for backward compatibility
+                if not should_expand:
+                    logger.info(f"Expert {instance_id} has should_expand_instrument_jobs=False, skipping instrument job expansion")
+                    # Return empty list to avoid creating duplicate jobs
+                    return []
+            
+            if instrument_selection_method == 'expert' and can_select_instruments:
+                # Expert-driven selection - call expert's get_recommended_instruments method
+                try:
+                    expert_instruments = expert.get_recommended_instruments()
+                    if expert_instruments:
+                        logger.info(f"Expert {instance_id} recommended {len(expert_instruments)} instruments: {expert_instruments}")
+                        
+                        # Auto-add instruments to database if they don't exist
+                        try:
+                            from .InstrumentAutoAdder import get_instrument_auto_adder
+                            auto_adder = get_instrument_auto_adder()
+                            auto_adder.queue_instruments_for_addition(
+                                symbols=expert_instruments,
+                                expert_shortname=expert.shortname,
+                                source='expert'
+                            )
+                        except Exception as e:
+                            logger.warning(f"Could not queue instruments for auto-addition: {e}")
+                        
+                        return expert_instruments
+                    else:
+                        logger.warning(f"Expert {instance_id} returned no instrument recommendations")
+                        return []
+                except Exception as e:
+                    logger.error(f"Error getting expert instrument recommendations for instance {instance_id}: {e}", exc_info=True)
+                    # Fall back to static method on error
+                    logger.warning(f"Falling back to static instrument selection for expert {instance_id}")
+            
+            # Static method (default) - get from enabled_instruments setting
             enabled_symbols = self._get_expert_setting(instance_id, "enabled_instruments")
-            enabled_symbols = list(enabled_symbols.keys()) if enabled_symbols else []                            
+            enabled_symbols = list(enabled_symbols.keys()) if enabled_symbols else []
+            
+            if instrument_selection_method == 'dynamic':
+                # Dynamic method requires manual UI selection - no automatic scheduling
+                logger.debug(f"Expert {instance_id} uses dynamic instrument selection - no automatic scheduling")
+                return []
+            
             return enabled_symbols
+            
         except Exception as e:
             logger.error(f"Error getting enabled instruments for instance {instance_id}: {e}", exc_info=True)
             return []

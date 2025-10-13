@@ -83,6 +83,11 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "type": "json", "required": False, "default": {},
                     "description": "Configuration of enabled instruments for this expert instance"
                 },
+                "instrument_selection_method": {
+                    "type": "str", "required": False, "default": "static",
+                    "description": "Method for selecting instruments: static (manual), dynamic (AI prompt), expert (expert-driven)",
+                    "choices": ["static", "dynamic", "expert"]
+                },
                 # Balance Management Settings
                 "min_available_balance_pct": {
                     "type": "float", "required": False, "default": 20.0,
@@ -106,6 +111,18 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             str: Description of the expert instance.
         """
         pass
+
+    @classmethod
+    def get_expert_properties(cls) -> Dict[str, Any]:
+        """
+        Get expert-specific properties and capabilities.
+        
+        Returns:
+            Dict[str, Any]: Dictionary containing expert properties and capabilities
+        """
+        return {
+            "can_select_instruments": False,  # Default: expert cannot select its own instruments
+        }
     
     @abstractmethod
     def render_market_analysis(self, market_analysis: MarketAnalysis) -> str:
@@ -404,6 +421,88 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         except Exception as e:
             logger.error(f"Error checking balance for expert {self.id}: {e}", exc_info=True)
             return False
+
+    def should_skip_analysis_for_symbol(self, symbol: str) -> tuple[bool, str]:
+        """
+        Check if analysis should be skipped for a symbol based on price and balance constraints.
+        
+        This function performs two checks:
+        1. If symbol price is higher than available balance, skip analysis
+        2. If available balance is lower than 5% of account balance, skip analysis
+        
+        Args:
+            symbol (str): The instrument symbol to check
+            
+        Returns:
+            tuple[bool, str]: (should_skip, reason)
+                - should_skip: True if analysis should be skipped, False if it should proceed
+                - reason: String explaining why analysis should be skipped (empty if should not skip)
+        """
+        try:
+            # Get account instance
+            from ..utils import get_account_instance_from_id
+            from ..db import get_instance
+            from ..models import ExpertInstance
+            
+            expert_instance = get_instance(ExpertInstance, self.id)
+            if not expert_instance:
+                logger.error(f"Expert instance {self.id} not found")
+                return True, "Expert instance not found"
+            
+            account = get_account_instance_from_id(expert_instance.account_id)
+            if not account:
+                logger.error(f"Account {expert_instance.account_id} not found for expert {self.id}")
+                return True, "Account not found"
+            
+            # Get current symbol price
+            current_price = account.get_instrument_current_price(symbol)
+            if current_price is None:
+                logger.warning(f"Could not get current price for {symbol}, skipping analysis")
+                return True, f"Could not get current price for {symbol}"
+            
+            # Get available balance for this expert
+            available_balance = self.get_available_balance()
+            if available_balance is None:
+                logger.warning(f"Could not get available balance for expert {self.id}")
+                return True, "Could not get available balance"
+            
+            # Check 1: If symbol price is higher than available balance, skip
+            if current_price > available_balance:
+                logger.info(f"Skipping analysis for {symbol}: price ${current_price:.2f} > available balance ${available_balance:.2f}")
+                return True, f"Symbol price ${current_price:.2f} exceeds available balance ${available_balance:.2f}"
+            
+            # Check 2: If available balance is lower than 5% of account balance, skip
+            account_balance = account.get_balance()
+            if account_balance is None:
+                logger.warning(f"Could not get account balance, skipping 5% check")
+                return True, "Could not get account balance for 5% check"
+            
+            min_balance_threshold = account_balance * 0.05  # 5% of account balance
+            if available_balance < min_balance_threshold:
+                available_pct = (available_balance / account_balance) * 100.0 if account_balance > 0 else 0.0
+                logger.info(f"Skipping analysis for {symbol}: available balance ${available_balance:.2f} "
+                           f"({available_pct:.1f}%) < 5% threshold ${min_balance_threshold:.2f}")
+                return True, f"Available balance ${available_balance:.2f} ({available_pct:.1f}%) below 5% threshold"
+            
+            # All checks passed - analysis should proceed
+            logger.debug(f"Analysis checks passed for {symbol}: price=${current_price:.2f}, "
+                        f"available=${available_balance:.2f}, account_balance=${account_balance:.2f}")
+            return False, ""
+            
+        except Exception as e:
+            logger.error(f"Error checking if analysis should be skipped for {symbol}: {e}", exc_info=True)
+            return True, f"Error during analysis check: {str(e)}"
+
+    def get_recommended_instruments(self) -> Optional[List[str]]:
+        """
+        Get expert-recommended instruments for analysis.
+        This method is only called if the expert's can_select_instruments property is True
+        and instrument_selection_method is set to "expert".
+        
+        Returns:
+            Optional[List[str]]: List of recommended instrument symbols, or None if not supported
+        """
+        return None
 
     @abstractmethod
     def run_analysis(self, symbol: str, market_analysis: MarketAnalysis) -> None:

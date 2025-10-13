@@ -1,8 +1,11 @@
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, LimitOrderRequest, StopOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
+from alpaca.common.exceptions import APIError
 from typing import Any, Dict, Optional
 from datetime import datetime, timezone
+import time
+import functools
 
 from ...logger import logger
 from ...core.models import TradingOrder, Position, Transaction
@@ -10,6 +13,46 @@ from ...core.types import OrderDirection, OrderStatus, OrderOpenType
 from ...core.interfaces import AccountInterface
 from ...core.db import get_db, get_instance, update_instance
 from sqlmodel import Session, select
+
+def alpaca_api_retry(func):
+    """
+    Decorator to retry Alpaca API calls with exponential backoff on rate limit errors.
+    
+    Retries on "too many requests" errors with delays: 1s, 3s, 10s, then fails.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        delays = [1.0, 3.0, 10.0]  # Exponential backoff: 1s, 3s, 10s
+        last_exception = None
+        
+        for attempt in range(len(delays) + 1):  # 4 total attempts (initial + 3 retries)
+            try:
+                return func(*args, **kwargs)
+            except APIError as e:
+                last_exception = e
+                error_message = str(e).lower()
+                
+                # Check if this is a rate limit error
+                if "too many requests" in error_message or "429" in error_message:
+                    if attempt < len(delays):  # Still have retries left
+                        delay = delays[attempt]
+                        logger.warning(f"Alpaca API rate limit hit in {func.__name__}, retrying in {delay}s (attempt {attempt + 1}/{len(delays) + 1})")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        logger.error(f"Alpaca API rate limit exceeded after {len(delays) + 1} attempts in {func.__name__}")
+                        raise
+                else:
+                    # Not a rate limit error, don't retry
+                    raise
+            except Exception as e:
+                # Non-API errors, don't retry
+                raise
+        
+        # This should never be reached, but just in case
+        raise last_exception
+    
+    return wrapper
 
 class AlpacaAccount(AccountInterface):
     """
@@ -29,18 +72,44 @@ class AlpacaAccount(AccountInterface):
             Exception: If initialization of Alpaca TradingClient fails.
         """
         super().__init__(id)
+        
+        # Initialize client as None first
+        self.client = None
+        self._authentication_error = None
 
         try:
+            # Check if we have the required settings
+            required_settings = ["api_key", "api_secret", "paper_account"]
+            missing_settings = [key for key in required_settings if key not in self.settings or not self.settings[key]]
+            
+            if missing_settings:
+                error_msg = f"Missing required settings: {', '.join(missing_settings)}"
+                self._authentication_error = error_msg
+                logger.error(f"AlpacaAccount {id}: {error_msg}")
+                raise ValueError(error_msg)
          
             self.client = TradingClient(
                 api_key=self.settings["api_key"],
                 secret_key=self.settings["api_secret"],
                 paper=self.settings["paper_account"], # True if "paper" in APCA_API_BASE_URL else False
             )
-            logger.info("Alpaca TradingClient initialized.")
+            logger.info(f"Alpaca TradingClient initialized for account {id}.")
         except Exception as e:
-            logger.error(f"Failed to initialize Alpaca TradingClient: {e}", exc_info=True)
+            self._authentication_error = str(e)
+            logger.error(f"Failed to initialize Alpaca TradingClient for account {id}: {e}", exc_info=True)
             raise
+    
+    def _check_authentication(self) -> bool:
+        """
+        Check if the account is properly authenticated.
+        
+        Returns:
+            bool: True if authenticated, False otherwise
+        """
+        if self.client is None:
+            logger.error(f"AlpacaAccount {self.id}: Not authenticated - {self._authentication_error}")
+            return False
+        return True
         
     def get_settings_definitions() -> Dict[str, Any]:
         """
@@ -217,6 +286,7 @@ class AlpacaAccount(AccountInterface):
             swap_rate=getattr(position, "swap_rate", None)
         )
         
+    @alpaca_api_retry
     def get_orders(self, status: Optional[OrderStatus] = OrderStatus.ALL): # TODO: Add filter handling
         """
         Retrieve a list of orders based on the provided filter.
@@ -228,6 +298,9 @@ class AlpacaAccount(AccountInterface):
             list: A list of TradingOrder objects representing the orders.
             Returns empty list if an error occurs.
         """
+        if not self._check_authentication():
+            return []
+            
         try:
             filter = GetOrdersRequest(
                 status=status
@@ -240,6 +313,7 @@ class AlpacaAccount(AccountInterface):
             logger.error(f"Error listing Alpaca orders: {e}", exc_info=True)
             return []
 
+    @alpaca_api_retry
     def _submit_order_impl(self, trading_order: TradingOrder) -> TradingOrder:
         """
         Submit a new order to Alpaca.
@@ -256,6 +330,9 @@ class AlpacaAccount(AccountInterface):
         Returns:
             TradingOrder: The database order record (updated with broker info), or None if failed
         """
+        if not self._check_authentication():
+            return None
+            
         from sqlmodel import Session
         from ...core.db import add_instance
         
@@ -402,6 +479,7 @@ class AlpacaAccount(AccountInterface):
             
             return None
 
+    @alpaca_api_retry
     def modify_order(self, order_id: str, trading_order: TradingOrder):
         """
         Modify an existing order in Alpaca.
@@ -431,6 +509,7 @@ class AlpacaAccount(AccountInterface):
             logger.error(f"Error modifying Alpaca order {order_id}: {e}", exc_info=True)
             return None
 
+    @alpaca_api_retry
     def get_order(self, order_id: str):
         """
         Retrieve a specific order by its ID.
@@ -448,7 +527,8 @@ class AlpacaAccount(AccountInterface):
         except Exception as e:
             logger.error(f"Error fetching Alpaca order {order_id}: {e}", exc_info=True)
             return None
-        
+
+    @alpaca_api_retry
     def cancel_order(self, order_id: str):
         """
         Cancel an existing order.
@@ -467,6 +547,7 @@ class AlpacaAccount(AccountInterface):
             logger.error(f"Error cancelling Alpaca order {order_id}: {e}", exc_info=True)
             return False
 
+    @alpaca_api_retry
     def get_positions(self):
         """
         Retrieve all current positions in the Alpaca account.
@@ -502,6 +583,7 @@ class AlpacaAccount(AccountInterface):
             logger.error(f"Error getting Alpaca account balance: {e}", exc_info=True)
             return None
 
+    @alpaca_api_retry
     def get_account_info(self):
         """
         Retrieve current account information from Alpaca.
@@ -509,6 +591,9 @@ class AlpacaAccount(AccountInterface):
         Returns:
             object: Account information if successful, None if an error occurs.
         """
+        if not self._check_authentication():
+            return None
+            
         try:
             account = self.client.get_account()
             logger.debug("Fetched Alpaca account info.")
@@ -517,6 +602,7 @@ class AlpacaAccount(AccountInterface):
             logger.error(f"Error fetching Alpaca account info: {e}", exc_info=True)
             return None
 
+    @alpaca_api_retry
     def _get_instrument_current_price_impl(self, symbol: str) -> Optional[float]:
         """
         Internal implementation of price fetching for Alpaca.
@@ -528,6 +614,9 @@ class AlpacaAccount(AccountInterface):
         Returns:
             Optional[float]: The current price if available, None if not found or error occurred
         """
+        if not self._check_authentication():
+            return None
+            
         try:
             from alpaca.data.historical import StockHistoricalDataClient
             from alpaca.data.requests import StockLatestQuoteRequest

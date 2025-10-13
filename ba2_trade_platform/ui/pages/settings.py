@@ -587,11 +587,33 @@ class AccountDefinitionsTab:
                 account.description = self.desc_input.value
                 update_instance(account)
                 logger.info(f"Updated account: {account.name}")
-                # Save dynamic settings using AccountInterface
-
-                acc_iface = provider_cls(account.id)
-                if isinstance(acc_iface, AccountInterface):
-                    acc_iface.save_settings(dynamic_settings)
+                
+                # Save dynamic settings FIRST, then validate
+                if provider_cls and dynamic_settings:
+                    try:
+                        # Save settings first
+                        temp_acc_iface = provider_cls.__new__(provider_cls)  # Create without calling __init__
+                        temp_acc_iface.id = account.id
+                        
+                        # Save each setting individually using save_setting method
+                        for key, value in dynamic_settings.items():
+                            temp_acc_iface.save_setting(key, value)
+                            
+                        logger.info(f"Saved {len(dynamic_settings)} settings for account {account.id}")
+                        
+                        # Now try to validate credentials
+                        try:
+                            acc_iface = provider_cls(account.id)
+                            logger.info(f"Successfully validated credentials for account {account.id}")
+                        except Exception as auth_error:
+                            logger.warning(f"Account {account.id} updated but authentication failed: {auth_error}")
+                            ui.notify(f"Account updated but authentication failed: {str(auth_error)}", type="warning")
+                            # Account is still updated, just with authentication issues
+                            
+                    except Exception as settings_error:
+                        logger.error(f"Failed to save settings for account {account.id}: {settings_error}", exc_info=True)
+                        ui.notify(f"Failed to save account settings: {str(settings_error)}", type="negative")
+                        return
             else:
                 new_account = AccountDefinition(
                     provider=provider,
@@ -600,11 +622,35 @@ class AccountDefinitionsTab:
                 )
                 new_account_id = add_instance(new_account)
                 logger.info(f"Created new account: {self.name_input.value} with id {new_account_id}")
-                # Save dynamic settings for new account
-                # Get the new account's id
-                acc_iface = provider_cls(new_account_id)
-                if isinstance(acc_iface, AccountInterface):
-                    acc_iface.save_settings(dynamic_settings)
+                
+                # Save dynamic settings FIRST before creating AccountInterface
+                # This ensures credentials are in database before AccountInterface tries to use them
+                if provider_cls and dynamic_settings:
+                    try:
+                        # Create a temporary AccountInterface instance just for saving settings
+                        # Use a special flag to prevent immediate client initialization
+                        temp_acc_iface = provider_cls.__new__(provider_cls)  # Create without calling __init__
+                        temp_acc_iface.id = new_account_id
+                        
+                        # Save each setting individually using save_setting method
+                        for key, value in dynamic_settings.items():
+                            temp_acc_iface.save_setting(key, value)
+                            
+                        logger.info(f"Saved {len(dynamic_settings)} settings for new account {new_account_id}")
+                        
+                        # Now try to create the full AccountInterface to validate credentials
+                        try:
+                            acc_iface = provider_cls(new_account_id)
+                            logger.info(f"Successfully validated credentials for account {new_account_id}")
+                        except Exception as auth_error:
+                            logger.warning(f"Account {new_account_id} created but authentication failed: {auth_error}")
+                            ui.notify(f"Account created but authentication failed: {str(auth_error)}", type="warning")
+                            # Account is still created, just with authentication issues
+                            
+                    except Exception as settings_error:
+                        logger.error(f"Failed to save settings for new account {new_account_id}: {settings_error}", exc_info=True)
+                        ui.notify(f"Failed to save account settings: {str(settings_error)}", type="negative")
+                        return
             self.dialog.close()
             self._update_table_rows()
         except Exception as e:
@@ -654,11 +700,60 @@ class AccountDefinitionsTab:
         self.dynamic_settings_container.clear()
         self._render_dynamic_settings(provider, account)
 
+    def _get_account_settings_from_db(self, account_id: int) -> dict:
+        """
+        Get account settings directly from database without creating AccountInterface.
+        This avoids authentication failures when accounts have missing credentials.
+        
+        Args:
+            account_id: The account ID to get settings for
+            
+        Returns:
+            dict: Dictionary of setting key -> value pairs
+        """
+        from sqlmodel import Session
+        import json
+        
+        settings = {}
+        try:
+            with Session(get_db().bind) as session:
+                statement = select(AccountSetting).where(AccountSetting.account_id == account_id)
+                results = session.exec(statement).all()
+                
+                for setting in results:
+                    # Determine value based on what's stored
+                    if setting.value_json and setting.value_json != {}:
+                        # Handle JSON values (includes booleans stored as JSON)
+                        value = setting.value_json
+                        # If it's a simple JSON value like {"value": true}, extract the actual value
+                        if isinstance(value, dict) and len(value) == 1 and "value" in value:
+                            value = value["value"]
+                    elif setting.value_float is not None:
+                        value = setting.value_float
+                    elif setting.value_str is not None:
+                        value = setting.value_str
+                    else:
+                        value = None
+                    
+                    settings[setting.key] = value
+                    
+            logger.debug(f"Loaded {len(settings)} settings from database for account {account_id}")
+            return settings
+            
+        except Exception as e:
+            logger.error(f"Error loading settings from database for account {account_id}: {e}", exc_info=True)
+            return {}
+
     def _render_dynamic_settings(self, provider, account=None):
         # Example: Render provider-specific fields dynamically
         provider_config = providers.get(provider, {})
         settings_def = provider_config.get_settings_definitions()
-        settings_values = provider_config(account.id).settings if account else {}
+        
+        # Get settings directly from database without creating AccountInterface
+        settings_values = {}
+        if account:
+            settings_values = self._get_account_settings_from_db(account.id)
+        
         self.settings_inputs = {}
         if settings_def and len(settings_def.keys()) > 0:
             for key, meta in settings_def.items():
@@ -980,20 +1075,22 @@ class ExpertSettingsTab:
                 
                 # Basic expert information
                 with ui.column().classes('w-full gap-4'):
-                    expert_types = self._get_available_expert_types()
-                    self.expert_select = ui.select(
-                        expert_types, 
-                        label='Expert Type'
-                    ).classes('w-full')
+                    # Expert type and alias on the same line
+                    with ui.row().classes('w-full gap-4'):
+                        expert_types = self._get_available_expert_types()
+                        self.expert_select = ui.select(
+                            expert_types, 
+                            label='Expert Type'
+                        ).classes('flex-1')
+                        
+                        # Alias as short display name
+                        self.alias_input = ui.input(
+                            label='Alias (max 100 chars)',
+                            placeholder='Short display name for this expert...'
+                        ).classes('flex-1').props('maxlength=100')
                     
                     # Description as read-only display
                     self.description_label = ui.label('').classes('text-grey-7 mb-2')
-                    
-                    # Alias as short display name
-                    self.alias_input = ui.input(
-                        label='Alias (max 100 chars)',
-                        placeholder='Short display name for this expert...'
-                    ).classes('w-full').props('maxlength=100')
                     
                     # User description as editable textarea
                     self.user_description_textarea = ui.textarea(
@@ -1008,11 +1105,22 @@ class ExpertSettingsTab:
                             value='100.0'
                         ).classes('w-48')
                     
-                    accounts = self._get_available_accounts()
-                    self.account_select = ui.select(
-                        accounts,
-                        label='Trading Account'
-                    ).classes('w-full')
+                    # Account selection and instrument selection method on the same line
+                    with ui.row().classes('w-full gap-4'):
+                        accounts = self._get_available_accounts()
+                        self.account_select = ui.select(
+                            accounts,
+                            label='Trading Account'
+                        ).classes('flex-1')
+                        
+                        # Instrument selection method
+                        self.instrument_selection_method_select = ui.select(
+                            options=["static", "dynamic", "expert"],
+                            label='Instrument Selection Method',
+                            value="static"
+                        ).classes('flex-1').tooltip(
+                            "How instruments are selected: Static (manual selection), Dynamic (AI prompt), Expert (expert-driven selection)"
+                        )
                 
                 # Fill values if editing
                 if is_edit:
@@ -1026,6 +1134,17 @@ class ExpertSettingsTab:
                     account_instance = get_instance(AccountDefinition, expert_instance.account_id)
                     if account_instance:
                         self.account_select.value = f"{account_instance.name} ({account_instance.provider})"
+                    
+                    # Load instrument selection method from settings
+                    try:
+                        from ...core.utils import get_expert_instance_from_id
+                        expert = get_expert_instance_from_id(expert_instance.id)
+                        if expert:
+                            instrument_method = expert.settings.get('instrument_selection_method', 'static')
+                            self.instrument_selection_method_select.value = instrument_method
+                    except Exception as e:
+                        logger.debug(f'Could not load instrument selection method: {e}')
+                        self.instrument_selection_method_select.value = 'static'
                 else:
                     if expert_types:
                         self.expert_select.value = expert_types[0]
@@ -2270,11 +2389,20 @@ class ExpertSettingsTab:
             expert.save_setting('max_virtual_equity_per_instrument_percent', max_equity_value, setting_type="float")
             logger.debug(f'Saved risk management: max_virtual_equity_per_instrument_percent={max_equity_value}%')
         
+        # Save instrument selection method (moved to main panel)
+        if hasattr(self, 'instrument_selection_method_select'):
+            expert.save_setting('instrument_selection_method', self.instrument_selection_method_select.value, setting_type="str")
+            logger.debug(f'Saved instrument_selection_method: {self.instrument_selection_method_select.value}')
+        
         # Save expert-specific settings
         if hasattr(self, 'expert_settings_inputs') and self.expert_settings_inputs:
             settings_def = expert.get_settings_definitions()
             
             for key, inp in self.expert_settings_inputs.items():
+                # Skip instrument_selection_method as it's now handled separately in the main panel
+                if key == 'instrument_selection_method':
+                    continue
+                    
                 meta = settings_def.get(key, {})
                 
                 if meta.get("type") == "bool":

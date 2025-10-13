@@ -728,20 +728,17 @@ class ManualAnalysisTab:
             expert = get_expert_instance_from_id(int(self.expert_instance_id))
             
             if expert:
-                enabled_instruments = expert.get_enabled_instruments()
-                logger.debug(f"Expert {self.expert_instance_id} has {len(enabled_instruments)} enabled instruments")
+                # Get instrument selection method from expert settings
+                instrument_selection_method = expert.settings.get('instrument_selection_method', 'static')
+                logger.debug(f"Expert {self.expert_instance_id} using instrument selection method: {instrument_selection_method}")
                 
-                # Clear and recreate instrument selector with filtered instruments
+                # Get expert properties to check capabilities
+                expert_properties = expert.__class__.get_expert_properties()
+                can_select_instruments = expert_properties.get('can_select_instruments', False)
+                
+                # Clear and recreate instrument selector based on selection method
                 self.instrument_selector_container.clear()
-                
-                with self.instrument_selector_container:
-                    from ..components.InstrumentSelector import InstrumentSelector
-                    self.instrument_selector = InstrumentSelector(
-                        on_selection_change=self.on_instrument_selection_change,
-                        instrument_list=enabled_instruments if enabled_instruments else None,
-                        hide_weights=True
-                    )
-                    self.instrument_selector.render()
+                self._render_instrument_selection_ui(expert, instrument_selection_method, can_select_instruments)
                 
                 # Enable analysis type selection
                 self.analysis_type_select.enable()
@@ -751,6 +748,158 @@ class ManualAnalysisTab:
         except Exception as e:
             logger.error(f"Error loading expert instruments: {e}", exc_info=True)
             ui.notify(f"Error loading expert: {str(e)}", type='negative')
+    
+    def _render_instrument_selection_ui(self, expert, selection_method: str, can_select_instruments: bool):
+        """Render the appropriate instrument selection UI based on method."""
+        with self.instrument_selector_container:
+            if selection_method == 'expert':
+                if can_select_instruments:
+                    # Expert will select instruments - show message
+                    with ui.card().classes('w-full p-4 bg-blue-50 border-l-4 border-blue-400'):
+                        with ui.row():
+                            ui.icon('auto_awesome').classes('text-blue-600 text-xl mr-3')
+                            with ui.column():
+                                ui.label('Expert-Driven Instrument Selection').classes('text-lg font-semibold text-blue-800')
+                                ui.label('This expert will automatically select the instruments for analysis. No manual selection required.').classes('text-blue-600')
+                    self.instrument_selector = None  # No manual selector needed
+                else:
+                    # Expert doesn't support instrument selection - fall back to static
+                    with ui.card().classes('w-full p-4 bg-orange-50 border-l-4 border-orange-400'):
+                        with ui.row():
+                            ui.icon('warning').classes('text-orange-600 text-xl mr-3')
+                            with ui.column():
+                                ui.label('Expert Selection Not Supported').classes('text-lg font-semibold text-orange-800')
+                                ui.label('This expert does not support automatic instrument selection. Using manual selection instead.').classes('text-orange-600')
+                    self._render_static_selector(expert)
+                    
+            elif selection_method == 'dynamic':
+                # AI-driven dynamic selection - show prompt input
+                with ui.card().classes('w-full p-4 bg-green-50 border-l-4 border-green-400'):
+                    with ui.row():
+                        ui.icon('psychology').classes('text-green-600 text-xl mr-3')
+                        with ui.column():
+                            ui.label('AI-Powered Dynamic Instrument Selection').classes('text-lg font-semibold text-green-800')
+                            ui.label('Enter a prompt to let AI select instruments based on your criteria.').classes('text-green-600')
+                
+                with ui.column().classes('w-full mt-4'):
+                    ui.label('AI Selection Prompt:').classes('text-sm font-medium mb-2')
+                    
+                    # Get default prompt from AIInstrumentSelector
+                    from ...core.AIInstrumentSelector import AIInstrumentSelector
+                    ai_selector = AIInstrumentSelector()
+                    default_prompt = ai_selector.get_default_prompt()
+                    
+                    self.ai_prompt_textarea = ui.textarea(
+                        value=default_prompt,
+                        placeholder='Enter your prompt for AI instrument selection...'
+                    ).classes('w-full').props('rows=6')
+                    
+                    with ui.row().classes('w-full justify-between mt-2'):
+                        ui.button('Reset to Default', on_click=lambda: self.ai_prompt_textarea.set_value(default_prompt), icon='refresh').classes('bg-gray-500')
+                        ui.button('Generate AI Selection', on_click=self._generate_ai_selection, icon='auto_awesome').classes('bg-green-600')
+                    
+                    # Container for AI-selected instruments (will be populated after AI selection)
+                    self.ai_results_container = ui.column().classes('w-full mt-4')
+                
+                self.instrument_selector = None  # Will be created after AI selection
+                
+            else:  # static (default)
+                self._render_static_selector(expert)
+    
+    def _render_static_selector(self, expert):
+        """Render the traditional static instrument selector."""
+        enabled_instruments = expert.get_enabled_instruments()
+        logger.debug(f"Expert {self.expert_instance_id} has {len(enabled_instruments)} enabled instruments")
+        
+        from ..components.InstrumentSelector import InstrumentSelector
+        self.instrument_selector = InstrumentSelector(
+            on_selection_change=self.on_instrument_selection_change,
+            instrument_list=enabled_instruments if enabled_instruments else None,
+            hide_weights=True
+        )
+        self.instrument_selector.render()
+    
+    def _generate_ai_selection(self):
+        """Generate AI instrument selection based on user prompt."""
+        try:
+            prompt = self.ai_prompt_textarea.value.strip()
+            if not prompt:
+                ui.notify("Please enter a prompt for AI selection", type='negative')
+                return
+            
+            # Show loading indicator
+            with self.ai_results_container:
+                self.ai_results_container.clear()
+                with ui.row().classes('items-center'):
+                    ui.spinner('dots', size='sm').classes('mr-2')
+                    ui.label('AI is selecting instruments...').classes('text-gray-600')
+            
+            # Perform AI selection in background
+            from ...core.AIInstrumentSelector import AIInstrumentSelector
+            ai_selector = AIInstrumentSelector()
+            
+            # Run AI selection
+            selected_symbols = ai_selector.select_instruments(prompt)
+            
+            # Auto-add instruments to database if they don't exist
+            if selected_symbols:
+                try:
+                    from ...core.InstrumentAutoAdder import get_instrument_auto_adder
+                    auto_adder = get_instrument_auto_adder()
+                    auto_adder.queue_instruments_for_addition(
+                        symbols=selected_symbols,
+                        expert_shortname='ai_selector',
+                        source='ai'
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not queue AI-selected instruments for auto-addition: {e}")
+            
+            # Clear loading and show results
+            self.ai_results_container.clear()
+            
+            if selected_symbols:
+                with self.ai_results_container:
+                    with ui.card().classes('w-full p-4 bg-blue-50 border border-blue-200'):
+                        with ui.column().classes('w-full'):
+                            with ui.row().classes('items-center mb-3'):
+                                ui.icon('check_circle').classes('text-green-600 mr-2')
+                                ui.label(f'AI Selected {len(selected_symbols)} Instruments').classes('text-lg font-semibold')
+                            
+                            # Show selected symbols as badges
+                            with ui.row().classes('flex-wrap gap-2'):
+                                for symbol in selected_symbols:
+                                    ui.badge(symbol).classes('bg-blue-100 text-blue-800 px-2 py-1')
+                            
+                            # Create instrument list for the selector
+                            instrument_list = [{'name': symbol, 'enabled': True} for symbol in selected_symbols]
+                            
+                            # Create traditional instrument selector with AI-selected instruments
+                            from ..components.InstrumentSelector import InstrumentSelector
+                            self.instrument_selector = InstrumentSelector(
+                                on_selection_change=self.on_instrument_selection_change,
+                                instrument_list=instrument_list,
+                                hide_weights=True
+                            )
+                            self.instrument_selector.render()
+                
+                ui.notify(f"AI selected {len(selected_symbols)} instruments successfully", type='positive')
+            else:
+                with self.ai_results_container:
+                    with ui.card().classes('w-full p-4 bg-red-50 border border-red-200'):
+                        with ui.row():
+                            ui.icon('error').classes('text-red-600 mr-2')
+                            ui.label('AI selection failed. Please try a different prompt or check your OpenAI API key.').classes('text-red-600')
+                ui.notify("AI instrument selection failed", type='negative')
+                
+        except Exception as e:
+            logger.error(f"Error during AI instrument selection: {e}", exc_info=True)
+            self.ai_results_container.clear()
+            with self.ai_results_container:
+                with ui.card().classes('w-full p-4 bg-red-50 border border-red-200'):
+                    with ui.row():
+                        ui.icon('error').classes('text-red-600 mr-2')
+                        ui.label(f'Error: {str(e)}').classes('text-red-600')
+            ui.notify(f"Error during AI selection: {str(e)}", type='negative')
     
     def on_analysis_type_change(self):
         """Handle analysis type selection change."""
@@ -771,16 +920,59 @@ class ManualAnalysisTab:
             if not self.analysis_type:
                 ui.notify("Please select an analysis type", type='negative')
                 return
+            
+            # Get the expert instance to determine selection method
+            from ...core.utils import get_expert_instance_from_id
+            expert = get_expert_instance_from_id(int(self.expert_instance_id))
+            
+            if not expert:
+                ui.notify("Failed to load expert instance", type='negative')
+                return
+            
+            # Get instrument selection method
+            instrument_selection_method = expert.settings.get('instrument_selection_method', 'static')
+            expert_properties = expert.__class__.get_expert_properties()
+            can_select_instruments = expert_properties.get('can_select_instruments', False)
+            
+            # Get instruments based on selection method
+            if instrument_selection_method == 'expert' and can_select_instruments:
+                # Expert-driven selection
+                try:
+                    instruments_to_analyze = expert.get_recommended_instruments()
+                    if not instruments_to_analyze:
+                        ui.notify("Expert returned no instrument recommendations", type='warning')
+                        return
+                    
+                    # Auto-add instruments to database if they don't exist
+                    try:
+                        from ...core.InstrumentAutoAdder import get_instrument_auto_adder
+                        auto_adder = get_instrument_auto_adder()
+                        auto_adder.queue_instruments_for_addition(
+                            symbols=instruments_to_analyze,
+                            expert_shortname=expert.shortname,
+                            source='expert'
+                        )
+                    except Exception as e:
+                        logger.warning(f"Could not queue instruments for auto-addition: {e}")
+                    
+                    # Convert to expected format
+                    selected_instruments = [{'name': symbol} for symbol in instruments_to_analyze]
+                    logger.info(f"Expert recommended {len(selected_instruments)} instruments: {instruments_to_analyze}")
+                except Exception as e:
+                    logger.error(f"Error getting expert instrument recommendations: {e}", exc_info=True)
+                    ui.notify(f"Error getting expert recommendations: {str(e)}", type='negative')
+                    return
+            else:
+                # Static or dynamic (manual selection required)
+                if not self.instrument_selector:
+                    ui.notify("No instruments available for selection", type='negative')
+                    return
                 
-            if not self.instrument_selector:
-                ui.notify("No instruments available for selection", type='negative')
-                return
-            
-            selected_instruments = self.instrument_selector.get_selected_instruments()
-            
-            if not selected_instruments:
-                ui.notify("Please select at least one instrument", type='negative')
-                return
+                selected_instruments = self.instrument_selector.get_selected_instruments()
+                
+                if not selected_instruments:
+                    ui.notify("Please select at least one instrument", type='negative')
+                    return
             
             # Submit analysis jobs for all selected instruments
             from ...core.JobManager import get_job_manager

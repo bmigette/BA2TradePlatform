@@ -7,7 +7,7 @@ import aiohttp
 import asyncio
 import json
 
-from ...core.db import get_all_instances, get_db, get_instance
+from ...core.db import get_all_instances, get_db, get_instance, update_instance
 from ...core.models import AccountDefinition, MarketAnalysis, ExpertRecommendation, ExpertInstance, AppSetting, TradingOrder
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, OrderStatus, OrderOpenType
 from ...core.utils import get_expert_instance_from_id, get_market_analysis_id_from_order_id
@@ -166,9 +166,8 @@ class OverviewTab:
                 if not provider_cls:
                     continue
                 
-                provider_obj = provider_cls(acc.id)
-                
                 try:
+                    provider_obj = provider_cls(acc.id)
                     # Get positions from broker
                     positions = provider_obj.get_positions()
                     
@@ -258,9 +257,8 @@ class OverviewTab:
                     if not provider_cls:
                         continue
                     
-                    provider_obj = provider_cls(acc.id)
-                    
                     try:
+                        provider_obj = provider_cls(acc.id)
                         # Get positions from broker
                         positions = provider_obj.get_positions()
                         
@@ -547,8 +545,8 @@ class OverviewTab:
             for acc in accounts:
                 provider_cls = providers.get(acc.provider)
                 if provider_cls:
-                    provider_obj = provider_cls(acc.id)
                     try:
+                        provider_obj = provider_cls(acc.id)
                         positions = provider_obj.get_positions()
                         for pos in positions:
                             pos_dict = pos if isinstance(pos, dict) else dict(pos)
@@ -1343,8 +1341,8 @@ class AccountOverviewTab:
         for acc in accounts:
             provider_cls = providers.get(acc.provider)
             if provider_cls:
-                provider_obj = provider_cls(acc.id)
                 try:
+                    provider_obj = provider_cls(acc.id)
                     positions = provider_obj.get_positions()
                     # Attach account name to each position for clarity
                     for pos in positions:
@@ -1359,6 +1357,9 @@ class AccountOverviewTab:
                             if isinstance(v, float):
                                 pos_dict[k] = f"{v:.2f}"
                         all_positions.append(pos_dict)
+                except Exception as e:
+                    logger.warning(f"Failed to load account {acc.name} (ID: {acc.id}): {e}")
+                    # Continue processing other accounts
                 except Exception as e:
                     all_positions.append({'account': acc.name, 'error': str(e)})
         
@@ -1573,6 +1574,11 @@ class AccountOverviewTab:
                              on_click=lambda: self._handle_retry_selected_orders(table.selected))\
                         .props('color=orange')\
                         .bind_enabled_from(table, 'selected', backward=lambda val: len(val) > 0)
+                    ui.button('Map to Broker Orders', 
+                             icon='link', 
+                             on_click=lambda: self._handle_map_selected_orders(table.selected))\
+                        .props('color=blue')\
+                        .bind_enabled_from(table, 'selected', backward=lambda val: len(val) > 0)
                     ui.button('Delete Selected Orders', 
                              icon='delete', 
                              on_click=lambda: self._handle_delete_selected_orders(table.selected))\
@@ -1773,6 +1779,301 @@ class AccountOverviewTab:
         except Exception as e:
             logger.error(f"Error confirming retry orders: {e}", exc_info=True)
             ui.notify(f'Error retrying orders: {str(e)}', type='negative')
+    
+    def _handle_map_selected_orders(self, selected_rows):
+        """Handle mapping selected database orders to broker orders."""
+        try:
+            if not selected_rows:
+                ui.notify('No orders selected', type='warning')
+                return
+            
+            # Get order IDs from selected rows
+            order_ids = [row['order_id'] for row in selected_rows]
+            
+            # Get database orders
+            db_orders = []
+            for order_id in order_ids:
+                order = get_instance(TradingOrder, order_id)
+                if order:
+                    db_orders.append(order)
+            
+            if not db_orders:
+                ui.notify('No valid orders found', type='warning')
+                return
+            
+            # Open mapping dialog
+            self._show_order_mapping_dialog(db_orders)
+            
+        except Exception as e:
+            logger.error(f"Error handling map selected orders: {e}", exc_info=True)
+            ui.notify(f'Error: {str(e)}', type='negative')
+    
+    def _show_order_mapping_dialog(self, db_orders):
+        """Show dialog to map database orders to broker orders."""
+        try:
+            # Get all unique accounts from selected orders
+            account_ids = list(set(order.account_id for order in db_orders))
+            
+            # Fetch broker orders for these accounts
+            all_broker_orders = {}
+            for account_id in account_ids:
+                try:
+                    account = get_instance(AccountDefinition, account_id)
+                    if not account:
+                        continue
+                        
+                    from ...modules.accounts import providers
+                    provider_cls = providers.get(account.provider)
+                    if not provider_cls:
+                        continue
+                    
+                    provider_obj = provider_cls(account.id)
+                    broker_orders = provider_obj.get_orders()
+                    
+                    # Filter to recent orders and convert to dict format
+                    if broker_orders:
+                        all_broker_orders[account_id] = [
+                            {
+                                'broker_order_id': str(bo.broker_order_id) if hasattr(bo, 'broker_order_id') and bo.broker_order_id is not None else str(bo.id),
+                                'symbol': bo.symbol,
+                                'side': bo.side,
+                                'quantity': bo.quantity,
+                                'status': bo.status,
+                                'order_type': getattr(bo, 'order_type', 'Unknown'),
+                                'created_at': getattr(bo, 'created_at', 'Unknown'),
+                                'client_order_id': getattr(bo, 'client_order_id', 'N/A')
+                            }
+                            for bo in broker_orders[-50:]  # Last 50 orders
+                        ]
+                        
+                except Exception as e:
+                    logger.warning(f"Could not fetch broker orders for account {account_id}: {e}")
+                    all_broker_orders[account_id] = []
+            
+            # Create mapping dialog
+            with ui.dialog().classes('w-[1200px] max-w-[90vw]') as dialog, ui.card():
+                ui.label('Map Database Orders to Broker Orders').classes('text-h5 mb-4')
+                ui.label('Match database orders with corresponding broker orders. Orders with matching symbol and quantity will be suggested.').classes('text-sm text-gray-600 mb-4')
+                
+                mapping_data = {}
+                
+                with ui.scroll_area().style('height: 600px'):
+                    for i, db_order in enumerate(db_orders):
+                        account_broker_orders = all_broker_orders.get(db_order.account_id, [])
+                        
+                        with ui.card().classes('mb-4 p-4'):
+                            # Database order info
+                            with ui.row().classes('w-full items-center mb-3'):
+                                ui.label(f'Database Order #{db_order.id}').classes('text-lg font-bold')
+                                ui.badge(f'{db_order.symbol}', color='blue').classes('ml-2')
+                                ui.badge(f'{db_order.side.value}', color='orange').classes('ml-1')
+                                ui.badge(f'{db_order.quantity}', color='green').classes('ml-1')
+                                ui.badge(f'Status: {db_order.status.value}', color='red').classes('ml-1')
+                            
+                            if db_order.broker_order_id:
+                                ui.label(f'Current Broker ID: {db_order.broker_order_id}').classes('text-sm text-gray-600 mb-2')
+                            else:
+                                ui.label('No broker order ID assigned').classes('text-sm text-orange-600 mb-2')
+                            
+                            # Broker order selection
+                            ui.label('Select matching broker order:').classes('text-sm font-medium mb-2')
+                            
+                            # Create options for broker orders
+                            broker_options = [{'label': 'No mapping', 'value': None}]
+                            suggested_match = None
+                            
+                            for bo in account_broker_orders:
+                                # Check if broker order is already used
+                                already_used = any(
+                                    other_order.broker_order_id == bo['broker_order_id'] 
+                                    for other_order in db_orders 
+                                    if other_order.id != db_order.id and other_order.broker_order_id
+                                )
+                                
+                                status_badge = '🔴' if already_used else '🟢'
+                                match_score = 0
+                                
+                                # Calculate match score
+                                if bo['symbol'] == db_order.symbol:
+                                    match_score += 10
+                                if bo['side'] == db_order.side.value:
+                                    match_score += 5
+                                if abs(float(bo['quantity']) - float(db_order.quantity)) < 0.01:
+                                    match_score += 10
+                                
+                                # Format creation date for display
+                                created_date = str(bo['created_at'])[:19] if bo['created_at'] != 'Unknown' else 'Unknown'
+                                
+                                # Format order type for display
+                                order_type_display = bo['order_type'].value if hasattr(bo['order_type'], 'value') else str(bo['order_type'])
+                                
+                                # Create detailed display label with symbol, qty, order type, creation date, and client_order_id
+                                label = f"{status_badge} {bo['symbol']} | {order_type_display} | Qty: {bo['quantity']} | {created_date} | Client: {bo['client_order_id']}"
+                                if already_used:
+                                    label += " (USED)"
+                                
+                                broker_options.append({
+                                    'label': label,
+                                    'value': bo['broker_order_id'],
+                                    'disabled': already_used,
+                                    'match_score': match_score
+                                })
+                                
+                                # Suggest best match that's not already used
+                                if not already_used and match_score >= 20 and (not suggested_match or match_score > suggested_match['match_score']):
+                                    suggested_match = {'value': bo['broker_order_id'], 'match_score': match_score}
+                            
+                            # Sort options by match score (but keep "No mapping" first)
+                            broker_options = [broker_options[0]] + sorted(broker_options[1:], key=lambda x: x.get('match_score', 0), reverse=True)
+                            
+                            # Create select widget - ensure all values are strings for consistency
+                            default_value = str(suggested_match['value']) if suggested_match and suggested_match['value'] is not None else None
+                            
+                            # Convert all broker option values to strings
+                            for opt in broker_options:
+                                if opt['value'] is not None:
+                                    opt['value'] = str(opt['value'])
+                            
+                            if db_order.broker_order_id:
+                                broker_order_id_str = str(db_order.broker_order_id)
+                                # Check if current broker ID exists in options
+                                broker_id_exists = any(opt['value'] == broker_order_id_str for opt in broker_options[1:])
+                                if not broker_id_exists:
+                                    # Current broker ID not in list, add it
+                                    broker_options.insert(1, {
+                                        'label': f'🔴 {broker_order_id_str} (CURRENT - NOT FOUND IN BROKER)',
+                                        'value': broker_order_id_str,
+                                        'disabled': True
+                                    })
+                                # Always set current broker ID as default if it exists
+                                default_value = broker_order_id_str
+                            
+                            # Final safety check: ensure default_value is in options
+                            logger.debug(f"Order mapping debug - DB Order {db_order.id}: broker_order_id='{db_order.broker_order_id}' (type: {type(db_order.broker_order_id)}), default_value='{default_value}' (type: {type(default_value)})")
+                            logger.debug(f"Order mapping debug - Broker options: {[(opt['value'], type(opt['value'])) for opt in broker_options]}")
+                            
+                            if default_value is not None and not any(opt['value'] == default_value for opt in broker_options):
+                                logger.warning(f"Default value '{default_value}' (type: {type(default_value)}) not found in broker options, falling back to None")
+                                # Let's also try string comparison in case there's a type mismatch
+                                str_match = any(str(opt['value']) == str(default_value) for opt in broker_options)
+                                logger.warning(f"String comparison match: {str_match}")
+                                default_value = None
+                            
+                            logger.debug(f"Order mapping debug - Final default_value: '{default_value}'")
+                            
+                            # Create select with proper options mapping
+                            # Convert options to the format NiceGUI expects: {value: label}
+                            select_options = {opt['value']: opt['label'] for opt in broker_options}
+                            
+                            try:
+                                select = ui.select(
+                                    options=select_options,
+                                    value=default_value,
+                                    label='Broker Order'
+                                ).classes('w-full')
+                            except ValueError as e:
+                                logger.error(f"Failed to create select with value '{default_value}': {e}")
+                                logger.error(f"Available options: {list(select_options.keys())}")
+                                # Force fallback to None and retry
+                                select = ui.select(
+                                    options=select_options,
+                                    value=None,
+                                    label='Broker Order'
+                                ).classes('w-full')
+                            
+                            mapping_data[db_order.id] = select
+                            
+                            if suggested_match and not db_order.broker_order_id:
+                                ui.label(f'✨ Suggested match (score: {suggested_match["match_score"]})').classes('text-xs text-green-600')
+                
+                # Dialog buttons
+                with ui.row().classes('w-full justify-end gap-2 mt-4'):
+                    ui.button('Cancel', on_click=dialog.close).props('flat')
+                    ui.button('Apply Mapping', 
+                             on_click=lambda: self._apply_order_mapping(mapping_data, db_orders, dialog))\
+                        .props('color=blue')
+            
+            dialog.open()
+            
+        except Exception as e:
+            logger.error(f"Error showing order mapping dialog: {e}", exc_info=True)
+            ui.notify(f'Error: {str(e)}', type='negative')
+    
+    def _apply_order_mapping(self, mapping_data, db_orders, dialog):
+        """Apply the order mapping selections."""
+        try:
+            updated_count = 0
+            errors = []
+            
+            for db_order in db_orders:
+                try:
+                    select_widget = mapping_data[db_order.id]
+                    new_broker_id = select_widget.value
+                    
+                    # Skip if no change
+                    if new_broker_id == db_order.broker_order_id:
+                        continue
+                    
+                    # Validate broker order ID isn't already used (double check)
+                    if new_broker_id:
+                        existing_order = None
+                        with get_db() as session:
+                            stmt = select(TradingOrder).where(
+                                TradingOrder.broker_order_id == new_broker_id,
+                                TradingOrder.id != db_order.id
+                            )
+                            existing_order = session.exec(stmt).first()
+                        
+                        if existing_order:
+                            errors.append(f"Order {db_order.id}: Broker ID {new_broker_id} already used by order {existing_order.id}")
+                            continue
+                    
+                    # Update only the broker_order_id field - do NOT update status during mapping
+                    # Status updates should only happen through proper account refresh, not mapping
+                    old_broker_id = db_order.broker_order_id
+                    db_order.broker_order_id = new_broker_id
+                    
+                    logger.info(f"Order mapping: Updated order {db_order.id} broker_order_id from '{old_broker_id}' to '{new_broker_id}' (status remains {db_order.status.value})")
+                    
+                    # Save the order
+                    if update_instance(db_order):
+                        updated_count += 1
+                        logger.info(f"Mapped order {db_order.id} to broker order {new_broker_id}")
+                    else:
+                        errors.append(f"Order {db_order.id}: Failed to save mapping")
+                        
+                except Exception as e:
+                    logger.error(f"Error mapping order {db_order.id}: {e}", exc_info=True)
+                    errors.append(f"Order {db_order.id}: {str(e)}")
+            
+            # Show results
+            if updated_count > 0:
+                ui.notify(f'Successfully mapped {updated_count} order(s)', type='positive')
+            
+            if errors:
+                error_msg = '; '.join(errors[:3])
+                if len(errors) > 3:
+                    error_msg += f'... and {len(errors) - 3} more errors'
+                ui.notify(f'Errors: {error_msg}', type='warning')
+            
+            # Close dialog and refresh
+            dialog.close()
+            
+            # Note: We intentionally do NOT call account refresh here to avoid triggering
+            # any automatic order creation or status update logic. Order mapping should
+            # ONLY update the broker_order_id field. Status updates should happen through
+            # the normal account refresh cycle, not during manual mapping.
+            logger.info(f"Order mapping completed. Updated {updated_count} order(s). No automatic refresh performed.")
+            
+            # Refresh the pending orders table
+            if hasattr(self, 'pending_orders_container'):
+                self.pending_orders_container.clear()
+                with self.pending_orders_container:
+                    self._render_pending_orders_content()
+            
+        except Exception as e:
+            logger.error(f"Error applying order mapping: {e}", exc_info=True)
+            ui.notify(f'Error applying mapping: {str(e)}', type='negative')
     
     def _handle_delete_selected_orders(self, selected_rows):
         """Handle deletion of selected pending orders."""

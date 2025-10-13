@@ -17,7 +17,7 @@ ALPHA_VANTAGE_API_KEY=None
 DB_FILE = os.path.join(os.path.expanduser("~"), "Documents", "ba2_trade_platform", "db.sqlite")
 CACHE_FOLDER = os.path.join(os.path.expanduser("~"), "Documents", "ba2_trade_platform", "cache")
 # Price cache duration in seconds
-PRICE_CACHE_TIME = 30  # Default to 30 seconds
+PRICE_CACHE_TIME = 60  # Default to 60 seconds
 
 def load_config_from_env() -> None:
     global FINNHUB_API_KEY, OPENAI_API_KEY, OPENAI_BACKEND_URL, ALPHA_VANTAGE_API_KEY, FILE_LOGGING, PRICE_CACHE_TIME
@@ -34,7 +34,7 @@ def load_config_from_env() -> None:
     try:
         PRICE_CACHE_TIME = int(os.getenv('PRICE_CACHE_TIME', PRICE_CACHE_TIME))
     except ValueError:
-        PRICE_CACHE_TIME = 30    
+        PRICE_CACHE_TIME = 60    
 
 
 def get_app_setting(key: str, default: Optional[str] = None) -> Optional[str]:

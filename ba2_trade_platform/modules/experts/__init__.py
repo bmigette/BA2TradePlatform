@@ -1,10 +1,11 @@
 from .TradingAgents import TradingAgents
 from .FinnHubRating import FinnHubRating
 from .FMPRating import FMPRating
-from .FMPSenateTrade import FMPSenateTrade
+from .FMPSenateTraderWeight import FMPSenateTraderWeight
+from .FMPSenateTraderCopy import FMPSenateTraderCopy
 #from .FinRobotExpert import FinRobotExpert
 
-experts = [TradingAgents, FinnHubRating, FMPRating, FMPSenateTrade] #, FinRobotExpert]
+experts = [TradingAgents, FinnHubRating, FMPRating, FMPSenateTraderWeight, FMPSenateTraderCopy] #, FinRobotExpert]
 
 def get_expert_class(expert_type):
     """Get the expert class by type name."""
