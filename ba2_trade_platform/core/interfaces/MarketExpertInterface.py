@@ -26,6 +26,8 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             id (int): The unique identifier for the Expert Instance.
         """
         self.id = id
+        # Initialize settings cache to None (will be loaded on first access)
+        self._settings_cache = None
         
         # Ensure builtin settings are initialized
         self._ensure_builtin_settings()

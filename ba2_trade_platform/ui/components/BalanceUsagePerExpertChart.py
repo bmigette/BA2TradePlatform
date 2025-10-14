@@ -102,8 +102,7 @@ class BalanceUsagePerExpertChart:
                     # Get account interface for market price (needed for pending equity)
                     account_interface = None
                     try:
-                        from ...modules.accounts import get_account_class
-                        from ...core.models import AccountDefinition
+                        from ...core.utils import get_account_instance_from_id
                         
                         # Get account from first order of this transaction
                         first_order = session.exec(
@@ -113,11 +112,8 @@ class BalanceUsagePerExpertChart:
                         ).first()
                         
                         if first_order and first_order.account_id:
-                            acc_def = session.get(AccountDefinition, first_order.account_id)
-                            if acc_def:
-                                account_class = get_account_class(acc_def.provider)
-                                if account_class:
-                                    account_interface = account_class(acc_def.id)
+                            # Use cached account instance instead of creating new one
+                            account_interface = get_account_instance_from_id(first_order.account_id, session=session)
                     except Exception as e:
                         logger.debug(f"Could not get account interface for transaction {transaction.id}: {e}")
                     

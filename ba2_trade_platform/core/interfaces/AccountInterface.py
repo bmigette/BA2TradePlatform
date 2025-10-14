@@ -41,6 +41,8 @@ class AccountInterface(ExtendableSettingsInterface):
             id (int): The unique identifier for the account.
         """
         self.id = id
+        # Initialize settings cache to None (will be loaded on first access)
+        self._settings_cache = None
         # Ensure this account has an entry in the global cache
         with self._CACHE_LOCK:
             if self.id not in self._GLOBAL_PRICE_CACHE:

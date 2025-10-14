@@ -2417,38 +2417,61 @@ class TransactionsTab:
                 ui.label('No transactions found.').classes('text-gray-500')
                 return
             
+            # BATCH PRICE FETCHING: Collect all symbols from open transactions grouped by account
+            # This prevents individual API calls and uses batch fetching instead
+            from ...core.types import TransactionStatus
+            from ...core.models import TradingOrder
+            from collections import defaultdict
+            
+            symbols_by_account = defaultdict(set)  # account_id -> set of symbols
+            txn_to_account = {}  # transaction_id -> account_id mapping
+            
+            for txn in transactions:
+                if txn.status == TransactionStatus.OPENED and txn.open_price and txn.quantity:
+                    # Get account_id for this transaction
+                    order_stmt = select(TradingOrder).where(TradingOrder.transaction_id == txn.id).limit(1)
+                    first_order = session.exec(order_stmt).first()
+                    if first_order:
+                        symbols_by_account[first_order.account_id].add(txn.symbol)
+                        txn_to_account[txn.id] = first_order.account_id
+            
+            # Fetch prices in batch for each account
+            current_prices = {}  # symbol -> price mapping
+            for account_id, symbols in symbols_by_account.items():
+                try:
+                    account_inst = get_account_instance_from_id(account_id)
+                    if account_inst and symbols:
+                        symbols_list = list(symbols)
+                        logger.debug(f"[BATCH] Fetching {len(symbols_list)} symbols for account {account_id}: {symbols_list}")
+                        # Batch fetch - returns dict {symbol: price}
+                        prices_dict = account_inst.get_instrument_current_price(symbols_list)
+                        if prices_dict:
+                            current_prices.update(prices_dict)
+                except Exception as e:
+                    logger.warning(f"Batch price fetch failed for account {account_id}: {e}")
+            
             # Prepare table data
             logger.debug(f"[RENDER] _render_transactions_table() - Building rows for {len(transactions)} transactions")
             rows = []
             for txn in transactions:
-                # Calculate current P/L for open positions using current price
+                # Calculate current P/L for open positions using cached/batch-fetched price
                 current_pnl = ''
                 current_price_str = ''
                 
-                # Fetch current price for open transactions
-                from ...core.types import TransactionStatus
+                # Use batch-fetched prices for open transactions
                 if txn.status == TransactionStatus.OPENED and txn.open_price and txn.quantity:
                     try:
-                        # Get account instance to fetch current price
-                        from ...core.models import TradingOrder
-                        # Find any order from this transaction to get account_id
-                        order_stmt = select(TradingOrder).where(TradingOrder.transaction_id == txn.id).limit(1)
-                        first_order = session.exec(order_stmt).first()
-                        
-                        if first_order:
-                            account_inst = get_account_instance_from_id(first_order.account_id)
-                            if account_inst:
-                                current_price = account_inst.get_instrument_current_price(txn.symbol)
-                                if current_price:
-                                    current_price_str = f"${current_price:.2f}"
-                                    # Calculate P/L: (current_price - open_price) * quantity
-                                    if txn.quantity > 0:  # Long position
-                                        pnl_current = (current_price - txn.open_price) * abs(txn.quantity)
-                                    else:  # Short position
-                                        pnl_current = (txn.open_price - current_price) * abs(txn.quantity)
-                                    current_pnl = f"${pnl_current:+.2f}"
+                        current_price = current_prices.get(txn.symbol)
+                        if current_price:
+                            current_price_str = f"${current_price:.2f}"
+                            # Calculate P/L: (current_price - open_price) * quantity
+                            if txn.quantity > 0:  # Long position
+                                pnl_current = (current_price - txn.open_price) * abs(txn.quantity)
+                            else:  # Short position
+                                pnl_current = (txn.open_price - current_price) * abs(txn.quantity)
+                            current_pnl = f"${pnl_current:+.2f}"
                     except Exception as e:
-                        logger.debug(f"Could not fetch current price for {txn.symbol}: {e}")
+                        logger.debug(f"Could not calculate P/L for {txn.symbol}: {e}")
                 
                 # Closed P/L - calculate from open/close prices
                 closed_pnl = ''
