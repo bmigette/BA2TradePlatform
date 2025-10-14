@@ -36,9 +36,19 @@ class OpenAISocialMediaSentiment(SocialMediaDataProviderInterface):
         
         # Get OpenAI configuration
         self.backend_url = config.OPENAI_BACKEND_URL
-        self.model = model
+        self.model = model or config.OPENAI_MODEL
         
-        self.client = OpenAI(base_url=self.backend_url)
+        # Get API key from database settings
+        api_key = config.get_app_setting('openai_api_key')
+        if not api_key:
+            api_key = config.OPENAI_API_KEY or "dummy-key-not-used"
+            logger.warning("OpenAI API key not found in database settings, using config or dummy key")
+        
+        # Initialize OpenAI client with web search capabilities
+        self.client = OpenAI(
+            base_url=self.backend_url,
+            api_key=api_key
+        )
         logger.debug(f"Initialized OpenAISocialMediaSentiment with model={self.model}, backend_url={self.backend_url}")
     
     @log_provider_call
@@ -95,7 +105,7 @@ Provide a comprehensive sentiment analysis including:
 Focus on posts and discussions that occurred within the specified date range ({start_str} to {end_str}).
 Provide specific examples with dates when possible."""
 
-            # Call OpenAI API with web search
+            # Call OpenAI API with web search enabled
             response = self.client.responses.create(
                 model=self.model,
                 input=[
@@ -119,13 +129,39 @@ Provide specific examples with dates when possible."""
                     }
                 ],
                 temperature=1,
-                max_output_tokens=4096,
+                max_output_tokens=65535,
                 top_p=1,
                 store=True,
             )
             
-            # Extract the response text
-            sentiment_text = response.output[1].content[0].text
+            # Extract text from response using robust parsing
+            sentiment_text = ""
+            
+            # Try response.output_text first (simple accessor for full text)
+            if hasattr(response, 'output_text') and response.output_text and isinstance(response.output_text, str) and len(response.output_text.strip()) > 0:
+                sentiment_text = response.output_text
+                logger.debug(f"Extracted text via response.output_text: {len(sentiment_text)} chars")
+            # Fall back to iterating through output items (output_text is often empty, need to check output array)
+            elif hasattr(response, 'output') and response.output:
+                logger.debug(f"Iterating through {len(response.output)} output items")
+                for item in response.output:
+                    # Check for ResponseOutputMessage with content
+                    if hasattr(item, 'content') and isinstance(item.content, list):
+                        logger.debug(f"Found item with content list ({len(item.content)} items)")
+                        for content_item in item.content:
+                            if hasattr(content_item, 'text'):
+                                text_value = str(content_item.text)
+                                logger.debug(f"Found text in content item: {len(text_value)} chars")
+                                sentiment_text += text_value + "\n\n"
+                sentiment_text = sentiment_text.strip()
+                logger.debug(f"Extracted text via output iteration: {len(sentiment_text)} chars")
+            
+            if not sentiment_text:
+                logger.error(f"Could not extract text from OpenAI response for {symbol}")
+                logger.error(f"Response has output_text: {hasattr(response, 'output_text')}, type: {type(response.output_text) if hasattr(response, 'output_text') else 'N/A'}, value: {repr(response.output_text)[:200] if hasattr(response, 'output_text') else 'N/A'}")
+                sentiment_text = "Error: Could not extract sentiment analysis from OpenAI response."
+            
+            logger.debug(f"Received sentiment analysis for {symbol}: {len(sentiment_text)} chars")
             
             # Build dict response (always build it for "both" format support)
             dict_response = {

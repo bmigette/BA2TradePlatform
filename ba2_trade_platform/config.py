@@ -23,7 +23,7 @@ PRICE_CACHE_TIME = 60  # Default to 60 seconds
 
 def load_config_from_env() -> None:
     global FINNHUB_API_KEY, OPENAI_API_KEY, OPENAI_BACKEND_URL, OPENAI_MODEL, OPENAI_FALLBACK_MODEL, ALPHA_VANTAGE_API_KEY, FILE_LOGGING, PRICE_CACHE_TIME
-    """Loads configuration from environment variables."""
+    """Loads configuration from environment variables and database app settings."""
 
     env_file = os.path.join(HOME_PARENT, '.env')
     load_dotenv(env_file)
@@ -38,7 +38,20 @@ def load_config_from_env() -> None:
     try:
         PRICE_CACHE_TIME = int(os.getenv('PRICE_CACHE_TIME', PRICE_CACHE_TIME))
     except ValueError:
-        PRICE_CACHE_TIME = 60    
+        PRICE_CACHE_TIME = 60
+    
+    # Override with database app settings if available
+    try:
+        db_openai_key = get_app_setting('openai_api_key')
+        if db_openai_key:
+            OPENAI_API_KEY = db_openai_key
+        
+        db_openai_model = get_app_setting('openai_quick_think_llm')
+        if db_openai_model:
+            OPENAI_MODEL = db_openai_model
+    except Exception:
+        # Database might not be initialized yet, ignore errors
+        pass    
 
 
 def get_app_setting(key: str, default: Optional[str] = None) -> Optional[str]:

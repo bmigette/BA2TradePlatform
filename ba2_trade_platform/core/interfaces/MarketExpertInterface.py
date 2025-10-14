@@ -414,9 +414,9 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         """
         try:
             # Get the minimum balance threshold from settings
-            min_balance_pct = self.settings.get('min_available_balance_pct', 20.0)
+            min_balance_pct = self.settings.get('min_available_balance_pct', 10.0)
             if min_balance_pct is None:
-                min_balance_pct = 20.0
+                min_balance_pct = 10.0
             
             # Get virtual and available balances using direct methods
             virtual_balance = self.get_virtual_balance()
