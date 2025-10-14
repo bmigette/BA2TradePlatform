@@ -25,5 +25,5 @@ def layout_render(navigation_title: str):
         ui.space()
         with ui.row():
             topmenu()
-    with ui.column().classes('items-center'):
+    with ui.column().classes('w-full'):
         yield

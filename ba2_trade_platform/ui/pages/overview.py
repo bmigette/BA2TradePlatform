@@ -10,7 +10,7 @@ import json
 from ...core.db import get_all_instances, get_db, get_instance, update_instance
 from ...core.models import AccountDefinition, MarketAnalysis, ExpertRecommendation, ExpertInstance, AppSetting, TradingOrder
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, OrderStatus, OrderOpenType
-from ...core.utils import get_expert_instance_from_id, get_market_analysis_id_from_order_id
+from ...core.utils import get_expert_instance_from_id, get_market_analysis_id_from_order_id, get_account_instance_from_id
 from ...modules.accounts import providers
 from ...logger import logger
 from ..components import ProfitPerExpertChart, InstrumentDistributionChart, BalanceUsagePerExpertChart
@@ -20,6 +20,7 @@ from ..components.FloatingPLPerAccountWidget import FloatingPLPerAccountWidget
 class OverviewTab:
     def __init__(self, tabs_ref=None):
         self.tabs_ref = tabs_ref
+        self.container = ui.column().classes('w-full')
         self.render()
     
     def _check_and_display_error_orders(self):
@@ -164,12 +165,11 @@ class OverviewTab:
             accounts = get_all_instances(AccountDefinition)
             
             for acc in accounts:
-                provider_cls = providers.get(acc.provider)
-                if not provider_cls:
-                    continue
-                
                 try:
-                    provider_obj = provider_cls(acc.id)
+                    provider_obj = get_account_instance_from_id(acc.id)
+                    if not provider_obj:
+                        continue
+                    
                     # Get positions from broker
                     positions = provider_obj.get_positions()
                     
@@ -255,12 +255,11 @@ class OverviewTab:
                 accounts = get_all_instances(AccountDefinition)
                 
                 for acc in accounts:
-                    provider_cls = providers.get(acc.provider)
-                    if not provider_cls:
-                        continue
-                    
                     try:
-                        provider_obj = provider_cls(acc.id)
+                        provider_obj = get_account_instance_from_id(acc.id)
+                        if not provider_obj:
+                            continue
+                        
                         # Get positions from broker
                         positions = provider_obj.get_positions()
                         
@@ -489,40 +488,47 @@ class OverviewTab:
         """Render the overview tab."""
         logger.debug("[RENDER] OverviewTab.render() - START")
         
-        # Check for ERROR orders and display alert
-        self._check_and_display_error_orders()
+        # Clear container and rebuild
+        self.container.clear()
         
-        # Create container for quantity mismatch alerts
-        self.mismatch_alerts_container = ui.column().classes('w-full')
-        
-        # Check for quantity mismatches asynchronously
-        asyncio.create_task(self._check_and_display_quantity_mismatches_async())
-        
-        # Check for PENDING orders and display notification
-        self._check_and_display_pending_orders(self.tabs_ref)
-        
-        with ui.grid(columns=4).classes('w-full gap-4'):
-            pass
-            # Row 1: OpenAI Spending, Analysis Jobs, Order Statistics, and Order Recommendations
-            self._render_openai_spending_widget()
-            self._render_analysis_jobs_widget()
-            self._render_order_statistics_widget()
-            with ui.column().classes(''):
-                self._render_order_recommendations_widget()
+        with self.container:
+            # Add refresh button at the top
+            with ui.row().classes('w-full justify-end mb-2'):
+                ui.button('🔄 Refresh', on_click=lambda: self.render()).props('flat color=primary')
             
-            # Row 2: Floating P/L widgets
-            FloatingPLPerExpertWidget()
-            FloatingPLPerAccountWidget()
+            # Check for ERROR orders and display alert
+            self._check_and_display_error_orders()
             
-            # Row 3: Profit Per Expert and Balance Usage Per Expert
-            ProfitPerExpertChart()
-            BalanceUsagePerExpertChart()
+            # Create container for quantity mismatch alerts
+            self.mismatch_alerts_container = ui.column().classes('w-full')
             
-            # Row 3: Position Distribution by Label
-            self._render_position_distribution_widget(grouping_field='labels')
+            # Check for quantity mismatches asynchronously
+            asyncio.create_task(self._check_and_display_quantity_mismatches_async())
             
-            # Row 3: Position Distribution by Category (can span or be paired with other widgets)
-            self._render_position_distribution_widget(grouping_field='categories')
+            # Check for PENDING orders and display notification
+            self._check_and_display_pending_orders(self.tabs_ref)
+            
+            with ui.grid(columns=4).classes('w-full gap-4'):
+                # Row 1: OpenAI Spending, Analysis Jobs, Order Statistics, and Order Recommendations
+                self._render_openai_spending_widget()
+                self._render_analysis_jobs_widget()
+                self._render_order_statistics_widget()
+                with ui.column().classes(''):
+                    self._render_order_recommendations_widget()
+                
+                # Row 2: Floating P/L widgets
+                FloatingPLPerExpertWidget()
+                FloatingPLPerAccountWidget()
+                
+                # Row 3: Profit Per Expert and Balance Usage Per Expert
+                ProfitPerExpertChart()
+                BalanceUsagePerExpertChart()
+                
+                # Row 3: Position Distribution by Label
+                self._render_position_distribution_widget(grouping_field='labels')
+                
+                # Row 3: Position Distribution by Category (can span or be paired with other widgets)
+                self._render_position_distribution_widget(grouping_field='categories')
     
     def _render_position_distribution_widget(self, grouping_field='labels'):
         """Fetch positions from accounts and render distribution chart.
@@ -549,17 +555,16 @@ class OverviewTab:
             all_positions_raw = []
             
             for acc in accounts:
-                provider_cls = providers.get(acc.provider)
-                if provider_cls:
-                    try:
-                        provider_obj = provider_cls(acc.id)
+                try:
+                    provider_obj = get_account_instance_from_id(acc.id)
+                    if provider_obj:
                         positions = provider_obj.get_positions()
                         for pos in positions:
                             pos_dict = pos if isinstance(pos, dict) else dict(pos)
                             pos_dict['account'] = acc.name
                             all_positions_raw.append(pos_dict)
-                    except Exception as e:
-                        logger.error(f"Error fetching positions from account {acc.name}: {e}", exc_info=True)
+                except Exception as e:
+                    logger.error(f"Error fetching positions from account {acc.name}: {e}", exc_info=True)
             
             # Clear loading message - check if client still exists
             try:
@@ -1334,69 +1339,111 @@ class OverviewTab:
 
 class AccountOverviewTab:
     def __init__(self):
+        self.container = ui.column().classes('w-full')
         self.render()
-        pass
 
     def render(self):
         logger.debug("[RENDER] AccountOverviewTab.render() - START")
-        accounts = get_all_instances(AccountDefinition)
-        all_positions = []
-        # Keep unformatted positions for chart calculations
-        all_positions_raw = []
         
-        for acc in accounts:
-            provider_cls = providers.get(acc.provider)
-            if provider_cls:
+        # Clear container and rebuild
+        self.container.clear()
+        
+        with self.container:
+            # Add refresh button at the top
+            with ui.row().classes('w-full justify-end mb-2'):
+                ui.button('🔄 Refresh', on_click=lambda: self.render()).props('flat color=primary')
+            
+            accounts = get_all_instances(AccountDefinition)
+            all_positions = []
+            # Keep unformatted positions for chart calculations
+            all_positions_raw = []
+            position_counter = 0  # Counter for unique row keys
+            
+            for acc in accounts:
                 try:
-                    provider_obj = provider_cls(acc.id)
-                    positions = provider_obj.get_positions()
-                    # Attach account name to each position for clarity
-                    for pos in positions:
-                        pos_dict = pos if isinstance(pos, dict) else dict(pos)
-                        pos_dict['account'] = acc.name
-                        
-                        # Keep raw copy for chart
-                        all_positions_raw.append(pos_dict.copy())
-                        
-                        # Format all float values to 2 decimal places for display
-                        for k, v in pos_dict.items():
-                            if isinstance(v, float):
-                                pos_dict[k] = f"{v:.2f}"
-                        all_positions.append(pos_dict)
+                    provider_obj = get_account_instance_from_id(acc.id)
+                    if provider_obj:
+                        positions = provider_obj.get_positions()
+                        # Attach account name to each position for clarity
+                        for pos in positions:
+                            pos_dict = pos if isinstance(pos, dict) else dict(pos)
+                            pos_dict['account'] = acc.name
+                            # Add unique row key combining account and symbol
+                            pos_dict['_row_key'] = f"{acc.name}_{pos_dict.get('symbol', '')}_{position_counter}"
+                            position_counter += 1
+                            
+                            # Keep raw copy for chart
+                            all_positions_raw.append(pos_dict.copy())
+                            
+                            # Format all float values to 2 decimal places for display
+                            for k, v in pos_dict.items():
+                                if isinstance(v, float):
+                                    pos_dict[k] = f"{v:.2f}"
+                            all_positions.append(pos_dict)
                 except Exception as e:
                     logger.warning(f"Failed to load account {acc.name} (ID: {acc.id}): {e}")
                     # Continue processing other accounts
-                except Exception as e:
-                    all_positions.append({'account': acc.name, 'error': str(e)})
-        
-        columns = [
-            {'name': 'account', 'label': 'Account', 'field': 'account'},
-            {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol'},
-            {'name': 'exchange', 'label': 'Exchange', 'field': 'exchange'},
-            {'name': 'asset_class', 'label': 'Asset Class', 'field': 'asset_class'},
-            {'name': 'side', 'label': 'Side', 'field': 'side'},
-            {'name': 'qty', 'label': 'Quantity', 'field': 'qty'},
-            {'name': 'current_price', 'label': 'Current Price', 'field': 'current_price'},
-            {'name': 'avg_entry_price', 'label': 'Entry Price', 'field': 'avg_entry_price'},
-            {'name': 'market_value', 'label': 'Market Value', 'field': 'market_value'},
-            {'name': 'unrealized_pl', 'label': 'Unrealized P/L', 'field': 'unrealized_pl'},
-            {'name': 'unrealized_plpc', 'label': 'P/L %', 'field': 'unrealized_plpc'},
-            {'name': 'change_today', 'label': 'Today Change %', 'field': 'change_today'}
-        ]
-        # Open Positions Table
-        with ui.card():
-            ui.label('Open Positions Across All Accounts').classes('text-h6 mb-4')
-            ui.table(columns=columns, rows=all_positions, row_key='account').classes('w-full')
-        
-        # All Orders Table
-        with ui.card().classes('mt-4'):
-            ui.label('Recent Orders from All Accounts (Past 15 Days)').classes('text-h6 mb-4')
-            self._render_live_orders_table()
-        
-        # Pending Orders Table
-        with ui.card().classes('mt-4'):
-            ui.label('Pending Orders (PENDING, WAITING_TRIGGER, or ERROR)').classes('text-h6 mb-4')
-            self._render_pending_orders_table()
+            
+            columns = [
+                {'name': 'account', 'label': 'Account', 'field': 'account', 'sortable': True, 'align': 'left'},
+                {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'align': 'left'},
+                {'name': 'exchange', 'label': 'Exchange', 'field': 'exchange', 'sortable': True, 'align': 'left'},
+                {'name': 'asset_class', 'label': 'Asset Class', 'field': 'asset_class', 'sortable': True, 'align': 'left'},
+                {'name': 'side', 'label': 'Side', 'field': 'side', 'sortable': True, 'align': 'center'},
+                {'name': 'qty', 'label': 'Quantity', 'field': 'qty', 'sortable': True, 'align': 'right'},
+                {'name': 'current_price', 'label': 'Current Price', 'field': 'current_price', 'sortable': True, 'align': 'right'},
+                {'name': 'avg_entry_price', 'label': 'Entry Price', 'field': 'avg_entry_price', 'sortable': True, 'align': 'right'},
+                {'name': 'market_value', 'label': 'Market Value', 'field': 'market_value', 'sortable': True, 'align': 'right'},
+                {'name': 'unrealized_pl', 'label': 'Unrealized P/L', 'field': 'unrealized_pl', 'sortable': True, 'align': 'right'},
+                {'name': 'unrealized_plpc', 'label': 'P/L %', 'field': 'unrealized_plpc', 'sortable': True, 'align': 'right'},
+                {'name': 'change_today', 'label': 'Today Change %', 'field': 'change_today', 'sortable': True, 'align': 'right'}
+            ]
+            # Open Positions Table
+            with ui.card():
+                ui.label('Open Positions Across All Accounts').classes('text-h6 mb-4')
+                
+                # Add built-in filter before the table
+                with ui.row().classes('w-full gap-2 mb-4'):
+                    filter_input = ui.input(label='Filter table', placeholder='Type to filter across all columns...').classes('flex-grow')
+                    ui.button('Clear', on_click=lambda: filter_input.set_value('')).props('flat')
+                
+                # Create the table with sortable columns
+                positions_table = ui.table(
+                    columns=columns, 
+                    rows=all_positions, 
+                    row_key='_row_key',  # Unique key for each position
+                    pagination={'rowsPerPage': 20, 'sortBy': 'account', 'descending': False}
+                ).classes('w-full')
+                
+                # Bind filter to table after table is created
+                filter_input.bind_value(positions_table, 'filter')
+                
+                # Add custom cell rendering for P/L columns with color coding
+                positions_table.add_slot('body-cell-unrealized_pl', r'''
+                    <q-td :props="props">
+                        <span :style="parseFloat(props.value) >= 0 ? 'color: green; font-weight: 500;' : 'color: red; font-weight: 500;'">
+                            {{ props.value }}
+                        </span>
+                    </q-td>
+                ''')
+                
+                positions_table.add_slot('body-cell-unrealized_plpc', r'''
+                    <q-td :props="props">
+                        <span :style="parseFloat(props.value) >= 0 ? 'color: green; font-weight: 500;' : 'color: red; font-weight: 500;'">
+                            {{ props.value }}
+                        </span>
+                    </q-td>
+                ''')
+            
+            # All Orders Table
+            with ui.card().classes('mt-4'):
+                ui.label('Recent Orders from All Accounts (Past 15 Days)').classes('text-h6 mb-4')
+                self._render_live_orders_table()
+            
+            # Pending Orders Table
+            with ui.card().classes('mt-4'):
+                ui.label('Pending Orders (PENDING, WAITING_TRIGGER, or ERROR)').classes('text-h6 mb-4')
+                self._render_pending_orders_table()
     
     def _render_live_orders_table(self):
         """Render table with recent orders from database (past 15 days) with expert information."""
@@ -1662,7 +1709,10 @@ class AccountOverviewTab:
                 return
                 
             try:
-                provider_obj = provider_cls(account.id)
+                provider_obj = get_account_instance_from_id(account.id)
+                if not provider_obj:
+                    ui.notify(f'Failed to get account instance for {account.name}', type='negative')
+                    return
                 submitted_order = provider_obj.submit_order(order)
                 
                 if submitted_order:
@@ -1744,14 +1794,11 @@ class AccountOverviewTab:
                         continue
                     
                     # Submit the order through the account provider
-                    from ...modules.accounts import providers
-                    provider_cls = providers.get(account.provider)
-                    if not provider_cls:
-                        errors.append(f"No provider found for {account.provider}")
-                        continue
-                        
                     try:
-                        provider_obj = provider_cls(account.id)
+                        provider_obj = get_account_instance_from_id(account.id)
+                        if not provider_obj:
+                            errors.append(f"Failed to get account instance for {account.name}")
+                            continue
                         submitted_order = provider_obj.submit_order(order)
                         
                         if submitted_order:
@@ -1832,13 +1879,11 @@ class AccountOverviewTab:
                     account = get_instance(AccountDefinition, account_id)
                     if not account:
                         continue
-                        
-                    from ...modules.accounts import providers
-                    provider_cls = providers.get(account.provider)
-                    if not provider_cls:
+                    
+                    provider_obj = get_account_instance_from_id(account.id)
+                    if not provider_obj:
                         continue
                     
-                    provider_obj = provider_cls(account.id)
                     broker_orders = provider_obj.get_orders()
                     
                     # Filter to recent orders and convert to dict format
@@ -2376,14 +2421,34 @@ class TransactionsTab:
             logger.debug(f"[RENDER] _render_transactions_table() - Building rows for {len(transactions)} transactions")
             rows = []
             for txn in transactions:
-                # Skip current price fetching on initial load to avoid blocking UI
-                # Users can refresh to get latest prices if needed
+                # Calculate current P/L for open positions using current price
                 current_pnl = ''
                 current_price_str = ''
                 
-                # Note: Removed synchronous price fetching to prevent UI freeze
-                # The get_instrument_current_price() call was blocking the UI
-                # Consider adding a refresh button or async loading if current prices are needed
+                # Fetch current price for open transactions
+                from ...core.types import TransactionStatus
+                if txn.status == TransactionStatus.OPENED and txn.open_price and txn.quantity:
+                    try:
+                        # Get account instance to fetch current price
+                        from ...core.models import TradingOrder
+                        # Find any order from this transaction to get account_id
+                        order_stmt = select(TradingOrder).where(TradingOrder.transaction_id == txn.id).limit(1)
+                        first_order = session.exec(order_stmt).first()
+                        
+                        if first_order:
+                            account_inst = get_account_instance_from_id(first_order.account_id)
+                            if account_inst:
+                                current_price = account_inst.get_instrument_current_price(txn.symbol)
+                                if current_price:
+                                    current_price_str = f"${current_price:.2f}"
+                                    # Calculate P/L: (current_price - open_price) * quantity
+                                    if txn.quantity > 0:  # Long position
+                                        pnl_current = (current_price - txn.open_price) * abs(txn.quantity)
+                                    else:  # Short position
+                                        pnl_current = (txn.open_price - current_price) * abs(txn.quantity)
+                                    current_pnl = f"${pnl_current:+.2f}"
+                    except Exception as e:
+                        logger.debug(f"Could not fetch current price for {txn.symbol}: {e}")
                 
                 # Closed P/L - calculate from open/close prices
                 closed_pnl = ''

@@ -13,6 +13,7 @@ from ...core.models import AccountDefinition
 from ...modules.accounts import get_account_class
 from ...core.db import add_instance
 from ...logger import logger
+from ...core.utils import get_account_instance_from_id
 from sqlmodel import select, func
 
 
@@ -2048,13 +2049,11 @@ class OrderRecommendationsTab:
                             return
                         
                         # Submit the order through the account provider
-                        from ...modules.accounts import providers
-                        provider_cls = providers.get(account.provider)
-                        if not provider_cls:
-                            ui.notify(f'No provider found for {account.provider}', type='negative')
+                        provider_obj = get_account_instance_from_id(account.id)
+                        if not provider_obj:
+                            ui.notify(f'Failed to get account instance for {account.name}', type='negative')
                             return
                         
-                        provider_obj = provider_cls(account.id)
                         submitted_order = provider_obj.submit_order(pending_order)
                         
                         if submitted_order:
@@ -2220,20 +2219,19 @@ class OrderRecommendationsTab:
                 order = get_instance(TradingOrder, order_id)
                 
                 # Submit the order through the account provider
-                provider_cls = get_account_class(account.provider)
-                if provider_cls:
-                    try:
-                        provider_obj = provider_cls(account.id)
+                try:
+                    provider_obj = get_account_instance_from_id(account.id)
+                    if provider_obj:
                         submitted_order = provider_obj.submit_order(order)
                         if submitted_order:
                             ui.notify(f'Order {order_id} submitted successfully to {account.provider}', type='positive')
                         else:
                             ui.notify(f'Order {order_id} created but failed to submit to broker', type='warning')
-                    except Exception as e:
-                        logger.error(f"Error submitting order {order_id}: {e}", exc_info=True)
-                        ui.notify(f'Order {order_id} created but submission failed: {str(e)}', type='warning')
-                else:
-                    ui.notify(f'Order {order_id} created but no provider found for {account.provider}', type='warning')
+                    else:
+                        ui.notify(f'Order {order_id} created but failed to get account instance', type='warning')
+                except Exception as e:
+                    logger.error(f"Error submitting order {order_id}: {e}", exc_info=True)
+                    ui.notify(f'Order {order_id} created but submission failed: {str(e)}', type='warning')
             else:
                 ui.notify('Failed to create order', type='negative')
                 return

@@ -453,9 +453,10 @@ class MarketAnalysisHistoryPage:
                 )
                 
                 # Add annotation for each recommendation at this date
-                y_position = 0.95  # Start near top
-                y_step = 0.15  # Move down for each annotation
+                # Use staggered positioning to avoid overlaps
+                num_recs = len(date_recs)
                 
+                # Calculate positions - spread annotations vertically and horizontally
                 for i, rec in enumerate(date_recs):
                     action_str = str(rec['action'].value if hasattr(rec['action'], 'value') else rec['action'])
                     action_str = action_str.replace('OrderRecommendation.', '').upper()
@@ -464,14 +465,36 @@ class MarketAnalysisHistoryPage:
                     color = action_colors.get(action_str, '#6b7280')
                     confidence = rec.get('confidence', 0)
                     time_horizon = str(rec.get('time_horizon', 'UNKNOWN')).replace('TimeHorizon.', '')
-                    expert_name = rec['expert_name']
+                    expert_id = rec['expert_id']
                     
-                    # Create label with action, confidence, and time horizon
-                    label = f"{icon} {action_str}<br>{confidence:.1f}% | {time_horizon}<br><small>{expert_name}</small>"
+                    # Create label with action, expert ID, confidence, and time horizon
+                    label = f"{icon} {action_str} (Expert {expert_id})<br>{confidence:.1f}% | {time_horizon}"
+                    
+                    # Smart positioning to avoid overlaps
+                    # If multiple recommendations, spread them out in a radial pattern
+                    if num_recs == 1:
+                        # Single annotation - place above chart
+                        y_pos = 0.95
+                        ax_offset = 0
+                        ay_offset = -40
+                    elif num_recs == 2:
+                        # Two annotations - left and right
+                        y_pos = 0.90
+                        ax_offset = 80 if i == 0 else -80
+                        ay_offset = -30
+                    else:
+                        # Three or more - stagger vertically and horizontally
+                        # Distribute across top, middle-top, and middle positions
+                        row = i // 2  # Which vertical position (0, 1, 2, ...)
+                        side = i % 2  # Left (0) or right (1)
+                        
+                        y_pos = 0.95 - (row * 0.20)  # Spread vertically: 0.95, 0.75, 0.55, ...
+                        ax_offset = 100 if side == 0 else -100  # Alternate left/right
+                        ay_offset = -25 - (row * 5)  # Vary arrow length slightly
                     
                     fig.add_annotation(
                         x=date_str,
-                        y=y_position - (i * y_step),
+                        y=y_pos,
                         yref="y domain",
                         xref="x",
                         text=label,
@@ -480,8 +503,8 @@ class MarketAnalysisHistoryPage:
                         arrowsize=1,
                         arrowwidth=2,
                         arrowcolor=color,
-                        ax=40 if i % 2 == 0 else -40,  # Alternate left/right
-                        ay=-30,
+                        ax=ax_offset,
+                        ay=ay_offset,
                         font=dict(size=10, color=color, family='Arial Black'),
                         bgcolor="rgba(255, 255, 255, 0.95)",
                         bordercolor=color,

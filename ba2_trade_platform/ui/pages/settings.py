@@ -10,6 +10,7 @@ from ...logger import logger
 from ...core.db import get_db, get_all_instances, delete_instance, add_instance, update_instance, get_instance
 from ...modules.accounts import providers
 from ...core.interfaces import AccountInterface
+from ...core.utils import get_account_instance_from_id
 from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, is_share_adjustment_action, AnalysisUseCase, MarketAnalysisStatus
 from ...core.cleanup import preview_cleanup, execute_cleanup, get_cleanup_statistics
 from yahooquery import Ticker, search as yq_search
@@ -603,8 +604,12 @@ class AccountDefinitionsTab:
                         
                         # Now try to validate credentials
                         try:
-                            acc_iface = provider_cls(account.id)
-                            logger.info(f"Successfully validated credentials for account {account.id}")
+                            acc_iface = get_account_instance_from_id(account.id, use_cache=False)  # Force new instance to test fresh credentials
+                            if acc_iface:
+                                logger.info(f"Successfully validated credentials for account {account.id}")
+                            else:
+                                logger.warning(f"Account {account.id} updated but could not validate credentials")
+                                ui.notify(f"Account updated but could not validate credentials", type="warning")
                         except Exception as auth_error:
                             logger.warning(f"Account {account.id} updated but authentication failed: {auth_error}")
                             ui.notify(f"Account updated but authentication failed: {str(auth_error)}", type="warning")
