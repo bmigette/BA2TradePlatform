@@ -150,17 +150,7 @@ class FloatingPLPerAccountWidget:
                     # Separator
                     ui.separator().classes('my-2')
                     
-                    # Summary statistics
-                    with ui.row().classes('w-full justify-between items-center mb-1'):
-                        ui.label('Positive P/L:').classes('text-sm font-bold')
-                        ui.label(f'${positive_pl:,.2f}').classes('text-sm font-bold text-green-600')
-                    
-                    with ui.row().classes('w-full justify-between items-center mb-1'):
-                        ui.label('Negative P/L:').classes('text-sm font-bold')
-                        ui.label(f'${negative_pl:,.2f}').classes('text-sm font-bold text-red-600')
-                    
-                    ui.separator().classes('my-2')
-                    
+                    # Total P/L
                     with ui.row().classes('w-full justify-between items-center'):
                         ui.label('Total P/L:').classes('text-sm font-bold')
                         total_color = 'text-green-600' if total_pl >= 0 else 'text-red-600'

@@ -603,7 +603,7 @@ class AlpacaAccount(AccountInterface):
             return None
 
     @alpaca_api_retry
-    def _get_instrument_current_price_impl(self, symbol_or_symbols):
+    def _get_instrument_current_price_impl(self, symbol_or_symbols, price_type='bid'):
         """
         Internal implementation of price fetching for Alpaca. Supports both single and bulk fetching.
         This is called by the base class get_instrument_current_price() when cache is stale.
@@ -612,6 +612,10 @@ class AlpacaAccount(AccountInterface):
         
         Args:
             symbol_or_symbols (Union[str, List[str]]): Single symbol or list of symbols to fetch prices for
+            price_type (str): Type of price to return - 'bid', 'ask', or 'avg' (default: 'bid')
+                             - 'bid': Use bid price divided by bid size
+                             - 'ask': Use ask price divided by ask size
+                             - 'avg': Average of bid and ask prices (both adjusted by their sizes)
         
         Returns:
             Union[Optional[float], Dict[str, Optional[float]]]:
@@ -645,15 +649,38 @@ class AlpacaAccount(AccountInterface):
             
             # Process quotes and calculate prices
             def calculate_price(quote):
-                """Calculate price from quote using bid-ask midpoint."""
-                if quote.bid_price and quote.ask_price:
-                    return (float(quote.bid_price) + float(quote.ask_price)) / 2
-                elif quote.bid_price:
-                    return float(quote.bid_price)
-                elif quote.ask_price:
-                    return float(quote.ask_price)
+                """
+                Calculate price from quote using bid/ask prices.
+                
+                Args:
+                    quote: Alpaca quote object with bid_price, ask_price
+                    
+                Returns:
+                    Optional[float]: Calculated price based on price_type, or None if unavailable
+                """
+                bid_price = float(quote.bid_price) if quote.bid_price else None
+                ask_price = float(quote.ask_price) if quote.ask_price else None
+                
+                if price_type == 'bid':
+                    # Return bid price, fallback to ask if bid not available
+                    return bid_price if bid_price else ask_price
+                elif price_type == 'ask':
+                    # Return ask price, fallback to bid if ask not available
+                    return ask_price if ask_price else bid_price
+                elif price_type == 'avg':
+                    # Return average of both prices
+                    if bid_price and ask_price:
+                        return (bid_price + ask_price) / 2
+                    elif bid_price:
+                        return bid_price
+                    elif ask_price:
+                        return ask_price
+                    else:
+                        return None
                 else:
-                    return None
+                    # Invalid price_type, default to bid behavior
+                    logger.warning(f"Invalid price_type '{price_type}', defaulting to 'bid'")
+                    return bid_price if bid_price else ask_price
             
             # Handle single symbol case (backward compatibility)
             if is_single_symbol:
@@ -661,7 +688,7 @@ class AlpacaAccount(AccountInterface):
                 if symbol in quotes:
                     quote = quotes[symbol]
                     current_price = calculate_price(quote)
-                    logger.debug(f"Current price for {symbol}: {current_price}")
+                    logger.debug(f"Current {price_type} price for {symbol}: {current_price}")
                     return current_price
                 else:
                     logger.warning(f"No quote data found for symbol {symbol}")
@@ -675,12 +702,12 @@ class AlpacaAccount(AccountInterface):
                         quote = quotes[symbol]
                         current_price = calculate_price(quote)
                         result[symbol] = current_price
-                        logger.debug(f"Bulk fetch - Current price for {symbol}: {current_price}")
+                        logger.debug(f"Bulk fetch - Current {price_type} price for {symbol}: {current_price}")
                     else:
                         result[symbol] = None
                         logger.warning(f"Bulk fetch - No quote data found for symbol {symbol}")
                 
-                logger.info(f"Bulk fetched prices for {len(symbols_list)} symbols in single API call")
+                logger.info(f"Bulk fetched {price_type} prices for {len(symbols_list)} symbols in single API call")
                 return result
                 
         except Exception as e:

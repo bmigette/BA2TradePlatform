@@ -2555,6 +2555,7 @@ class TransactionsTab:
                     'status': txn.status.value,
                     'status_color': status_color,
                     'created_at': txn.created_at.strftime('%Y-%m-%d %H:%M') if txn.created_at else '',
+                    'closed_at': txn.close_date.strftime('%Y-%m-%d %H:%M') if txn.close_date else '',
                     'is_open': txn.status == TransactionStatus.OPENED,
                     'is_waiting': txn.status == TransactionStatus.WAITING,  # Track WAITING status
                     'is_closing': txn.status == TransactionStatus.CLOSING,  # Track CLOSING status
@@ -2598,6 +2599,7 @@ class TransactionsTab:
             {'name': 'status', 'label': 'Status', 'field': 'status', 'align': 'center', 'sortable': True},
             {'name': 'order_count', 'label': 'Orders', 'field': 'order_count', 'align': 'center'},
             {'name': 'created_at', 'label': 'Created', 'field': 'created_at', 'align': 'left', 'sortable': True},
+            {'name': 'closed_at', 'label': 'Closed', 'field': 'closed_at', 'align': 'left', 'sortable': True},
             {'name': 'actions', 'label': 'Actions', 'field': 'actions', 'align': 'center'}
         ]
         
