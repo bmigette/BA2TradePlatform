@@ -598,7 +598,7 @@ class TradingAgentsUI:
                         'HOLD': 'text-orange-600', 
                         'ERROR': 'text-grey-600'
                     }.get(latest_recommendation.recommended_action, 'text-grey-600')
-                    ui.label(f'{action_icon} {latest_recommendation.recommended_action}').classes(f'text-xl font-bold {action_color}')
+                    ui.label(f'{action_icon} {latest_recommendation.recommended_action.value}').classes(f'text-xl font-bold {action_color}')
                 
                 # Confidence card
                 with ui.card().classes('p-4 flex-1'):
