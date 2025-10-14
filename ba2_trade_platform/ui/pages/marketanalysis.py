@@ -2498,6 +2498,12 @@ class OrderRecommendationsTab:
                         order_map = {}  # Map row keys to order objects
                         total_estimated_value = 0
                         
+                        # Fetch all prices at once (bulk fetching)
+                        all_symbols = list(set(order.symbol for order in orders_to_submit))
+                        logger.debug(f"Fetching prices for {len(all_symbols)} symbols in bulk for order submission table")
+                        symbol_prices = account.get_instrument_current_price(all_symbols)
+                        logger.info(f"Bulk fetched {len(symbol_prices)} prices for market analysis page")
+                        
                         for order in orders_to_submit:
                             # Get recommendation data
                             recommendation = None
@@ -2512,8 +2518,8 @@ class OrderRecommendationsTab:
                                     roi = f"{recommendation.expected_profit_percent:.2f}%" if recommendation.expected_profit_percent else 'N/A'
                                     risk_level = recommendation.risk_level.value.title() if hasattr(recommendation.risk_level, 'value') else (recommendation.risk_level.name.title() if hasattr(recommendation.risk_level, 'name') else str(recommendation.risk_level))
                             
-                            # Get current price from account interface
-                            current_price = account.get_instrument_current_price(order.symbol)
+                            # Get current price from bulk-fetched prices
+                            current_price = symbol_prices.get(order.symbol) if symbol_prices else None
                             if current_price is None:
                                 logger.warning(f"Could not get current price for {order.symbol}, using price_at_date from recommendation")
                                 # Fallback to historical price from recommendation if available

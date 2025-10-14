@@ -341,14 +341,20 @@ class TradeRiskManagement:
         self.logger.info(f"Top 3 ROI symbols: {top_3_symbols}")
         self.logger.debug(f"Available balance: ${remaining_balance:.2f}, Max per instrument: ${max_equity_per_instrument:.2f}")
         
+        # Fetch all prices at once (bulk fetching)
+        all_symbols = list(set(order.symbol for order, _ in prioritized_orders))
+        self.logger.debug(f"Fetching prices for {len(all_symbols)} symbols in bulk")
+        symbol_prices = account.get_instrument_current_price(all_symbols)
+        self.logger.info(f"Bulk fetched {len(symbol_prices)} prices in single API call")
+        
         for order, recommendation in prioritized_orders:
             try:
                 symbol = order.symbol
                 current_allocation = instrument_allocations.get(symbol, 0.0)
                 available_for_instrument = max_equity_per_instrument - current_allocation
                 
-                # Get current market price from account interface
-                current_price = account.get_instrument_current_price(symbol)
+                # Get current market price from bulk-fetched prices
+                current_price = symbol_prices.get(symbol) if symbol_prices else None
                 if current_price is None:
                     self.logger.error(f"Could not get current price for {symbol}, skipping order {order.id}", exc_info=True)
                     order.quantity = 0

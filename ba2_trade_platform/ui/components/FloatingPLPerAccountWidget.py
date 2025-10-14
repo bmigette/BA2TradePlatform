@@ -33,7 +33,7 @@ class FloatingPLPerAccountWidget:
             asyncio.create_task(self._load_data_async(loading_label, content_container))
     
     def _calculate_pl_sync(self) -> Dict[str, float]:
-        """Synchronous P/L calculation (runs in thread pool to avoid blocking)."""
+        """Synchronous P/L calculation (runs in thread pool to avoid blocking). Uses bulk price fetching."""
         account_pl = {}
         
         session = get_db()
@@ -44,7 +44,9 @@ class FloatingPLPerAccountWidget:
                 .where(Transaction.status.in_([TransactionStatus.OPENED, TransactionStatus.WAITING]))
             ).all()
             
-            # Calculate P/L for each transaction
+            # Group transactions by account to batch price fetching
+            account_transactions = {}  # account_id -> [(transaction, account_name), ...]
+            
             for trans in transactions:
                 try:
                     # Get first order to determine account
@@ -63,27 +65,46 @@ class FloatingPLPerAccountWidget:
                         continue
                     
                     account_name = account_def.name
+                    account_id = first_order.account_id
                     
-                    # Get account interface for current price
-                    account = get_account_instance_from_id(first_order.account_id, session=session)
+                    if account_id not in account_transactions:
+                        account_transactions[account_id] = []
+                    account_transactions[account_id].append((trans, account_name))
+                    
+                except Exception as e:
+                    logger.error(f"Error grouping transaction {trans.id}: {e}", exc_info=True)
+                    continue
+            
+            # Fetch prices in bulk per account and calculate P/L
+            for account_id, trans_list in account_transactions.items():
+                try:
+                    # Get account interface once
+                    account = get_account_instance_from_id(account_id, session=session)
                     if not account:
                         continue
                     
-                    # Get current market price
-                    current_price = account.get_instrument_current_price(trans.symbol)
+                    # Collect all unique symbols for this account
+                    symbols = list(set(trans.symbol for trans, _ in trans_list))
                     
-                    if not current_price or trans.open_price is None:
-                        continue
+                    # Fetch all prices at once (single API call)
+                    prices = account.get_instrument_current_price(symbols)
                     
-                    # Calculate P/L: (current_price - open_price) * quantity
-                    pl = (current_price - trans.open_price) * trans.quantity
-                    
-                    if account_name not in account_pl:
-                        account_pl[account_name] = 0.0
-                    account_pl[account_name] += pl
-                    
+                    # Calculate P/L for each transaction using fetched prices
+                    for trans, account_name in trans_list:
+                        current_price = prices.get(trans.symbol) if prices else None
+                        
+                        if not current_price or trans.open_price is None:
+                            continue
+                        
+                        # Calculate P/L: (current_price - open_price) * quantity
+                        pl = (current_price - trans.open_price) * trans.quantity
+                        
+                        if account_name not in account_pl:
+                            account_pl[account_name] = 0.0
+                        account_pl[account_name] += pl
+                        
                 except Exception as e:
-                    logger.error(f"Error calculating P/L for transaction {trans.id}: {e}", exc_info=True)
+                    logger.error(f"Error calculating P/L for account {account_id}: {e}", exc_info=True)
                     continue
             
         finally:

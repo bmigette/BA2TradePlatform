@@ -33,7 +33,7 @@ class FloatingPLPerExpertWidget:
             asyncio.create_task(self._load_data_async(loading_label, content_container))
     
     def _calculate_pl_sync(self) -> Dict[str, float]:
-        """Synchronous P/L calculation (runs in thread pool to avoid blocking)."""
+        """Synchronous P/L calculation (runs in thread pool to avoid blocking). Uses bulk price fetching."""
         expert_pl = {}
         
         session = get_db()
@@ -45,7 +45,9 @@ class FloatingPLPerExpertWidget:
                 .where(Transaction.status.in_([TransactionStatus.OPENED, TransactionStatus.WAITING]))
             ).all()
             
-            # Calculate P/L for each transaction
+            # Group transactions by account to batch price fetching
+            account_transactions = {}  # account_id -> [(transaction, expert_name), ...]
+            
             for trans in transactions:
                 try:
                     # Get expert info
@@ -55,34 +57,56 @@ class FloatingPLPerExpertWidget:
                     
                     expert_name = f"{expert.alias or expert.expert}-{expert.id}"
                     
-                    # Get account interface for current price
-                    account = None
+                    # Get account ID from first order
                     first_order = session.exec(
                         select(TradingOrder)
                         .where(TradingOrder.transaction_id == trans.id)
                         .limit(1)
                     ).first()
                     
-                    if first_order and first_order.account_id:
-                        account = get_account_instance_from_id(first_order.account_id, session=session)
-                    
-                    # Get current market price
-                    current_price = None
-                    if account:
-                        current_price = account.get_instrument_current_price(trans.symbol)
-                    
-                    if not current_price or trans.open_price is None:
+                    if not first_order or not first_order.account_id:
                         continue
                     
-                    # Calculate P/L: (current_price - open_price) * quantity
-                    pl = (current_price - trans.open_price) * trans.quantity
+                    account_id = first_order.account_id
                     
-                    if expert_name not in expert_pl:
-                        expert_pl[expert_name] = 0.0
-                    expert_pl[expert_name] += pl
+                    if account_id not in account_transactions:
+                        account_transactions[account_id] = []
+                    account_transactions[account_id].append((trans, expert_name))
                     
                 except Exception as e:
-                    logger.error(f"Error calculating P/L for transaction {trans.id}: {e}", exc_info=True)
+                    logger.error(f"Error grouping transaction {trans.id}: {e}", exc_info=True)
+                    continue
+            
+            # Fetch prices in bulk per account and calculate P/L
+            for account_id, trans_list in account_transactions.items():
+                try:
+                    # Get account interface once
+                    account = get_account_instance_from_id(account_id, session=session)
+                    if not account:
+                        continue
+                    
+                    # Collect all unique symbols for this account
+                    symbols = list(set(trans.symbol for trans, _ in trans_list))
+                    
+                    # Fetch all prices at once (single API call)
+                    prices = account.get_instrument_current_price(symbols)
+                    
+                    # Calculate P/L for each transaction using fetched prices
+                    for trans, expert_name in trans_list:
+                        current_price = prices.get(trans.symbol) if prices else None
+                        
+                        if not current_price or trans.open_price is None:
+                            continue
+                        
+                        # Calculate P/L: (current_price - open_price) * quantity
+                        pl = (current_price - trans.open_price) * trans.quantity
+                        
+                        if expert_name not in expert_pl:
+                            expert_pl[expert_name] = 0.0
+                        expert_pl[expert_name] += pl
+                        
+                except Exception as e:
+                    logger.error(f"Error calculating P/L for account {account_id}: {e}", exc_info=True)
                     continue
             
         finally:

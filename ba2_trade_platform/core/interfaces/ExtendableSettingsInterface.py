@@ -150,6 +150,7 @@ class ExtendableSettingsInterface(ABC):
     def save_setting(self, key: str, value: Any, setting_type: Optional[str] = None):
         """
         Save a single account setting to the database, converting bool to JSON for storage.
+        Invalidates the settings cache to ensure fresh data on next access.
         
         Args:
             key: The setting key
@@ -165,6 +166,9 @@ class ExtendableSettingsInterface(ABC):
             self._save_single_setting(session, key, value, setting_type)
             session.commit()
             logger.info(f"Saved setting '{key}' for {lk_field}={self.id}: {value}")
+            
+            # Invalidate cache for account settings
+            self._invalidate_settings_cache()
         except Exception as e:
             session.rollback()
             logger.error(f"Error saving account setting '{key}': {e}", exc_info=True)
@@ -175,6 +179,7 @@ class ExtendableSettingsInterface(ABC):
     def save_settings(self, settings: Dict[str, Any]):
         """
         Save account settings to the database, converting bool to JSON for storage.
+        Invalidates the settings cache to ensure fresh data on next access.
         """
         lk_field = type(self).SETTING_LOOKUP_FIELD
         session = get_db()
@@ -184,12 +189,24 @@ class ExtendableSettingsInterface(ABC):
                 self._save_single_setting(session, key, value, setting_type)
             session.commit()
             logger.info(f"Saved settings for {lk_field}={self.id}: {settings}")
+            
+            # Invalidate cache for account settings
+            self._invalidate_settings_cache()
         except Exception as e:
             session.rollback()
             logger.error(f"Error saving account settings: {e}", exc_info=True)
             raise
         finally:
             session.close()
+    
+    def _invalidate_settings_cache(self):
+        """
+        Invalidate the cached settings for this instance.
+        Call this after updating settings in the database.
+        """
+        # Clear instance-level settings cache
+        self._settings_cache = None
+        logger.debug(f"Cleared settings cache for {type(self).__name__} id={self.id}")
     
     def get_all_settings(self) -> Dict[str, Any]:
         """
@@ -204,10 +221,18 @@ class ExtendableSettingsInterface(ABC):
         based on the settings definitions provided by the implementation.
         Handles JSON->bool conversion for bool types.
         Also includes settings from database that don't have definitions.
+        
+        Settings are cached at the instance level to avoid repeated database queries.
         """
+        # Check if settings are already cached on this instance
+        if hasattr(self, '_settings_cache') and self._settings_cache is not None:
+            #logger.debug(f"Returning cached settings for {type(self).__name__} id={self.id}")
+            return self._settings_cache
+        
         setting_model = type(self).SETTING_MODEL
         lk_field = type(self).SETTING_LOOKUP_FIELD
         try:
+            logger.debug(f"Loading settings from database for {type(self).__name__} id={self.id}")
             definitions = type(self).get_merged_settings_definitions()
             with get_db() as session:
                 statement = select(setting_model).filter_by(**{lk_field: self.id})
@@ -261,6 +286,9 @@ class ExtendableSettingsInterface(ABC):
                     settings[setting.key] = setting.value_str
                     
             #logger.debug(f"Loaded settings for {lk_field}={self.id}: {settings}")
+            
+            # Cache the settings for future access
+            self._settings_cache = settings
             return settings
         except Exception as e:
             logger.error(f"Error loading account settings: {e}", exc_info=True)

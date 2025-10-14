@@ -337,7 +337,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
     
     def _calculate_used_balance(self, account: AccountInterface) -> Optional[float]:
         """
-        Calculate the used balance from all open transactions for this expert.
+        Calculate the used balance from all open transactions for this expert. Uses bulk price fetching.
         
         Args:
             account: The account instance to get current prices
@@ -356,13 +356,21 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 )
                 transactions = session.exec(statement).all()
             
+            if not transactions:
+                return used_balance
+            
+            # Fetch all prices at once (bulk fetching)
+            all_symbols = list(set(t.symbol for t in transactions))
+            logger.debug(f"Fetching prices for {len(all_symbols)} symbols in bulk for used balance calculation")
+            symbol_prices = account.get_instrument_current_price(all_symbols)
+            
             for transaction in transactions:
                 if transaction.open_price is None or transaction.quantity is None:
                     logger.warning(f"Transaction {transaction.id} missing open_price or quantity, skipping")
                     continue
                 
-                # Get current price for the symbol
-                current_price = account.get_instrument_current_price(transaction.symbol)
+                # Get current price from bulk-fetched prices
+                current_price = symbol_prices.get(transaction.symbol) if symbol_prices else None
                 if current_price is None:
                     logger.warning(f"Could not get current price for {transaction.symbol}, using open_price")
                     current_price = transaction.open_price

@@ -214,7 +214,7 @@ def get_orders_for_expert_and_symbol(expert_instance_id: int, symbol: str = None
         return []
 
 
-def get_account_instance_from_id(account_id: int, session=None):
+def get_account_instance_from_id(account_id: int, session=None, use_cache: bool = True):
     """
     Get an account instance with the appropriate class instantiated from the database.
     
@@ -224,9 +224,13 @@ def get_account_instance_from_id(account_id: int, session=None):
     3. Dynamically imports and instantiates the appropriate account class
     4. Returns the instantiated account object ready to use
     
+    By default, uses a singleton cache to ensure only one instance per account_id exists
+    in memory. This dramatically reduces database calls for settings loading.
+    
     Args:
         account_id (int): The ID of the account definition in the database
         session (Session, optional): An existing database session to reuse. If not provided, creates a new one.
+        use_cache (bool, optional): If True (default), use singleton cache. If False, create new instance.
         
     Returns:
         Optional[AccountInterface]: The instantiated account instance, or None if not found
@@ -237,12 +241,13 @@ def get_account_instance_from_id(account_id: int, session=None):
         ...     account_info = account.get_account_info()
         ...     orders = account.list_orders()
         
-        >>> # Better: Reuse existing session in a loop
-        >>> with get_db() as session:
-        ...     for account_id in account_ids:
-        ...         account = get_account_instance_from_id(account_id, session=session)
+        >>> # Multiple calls return the same cached instance (with cached settings)
+        >>> account1 = get_account_instance_from_id(1)
+        >>> account2 = get_account_instance_from_id(1)
+        >>> assert account1 is account2  # Same object in memory
     """
     from .models import AccountDefinition
+    from .AccountInstanceCache import AccountInstanceCache
     
     # Get the account definition record from database (reuse session if provided)
     account_def = get_instance(AccountDefinition, account_id, session=session)
@@ -254,5 +259,9 @@ def get_account_instance_from_id(account_id: int, session=None):
     if not account_class:
         raise ValueError(f"Unknown account provider: {account_def.provider}")
     
-    # Instantiate and return the account with the database ID
-    return account_class(account_id)
+    # Use cache by default for singleton behavior
+    if use_cache:
+        return AccountInstanceCache.get_instance(account_id, account_class)
+    else:
+        # Create new instance without caching (for special cases)
+        return account_class(account_id)

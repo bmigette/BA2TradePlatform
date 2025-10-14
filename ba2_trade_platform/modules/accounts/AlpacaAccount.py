@@ -603,19 +603,27 @@ class AlpacaAccount(AccountInterface):
             return None
 
     @alpaca_api_retry
-    def _get_instrument_current_price_impl(self, symbol: str) -> Optional[float]:
+    def _get_instrument_current_price_impl(self, symbol_or_symbols):
         """
-        Internal implementation of price fetching for Alpaca.
+        Internal implementation of price fetching for Alpaca. Supports both single and bulk fetching.
         This is called by the base class get_instrument_current_price() when cache is stale.
         
+        Alpaca's API natively supports fetching multiple symbols in a single request via symbol_or_symbols parameter.
+        
         Args:
-            symbol (str): The asset symbol to get the price for
+            symbol_or_symbols (Union[str, List[str]]): Single symbol or list of symbols to fetch prices for
         
         Returns:
-            Optional[float]: The current price if available, None if not found or error occurred
+            Union[Optional[float], Dict[str, Optional[float]]]:
+                - If symbol_or_symbols is str: Returns Optional[float] (single price or None)
+                - If symbol_or_symbols is List[str]: Returns Dict[str, Optional[float]] (symbol -> price mapping)
         """
         if not self._check_authentication():
-            return None
+            # Return appropriate type based on input
+            if isinstance(symbol_or_symbols, str):
+                return None
+            else:
+                return {symbol: None for symbol in symbol_or_symbols}
             
         try:
             from alpaca.data.historical import StockHistoricalDataClient
@@ -627,31 +635,61 @@ class AlpacaAccount(AccountInterface):
                 secret_key=self.settings["api_secret"]
             )
             
-            # Get latest quote
-            request = StockLatestQuoteRequest(symbol_or_symbols=[symbol])
+            # Normalize input to list for uniform processing
+            is_single_symbol = isinstance(symbol_or_symbols, str)
+            symbols_list = [symbol_or_symbols] if is_single_symbol else symbol_or_symbols
+            
+            # Get latest quotes - Alpaca natively supports bulk fetching
+            request = StockLatestQuoteRequest(symbol_or_symbols=symbols_list)
             quotes = data_client.get_stock_latest_quote(request)
             
-            if symbol in quotes:
-                quote = quotes[symbol]
-                # Use bid-ask midpoint as current price
+            # Process quotes and calculate prices
+            def calculate_price(quote):
+                """Calculate price from quote using bid-ask midpoint."""
                 if quote.bid_price and quote.ask_price:
-                    current_price = (float(quote.bid_price) + float(quote.ask_price)) / 2
+                    return (float(quote.bid_price) + float(quote.ask_price)) / 2
                 elif quote.bid_price:
-                    current_price = float(quote.bid_price)
+                    return float(quote.bid_price)
                 elif quote.ask_price:
-                    current_price = float(quote.ask_price)
+                    return float(quote.ask_price)
                 else:
-                    current_price = None
-                
-                logger.debug(f"Current price for {symbol}: {current_price}")
-                return current_price
+                    return None
+            
+            # Handle single symbol case (backward compatibility)
+            if is_single_symbol:
+                symbol = symbol_or_symbols
+                if symbol in quotes:
+                    quote = quotes[symbol]
+                    current_price = calculate_price(quote)
+                    logger.debug(f"Current price for {symbol}: {current_price}")
+                    return current_price
+                else:
+                    logger.warning(f"No quote data found for symbol {symbol}")
+                    return None
+            
+            # Handle multiple symbols case
             else:
-                logger.warning(f"No quote data found for symbol {symbol}")
-                return None
+                result = {}
+                for symbol in symbols_list:
+                    if symbol in quotes:
+                        quote = quotes[symbol]
+                        current_price = calculate_price(quote)
+                        result[symbol] = current_price
+                        logger.debug(f"Bulk fetch - Current price for {symbol}: {current_price}")
+                    else:
+                        result[symbol] = None
+                        logger.warning(f"Bulk fetch - No quote data found for symbol {symbol}")
+                
+                logger.info(f"Bulk fetched prices for {len(symbols_list)} symbols in single API call")
+                return result
                 
         except Exception as e:
-            logger.error(f"Error getting current price for {symbol}: {e}", exc_info=True)
-            return None
+            logger.error(f"Error getting current price for {symbol_or_symbols}: {e}", exc_info=True)
+            # Return appropriate type based on input
+            if isinstance(symbol_or_symbols, str):
+                return None
+            else:
+                return {symbol: None for symbol in symbol_or_symbols}
         
         
     def refresh_positions(self) -> bool:

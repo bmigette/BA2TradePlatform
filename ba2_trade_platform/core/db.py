@@ -184,7 +184,24 @@ def get_db():
         Session: An active SQLModel session.
     """
     session = Session(engine)
-    logger.debug(f"Database session created (id={id(session)})")
+    
+    # Get caller information from stack trace
+    # import traceback
+    # import inspect
+    # stack = inspect.stack()
+    
+    # # Build caller info string with last 2 calling functions
+    # caller_info = []
+    # for i in range(1, min(3, len(stack))):  # Get frames 1 and 2 (skip current function)
+    #     frame_info = stack[i]
+    #     func_name = frame_info.function
+    #     filename = os.path.basename(frame_info.filename)
+    #     line_no = frame_info.lineno
+    #     caller_info.append(f"{filename}:{func_name}():{line_no}")
+    
+    # caller_str = " <- ".join(caller_info) if caller_info else "unknown"
+    
+    # logger.debug(f"Database session created (id={id(session)}) [Called from: {caller_str}]")
     return session
 
 @retry_on_lock
