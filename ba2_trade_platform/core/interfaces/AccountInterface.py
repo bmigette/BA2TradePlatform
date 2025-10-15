@@ -531,13 +531,14 @@ class AccountInterface(ExtendableSettingsInterface):
 
 
     @abstractmethod
-    def _get_instrument_current_price_impl(self, symbol_or_symbols):
+    def _get_instrument_current_price_impl(self, symbol_or_symbols, price_type='bid'):
         """
         Internal implementation of price fetching. This method should be implemented by child classes.
         This is called by get_instrument_current_price() when cache is stale or missing.
         
         Args:
             symbol_or_symbols (Union[str, List[str]]): Single symbol or list of symbols to fetch prices for
+            price_type (str): Type of price to fetch - 'bid', 'ask', or 'mid' (default: 'bid')
         
         Returns:
             Union[Optional[float], Dict[str, Optional[float]]]: 
@@ -563,12 +564,15 @@ class AccountInterface(ExtendableSettingsInterface):
                 self._SYMBOL_LOCKS[lock_key] = Lock()
             return self._SYMBOL_LOCKS[lock_key]
     
-    def get_instrument_current_price(self, symbol_or_symbols):
+    def get_instrument_current_price(self, symbol_or_symbols, price_type='bid'):
         """
         Get the current market price for instrument(s) with caching. Supports both single and bulk fetching.
         
         This method implements a thread-safe global cache with configurable TTL (PRICE_CACHE_TIME in config.py).
         The cache is shared across all instances of the same account and persists between instance creations.
+        
+        **Price Type Support:**
+        Cache keys include price_type to prevent mixing bid/ask/mid prices.
         
         **Duplicate API Call Prevention:**
         Uses per-symbol locks to ensure only ONE thread fetches a price when multiple threads
@@ -584,6 +588,7 @@ class AccountInterface(ExtendableSettingsInterface):
         
         Args:
             symbol_or_symbols (Union[str, List[str]]): Single symbol or list of symbols to get prices for
+            price_type (str): Price type to fetch - 'bid', 'ask', or 'mid' (default: 'bid')
         
         Returns:
             Union[Optional[float], Dict[str, Optional[float]]]:
@@ -595,53 +600,55 @@ class AccountInterface(ExtendableSettingsInterface):
         # Handle backward compatibility - single symbol case
         if isinstance(symbol_or_symbols, str):
             symbol = symbol_or_symbols
+            # Create cache key that includes price type to avoid mixing bid/ask/mid
+            cache_key = f"{symbol}:{price_type}"
             
             # Quick cache check (no symbol lock needed for cache hits)
             with self._CACHE_LOCK:
                 account_cache = self._GLOBAL_PRICE_CACHE.get(self.id, {})
                 
-                if symbol in account_cache:
-                    cached_data = account_cache[symbol]
+                if cache_key in account_cache:
+                    cached_data = account_cache[cache_key]
                     cached_time = cached_data['timestamp']
                     current_time = datetime.now(timezone.utc)
                     time_diff = (current_time - cached_time).total_seconds()
                     
                     # If cache is still valid, return immediately
                     if time_diff < config.PRICE_CACHE_TIME:
-                        logger.debug(f"[Account {self.id}] Returning cached price for {symbol}: ${cached_data['price']} (age: {time_diff:.1f}s)")
+                        logger.debug(f"[Account {self.id}] Returning cached {price_type} price for {symbol}: ${cached_data['price']} (age: {time_diff:.1f}s)")
                         return cached_data['price']
                     else:
-                        logger.debug(f"[Account {self.id}] Cache expired for {symbol} (age: {time_diff:.1f}s > {config.PRICE_CACHE_TIME}s)")
+                        logger.debug(f"[Account {self.id}] Cache expired for {cache_key} (age: {time_diff:.1f}s > {config.PRICE_CACHE_TIME}s)")
             
             # Cache miss or expired - need to fetch
-            # Use per-symbol lock to prevent duplicate API calls
-            symbol_lock = self._get_symbol_lock(symbol)
+            # Use per-symbol lock to prevent duplicate API calls (lock on cache_key to include price_type)
+            symbol_lock = self._get_symbol_lock(cache_key)
             
             with symbol_lock:
                 # Double-check cache after acquiring lock (another thread may have just fetched it)
                 with self._CACHE_LOCK:
                     account_cache = self._GLOBAL_PRICE_CACHE.get(self.id, {})
                     
-                    if symbol in account_cache:
-                        cached_data = account_cache[symbol]
+                    if cache_key in account_cache:
+                        cached_data = account_cache[cache_key]
                         cached_time = cached_data['timestamp']
                         current_time = datetime.now(timezone.utc)
                         time_diff = (current_time - cached_time).total_seconds()
                         
                         if time_diff < config.PRICE_CACHE_TIME:
-                            logger.debug(f"[Account {self.id}] Another thread cached {symbol} while waiting: ${cached_data['price']} (age: {time_diff:.1f}s)")
+                            logger.debug(f"[Account {self.id}] Another thread cached {cache_key} while waiting: ${cached_data['price']} (age: {time_diff:.1f}s)")
                             return cached_data['price']
                 
                 # Still need to fetch - we hold the symbol lock, so only this thread will fetch
-                logger.debug(f"[Account {self.id}] Fetching fresh price for {symbol} (holding symbol lock)")
-                price = self._get_instrument_current_price_impl(symbol)
+                logger.debug(f"[Account {self.id}] Fetching fresh {price_type} price for {symbol} (holding symbol lock)")
+                price = self._get_instrument_current_price_impl(symbol, price_type=price_type)
                 
                 # Update cache if we got a valid price
                 if price is not None:
                     with self._CACHE_LOCK:
                         if self.id not in self._GLOBAL_PRICE_CACHE:
                             self._GLOBAL_PRICE_CACHE[self.id] = {}
-                        self._GLOBAL_PRICE_CACHE[self.id][symbol] = {
+                        self._GLOBAL_PRICE_CACHE[self.id][cache_key] = {
                             'price': price,
                             'timestamp': datetime.now(timezone.utc)
                         }
@@ -658,24 +665,25 @@ class AccountInterface(ExtendableSettingsInterface):
             result = {}
             symbols_to_fetch = []
             
-            # Check cache for all symbols
+            # Check cache for all symbols (with price_type in cache key)
             with self._CACHE_LOCK:
                 account_cache = self._GLOBAL_PRICE_CACHE.get(self.id, {})
                 
                 for symbol in symbols:
-                    if symbol in account_cache:
-                        cached_data = account_cache[symbol]
+                    cache_key = f"{symbol}:{price_type}"
+                    if cache_key in account_cache:
+                        cached_data = account_cache[cache_key]
                         cached_time = cached_data['timestamp']
                         time_diff = (current_time - cached_time).total_seconds()
                         
                         if time_diff < config.PRICE_CACHE_TIME:
                             # Use cached price
                             result[symbol] = cached_data['price']
-                            logger.debug(f"[Account {self.id}] Returning cached price for {symbol}: ${cached_data['price']} (age: {time_diff:.1f}s)")
+                            logger.debug(f"[Account {self.id}] Returning cached {price_type} price for {symbol}: ${cached_data['price']} (age: {time_diff:.1f}s)")
                         else:
                             # Cache expired
                             symbols_to_fetch.append(symbol)
-                            logger.debug(f"[Account {self.id}] Cache expired for {symbol} (age: {time_diff:.1f}s > {config.PRICE_CACHE_TIME}s)")
+                            logger.debug(f"[Account {self.id}] Cache expired for {cache_key} (age: {time_diff:.1f}s > {config.PRICE_CACHE_TIME}s)")
                     else:
                         # Not in cache
                         symbols_to_fetch.append(symbol)
@@ -685,7 +693,7 @@ class AccountInterface(ExtendableSettingsInterface):
                 logger.debug(f"[Account {self.id}] Fetching {len(symbols_to_fetch)} symbols in bulk: {symbols_to_fetch}")
                 
                 # Call implementation with list of symbols (broker-specific bulk fetch)
-                fetched_prices = self._get_instrument_current_price_impl(symbols_to_fetch)
+                fetched_prices = self._get_instrument_current_price_impl(symbols_to_fetch, price_type=price_type)
                 
                 # Update cache and result with fetched prices
                 if fetched_prices:
@@ -694,16 +702,17 @@ class AccountInterface(ExtendableSettingsInterface):
                             self._GLOBAL_PRICE_CACHE[self.id] = {}
                         
                         for symbol, price in fetched_prices.items():
+                            cache_key = f"{symbol}:{price_type}"
                             if price is not None:
-                                self._GLOBAL_PRICE_CACHE[self.id][symbol] = {
+                                self._GLOBAL_PRICE_CACHE[self.id][cache_key] = {
                                     'price': price,
                                     'timestamp': current_time
                                 }
                                 result[symbol] = price
-                                logger.debug(f"[Account {self.id}] Cached bulk-fetched price for {symbol}: ${price}")
+                                logger.debug(f"[Account {self.id}] Cached bulk-fetched {price_type} price for {symbol}: ${price}")
                             else:
                                 result[symbol] = None
-                                logger.warning(f"[Account {self.id}] Failed to fetch price for {symbol} in bulk")
+                                logger.warning(f"[Account {self.id}] Failed to fetch {price_type} price for {symbol} in bulk")
                 else:
                     # Bulk fetch failed, set all to None
                     for symbol in symbols_to_fetch:

@@ -667,8 +667,8 @@ class AlpacaAccount(AccountInterface):
                 elif price_type == 'ask':
                     # Return ask price, fallback to bid if ask not available
                     return ask_price if ask_price else bid_price
-                elif price_type == 'avg':
-                    # Return average of both prices
+                elif price_type in ('avg', 'mid'):
+                    # Return average of both prices (support both 'avg' and 'mid')
                     if bid_price and ask_price:
                         return (bid_price + ask_price) / 2
                     elif bid_price:

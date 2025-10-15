@@ -5,6 +5,7 @@ Displays unrealized profit/loss for open positions grouped by account.
 from nicegui import ui
 import asyncio
 from typing import Dict
+from datetime import datetime, timezone
 from sqlmodel import select
 from ...logger import logger
 from ...core.db import get_db
@@ -83,25 +84,85 @@ class FloatingPLPerAccountWidget:
                     if not account:
                         continue
                     
-                    # Collect all unique symbols for this account
-                    symbols = list(set(trans.symbol for trans, _ in trans_list))
+                    # Get broker positions to use their current_price (same as broker P/L calculation)
+                    broker_positions = account.get_positions()
+                    prices = {}
+                    if broker_positions:
+                        for pos in broker_positions:
+                            pos_dict = pos if isinstance(pos, dict) else dict(pos)
+                            prices[pos_dict['symbol']] = float(pos_dict['current_price'])
                     
-                    # Fetch all prices at once (single API call)
-                    prices = account.get_instrument_current_price(symbols)
-                    
-                    # Calculate P/L for each transaction using fetched prices
+                    # Calculate P/L for each transaction using broker prices
                     for trans, account_name in trans_list:
-                        current_price = prices.get(trans.symbol) if prices else None
+                        current_price = prices.get(trans.symbol)
                         
-                        if not current_price or trans.open_price is None:
+                        if not current_price:
                             continue
                         
-                        # Calculate P/L: (current_price - open_price) * quantity
-                        pl = (current_price - trans.open_price) * trans.quantity
+                        # Get all orders for this transaction
+                        from ...core.types import OrderStatus, OrderDirection, OrderType
+                        all_orders = session.exec(
+                            select(TradingOrder)
+                            .where(TradingOrder.transaction_id == trans.id)
+                        ).all()
+                        
+                        if not all_orders:
+                            continue
+                        
+                        # Determine position direction from first order
+                        first_order = min(all_orders, key=lambda o: o.created_at or datetime.min.replace(tzinfo=timezone.utc))
+                        position_direction = first_order.side
+                        
+                        # Filter for market entry orders (exclude TP/SL limit orders)
+                        # Include: MARKET, BUY_STOP, SELL_STOP (entry orders)
+                        # Exclude: BUY_LIMIT, SELL_LIMIT, TRAILING_STOP (typically TP/SL exit orders)
+                        market_entry_orders = [
+                            order for order in all_orders
+                            if order.side == position_direction  # Same direction as position
+                            and order.order_type in [OrderType.MARKET, OrderType.BUY_STOP, OrderType.SELL_STOP]  # Entry orders only
+                        ]
+                        
+                        # Calculate P/L from FILLED market entry orders only
+                        filled_entry_orders = [o for o in market_entry_orders if o.status in OrderStatus.get_executed_statuses()]
+                        
+                        total_cost = 0.0
+                        filled_qty = 0.0
+                        
+                        for order in filled_entry_orders:
+                            if not order.open_price or not order.filled_qty:
+                                continue
+                            
+                            # All entry orders are same direction, so just sum
+                            total_cost += order.filled_qty * order.open_price
+                            filled_qty += order.filled_qty
+                        
+                        if abs(filled_qty) < 0.01:  # No filled position yet
+                            continue
+                        
+                        # Calculate weighted average price
+                        avg_price = total_cost / filled_qty
+                        
+                        # Calculate P/L: (current_price - avg_price) * filled_quantity
+                        # For short positions, this will be negative when price goes up (correct)
+                        pl = (current_price - avg_price) * filled_qty
+                        if position_direction == OrderDirection.SELL:
+                            pl = -pl  # Invert for short positions
                         
                         if account_name not in account_pl:
                             account_pl[account_name] = 0.0
                         account_pl[account_name] += pl
+                        
+                        # Validate: Check total quantity (filled + pending market entry orders) vs transaction quantity
+                        pending_entry_orders = [o for o in market_entry_orders if o.status in [OrderStatus.PENDING, OrderStatus.OPEN]]
+                        total_order_qty = filled_qty + sum(o.quantity for o in pending_entry_orders if o.quantity)
+                        
+                        if abs(total_order_qty - abs(trans.quantity)) > 0.01:
+                            logger.error(
+                                f"Transaction {trans.id} quantity mismatch: "
+                                f"transaction.quantity={trans.quantity}, "
+                                f"total market entry orders qty={total_order_qty:.2f} "
+                                f"(filled={filled_qty:.2f} + pending={total_order_qty - filled_qty:.2f})"
+                            )
                         
                 except Exception as e:
                     logger.error(f"Error calculating P/L for account {account_id}: {e}", exc_info=True)

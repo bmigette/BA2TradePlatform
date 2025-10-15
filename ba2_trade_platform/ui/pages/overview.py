@@ -1376,9 +1376,14 @@ class AccountOverviewTab:
                             all_positions_raw.append(pos_dict.copy())
                             
                             # Format all float values to 2 decimal places for display
+                            # Special handling for percentage fields - multiply by 100
                             for k, v in pos_dict.items():
                                 if isinstance(v, float):
-                                    pos_dict[k] = f"{v:.2f}"
+                                    if k in ['unrealized_plpc', 'change_today', 'unrealized_intraday_plpc']:
+                                        # Percentage fields: multiply by 100 for display
+                                        pos_dict[k] = f"{v * 100:.2f}%"
+                                    else:
+                                        pos_dict[k] = f"{v:.2f}"
                             all_positions.append(pos_dict)
                 except Exception as e:
                     logger.warning(f"Failed to load account {acc.name} (ID: {acc.id}): {e}")
@@ -1455,6 +1460,10 @@ class AccountOverviewTab:
                     ui.label(f'Market Value: ${total_mv:,.2f}').classes('text-sm font-semibold')
                     
                 ui.label('Note: Total reflects all positions. Use filter to view subsets.').classes('text-xs text-gray-500 italic px-4 pb-2')
+                
+                # Compare with Broker button
+                with ui.row().classes('w-full justify-end px-4 pb-3'):
+                    ui.button('🔍 Compare with Broker', on_click=self._show_broker_comparison_dialog).props('outline color=primary')
             
             # All Orders Table
             with ui.card().classes('mt-4'):
@@ -2235,6 +2244,368 @@ class AccountOverviewTab:
         except Exception as e:
             logger.error(f"Error confirming delete orders: {e}", exc_info=True)
             ui.notify(f'Error deleting orders: {str(e)}', type='negative')
+        finally:
+            session.close()
+    
+    def _show_broker_comparison_dialog(self):
+        """Show dialog comparing broker positions with our transaction data."""
+        from ...core.models import Transaction, AccountDefinition
+        from ...core.types import TransactionStatus
+        
+        try:
+            # Get comparison results
+            result = self._compare_positions_with_broker()
+            
+            # Check if error occurred (None returned)
+            if result is None:
+                ui.notify('❌ Error comparing positions with broker. Check logs for details.', type='negative')
+                return
+            
+            discrepancies = result['discrepancies']
+            orphaned_orders = result['orphaned_orders']
+            
+            if not discrepancies and not orphaned_orders:
+                ui.notify('✅ No discrepancies or orphaned orders found! All positions match broker data.', type='positive')
+                return
+            
+            # Show dialog with results
+            with ui.dialog() as dialog, ui.card().classes('w-full max-w-6xl'):
+                ui.label('🔍 Broker Position Comparison').classes('text-h5 mb-4')
+                
+                # Summary message
+                summary_parts = []
+                if discrepancies:
+                    summary_parts.append(f'{len(discrepancies)} discrepancies')
+                if orphaned_orders:
+                    summary_parts.append(f'{len(orphaned_orders)} orphaned orders')
+                ui.label(f'Found {" and ".join(summary_parts)} across accounts').classes('text-subtitle2 text-orange mb-4')
+                
+                # Group discrepancies by account
+                by_account = {}
+                for disc in discrepancies:
+                    acc_name = disc['account']
+                    if acc_name not in by_account:
+                        by_account[acc_name] = []
+                    by_account[acc_name].append(disc)
+                
+                # Display each account's discrepancies
+                for account_name, account_discs in by_account.items():
+                    with ui.expansion(account_name, icon='account_balance').classes('w-full mb-2').props('default-opened'):
+                        columns = [
+                            {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'align': 'left'},
+                            {'name': 'our_qty', 'label': 'Our Qty', 'field': 'our_qty', 'sortable': True, 'align': 'right'},
+                            {'name': 'broker_qty', 'label': 'Broker Qty', 'field': 'broker_qty', 'sortable': True, 'align': 'right'},
+                            {'name': 'qty_diff', 'label': 'Qty Diff', 'field': 'qty_diff', 'sortable': True, 'align': 'right'},
+                            {'name': 'our_avg_price', 'label': 'Our Avg Price', 'field': 'our_avg_price', 'sortable': True, 'align': 'right'},
+                            {'name': 'broker_avg_price', 'label': 'Broker Avg Price', 'field': 'broker_avg_price', 'sortable': True, 'align': 'right'},
+                            {'name': 'price_diff_pct', 'label': 'Price Diff %', 'field': 'price_diff_pct', 'sortable': True, 'align': 'right'},
+                            {'name': 'discrepancy_type', 'label': 'Issue', 'field': 'discrepancy_type', 'sortable': True, 'align': 'left'}
+                        ]
+                        
+                        rows = []
+                        for disc in account_discs:
+                            rows.append({
+                                'symbol': disc['symbol'],
+                                'our_qty': f"{disc['our_qty']:.2f}",
+                                'broker_qty': f"{disc['broker_qty']:.2f}",
+                                'qty_diff': f"{disc['qty_diff']:.2f}",
+                                'our_avg_price': f"${disc['our_avg_price']:.2f}" if disc['our_avg_price'] else 'N/A',
+                                'broker_avg_price': f"${disc['broker_avg_price']:.2f}" if disc['broker_avg_price'] else 'N/A',
+                                'price_diff_pct': f"{disc['price_diff_pct']:.2f}%" if disc['price_diff_pct'] is not None else 'N/A',
+                                'discrepancy_type': disc['discrepancy_type']
+                            })
+                        
+                        ui.table(columns=columns, rows=rows).classes('w-full')
+                
+                # Display orphaned orders if any
+                if orphaned_orders:
+                    ui.separator().classes('my-4')
+                    ui.label('⚠️ Orphaned Orders (Executed but not bound to transactions)').classes('text-h6 mb-2 text-red')
+                    
+                    # Group orphaned orders by account
+                    orphans_by_account = {}
+                    for orphan in orphaned_orders:
+                        acc_name = orphan['account']
+                        if acc_name not in orphans_by_account:
+                            orphans_by_account[acc_name] = []
+                        orphans_by_account[acc_name].append(orphan)
+                    
+                    for account_name, account_orphans in orphans_by_account.items():
+                        with ui.expansion(f"{account_name} - {len(account_orphans)} orphaned order(s)", icon='warning').classes('w-full mb-2 bg-red-50'):
+                            orphan_columns = [
+                                {'name': 'order_id', 'label': 'Order ID', 'field': 'order_id', 'sortable': True, 'align': 'left'},
+                                {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'align': 'left'},
+                                {'name': 'side', 'label': 'Side', 'field': 'side', 'sortable': True, 'align': 'left'},
+                                {'name': 'qty', 'label': 'Qty', 'field': 'qty', 'sortable': True, 'align': 'right'},
+                                {'name': 'price', 'label': 'Price', 'field': 'price', 'sortable': True, 'align': 'right'},
+                                {'name': 'date', 'label': 'Date', 'field': 'date', 'sortable': True, 'align': 'left'},
+                                {'name': 'broker_order_id', 'label': 'Broker Order ID', 'field': 'broker_order_id', 'sortable': True, 'align': 'left'}
+                            ]
+                            
+                            orphan_rows = []
+                            for orphan in account_orphans:
+                                orphan_rows.append({
+                                    'order_id': str(orphan['order_id']),
+                                    'symbol': orphan['symbol'],
+                                    'side': orphan['side'],
+                                    'qty': f"{orphan['qty']:.2f}",
+                                    'price': f"${orphan['price']:.2f}" if orphan['price'] else 'N/A',
+                                    'date': orphan['date'],
+                                    'broker_order_id': orphan['broker_order_id']
+                                })
+                            
+                            ui.table(columns=orphan_columns, rows=orphan_rows).classes('w-full')
+                            ui.label('These orders are executed but not associated with any transaction. Consider linking them or investigating why they exist.').classes('text-sm text-orange italic mt-2')
+                
+                # Add legend
+                with ui.card().classes('w-full mt-4 bg-blue-50'):
+                    ui.label('ℹ️ Legend').classes('text-subtitle2 font-bold mb-2')
+                    ui.label('• Quantity Mismatch: Our transaction qty differs from broker qty').classes('text-sm')
+                    ui.label('• Price Mismatch (>3%): Total cost basis differs by more than 3%').classes('text-sm')
+                    ui.label('• Both: Both quantity and price mismatches detected').classes('text-sm')
+                    if orphaned_orders:
+                        ui.label('• Orphaned Orders: Executed orders not bound to any transaction').classes('text-sm text-red')
+                
+                with ui.row().classes('w-full justify-end mt-4'):
+                    ui.button('Close', on_click=dialog.close).props('flat')
+            
+            dialog.open()
+            
+        except Exception as e:
+            logger.error(f"Error showing broker comparison dialog: {e}", exc_info=True)
+            ui.notify(f'Error comparing positions: {str(e)}', type='negative')
+    
+    def _compare_positions_with_broker(self):
+        """
+        Compare our transaction positions with broker positions.
+        Works per-transaction for open positions, aggregates by symbol.
+        Also detects orphaned orders (executed orders not bound to transactions).
+        Returns dict with 'discrepancies' list and 'orphaned_orders' list.
+        Returns None if an error occurs.
+        """
+        from ...core.models import Transaction, AccountDefinition, TradingOrder
+        from ...core.types import TransactionStatus, OrderStatus, OrderDirection, OrderType
+        from sqlmodel import select
+        
+        discrepancies = []
+        orphaned_orders = []
+        session = get_db()
+        
+        try:
+            # Get all accounts
+            accounts = get_all_instances(AccountDefinition)
+            
+            logger.info(f"Starting broker position comparison for {len(accounts)} account(s)")
+            
+            for account in accounts:
+                try:
+                    # Get broker positions
+                    account_provider = get_account_instance_from_id(account.id)
+                    if not account_provider:
+                        logger.warning(f"Could not get account provider for {account.name}")
+                        continue
+                    
+                    broker_positions = account_provider.get_positions()
+                    
+                    # Step 1: Check for orphaned orders (executed orders without transactions)
+                    orphan_statement = (
+                        select(TradingOrder)
+                        .where(TradingOrder.account_id == account.id)
+                        .where(TradingOrder.status.in_(OrderStatus.get_executed_statuses()))
+                        .where(TradingOrder.transaction_id.is_(None))
+                    )
+                    orphaned = session.exec(orphan_statement).all()
+                    
+                    for orphan_order in orphaned:
+                        orphaned_orders.append({
+                            'account': account.name,
+                            'order_id': orphan_order.id,
+                            'symbol': orphan_order.symbol,
+                            'side': orphan_order.side.value if orphan_order.side else 'UNKNOWN',
+                            'qty': orphan_order.filled_qty or 0,
+                            'price': orphan_order.open_price or 0,
+                            'date': orphan_order.created_at.strftime('%Y-%m-%d %H:%M') if orphan_order.created_at else 'N/A',
+                            'broker_order_id': orphan_order.broker_order_id or 'N/A'
+                        })
+                        logger.warning(
+                            f"Orphaned order found: Order {orphan_order.id} - "
+                            f"{orphan_order.symbol} {orphan_order.side.value if orphan_order.side else 'N/A'} "
+                            f"qty={orphan_order.filled_qty} @ ${orphan_order.open_price or 0:.2f}"
+                        )
+                    
+                    # Step 2: Get open transactions and aggregate by symbol
+                    # Work per transaction to calculate positions correctly
+                    statement = (
+                        select(Transaction)
+                        .where(Transaction.expert_id.in_(
+                            select(TradingOrder.expert_recommendation_id)
+                            .where(TradingOrder.account_id == account.id)
+                            .distinct()
+                        ) | (Transaction.expert_id.is_(None)))
+                        .where(Transaction.status == TransactionStatus.OPENED)
+                    )
+                    
+                    # Get all open transactions for this account through orders
+                    open_transactions_statement = (
+                        select(Transaction)
+                        .join(TradingOrder, Transaction.id == TradingOrder.transaction_id)
+                        .where(TradingOrder.account_id == account.id)
+                        .where(Transaction.status == TransactionStatus.OPENED)
+                        .distinct()
+                    )
+                    open_transactions = session.exec(open_transactions_statement).all()
+                    
+                    # Aggregate positions by symbol from open transactions
+                    our_positions = {}
+                    for transaction in open_transactions:
+                        # Get all FILLED orders for this transaction (exclude pending/limit orders)
+                        orders_statement = (
+                            select(TradingOrder)
+                            .where(TradingOrder.transaction_id == transaction.id)
+                            .where(TradingOrder.account_id == account.id)
+                            .where(TradingOrder.status.in_(OrderStatus.get_executed_statuses()))
+                        )
+                        orders = session.exec(orders_statement).all()
+                        
+                        for order in orders:
+                            if not order.symbol or not order.filled_qty:
+                                continue
+                            
+                            # Initialize position tracker for symbol
+                            if order.symbol not in our_positions:
+                                our_positions[order.symbol] = {
+                                    'qty': 0.0,
+                                    'cost_basis': 0.0,
+                                    'avg_price': 0.0,
+                                    'order_count': 0,
+                                    'transaction_ids': set()
+                                }
+                            
+                            # Calculate quantity (positive for buy, negative for sell)
+                            qty_delta = order.filled_qty if order.side == OrderDirection.BUY else -order.filled_qty
+                            
+                            # Update cost basis - use open_price (the filled price)
+                            if order.open_price and order.filled_qty:
+                                cost_delta = abs(qty_delta) * order.open_price
+                                our_positions[order.symbol]['cost_basis'] += cost_delta
+                                logger.debug(
+                                    f"  Txn {transaction.id}, Order {order.id}: {order.symbol} "
+                                    f"{order.side.value} qty={order.filled_qty} @ ${order.open_price:.2f} "
+                                    f"-> cost_delta=${cost_delta:.2f}"
+                                )
+                            
+                            our_positions[order.symbol]['qty'] += qty_delta
+                            our_positions[order.symbol]['order_count'] += 1
+                            our_positions[order.symbol]['transaction_ids'].add(transaction.id)
+                    
+                    # Calculate average prices
+                    for symbol, data in our_positions.items():
+                        if abs(data['qty']) > 0.01:
+                            data['avg_price'] = data['cost_basis'] / abs(data['qty'])
+                            logger.debug(
+                                f"Position summary for {symbol}: "
+                                f"{data['order_count']} orders from {len(data['transaction_ids'])} transactions, "
+                                f"net_qty={data['qty']:.2f}, "
+                                f"cost_basis=${data['cost_basis']:.2f}, "
+                                f"avg_price=${data['avg_price']:.2f}"
+                            )
+                    
+                    # Compare broker positions with our positions
+                    broker_symbols = set()
+                    for broker_pos in broker_positions:
+                        pos_dict = broker_pos if isinstance(broker_pos, dict) else dict(broker_pos)
+                        symbol = pos_dict.get('symbol')
+                        broker_qty = float(pos_dict.get('qty', 0))
+                        broker_avg_price = float(pos_dict.get('avg_entry_price', 0))
+                        
+                        broker_symbols.add(symbol)
+                        
+                        # Get our position for this symbol
+                        our_data = our_positions.get(symbol, {'qty': 0.0, 'avg_price': 0.0, 'cost_basis': 0.0})
+                        our_qty = our_data['qty']
+                        our_avg_price = our_data['avg_price']
+                        our_cost_basis = our_data['cost_basis']
+                        
+                        # Check for discrepancies
+                        qty_mismatch = abs(broker_qty - our_qty) > 0.01  # Tolerance for float comparison
+                        price_mismatch = False
+                        price_diff_pct = None
+                        
+                        # Only check price if both have non-zero quantities and prices
+                        # Compare total cost basis (avg_price * qty) instead of just avg_price
+                        if abs(broker_qty) > 0.01 and abs(our_qty) > 0.01 and broker_avg_price > 0 and our_avg_price > 0:
+                            # Calculate cost basis for broker position
+                            broker_cost_basis = broker_avg_price * abs(broker_qty)
+                            # Compare cost basis percentage difference
+                            price_diff_pct = abs(broker_cost_basis - our_cost_basis) / broker_cost_basis * 100
+                            price_mismatch = price_diff_pct > 3.0  # 3% tolerance
+                        
+                        if qty_mismatch or price_mismatch:
+                            discrepancy_type = []
+                            if qty_mismatch:
+                                discrepancy_type.append('Quantity Mismatch')
+                            if price_mismatch:
+                                discrepancy_type.append(f'Price Mismatch (>{price_diff_pct:.1f}%)')
+                            
+                            discrepancies.append({
+                                'account': account.name,
+                                'account_id': account.id,
+                                'symbol': symbol,
+                                'our_qty': our_qty,
+                                'broker_qty': broker_qty,
+                                'qty_diff': broker_qty - our_qty,
+                                'our_avg_price': our_avg_price,
+                                'broker_avg_price': broker_avg_price,
+                                'price_diff_pct': price_diff_pct,
+                                'discrepancy_type': ' + '.join(discrepancy_type)
+                            })
+                    
+                    # Check for symbols we have but broker doesn't
+                    for symbol, our_data in our_positions.items():
+                        if symbol not in broker_symbols and abs(our_data['qty']) > 0.01:
+                            discrepancies.append({
+                                'account': account.name,
+                                'account_id': account.id,
+                                'symbol': symbol,
+                                'our_qty': our_data['qty'],
+                                'broker_qty': 0.0,
+                                'qty_diff': -our_data['qty'],
+                                'our_avg_price': our_data['avg_price'],
+                                'broker_avg_price': 0.0,
+                                'price_diff_pct': None,
+                                'discrepancy_type': 'Position Not at Broker'
+                            })
+                    
+                    # Log summary for this account
+                    account_discrepancies = [d for d in discrepancies if d['account'] == account.name]
+                    account_orphans = [o for o in orphaned_orders if o['account'] == account.name]
+                    logger.info(
+                        f"Account '{account.name}': {len(broker_positions)} broker positions, "
+                        f"{len(our_positions)} our positions, "
+                        f"{len(account_discrepancies)} discrepancies, "
+                        f"{len(account_orphans)} orphaned orders found"
+                    )
+                
+                except Exception as e:
+                    logger.error(f"Error comparing positions for account {account.name}: {e}", exc_info=True)
+                    # Return None to indicate error occurred
+                    return None
+            
+            # Log final summary
+            logger.info(
+                f"Broker comparison complete: {len(accounts)} accounts checked, "
+                f"{len(discrepancies)} total discrepancies, "
+                f"{len(orphaned_orders)} orphaned orders found"
+            )
+            
+            return {
+                'discrepancies': discrepancies,
+                'orphaned_orders': orphaned_orders
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in _compare_positions_with_broker: {e}", exc_info=True)
+            return None
         finally:
             session.close()
 
