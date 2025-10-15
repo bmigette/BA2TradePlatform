@@ -423,8 +423,10 @@ class JobMonitoringTab:
                 # Build options dictionary
                 options = {'all': 'All Experts'}
                 for expert in expert_instances:
-                    # Use user_description if available, otherwise expert name
-                    display_name = expert.user_description or expert.expert
+                    # Use alias if available, otherwise expert type
+                    # Format: alias-ID or expertType-ID
+                    base_name = expert.alias or expert.expert
+                    display_name = f"{base_name}-{expert.id}"
                     options[str(expert.id)] = display_name
                 
                 return options
@@ -2259,10 +2261,11 @@ class OrderRecommendationsTab:
             # Always start with 'All Experts' option
             options = ['all']
             
-            # Create options: display name with instance ID
+            # Create options: alias-ID or expertType-ID format
             for expert in enabled_experts:
-                desc = expert.user_description or f"Expert {expert.id}"
-                display_name = f"{expert.expert} - {desc} (ID: {expert.id})"
+                # Use alias if available, otherwise expert type
+                base_name = expert.alias or expert.expert
+                display_name = f"{base_name}-{expert.id}"
                 options.append(display_name)
             
             return options

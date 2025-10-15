@@ -1580,22 +1580,38 @@ class ExpertSettingsTab:
         # Get selected days
         if hasattr(self, 'enter_market_schedule_days'):
             for day, checkbox in self.enter_market_schedule_days.items():
-                schedule['days'][day] = checkbox.value
+                try:
+                    schedule['days'][day] = checkbox.value
+                    logger.debug(f"Reading enter_market schedule day {day}: {checkbox.value}")
+                except Exception as e:
+                    logger.error(f"Error reading enter_market schedule day {day}: {e}")
+        else:
+            logger.warning("No enter_market_schedule_days attribute found")
         
         # Get execution times
         if hasattr(self, 'enter_market_execution_times'):
+            logger.debug(f"Found {len(self.enter_market_execution_times)} enter_market execution time inputs")
             for time_input in self.enter_market_execution_times:
-                time_value = time_input.value.strip()
-                if time_value and ':' in time_value:
-                    try:
+                try:
+                    time_value = time_input.value.strip() if time_input.value else ""
+                    logger.debug(f"Reading enter_market time input: '{time_value}'")
+                    if time_value and ':' in time_value:
                         hours, minutes = time_value.split(':')
                         hours_int = int(hours)
                         minutes_int = int(minutes)
                         if 0 <= hours_int <= 23 and 0 <= minutes_int <= 59:
                             schedule['times'].append(time_value)
-                    except ValueError:
-                        pass  # Skip invalid times
+                            logger.debug(f"Added valid enter_market time: {time_value}")
+                        else:
+                            logger.warning(f"Invalid enter_market time range: {time_value}")
+                except ValueError as e:
+                    logger.warning(f"Error parsing enter_market time '{time_value}': {e}")
+                except Exception as e:
+                    logger.error(f"Unexpected error reading enter_market time input: {e}")
+        else:
+            logger.warning("No enter_market_execution_times attribute found")
         
+        logger.info(f"Enter market schedule config: {schedule}")
         return schedule
     
     def _get_open_positions_schedule_config(self):
@@ -1608,22 +1624,38 @@ class ExpertSettingsTab:
         # Get selected days
         if hasattr(self, 'open_positions_schedule_days'):
             for day, checkbox in self.open_positions_schedule_days.items():
-                schedule['days'][day] = checkbox.value
+                try:
+                    schedule['days'][day] = checkbox.value
+                    logger.debug(f"Reading open_positions schedule day {day}: {checkbox.value}")
+                except Exception as e:
+                    logger.error(f"Error reading open_positions schedule day {day}: {e}")
+        else:
+            logger.warning("No open_positions_schedule_days attribute found")
         
         # Get execution times
         if hasattr(self, 'open_positions_execution_times'):
+            logger.debug(f"Found {len(self.open_positions_execution_times)} open_positions execution time inputs")
             for time_input in self.open_positions_execution_times:
-                time_value = time_input.value.strip()
-                if time_value and ':' in time_value:
-                    try:
+                try:
+                    time_value = time_input.value.strip() if time_input.value else ""
+                    logger.debug(f"Reading open_positions time input: '{time_value}'")
+                    if time_value and ':' in time_value:
                         hours, minutes = time_value.split(':')
                         hours_int = int(hours)
                         minutes_int = int(minutes)
                         if 0 <= hours_int <= 23 and 0 <= minutes_int <= 59:
                             schedule['times'].append(time_value)
-                    except ValueError:
-                        pass  # Skip invalid times
+                            logger.debug(f"Added valid open_positions time: {time_value}")
+                        else:
+                            logger.warning(f"Invalid open_positions time range: {time_value}")
+                except ValueError as e:
+                    logger.warning(f"Error parsing open_positions time '{time_value}': {e}")
+                except Exception as e:
+                    logger.error(f"Unexpected error reading open_positions time input: {e}")
+        else:
+            logger.warning("No open_positions_execution_times attribute found")
         
+        logger.info(f"Open positions schedule config: {schedule}")
         return schedule
     
     def _load_schedule_config(self, schedule_config):

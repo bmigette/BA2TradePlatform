@@ -1434,6 +1434,27 @@ class AccountOverviewTab:
                         </span>
                     </q-td>
                 ''')
+                
+                # Add totals row below table
+                ui.separator().classes('my-2')
+                
+                # Calculate totals from all positions
+                def calculate_totals():
+                    total_qty = sum(float(pos['qty']) for pos in all_positions)
+                    total_pl = sum(float(pos['unrealized_pl'].replace('$', '').replace(',', '')) if pos['unrealized_pl'] else 0 for pos in all_positions)
+                    total_mv = sum(float(pos['market_value'].replace('$', '').replace(',', '')) if pos['market_value'] else 0 for pos in all_positions)
+                    return total_qty, total_pl, total_mv
+                
+                total_qty, total_pl, total_mv = calculate_totals()
+                
+                with ui.row().classes('w-full justify-end items-center gap-6 px-4 py-3 bg-gray-50 border-t-2 border-gray-300'):
+                    ui.label('TOTAL:').classes('text-sm font-bold text-gray-700')
+                    ui.label(f'Qty: {total_qty:.2f}').classes('text-sm font-semibold')
+                    pl_color = 'text-green-600' if total_pl >= 0 else 'text-red-600'
+                    ui.label(f'Unrealized P/L: ${total_pl:,.2f}').classes(f'text-sm font-bold {pl_color}')
+                    ui.label(f'Market Value: ${total_mv:,.2f}').classes('text-sm font-semibold')
+                    
+                ui.label('Note: Total reflects all positions. Use filter to view subsets.').classes('text-xs text-gray-500 italic px-4 pb-2')
             
             # All Orders Table
             with ui.card().classes('mt-4'):

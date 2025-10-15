@@ -201,12 +201,29 @@ class ExtendableSettingsInterface(ABC):
     
     def _invalidate_settings_cache(self):
         """
-        Invalidate the cached settings for this instance.
+        Invalidate the cached settings for this instance and the singleton cache.
         Call this after updating settings in the database.
         """
         # Clear instance-level settings cache
         self._settings_cache = None
         logger.debug(f"Cleared settings cache for {type(self).__name__} id={self.id}")
+        
+        # Also invalidate the singleton cache to ensure fresh data on next access
+        try:
+            # Check if this is an AccountInterface or MarketExpertInterface
+            from ..interfaces.AccountInterface import AccountInterface
+            from ..interfaces.MarketExpertInterface import MarketExpertInterface
+            
+            if isinstance(self, AccountInterface):
+                from ..AccountInstanceCache import AccountInstanceCache
+                AccountInstanceCache.invalidate_instance(self.id)
+                logger.debug(f"Invalidated AccountInstanceCache for account {self.id}")
+            elif isinstance(self, MarketExpertInterface):
+                from ..ExpertInstanceCache import ExpertInstanceCache
+                ExpertInstanceCache.invalidate_instance(self.id)
+                logger.debug(f"Invalidated ExpertInstanceCache for expert {self.id}")
+        except Exception as e:
+            logger.warning(f"Could not invalidate singleton cache: {e}")
     
     def get_all_settings(self) -> Dict[str, Any]:
         """
