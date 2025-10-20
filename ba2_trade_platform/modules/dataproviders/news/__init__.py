@@ -14,16 +14,19 @@ Available Providers:
 
 from .AlpacaNewsProvider import AlpacaNewsProvider
 from .AlphaVantageNewsProvider import AlphaVantageNewsProvider
-from .OpenAINewsProvider import OpenAINewsProvider
+from .AINewsProvider import AINewsProvider
+from .OpenAINewsProvider import OpenAINewsProvider  # Legacy - deprecated
 from .GoogleNewsProvider import GoogleNewsProvider
 from .FMPNewsProvider import FMPNewsProvider
-# from .FinnhubNewsProvider import FinnhubNewsProvider
+from .FinnhubNewsProvider import FinnhubNewsProvider
 # from .RedditNewsProvider import RedditNewsProvider
 
 __all__ = [
     "AlpacaNewsProvider",
     "AlphaVantageNewsProvider",
-    "OpenAINewsProvider",
+    "AINewsProvider",
+    "OpenAINewsProvider",  # Legacy - deprecated
     "GoogleNewsProvider",
     "FMPNewsProvider",
+    "FinnhubNewsProvider",
 ]

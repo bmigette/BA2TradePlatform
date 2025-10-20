@@ -236,16 +236,15 @@ class TradeManager:
                         # Submit the dependent order
                         try:
                             self.logger.info(
-                                f"Submitting dependent order {dependent_order.id}: {dependent_order.direction.value} "
+                                f"Submitting dependent order {dependent_order.id}: {dependent_order.side.value} "
                                 f"{dependent_order.quantity} {dependent_order.symbol} @ {dependent_order.order_type.value} "
                                 f"(triggered by parent order {parent_order_id})"
                             )
                             submitted_order = account.submit_order(dependent_order)
                             
                             if submitted_order:
-                                # Update dependent order status to OPEN
-                                dependent_order.status = OrderStatus.OPEN
-                                session.add(dependent_order)
+                                # Refresh dependent_order from database to get latest state (including broker_order_id)
+                                session.refresh(dependent_order)
                                 self.logger.info(f"Successfully submitted dependent order {dependent_order.id} triggered by parent order {parent_order_id}")
                                 triggered_orders.append(dependent_order.id)
                             else:
@@ -392,16 +391,16 @@ class TradeManager:
                             # Submit the dependent order
                             try:
                                 self.logger.info(
-                                    f"Submitting dependent order {dependent_order.id}: {dependent_order.direction.value} "
+                                    f"Submitting dependent order {dependent_order.id}: {dependent_order.side.value} "
                                     f"{dependent_order.quantity} {dependent_order.symbol} @ {dependent_order.order_type.value} "
                                     f"(triggered by parent order {parent_order_id})"
                                 )
                                 submitted_order = account.submit_order(dependent_order)
                                 
                                 if submitted_order:
-                                    # Update dependent order status to OPEN
-                                    dependent_order.status = OrderStatus.OPEN
-                                    session.add(dependent_order)
+                                    # Use the fresh order returned by submit_order (has broker_order_id)
+                                    # Refresh dependent_order from database to get latest state
+                                    session.refresh(dependent_order)
                                     self.logger.info(f"Successfully submitted dependent order {dependent_order.id}")
                                     triggered_orders.append(dependent_order.id)
                                 else:

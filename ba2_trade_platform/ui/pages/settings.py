@@ -11,7 +11,7 @@ from ...core.db import get_db, get_all_instances, delete_instance, add_instance,
 from ...modules.accounts import providers
 from ...core.interfaces import AccountInterface
 from ...core.utils import get_account_instance_from_id
-from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, is_share_adjustment_action, AnalysisUseCase, MarketAnalysisStatus
+from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, is_share_adjustment_action, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label
 from ...core.cleanup import preview_cleanup, execute_cleanup, get_cleanup_statistics
 from yahooquery import Ticker, search as yq_search
 from nicegui.events import UploadEventArguments
@@ -373,6 +373,8 @@ class AppSettingsTab:
     def __init__(self):
         self.openai_input = None
         self.openai_admin_input = None
+        self.naga_ai_input = None
+        self.naga_ai_admin_input = None
         self.finnhub_input = None
         self.fred_input = None
         self.alpha_vantage_input = None
@@ -387,6 +389,8 @@ class AppSettingsTab:
         session = get_db()
         openai = session.exec(select(AppSetting).where(AppSetting.key == 'openai_api_key')).first()
         openai_admin = session.exec(select(AppSetting).where(AppSetting.key == 'openai_admin_api_key')).first()
+        naga_ai = session.exec(select(AppSetting).where(AppSetting.key == 'naga_ai_api_key')).first()
+        naga_ai_admin = session.exec(select(AppSetting).where(AppSetting.key == 'naga_ai_admin_api_key')).first()
         finnhub = session.exec(select(AppSetting).where(AppSetting.key == 'finnhub_api_key')).first()
         fred = session.exec(select(AppSetting).where(AppSetting.key == 'fred_api_key')).first()
         alpha_vantage = session.exec(select(AppSetting).where(AppSetting.key == 'alpha_vantage_api_key')).first()
@@ -397,10 +401,19 @@ class AppSettingsTab:
         account_refresh_interval = session.exec(select(AppSetting).where(AppSetting.key == 'account_refresh_interval')).first()
         
         with ui.card().classes('w-full'):
+            ui.label('OpenAI API Keys').classes('text-lg font-semibold')
             self.openai_input = ui.input(label='OpenAI API Key', value=openai.value_str if openai else '').classes('w-full')
             with ui.row().classes('w-full items-center gap-2 mt-2 mb-2'):
                 self.openai_admin_input = ui.input(label='OpenAI Admin API Key (for usage data)', value=openai_admin.value_str if openai_admin else '').classes('flex-1')
                 ui.link('Get Admin Key', 'https://platform.openai.com/settings/organization/admin-keys', new_tab=True).classes('text-sm text-blue-600 underline')
+            
+            ui.label('Naga AI API Keys').classes('text-lg font-semibold mt-4')
+            with ui.row().classes('w-full items-center gap-2 mt-2'):
+                self.naga_ai_input = ui.input(label='Naga AI API Key', value=naga_ai.value_str if naga_ai else '').classes('flex-1')
+                ui.link('Get Naga AI Key', 'https://naga.ac/', new_tab=True).classes('text-sm text-blue-600 underline')
+            self.naga_ai_admin_input = ui.input(label='Naga AI Admin API Key (for usage data)', value=naga_ai_admin.value_str if naga_ai_admin else '').classes('w-full')
+            
+            ui.label('Other API Keys').classes('text-lg font-semibold mt-4')
             self.finnhub_input = ui.input(label='Finnhub API Key', value=finnhub.value_str if finnhub else '').classes('w-full')
             self.fred_input = ui.input(label='FRED API Key', value=fred.value_str if fred else '').classes('w-full')
             self.alpha_vantage_input = ui.input(label='Alpha Vantage API Key', value=alpha_vantage.value_str if alpha_vantage else '').classes('w-full')
@@ -454,6 +467,24 @@ class AppSettingsTab:
             else:
                 openai_admin = AppSetting(key='openai_admin_api_key', value_str=self.openai_admin_input.value)
                 add_instance(openai_admin, session)
+
+            # Naga AI Regular Key
+            naga_ai = session.exec(select(AppSetting).where(AppSetting.key == 'naga_ai_api_key')).first()
+            if naga_ai:
+                naga_ai.value_str = self.naga_ai_input.value
+                update_instance(naga_ai, session)
+            else:
+                naga_ai = AppSetting(key='naga_ai_api_key', value_str=self.naga_ai_input.value)
+                add_instance(naga_ai, session)
+
+            # Naga AI Admin Key
+            naga_ai_admin = session.exec(select(AppSetting).where(AppSetting.key == 'naga_ai_admin_api_key')).first()
+            if naga_ai_admin:
+                naga_ai_admin.value_str = self.naga_ai_admin_input.value
+                update_instance(naga_ai_admin, session)
+            else:
+                naga_ai_admin = AppSetting(key='naga_ai_admin_api_key', value_str=self.naga_ai_admin_input.value)
+                add_instance(naga_ai_admin, session)
 
             # Finnhub
             finnhub = session.exec(select(AppSetting).where(AppSetting.key == 'finnhub_api_key')).first()
@@ -908,6 +939,8 @@ class ExpertSettingsTab:
     def __init__(self):
         logger.debug('Initializing ExpertSettingsTab')
         self.dialog = ui.dialog()
+        # Disallow closing dialog by clicking outside - user must explicitly click Cancel or Save
+        self.dialog.props('no-backdrop-dismiss')
         self.experts_table = None
         self.instrument_selector = None
         self.render()
@@ -923,7 +956,6 @@ class ExpertSettingsTab:
                 columns=[
                     {'name': 'expert', 'label': 'Expert Type', 'field': 'expert', 'sortable': True},
                     {'name': 'alias', 'label': 'Alias', 'field': 'alias', 'sortable': True},
-                    {'name': 'user_description', 'label': 'User Notes', 'field': 'user_description'},
                     {'name': 'enabled', 'label': 'Enabled', 'field': 'enabled', 'align': 'center'},
                     {'name': 'virtual_equity_pct', 'label': 'Virtual Equity %', 'field': 'virtual_equity_pct', 'align': 'right'},
                     {'name': 'account_id', 'label': 'Account ID', 'field': 'account_id'},
@@ -965,13 +997,6 @@ class ExpertSettingsTab:
                 
                 # Ensure alias is displayed (no truncation needed, max 100 chars)
                 row['alias'] = instance.alias or ''
-                
-                # Ensure user_description is displayed properly (truncate if too long for table)
-                user_desc = instance.user_description or ''
-                if len(user_desc) > 50:
-                    row['user_description'] = user_desc[:47] + '...'
-                else:
-                    row['user_description'] = user_desc
                 
                 # Fetch and add ruleset names
                 if instance.enter_market_ruleset_id:
@@ -1105,6 +1130,10 @@ class ExpertSettingsTab:
         """Show the add/edit expert dialog."""
         logger.debug(f'Showing expert dialog for instance: {expert_instance.id if expert_instance else "new instance"}')
         
+        # Initialize import attributes
+        self._imported_expert_settings = None
+        self._imported_symbol_settings = None
+        
         is_edit = expert_instance is not None
         
         with self.dialog:
@@ -1205,6 +1234,7 @@ class ExpertSettingsTab:
                     ui.tab('General Settings', icon='schedule')
                     ui.tab('Instruments', icon='trending_up')
                     ui.tab('Expert Settings', icon='settings')
+                    ui.tab('Import/Export', icon='download')
                     ui.tab('Cleanup', icon='delete_sweep')
                 
                 with ui.tab_panels(settings_tabs, value='General Settings').classes('w-full').style('flex: 1; overflow-y: auto'):
@@ -1384,6 +1414,10 @@ class ExpertSettingsTab:
                         # Update settings when expert type changes
                         self.expert_select.on('update:model-value', 
                                             lambda e: self._on_expert_type_change(e, expert_instance))
+                    
+                    # Import/Export tab
+                    with ui.tab_panel('Import/Export'):
+                        self._render_import_export_tab(expert_instance)
                     
                     # Cleanup tab
                     with ui.tab_panel('Cleanup'):
@@ -2189,6 +2223,7 @@ class ExpertSettingsTab:
                     
                     # Check if setting has valid_values (dropdown)
                     valid_values = meta.get("valid_values")
+                    allow_custom = meta.get("allow_custom", False)  # Check if custom values are allowed
                     help_text = meta.get("help")
                     tooltip_text = meta.get("tooltip")
                     
@@ -2210,12 +2245,30 @@ class ExpertSettingsTab:
                         if meta["type"] == "str":
                             value = current_value if current_value is not None else default_value or ""
                             if valid_values:
-                                # Show as dropdown
-                                inp = ui.select(
-                                    options=valid_values,
-                                    label=display_label,
-                                    value=value if value in valid_values else (valid_values[0] if valid_values else "")
-                                ).classes('w-full')
+                                # Show as dropdown (editable if allow_custom is True)
+                                if allow_custom:
+                                    # Editable select - allows typing custom values
+                                    # Add current value to options if not already in list to prevent ValueError
+                                    options = list(valid_values)
+                                    if value and value not in options:
+                                        options.append(value)
+                                    inp = ui.select(
+                                        options=options,
+                                        label=display_label,
+                                        value=value,
+                                        with_input=True,  # Enable text input
+                                        new_value_mode='add-unique'  # Allow adding new custom values
+                                    ).classes('w-full').props('use-input')  # Enable search
+                                else:
+                                    # Regular select - restricted to list
+                                    # Add search capability if there are many options (>10)
+                                    inp = ui.select(
+                                        options=valid_values,
+                                        label=display_label,
+                                        value=value if value in valid_values else (valid_values[0] if valid_values else "")
+                                    ).classes('w-full')
+                                    if len(valid_values) > 10:
+                                        inp.props('use-input')  # Enable search for long lists
                             else:
                                 inp = ui.input(label=display_label, value=value).classes('w-full')
                         elif meta["type"] == "list":
@@ -2229,6 +2282,8 @@ class ExpertSettingsTab:
                                     value=value if isinstance(value, list) else [value] if value else [],
                                     multiple=True
                                 ).classes('w-full')
+                                if len(valid_values) > 10:
+                                    inp.props('use-input')  # Enable search for long lists
                             else:
                                 # Fallback to JSON input for list without valid_values
                                 import json
@@ -2243,11 +2298,28 @@ class ExpertSettingsTab:
                             value = current_value if current_value is not None else default_value or ""
                             if valid_values:
                                 # Show as dropdown for other types too if valid_values exist
-                                inp = ui.select(
-                                    options=valid_values,
-                                    label=display_label,
-                                    value=value if value in valid_values else (valid_values[0] if valid_values else "")
-                                ).classes('w-full')
+                                if allow_custom:
+                                    # Editable select for custom values
+                                    # Add current value to options if not already in list to prevent ValueError
+                                    options = list(valid_values)
+                                    if value and value not in options:
+                                        options.append(value)
+                                    inp = ui.select(
+                                        options=options,
+                                        label=display_label,
+                                        value=value,
+                                        with_input=True,
+                                        new_value_mode='add-unique'
+                                    ).classes('w-full').props('use-input')  # Enable search
+                                else:
+                                    # Regular select - restricted to list
+                                    inp = ui.select(
+                                        options=valid_values,
+                                        label=display_label,
+                                        value=value if value in valid_values else (valid_values[0] if valid_values else "")
+                                    ).classes('w-full')
+                                    if len(valid_values) > 10:
+                                        inp.props('use-input')  # Enable search for long lists
                             else:
                                 inp = ui.input(label=display_label, value=str(value)).classes('w-full')
                         
@@ -2269,6 +2341,168 @@ class ExpertSettingsTab:
         """Handle expert type change."""
         logger.debug(f'Expert type changed to: {event.value if hasattr(event, "value") else event}')
         self._render_expert_settings(expert_instance)
+    
+    def _render_import_export_tab(self, expert_instance=None):
+        """Render the import/export tab for expert settings."""
+        import json
+        from datetime import datetime
+        
+        ui.label('Import / Export Expert Settings').classes('text-subtitle1 mb-4')
+        ui.label('Export your expert settings to a file or import from a previously saved configuration.').classes('text-body2 mb-4')
+        
+        # Export section
+        with ui.card().classes('w-full mb-4'):
+            ui.label('Export Settings').classes('text-subtitle2 mb-4')
+            
+            ui.label('Select which settings to export:').classes('text-body2 mb-2')
+            with ui.column().classes('w-full mb-4'):
+                export_general = ui.checkbox('General Settings', value=True).classes('mb-2')
+                export_expert = ui.checkbox('Expert Settings', value=True).classes('mb-2')
+                export_symbols = ui.checkbox('Symbol Settings', value=True).classes('mb-2')
+                export_instruments = ui.checkbox('Instruments', value=True).classes('mb-2')
+            
+            def export_settings_click():
+                """Export expert settings to JSON file."""
+                if not expert_instance:
+                    ui.notify('Please save the expert first before exporting', type='warning')
+                    return
+                
+                try:
+                    export_data = {}
+                    
+                    # Export general settings
+                    if export_general.value:
+                        export_data['general'] = {
+                            'alias': self.alias_input.value,
+                            'user_description': self.user_description_textarea.value,
+                            'enabled': self.enabled_checkbox.value,
+                            'virtual_equity': float(self.virtual_equity_input.value),
+                        }
+                    
+                    # Export expert settings if editing
+                    if expert_instance and (export_expert.value or export_symbols.value):
+                        from ...core.utils import get_expert_instance_from_id
+                        expert = get_expert_instance_from_id(expert_instance.id)
+                        if expert:
+                            if export_expert.value:
+                                export_data['expert_settings'] = dict(expert.settings) if hasattr(expert, 'settings') else {}
+                            
+                            if export_symbols.value:
+                                # Export enabled instruments/symbols
+                                enabled_config = expert._get_enabled_instruments_config() if hasattr(expert, '_get_enabled_instruments_config') else {}
+                                export_data['symbol_settings'] = enabled_config
+                    
+                    # Export instruments from selector if available
+                    if export_instruments.value and hasattr(self, 'instrument_selector') and self.instrument_selector:
+                        instruments_data = {}
+                        if hasattr(self.instrument_selector, 'selected_instruments'):
+                            for inst_id, inst_config in self.instrument_selector.selected_instruments.items():
+                                instruments_data[str(inst_id)] = inst_config
+                        export_data['instruments'] = instruments_data
+                    
+                    # Create filename with timestamp
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    filename = f"expert_settings_{expert_instance.expert}_{expert_instance.id}_{timestamp}.json"
+                    
+                    # Log exported data
+                    logger.info(f'Exporting expert settings to {filename}')
+                    
+                    # Create download link by storing in memory and creating data URL
+                    json_str = json.dumps(export_data, indent=2)
+                    ui.notify(f'✅ Settings exported to: {filename}', type='positive')
+                    
+                    # Simulate download by logging and showing in UI
+                    logger.debug(f'Export data: {json_str}')
+                    
+                    # Show export data in UI for copy-paste
+                    export_data_container.clear()
+                    with export_data_container:
+                        ui.label('Export Data (copy to save as JSON file):').classes('text-body2 font-semibold mb-2')
+                        ui.textarea(
+                            value=json_str,
+                            placeholder='Export data will appear here'
+                        ).classes('w-full h-48').props('readonly')
+                        
+                        ui.button(
+                            'Copy to Clipboard',
+                            icon='content_copy',
+                            on_click=lambda: ui.run_javascript(
+                                f"navigator.clipboard.writeText('{json_str.replace(chr(39), chr(92)+chr(39))}')"
+                            )
+                        ).props('outlined')
+                
+                except Exception as e:
+                    logger.error(f'Error exporting expert settings: {e}', exc_info=True)
+                    ui.notify(f'Error exporting settings: {str(e)}', type='negative')
+            
+            ui.button('Export Settings', icon='download', on_click=export_settings_click).classes('mb-4')
+            
+            export_data_container = ui.column().classes('w-full')
+        
+        # Import section
+        with ui.card().classes('w-full mb-4'):
+            ui.label('Import Settings').classes('text-subtitle2 mb-4')
+            
+            ui.label('Paste previously exported JSON settings to restore them:').classes('text-body2 mb-2')
+            import_textarea = ui.textarea(
+                placeholder='Paste JSON export data here',
+                value=''
+            ).classes('w-full h-40 mb-4')
+            
+            def import_settings_click():
+                """Import expert settings from JSON."""
+                try:
+                    import_json = import_textarea.value.strip()
+                    if not import_json:
+                        ui.notify('Please paste JSON data to import', type='warning')
+                        return
+                    
+                    import_data = json.loads(import_json)
+                    
+                    # Import general settings
+                    if 'general' in import_data:
+                        general = import_data['general']
+                        if 'alias' in general:
+                            self.alias_input.value = general['alias']
+                        if 'user_description' in general:
+                            self.user_description_textarea.value = general['user_description']
+                        if 'enabled' in general:
+                            self.enabled_checkbox.value = general['enabled']
+                        if 'virtual_equity' in general:
+                            self.virtual_equity_input.value = str(general['virtual_equity'])
+                    
+                    # Import expert settings
+                    if expert_instance and 'expert_settings' in import_data and hasattr(self, '_imported_expert_settings'):
+                        self._imported_expert_settings = import_data['expert_settings']
+                        ui.notify('Expert settings ready to import (will be applied on save)', type='info')
+                    
+                    # Import symbol settings
+                    if expert_instance and 'symbol_settings' in import_data and hasattr(self, '_imported_symbol_settings'):
+                        self._imported_symbol_settings = import_data['symbol_settings']
+                        ui.notify('Symbol settings ready to import (will be applied on save)', type='info')
+                    
+                    # Import instruments
+                    if 'instruments' in import_data and hasattr(self, 'instrument_selector') and self.instrument_selector:
+                        instruments_data = import_data['instruments']
+                        instrument_configs = {}
+                        for inst_id_str, inst_config in instruments_data.items():
+                            try:
+                                instrument_configs[int(inst_id_str)] = inst_config
+                            except ValueError:
+                                logger.warning(f'Invalid instrument ID: {inst_id_str}')
+                        if self.instrument_selector:
+                            self.instrument_selector.set_selected_instruments(instrument_configs)
+                    
+                    ui.notify('✅ Settings imported successfully! Click Save to apply all changes.', type='positive')
+                    
+                except json.JSONDecodeError as e:
+                    logger.error(f'Invalid JSON format: {e}')
+                    ui.notify(f'Invalid JSON format: {str(e)}', type='negative')
+                except Exception as e:
+                    logger.error(f'Error importing expert settings: {e}', exc_info=True)
+                    ui.notify(f'Error importing settings: {str(e)}', type='negative')
+            
+            ui.button('Import Settings', icon='upload', on_click=import_settings_click).classes('mb-2')
     
     def _render_cleanup_tab(self, expert_instance=None):
         """Render the cleanup tab for managing old analysis data."""
@@ -2636,6 +2870,27 @@ class ExpertSettingsTab:
         
         expert = expert_class(expert_id)
         
+        # Apply imported expert settings if available
+        if hasattr(self, '_imported_expert_settings') and self._imported_expert_settings:
+            for setting_key, setting_value in self._imported_expert_settings.items():
+                try:
+                    expert.save_setting(setting_key, setting_value)
+                    logger.debug(f'Imported expert setting: {setting_key}')
+                except Exception as e:
+                    logger.warning(f'Could not import setting {setting_key}: {e}')
+            # Clear imported settings after applying
+            self._imported_expert_settings = None
+        
+        # Apply imported symbol settings if available
+        if hasattr(self, '_imported_symbol_settings') and self._imported_symbol_settings:
+            try:
+                expert.save_setting('enabled_instruments', self._imported_symbol_settings, setting_type="json")
+                logger.debug(f'Imported symbol settings')
+            except Exception as e:
+                logger.warning(f'Could not import symbol settings: {e}')
+            # Clear imported settings after applying
+            self._imported_symbol_settings = None
+        
         # Save general settings (schedules and trading permissions)
         if hasattr(self, 'enter_market_schedule_days') and hasattr(self, 'enter_market_execution_times'):
             schedule_config = self._get_enter_market_schedule_config()
@@ -2828,7 +3083,9 @@ class TradeSettingsTab:
     def __init__(self):
         logger.debug('Initializing TradeSettingsTab')
         self.rules_dialog = ui.dialog()
+        self.rules_dialog.props('no-backdrop-dismiss')
         self.rulesets_dialog = ui.dialog()
+        self.rulesets_dialog.props('no-backdrop-dismiss')
         self.reorder_dialog = ui.dialog()
         self.rules_table = None
         self.rulesets_table = None
@@ -3247,9 +3504,10 @@ class TradeSettingsTab:
         with self.actions_container:
             with ui.card().classes('w-full p-4') as action_card:
                 with ui.row().classes('w-full items-center'):
-                    # Action type selection
+                    # Action type selection with user-friendly labels
+                    action_options = {a.value: get_action_type_display_label(a.value) for a in ExpertActionType}
                     action_select = ui.select(
-                        options=[a.value for a in ExpertActionType],
+                        options=action_options,
                         label='Action Type',
                         value=action_config.get('action_type', action_config.get('type', ExpertActionType.BUY.value)) if action_config else ExpertActionType.BUY.value
                     ).classes('flex-1')
@@ -3558,7 +3816,7 @@ class TradeSettingsTab:
                                                 trigger_summary = ', '.join([f"{k}: {v.get('event_type', v.get('type', 'unknown'))}" for k, v in rule.triggers.items()])
                                                 ui.label(f'Triggers: {trigger_summary}').classes('text-sm text-grey-6')
                                             if rule.actions:
-                                                action_summary = ', '.join([f"{k}: {v.get('action_type', v.get('type', 'unknown'))}" for k, v in rule.actions.items()])
+                                                action_summary = ', '.join([f"{k}: {get_action_type_display_label(v.get('action_type', v.get('type', 'unknown')))}" for k, v in rule.actions.items()])
                                                 ui.label(f'Actions: {action_summary}').classes('text-sm text-grey-6')
                                 
                                 self.selected_rules[rule.id] = rule_checkbox

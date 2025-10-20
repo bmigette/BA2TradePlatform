@@ -59,11 +59,21 @@ class Toolkit:
         Args:
             provider_map: Dictionary mapping provider categories to list of provider classes
             provider_args: Optional dictionary with arguments for provider instantiation
-                          (e.g., {"openai_model": "gpt-5"})
+                          (e.g., {"websearch_model": "gpt-5"})
         """
         self.provider_map = provider_map
         self.provider_args = provider_args or {}
         logger.debug(f"Toolkit initialized with provider_map keys: {list(provider_map.keys())}")
+        
+        # Log model configuration for AI providers
+        if self.provider_args and 'websearch_model' in self.provider_args:
+            model = self.provider_args['websearch_model']
+            # Parse provider from model string (e.g., "OpenAI/gpt-5" or "NagaAI/grok-4")
+            provider_prefix = ""
+            if '/' in model:
+                provider_prefix = f"({model.split('/')[0]}) "
+            logger.info(f"[TRADING_AGENTS_CONFIG] Data Provider Model: {provider_prefix}{model}")
+        
         if self.provider_args:
             logger.debug(f"Provider args: {self.provider_args}")
     
@@ -89,9 +99,10 @@ class Toolkit:
             logger.debug(f"Instantiating {provider_name} with OHLCV provider: {ohlcv_provider.__class__.__name__}")
             return provider_class(ohlcv_provider=ohlcv_provider)
         
-        # Check if this is an OpenAI provider that needs model argument
-        elif 'OpenAI' in provider_name and 'openai_model' in self.provider_args:
-            model = self.provider_args['openai_model']
+        # Check if this is an AI provider that supports model parameter (OpenAI or NagaAI)
+        # Includes: AINewsProvider, AICompanyOverviewProvider, AISocialMediaSentiment, etc.
+        elif (provider_name.startswith('AI') or 'OpenAI' in provider_name) and 'websearch_model' in self.provider_args:
+            model = self.provider_args['websearch_model']
             logger.debug(f"Instantiating {provider_name} with model={model}")
             return provider_class(model=model)
         
@@ -118,9 +129,9 @@ class Toolkit:
         ohlcv_provider_class = self.provider_map["ohlcv"][0]
         provider_name = ohlcv_provider_class.__name__
         
-        # Check if OpenAI provider needs model argument
-        if 'OpenAI' in provider_name and 'openai_model' in self.provider_args:
-            model = self.provider_args['openai_model']
+        # Check if AI provider needs model argument
+        if (provider_name.startswith('AI') or 'OpenAI' in provider_name) and 'websearch_model' in self.provider_args:
+            model = self.provider_args['websearch_model']
             return ohlcv_provider_class(model=model)
         # Check if Alpha Vantage provider needs source argument
         elif 'AlphaVantage' in provider_name and 'alpha_vantage_source' in self.provider_args:

@@ -9,19 +9,33 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 class FinancialSituationMemory:
     def __init__(self, name, config, symbol=None, market_analysis_id=None, expert_instance_id=None):
-        if config["backend_url"] == "http://localhost:11434/v1":
+        # Get embedding model from config (with backward compatibility)
+        if config.get("backend_url") == "http://localhost:11434/v1":
             self.embedding = "nomic-embed-text"
+            embedding_backend_url = config["backend_url"]
+            embedding_api_key_setting = None
         else:
-            self.embedding = "text-embedding-3-small"
+            # Use embedding-specific config if available, otherwise fallback to main backend_url
+            self.embedding = config.get("embedding_model", "text-embedding-3-small")
+            embedding_backend_url = config.get("embedding_backend_url", config.get("backend_url", "https://api.openai.com/v1"))
+            embedding_api_key_setting = config.get("embedding_api_key_setting", config.get("api_key_setting", "openai_api_key"))
             
         # Get API key from config
         try:
             from ...dataflows.config import get_openai_api_key
-            api_key = get_openai_api_key()
+            # If we have embedding-specific API key setting, get that one
+            if embedding_api_key_setting:
+                from ba2_trade_platform.core.db import get_setting
+                api_key = get_setting(embedding_api_key_setting)
+                if not api_key:
+                    # Fallback to openai_api_key
+                    api_key = get_openai_api_key()
+            else:
+                api_key = get_openai_api_key()
         except ImportError:
             api_key = None
             
-        self.client = OpenAI(base_url=config["backend_url"], api_key=api_key)
+        self.client = OpenAI(base_url=embedding_backend_url, api_key=api_key)
         
         # Use persistent client with expert-specific subdirectory
         from ba2_trade_platform.config import CACHE_FOLDER

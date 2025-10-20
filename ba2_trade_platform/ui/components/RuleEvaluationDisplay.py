@@ -8,6 +8,7 @@ including operands, calculated values, and action configurations.
 from nicegui import ui
 from typing import Dict, Any, List, Optional
 from ...logger import logger
+from ...core.types import get_action_type_display_label
 
 
 def render_rule_evaluations(evaluation_details: Dict[str, Any], show_actions: bool = True, compact: bool = False):
@@ -166,7 +167,9 @@ def _render_actions(actions: List[Dict[str, Any]], compact: bool = False):
                         # Handle enum values
                         if hasattr(action_type, 'value'):
                             action_type = action_type.value
-                        ui.label(f'Action {i}: {action_type}').classes('font-medium' if not compact else 'text-sm font-medium')
+                        # Use user-friendly display label
+                        action_display = get_action_type_display_label(action_type) if action_type != 'Unknown' else 'Unknown'
+                        ui.label(f'Action {i}: {action_display}').classes('font-medium' if not compact else 'text-sm font-medium')
                         ui.label(action.get('description', 'No description')).classes('text-sm text-grey-7' if not compact else 'text-xs text-grey-7')
                         
                         # Display action-specific values (TP/SL, target_percent, etc.)

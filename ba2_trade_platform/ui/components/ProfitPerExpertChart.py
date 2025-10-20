@@ -50,8 +50,8 @@ class ProfitPerExpertChart:
                         logger.warning(f"Expert instance {transaction.expert_id} not found for transaction {transaction.id}")
                         continue
                     
-                    # Create unique expert name (Expert Name - Account Name)
-                    expert_name = f"{expert.expert} (ID: {expert.id})"
+                    # Create unique expert name using alias or expert type with ID
+                    expert_name = f"{expert.alias or expert.expert}-{expert.id}"
                     
                     # Calculate profit/loss
                     # Profit = (close_price - open_price) * quantity

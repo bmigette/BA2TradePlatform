@@ -1,327 +1,53 @@
 """
 TradingAgents Logger System
-Provides expert-specific logging with both console and file output
+Provides expert-specific logging using BA2 platform's unified logger system
 """
 import logging
-import os
-import sys
-from datetime import datetime
 from typing import Optional
-from logging.handlers import RotatingFileHandler
-
-from .... import config as ba2_config
-
-
-
-class ColoredFormatter(logging.Formatter):
-    """Custom formatter that adds colors and icons to log messages"""
-    
-    # ANSI color codes
-    COLORS = {
-        'DEBUG': '\033[36m',    # Cyan
-        'INFO': '\033[92m',     # Green
-        'WARNING': '\033[93m',  # Yellow
-        'ERROR': '\033[91m',    # Red
-        'CRITICAL': '\033[95m', # Magenta
-        'RESET': '\033[0m'      # Reset
-    }
-    
-    # Icons for different log levels (fallback to ASCII if Unicode not supported)
-    ICONS = {
-        'DEBUG': '[DEBUG]',
-        'INFO': '[INFO] ',
-        'WARNING': '[WARN] ',
-        'ERROR': '[ERROR]',
-        'CRITICAL': '[CRIT]'
-    }
-    
-    # Try to use Unicode icons if console supports it
-    try:
-        # Test Unicode support
-        '\U0001f50d'.encode(sys.stdout.encoding or 'utf-8')
-        ICONS = {
-            'DEBUG': '🔍',
-            'INFO': 'ℹ️ ',
-            'WARNING': '⚠️ ',
-            'ERROR': '❌',
-            'CRITICAL': '🚨'
-        }
-    except (UnicodeEncodeError, AttributeError):
-        # Fallback to ASCII icons
-        pass
-    
-    def format(self, record):
-        # Add color and icon to the record
-        if record.levelname in self.COLORS:
-            color = self.COLORS[record.levelname]
-            icon = self.ICONS.get(record.levelname, '')
-            reset = self.COLORS['RESET']
-            
-            # Format the message with color and icon
-            record.levelname_colored = f"{color}{icon} {record.levelname}{reset}"
-            record.message_colored = f"{color}{record.getMessage()}{reset}"
-        else:
-            record.levelname_colored = record.levelname
-            record.message_colored = record.getMessage()
-        
-        return super().format(record)
-
-
-class TradingAgentsLogger:
-    """
-    Custom logger for TradingAgents with expert-specific file logging
-    """
-    
-    def __init__(self, expert_id: Optional[int] = None, log_dir: str = None):
-        """
-        Initialize the logger
-        
-        Args:
-            expert_id: Expert instance ID for log file naming
-            log_dir: Directory to store log files (uses LOG_FOLDER from config.py)
-        """
-        self.expert_id = expert_id
-        # Use LOG_FOLDER from BA2 platform config
-        if log_dir is None:
-            self.log_dir = ba2_config.LOG_FOLDER
-        else:
-            self.log_dir = log_dir
-        
-        # Create logger name
-        logger_name = f"tradingagents_exp{expert_id}" if expert_id else "tradingagents"
-        self.logger = logging.getLogger(logger_name)
-        
-        # CRITICAL: Set propagate to False BEFORE clearing handlers
-        # This prevents any logs from going to parent/root loggers
-        self.logger.propagate = False
-        
-        # Clear any existing handlers to prevent duplicates
-        self.logger.handlers.clear()
-            
-        self.logger.setLevel(logging.DEBUG)
-        
-        # Create formatters - use same format as main app logger
-        # Main app format: '%(asctime)s - %(name)s - %(module)s - %(levelname)s - %(message)s'
-        console_formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(module)s - %(levelname)s - %(message)s'
-        )
-        file_formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(module)s - %(levelname)s - %(message)s'
-        )
-        
-        # Console handler (respects STDOUT setting) with colors
-        # DISABLED: Console logging handled by BA2 platform logger to avoid duplicates
-        # The BA2 logger already captures all logs from the tradingagents namespace
-        # if self._should_log_to_console():
-        #     console_handler = logging.StreamHandler(sys.stdout)
-        #     console_handler.setLevel(logging.INFO)
-        #     console_handler.setFormatter(console_formatter)
-        #     self.logger.addHandler(console_handler)
-        
-        # File handler (always enabled for file logging)
-        if self._should_log_to_file():
-            log_filename = f"tradeagents-exp{expert_id}.log" if expert_id else "tradeagents.log"
-            log_filepath = os.path.join(self.log_dir, log_filename)
-            
-            # Create directory if it doesn't exist
-            os.makedirs(self.log_dir, exist_ok=True)
-            
-            file_handler = RotatingFileHandler(
-                log_filepath,
-                maxBytes=10*1024*1024,  # 10MB
-                backupCount=5,
-                encoding='utf-8'  # Explicitly set UTF-8 encoding to handle Unicode characters
-            )
-            file_handler.setLevel(logging.DEBUG)
-            file_handler.setFormatter(file_formatter)
-            self.logger.addHandler(file_handler)
-    
-    def _should_log_to_console(self) -> bool:
-        """Check if console logging is enabled"""
-        try:
-            return getattr(ba2_config, 'STDOUT_LOGGING', True)
-        except:
-            # Fallback to environment variable
-            console_logging = os.getenv("TRADINGAGENTS_CONSOLE_LOGGING", "true").lower()
-            return console_logging in ("true", "1", "yes", "on")
-    
-    def _should_log_to_file(self) -> bool:
-        """Check if file logging is enabled"""
-        try:
-            return getattr(ba2_config, 'FILE_LOGGING', True)
-        except:
-            # Fallback to environment variable
-            file_logging = os.getenv("TRADINGAGENTS_FILE_LOGGING", "true").lower()
-            return file_logging in ("true", "1", "yes", "on")
-    
-    def debug(self, message: str, *args, **kwargs):
-        """Log debug message"""
-        self.logger.debug(message, *args, **kwargs)
-    
-    def info(self, message: str, *args, **kwargs):
-        """Log info message"""
-        self.logger.info(message, *args, **kwargs)
-    
-    def warning(self, message: str, *args, **kwargs):
-        """Log warning message"""
-        self.logger.warning(message, *args, **kwargs)
-    
-    def error(self, message: str, *args, **kwargs):
-        """
-        Log error message.
-        Note: exc_info should only be passed as True when inside an exception handler.
-        """
-        self.logger.error(message, *args, **kwargs)
-    
-    def critical(self, message: str, *args, **kwargs):
-        """Log critical message"""
-        self.logger.critical(message, *args, **kwargs)
-    
-    def log_tool_call(self, tool_name: str, inputs: dict, agent_type: str = "unknown"):
-        """Log a tool call"""
-        self.info(f"[TOOL] [{agent_type}] Calling tool: {tool_name} with inputs: {inputs}")
-    
-    def log_tool_result(self, tool_name: str, success: bool, result_summary: str = ""):
-        """Log tool call result"""
-        if success:
-            self.info(f"[SUCCESS] Tool {tool_name}: {result_summary}")
-        else:
-            self.error(f"[FAILED] Tool {tool_name}: {result_summary}")
-    
-    def log_agent_start(self, agent_type: str, symbol: str):
-        """Log agent starting analysis"""
-        icon_map = {
-            "market": "[MARKET]",
-            "news": "[NEWS]", 
-            "fundamentals": "[FUND]",
-            "social": "[SOCIAL]",
-            "macro": "[MACRO]",
-            "bull": "[BULL]",
-            "bear": "[BEAR]",
-            "trader": "[TRADER]",
-            "manager": "[MGR]"
-        }
-        
-        # Try Unicode icons first
-        try:
-            unicode_icons = {
-                "market": "📈",
-                "news": "📰", 
-                "fundamentals": "🏢",
-                "social": "💬",
-                "macro": "🌍",
-                "bull": "🐂",
-                "bear": "🐻",
-                "trader": "💼",
-                "manager": "👔"
-            }
-            icon = unicode_icons.get(agent_type.lower(), "🤖")
-            # Test if Unicode can be encoded
-            icon.encode(sys.stdout.encoding or 'utf-8')
-        except (UnicodeEncodeError, AttributeError):
-            # Fallback to ASCII
-            icon = icon_map.get(agent_type.lower(), "[AGENT]")
-            
-        self.info(f"{icon} [{agent_type}] Starting analysis for {symbol}")
-    
-    def log_agent_complete(self, agent_type: str, symbol: str, success: bool):
-        """Log agent completion"""
-        icon_map = {
-            "market": "[MARKET]",
-            "news": "[NEWS]", 
-            "fundamentals": "[FUND]",
-            "social": "[SOCIAL]",
-            "macro": "[MACRO]",
-            "bull": "[BULL]",
-            "bear": "[BEAR]",
-            "trader": "[TRADER]",
-            "manager": "[MGR]"
-        }
-        
-        # Try Unicode icons first
-        try:
-            unicode_icons = {
-                "market": "📈",
-                "news": "📰", 
-                "fundamentals": "🏢",
-                "social": "💬",
-                "macro": "🌍",
-                "bull": "🐂",
-                "bear": "🐻",
-                "trader": "💼",
-                "manager": "👔"
-            }
-            icon = unicode_icons.get(agent_type.lower(), "🤖")
-            status_icon = "✅" if success else "❌"
-            # Test if Unicode can be encoded
-            icon.encode(sys.stdout.encoding or 'utf-8')
-            status_icon.encode(sys.stdout.encoding or 'utf-8')
-        except (UnicodeEncodeError, AttributeError):
-            # Fallback to ASCII
-            icon = icon_map.get(agent_type.lower(), "[AGENT]")
-            status_icon = "[OK]" if success else "[FAIL]"
-            
-        status = "completed successfully" if success else "failed"
-        self.info(f"{icon} [{agent_type}] Analysis for {symbol} {status} {status_icon}")
-    
-    def log_step_start(self, step_name: str, context: str = ""):
-        """Log step starting"""
-        context_str = f" ({context})" if context else ""
-        try:
-            "🚀".encode(sys.stdout.encoding or 'utf-8')
-            self.info(f"🚀 Starting step: {step_name}{context_str}")
-        except (UnicodeEncodeError, AttributeError):
-            self.info(f"[START] Starting step: {step_name}{context_str}")
-    
-    def log_step_complete(self, step_name: str, success: bool, duration: float = None):
-        """Log step completion"""
-        status = "completed" if success else "failed"
-        duration_str = f" in {duration:.2f}s" if duration else ""
-        
-        try:
-            status_icon = "✅" if success else "❌"
-            status_icon.encode(sys.stdout.encoding or 'utf-8')
-            self.info(f"{status_icon} Step {step_name} {status}{duration_str}")
-        except (UnicodeEncodeError, AttributeError):
-            status_icon = "[OK]" if success else "[FAIL]"
-            self.info(f"{status_icon} Step {step_name} {status}{duration_str}")
+from .... import logger as ba2_logger
 
 
 # Global logger instance
-_global_logger: Optional[TradingAgentsLogger] = None
+_global_logger: Optional[logging.Logger] = None
 
 
-def get_logger(expert_id: Optional[int] = None, log_dir: str = None) -> TradingAgentsLogger:
+def get_logger(expert_id: Optional[int] = None, log_dir: str = None) -> logging.Logger:
     """
-    Get or create a logger instance
+    Get or create a logger instance using BA2 platform's unified system.
     
     Args:
         expert_id: Expert instance ID for log file naming
-        log_dir: Directory to store log files
+        log_dir: Directory to store log files (ignored, uses BA2 config)
         
     Returns:
-        TradingAgentsLogger instance
+        logging.Logger instance configured for TradingAgents expert
     """
     global _global_logger
-    # Create new logger if needed or if parameters changed
-    if (_global_logger is None or 
-        _global_logger.expert_id != expert_id or 
-        _global_logger.log_dir != log_dir):
-        _global_logger = TradingAgentsLogger(expert_id, log_dir)
+    
+    if _global_logger is None or (expert_id and not _global_logger.name.endswith(f"exp{expert_id}")):
+        if expert_id:
+            _global_logger = ba2_logger.get_expert_logger("TradingAgents", expert_id)
+        else:
+            # Fallback to main BA2 logger if no expert_id provided
+            _global_logger = ba2_logger.logger
     
     return _global_logger
 
 
 def init_logger(expert_id: Optional[int] = None, log_dir: str = None):
     """
-    Initialize the global logger
+    Initialize the global logger using BA2 platform's unified system.
     
     Args:
         expert_id: Expert instance ID for log file naming
-        log_dir: Directory to store log files
+        log_dir: Directory to store log files (ignored, uses BA2 config)
     """
     global _global_logger
-    _global_logger = TradingAgentsLogger(expert_id, log_dir)
+    
+    if expert_id:
+        _global_logger = ba2_logger.get_expert_logger("TradingAgents", expert_id)
+    else:
+        _global_logger = ba2_logger.logger
 
 
 # Convenience functions that use the global logger
@@ -358,37 +84,45 @@ def critical(message: str, *args, **kwargs):
         _global_logger.critical(message, *args, **kwargs)
 
 
+# Legacy helper functions for backwards compatibility
 def log_tool_call(tool_name: str, inputs: dict, agent_type: str = "unknown"):
     """Log a tool call using global logger"""
     if _global_logger:
-        _global_logger.log_tool_call(tool_name, inputs, agent_type)
+        _global_logger.info(f"[TOOL] [{agent_type}] Calling tool: {tool_name} with inputs: {inputs}")
 
 
 def log_tool_result(tool_name: str, success: bool, result_summary: str = ""):
     """Log tool call result using global logger"""
     if _global_logger:
-        _global_logger.log_tool_result(tool_name, success, result_summary)
+        if success:
+            _global_logger.info(f"[SUCCESS] Tool {tool_name}: {result_summary}")
+        else:
+            _global_logger.error(f"[FAILED] Tool {tool_name}: {result_summary}")
 
 
 def log_agent_start(agent_type: str, symbol: str):
     """Log agent starting analysis using global logger"""
     if _global_logger:
-        _global_logger.log_agent_start(agent_type, symbol)
+        _global_logger.info(f"[{agent_type.upper()}] Starting analysis for {symbol}")
 
 
 def log_agent_complete(agent_type: str, symbol: str, success: bool):
     """Log agent completion using global logger"""
     if _global_logger:
-        _global_logger.log_agent_complete(agent_type, symbol, success)
+        status = "completed successfully" if success else "failed"
+        _global_logger.info(f"[{agent_type.upper()}] Analysis for {symbol} {status}")
 
 
 def log_step_start(step_name: str, context: str = ""):
     """Log step starting using global logger"""
     if _global_logger:
-        _global_logger.log_step_start(step_name, context)
+        context_str = f" ({context})" if context else ""
+        _global_logger.info(f"[START] Starting step: {step_name}{context_str}")
 
 
 def log_step_complete(step_name: str, success: bool, duration: float = None):
     """Log step completion using global logger"""
     if _global_logger:
-        _global_logger.log_step_complete(step_name, success, duration)
+        status = "completed" if success else "failed"
+        duration_str = f" in {duration:.2f}s" if duration else ""
+        _global_logger.info(f"[{'OK' if success else 'FAIL'}] Step {step_name} {status}{duration_str}")

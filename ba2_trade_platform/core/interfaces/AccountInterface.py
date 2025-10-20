@@ -230,12 +230,16 @@ class AccountInterface(ExtendableSettingsInterface):
         # CRITICAL: Save order to database BEFORE broker submission
         # This ensures the order has an ID for error tracking
         # Use expunge_after_flush=True to allow normal attribute access after save
-        from ..db import add_instance
+        from ..db import add_instance, update_instance
         
         if not trading_order.id:
             # Save to database - object will be expunged and can be used like a normal Pydantic object
             order_id = add_instance(trading_order, expunge_after_flush=True)
             logger.debug(f"Created order {order_id} in database before broker submission")
+        else:
+            # Order already exists - update it to persist transaction_id and other changes
+            update_instance(trading_order)
+            logger.debug(f"Updated existing order {trading_order.id} in database with transaction_id={trading_order.transaction_id}")
         
         # Log successful validation (using captured values to avoid any potential issues)
         logger.info(f"Order validation passed for {symbol} - {side.value} {quantity} @ {order_type.value}")

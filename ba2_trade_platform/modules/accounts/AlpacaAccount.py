@@ -432,8 +432,15 @@ class AlpacaAccount(AccountInterface):
             # Step 3: Update database record with broker response using thread-safe function
             fresh_order = get_instance(TradingOrder, trading_order.id)
             if fresh_order:
-                # Update with broker order ID
-                fresh_order.broker_order_id = str(alpaca_order.id) if alpaca_order.id else None
+                # Update with broker order ID (only if not already set)
+                new_broker_order_id = str(alpaca_order.id) if alpaca_order.id else None
+                if fresh_order.broker_order_id and fresh_order.broker_order_id != new_broker_order_id:
+                    logger.warning(
+                        f"Order {fresh_order.id} already has broker_order_id={fresh_order.broker_order_id}, "
+                        f"not overwriting with new value: {new_broker_order_id}"
+                    )
+                else:
+                    fresh_order.broker_order_id = new_broker_order_id
                 
                 # Update status from broker response
                 result_order = self.alpaca_order_to_tradingorder(alpaca_order)

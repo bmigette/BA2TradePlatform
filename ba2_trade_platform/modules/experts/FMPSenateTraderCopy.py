@@ -24,7 +24,7 @@ from ...core.interfaces import MarketExpertInterface
 from ...core.models import ExpertInstance, MarketAnalysis, AnalysisOutput, ExpertRecommendation
 from ...core.db import get_db, get_instance, update_instance, add_instance
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, RiskLevel, TimeHorizon
-from ...logger import logger
+from ...logger import get_expert_logger
 from ...config import get_app_setting
 
 
@@ -68,6 +68,9 @@ class FMPSenateTraderCopy(MarketExpertInterface):
         
         self._load_expert_instance(id)
         self._api_key = self._get_fmp_api_key()
+        
+        # Initialize expert-specific logger
+        self.logger = get_expert_logger("FMPSenateTraderCopy", id)
     
     def _load_expert_instance(self, id: int) -> None:
         """Load and validate expert instance from database."""
@@ -79,7 +82,7 @@ class FMPSenateTraderCopy(MarketExpertInterface):
         """Get FMP API key from app settings."""
         api_key = get_app_setting('FMP_API_KEY')
         if not api_key:
-            logger.warning("FMP API key not found in app settings")
+            self.logger.warning("FMP API key not found in app settings")
         return api_key
     
     @classmethod
@@ -121,7 +124,7 @@ class FMPSenateTraderCopy(MarketExpertInterface):
             List of trade records or None if error
         """
         if not self._api_key:
-            logger.error("Cannot fetch senate trades: FMP API key not configured")
+            self.logger.error("Cannot fetch senate trades: FMP API key not configured")
             return None
         
         try:
@@ -133,7 +136,7 @@ class FMPSenateTraderCopy(MarketExpertInterface):
                     "apikey": self._api_key,
                     "symbol": symbol.upper()
                 }
-                logger.debug(f"Fetching FMP senate trades for {symbol}")
+                self.logger.debug(f"Fetching FMP senate trades for {symbol}")
             else:
                 # Use latest disclosures endpoint with pagination for all trades
                 url = f"https://financialmodelingprep.com/stable/senate-latest"
@@ -142,24 +145,24 @@ class FMPSenateTraderCopy(MarketExpertInterface):
                     "page": 0,
                     "limit": 1000  # Maximum allowed per request
                 }
-                logger.debug("Fetching all FMP senate trades (latest disclosures)")
+                self.logger.debug("Fetching all FMP senate trades (latest disclosures)")
             
             response = requests.get(url, params=params, timeout=30)
             response.raise_for_status()
             
             data = response.json()
             symbol_text = f" for {symbol}" if symbol else " (all)"
-            logger.debug(f"Received {len(data) if isinstance(data, list) else 0} senate trade records{symbol_text}")
+            self.logger.debug(f"Received {len(data) if isinstance(data, list) else 0} senate trade records{symbol_text}")
             
             return data if isinstance(data, list) else []
             
         except requests.exceptions.RequestException as e:
             symbol_text = f" for {symbol}" if symbol else " (all)"
-            logger.error(f"Failed to fetch FMP senate trades{symbol_text}: {e}", exc_info=True)
+            self.logger.error(f"Failed to fetch FMP senate trades{symbol_text}: {e}", exc_info=True)
             return None
         except Exception as e:
             symbol_text = f" for {symbol}" if symbol else " (all)"
-            logger.error(f"Unexpected error fetching senate trades{symbol_text}: {e}", exc_info=True)
+            self.logger.error(f"Unexpected error fetching senate trades{symbol_text}: {e}", exc_info=True)
             return None
     
     def _fetch_house_trades(self, symbol: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
@@ -173,7 +176,7 @@ class FMPSenateTraderCopy(MarketExpertInterface):
             List of trade records or None if error
         """
         if not self._api_key:
-            logger.error("Cannot fetch house trades: FMP API key not configured")
+            self.logger.error("Cannot fetch house trades: FMP API key not configured")
             return None
         
         try:
@@ -185,7 +188,7 @@ class FMPSenateTraderCopy(MarketExpertInterface):
                     "apikey": self._api_key,
                     "symbol": symbol.upper()
                 }
-                logger.debug(f"Fetching FMP house trades for {symbol}")
+                self.logger.debug(f"Fetching FMP house trades for {symbol}")
             else:
                 # Use latest disclosures endpoint with pagination for all trades
                 url = f"https://financialmodelingprep.com/stable/house-latest"
@@ -194,24 +197,24 @@ class FMPSenateTraderCopy(MarketExpertInterface):
                     "page": 0,
                     "limit": 1000  # Maximum allowed per request
                 }
-                logger.debug("Fetching all FMP house trades (latest disclosures)")
+                self.logger.debug("Fetching all FMP house trades (latest disclosures)")
             
             response = requests.get(url, params=params, timeout=30)
             response.raise_for_status()
             
             data = response.json()
             symbol_text = f" for {symbol}" if symbol else " (all)"
-            logger.debug(f"Received {len(data) if isinstance(data, list) else 0} house trade records{symbol_text}")
+            self.logger.debug(f"Received {len(data) if isinstance(data, list) else 0} house trade records{symbol_text}")
             
             return data if isinstance(data, list) else []
             
         except requests.exceptions.RequestException as e:
             symbol_text = f" for {symbol}" if symbol else " (all)"
-            logger.error(f"Failed to fetch FMP house trades{symbol_text}: {e}", exc_info=True)
+            self.logger.error(f"Failed to fetch FMP house trades{symbol_text}: {e}", exc_info=True)
             return None
         except Exception as e:
             symbol_text = f" for {symbol}" if symbol else " (all)"
-            logger.error(f"Unexpected error fetching house trades{symbol_text}: {e}", exc_info=True)
+            self.logger.error(f"Unexpected error fetching house trades{symbol_text}: {e}", exc_info=True)
             return None
     
     def _get_current_price(self, symbol: str) -> Optional[float]:
@@ -230,7 +233,7 @@ class FMPSenateTraderCopy(MarketExpertInterface):
             return account.get_instrument_current_price(symbol)
             
         except Exception as e:
-            logger.error(f"Error getting current price for {symbol}: {e}", exc_info=True)
+            self.logger.error(f"Error getting current price for {symbol}: {e}", exc_info=True)
             return None
     
     def _filter_trades_by_age(self, trades: List[Dict[str, Any]], 
@@ -263,7 +266,7 @@ class FMPSenateTraderCopy(MarketExpertInterface):
                 trader_name = f"{trade.get('firstName', '')} {trade.get('lastName', '')}".strip() or 'Unknown'
 
                 if not disclose_date_str or not exec_date_str:
-                    logger.debug(f"Trade missing dates, skipping: {trader_name}")
+                    self.logger.debug(f"Trade missing dates, skipping: {trader_name}")
                     continue
                 
                 # Parse dates (FMP returns YYYY-MM-DD format)
@@ -294,10 +297,10 @@ class FMPSenateTraderCopy(MarketExpertInterface):
                 filtered_trades.append(trade)
                 
             except Exception as e:
-                logger.error(f"Error processing trade: {e}", exc_info=True)
+                self.logger.error(f"Error processing trade: {e}", exc_info=True)
                 continue
         
-        logger.info(f"Filtered {len(filtered_trades)} trades from {len(trades)} total based on age criteria")
+        self.logger.info(f"Filtered {len(filtered_trades)} trades from {len(trades)} total based on age criteria")
         return filtered_trades
     
     def _filter_trades_by_age_multi(self, trades: List[Dict[str, Any]], 
@@ -328,7 +331,7 @@ class FMPSenateTraderCopy(MarketExpertInterface):
                 trader_name = f"{trade.get('firstName', '')} {trade.get('lastName', '')}".strip() or 'Unknown'
 
                 if not disclose_date_str or not exec_date_str:
-                    logger.debug(f"Trade missing dates, skipping: {trader_name}")
+                    self.logger.debug(f"Trade missing dates, skipping: {trader_name}")
                     continue
                 
                 # Parse dates (FMP returns YYYY-MM-DD format)
@@ -354,10 +357,10 @@ class FMPSenateTraderCopy(MarketExpertInterface):
                 filtered_trades.append(trade)
                 
             except Exception as e:
-                logger.error(f"Error processing trade: {e}", exc_info=True)
+                self.logger.error(f"Error processing trade: {e}", exc_info=True)
                 continue
         
-        logger.info(f"Filtered {len(filtered_trades)} trades from {len(trades)} total based on age criteria (multi-symbol)")
+        self.logger.info(f"Filtered {len(filtered_trades)} trades from {len(trades)} total based on age criteria (multi-symbol)")
         return filtered_trades
     
     def _find_copy_trades(self, filtered_trades: List[Dict[str, Any]], 
@@ -552,13 +555,13 @@ Note: If multiple trades exist for the same instrument, the most recent trade de
             )
             
             recommendation_id = add_instance(expert_recommendation)
-            logger.info(f"Created ExpertRecommendation (ID: {recommendation_id}) for {symbol}: "
+            self.logger.info(f"Created ExpertRecommendation (ID: {recommendation_id}) for {symbol}: "
                        f"{recommendation_data['signal'].value} with {recommendation_data['confidence']:.1f}% confidence, "
                        f"based on {recommendation_data['trade_count']} copy trades")
             return recommendation_id
             
         except Exception as e:
-            logger.error(f"Failed to create ExpertRecommendation for {symbol}: {e}", exc_info=True)
+            self.logger.error(f"Failed to create ExpertRecommendation for {symbol}: {e}", exc_info=True)
             raise
     
     def _store_analysis_outputs(self, market_analysis_id: int, symbol: str,
@@ -636,7 +639,7 @@ Note: If multiple trades exist for the same instrument, the most recent trade de
             
         except Exception as e:
             session.rollback()
-            logger.error(f"Failed to store analysis outputs: {e}", exc_info=True)
+            self.logger.error(f"Failed to store analysis outputs: {e}", exc_info=True)
             raise
         finally:
             session.close()
@@ -723,7 +726,7 @@ Recommendations Generated:"""
             
         except Exception as e:
             session.rollback()
-            logger.error(f"Failed to store multi-symbol analysis outputs: {e}", exc_info=True)
+            self.logger.error(f"Failed to store multi-symbol analysis outputs: {e}", exc_info=True)
             raise
         finally:
             session.close()
@@ -740,7 +743,7 @@ Recommendations Generated:"""
             symbol: Placeholder symbol (typically "MULTI" for multi-instrument analysis)
             market_analysis: MarketAnalysis instance to update with results
         """
-        logger.info(f"Starting FMPSenateTraderCopy multi-instrument analysis (Analysis ID: {market_analysis.id})")
+        self.logger.info(f"Starting FMPSenateTraderCopy multi-instrument analysis (Analysis ID: {market_analysis.id})")
         
         try:
             # Update status to running
@@ -774,7 +777,7 @@ Recommendations Generated:"""
             if house_trades:
                 all_trades.extend(house_trades)
             
-            logger.info(f"Fetched {len(senate_trades) if senate_trades else 0} senate trades and "
+            self.logger.info(f"Fetched {len(senate_trades) if senate_trades else 0} senate trades and "
                        f"{len(house_trades) if house_trades else 0} house trades for all symbols")
             
             # Filter trades by age (no symbol filter)
@@ -794,7 +797,7 @@ Recommendations Generated:"""
                         trades_by_symbol[trade_symbol] = []
                     trades_by_symbol[trade_symbol].append(trade)
             
-            logger.info(f"Found copy trades for {len(trades_by_symbol)} symbols: {sorted(trades_by_symbol.keys())}")
+            self.logger.info(f"Found copy trades for {len(trades_by_symbol)} symbols: {sorted(trades_by_symbol.keys())}")
             
             # Create recommendations for each symbol
             recommendation_ids = []
@@ -805,7 +808,7 @@ Recommendations Generated:"""
                     # Get current price for this symbol
                     current_price = self._get_current_price(trade_symbol)
                     if not current_price:
-                        logger.warning(f"Unable to get current price for {trade_symbol}, using 0.0")
+                        self.logger.warning(f"Unable to get current price for {trade_symbol}, using 0.0")
                         current_price = 0.0
                     
                     # Generate recommendations for this symbol
@@ -829,11 +832,11 @@ Recommendations Generated:"""
                         'trader_name': recommendation_data.get('trader_name', 'Unknown')  # Include trader name
                     }
                     
-                    logger.info(f"Created recommendation for {trade_symbol}: {recommendation_data['signal'].value} "
+                    self.logger.info(f"Created recommendation for {trade_symbol}: {recommendation_data['signal'].value} "
                                f"({recommendation_data['confidence']:.1f}% confidence)")
                     
                 except Exception as e:
-                    logger.error(f"Error creating recommendation for {trade_symbol}: {e}", exc_info=True)
+                    self.logger.error(f"Error creating recommendation for {trade_symbol}: {e}", exc_info=True)
                     # Continue with other symbols
             
             # Store comprehensive analysis outputs
@@ -876,12 +879,12 @@ Recommendations Generated:"""
             market_analysis.status = MarketAnalysisStatus.COMPLETED
             update_instance(market_analysis)
             
-            logger.info(f"Completed FMPSenateTraderCopy analysis for {symbol}: {recommendation_data['signal'].value} "
+            self.logger.info(f"Completed FMPSenateTraderCopy analysis for {symbol}: {recommendation_data['signal'].value} "
                        f"(confidence: {recommendation_data['confidence']:.1f}%, "
                        f"{recommendation_data['trade_count']} relevant trades found)")
             
         except Exception as e:
-            logger.error(f"FMPSenateTraderCopy analysis failed for {symbol}: {e}", exc_info=True)
+            self.logger.error(f"FMPSenateTraderCopy analysis failed for {symbol}: {e}", exc_info=True)
             
             # Update status to failed
             market_analysis.state = {
@@ -905,7 +908,7 @@ Recommendations Generated:"""
                 session.commit()
                 session.close()
             except Exception as db_error:
-                logger.error(f"Failed to store error output: {db_error}", exc_info=True)
+                self.logger.error(f"Failed to store error output: {db_error}", exc_info=True)
             
             raise
     
@@ -933,7 +936,7 @@ Recommendations Generated:"""
                     ui.label(f"Unknown analysis status: {market_analysis.status}")
                     
         except Exception as e:
-            logger.error(f"Error rendering market analysis {market_analysis.id}: {e}", exc_info=True)
+            self.logger.error(f"Error rendering market analysis {market_analysis.id}: {e}", exc_info=True)
             with ui.card().classes('w-full p-8 text-center'):
                 ui.icon('error', size='3rem', color='negative').classes('mb-4')
                 ui.label('Rendering Error').classes('text-h5 text-negative')

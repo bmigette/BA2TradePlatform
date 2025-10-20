@@ -373,3 +373,27 @@ def is_adjustment_action(action_value):
 def is_share_adjustment_action(action_value):
     """Check if an action value corresponds to a share adjustment action type."""
     return action_value in get_share_adjustment_action_values()
+
+
+def get_action_type_display_label(action_value):
+    """
+    Get user-friendly display label for an ExpertActionType value.
+    
+    Maps enum values to more descriptive labels:
+    - 'buy' -> 'bullish (buy)'
+    - 'sell' -> 'bearish (sell)'
+    - Others are capitalized with underscores replaced by spaces
+    
+    Args:
+        action_value: The ExpertActionType enum value (e.g., 'buy', 'sell')
+        
+    Returns:
+        User-friendly display label string
+    """
+    if action_value == ExpertActionType.BUY.value:
+        return "bullish (buy)"
+    elif action_value == ExpertActionType.SELL.value:
+        return "bearish (sell)"
+    else:
+        # Capitalize and replace underscores with spaces for other actions
+        return action_value.replace("_", " ").title()

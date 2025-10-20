@@ -149,10 +149,18 @@ class FREDMacroProvider(MacroEconomicsInterface):
         """
         Get economic indicators (GDP, unemployment, inflation, etc.).
         """
-        # Validate date range - returns tuple (start_date, end_date)
-        actual_start_date, actual_end_date = validate_date_range(start_date, end_date, lookback_days)
+        # Calculate start_date from lookback_days if not provided
+        if start_date is None and lookback_days:
+            start_date, end_date = calculate_date_range(end_date, lookback_days)
         
-        # Use validated end_date if provided
+        # Validate date range
+        actual_start_date, actual_end_date = validate_date_range(start_date, end_date, max_days=None)
+        
+        # Use validated dates
+        if actual_start_date is None:
+            # Default to 365 days (1 year) lookback for meaningful trend analysis
+            # Most economic indicators are monthly/quarterly, so 1 year gives ~4-12 data points
+            actual_start_date, end_date = calculate_date_range(end_date, 365)
         if actual_end_date:
             end_date = actual_end_date
         
@@ -242,10 +250,18 @@ class FREDMacroProvider(MacroEconomicsInterface):
         """
         Get Treasury yield curve data.
         """
-        # Validate date range - returns tuple (start_date, end_date)
-        actual_start_date, actual_end_date = validate_date_range(start_date, end_date, lookback_days)
+        # Calculate start_date from lookback_days if not provided
+        if start_date is None and lookback_days:
+            start_date, end_date = calculate_date_range(end_date, lookback_days)
         
-        # Use validated end_date if provided
+        # Validate date range
+        actual_start_date, actual_end_date = validate_date_range(start_date, end_date, max_days=None)
+        
+        # Use validated dates
+        if actual_start_date is None:
+            # Default to 365 days (1 year) lookback for meaningful trend analysis
+            # Yield curve data is daily, so 1 year gives good historical context
+            actual_start_date, end_date = calculate_date_range(end_date, 365)
         if actual_end_date:
             end_date = actual_end_date
         

@@ -244,11 +244,12 @@ def get_market_analysis_outputs(analysis_id: int):
 class LoggingToolNode:
     """Custom ToolNode wrapper that logs tool calls and stores JSON data."""
     
-    def __init__(self, tools, market_analysis_id=None):
+    def __init__(self, tools, market_analysis_id=None, model_info: str = None):
         from langgraph.prebuilt import ToolNode
         from langchain_core.tools import tool
         
         self.market_analysis_id = market_analysis_id
+        self.model_info = model_info  # Model info for logging (e.g., "NagaAI/grok-4" or "OpenAI/gpt-5")
         self.original_tools = {t.name: t for t in tools}
         
         # Wrap each tool to intercept results and store JSON
@@ -266,12 +267,16 @@ class LoggingToolNode:
         
         tool_name = original_tool.name
         market_analysis_id = self.market_analysis_id
+        model_info = self.model_info
         
         # Create wrapped function
         def wrapped_func(**kwargs):
             """Wrapper that stores JSON and returns text for agent."""
-            # Log tool call
-            logger.info(f"[TOOL_CALL] Executing {tool_name} with args: {kwargs}")
+            # Log tool call with model information if available
+            if model_info:
+                logger.info(f"[TOOL_CALL] Executing {tool_name} with args: {kwargs} | Model: {model_info}")
+            else:
+                logger.info(f"[TOOL_CALL] Executing {tool_name} with args: {kwargs}")
             
             if market_analysis_id:
                 store_analysis_output(

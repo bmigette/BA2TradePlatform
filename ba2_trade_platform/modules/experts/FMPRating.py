@@ -7,7 +7,7 @@ from ...core.interfaces import MarketExpertInterface
 from ...core.models import ExpertInstance, MarketAnalysis, AnalysisOutput, ExpertRecommendation
 from ...core.db import get_db, get_instance, update_instance, add_instance, get_setting
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, RiskLevel, TimeHorizon
-from ...logger import logger
+from ...logger import get_expert_logger
 from ...config import get_app_setting
 
 
@@ -30,6 +30,9 @@ class FMPRating(MarketExpertInterface):
         
         self._load_expert_instance(id)
         self._api_key = self._get_fmp_api_key()
+        
+        # Initialize expert-specific logger
+        self.logger = get_expert_logger("FMPRating", id)
     
     def _load_expert_instance(self, id: int) -> None:
         """Load and validate expert instance from database."""
@@ -41,7 +44,7 @@ class FMPRating(MarketExpertInterface):
         """Get FMP API key from app settings."""
         api_key = get_app_setting('FMP_API_KEY')
         if not api_key:
-            logger.warning("FMP API key not found in app settings")
+            self.logger.warning("FMP API key not found in app settings")
         return api_key
     
     @classmethod
@@ -75,7 +78,7 @@ class FMPRating(MarketExpertInterface):
             API response data or None if error
         """
         if not self._api_key:
-            logger.error("Cannot fetch price target consensus: FMP API key not configured")
+            self.logger.error("Cannot fetch price target consensus: FMP API key not configured")
             return None
         
         try:
@@ -85,12 +88,33 @@ class FMPRating(MarketExpertInterface):
                 "apikey": self._api_key
             }
             
-            logger.debug(f"Fetching FMP price target consensus for {symbol}")
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
+            self.logger.debug(f"Fetching FMP price target consensus for {symbol}")
+            
+            # Retry logic with 60s timeout
+            max_retries = 3
+            timeout = 60
+            response = None
+            
+            for attempt in range(1, max_retries + 1):
+                try:
+                    response = requests.get(url, params=params, timeout=timeout)
+                    response.raise_for_status()
+                    break  # Success
+                except requests.exceptions.ReadTimeout:
+                    if attempt < max_retries:
+                        self.logger.warning(f"FMP price target consensus timeout for {symbol} (attempt {attempt}/{max_retries}), retrying...")
+                        continue
+                    else:
+                        error_msg = f"Failed to fetch price target consensus for {symbol} after {max_retries} attempts (timeout)"
+                        self.logger.error(error_msg)
+                        raise ValueError(error_msg)
+                except requests.exceptions.RequestException as e:
+                    error_msg = f"Failed to fetch FMP price target consensus for {symbol}: {e}"
+                    self.logger.error(error_msg)
+                    raise ValueError(error_msg) from e
             
             data = response.json()
-            logger.debug(f"Received price target consensus data for {symbol}")
+            self.logger.debug(f"Received price target consensus data for {symbol}")
             
             # FMP returns a list with one item, extract the first element
             if isinstance(data, list) and len(data) > 0:
@@ -98,15 +122,16 @@ class FMPRating(MarketExpertInterface):
             elif isinstance(data, dict):
                 return data
             else:
-                logger.warning(f"Unexpected price target consensus format for {symbol}: {type(data)}")
+                self.logger.warning(f"Unexpected price target consensus format for {symbol}: {type(data)}")
                 return None
             
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to fetch FMP price target consensus for {symbol}: {e}", exc_info=True)
-            return None
+        except ValueError:
+            # Re-raise ValueError (from our error handling above)
+            raise
         except Exception as e:
-            logger.error(f"Unexpected error fetching price target consensus for {symbol}: {e}", exc_info=True)
-            return None
+            error_msg = f"Unexpected error fetching price target consensus for {symbol}: {e}"
+            self.logger.error(error_msg)
+            raise ValueError(error_msg) from e
     
     def _fetch_upgrade_downgrade(self, symbol: str) -> Optional[list]:
         """
@@ -119,7 +144,7 @@ class FMPRating(MarketExpertInterface):
             API response data or None if error
         """
         if not self._api_key:
-            logger.error("Cannot fetch upgrade/downgrade data: FMP API key not configured")
+            self.logger.error("Cannot fetch upgrade/downgrade data: FMP API key not configured")
             return None
         
         try:
@@ -129,22 +154,44 @@ class FMPRating(MarketExpertInterface):
                 "apikey": self._api_key
             }
             
-            logger.debug(f"Fetching FMP upgrade/downgrade consensus for {symbol}")
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
+            self.logger.debug(f"Fetching FMP upgrade/downgrade consensus for {symbol}")
+            
+            # Retry logic with 60s timeout
+            max_retries = 3
+            timeout = 60
+            response = None
+            
+            for attempt in range(1, max_retries + 1):
+                try:
+                    response = requests.get(url, params=params, timeout=timeout)
+                    response.raise_for_status()
+                    break  # Success
+                except requests.exceptions.ReadTimeout:
+                    if attempt < max_retries:
+                        self.logger.warning(f"FMP upgrade/downgrade timeout for {symbol} (attempt {attempt}/{max_retries}), retrying...")
+                        continue
+                    else:
+                        error_msg = f"Failed to fetch upgrade/downgrade for {symbol} after {max_retries} attempts (timeout)"
+                        self.logger.error(error_msg)
+                        raise ValueError(error_msg)
+                except requests.exceptions.RequestException as e:
+                    error_msg = f"Failed to fetch FMP upgrade/downgrade for {symbol}: {e}"
+                    self.logger.error(error_msg)
+                    raise ValueError(error_msg) from e
             
             data = response.json()
-            logger.debug(f"Received {len(data) if isinstance(data, list) else 0} upgrade/downgrade records")
+            self.logger.debug(f"Received {len(data) if isinstance(data, list) else 0} upgrade/downgrade records")
             
             # Return the list as-is (we'll use it to count analysts)
             return data if isinstance(data, list) else None
             
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to fetch FMP upgrade/downgrade for {symbol}: {e}", exc_info=True)
-            return None
+        except ValueError:
+            # Re-raise ValueError (from our error handling above)
+            raise
         except Exception as e:
-            logger.error(f"Unexpected error fetching upgrade/downgrade for {symbol}: {e}", exc_info=True)
-            return None
+            error_msg = f"Unexpected error fetching upgrade/downgrade for {symbol}: {e}"
+            self.logger.error(error_msg)
+            raise ValueError(error_msg) from e
     
     def _calculate_recommendation(self, consensus_data: Dict[str, Any], 
                                  upgrade_data: list,
@@ -154,12 +201,12 @@ class FMPRating(MarketExpertInterface):
         """
         Calculate trading recommendation from price target consensus.
         
-        Formula:
-        1. Determine signal based on consensus vs current price
-        2. Calculate weighted profit potential:
-           - For BUY: (target_high - current_price) * confidence * profit_ratio
-           - For SELL: (current_price - target_low) * confidence * profit_ratio
-        3. Calculate expected profit percentage from current price
+        New Formula (matching FinnHub methodology with price target boost):
+        1. Calculate base score from analyst buy/sell ratings (FinnHub style)
+        2. Determine signal based on dominant rating
+        3. Calculate price target boost from current price to lower/consensus targets
+        4. Average the boosts and add to base confidence
+        5. Clamp final confidence to 0-100%
         
         Args:
             consensus_data: Price target consensus from FMP
@@ -190,8 +237,14 @@ class FMPRating(MarketExpertInterface):
         target_low = consensus_data.get('targetLow')
         target_median = consensus_data.get('targetMedian')
         
-        # Get analyst count from upgrade/downgrade data
+        # Get analyst ratings from upgrade/downgrade data
         analyst_count = 0
+        strong_buy = 0
+        buy = 0
+        hold = 0
+        sell = 0
+        strong_sell = 0
+        
         if upgrade_data and len(upgrade_data) > 0:
             latest_grade = upgrade_data[0]
             # Sum all rating categories to get total analyst count
@@ -216,40 +269,64 @@ class FMPRating(MarketExpertInterface):
                 'analyst_count': analyst_count
             }
         
-        # Determine signal based on consensus vs current price
-        if target_consensus and current_price:
-            price_delta_pct = ((target_consensus - current_price) / current_price) * 100
-            
-            # Signal logic
-            if price_delta_pct > 5:  # More than 5% upside
-                signal = OrderRecommendation.BUY
-                # Use high target for BUY
-                target_price = target_high if target_high else target_consensus
-            elif price_delta_pct < -5:  # More than 5% downside
-                signal = OrderRecommendation.SELL
-                # Use low target for SELL
-                target_price = target_low if target_low else target_consensus
-            else:
-                signal = OrderRecommendation.HOLD
-                target_price = target_consensus
+        # === NEW CONFIDENCE CALCULATION (FinnHub style with price target boost) ===
+        
+        # Step 1: Calculate base score from analyst ratings (same as FinnHub)
+        strong_factor = 2.0  # Weight for strong ratings
+        buy_score = (strong_buy * strong_factor) + buy
+        sell_score = (strong_sell * strong_factor) + sell
+        hold_score = hold
+        
+        total_weighted = buy_score + sell_score + hold_score
+        
+        # Step 2: Determine signal and base confidence from ratings
+        if buy_score > sell_score and buy_score > hold_score:
+            signal = OrderRecommendation.BUY
+            dominant_score = buy_score
+            target_price = target_high if target_high else target_consensus
+        elif sell_score > buy_score and sell_score > hold_score:
+            signal = OrderRecommendation.SELL
+            dominant_score = sell_score
+            target_price = target_low if target_low else target_consensus
         else:
             signal = OrderRecommendation.HOLD
+            dominant_score = hold_score
             target_price = target_consensus
         
-        # Calculate base confidence from analyst agreement
-        # Higher confidence if high/low targets are close to consensus
-        if target_high and target_low and target_consensus:
-            consensus_range = target_high - target_low
-            consensus_spread_pct = (consensus_range / target_consensus) * 100 if target_consensus > 0 else 100
-            # Lower spread = higher confidence (inverse relationship)
-            # 0% spread = 100% confidence, 50% spread = 50% confidence, 100% spread = 0% confidence
-            base_confidence = max(0, min(100, 100 - consensus_spread_pct))
-        else:
-            base_confidence = 50.0  # Default medium confidence
+        # Base confidence from analyst consensus (0-100 scale)
+        base_confidence = (dominant_score / total_weighted * 100) if total_weighted > 0 else 0.0
         
-        # Adjust confidence based on analyst count (more analysts = higher confidence)
-        analyst_confidence_boost = min(20, (analyst_count - min_analysts) * 2)
-        confidence = min(100, base_confidence + analyst_confidence_boost)
+        # Step 3: Calculate price target boost
+        price_target_boost = 0.0
+        boost_to_lower = 0.0
+        boost_to_consensus = 0.0
+        
+        if current_price and target_low and target_consensus:
+            # Calculate expected profit % if we hit lower target
+            if current_price > target_low:
+                # Current price is above lower target - negative boost (bearish)
+                boost_to_lower = ((target_low - current_price) / current_price) * 100
+            else:
+                # Current price is below lower target - positive boost (bullish)
+                boost_to_lower = ((target_low - current_price) / current_price) * 100
+            
+            # Calculate expected profit % if we hit consensus target
+            if current_price > target_consensus:
+                # Current price is above consensus - negative boost (bearish)
+                boost_to_consensus = ((target_consensus - current_price) / current_price) * 100
+            else:
+                # Current price is below consensus - positive boost (bullish)
+                boost_to_consensus = ((target_consensus - current_price) / current_price) * 100
+            
+            # Average the two boosts
+            price_target_boost = (boost_to_lower + boost_to_consensus) / 2.0
+        
+        # Step 4: Apply price target boost to base confidence
+        # Positive boost increases confidence, negative boost decreases it
+        confidence = base_confidence + price_target_boost
+        
+        # Step 5: Clamp final confidence to 0-100%
+        confidence = max(0.0, min(100.0, confidence))
         
         # Calculate expected profit
         if signal == OrderRecommendation.BUY and target_price and current_price:
@@ -270,27 +347,47 @@ class FMPRating(MarketExpertInterface):
 
 Current Price: ${current_price:.2f}
 
+Analyst Ratings:
+- Strong Buy: {strong_buy}
+- Buy: {buy}
+- Hold: {hold}
+- Sell: {sell}
+- Strong Sell: {strong_sell}
+Total Analysts: {analyst_count}
+
 Price Targets:
 - Consensus Target: ${target_consensus:.2f} ({((target_consensus - current_price) / current_price * 100):.1f}% from current)
 - High Target: ${target_high:.2f} ({((target_high - current_price) / current_price * 100):.1f}% from current)
 - Low Target: ${target_low:.2f} ({((target_low - current_price) / current_price * 100):.1f}% from current)
 - Median Target: ${target_median:.2f} ({((target_median - current_price) / current_price * 100):.1f}% from current)
 
-Analyst Coverage: {analyst_count} analysts
-
 Recommendation: {signal.value}
 Confidence: {confidence:.1f}%
 Expected Profit: {expected_profit_percent:.1f}%
 
-Calculation Method:
-Price Delta = {'High' if signal == OrderRecommendation.BUY else 'Low'} Target - Current Price = ${target_price:.2f} - ${current_price:.2f} = ${target_price - current_price:.2f}
-Weighted Delta = Price Delta × Confidence × Profit Ratio = ${target_price - current_price:.2f} × {confidence/100:.2f} × {profit_ratio} = ${(target_price - current_price) * (confidence/100) * profit_ratio:.2f}
-Expected Profit % = Weighted Delta / Current Price × 100 = ${(target_price - current_price) * (confidence/100) * profit_ratio:.2f} / ${current_price:.2f} × 100 = {expected_profit_percent:.1f}%
+Confidence Calculation (FinnHub Methodology + Price Target Boost):
 
-Confidence Calculation:
-Base Confidence = 100 - Target Spread % = 100 - {((target_high - target_low) / target_consensus * 100):.1f}% = {base_confidence:.1f}%
-Analyst Boost = min(20, ({analyst_count} - {min_analysts}) × 2) = {analyst_confidence_boost:.1f}%
-Final Confidence = {confidence:.1f}%
+Step 1 - Weighted Scores (Strong Factor: {strong_factor}x):
+Buy Score = (Strong Buy × {strong_factor}) + Buy = ({strong_buy} × {strong_factor}) + {buy} = {buy_score:.1f}
+Hold Score = Hold = {hold}
+Sell Score = (Strong Sell × {strong_factor}) + Sell = ({strong_sell} × {strong_factor}) + {sell} = {sell_score:.1f}
+Total Weighted = {total_weighted:.1f}
+
+Step 2 - Base Confidence from Analyst Ratings:
+Base Confidence = Dominant Score / Total × 100 = {dominant_score:.1f} / {total_weighted:.1f} × 100 = {base_confidence:.1f}%
+
+Step 3 - Price Target Boost:
+Boost to Lower Target = ((${target_low:.2f} - ${current_price:.2f}) / ${current_price:.2f}) × 100 = {boost_to_lower:.1f}%
+Boost to Consensus = ((${target_consensus:.2f} - ${current_price:.2f}) / ${current_price:.2f}) × 100 = {boost_to_consensus:.1f}%
+Avg Price Target Boost = ({boost_to_lower:.1f}% + {boost_to_consensus:.1f}%) / 2 = {price_target_boost:.1f}%
+
+Step 4 - Final Confidence (clamped to 0-100%):
+Final Confidence = Base Confidence + Avg Boost = {base_confidence:.1f}% + {price_target_boost:.1f}% = {confidence:.1f}%
+
+Expected Profit Calculation:
+Price Delta = {'High' if signal == OrderRecommendation.BUY else 'Low'} Target - Current = ${target_price:.2f} - ${current_price:.2f} = ${target_price - current_price:.2f}
+Weighted Delta = Price Delta × Confidence × Profit Ratio = ${target_price - current_price:.2f} × {confidence/100:.2f} × {profit_ratio} = ${(target_price - current_price) * (confidence/100) * profit_ratio:.2f}
+Expected Profit % = (Weighted Delta / Current) × 100 = {expected_profit_percent:.1f}%
 """
         
         return {
@@ -303,16 +400,20 @@ Final Confidence = {confidence:.1f}%
             'target_low': target_low,
             'target_median': target_median,
             'analyst_count': analyst_count,
+            # New calculation components
+            'strong_buy': strong_buy,
+            'buy': buy,
+            'hold': hold,
+            'sell': sell,
+            'strong_sell': strong_sell,
+            'buy_score': buy_score,
+            'sell_score': sell_score,
+            'hold_score': hold_score,
             'base_confidence': base_confidence,
-            'analyst_confidence_boost': analyst_confidence_boost,
-            # Add analyst breakdown
-            'strong_buy': strong_buy if 'strong_buy' in locals() else 0,
-            'buy': buy if 'buy' in locals() else 0,
-            'hold': hold if 'hold' in locals() else 0,
-            'sell': sell if 'sell' in locals() else 0,
-            'strong_sell': strong_sell if 'strong_sell' in locals() else 0,
-            'consensus_spread_pct': ((target_high - target_low) / target_consensus * 100) if (target_high and target_low and target_consensus) else 0,
-            'target_price': target_price if 'target_price' in locals() else target_consensus
+            'boost_to_lower': boost_to_lower,
+            'boost_to_consensus': boost_to_consensus,
+            'price_target_boost': price_target_boost,
+            'target_price': target_price
         }
     
     def _create_expert_recommendation(self, recommendation_data: Dict[str, Any], 
@@ -335,13 +436,13 @@ Final Confidence = {confidence:.1f}%
             )
             
             recommendation_id = add_instance(expert_recommendation)
-            logger.info(f"Created ExpertRecommendation (ID: {recommendation_id}) for {symbol}: "
+            self.logger.info(f"Created ExpertRecommendation (ID: {recommendation_id}) for {symbol}: "
                        f"{recommendation_data['signal'].value} with {recommendation_data['confidence']:.1f}% confidence, "
                        f"expected profit: {recommendation_data['expected_profit_percent']:.1f}%")
             return recommendation_id
             
         except Exception as e:
-            logger.error(f"Failed to create ExpertRecommendation for {symbol}: {e}", exc_info=True)
+            self.logger.error(f"Failed to create ExpertRecommendation for {symbol}: {e}", exc_info=True)
             raise
     
     def _store_analysis_outputs(self, market_analysis_id: int, symbol: str,
@@ -400,7 +501,7 @@ Final Confidence = {confidence:.1f}%
             
         except Exception as e:
             session.rollback()
-            logger.error(f"Failed to store analysis outputs: {e}", exc_info=True)
+            self.logger.error(f"Failed to store analysis outputs: {e}", exc_info=True)
             raise
         finally:
             session.close()
@@ -421,7 +522,7 @@ Final Confidence = {confidence:.1f}%
             return account.get_instrument_current_price(symbol)
             
         except Exception as e:
-            logger.error(f"Error getting current price for {symbol}: {e}", exc_info=True)
+            self.logger.error(f"Error getting current price for {symbol}: {e}", exc_info=True)
             return None
     
     def run_analysis(self, symbol: str, market_analysis: MarketAnalysis) -> None:
@@ -432,7 +533,7 @@ Final Confidence = {confidence:.1f}%
             symbol: Financial instrument symbol to analyze
             market_analysis: MarketAnalysis instance to update with results
         """
-        logger.info(f"Starting FMPRating analysis for {symbol} (Analysis ID: {market_analysis.id})")
+        self.logger.info(f"Starting FMPRating analysis for {symbol} (Analysis ID: {market_analysis.id})")
         
         try:
             # Update status to running
@@ -497,9 +598,14 @@ Final Confidence = {confidence:.1f}%
                         'strong_sell': recommendation_data.get('strong_sell', 0)
                     },
                     'confidence_breakdown': {
+                        # New calculation components (FinnHub methodology + price target boost)
                         'base_confidence': recommendation_data.get('base_confidence', 0),
-                        'analyst_confidence_boost': recommendation_data.get('analyst_confidence_boost', 0),
-                        'consensus_spread_pct': recommendation_data.get('consensus_spread_pct', 0)
+                        'price_target_boost': recommendation_data.get('price_target_boost', 0),
+                        'boost_to_lower': recommendation_data.get('boost_to_lower', 0),
+                        'boost_to_consensus': recommendation_data.get('boost_to_consensus', 0),
+                        'buy_score': recommendation_data.get('buy_score', 0),
+                        'sell_score': recommendation_data.get('sell_score', 0),
+                        'hold_score': recommendation_data.get('hold_score', 0),
                     },
                     'consensus_data': consensus_data,
                     'upgrade_data': upgrade_data,
@@ -517,12 +623,12 @@ Final Confidence = {confidence:.1f}%
             market_analysis.status = MarketAnalysisStatus.COMPLETED
             update_instance(market_analysis)
             
-            logger.info(f"Completed FMPRating analysis for {symbol}: {recommendation_data['signal'].value} "
+            self.logger.info(f"Completed FMPRating analysis for {symbol}: {recommendation_data['signal'].value} "
                        f"(confidence: {recommendation_data['confidence']:.1f}%, "
                        f"expected profit: {recommendation_data['expected_profit_percent']:.1f}%)")
             
         except Exception as e:
-            logger.error(f"FMPRating analysis failed for {symbol}: {e}", exc_info=True)
+            self.logger.error(f"FMPRating analysis failed for {symbol}: {e}", exc_info=True)
             
             # Update status to failed
             market_analysis.state = {
@@ -546,7 +652,7 @@ Final Confidence = {confidence:.1f}%
                 session.commit()
                 session.close()
             except Exception as db_error:
-                logger.error(f"Failed to store error output: {db_error}", exc_info=True)
+                self.logger.error(f"Failed to store error output: {db_error}", exc_info=True)
             
             raise
     
@@ -574,7 +680,7 @@ Final Confidence = {confidence:.1f}%
                     ui.label(f"Unknown analysis status: {market_analysis.status}")
                     
         except Exception as e:
-            logger.error(f"Error rendering market analysis {market_analysis.id}: {e}", exc_info=True)
+            self.logger.error(f"Error rendering market analysis {market_analysis.id}: {e}", exc_info=True)
             with ui.card().classes('w-full p-8 text-center'):
                 ui.icon('error', size='3rem', color='negative').classes('mb-4')
                 ui.label('Rendering Error').classes('text-h5 text-negative')
@@ -815,27 +921,54 @@ Final Confidence = {confidence:.1f}%
             confidence_breakdown = state.get('confidence_breakdown', {})
             if confidence_breakdown:
                 base_confidence = confidence_breakdown.get('base_confidence', 0)
-                analyst_boost = confidence_breakdown.get('analyst_confidence_boost', 0)
-                spread_pct = confidence_breakdown.get('consensus_spread_pct', 0)
+                price_target_boost = confidence_breakdown.get('price_target_boost', 0)
+                boost_to_lower = confidence_breakdown.get('boost_to_lower', 0)
+                boost_to_consensus = confidence_breakdown.get('boost_to_consensus', 0)
                 
                 with ui.card_section():
-                    ui.label('Confidence Score Breakdown').classes('text-subtitle1 text-weight-medium mb-2')
+                    ui.label('Confidence Score Breakdown (New Methodology)').classes('text-subtitle1 text-weight-medium mb-2')
+                    ui.label('FinnHub Analyst Rating Base + Price Target Boost').classes('text-xs text-grey-6 mb-3')
                     
-                    with ui.grid(columns=3).classes('w-full gap-4'):
+                    with ui.grid(columns=2).classes('w-full gap-4'):
+                        # Base Confidence from Analyst Ratings
                         with ui.card().classes('bg-blue-50'):
-                            ui.label('Base Confidence').classes('text-caption text-grey-7')
+                            ui.label('Base (from Analyst Ratings)').classes('text-caption text-grey-7')
                             ui.label(f'{base_confidence:.1f}%').classes('text-h5 text-blue-700')
-                            ui.label(f'From {spread_pct:.1f}% spread').classes('text-xs text-grey-6')
+                            ui.label(f'Weighted buy/sell/hold scores').classes('text-xs text-grey-6')
                         
-                        with ui.card().classes('bg-green-50'):
-                            ui.label('Analyst Boost').classes('text-caption text-grey-7')
-                            ui.label(f'+{analyst_boost:.1f}%').classes('text-h5 text-green-700')
-                            ui.label(f'{analyst_count} analysts').classes('text-xs text-grey-6')
+                        # Price Target Boost
+                        boost_color = 'positive' if price_target_boost > 0 else 'negative' if price_target_boost < 0 else 'grey'
+                        with ui.card().classes(f'bg-{"green" if price_target_boost > 0 else "red" if price_target_boost < 0 else "grey"}-50'):
+                            ui.label('Price Target Boost').classes('text-caption text-grey-7')
+                            ui.label(f'{price_target_boost:+.1f}%').classes(f'text-h5 text-{boost_color}')
+                            ui.label(f'Avg of lower & consensus targets').classes('text-xs text-grey-6')
                         
-                        with ui.card().classes('bg-purple-50'):
-                            ui.label('Final Confidence').classes('text-caption text-grey-7')
-                            ui.label(f'{confidence:.1f}%').classes('text-h5 text-purple-700')
-                            ui.label('Combined score').classes('text-xs text-grey-6')
+                        # Boost to Lower Target
+                        with ui.card().classes('bg-grey-50'):
+                            ui.label('Boost to Lower Target').classes('text-caption text-grey-7')
+                            ui.label(f'{boost_to_lower:+.1f}%').classes('text-h6 text-grey-700')
+                        
+                        # Boost to Consensus Target
+                        with ui.card().classes('bg-grey-50'):
+                            ui.label('Boost to Consensus Target').classes('text-caption text-grey-7')
+                            ui.label(f'{boost_to_consensus:+.1f}%').classes('text-h6 text-grey-700')
+                    
+                    ui.separator().classes('my-2')
+                    
+                    # Calculate what confidence should be
+                    calculated_confidence = base_confidence + price_target_boost
+                    clamped_confidence = max(0.0, min(100.0, calculated_confidence))
+                    
+                    # Show the formula
+                    ui.label(f'Final Confidence = Base + Boost = {base_confidence:.1f}% + {price_target_boost:+.1f}% = {calculated_confidence:.1f}%').classes('text-sm text-grey-7')
+                    
+                    # If clamping occurred, show it
+                    if calculated_confidence != clamped_confidence:
+                        ui.label(f'Clamped to valid range [0-100%]: {clamped_confidence:.1f}%').classes('text-sm text-orange-600 font-medium')
+                    
+                    # If stored confidence doesn't match what we calculated, show warning
+                    if abs(confidence - clamped_confidence) > 0.1:
+                        ui.label(f'⚠️ Stored confidence ({confidence:.1f}%) differs from calculated ({clamped_confidence:.1f}%)').classes('text-sm text-red-600 font-bold')
             
             # Settings
             profit_ratio = float(settings.get('profit_ratio', 1.0))
@@ -853,8 +986,19 @@ Final Confidence = {confidence:.1f}%
                 with ui.card_section().classes('bg-grey-1'):
                     confidence_breakdown = state.get('confidence_breakdown', {})
                     base_conf = confidence_breakdown.get('base_confidence', 0)
-                    analyst_boost = confidence_breakdown.get('analyst_confidence_boost', 0)
-                    spread_pct = confidence_breakdown.get('consensus_spread_pct', 0)
+                    price_boost = confidence_breakdown.get('price_target_boost', 0)
+                    boost_lower = confidence_breakdown.get('boost_to_lower', 0)
+                    boost_consensus = confidence_breakdown.get('boost_to_consensus', 0)
+                    buy_score = confidence_breakdown.get('buy_score', 0)
+                    sell_score = confidence_breakdown.get('sell_score', 0)
+                    hold_score = confidence_breakdown.get('hold_score', 0)
+                    
+                    analyst_breakdown = state.get('analyst_breakdown', {})
+                    strong_buy = analyst_breakdown.get('strong_buy', 0)
+                    buy = analyst_breakdown.get('buy', 0)
+                    hold = analyst_breakdown.get('hold', 0)
+                    sell = analyst_breakdown.get('sell', 0)
+                    strong_sell = analyst_breakdown.get('strong_sell', 0)
                     
                     ui.markdown(f'''
 **Signal Determination:**
@@ -866,22 +1010,27 @@ The recommendation signal is based on the price delta from current price to cons
 
 ---
 
-**Confidence Score Calculation:**
+**NEW Confidence Score Calculation (FinnHub Methodology + Price Target Boost):**
 
-1. **Base Confidence** = 100 - Target Spread %
-   - Target Spread % = (High Target - Low Target) / Consensus × 100
-   - Current Spread: {spread_pct:.1f}%
-   - Base Score: {base_conf:.1f}%
-   - **Logic**: Tighter analyst agreement (lower spread) = Higher confidence
+1. **Weighted Analyst Scores**
+   - Buy Score = (Strong Buy × 2) + Buy = ({strong_buy} × 2) + {buy} = {buy_score:.1f}
+   - Hold Score = Hold = {hold}
+   - Sell Score = (Strong Sell × 2) + Sell = ({strong_sell} × 2) + {sell} = {sell_score:.1f}
+   - Total Weighted = {buy_score + hold_score + sell_score:.1f}
 
-2. **Analyst Coverage Boost** = min(20, (Analyst Count - Min Required) × 2)
-   - Analyst Count: {analyst_count}
-   - Min Required: {min_analysts}
-   - Coverage Boost: +{analyst_boost:.1f}%
-   - **Logic**: More analyst coverage = Higher reliability (capped at +20%)
+2. **Base Confidence from Analyst Ratings**
+   - Base Confidence = Dominant Score / Total × 100
+   - Current: {base_conf:.1f}%
+   - **Logic**: Analyst consensus strength drives base confidence
 
-3. **Final Confidence** = Base Confidence + Analyst Boost
-   - Result: {base_conf:.1f}% + {analyst_boost:.1f}% = **{confidence:.1f}%**
+3. **Price Target Boost**
+   - Boost to Lower Target = ((Low Target - Current) / Current) × 100 = {boost_lower:+.1f}%
+   - Boost to Consensus = ((Consensus - Current) / Current) × 100 = {boost_consensus:+.1f}%
+   - Avg Price Target Boost = ({boost_lower:+.1f}% + {boost_consensus:+.1f}%) / 2 = {price_boost:+.1f}%
+   - **Logic**: Positive when targets are above current price (more upside potential)
+
+4. **Final Confidence (Clamped to 0-100%)**
+   - Final = Base + Boost = {base_conf:.1f}% + {price_boost:+.1f}% = **{confidence:.1f}%**
 
 ---
 
@@ -904,9 +1053,9 @@ For **SELL** signals:
 **Analyst Recommendations:**
 
 The breakdown shows how many analysts rate the stock as:
-- **Strong Buy / Buy**: Bullish ratings (expecting price increase)
+- **Strong Buy / Buy**: Bullish ratings (expecting price increase) - weighted 2x for strong ratings
 - **Hold**: Neutral rating (price expected to stay stable)
-- **Sell / Strong Sell**: Bearish ratings (expecting price decrease)
+- **Sell / Strong Sell**: Bearish ratings (expecting price decrease) - weighted 2x for strong ratings
 
 This distribution helps validate the consensus target and signal strength.
 

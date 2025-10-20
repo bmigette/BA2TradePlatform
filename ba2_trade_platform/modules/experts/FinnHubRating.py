@@ -7,7 +7,7 @@ from ...core.interfaces import MarketExpertInterface
 from ...core.models import ExpertInstance, MarketAnalysis, AnalysisOutput, ExpertRecommendation
 from ...core.db import get_db, get_instance, update_instance, add_instance, get_setting
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, RiskLevel, TimeHorizon
-from ...logger import logger
+from ...logger import get_expert_logger
 
 
 class FinnHubRating(MarketExpertInterface):
@@ -26,23 +26,24 @@ class FinnHubRating(MarketExpertInterface):
     def __init__(self, id: int):
         """Initialize FinnHubRating expert with database instance."""
         super().__init__(id)
-        #logger.debug(f'Initializing FinnHubRating expert with instance ID: {id}')
         
         self._load_expert_instance(id)
         self._api_key = self._get_finnhub_api_key()
+        
+        # Initialize expert-specific logger
+        self.logger = get_expert_logger("FinnHubRating", id)
     
     def _load_expert_instance(self, id: int) -> None:
         """Load and validate expert instance from database."""
         self.instance = get_instance(ExpertInstance, id)
         if not self.instance:
             raise ValueError(f"ExpertInstance with ID {id} not found")
-        #logger.debug(f'FinnHubRating expert loaded: {self.instance.expert}')
     
     def _get_finnhub_api_key(self) -> Optional[str]:
         """Get Finnhub API key from app settings."""
         api_key = get_setting('finnhub_api_key')
         if not api_key:
-            logger.warning("Finnhub API key not found in app settings")
+            self.logger.warning("Finnhub API key not found in app settings")
         return api_key
     
     @classmethod
@@ -69,7 +70,7 @@ class FinnHubRating(MarketExpertInterface):
             API response data or None if error
         """
         if not self._api_key:
-            logger.error("Cannot fetch recommendations: Finnhub API key not configured")
+            self.logger.error("Cannot fetch recommendations: Finnhub API key not configured")
             return None
         
         try:
@@ -79,20 +80,20 @@ class FinnHubRating(MarketExpertInterface):
                 "token": self._api_key
             }
             
-            logger.debug(f"Fetching Finnhub recommendations for {symbol}")
+            self.logger.debug(f"Fetching Finnhub recommendations for {symbol}")
             response = requests.get(url, params=params, timeout=10)
             response.raise_for_status()
             
             data = response.json()
-            logger.debug(f"Received {len(data) if isinstance(data, list) else 0} recommendation periods")
+            self.logger.debug(f"Received {len(data) if isinstance(data, list) else 0} recommendation periods")
             
             return data
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to fetch Finnhub recommendations for {symbol}: {e}", exc_info=True)
+            self.logger.error(f"Failed to fetch Finnhub recommendations for {symbol}: {e}", exc_info=True)
             return None
         except Exception as e:
-            logger.error(f"Unexpected error fetching recommendations for {symbol}: {e}", exc_info=True)
+            self.logger.error(f"Unexpected error fetching recommendations for {symbol}: {e}", exc_info=True)
             return None
     
     def _calculate_recommendation(self, trends_data: list, strong_factor: float) -> Dict[str, Any]:
@@ -213,12 +214,12 @@ Confidence = Dominant Score / Total × 100 = {dominant_score:.1f} / {total_weigh
             )
             
             recommendation_id = add_instance(expert_recommendation)
-            logger.info(f"Created ExpertRecommendation (ID: {recommendation_id}) for {symbol}: "
+            self.logger.info(f"Created ExpertRecommendation (ID: {recommendation_id}) for {symbol}: "
                        f"{recommendation_data['signal'].value} with {recommendation_data['confidence']:.1f}% confidence")
             return recommendation_id
             
         except Exception as e:
-            logger.error(f"Failed to create ExpertRecommendation for {symbol}: {e}", exc_info=True)
+            self.logger.error(f"Failed to create ExpertRecommendation for {symbol}: {e}", exc_info=True)
             raise
     
     def _store_analysis_outputs(self, market_analysis_id: int, symbol: str,
@@ -250,7 +251,7 @@ Confidence = Dominant Score / Total × 100 = {dominant_score:.1f} / {total_weigh
             
         except Exception as e:
             session.rollback()
-            logger.error(f"Failed to store analysis outputs: {e}", exc_info=True)
+            self.logger.error(f"Failed to store analysis outputs: {e}", exc_info=True)
             raise
         finally:
             session.close()
@@ -271,7 +272,7 @@ Confidence = Dominant Score / Total × 100 = {dominant_score:.1f} / {total_weigh
             return account.get_instrument_current_price(symbol)
             
         except Exception as e:
-            logger.error(f"Error getting current price for {symbol}: {e}", exc_info=True)
+            self.logger.error(f"Error getting current price for {symbol}: {e}", exc_info=True)
             return None
     
     def _sanitize_api_response(self, trends_data: list) -> list:
@@ -309,7 +310,7 @@ Confidence = Dominant Score / Total × 100 = {dominant_score:.1f} / {total_weigh
             symbol: Financial instrument symbol to analyze
             market_analysis: MarketAnalysis instance to update with results
         """
-        logger.info(f"Starting FinnHubRating analysis for {symbol} (Analysis ID: {market_analysis.id})")
+        self.logger.info(f"Starting FinnHubRating analysis for {symbol} (Analysis ID: {market_analysis.id})")
         
         try:
             # Update status to running
@@ -371,11 +372,11 @@ Confidence = Dominant Score / Total × 100 = {dominant_score:.1f} / {total_weigh
             market_analysis.status = MarketAnalysisStatus.COMPLETED
             update_instance(market_analysis)
             
-            logger.info(f"Completed FinnHubRating analysis for {symbol}: {recommendation_data['signal'].value} "
+            self.logger.info(f"Completed FinnHubRating analysis for {symbol}: {recommendation_data['signal'].value} "
                        f"(confidence: {recommendation_data['confidence']:.1f}%)")
             
         except Exception as e:
-            logger.error(f"FinnHubRating analysis failed for {symbol}: {e}", exc_info=True)
+            self.logger.error(f"FinnHubRating analysis failed for {symbol}: {e}", exc_info=True)
             
             # Update status to failed
             market_analysis.state = {
@@ -399,7 +400,7 @@ Confidence = Dominant Score / Total × 100 = {dominant_score:.1f} / {total_weigh
                 session.commit()
                 session.close()
             except Exception as db_error:
-                logger.error(f"Failed to store error output: {db_error}", exc_info=True)
+                self.logger.error(f"Failed to store error output: {db_error}", exc_info=True)
             
             raise
     
@@ -427,7 +428,7 @@ Confidence = Dominant Score / Total × 100 = {dominant_score:.1f} / {total_weigh
                     ui.label(f"Unknown analysis status: {market_analysis.status}")
                     
         except Exception as e:
-            logger.error(f"Error rendering market analysis {market_analysis.id}: {e}", exc_info=True)
+            self.logger.error(f"Error rendering market analysis {market_analysis.id}: {e}", exc_info=True)
             with ui.card().classes('w-full p-8 text-center'):
                 ui.icon('error', size='3rem', color='negative').classes('mb-4')
                 ui.label('Rendering Error').classes('text-h5 text-negative')

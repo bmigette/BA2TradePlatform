@@ -391,7 +391,23 @@ class RulesExportImportUI:
 
                 def handle_import(e):
                     try:
-                        content = e.content.read().decode('utf-8')
+                        # Debug: Check what attributes the event has
+                        logger.debug(f"Upload event type: {type(e)}")
+                        logger.debug(f"Upload event attributes: {dir(e)}")
+                        
+                        # Read the uploaded file content
+                        # Handle both old and new NiceGUI API
+                        if hasattr(e, 'content'):
+                            e.content.seek(0)  # Ensure we're at the beginning of the file
+                            content = e.content.read().decode('utf-8')
+                        elif hasattr(e, 'sender') and hasattr(e.sender, 'content'):
+                            e.sender.content.seek(0)
+                            content = e.sender.content.read().decode('utf-8')
+                        else:
+                            logger.error(f"Cannot find content in upload event. Available attributes: {dir(e)}")
+                            self.ui.notify('Upload failed: Unsupported event format', type='negative')
+                            return
+                            
                         data = json.loads(content)
 
                         # Determine import type

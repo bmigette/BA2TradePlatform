@@ -509,8 +509,8 @@ class OverviewTab:
             self._check_and_display_pending_orders(self.tabs_ref)
             
             with ui.grid(columns=4).classes('w-full gap-4'):
-                # Row 1: OpenAI Spending, Analysis Jobs, Order Statistics, and Order Recommendations
-                self._render_openai_spending_widget()
+                # Row 1: API Usage, Analysis Jobs, Order Statistics, and Order Recommendations
+                self._render_api_usage_widget()
                 self._render_analysis_jobs_widget()
                 self._render_order_statistics_widget()
                 with ui.column().classes(''):
@@ -597,17 +597,17 @@ class OverviewTab:
                 # Client has been deleted (user navigated away), ignore the error
                 pass
     
-    def _render_openai_spending_widget(self):
-        """Widget showing OpenAI API spending."""
+    def _render_api_usage_widget(self):
+        """Widget showing API usage for OpenAI and Naga AI."""
         with ui.card().classes('p-4'):
-            ui.label('💰 OpenAI API Usage').classes('text-h6 mb-4')
+            ui.label('💰 API Usage').classes('text-h6 mb-4')
             
             # Create loading placeholder and load data asynchronously
             loading_label = ui.label('🔄 Loading usage data...').classes('text-sm text-gray-500')
             content_container = ui.column().classes('w-full')
             
             # Load data asynchronously
-            asyncio.create_task(self._load_openai_usage_data(loading_label, content_container))
+            asyncio.create_task(self._load_api_usage_data(loading_label, content_container))
     
     def _render_analysis_jobs_widget(self):
         """Widget showing analysis job statistics."""
@@ -797,10 +797,14 @@ class OverviewTab:
         
         return counts
     
-    async def _load_openai_usage_data(self, loading_label, content_container):
-        """Load OpenAI usage data asynchronously and update UI."""
+    async def _load_api_usage_data(self, loading_label, content_container):
+        """Load API usage data for both OpenAI and Naga AI asynchronously and update UI."""
         try:
-            usage_data = await self._get_openai_usage_data_async()
+            # Fetch data from both providers concurrently
+            openai_data_task = asyncio.create_task(self._get_openai_usage_data_async())
+            naga_ai_data_task = asyncio.create_task(self._get_naga_ai_usage_data_async())
+            
+            openai_data, naga_ai_data = await asyncio.gather(openai_data_task, naga_ai_data_task)
             
             # Clear loading message - check if client still exists
             try:
@@ -812,9 +816,12 @@ class OverviewTab:
             # Populate content - check if client still exists
             try:
                 with content_container:
-                    if usage_data.get('error'):
+                    # OpenAI Section
+                    ui.label('🤖 OpenAI').classes('text-subtitle2 font-bold mb-2')
+                    
+                    if openai_data.get('error'):
                         ui.label('⚠️ Error fetching usage data').classes('text-sm text-red-600 mb-2')
-                        error_message = usage_data['error']
+                        error_message = openai_data['error']
                         
                         # Check if this is an admin key requirement error
                         if 'admin-keys' in error_message:
@@ -828,42 +835,56 @@ class OverviewTab:
                         else:
                             ui.label(error_message).classes('text-xs text-gray-500')
                     else:
-                        with ui.row().classes('w-full justify-between items-center mb-2'):
-                            ui.label('Last Week:').classes('text-sm')
-                            week_cost = usage_data.get('week_cost', 0)
-                            ui.label(f'${week_cost:.2f}').classes('text-sm font-bold text-orange-600')
+                        with ui.row().classes('w-full justify-between items-center mb-1'):
+                            ui.label('Last Week:').classes('text-xs')
+                            week_cost = openai_data.get('week_cost', 0)
+                            ui.label(f'${week_cost:.2f}').classes('text-xs font-bold text-orange-600')
                         
-                        with ui.row().classes('w-full justify-between items-center mb-2'):
-                            ui.label('Last Month:').classes('text-sm')
-                            month_cost = usage_data.get('month_cost', 0)
-                            ui.label(f'${month_cost:.2f}').classes('text-sm font-bold text-red-600')
+                        with ui.row().classes('w-full justify-between items-center mb-1'):
+                            ui.label('Last Month:').classes('text-xs')
+                            month_cost = openai_data.get('month_cost', 0)
+                            ui.label(f'${month_cost:.2f}').classes('text-xs font-bold text-red-600')
                         
                         # Show remaining credit only if available
-                        remaining = usage_data.get('remaining_credit')
+                        remaining = openai_data.get('remaining_credit')
                         if remaining is not None:
-                            with ui.row().classes('w-full justify-between items-center mb-2'):
-                                ui.label('Remaining Credit:').classes('text-sm')
-                                ui.label(f'${remaining:.2f}').classes('text-sm font-bold text-green-600')
-                        else:
-                            with ui.row().classes('w-full justify-between items-center mb-2'):
-                                ui.label('Remaining Credit:').classes('text-sm')
-                                ui.label('Not available').classes('text-sm text-gray-500')
+                            with ui.row().classes('w-full justify-between items-center mb-1'):
+                                ui.label('Remaining:').classes('text-xs')
+                                ui.label(f'${remaining:.2f}').classes('text-xs font-bold text-green-600')
+                    
+                    # Separator between providers
+                    ui.separator().classes('my-3')
+                    
+                    # Naga AI Section
+                    ui.label('🌊 Naga AI').classes('text-subtitle2 font-bold mb-2')
+                    
+                    if naga_ai_data.get('error'):
+                        ui.label('⚠️ Error fetching usage data').classes('text-sm text-red-600 mb-2')
+                        error_message = naga_ai_data['error']
+                        ui.label(error_message).classes('text-xs text-gray-500')
+                    else:
+                        with ui.row().classes('w-full justify-between items-center mb-1'):
+                            ui.label('Last Week:').classes('text-xs')
+                            week_cost = naga_ai_data.get('week_cost', 0)
+                            ui.label(f'${week_cost:.2f}').classes('text-xs font-bold text-orange-600')
                         
-                        # Show hard limit if available
-                        hard_limit = usage_data.get('hard_limit')
-                        if hard_limit:
-                            with ui.row().classes('w-full justify-between items-center mb-2'):
-                                ui.label('Credit Limit:').classes('text-sm')
-                                ui.label(f'${hard_limit:.2f}').classes('text-sm text-gray-600')
+                        with ui.row().classes('w-full justify-between items-center mb-1'):
+                            ui.label('Last Month:').classes('text-xs')
+                            month_cost = naga_ai_data.get('month_cost', 0)
+                            ui.label(f'${month_cost:.2f}').classes('text-xs font-bold text-red-600')
                         
-                        ui.separator().classes('my-2')
-                        last_updated = usage_data.get('last_updated', 'Unknown')
-                        ui.label(f'Last updated: {last_updated}').classes('text-xs text-gray-500')
-                        
-                        # Show note if using simulated data
-                        note = usage_data.get('note')
-                        if note:
-                            ui.label(f'📝 {note}').classes('text-xs text-blue-600')
+                        # Show remaining credit only if available
+                        remaining = naga_ai_data.get('remaining_credit')
+                        if remaining is not None:
+                            with ui.row().classes('w-full justify-between items-center mb-1'):
+                                ui.label('Balance:').classes('text-xs')
+                                ui.label(f'${remaining:.2f}').classes('text-xs font-bold text-green-600')
+                    
+                    # Show last updated timestamp (use most recent)
+                    ui.separator().classes('my-2')
+                    last_updated = openai_data.get('last_updated', naga_ai_data.get('last_updated', 'Unknown'))
+                    ui.label(f'Last updated: {last_updated}').classes('text-xs text-gray-500')
+                    
             except RuntimeError:
                 # Client has been deleted (user navigated away), stop processing
                 return
@@ -1008,7 +1029,7 @@ class OverviewTab:
                             return {'error': 'OpenAI API rate limit exceeded - try again later'}
                         else:
                             error_text = await response.text()
-                            logger.error(f'OpenAI API error {response.status}: {error_text}', exc_info=True)
+                            logger.error(f'OpenAI API error {response.status}: {error_text}')
                             return {'error': f'OpenAI API error ({response.status}): {error_text[:100]}...'}
                             
             except aiohttp.ClientError as e:
@@ -1159,7 +1180,7 @@ class OverviewTab:
                     return {'error': 'OpenAI API rate limit exceeded - try again later'}
                 else:
                     error_text = response.text
-                    logger.error(f'OpenAI API error {response.status_code}: {error_text}', exc_info=True)
+                    logger.error(f'OpenAI API error {response.status_code}: {error_text}')
                     return {'error': f'OpenAI API error ({response.status_code}): {error_text[:100]}...'}
                     
             except requests.exceptions.RequestException as e:
@@ -1182,6 +1203,140 @@ class OverviewTab:
             return {'error': f'Network error: {str(e)}'}
         except Exception as e:
             logger.error(f'Unexpected error fetching OpenAI usage data: {e}', exc_info=True)
+            return {'error': f'Unexpected error: {str(e)}'}
+
+    async def _get_naga_ai_usage_data_async(self) -> Dict[str, Any]:
+        """Fetch Naga AI usage data from the API asynchronously."""
+        try:
+            # Get Naga AI admin API key from app settings
+            session = get_db()
+            try:
+                admin_key_setting = session.exec(
+                    select(AppSetting).where(AppSetting.key == 'naga_ai_admin_api_key')
+                ).first()
+                
+                if not admin_key_setting or not admin_key_setting.value_str:
+                    return {'error': 'Naga AI Admin API key not configured in settings'}
+                
+                api_key = admin_key_setting.value_str
+                
+            finally:
+                session.close()
+            
+            # Calculate date ranges
+            now = datetime.now()
+            week_ago = now - timedelta(days=7)
+            month_ago = now - timedelta(days=30)
+            
+            # Fetch usage data from Naga AI API
+            headers = {
+                'Authorization': f'Bearer {api_key}'
+            }
+            
+            try:
+                async with aiohttp.ClientSession() as session:
+                    # Get account balance
+                    balance_url = 'https://api.naga.ac/v1/account/balance'
+                    balance_data = None
+                    
+                    async with session.get(balance_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                        if response.status == 200:
+                            balance_data = await response.json()
+                        elif response.status == 401:
+                            return {'error': 'Invalid Naga AI Admin API key'}
+                        else:
+                            error_text = await response.text()
+                            logger.error(f'Naga AI balance API error {response.status}: {error_text}')
+                    
+                    # Get account activity
+                    activity_url = 'https://api.naga.ac/v1/account/activity'
+                    activity_data = None
+                    
+                    async with session.get(activity_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                        if response.status == 200:
+                            activity_data = await response.json()
+                        elif response.status == 401:
+                            return {'error': 'Invalid Naga AI Admin API key'}
+                        else:
+                            error_text = await response.text()
+                            logger.error(f'Naga AI activity API error {response.status}: {error_text}')
+                    
+                    # Process the data
+                    week_cost = 0
+                    month_cost = 0
+                    remaining_credit = None
+                    
+                    # Extract balance information
+                    if balance_data:
+                        balance_str = balance_data.get('balance', '0')
+                        try:
+                            remaining_credit = float(balance_str)
+                        except (ValueError, TypeError):
+                            remaining_credit = 0
+                    
+                    # Extract activity/usage information
+                    if activity_data:
+                        # Check for daily_stats array (preferred for time-based calculation)
+                        daily_stats = activity_data.get('daily_stats', [])
+                        
+                        if daily_stats:
+                            for day_stat in daily_stats:
+                                date_str = day_stat.get('date')
+                                if date_str:
+                                    try:
+                                        # Parse date string
+                                        try:
+                                            day_date = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+                                        except:
+                                            day_date = datetime.strptime(date_str, '%Y-%m-%d')
+                                        
+                                        # Extract cost (handle string format like "0E-10")
+                                        cost_str = day_stat.get('total_cost', '0')
+                                        try:
+                                            cost = float(cost_str)
+                                        except (ValueError, TypeError):
+                                            cost = 0
+                                        
+                                        # Add to appropriate time periods
+                                        if day_date >= week_ago:
+                                            week_cost += abs(cost)
+                                        if day_date >= month_ago:
+                                            month_cost += abs(cost)
+                                    except Exception as e:
+                                        logger.debug(f"Error parsing daily stat: {e}")
+                                        continue
+                        else:
+                            # Fallback to total_stats if no daily breakdown available
+                            total_stats = activity_data.get('total_stats', {})
+                            if total_stats:
+                                total_cost_str = total_stats.get('total_cost', '0')
+                                try:
+                                    total_cost = float(total_cost_str)
+                                    # Assume total is for the month if no daily stats
+                                    month_cost = abs(total_cost)
+                                    week_cost = month_cost  # Can't distinguish without daily data
+                                except (ValueError, TypeError):
+                                    pass
+                    
+                    return {
+                        'week_cost': week_cost,
+                        'month_cost': month_cost,
+                        'remaining_credit': remaining_credit,
+                        'last_updated': now.strftime('%Y-%m-%d %H:%M:%S'),
+                        'note': 'Real Naga AI usage data'
+                    }
+                    
+            except aiohttp.ClientError as e:
+                logger.error(f'Network error calling Naga AI API: {e}', exc_info=True)
+                return {'error': f'Network error: {str(e)}'}
+                
+        except asyncio.TimeoutError:
+            return {'error': 'Request timeout - Naga AI API not responding'}
+        except aiohttp.ClientError as e:
+            logger.error(f'Error fetching Naga AI usage data: {e}', exc_info=True)
+            return {'error': f'Network error: {str(e)}'}
+        except Exception as e:
+            logger.error(f'Unexpected error fetching Naga AI usage data: {e}', exc_info=True)
             return {'error': f'Unexpected error: {str(e)}'}
 
     def _handle_risk_management_from_overview(self, pending_orders):
@@ -2117,6 +2272,11 @@ class AccountOverviewTab:
                     # Update only the broker_order_id field - do NOT update status during mapping
                     # Status updates should only happen through proper account refresh, not mapping
                     old_broker_id = db_order.broker_order_id
+                    
+                    # Warn if overwriting existing non-None broker_order_id with different value
+                    if old_broker_id and old_broker_id != new_broker_id:
+                        logger.warning(f"Order mapping: Overwriting existing broker_order_id '{old_broker_id}' with '{new_broker_id}' for order {db_order.id}")
+                    
                     db_order.broker_order_id = new_broker_id
                     
                     logger.info(f"Order mapping: Updated order {db_order.id} broker_order_id from '{old_broker_id}' to '{new_broker_id}' (status remains {db_order.status.value})")
@@ -2616,6 +2776,8 @@ class TransactionsTab:
         self.transactions_container = None
         self.transactions_table = None
         self.selected_transaction = None
+        self.selected_transactions = {}  # Dictionary to track selected transaction IDs
+        self.batch_operations_container = None
         self.render()
     
     def _get_order_status_color(self, status):
@@ -2672,6 +2834,36 @@ class TransactionsTab:
                     ).classes('w-40')
                     
                     ui.button('Refresh', icon='refresh', on_click=lambda: self._refresh_transactions()).props('outline')
+                    
+                    # Batch operation buttons
+                    self.batch_operations_container = ui.row().classes('gap-2 ml-4')
+                    self.batch_select_all_btn = ui.button(
+                        'Select All',
+                        icon='done_all',
+                        on_click=self._select_all_transactions
+                    ).props('outline size=md').classes('hidden')
+                    self.batch_select_all_btn.set_visibility(False)
+                    
+                    self.batch_clear_btn = ui.button(
+                        'Clear',
+                        icon='clear',
+                        on_click=self._clear_selected_transactions
+                    ).props('outline size=md').classes('hidden')
+                    self.batch_clear_btn.set_visibility(False)
+                    
+                    self.batch_close_btn = ui.button(
+                        'Batch Close',
+                        icon='close',
+                        on_click=self._batch_close_transactions
+                    ).props('outline color=negative size=md').classes('hidden')
+                    self.batch_close_btn.set_visibility(False)
+                    
+                    self.batch_adjust_tp_btn = ui.button(
+                        'Batch Adjust TP',
+                        icon='trending_up',
+                        on_click=self._batch_adjust_tp_dialog
+                    ).props('outline color=info size=md').classes('hidden')
+                    self.batch_adjust_tp_btn.set_visibility(False)
             
             # Transactions table container
             self.transactions_container = ui.column().classes('w-full')
@@ -2952,7 +3144,8 @@ class TransactionsTab:
                     'is_waiting': txn.status == TransactionStatus.WAITING,  # Track WAITING status
                     'is_closing': txn.status == TransactionStatus.CLOSING,  # Track CLOSING status
                     'orders': orders_data,  # Add orders for expansion
-                    'order_count': len(orders_data)  # Show order count
+                    'order_count': len(orders_data),  # Show order count
+                    '_selected': txn.id in self.selected_transactions  # Track selection state
                 }
                 rows.append(row)
             
@@ -2977,6 +3170,7 @@ class TransactionsTab:
         
         # Table columns
         columns = [
+            {'name': 'select', 'label': '', 'field': 'select', 'align': 'left'},  # Selection checkbox
             {'name': 'expand', 'label': '', 'field': 'expand', 'align': 'left'},  # Expand column
             {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left', 'sortable': True},
             {'name': 'expert', 'label': 'Expert', 'field': 'expert', 'align': 'left', 'sortable': True},
@@ -3007,7 +3201,17 @@ class TransactionsTab:
         # Add Quasar table props for expansion
         self.transactions_table.props('flat bordered')
         
-        # Add expand button in first column
+        # Add select checkbox in first column
+        self.transactions_table.add_slot('body-cell-select', '''
+            <q-td :props="props">
+                <q-checkbox
+                    :model-value="props.row._selected"
+                    @update:model-value="$parent.$emit('toggle_transaction_select', props.row.id)"
+                />
+            </q-td>
+        ''')
+        
+        # Add expand button in second column
         self.transactions_table.add_slot('body-cell-expand', '''
             <q-td :props="props">
                 <q-btn
@@ -3025,7 +3229,13 @@ class TransactionsTab:
         self.transactions_table.add_slot('body', '''
                 <q-tr :props="props">
                     <q-td v-for="col in props.cols" :key="col.name" :props="props">
-                        <template v-if="col.name === 'expand'">
+                        <template v-if="col.name === 'select'">
+                            <q-checkbox
+                                :model-value="props.row._selected"
+                                @update:model-value="$parent.$emit('toggle_transaction_select', props.row.id)"
+                            />
+                        </template>
+                        <template v-else-if="col.name === 'expand'">
                             <q-btn
                                 size="sm"
                                 color="primary"
@@ -3153,6 +3363,7 @@ class TransactionsTab:
         self.transactions_table.on('close_transaction', self._show_close_dialog)
         self.transactions_table.on('retry_close_transaction', self._show_retry_close_dialog)
         self.transactions_table.on('view_recommendation', self._show_recommendation_dialog)
+        self.transactions_table.on('toggle_transaction_select', self._toggle_transaction_select)
         logger.debug("[RENDER] _render_transactions_table() - END (success)")
     
     def _show_edit_dialog(self, event_data):
@@ -3610,6 +3821,325 @@ class TransactionsTab:
                 ui.button('Close', on_click=dialog.close).props('flat color=primary')
         
         dialog.open()
+    
+    def _toggle_transaction_select(self, event_data):
+        """Toggle selection state for a transaction."""
+        # Event data comes as (transaction_id,) tuple from Vue emit
+        transaction_id = event_data.args[0] if hasattr(event_data, 'args') and event_data.args else None
+        
+        if not transaction_id:
+            return
+        
+        if transaction_id in self.selected_transactions:
+            del self.selected_transactions[transaction_id]
+        else:
+            self.selected_transactions[transaction_id] = True
+        
+        # Update button visibility
+        self._update_batch_buttons()
+        
+        # Refresh table to update checkboxes
+        self._refresh_transactions()
+    
+    def _select_all_transactions(self):
+        """Select all visible transactions."""
+        rows = self._get_transactions_data()
+        if rows:
+            for row in rows:
+                self.selected_transactions[row['id']] = True
+        
+        self._update_batch_buttons()
+        self._refresh_transactions()
+    
+    def _clear_selected_transactions(self):
+        """Clear all selected transactions."""
+        self.selected_transactions.clear()
+        self._update_batch_buttons()
+        self._refresh_transactions()
+    
+    def _update_batch_buttons(self):
+        """Show/hide batch operation buttons based on selection."""
+        if not hasattr(self, 'batch_close_btn'):
+            return
+        
+        has_selection = len(self.selected_transactions) > 0
+        
+        self.batch_select_all_btn.set_visibility(True)
+        self.batch_clear_btn.set_visibility(has_selection)
+        self.batch_close_btn.set_visibility(has_selection)
+        self.batch_adjust_tp_btn.set_visibility(has_selection)
+    
+    def _batch_close_transactions(self):
+        """Show confirmation dialog and close all selected transactions."""
+        if not self.selected_transactions:
+            ui.notify('No transactions selected', type='warning')
+            return
+        
+        count = len(self.selected_transactions)
+        
+        with ui.dialog() as dialog, ui.card().classes('w-full max-w-sm'):
+            ui.label('Confirm Batch Close').classes('text-h6 mb-4')
+            
+            ui.label(f'Are you sure you want to close {count} transaction{"s" if count != 1 else ""}?').classes('text-body1 mb-4')
+            ui.label('This action cannot be undone.').classes('text-caption text-red-700 mb-4')
+            
+            with ui.row().classes('w-full justify-end gap-2'):
+                ui.button('Cancel', on_click=dialog.close).props('flat')
+                ui.button('Confirm Close', on_click=lambda: self._execute_batch_close(dialog)).props('color=negative')
+        
+        dialog.open()
+    
+    def _execute_batch_close(self, dialog):
+        """Execute batch close operation (async, non-blocking)."""
+        dialog.close()
+        
+        transaction_ids = list(self.selected_transactions.keys())
+        if not transaction_ids:
+            ui.notify('No transactions selected', type='warning')
+            return
+        
+        # Capture context for background task
+        from nicegui import context, background_tasks
+        client = context.client
+        
+        async def batch_close_async():
+            """Async batch close operation."""
+            try:
+                from ...core.db import get_instance
+                from ...core.models import Transaction
+                from ...core.utils import get_account_instance_from_id
+                
+                success_count = 0
+                failed = []
+                
+                for txn_id in transaction_ids:
+                    try:
+                        txn = get_instance(Transaction, txn_id)
+                        if not txn:
+                            failed.append(txn_id)
+                            continue
+                        
+                        # Get account and close transaction
+                        account = get_account_instance_from_id(txn.account_id) if hasattr(txn, 'account_id') else None
+                        if account and hasattr(account, 'close_transaction_async'):
+                            result = await account.close_transaction_async(txn_id)
+                            if result.get('success'):
+                                success_count += 1
+                                logger.info(f"Batch close transaction {txn_id}: {result.get('message')}")
+                            else:
+                                failed.append(txn_id)
+                                logger.warning(f"Batch close transaction {txn_id} failed: {result.get('message')}")
+                        else:
+                            failed.append(txn_id)
+                            logger.warning(f"Cannot close transaction {txn_id}: no account found")
+                    except Exception as e:
+                        logger.error(f"Error closing transaction {txn_id}: {e}")
+                        failed.append(txn_id)
+                
+                # Schedule UI update
+                def show_result():
+                    if failed:
+                        ui.notify(
+                            f'Closed {success_count}/{len(transaction_ids)} transactions. {len(failed)} failed.',
+                            type='warning'
+                        )
+                    else:
+                        ui.notify(
+                            f'Successfully closed {success_count} transaction{"s" if success_count != 1 else ""}',
+                            type='positive'
+                        )
+                    self.selected_transactions.clear()
+                    self._update_batch_buttons()
+                    self._refresh_transactions()
+                
+                client.safe_invoke(show_result)
+                
+            except Exception as e:
+                def show_error():
+                    ui.notify(f'Error during batch close: {str(e)}', type='negative')
+                client.safe_invoke(show_error)
+                logger.error(f"Error in batch_close_async: {e}", exc_info=True)
+        
+        # Run async operation in background
+        background_tasks.create(batch_close_async(), name=f'batch_close_{len(transaction_ids)}_txns')
+        ui.notify(f'Closing {len(transaction_ids)} transaction{"s" if len(transaction_ids) != 1 else ""}...', type='info')
+    
+    def _batch_adjust_tp_dialog(self):
+        """Show dialog to set TP percentage for batch of transactions."""
+        if not self.selected_transactions:
+            ui.notify('No transactions selected', type='warning')
+            return
+        
+        count = len(self.selected_transactions)
+        
+        with ui.dialog() as dialog, ui.card().classes('w-full max-w-sm'):
+            ui.label('Batch Adjust Take Profit').classes('text-h6 mb-4')
+            
+            ui.label(f'Set TP for {count} transaction{"s" if count != 1 else ""}').classes('text-body2 mb-4')
+            
+            tp_percent_input = ui.number(
+                label='TP % from Open Price',
+                value=5.0,
+                min=0.1,
+                max=100.0,
+                step=0.1,
+                format='%.1f'
+            ).classes('w-full mb-4')
+            
+            ui.label('Example: 5.0% means TP = Open Price × 1.05').classes('text-caption text-grey-7')
+            
+            with ui.row().classes('w-full justify-end gap-2 mt-4'):
+                ui.button('Cancel', on_click=dialog.close).props('flat')
+                ui.button('Apply', on_click=lambda: self._execute_batch_adjust_tp(tp_percent_input.value, dialog)).props('color=info')
+        
+        dialog.open()
+    
+    def _execute_batch_adjust_tp(self, tp_percent: float, dialog):
+        """Execute batch TP adjustment (async, non-blocking)."""
+        dialog.close()
+        
+        transaction_ids = list(self.selected_transactions.keys())
+        if not transaction_ids:
+            ui.notify('No transactions selected', type='warning')
+            return
+        
+        # Capture context for background task
+        from nicegui import context, background_tasks
+        client = context.client
+        
+        async def batch_adjust_tp_async():
+            """Async batch TP adjustment."""
+            try:
+                from ...core.db import get_instance, update_instance
+                from ...core.models import Transaction, TradingOrder
+                from ...core.types import OrderType, OrderDirection
+                from ...core.utils import get_account_instance_from_id
+                from sqlmodel import Session, select
+                
+                success_count = 0
+                failed = []
+                existing_tp_modified = []
+                new_tp_created = []
+                
+                for txn_id in transaction_ids:
+                    try:
+                        txn = get_instance(Transaction, txn_id)
+                        if not txn or not txn.open_price or txn.open_price <= 0:
+                            failed.append(txn_id)
+                            continue
+                        
+                        # Calculate new TP price
+                        new_tp_price = txn.open_price * (1 + tp_percent / 100)
+                        
+                        # Get account for order operations
+                        # Note: Assuming Transaction has account_id or can be derived from expert
+                        account = None
+                        if hasattr(txn, 'account_id') and txn.account_id:
+                            account = get_account_instance_from_id(txn.account_id)
+                        
+                        if not account:
+                            logger.warning(f"Cannot adjust TP for transaction {txn_id}: no account found")
+                            failed.append(txn_id)
+                            continue
+                        
+                        # Check if existing TP order exists
+                        session = get_db()
+                        existing_tp_order = None
+                        try:
+                            statement = select(TradingOrder).where(
+                                TradingOrder.transaction_id == txn_id,
+                                TradingOrder.type == OrderType.LIMIT,
+                                TradingOrder.side == (OrderDirection.SELL if txn.get_current_open_qty() > 0 else OrderDirection.BUY)
+                            )
+                            results = session.exec(statement).all()
+                            # Find the TP order (typically a SELL limit for long positions)
+                            for order in results:
+                                if order.limit_price and order.limit_price > txn.open_price:
+                                    existing_tp_order = order
+                                    break
+                        except Exception as e:
+                            logger.debug(f"Could not check for existing TP order: {e}")
+                        finally:
+                            session.close()
+                        
+                        if existing_tp_order:
+                            # Modify existing TP order using Alpaca modify_order
+                            logger.info(f"Modifying existing TP order {existing_tp_order.alpaca_order_id} for transaction {txn_id}")
+                            try:
+                                from ...core.models import TradingOrder as TO
+                                
+                                # Create modified trading order with new limit price
+                                modified_order = TO(
+                                    symbol=txn.symbol,
+                                    quantity=existing_tp_order.quantity,
+                                    side=existing_tp_order.side,
+                                    type=OrderType.LIMIT,
+                                    limit_price=new_tp_price,
+                                    good_for=existing_tp_order.good_for or 'day'
+                                )
+                                
+                                # Use account's modify_order method
+                                result = account.modify_order(existing_tp_order.alpaca_order_id, modified_order)
+                                if result:
+                                    existing_tp_order.limit_price = new_tp_price
+                                    update_instance(existing_tp_order)
+                                    success_count += 1
+                                    existing_tp_modified.append(txn_id)
+                                    logger.info(f"Successfully modified TP for transaction {txn_id}")
+                                else:
+                                    failed.append(txn_id)
+                                    logger.error(f"Failed to modify TP order for transaction {txn_id}")
+                            except Exception as e:
+                                logger.error(f"Error modifying TP order for transaction {txn_id}: {e}")
+                                failed.append(txn_id)
+                        else:
+                            # No existing TP order - just update the transaction TP field
+                            logger.info(f"Creating/updating TP for transaction {txn_id} to ${new_tp_price:.2f}")
+                            try:
+                                txn.take_profit = new_tp_price
+                                update_instance(txn)
+                                success_count += 1
+                                new_tp_created.append(txn_id)
+                                logger.info(f"Successfully updated TP for transaction {txn_id}")
+                            except Exception as e:
+                                logger.error(f"Error updating TP for transaction {txn_id}: {e}")
+                                failed.append(txn_id)
+                    
+                    except Exception as e:
+                        logger.error(f"Error processing transaction {txn_id}: {e}")
+                        failed.append(txn_id)
+                
+                # Schedule UI update with detailed results
+                def show_result():
+                    msg_parts = [f'Updated {success_count}/{len(transaction_ids)} transactions']
+                    if existing_tp_modified:
+                        msg_parts.append(f'{len(existing_tp_modified)} modified existing orders')
+                    if new_tp_created:
+                        msg_parts.append(f'{len(new_tp_created)} created new TPs')
+                    
+                    message = ' • '.join(msg_parts)
+                    
+                    if failed:
+                        message += f' • {len(failed)} failed'
+                        ui.notify(message, type='warning')
+                    else:
+                        ui.notify(message + f' (+{tp_percent:.1f}%)', type='positive')
+                    
+                    self.selected_transactions.clear()
+                    self._update_batch_buttons()
+                    self._refresh_transactions()
+                
+                client.safe_invoke(show_result)
+                
+            except Exception as e:
+                def show_error():
+                    ui.notify(f'Error during batch TP adjustment: {str(e)}', type='negative')
+                client.safe_invoke(show_error)
+                logger.error(f"Error in batch_adjust_tp_async: {e}", exc_info=True)
+        
+        # Run async operation in background
+        background_tasks.create(batch_adjust_tp_async(), name=f'batch_adjust_tp_{len(transaction_ids)}_txns')
+        ui.notify(f'Adjusting TP for {len(transaction_ids)} transaction{"s" if len(transaction_ids) != 1 else ""}...', type='info')
 
 class PerformanceTab:
     """Performance analytics tab showing comprehensive trading metrics."""

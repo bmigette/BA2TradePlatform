@@ -89,8 +89,8 @@ class BalanceUsagePerExpertChart:
                         logger.warning(f"Expert instance {transaction.expert_id} not found for transaction {transaction.id}")
                         continue
                     
-                    # Create unique expert name
-                    expert_name = f"{expert.expert} (ID: {expert.id})"
+                    # Create unique expert name using alias or expert type with ID
+                    expert_name = f"{expert.alias or expert.expert}-{expert.id}"
                     
                     # Initialize expert entry if not exists
                     if expert_name not in balance_usage:

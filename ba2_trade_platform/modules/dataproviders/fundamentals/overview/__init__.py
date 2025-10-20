@@ -10,11 +10,13 @@ Available Providers:
 """
 
 from .AlphaVantageCompanyOverviewProvider import AlphaVantageCompanyOverviewProvider
-from .OpenAICompanyOverviewProvider import OpenAICompanyOverviewProvider
+from .AICompanyOverviewProvider import AICompanyOverviewProvider
+from .OpenAICompanyOverviewProvider import OpenAICompanyOverviewProvider  # Legacy - deprecated
 from .FMPCompanyOverviewProvider import FMPCompanyOverviewProvider
 
 __all__ = [
     "AlphaVantageCompanyOverviewProvider",
-    "OpenAICompanyOverviewProvider",
+    "AICompanyOverviewProvider",
+    "OpenAICompanyOverviewProvider",  # Legacy - deprecated
     "FMPCompanyOverviewProvider",
 ]

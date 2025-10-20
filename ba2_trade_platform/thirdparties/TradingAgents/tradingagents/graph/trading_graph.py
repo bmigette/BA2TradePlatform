@@ -56,7 +56,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             market_analysis_id: Existing MarketAnalysis ID to use (prevents creating a new one)
             expert_instance_id: Expert instance ID for persistent memory storage
             provider_map: BA2 provider map for data access (required for new toolkit)
-            provider_args: Optional arguments for provider instantiation (e.g., {"openai_model": "gpt-5"})
+            provider_args: Optional arguments for provider instantiation (e.g., {"websearch_model": "gpt-5"})
         """
         super().__init__()
         self.debug = debug
@@ -97,8 +97,10 @@ class TradingAgentsGraph(DatabaseStorageMixin):
 
         # Initialize LLMs
         if self.config["llm_provider"].lower() == "openai" or self.config["llm_provider"] == "ollama" or self.config["llm_provider"] == "openrouter":
-            from ..dataflows.config import get_openai_api_key
-            api_key = get_openai_api_key()
+            from ..dataflows.config import get_api_key_from_database
+            # Get API key based on the provider (defaults to openai_api_key for backward compatibility)
+            api_key_setting = self.config.get("api_key_setting", "openai_api_key")
+            api_key = get_api_key_from_database(api_key_setting)
             self.deep_thinking_llm = ChatOpenAI(model=self.config["deep_think_llm"], base_url=self.config["backend_url"], api_key=api_key)
             self.quick_thinking_llm = ChatOpenAI(model=self.config["quick_think_llm"], base_url=self.config["backend_url"], api_key=api_key)
         elif self.config["llm_provider"].lower() == "anthropic":
@@ -302,6 +304,11 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         from ..db_storage import LoggingToolNode
         from langchain_core.tools import tool
         
+        # Extract model info from provider_args if available
+        model_info = None
+        if self.provider_args and 'websearch_model' in self.provider_args:
+            model_info = self.provider_args['websearch_model']
+        
         # Wrap toolkit methods with @tool decorator for LangChain compatibility
         # This creates proper Tool objects from instance methods
         
@@ -431,19 +438,22 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                     get_ohlcv_data,
                     get_indicator_data,
                 ],
-                self.market_analysis_id
+                self.market_analysis_id,
+                model_info=model_info
             ),
             "social": LoggingToolNode(
                 [
                     get_social_media_sentiment,  # For social media sentiment and discussions
                 ],
-                self.market_analysis_id
+                self.market_analysis_id,
+                model_info=model_info
             ),
             "news": LoggingToolNode(
                 [
                     get_global_news,  # For global/macro news
                 ],
-                self.market_analysis_id
+                self.market_analysis_id,
+                model_info=model_info
             ),
             "fundamentals": LoggingToolNode(
                 [
@@ -453,7 +463,8 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                     get_insider_transactions,
                     get_insider_sentiment,
                 ],
-                self.market_analysis_id
+                self.market_analysis_id,
+                model_info=model_info
             ),
             "macro": LoggingToolNode(
                 [
@@ -461,7 +472,8 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                     get_yield_curve,
                     get_fed_calendar,
                 ],
-                self.market_analysis_id
+                self.market_analysis_id,
+                model_info=model_info
             ),
         }
 

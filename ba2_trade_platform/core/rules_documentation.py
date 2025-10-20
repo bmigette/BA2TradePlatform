@@ -228,7 +228,7 @@ def get_action_type_documentation() -> dict:
     """
     return {
         ExpertActionType.SELL.value: {
-            "name": "SELL",
+            "name": "Bearish (Sell)",
             "description": "Create a SELL order for the symbol. Can be used to open a short position or close a long position.",
             "use_cases": [
                 "Enter a short position when bearish signals detected",
@@ -239,7 +239,7 @@ def get_action_type_documentation() -> dict:
             "example": "When rating changes to NEGATIVE and confidence > 70%, action: SELL"
         },
         ExpertActionType.BUY.value: {
-            "name": "BUY",
+            "name": "Bullish (Buy)",
             "description": "Create a BUY order for the symbol. Can be used to open a long position or close a short position.",
             "use_cases": [
                 "Enter a long position when bullish signals detected",

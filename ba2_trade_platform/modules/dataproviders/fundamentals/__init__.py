@@ -14,12 +14,18 @@ Available Providers:
 - FMPCompanyDetailsProvider: Financial statements from Financial Modeling Prep
 """
 
-from .overview import AlphaVantageCompanyOverviewProvider, OpenAICompanyOverviewProvider, FMPCompanyOverviewProvider
+from .overview import (
+    AlphaVantageCompanyOverviewProvider, 
+    AICompanyOverviewProvider,
+    OpenAICompanyOverviewProvider,  # Legacy - deprecated
+    FMPCompanyOverviewProvider
+)
 from .details import AlphaVantageCompanyDetailsProvider, YFinanceCompanyDetailsProvider, FMPCompanyDetailsProvider
 
 __all__ = [
     "AlphaVantageCompanyOverviewProvider",
-    "OpenAICompanyOverviewProvider",
+    "AICompanyOverviewProvider",
+    "OpenAICompanyOverviewProvider",  # Legacy - deprecated
     "FMPCompanyOverviewProvider",
     "AlphaVantageCompanyDetailsProvider",
     "YFinanceCompanyDetailsProvider",

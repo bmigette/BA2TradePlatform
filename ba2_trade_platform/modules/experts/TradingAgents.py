@@ -6,7 +6,7 @@ from ...core.interfaces import MarketExpertInterface
 from ...core.models import ExpertInstance, MarketAnalysis, AnalysisOutput, ExpertRecommendation
 from ...core.db import get_db, get_instance, update_instance, add_instance
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, RiskLevel, TimeHorizon, AnalysisUseCase
-from ...logger import logger
+from ...logger import get_expert_logger
 from ...thirdparties.TradingAgents.tradingagents.graph.trading_graph import TradingAgentsGraph
 from ...thirdparties.TradingAgents.tradingagents.default_config import DEFAULT_CONFIG
 from ...thirdparties.TradingAgents.tradingagents.db_storage import update_market_analysis_status
@@ -34,26 +34,80 @@ class TradingAgents(MarketExpertInterface):
     def __init__(self, id: int):
         """Initialize TradingAgents expert with database instance."""
         super().__init__(id)
-        #logger.debug(f'Initializing TradingAgents expert with instance ID: {id}')
         
         self._setup_api_keys()
         self._load_expert_instance(id)
+        
+        # Initialize expert-specific logger
+        self.logger = get_expert_logger("TradingAgents", id)
     
     def _setup_api_keys(self) -> None:
         """Setup API keys from database configuration."""
         try:
             from ...thirdparties.TradingAgents.tradingagents.dataflows.config import set_environment_variables_from_database
             set_environment_variables_from_database()
-            #logger.debug("API keys loaded from database")
         except Exception as e:
-            logger.warning(f"Could not load API keys from database: {e}")
+            # Logger not initialized yet, will log in __init__ after logger is set up
+            self._api_key_error = str(e)
     
     def _load_expert_instance(self, id: int) -> None:
         """Load and validate expert instance from database."""
         self.instance = get_instance(ExpertInstance, id)
         if not self.instance:
             raise ValueError(f"ExpertInstance with ID {id} not found")
-        #logger.debug(f'TradingAgents expert loaded: {self.instance.expert}')
+        
+        # Log API key setup error if it occurred
+        if hasattr(self, '_api_key_error'):
+            self.logger.warning(f"Could not load API keys from database: {self._api_key_error}")
+    
+    @staticmethod
+    def _parse_model_config(model_string: str) -> Dict[str, str]:
+        """
+        Parse model string to extract provider and model name.
+        
+        Format: Provider/ModelName (e.g., "OpenAI/gpt-5-mini" or "NagaAI/grok-4")
+        
+        Returns:
+            dict with keys: 'provider', 'model', 'base_url', 'api_key_setting'
+        """
+        from ...core.db import get_setting
+        
+        # Handle legacy format (no provider prefix)
+        if '/' not in model_string:
+            # Default to OpenAI for backward compatibility
+            return {
+                'provider': 'OpenAI',
+                'model': model_string,
+                'base_url': 'https://api.openai.com/v1',
+                'api_key_setting': 'openai_api_key'
+            }
+        
+        # Parse Provider/Model format
+        provider, model = model_string.split('/', 1)
+        
+        if provider == 'OpenAI':
+            return {
+                'provider': 'OpenAI',
+                'model': model,
+                'base_url': 'https://api.openai.com/v1',
+                'api_key_setting': 'openai_api_key'
+            }
+        elif provider == 'NagaAI':
+            return {
+                'provider': 'NagaAI',
+                'model': model,
+                'base_url': 'https://api.naga.ac/v1',
+                'api_key_setting': 'naga_ai_api_key'
+            }
+        else:
+            # Unknown provider, default to OpenAI and use just the model name
+            # Note: Cannot log warning here as this is a static method
+            return {
+                'provider': 'OpenAI',
+                'model': model,  # Use just the model part, not the full string
+                'base_url': 'https://api.openai.com/v1',
+                'api_key_setting': 'openai_api_key'
+            }
     
     @classmethod
     def get_settings_definitions(cls) -> Dict[str, Any]:
@@ -77,26 +131,141 @@ class TradingAgents(MarketExpertInterface):
                 "tooltip": "The time interval used for technical analysis charts and indicators. Shorter timeframes (1m, 5m) are for day trading, medium (1h, 4h, 1d) for swing trading, longer (1wk, 1mo) for position trading."
             },
             
-            # LLM Models
+            # LLM Models (Format: Provider/ModelName - e.g., OpenAI/gpt-4o-mini or NagaAI/gemini-2.5-flash:free)
             "deep_think_llm": {
-                "type": "str", "required": True, "default": "gpt-5-mini",
+                "type": "str", "required": True, "default": "OpenAI/gpt-4o-mini",
                 "description": "LLM model for complex reasoning and deep analysis",
-                "valid_values": ["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "o4-mini"],
-                "tooltip": "The AI model used for in-depth analysis requiring complex reasoning, such as fundamental analysis and debate arbitration. Higher-tier models (gpt-5) provide better insights but cost more. Mini/nano variants balance cost and performance."
+                "valid_values": [
+                    # OpenAI models (direct) - Legacy + New models
+                    "OpenAI/gpt-4o", "OpenAI/gpt-4o-mini",
+                    "OpenAI/gpt-5", "OpenAI/gpt-5-mini", "OpenAI/gpt-5-nano",
+                    "OpenAI/gpt-4.1", "OpenAI/gpt-4.1-mini", "OpenAI/gpt-4.1-nano",
+                    "OpenAI/o1", "OpenAI/o1-mini", "OpenAI/o3-mini",
+                    "OpenAI/o4-mini", "OpenAI/o4-mini-deep-research",
+                    # GPT-5 (latest via Naga AI)
+                    "NagaAI/gpt-5-2025-08-07",
+                    "NagaAI/gpt-5-mini-2025-08-07",
+                    "NagaAI/gpt-5-mini-2025-08-07:free",
+                    "NagaAI/gpt-5-nano-2025-08-07",
+                    "NagaAI/gpt-5-chat-latest",
+                    "NagaAI/gpt-5-codex",
+                    # GPT-4 (latest via Naga AI)
+                    "NagaAI/gpt-4o-2024-11-20",
+                    "NagaAI/gpt-4o-2024-11-20:free",
+                    "NagaAI/gpt-4.1-2025-04-14",
+                    "NagaAI/gpt-4.1-mini-2025-04-14",
+                    "NagaAI/gpt-4.1-mini-2025-04-14:free",
+                    "NagaAI/gpt-4.1-nano-2025-04-14",
+                    # OpenAI O1/O3/O4 reasoning models (latest)
+                    "NagaAI/o1-2024-12-17",
+                    "NagaAI/o3-2025-04-16",
+                    "NagaAI/o3-mini-2025-01-31",
+                    "NagaAI/o4-2025-04-16",
+                    "NagaAI/o4-mini-2025-04-16",
+                    # Grok (latest from X-AI)
+                    "NagaAI/grok-4-0709",
+                    "NagaAI/grok-4-fast-non-reasoning",
+                    "NagaAI/grok-4-fast-reasoning",
+                    "NagaAI/grok-3",
+                    "NagaAI/grok-3-mini",
+                    # Gemini (latest from Google)
+                    "NagaAI/gemini-2.5-flash",
+                    "NagaAI/gemini-2.5-flash:free",
+                    "NagaAI/gemini-2.5-pro",
+                    "NagaAI/gemini-2.0-flash-001",
+                    "NagaAI/gemini-2.0-flash-001:free",
+                    "NagaAI/gemini-2.0-flash-lite-001",
+                    # DeepSeek (latest)
+                    "NagaAI/deepseek-v3.2-exp",
+                    "NagaAI/deepseek-v3.2-exp:free",
+                    "NagaAI/deepseek-chat-v3.1",
+                    "NagaAI/deepseek-chat-v3.1:free",
+                    "NagaAI/deepseek-reasoner-0528",
+                    "NagaAI/deepseek-reasoner-0528:free",
+                ],
+                "allow_custom": True,  # Allow users to enter custom model names not in the list
+                "tooltip": "The AI model used for in-depth analysis requiring complex reasoning, such as fundamental analysis and debate arbitration. Format: Provider/ModelName. OpenAI models provide proven performance. Naga AI provides access to multiple frontier models including GPT-5, GPT-4, O1/O3, Grok-4, Gemini 2.5, and DeepSeek v3 with free tier available. You can also enter custom model names."
             },
             "quick_think_llm": {
-                "type": "str", "required": True, "default": "gpt-5-mini",
+                "type": "str", "required": True, "default": "OpenAI/gpt-4o-mini",
                 "description": "LLM model for quick analysis and real-time decisions",
-                "valid_values": ["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "o4-mini", "o4-mini-deep-research"],
-                "help": "For more information on available models, see [OpenAI Models Documentation](https://platform.openai.com/docs/models)",
-                "tooltip": "The AI model used for faster analysis tasks like technical indicators and quick data summarization. Nano/mini models are cost-effective for these simpler tasks. The o4-mini-deep-research variant provides enhanced analytical capabilities."
+                "valid_values": [
+                    # OpenAI models (direct) - Legacy + New models
+                    "OpenAI/gpt-4o", "OpenAI/gpt-4o-mini",
+                    "OpenAI/gpt-5", "OpenAI/gpt-5-mini", "OpenAI/gpt-5-nano",
+                    "OpenAI/gpt-4.1", "OpenAI/gpt-4.1-mini", "OpenAI/gpt-4.1-nano",
+                    "OpenAI/o1-mini", "OpenAI/o3-mini",
+                    "OpenAI/o4-mini", "OpenAI/o4-mini-deep-research",
+                    # GPT-5 mini/nano (latest, fast)
+                    "NagaAI/gpt-5-mini-2025-08-07",
+                    "NagaAI/gpt-5-mini-2025-08-07:free",
+                    "NagaAI/gpt-5-nano-2025-08-07",
+                    # GPT-4 mini/nano (latest, fast)
+                    "NagaAI/gpt-4o-mini-2024-07-18",
+                    "NagaAI/gpt-4o-mini-2024-07-18:free",
+                    "NagaAI/gpt-4.1-mini-2025-04-14",
+                    "NagaAI/gpt-4.1-mini-2025-04-14:free",
+                    "NagaAI/gpt-4.1-nano-2025-04-14",
+                    # O-series mini (reasoning, fast)
+                    "NagaAI/o3-mini-2025-01-31",
+                    "NagaAI/o4-mini-2025-04-16",
+                    # Grok mini (fast)
+                    "NagaAI/grok-3-mini",
+                    "NagaAI/grok-4-fast-non-reasoning",
+                    "NagaAI/grok-4-fast-reasoning",
+                    "NagaAI/grok-4-0709",
+                    # Gemini flash (fast, latest)
+                    "NagaAI/gemini-2.5-flash",
+                    "NagaAI/gemini-2.5-flash:free",
+                    "NagaAI/gemini-2.0-flash-001",
+                    "NagaAI/gemini-2.0-flash-001:free",
+                    "NagaAI/gemini-2.0-flash-lite-001",
+                    # DeepSeek (fast)
+                    "NagaAI/deepseek-chat-v3.1",
+                    "NagaAI/deepseek-chat-v3.1:free",
+                    "NagaAI/deepseek-v3.2-exp",
+                    "NagaAI/deepseek-v3.2-exp:free",
+                ],
+                "allow_custom": True,  # Allow users to enter custom model names not in the list
+                "help": "For more information, see [OpenAI Models](https://platform.openai.com/docs/models) and [Naga AI Models](https://naga.ac/models)",
+                "tooltip": "The AI model used for faster analysis tasks like technical indicators and quick data summarization. Format: Provider/ModelName. Mini/nano/flash models are cost-effective for these simpler tasks. Includes GPT-5 nano, GPT-4 mini, Gemini flash, Grok mini, and DeepSeek with free tier options. You can also enter custom model names."
             },
-            "openai_provider_model": {
-                "type": "str", "required": True, "default": "gpt-5",
-                "description": "OpenAI model for data provider web searches",
-                "valid_values": ["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "o4-mini", "o4-mini-deep-research"],
-                "help": "For more information on available models, see [OpenAI Models Documentation](https://platform.openai.com/docs/models)",
-                "tooltip": "The OpenAI model used by OpenAI data providers (news, fundamentals) for web search and data gathering. Higher-tier models (gpt-5) provide better search results and data extraction. Use mini/nano for cost savings. This setting only affects OpenAI-based data providers."
+            "dataprovider_websearch_model": {
+                "type": "str", "required": True, "default": "OpenAI/gpt-4o",
+                "description": "Model for data provider web searches",
+                "valid_values": [
+                    # OpenAI GPT-5 (direct - best for search)
+                    "OpenAI/gpt-5", "OpenAI/gpt-5-mini", "OpenAI/gpt-5-nano",
+                    # NagaAI GPT-5 (latest, excellent search)
+                    "NagaAI/gpt-5-2025-08-07",
+                    "NagaAI/gpt-5-mini-2025-08-07",
+                    "NagaAI/gpt-5-chat-latest",
+                    "NagaAI/gpt-5-codex",
+                    # NagaAI GPT-4o Search (optimized for web search)
+                    "NagaAI/gpt-4o-search-preview-2025-03-11",
+                    # NagaAI Grok-4 (excellent for real-time search with X integration)
+                    "NagaAI/grok-4-0709",
+                    "NagaAI/grok-4-fast-non-reasoning",
+                    "NagaAI/grok-4-fast-reasoning",
+                ],
+                "allow_custom": True,  # Allow users to enter custom model names not in the list
+                "help": "For more information, see [OpenAI Docs](https://platform.openai.com/docs/models) and [Naga AI Web Search](https://docs.naga.ac/features/web-search)",
+                "tooltip": "The model used by data providers (news, fundamentals) for web search and data gathering. Format: Provider/ModelName. Optimized for search: GPT-5 (best general search), GPT-4o-search (web-optimized), Grok-4 (real-time with X/Twitter integration). You can also enter custom model names."
+            },
+            "embedding_model": {
+                "type": "str", "required": True, "default": "OpenAI/text-embedding-3-small",
+                "description": "Model for generating embeddings for memories/vector storage",
+                "valid_values": [
+                    # OpenAI embeddings (direct)
+                    "OpenAI/text-embedding-3-small",
+                    "OpenAI/text-embedding-3-large",
+                    # NagaAI embeddings (same models via Naga AI)
+                    "NagaAI/text-embedding-3-small",
+                    "NagaAI/text-embedding-3-large",
+                ],
+                "allow_custom": True,  # Allow users to enter custom embedding model names
+                "help": "For more information, see [OpenAI Embeddings](https://platform.openai.com/docs/guides/embeddings) and [Naga AI Embeddings](https://docs.naga.ac/models/embeddings)",
+                "tooltip": "The model used to generate embeddings for storing and retrieving memories in vector databases. Format: Provider/ModelName. text-embedding-3-small is faster and cheaper, text-embedding-3-large provides better accuracy. Both providers support the same models. You can also enter custom embedding model names."
             },
             
             # Data Lookback Periods
@@ -139,9 +308,9 @@ class TradingAgents(MarketExpertInterface):
             "vendor_fundamentals": {
                 "type": "list", "required": True, "default": ["alpha_vantage"],
                 "description": "Data vendor(s) for company fundamentals overview",
-                "valid_values": ["alpha_vantage", "openai", "fmp"],
+                "valid_values": ["alpha_vantage", "ai", "fmp"],
                 "multiple": True,
-                "tooltip": "Select one or more data providers for company overview and key metrics (market cap, P/E ratio, beta, industry, sector, etc.). Multiple vendors enable automatic fallback. Alpha Vantage provides comprehensive company overviews. OpenAI searches for latest company information. FMP provides detailed company profiles including valuation metrics and company information."
+                "tooltip": "Select one or more data providers for company overview and key metrics (market cap, P/E ratio, beta, industry, sector, etc.). Multiple vendors enable automatic fallback. Alpha Vantage provides comprehensive company overviews. AI uses OpenAI (direct) or NagaAI models for web search to gather latest company information. FMP provides detailed company profiles including valuation metrics and company information."
             },
             "vendor_fundamentals_details": {
                 "type": "list", "required": True, "default": ["yfinance"],
@@ -151,18 +320,18 @@ class TradingAgents(MarketExpertInterface):
                 "tooltip": "Select one or more data providers for detailed financial statements (balance sheet, cash flow statement, income statement). Multiple vendors enable automatic fallback. YFinance provides quarterly/annual data. FMP provides comprehensive financial data. Alpha Vantage offers similar data."
             },
             "vendor_news": {
-                "type": "list", "required": True, "default": ["openai", "alpaca"],
+                "type": "list", "required": True, "default": ["ai", "alpaca"],
                 "description": "Data vendor(s) for company news",
-                "valid_values": ["openai", "alpaca", "alpha_vantage", "fmp"],
+                "valid_values": ["ai", "alpaca", "alpha_vantage", "fmp", "finnhub"],
                 "multiple": True,
-                "tooltip": "Select one or more data providers for company news articles. Multiple vendors enable automatic fallback. OpenAI searches social media/news. Alpaca provides news from multiple sources. Alpha Vantage provides news sentiment API. FMP provides company-specific news articles."
+                "tooltip": "Select one or more data providers for company news articles. Multiple vendors enable automatic fallback. AI uses OpenAI (direct) or NagaAI models for web search across social media/news. Alpaca provides news from multiple sources. Alpha Vantage provides news sentiment API. FMP provides company-specific news articles. Finnhub provides comprehensive news from multiple financial sources."
             },
             "vendor_global_news": {
-                "type": "list", "required": True, "default": ["openai"],
+                "type": "list", "required": True, "default": ["ai"],
                 "description": "Data vendor(s) for global/macro news",
-                "valid_values": ["openai", "fmp"],
+                "valid_values": ["ai", "fmp", "finnhub"],
                 "multiple": True,
-                "tooltip": "Select one or more data providers for global macroeconomic news (interest rates, inflation, geopolitics, etc.). Multiple vendors enable automatic fallback. OpenAI searches web for latest news. FMP provides general market news."
+                "tooltip": "Select one or more data providers for global macroeconomic news (interest rates, inflation, geopolitics, etc.). Multiple vendors enable automatic fallback. AI uses OpenAI (direct) or NagaAI models for web search to find latest news. FMP provides general market news. Finnhub provides general market news from multiple financial sources."
             },
             "vendor_insider": {
                 "type": "list", "required": True, "default": ["fmp"],
@@ -172,11 +341,11 @@ class TradingAgents(MarketExpertInterface):
                 "tooltip": "Select one or more data providers for insider trading data. FMP provides both insider transactions (buys/sells by executives) and calculated sentiment scores from SEC filings."
             },
             "vendor_social_media": {
-                "type": "list", "required": True, "default": ["openai"],
+                "type": "list", "required": True, "default": ["ai"],
                 "description": "Data vendor(s) for social media sentiment analysis",
-                "valid_values": ["openai"],
+                "valid_values": ["ai"],
                 "multiple": True,
-                "tooltip": "Select one or more data providers for social media sentiment analysis. Crawls Twitter/X, Reddit, StockTwits, forums, and other public sources. OpenAI uses web search to analyze sentiment across multiple platforms."
+                "tooltip": "Select one or more data providers for social media sentiment analysis. Crawls Twitter/X, Reddit, StockTwits, forums, and other public sources. AI uses OpenAI (direct) or NagaAI models for web search to analyze sentiment across multiple platforms."
             },
             
             # Provider Configuration
@@ -273,12 +442,33 @@ class TradingAgents(MarketExpertInterface):
             'get_insider_transactions': _get_vendor_string('vendor_insider'),
         }
         
+        # Parse model configurations to extract provider and actual model names
+        deep_think_model_str = self.settings.get('deep_think_llm', settings_def['deep_think_llm']['default'])
+        quick_think_model_str = self.settings.get('quick_think_llm', settings_def['quick_think_llm']['default'])
+        embedding_model_str = self.settings.get('embedding_model', settings_def['embedding_model']['default'])
+        
+        deep_think_config = self._parse_model_config(deep_think_model_str)
+        quick_think_config = self._parse_model_config(quick_think_model_str)
+        embedding_config = self._parse_model_config(embedding_model_str)
+        
+        # Use the provider's base_url (they should match, but use deep_think as primary)
+        backend_url = deep_think_config['base_url']
+        
+        # Get the API key setting name for the primary provider
+        # This will be used by the graph to retrieve the correct API key
+        api_key_setting = deep_think_config['api_key_setting']
+        
         # Apply user settings with defaults from settings definitions
         config.update({
             'max_debate_rounds': max_debate_rounds,
             'max_risk_discuss_rounds': max_risk_discuss_rounds,
-            'deep_think_llm': self.settings.get('deep_think_llm', settings_def['deep_think_llm']['default']),
-            'quick_think_llm': self.settings.get('quick_think_llm', settings_def['quick_think_llm']['default']),
+            'deep_think_llm': deep_think_config['model'],  # Just the model name without provider prefix
+            'quick_think_llm': quick_think_config['model'],  # Just the model name without provider prefix
+            'backend_url': backend_url,  # Dynamic base URL based on provider
+            'api_key_setting': api_key_setting,  # Store which API key setting to use
+            'embedding_model': embedding_config['model'],  # Embedding model name
+            'embedding_backend_url': embedding_config['base_url'],  # Embedding endpoint
+            'embedding_api_key_setting': embedding_config['api_key_setting'],  # Embedding API key
             'news_lookback_days': int(self.settings.get('news_lookback_days', settings_def['news_lookback_days']['default'])),
             'market_history_days': int(self.settings.get('market_history_days', settings_def['market_history_days']['default'])),
             'economic_data_days': int(self.settings.get('economic_data_days', settings_def['economic_data_days']['default'])),
@@ -339,7 +529,7 @@ class TradingAgents(MarketExpertInterface):
             if vendor in NEWS_PROVIDERS:
                 provider_map['news'].append(NEWS_PROVIDERS[vendor])
             else:
-                logger.warning(f"News provider '{vendor}' not found in NEWS_PROVIDERS registry")
+                self.logger.warning(f"News provider '{vendor}' not found in NEWS_PROVIDERS registry")
         
         # Social media providers (aggregated)
         # Uses dedicated social media providers with sentiment analysis capabilities
@@ -349,7 +539,7 @@ class TradingAgents(MarketExpertInterface):
             if vendor in SOCIALMEDIA_PROVIDERS:
                 provider_map['social_media'].append(SOCIALMEDIA_PROVIDERS[vendor])
             else:
-                logger.warning(f"Social media provider '{vendor}' not found in SOCIALMEDIA_PROVIDERS registry")
+                self.logger.warning(f"Social media provider '{vendor}' not found in SOCIALMEDIA_PROVIDERS registry")
         
         # Global news uses same providers as company news
         # The toolkit will call get_global_news() on each provider
@@ -361,7 +551,7 @@ class TradingAgents(MarketExpertInterface):
             if vendor in INSIDER_PROVIDERS:
                 provider_map['insider'].append(INSIDER_PROVIDERS[vendor])
             else:
-                logger.warning(f"Insider provider '{vendor}' not found in INSIDER_PROVIDERS registry")
+                self.logger.warning(f"Insider provider '{vendor}' not found in INSIDER_PROVIDERS registry")
         
         # Macro providers (aggregated) - for economic indicators, yield curve, Fed calendar
         # Note: We don't have a vendor_macro setting yet, so we'll default to 'fred'
@@ -376,7 +566,7 @@ class TradingAgents(MarketExpertInterface):
             if vendor in FUNDAMENTALS_DETAILS_PROVIDERS:
                 provider_map['fundamentals_details'].append(FUNDAMENTALS_DETAILS_PROVIDERS[vendor])
             else:
-                logger.warning(f"Fundamentals details provider '{vendor}' not found in FUNDAMENTALS_DETAILS_PROVIDERS registry")
+                self.logger.warning(f"Fundamentals details provider '{vendor}' not found in FUNDAMENTALS_DETAILS_PROVIDERS registry")
         
         # Fundamentals overview providers (aggregated) - for company overview, key metrics
         # Use vendor_fundamentals setting (merged with old vendor_fundamentals_overview)
@@ -387,7 +577,7 @@ class TradingAgents(MarketExpertInterface):
             if vendor in FUNDAMENTALS_OVERVIEW_PROVIDERS:
                 provider_map['fundamentals_overview'].append(FUNDAMENTALS_OVERVIEW_PROVIDERS[vendor])
             else:
-                logger.warning(f"Fundamentals overview provider '{vendor}' not found in FUNDAMENTALS_OVERVIEW_PROVIDERS registry")
+                self.logger.warning(f"Fundamentals overview provider '{vendor}' not found in FUNDAMENTALS_OVERVIEW_PROVIDERS registry")
         
         # OHLCV providers (fallback) - tries first, then second, etc.
         ohlcv_vendors = _get_vendor_list('vendor_stock_data')
@@ -396,7 +586,7 @@ class TradingAgents(MarketExpertInterface):
             if vendor in OHLCV_PROVIDERS:
                 provider_map['ohlcv'].append(OHLCV_PROVIDERS[vendor])
             else:
-                logger.warning(f"OHLCV provider '{vendor}' not found in OHLCV_PROVIDERS registry")
+                self.logger.warning(f"OHLCV provider '{vendor}' not found in OHLCV_PROVIDERS registry")
         
         # Indicators providers (fallback) - tries first, then second, etc.
         indicator_vendors = _get_vendor_list('vendor_indicators')
@@ -405,9 +595,9 @@ class TradingAgents(MarketExpertInterface):
             if vendor in INDICATORS_PROVIDERS:
                 provider_map['indicators'].append(INDICATORS_PROVIDERS[vendor])
             else:
-                logger.warning(f"Indicators provider '{vendor}' not found in INDICATORS_PROVIDERS registry")
+                self.logger.warning(f"Indicators provider '{vendor}' not found in INDICATORS_PROVIDERS registry")
         
-        logger.debug(f"Built provider_map with {len(provider_map)} categories: {list(provider_map.keys())}")
+        self.logger.debug(f"Built provider_map with {len(provider_map)} categories: {list(provider_map.keys())}")
         return provider_map
     
     def _extract_recommendation_data(self, final_state: Dict, processed_signal: str, symbol: str) -> Dict[str, Any]:
@@ -427,13 +617,13 @@ class TradingAgents(MarketExpertInterface):
                         current_price = account.get_instrument_current_price(symbol)
                         if current_price and current_price > 0:
                             price_at_date = current_price
-                            logger.info(f"Fetched current market price for {symbol}: ${price_at_date:.2f} (price_at_date was missing from analysis)")
+                            self.logger.info(f"Fetched current market price for {symbol}: ${price_at_date:.2f} (price_at_date was missing from analysis)")
                         else:
-                            logger.warning(f"Could not fetch current price for {symbol}, price_at_date will be 0")
+                            self.logger.warning(f"Could not fetch current price for {symbol}, price_at_date will be 0")
                     else:
-                        logger.error(f"Could not get account instance for account_id {self.instance.account_id}")
+                        self.logger.error(f"Could not get account instance for account_id {self.instance.account_id}")
                 except Exception as e:
-                    logger.error(f"Error fetching current price for {symbol}: {e}")
+                    self.logger.error(f"Error fetching current price for {symbol}: {e}")
             
             return {
                 'signal': expert_recommendation.get('recommended_action', OrderRecommendation.ERROR),
@@ -454,13 +644,13 @@ class TradingAgents(MarketExpertInterface):
                     current_price = account.get_instrument_current_price(symbol)
                     if current_price and current_price > 0:
                         price_at_date = current_price
-                        logger.info(f"Fetched current market price for {symbol}: ${price_at_date:.2f} (fallback path)")
+                        self.logger.info(f"Fetched current market price for {symbol}: ${price_at_date:.2f} (fallback path)")
                     else:
-                        logger.warning(f"Could not fetch current price for {symbol} in fallback path")
+                        self.logger.warning(f"Could not fetch current price for {symbol} in fallback path")
                 else:
-                    logger.error(f"Could not get account instance for account_id {self.instance.account_id} in fallback path")
+                    self.logger.error(f"Could not get account instance for account_id {self.instance.account_id} in fallback path")
             except Exception as e:
-                logger.error(f"Error fetching current price for {symbol} in fallback path: {e}")
+                self.logger.error(f"Error fetching current price for {symbol} in fallback path: {e}")
             
             return {
                 'signal': processed_signal if processed_signal in ['BUY', 'SELL', 'HOLD'] else OrderRecommendation.ERROR,
@@ -490,12 +680,12 @@ class TradingAgents(MarketExpertInterface):
             )
             
             recommendation_id = add_instance(expert_recommendation)
-            logger.info(f"[SUCCESS] Created ExpertRecommendation (ID: {recommendation_id}) for {symbol}: "
+            self.logger.info(f"[SUCCESS] Created ExpertRecommendation (ID: {recommendation_id}) for {symbol}: "
                        f"{recommendation_data['signal']} with {recommendation_data['confidence']:.1f}% confidence")
             return recommendation_id
             
         except Exception as e:
-            logger.error(f"[ERROR] Failed to create ExpertRecommendation for {symbol}: {e}", exc_info=True)
+            self.logger.error(f"[ERROR] Failed to create ExpertRecommendation for {symbol}: {e}", exc_info=True)
             raise
     
     def _store_analysis_outputs(self, market_analysis_id: int, symbol: str, 
@@ -539,7 +729,7 @@ class TradingAgents(MarketExpertInterface):
             
         except Exception as e:
             session.rollback()
-            logger.error(f"Failed to store analysis outputs: {e}", exc_info=True)
+            self.logger.error(f"Failed to store analysis outputs: {e}", exc_info=True)
             raise
         finally:
             session.close()
@@ -576,7 +766,7 @@ Analysis completed at: {self._get_current_timestamp()}"""
             symbol: Financial instrument symbol to analyze
             market_analysis: MarketAnalysis instance to update with results
         """
-        logger.info(f"[START] Starting TradingAgents analysis for {symbol} (Analysis ID: {market_analysis.id})")
+        self.logger.info(f"[START] Starting TradingAgents analysis for {symbol} (Analysis ID: {market_analysis.id})")
         
         try:
             # Update status to running
@@ -607,14 +797,14 @@ Analysis completed at: {self._get_current_timestamp()}"""
             attributes.flag_modified(market_analysis, "state")
             update_instance(market_analysis)
 
-            logger.info(f"[COMPLETE] TradingAgents analysis completed for {symbol}: "
+            self.logger.info(f"[COMPLETE] TradingAgents analysis completed for {symbol}: "
                        f"{recommendation_data['signal']} ({recommendation_data['confidence']:.1f}% confidence)")
             
             # Trigger Trade Manager to process the recommendation (if automatic trading is enabled)
             self._notify_trade_manager(recommendation_id, symbol)
 
         except Exception as e:
-            logger.error(f"[FAILED] TradingAgents analysis failed for {symbol}: {e}", exc_info=True)
+            self.logger.error(f"[FAILED] TradingAgents analysis failed for {symbol}: {e}", exc_info=True)
             self._handle_analysis_error(market_analysis, symbol, str(e))
             raise
     
@@ -644,10 +834,10 @@ Analysis completed at: {self._get_current_timestamp()}"""
         
         # Ensure at least one analyst is selected
         if not selected_analysts:
-            logger.warning("No analysts selected! Defaulting to all analysts enabled.")
+            self.logger.warning("No analysts selected! Defaulting to all analysts enabled.")
             selected_analysts = ['market', 'social', 'news', 'fundamentals', 'macro']
         
-        logger.info(f"Selected analysts: {', '.join(selected_analysts)}")
+        self.logger.info(f"Selected analysts: {', '.join(selected_analysts)}")
         return selected_analysts
     
     def _execute_tradingagents_analysis(self, symbol: str, market_analysis_id: int, subtype: str) -> tuple:
@@ -660,20 +850,29 @@ Analysis completed at: {self._get_current_timestamp()}"""
         
         # Build provider_args for OpenAI and Alpha Vantage providers
         settings_def = self.get_settings_definitions()
-        openai_model = self.settings.get('openai_provider_model', settings_def['openai_provider_model']['default'])
+        
+        # Get dataprovider_websearch_model with backward compatibility for old setting name
+        websearch_model = self.settings.get('dataprovider_websearch_model')
+        if not websearch_model:
+            # Backward compatibility: check for old setting name
+            websearch_model = self.settings.get('openai_provider_model')
+        if not websearch_model:
+            # Use default value
+            websearch_model = settings_def['dataprovider_websearch_model']['default']
+        
         alpha_vantage_source = self.settings.get('alpha_vantage_source', settings_def['alpha_vantage_source']['default'])
         provider_args = {
-            'openai_model': openai_model,
+            'websearch_model': websearch_model,
             'alpha_vantage_source': alpha_vantage_source
         }
         
         # Log provider_map configuration
-        logger.info(f"=== TradingAgents Provider Configuration ===")
+        self.logger.info(f"=== TradingAgents Provider Configuration ===")
         for category, providers in provider_map.items():
             provider_names = [p.__name__ for p in providers] if providers else ["None"]
-            logger.info(f"  {category}: {', '.join(provider_names)}")
-        logger.info(f"  provider_args: {provider_args}")
-        logger.info(f"============================================")
+            self.logger.info(f"  {category}: {', '.join(provider_names)}")
+        self.logger.info(f"  provider_args: {provider_args}")
+        self.logger.info(f"============================================")
         
         # Initialize TradingAgents graph
         # Get debug mode from settings (defaults to True for detailed logging)
@@ -694,10 +893,10 @@ Analysis completed at: {self._get_current_timestamp()}"""
         
         # Run analysis
         trade_date = datetime.now().strftime("%Y-%m-%d")
-        logger.debug(f"Running TradingAgents propagation for {symbol} on {trade_date}")
+        self.logger.debug(f"Running TradingAgents propagation for {symbol} on {trade_date}")
         
         final_state, processed_signal = ta_graph.propagate(symbol, trade_date)
-        logger.debug(f"TradingAgents propagation completed for {symbol}")
+        self.logger.debug(f"TradingAgents propagation completed for {symbol}")
         
         return final_state, processed_signal
     
@@ -763,7 +962,7 @@ Analysis completed at: {self._get_current_timestamp()}"""
             session.commit()
             session.close()
         except Exception as db_error:
-            logger.error(f"Failed to store error output: {db_error}", exc_info=True)
+            self.logger.error(f"Failed to store error output: {db_error}", exc_info=True)
     
     def render_market_analysis(self, market_analysis: MarketAnalysis) -> None:
         """
@@ -781,7 +980,7 @@ Analysis completed at: {self._get_current_timestamp()}"""
             trading_ui.render()
             
         except Exception as e:
-            logger.error(f"Error rendering market analysis {market_analysis.id}: {e}", exc_info=True)
+            self.logger.error(f"Error rendering market analysis {market_analysis.id}: {e}", exc_info=True)
             # Fallback to error display
             from nicegui import ui
             with ui.card().classes('w-full p-8 text-center'):
@@ -809,7 +1008,7 @@ Analysis completed at: {self._get_current_timestamp()}"""
             return self._build_in_progress_html_tabs(market_analysis, trading_state, analysis_outputs)
             
         except Exception as e:
-            logger.error(f"Error rendering in-progress analysis: {e}", exc_info=True)
+            self.logger.error(f"Error rendering in-progress analysis: {e}", exc_info=True)
             return self._render_basic_in_progress()
     
     def _render_basic_in_progress(self) -> str:
@@ -865,7 +1064,7 @@ Please check back in a few minutes for results."""
             return html_content
             
         except Exception as e:
-            logger.error(f"Error rendering comprehensive analysis: {e}", exc_info=True)
+            self.logger.error(f"Error rendering comprehensive analysis: {e}", exc_info=True)
             return self._render_fallback_analysis(market_analysis)
     
     def _build_analysis_html_tabs(self, market_analysis: MarketAnalysis, trading_state: dict, analysis_outputs: list) -> str:
@@ -1406,7 +1605,7 @@ Please check back in a few minutes for results."""
             legacy_automatic_trading = self.settings.get('automatic_trading', False)
             
             if not allow_automated_trade_opening and not legacy_automatic_trading:
-                logger.debug(f"[TRADE MANAGER] Automatic trade opening disabled for expert {self.id}, skipping order creation for {symbol}")
+                self.logger.debug(f"[TRADE MANAGER] Automatic trade opening disabled for expert {self.id}, skipping order creation for {symbol}")
                 return
             
             # Get the recommendation from database
@@ -1416,12 +1615,12 @@ Please check back in a few minutes for results."""
             
             recommendation = get_instance(ExpertRecommendation, recommendation_id)
             if not recommendation:
-                logger.error(f"[TRADE MANAGER] ExpertRecommendation {recommendation_id} not found")
+                self.logger.error(f"[TRADE MANAGER] ExpertRecommendation {recommendation_id} not found")
                 return
             
             # Skip HOLD recommendations as they don't require orders
             if recommendation.recommended_action == OrderRecommendation.HOLD:
-                logger.debug(f"[TRADE MANAGER] HOLD recommendation for {symbol}, no order needed")
+                self.logger.debug(f"[TRADE MANAGER] HOLD recommendation for {symbol}, no order needed")
                 return
             
             # Get the trade manager and process the recommendation
@@ -1429,14 +1628,14 @@ Please check back in a few minutes for results."""
             placed_order = trade_manager.process_recommendation(recommendation)
             
             if placed_order:
-                logger.info(f"[TRADE MANAGER] Successfully created order {placed_order.id} for {symbol} "
+                self.logger.info(f"[TRADE MANAGER] Successfully created order {placed_order.id} for {symbol} "
                            f"({recommendation.recommended_action.value}) based on recommendation {recommendation_id}")
             else:
-                logger.info(f"[TRADE MANAGER] No order created for {symbol} recommendation {recommendation_id} "
+                self.logger.info(f"[TRADE MANAGER] No order created for {symbol} recommendation {recommendation_id} "
                            f"(may be filtered by rules or permissions)")
                 
         except Exception as e:
-            logger.error(f"[TRADE MANAGER] Error notifying trade manager for recommendation {recommendation_id}, symbol {symbol}: {e}", exc_info=True)
+            self.logger.error(f"[TRADE MANAGER] Error notifying trade manager for recommendation {recommendation_id}, symbol {symbol}: {e}", exc_info=True)
     
     @classmethod
     def get_expert_actions(cls) -> List[Dict[str, Any]]:
@@ -1488,7 +1687,7 @@ Please check back in a few minutes for results."""
                             "path": expert_base_dir
                         })
                 except Exception as e:
-                    logger.debug(f"Could not read collections from {expert_base_dir}: {e}")
+                    self.logger.debug(f"Could not read collections from {expert_base_dir}: {e}")
             
             # Check symbol subdirectories
             for symbol_dir in os.listdir(expert_base_dir):
@@ -1505,7 +1704,7 @@ Please check back in a few minutes for results."""
                                 "path": symbol_path
                             })
                     except Exception as e:
-                        logger.debug(f"Could not read collections from {symbol_path}: {e}")
+                        self.logger.debug(f"Could not read collections from {symbol_path}: {e}")
             
             if not collection_info:
                 return {
@@ -1523,7 +1722,7 @@ Please check back in a few minutes for results."""
             }
             
         except Exception as e:
-            logger.error(f"Error listing memory collections for expert {self.id}: {e}", exc_info=True)
+            self.logger.error(f"Error listing memory collections for expert {self.id}: {e}", exc_info=True)
             return {
                 "status": "error",
                 "message": f"Error accessing memory collections: {str(e)}"
@@ -1569,11 +1768,11 @@ Please check back in a few minutes for results."""
                         try:
                             client.delete_collection(collection.name)
                             deleted_count += 1
-                            logger.info(f"Deleted memory collection '{collection.name}' for expert {self.id}")
+                            self.logger.info(f"Deleted memory collection '{collection.name}' for expert {self.id}")
                         except Exception as e:
                             errors.append(f"Failed to delete collection '{collection.name}': {str(e)}")
                 except Exception as e:
-                    logger.debug(f"Could not access collections in {expert_base_dir}: {e}")
+                    self.logger.debug(f"Could not access collections in {expert_base_dir}: {e}")
             
             # Delete from symbol subdirectories
             for symbol_dir in os.listdir(expert_base_dir):
@@ -1590,7 +1789,7 @@ Please check back in a few minutes for results."""
                             try:
                                 client.delete_collection(collection.name)
                                 deleted_count += 1
-                                logger.info(f"Deleted memory collection '{collection_full_name}' for expert {self.id}")
+                                self.logger.info(f"Deleted memory collection '{collection_full_name}' for expert {self.id}")
                             except Exception as e:
                                 errors.append(f"Failed to delete collection '{collection_full_name}': {str(e)}")
                         
@@ -1599,19 +1798,19 @@ Please check back in a few minutes for results."""
                         if not remaining:
                             try:
                                 shutil.rmtree(symbol_path)
-                                logger.info(f"Removed empty symbol directory: {symbol_path}")
+                                self.logger.info(f"Removed empty symbol directory: {symbol_path}")
                             except Exception as e:
-                                logger.warning(f"Could not remove symbol directory {symbol_path}: {e}")
+                                self.logger.warning(f"Could not remove symbol directory {symbol_path}: {e}")
                     except Exception as e:
-                        logger.debug(f"Could not access collections in {symbol_path}: {e}")
+                        self.logger.debug(f"Could not access collections in {symbol_path}: {e}")
             
             # If expert directory is now empty, remove it
             if not os.listdir(expert_base_dir) or (len(os.listdir(expert_base_dir)) == 1 and os.listdir(expert_base_dir)[0] == 'chroma.sqlite3'):
                 try:
                     shutil.rmtree(expert_base_dir)
-                    logger.info(f"Removed memory directory for expert {self.id}")
+                    self.logger.info(f"Removed memory directory for expert {self.id}")
                 except Exception as e:
-                    logger.warning(f"Could not remove expert directory: {e}")
+                    self.logger.warning(f"Could not remove expert directory: {e}")
             
             # Build result message
             if errors:
@@ -1627,7 +1826,7 @@ Please check back in a few minutes for results."""
                 }
             
         except Exception as e:
-            logger.error(f"Error clearing memory collections for expert {self.id}: {e}", exc_info=True)
+            self.logger.error(f"Error clearing memory collections for expert {self.id}: {e}", exc_info=True)
             return {
                 "status": "error",
                 "message": f"Error clearing memory collections: {str(e)}"

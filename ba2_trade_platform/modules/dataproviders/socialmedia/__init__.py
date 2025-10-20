@@ -4,11 +4,14 @@ Social Media Sentiment Data Providers
 Providers for social media sentiment analysis across various platforms.
 
 Available Providers:
-    - OpenAI: AI-powered sentiment analysis using web search across multiple platforms
+    - AI: AI-powered sentiment analysis using web search across multiple platforms
+    - OpenAI: Legacy - deprecated (use AI provider instead)
 """
 
-from .OpenAISocialMediaSentiment import OpenAISocialMediaSentiment
+from .AISocialMediaSentiment import AISocialMediaSentiment
+from .OpenAISocialMediaSentiment import OpenAISocialMediaSentiment  # Legacy - deprecated
 
 __all__ = [
-    "OpenAISocialMediaSentiment",
+    "AISocialMediaSentiment",
+    "OpenAISocialMediaSentiment",  # Legacy - deprecated
 ]

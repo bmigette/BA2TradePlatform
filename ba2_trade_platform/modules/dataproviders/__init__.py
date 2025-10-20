@@ -43,11 +43,12 @@ from .ohlcv.AlpacaOHLCVProvider import AlpacaOHLCVProvider
 from .ohlcv.FMPOHLCVProvider import FMPOHLCVProvider
 
 # Import provider implementations
-from .news import AlpacaNewsProvider, AlphaVantageNewsProvider, GoogleNewsProvider, OpenAINewsProvider, FMPNewsProvider
+from .news import AlpacaNewsProvider, AlphaVantageNewsProvider, GoogleNewsProvider, AINewsProvider, OpenAINewsProvider, FMPNewsProvider, FinnhubNewsProvider
 from .indicators import PandasIndicatorCalc, AlphaVantageIndicatorsProvider
 from .fundamentals import (
     AlphaVantageCompanyOverviewProvider,
-    OpenAICompanyOverviewProvider,
+    AICompanyOverviewProvider,
+    OpenAICompanyOverviewProvider,  # Legacy - deprecated
     FMPCompanyOverviewProvider,
     AlphaVantageCompanyDetailsProvider,
     YFinanceCompanyDetailsProvider,
@@ -55,7 +56,7 @@ from .fundamentals import (
 )
 from .macro import FREDMacroProvider
 from .insider import FMPInsiderProvider
-from .socialmedia import OpenAISocialMediaSentiment
+from .socialmedia import AISocialMediaSentiment, OpenAISocialMediaSentiment
 
 # Provider registries - will be populated as providers are implemented
 OHLCV_PROVIDERS: Dict[str, Type[DataProviderInterface]] = {
@@ -71,7 +72,8 @@ INDICATORS_PROVIDERS: Dict[str, Type[MarketIndicatorsInterface]] = {
 
 FUNDAMENTALS_OVERVIEW_PROVIDERS: Dict[str, Type[CompanyFundamentalsOverviewInterface]] = {
     "alphavantage": AlphaVantageCompanyOverviewProvider,
-    "openai": OpenAICompanyOverviewProvider,
+    "ai": AICompanyOverviewProvider,
+    "openai": OpenAICompanyOverviewProvider,  # Legacy - deprecated, use 'ai' instead
     "fmp": FMPCompanyOverviewProvider,
 }
 
@@ -86,9 +88,10 @@ NEWS_PROVIDERS: Dict[str, Type[MarketNewsInterface]] = {
     "alpaca": AlpacaNewsProvider,
     "alphavantage": AlphaVantageNewsProvider,
     "google": GoogleNewsProvider,
-    "openai": OpenAINewsProvider,
+    "ai": AINewsProvider,
+    "openai": OpenAINewsProvider,  # Legacy - deprecated, use 'ai' instead
     "fmp": FMPNewsProvider,
-    # "finnhub": FinnhubNewsProvider,
+    "finnhub": FinnhubNewsProvider,
     # "reddit": RedditNewsProvider,
 }
 
@@ -104,7 +107,8 @@ INSIDER_PROVIDERS: Dict[str, Type[CompanyInsiderInterface]] = {
 }
 
 SOCIALMEDIA_PROVIDERS: Dict[str, Type[SocialMediaDataProviderInterface]] = {
-    "openai": OpenAISocialMediaSentiment,
+    "ai": AISocialMediaSentiment,
+    "openai": OpenAISocialMediaSentiment,  # Legacy - deprecated, use 'ai' instead
 }
 
 
@@ -230,19 +234,22 @@ __all__ = [
     "AlpacaNewsProvider",
     "AlphaVantageNewsProvider",
     "GoogleNewsProvider",
-    "OpenAINewsProvider",
+    "AINewsProvider",
+    "OpenAINewsProvider",  # Legacy - deprecated
     "FMPNewsProvider",
     "PandasIndicatorCalc",
     "AlphaVantageIndicatorsProvider",
     "AlphaVantageCompanyOverviewProvider",
-    "OpenAICompanyOverviewProvider",
+    "AICompanyOverviewProvider",
+    "OpenAICompanyOverviewProvider",  # Legacy - deprecated
     "FMPCompanyOverviewProvider",
     "AlphaVantageCompanyDetailsProvider",
     "YFinanceCompanyDetailsProvider",
     "FMPCompanyDetailsProvider",
     "FREDMacroProvider",
     "FMPInsiderProvider",
-    "OpenAISocialMediaSentiment",
+    "AISocialMediaSentiment",
+    "OpenAISocialMediaSentiment",  # Legacy - deprecated
     
     # Interfaces
     "DataProviderInterface",

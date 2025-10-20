@@ -481,9 +481,16 @@ class CloseAction(TradeAction):
             submit_result = self.account.submit_order(order_record)
             
             if submit_result is not None:
-                # Update order record with broker order ID
+                # Update order record with broker order ID (only if not already set)
                 if hasattr(submit_result, 'account_order_id') and submit_result.account_order_id:
-                    order_record.broker_order_id = str(submit_result.account_order_id)
+                    new_broker_id = str(submit_result.account_order_id)
+                    if order_record.broker_order_id and order_record.broker_order_id != new_broker_id:
+                        logger.warning(
+                            f"Order {order_record.id} already has broker_order_id={order_record.broker_order_id}, "
+                            f"not overwriting with: {new_broker_id}"
+                        )
+                    else:
+                        order_record.broker_order_id = new_broker_id
                     order_record.status = OrderStatus.OPEN.value
                     update_instance(order_record)
                 
@@ -1006,9 +1013,16 @@ class AdjustStopLossAction(TradeAction):
             submit_result = self.account.submit_order(sl_order_record)
             
             if submit_result is not None:
-                # Update SL order record with broker order ID
+                # Update SL order record with broker order ID (only if not already set)
                 if hasattr(submit_result, 'account_order_id') and submit_result.account_order_id:
-                    sl_order_record.broker_order_id = str(submit_result.account_order_id)
+                    new_broker_id = str(submit_result.account_order_id)
+                    if sl_order_record.broker_order_id and sl_order_record.broker_order_id != new_broker_id:
+                        logger.warning(
+                            f"Stop loss order {sl_order_record.id} already has broker_order_id={sl_order_record.broker_order_id}, "
+                            f"not overwriting with: {new_broker_id}"
+                        )
+                    else:
+                        sl_order_record.broker_order_id = new_broker_id
                     sl_order_record.status = OrderStatus.OPEN.value
                     update_instance(sl_order_record)
                 
