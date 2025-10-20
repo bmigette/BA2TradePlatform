@@ -2835,6 +2835,8 @@ class TransactionsTab:
                     
                     ui.button('Refresh', icon='refresh', on_click=lambda: self._refresh_transactions()).props('outline')
                     
+                    ui.button('Force Refresh Account', icon='cloud_download', on_click=self._force_refresh_account_now).props('outline')
+                    
                     # Batch operation buttons
                     self.batch_operations_container = ui.row().classes('gap-2 ml-4')
                     self.batch_select_all_btn = ui.button(
@@ -2949,6 +2951,22 @@ class TransactionsTab:
             self.transactions_container.clear()
             with self.transactions_container:
                 self._render_transactions_table()
+    
+    def _force_refresh_account_now(self):
+        """Force an immediate account refresh (non-blocking)."""
+        logger.info("[ACCOUNT_REFRESH] User clicked 'Force Refresh Account' button")
+        try:
+            from ...core.JobManager import get_job_manager
+            job_manager = get_job_manager()
+            
+            # Execute account refresh immediately as background task
+            job_manager.execute_account_refresh_immediately()
+            
+            ui.notify('Account refresh started in background', type='info')
+            logger.info("[ACCOUNT_REFRESH] Account refresh task queued successfully")
+        except Exception as e:
+            ui.notify(f'Error starting account refresh: {str(e)}', type='negative')
+            logger.error(f"Error executing account refresh: {e}", exc_info=True)
     
     def _get_transactions_data(self):
         """Get transactions data for the table.
@@ -3126,6 +3144,7 @@ class TransactionsTab:
                 
                 row = {
                     'id': txn.id,
+                    '_selected': txn.id in self.selected_transactions,  # Track selection state for checkbox
                     'symbol': txn.symbol,
                     'expert': expert_shortname,
                     'quantity': f"{txn.quantity:+.2f}",
@@ -3145,7 +3164,6 @@ class TransactionsTab:
                     'is_closing': txn.status == TransactionStatus.CLOSING,  # Track CLOSING status
                     'orders': orders_data,  # Add orders for expansion
                     'order_count': len(orders_data),  # Show order count
-                    '_selected': txn.id in self.selected_transactions  # Track selection state
                 }
                 rows.append(row)
             
@@ -3170,7 +3188,7 @@ class TransactionsTab:
         
         # Table columns
         columns = [
-            {'name': 'select', 'label': '', 'field': 'select', 'align': 'left'},  # Selection checkbox
+            {'name': 'select', 'label': '', 'field': 'select', 'align': 'left', 'sortable': False},  # Selection checkbox column
             {'name': 'expand', 'label': '', 'field': 'expand', 'align': 'left'},  # Expand column
             {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left', 'sortable': True},
             {'name': 'expert', 'label': 'Expert', 'field': 'expert', 'align': 'left', 'sortable': True},
@@ -3189,27 +3207,34 @@ class TransactionsTab:
             {'name': 'actions', 'label': 'Actions', 'field': 'actions', 'align': 'center'}
         ]
         
-        # Create table with expansion enabled
+        # Create table with expansion support
         logger.debug(f"[RENDER] _render_transactions_table() - Creating table with {len(rows)} rows")
         self.transactions_table = ui.table(
             columns=columns, 
             rows=rows, 
             row_key='id',
             pagination={'rowsPerPage': 20}
-        ).classes('w-full')
+        ).classes('w-full').props('flat bordered')
         
-        # Add Quasar table props for expansion
-        self.transactions_table.props('flat bordered')
+        # Add row selection via click handler
+        # Store reference to rows for selection tracking
+        def on_row_click(row_data):
+            """Handle row clicks to toggle selection."""
+            row_id = row_data['id']
+            if row_id in self.selected_transactions:
+                del self.selected_transactions[row_id]
+            else:
+                self.selected_transactions[row_id] = True
+            self._update_batch_buttons()
+            # Refresh table to show updated styling
+            self.transactions_table.update()
         
-        # Add select checkbox in first column
-        self.transactions_table.add_slot('body-cell-select', '''
-            <q-td :props="props">
-                <q-checkbox
-                    :model-value="props.row._selected"
-                    @update:model-value="$parent.$emit('toggle_transaction_select', props.row.id)"
-                />
-            </q-td>
-        ''')
+        # Attach click handler to table rows via Quasar's row-click event
+        self.transactions_table.props('row-key="id" @row-click="(evt, row) => {}"')
+        
+        # We'll manually handle selection in the Vue template slot instead
+        # Store the click handler for reference
+        self._on_row_click = on_row_click
         
         # Add expand button in second column
         self.transactions_table.add_slot('body-cell-expand', '''
@@ -3230,9 +3255,9 @@ class TransactionsTab:
                 <q-tr :props="props">
                     <q-td v-for="col in props.cols" :key="col.name" :props="props">
                         <template v-if="col.name === 'select'">
-                            <q-checkbox
-                                :model-value="props.row._selected"
-                                @update:model-value="$parent.$emit('toggle_transaction_select', props.row.id)"
+                            <q-checkbox 
+                                :model-value="props.row._selected || false"
+                                @update:model-value="(val) => $parent.$emit('toggle_row_selection', props.row.id)"
                             />
                         </template>
                         <template v-else-if="col.name === 'expand'">
@@ -3359,12 +3384,32 @@ class TransactionsTab:
         
         # Handle events
         logger.debug("[RENDER] _render_transactions_table() - Setting up event handlers")
+        self.transactions_table.on('toggle_row_selection', self._toggle_row_selection)
         self.transactions_table.on('edit_transaction', self._show_edit_dialog)
         self.transactions_table.on('close_transaction', self._show_close_dialog)
         self.transactions_table.on('retry_close_transaction', self._show_retry_close_dialog)
         self.transactions_table.on('view_recommendation', self._show_recommendation_dialog)
-        self.transactions_table.on('toggle_transaction_select', self._toggle_transaction_select)
         logger.debug("[RENDER] _render_transactions_table() - END (success)")
+    
+    def _toggle_row_selection(self, event_data):
+        """Toggle selection state for a transaction row."""
+        # Extract transaction_id from event_data
+        transaction_id = event_data.args if hasattr(event_data, 'args') else event_data
+        
+        if transaction_id in self.selected_transactions:
+            del self.selected_transactions[transaction_id]
+        else:
+            self.selected_transactions[transaction_id] = True
+        
+        # Update the specific row's _selected flag in the table data
+        for row in self.transactions_table.rows:
+            if row['id'] == transaction_id:
+                row['_selected'] = transaction_id in self.selected_transactions
+                break
+        
+        self._update_batch_buttons()
+        # Refresh table to show updated checkbox state
+        self.transactions_table.update()
     
     def _show_edit_dialog(self, event_data):
         """Show dialog to edit TP/SL for a transaction."""
@@ -3822,40 +3867,31 @@ class TransactionsTab:
         
         dialog.open()
     
-    def _toggle_transaction_select(self, event_data):
-        """Toggle selection state for a transaction."""
-        # Event data comes as (transaction_id,) tuple from Vue emit
-        transaction_id = event_data.args[0] if hasattr(event_data, 'args') and event_data.args else None
-        
-        if not transaction_id:
-            return
-        
-        if transaction_id in self.selected_transactions:
-            del self.selected_transactions[transaction_id]
-        else:
-            self.selected_transactions[transaction_id] = True
-        
-        # Update button visibility
-        self._update_batch_buttons()
-        
-        # Refresh table to update checkboxes
-        self._refresh_transactions()
-    
     def _select_all_transactions(self):
         """Select all visible transactions."""
-        rows = self._get_transactions_data()
-        if rows:
-            for row in rows:
-                self.selected_transactions[row['id']] = True
+        if not self.transactions_table:
+            return
+        
+        # Select all current rows
+        for row in self.transactions_table.rows:
+            self.selected_transactions[row['id']] = True
+            row['_selected'] = True
         
         self._update_batch_buttons()
-        self._refresh_transactions()
+        # Update table to show checkboxes
+        self.transactions_table.update()
     
     def _clear_selected_transactions(self):
         """Clear all selected transactions."""
         self.selected_transactions.clear()
+        # Update all rows to reflect cleared selection
+        if self.transactions_table:
+            for row in self.transactions_table.rows:
+                row['_selected'] = False
         self._update_batch_buttons()
-        self._refresh_transactions()
+        # Update table to hide checkboxes
+        if self.transactions_table:
+            self.transactions_table.update()
     
     def _update_batch_buttons(self):
         """Show/hide batch operation buttons based on selection."""
@@ -4093,17 +4129,57 @@ class TransactionsTab:
                                 logger.error(f"Error modifying TP order for transaction {txn_id}: {e}")
                                 failed.append(txn_id)
                         else:
-                            # No existing TP order - just update the transaction TP field
-                            logger.info(f"Creating/updating TP for transaction {txn_id} to ${new_tp_price:.2f}")
-                            try:
-                                txn.take_profit = new_tp_price
-                                update_instance(txn)
-                                success_count += 1
-                                new_tp_created.append(txn_id)
-                                logger.info(f"Successfully updated TP for transaction {txn_id}")
-                            except Exception as e:
-                                logger.error(f"Error updating TP for transaction {txn_id}: {e}")
-                                failed.append(txn_id)
+                            # No existing TP order
+                            # If position is already filled (open qty matches entry qty), submit market TP order
+                            # Otherwise, just update the TP field for later order creation
+                            
+                            open_qty = txn.get_current_open_qty()
+                            entry_qty = txn.quantity
+                            
+                            if open_qty > 0 and open_qty == entry_qty:
+                                # Position is filled - submit TP limit order directly to market
+                                logger.info(f"Position filled for transaction {txn_id}. Submitting TP limit order to market at ${new_tp_price:.2f}")
+                                try:
+                                    # Determine sell side based on position direction
+                                    # If we bought (went long), we sell to take profit
+                                    tp_side = OrderDirection.SELL if entry_qty > 0 else OrderDirection.BUY
+                                    
+                                    # Create and submit TP limit order
+                                    tp_order = TradingOrder(
+                                        symbol=txn.symbol,
+                                        quantity=open_qty,
+                                        side=tp_side,
+                                        type=OrderType.LIMIT,
+                                        limit_price=new_tp_price,
+                                        transaction_id=txn_id,
+                                        good_for='day'
+                                    )
+                                    
+                                    # Submit to market via account
+                                    # Note: account.submit_order() handles database persistence internally
+                                    alpaca_order = account.submit_order(tp_order)
+                                    if alpaca_order:
+                                        success_count += 1
+                                        new_tp_created.append(txn_id)
+                                        logger.info(f"Successfully submitted TP limit order for transaction {txn_id}")
+                                    else:
+                                        failed.append(txn_id)
+                                        logger.error(f"Failed to submit TP order for transaction {txn_id}")
+                                except Exception as e:
+                                    logger.error(f"Error submitting TP order for transaction {txn_id}: {e}")
+                                    failed.append(txn_id)
+                            else:
+                                # Position not yet filled - just update the TP field for later
+                                logger.info(f"Position not yet filled for transaction {txn_id}. Updating TP field to ${new_tp_price:.2f}")
+                                try:
+                                    txn.take_profit = new_tp_price
+                                    update_instance(txn)
+                                    success_count += 1
+                                    new_tp_created.append(txn_id)
+                                    logger.info(f"Successfully updated TP field for transaction {txn_id}")
+                                except Exception as e:
+                                    logger.error(f"Error updating TP field for transaction {txn_id}: {e}")
+                                    failed.append(txn_id)
                     
                     except Exception as e:
                         logger.error(f"Error processing transaction {txn_id}: {e}")

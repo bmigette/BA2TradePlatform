@@ -13,19 +13,19 @@ def create_fundamentals_analyst(llm, toolkit):
 
         # Wrap toolkit methods with @tool decorator
         @tool
-        def get_balance_sheet(symbol: str, end_date: str, lookback_periods: int = None) -> str:
+        def get_balance_sheet(symbol: str, frequency: str, end_date: str, lookback_periods: int = None) -> str:
             """Get balance sheet data for a company."""
-            return toolkit.get_balance_sheet(symbol, end_date, lookback_periods)
+            return toolkit.get_balance_sheet(symbol, frequency, end_date, lookback_periods)
         
         @tool
-        def get_income_statement(symbol: str, end_date: str, lookback_periods: int = None) -> str:
+        def get_income_statement(symbol: str, frequency: str, end_date: str, lookback_periods: int = None) -> str:
             """Get income statement data for a company."""
-            return toolkit.get_income_statement(symbol, end_date, lookback_periods)
+            return toolkit.get_income_statement(symbol, frequency, end_date, lookback_periods)
         
         @tool
-        def get_cashflow_statement(symbol: str, end_date: str, lookback_periods: int = None) -> str:
+        def get_cashflow_statement(symbol: str, frequency: str, end_date: str, lookback_periods: int = None) -> str:
             """Get cash flow statement data for a company."""
-            return toolkit.get_cashflow_statement(symbol, end_date, lookback_periods)
+            return toolkit.get_cashflow_statement(symbol, frequency, end_date, lookback_periods)
         
         @tool
         def get_insider_transactions(symbol: str, end_date: str, lookback_days: int = None) -> str:

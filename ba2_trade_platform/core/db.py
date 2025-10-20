@@ -257,6 +257,9 @@ def update_instance(instance, session: Session | None = None):
     Commits and refreshes the instance after updating.
     Thread-safe: Uses a lock to prevent concurrent write conflicts.
     Retries on database lock errors with exponential backoff.
+    
+    Handles objects already attached to different sessions by merging them
+    into the current session.
 
     Args:
         instance: The instance to update.
@@ -267,15 +270,48 @@ def update_instance(instance, session: Session | None = None):
     """
     with _db_write_lock:
         try:
+            instance_id = instance.id
+            model_class = type(instance)
+            
             if session:
-                session.add(instance)
-                session.commit()
-                session.refresh(instance)
-            else:
-                with Session(engine) as session:
+                # Merge the instance into the current session to avoid attachment issues
+                merged_instance = session.get(model_class, instance_id)
+                if merged_instance:
+                    # Update merged instance with the values from the passed instance
+                    for key, value in instance.__dict__.items():
+                        if not key.startswith('_'):
+                            setattr(merged_instance, key, value)
+                    session.commit()
+                    session.refresh(merged_instance)
+                    # Update the original instance with refreshed values
+                    for key in instance.__dict__.keys():
+                        if not key.startswith('_') and hasattr(merged_instance, key):
+                            setattr(instance, key, getattr(merged_instance, key))
+                else:
+                    # Object not found in current session, try adding it
                     session.add(instance)
                     session.commit()
                     session.refresh(instance)
+            else:
+                with Session(engine) as new_session:
+                    # Get the instance in this session
+                    merged_instance = new_session.get(model_class, instance_id)
+                    if merged_instance:
+                        # Update merged instance with the values from the passed instance
+                        for key, value in instance.__dict__.items():
+                            if not key.startswith('_'):
+                                setattr(merged_instance, key, value)
+                        new_session.commit()
+                        new_session.refresh(merged_instance)
+                        # Update the original instance with refreshed values
+                        for key in instance.__dict__.keys():
+                            if not key.startswith('_') and hasattr(merged_instance, key):
+                                setattr(instance, key, getattr(merged_instance, key))
+                    else:
+                        # Object not found in new session, add it
+                        new_session.add(instance)
+                        new_session.commit()
+                        new_session.refresh(instance)
             return True
         except Exception as e:
             # Let the retry decorator handle logging with appropriate detail level

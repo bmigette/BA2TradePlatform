@@ -261,6 +261,16 @@ class LoggingToolNode:
         # Create ToolNode with wrapped tools
         self.tool_node = ToolNode(wrapped_tools)
     
+    def _format_message_header(self, content: str) -> str:
+        """Format AI message with model information header."""
+        if not self.model_info:
+            return content
+        return f"""================================== AI Message ({self.model_info}) ==================================
+
+{content}
+
+"""
+    
     def _wrap_tool(self, original_tool):
         """Wrap a tool to intercept its result and store JSON before returning."""
         from langchain_core.tools import StructuredTool
@@ -307,14 +317,17 @@ class LoggingToolNode:
                 else:
                     logger.info(f"[TOOL_RESULT] {tool_name} returned: {text_for_agent[:500]}...")
                 
-                # Store outputs
+                # Store outputs with model header
                 if market_analysis_id:
+                    # Format message with model header
+                    formatted_output = f"Tool: {tool_name}\nOutput:\n\n{self._format_message_header(text_for_agent)}\n\nTimestamp: {datetime.now(timezone.utc).isoformat()}"
+                    
                     # Store text format
                     store_analysis_output(
                         market_analysis_id=market_analysis_id,
                         name=f"tool_output_{tool_name}",
                         output_type="tool_call_output_error" if is_error else "tool_call_output",
-                        text=f"Tool: {tool_name}\nOutput: {text_for_agent}\nTimestamp: {datetime.now(timezone.utc).isoformat()}"
+                        text=formatted_output
                     )
                     
                     # Store JSON format if provided
@@ -328,17 +341,18 @@ class LoggingToolNode:
                         )
                         logger.info(f"[JSON_STORED] Saved JSON parameters for {tool_name}")
                 
-                # Return only text for agent
+                # Return only text for agent (without model header)
                 return text_for_agent
             else:
                 # Simple text result
                 logger.info(f"[TOOL_RESULT] {tool_name} returned: {str(result)[:500]}...")
                 if market_analysis_id:
+                    formatted_output = f"Tool: {tool_name}\nOutput:\n\n{self._format_message_header(str(result))}\n\nTimestamp: {datetime.now(timezone.utc).isoformat()}"
                     store_analysis_output(
                         market_analysis_id=market_analysis_id,
                         name=f"tool_output_{tool_name}",
                         output_type="tool_call_output",
-                        text=f"Tool: {tool_name}\nOutput: {result}\nTimestamp: {datetime.now(timezone.utc).isoformat()}"
+                        text=formatted_output
                     )
                 return result
         
