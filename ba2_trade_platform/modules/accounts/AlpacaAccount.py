@@ -400,26 +400,32 @@ class AlpacaAccount(AccountInterface):
                                       CoreOrderType.SELL_LIMIT.value.lower()]:
                 if not trading_order.limit_price:
                     raise ValueError("Limit price is required for limit orders")
+                
+                # Round limit price using Alpaca pricing rules
+                rounded_limit_price = self._round_price(trading_order.limit_price, trading_order.symbol)
                     
                 order_request = LimitOrderRequest(
                     symbol=trading_order.symbol,
                     qty=trading_order.quantity,
                     side=side,
                     time_in_force=time_in_force,
-                    limit_price=trading_order.limit_price,
+                    limit_price=rounded_limit_price,
                     client_order_id=trading_order.comment
                 )
             elif order_type_value in [CoreOrderType.BUY_STOP.value.lower(), 
                                       CoreOrderType.SELL_STOP.value.lower()]:
                 if not trading_order.stop_price:
                     raise ValueError("Stop price is required for stop orders")
+                
+                # Round stop price using Alpaca pricing rules
+                rounded_stop_price = self._round_price(trading_order.stop_price, trading_order.symbol)
                     
                 order_request = StopOrderRequest(
                     symbol=trading_order.symbol,
                     qty=trading_order.quantity,
                     side=side,
                     time_in_force=time_in_force,
-                    stop_price=trading_order.stop_price,
+                    stop_price=rounded_stop_price,
                     client_order_id=trading_order.comment
                 )
             else:

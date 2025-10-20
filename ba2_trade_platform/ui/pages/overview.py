@@ -4136,7 +4136,7 @@ class TransactionsTab:
                             
                             statement = select(TradingOrder).where(
                                 TradingOrder.transaction_id == txn_id,
-                                TradingOrder.type.in_(tp_types),
+                                TradingOrder.order_type.in_(tp_types),
                                 TradingOrder.side == tp_side
                             )
                             results = session.exec(statement).all()
@@ -4163,10 +4163,11 @@ class TransactionsTab:
                                 
                                 # Create modified trading order with new limit price
                                 modified_order = TO(
+                                    account_id=expert_instance.account_id,
                                     symbol=txn.symbol,
                                     quantity=existing_tp_order.quantity,
                                     side=existing_tp_order.side,
-                                    type=tp_type,
+                                    order_type=tp_type,
                                     limit_price=new_tp_price,
                                     good_for=existing_tp_order.good_for or 'day'
                                 )
@@ -4177,9 +4178,14 @@ class TransactionsTab:
                                 if result:
                                     existing_tp_order.limit_price = new_tp_price
                                     update_instance(existing_tp_order)
+                                    
+                                    # Also update the transaction's take_profit field
+                                    txn.take_profit = new_tp_price
+                                    update_instance(txn)
+                                    
                                     success_count += 1
                                     existing_tp_modified.append(txn_id)
-                                    logger.info(f"[Batch TP] Transaction {txn_id}: ✓ Successfully modified TP to ${new_tp_price:.2f}")
+                                    logger.info(f"[Batch TP] Transaction {txn_id}: ✓ Successfully modified TP to ${new_tp_price:.2f} and updated transaction TP field")
                                 else:
                                     failed.append(txn_id)
                                     logger.error(f"[Batch TP] Transaction {txn_id}: ✗ Failed to modify TP order (modify_order returned falsy)")
@@ -4208,10 +4214,11 @@ class TransactionsTab:
                                     
                                     # Create and submit TP limit order
                                     tp_order = TradingOrder(
+                                        account_id=expert_instance.account_id,
                                         symbol=txn.symbol,
                                         quantity=open_qty,
                                         side=tp_side,
-                                        type=tp_type,
+                                        order_type=tp_type,
                                         limit_price=new_tp_price,
                                         transaction_id=txn_id,
                                         good_for='day'
@@ -4222,9 +4229,13 @@ class TransactionsTab:
                                     alpaca_order = account.submit_order(tp_order)
                                     logger.info(f"[Batch TP] Transaction {txn_id}: submit_order result={alpaca_order is not None}")
                                     if alpaca_order:
+                                        # Update the transaction's take_profit field
+                                        txn.take_profit = new_tp_price
+                                        update_instance(txn)
+                                        
                                         success_count += 1
                                         new_tp_created.append(txn_id)
-                                        logger.info(f"[Batch TP] Transaction {txn_id}: ✓ Successfully submitted TP limit order")
+                                        logger.info(f"[Batch TP] Transaction {txn_id}: ✓ Successfully submitted TP limit order and updated transaction TP field")
                                     else:
                                         failed.append(txn_id)
                                         logger.error(f"[Batch TP] Transaction {txn_id}: ✗ Failed to submit TP order (submit_order returned None)")
