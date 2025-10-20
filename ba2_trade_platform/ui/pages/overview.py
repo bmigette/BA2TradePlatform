@@ -965,9 +965,12 @@ class OverviewTab:
                 'limit': 35
             }
             
+            logger.debug(f'[OpenAI Usage] Calling {costs_url} with start_time={params["start_time"]}, end_time={params["end_time"]}')
+            
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(costs_url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=60)) as response:
+                        logger.debug(f'[OpenAI Usage] Response status: {response.status}')
                         if response.status == 200:
                             costs_data = await response.json()
                             
@@ -1030,7 +1033,11 @@ class OverviewTab:
                         else:
                             error_text = await response.text()
                             logger.error(f'OpenAI API error {response.status}: {error_text}')
-                            return {'error': f'OpenAI API error ({response.status}): {error_text[:100]}...'}
+                            # For 500 errors, provide a more helpful message
+                            if response.status == 500:
+                                return {'error': 'OpenAI server error (500) - their API may be experiencing issues. Try again later.'}
+                            else:
+                                return {'error': f'OpenAI API error ({response.status}): {error_text[:150]}...'}
                             
             except aiohttp.ClientError as e:
                 logger.error(f'Network error calling OpenAI costs API: {e}', exc_info=True)
@@ -1046,6 +1053,7 @@ class OverviewTab:
             }
                 
         except asyncio.TimeoutError:
+            logger.error('Request timeout - OpenAI API not responding')
             return {'error': 'Request timeout - OpenAI API not responding'}
         except aiohttp.ClientError as e:
             logger.error(f'Error fetching OpenAI usage data: {e}', exc_info=True)
@@ -1117,6 +1125,7 @@ class OverviewTab:
             
             try:
                 response = requests.get(costs_url, headers=headers, params=params, timeout=30)
+                logger.debug(f'[OpenAI Usage] Sync response status: {response.status_code}')
                 
                 if response.status_code == 200:
                     costs_data = response.json()
@@ -1181,7 +1190,11 @@ class OverviewTab:
                 else:
                     error_text = response.text
                     logger.error(f'OpenAI API error {response.status_code}: {error_text}')
-                    return {'error': f'OpenAI API error ({response.status_code}): {error_text[:100]}...'}
+                    # For 500 errors, provide a more helpful message
+                    if response.status_code == 500:
+                        return {'error': 'OpenAI server error (500) - their API may be experiencing issues. Try again later.'}
+                    else:
+                        return {'error': f'OpenAI API error ({response.status_code}): {error_text[:100]}...'}
                     
             except requests.exceptions.RequestException as e:
                 logger.error(f'Network error calling OpenAI costs API: {e}', exc_info=True)
@@ -3942,7 +3955,7 @@ class TransactionsTab:
             """Async batch close operation."""
             try:
                 from ...core.db import get_instance
-                from ...core.models import Transaction
+                from ...core.models import Transaction, ExpertInstance
                 from ...core.utils import get_account_instance_from_id
                 
                 success_count = 0
@@ -3955,8 +3968,13 @@ class TransactionsTab:
                             failed.append(txn_id)
                             continue
                         
-                        # Get account and close transaction
-                        account = get_account_instance_from_id(txn.account_id) if hasattr(txn, 'account_id') else None
+                        # Get account from expert instance
+                        account = None
+                        if txn.expert_id:
+                            expert_instance = get_instance(ExpertInstance, txn.expert_id)
+                            if expert_instance and expert_instance.account_id:
+                                account = get_account_instance_from_id(expert_instance.account_id)
+                        
                         if account and hasattr(account, 'close_transaction_async'):
                             result = await account.close_transaction_async(txn_id)
                             if result.get('success'):
@@ -3969,7 +3987,7 @@ class TransactionsTab:
                             failed.append(txn_id)
                             logger.warning(f"Cannot close transaction {txn_id}: no account found")
                     except Exception as e:
-                        logger.error(f"Error closing transaction {txn_id}: {e}")
+                        logger.error(f"Error closing transaction {txn_id}: {e}", exc_info=True)
                         failed.append(txn_id)
                 
                 # Schedule UI update
@@ -4046,8 +4064,8 @@ class TransactionsTab:
         async def batch_adjust_tp_async():
             """Async batch TP adjustment."""
             try:
-                from ...core.db import get_instance, update_instance
-                from ...core.models import Transaction, TradingOrder
+                from ...core.db import get_instance, update_instance, get_db
+                from ...core.models import Transaction, TradingOrder, ExpertInstance
                 from ...core.types import OrderType, OrderDirection
                 from ...core.utils import get_account_instance_from_id
                 from sqlmodel import Session, select
@@ -4059,97 +4077,141 @@ class TransactionsTab:
                 
                 for txn_id in transaction_ids:
                     try:
+                        logger.info(f"[Batch TP] Processing transaction {txn_id}")
                         txn = get_instance(Transaction, txn_id)
-                        if not txn or not txn.open_price or txn.open_price <= 0:
+                        if not txn:
+                            logger.error(f"[Batch TP] Transaction {txn_id} not found")
                             failed.append(txn_id)
                             continue
+                        
+                        if not txn.open_price or txn.open_price <= 0:
+                            logger.error(f"[Batch TP] Transaction {txn_id} has invalid open_price: {txn.open_price}")
+                            failed.append(txn_id)
+                            continue
+                        
+                        logger.info(f"[Batch TP] Transaction {txn_id}: symbol={txn.symbol}, open_price={txn.open_price}")
+                        
+                        # Get current open qty early (while txn is in session context)
+                        try:
+                            current_open_qty = txn.get_current_open_qty()
+                            logger.info(f"[Batch TP] Transaction {txn_id}: current_open_qty={current_open_qty}")
+                        except Exception as e:
+                            logger.error(f"[Batch TP] Could not get current open qty for transaction {txn_id}: {e}", exc_info=True)
+                            current_open_qty = 0
                         
                         # Calculate new TP price
                         new_tp_price = txn.open_price * (1 + tp_percent / 100)
+                        logger.info(f"[Batch TP] Transaction {txn_id}: calculated new_tp_price={new_tp_price:.2f}")
                         
                         # Get account for order operations
-                        # Note: Assuming Transaction has account_id or can be derived from expert
+                        # Transaction has expert_id, get account from expert instance
                         account = None
-                        if hasattr(txn, 'account_id') and txn.account_id:
-                            account = get_account_instance_from_id(txn.account_id)
+                        if txn.expert_id:
+                            try:
+                                expert_instance = get_instance(ExpertInstance, txn.expert_id)
+                                if expert_instance and expert_instance.account_id:
+                                    logger.info(f"[Batch TP] Transaction {txn_id}: found expert_id={txn.expert_id}, account_id={expert_instance.account_id}")
+                                    account = get_account_instance_from_id(expert_instance.account_id)
+                                else:
+                                    logger.warning(f"[Batch TP] Transaction {txn_id}: expert {txn.expert_id} not found or has no account")
+                            except Exception as e:
+                                logger.error(f"[Batch TP] Transaction {txn_id}: error getting expert instance: {e}", exc_info=True)
+                        else:
+                            logger.warning(f"[Batch TP] Transaction {txn_id}: no expert_id")
                         
                         if not account:
-                            logger.warning(f"Cannot adjust TP for transaction {txn_id}: no account found")
+                            logger.error(f"[Batch TP] Cannot adjust TP for transaction {txn_id}: no account found")
                             failed.append(txn_id)
                             continue
+                        
+                        logger.info(f"[Batch TP] Transaction {txn_id}: found account")
                         
                         # Check if existing TP order exists
                         session = get_db()
                         existing_tp_order = None
                         try:
+                            # Look for existing limit orders (SELL_LIMIT for long positions, BUY_LIMIT for short)
+                            tp_side = OrderDirection.SELL if current_open_qty > 0 else OrderDirection.BUY
+                            tp_types = [OrderType.SELL_LIMIT, OrderType.BUY_LIMIT]
+                            
                             statement = select(TradingOrder).where(
                                 TradingOrder.transaction_id == txn_id,
-                                TradingOrder.type == OrderType.LIMIT,
-                                TradingOrder.side == (OrderDirection.SELL if txn.get_current_open_qty() > 0 else OrderDirection.BUY)
+                                TradingOrder.type.in_(tp_types),
+                                TradingOrder.side == tp_side
                             )
                             results = session.exec(statement).all()
+                            logger.info(f"[Batch TP] Transaction {txn_id}: found {len(results)} existing TP orders")
                             # Find the TP order (typically a SELL limit for long positions)
                             for order in results:
                                 if order.limit_price and order.limit_price > txn.open_price:
                                     existing_tp_order = order
+                                    logger.info(f"[Batch TP] Transaction {txn_id}: selected TP order {order.alpaca_order_id}")
                                     break
                         except Exception as e:
-                            logger.debug(f"Could not check for existing TP order: {e}")
+                            logger.error(f"[Batch TP] Could not check for existing TP order for transaction {txn_id}: {e}", exc_info=True)
                         finally:
                             session.close()
                         
                         if existing_tp_order:
                             # Modify existing TP order using Alpaca modify_order
-                            logger.info(f"Modifying existing TP order {existing_tp_order.alpaca_order_id} for transaction {txn_id}")
+                            logger.info(f"[Batch TP] Transaction {txn_id}: modifying existing TP order {existing_tp_order.alpaca_order_id}")
                             try:
                                 from ...core.models import TradingOrder as TO
+                                
+                                # Use the correct OrderType based on side
+                                tp_type = OrderType.SELL_LIMIT if existing_tp_order.side == OrderDirection.SELL else OrderType.BUY_LIMIT
                                 
                                 # Create modified trading order with new limit price
                                 modified_order = TO(
                                     symbol=txn.symbol,
                                     quantity=existing_tp_order.quantity,
                                     side=existing_tp_order.side,
-                                    type=OrderType.LIMIT,
+                                    type=tp_type,
                                     limit_price=new_tp_price,
                                     good_for=existing_tp_order.good_for or 'day'
                                 )
                                 
                                 # Use account's modify_order method
                                 result = account.modify_order(existing_tp_order.alpaca_order_id, modified_order)
+                                logger.info(f"[Batch TP] Transaction {txn_id}: modify_order result={result}")
                                 if result:
                                     existing_tp_order.limit_price = new_tp_price
                                     update_instance(existing_tp_order)
                                     success_count += 1
                                     existing_tp_modified.append(txn_id)
-                                    logger.info(f"Successfully modified TP for transaction {txn_id}")
+                                    logger.info(f"[Batch TP] Transaction {txn_id}: ✓ Successfully modified TP to ${new_tp_price:.2f}")
                                 else:
                                     failed.append(txn_id)
-                                    logger.error(f"Failed to modify TP order for transaction {txn_id}")
+                                    logger.error(f"[Batch TP] Transaction {txn_id}: ✗ Failed to modify TP order (modify_order returned falsy)")
                             except Exception as e:
-                                logger.error(f"Error modifying TP order for transaction {txn_id}: {e}")
+                                logger.error(f"[Batch TP] Transaction {txn_id}: ✗ Error modifying TP order: {e}", exc_info=True)
                                 failed.append(txn_id)
                         else:
                             # No existing TP order
                             # If position is already filled (open qty matches entry qty), submit market TP order
                             # Otherwise, just update the TP field for later order creation
                             
-                            open_qty = txn.get_current_open_qty()
+                            open_qty = current_open_qty
                             entry_qty = txn.quantity
+                            logger.info(f"[Batch TP] Transaction {txn_id}: no existing TP order. open_qty={open_qty}, entry_qty={entry_qty}")
                             
                             if open_qty > 0 and open_qty == entry_qty:
                                 # Position is filled - submit TP limit order directly to market
-                                logger.info(f"Position filled for transaction {txn_id}. Submitting TP limit order to market at ${new_tp_price:.2f}")
+                                logger.info(f"[Batch TP] Transaction {txn_id}: position filled, submitting TP limit order at ${new_tp_price:.2f}")
                                 try:
                                     # Determine sell side based on position direction
                                     # If we bought (went long), we sell to take profit
                                     tp_side = OrderDirection.SELL if entry_qty > 0 else OrderDirection.BUY
+                                    
+                                    # Use the correct OrderType based on side
+                                    tp_type = OrderType.SELL_LIMIT if entry_qty > 0 else OrderType.BUY_LIMIT
                                     
                                     # Create and submit TP limit order
                                     tp_order = TradingOrder(
                                         symbol=txn.symbol,
                                         quantity=open_qty,
                                         side=tp_side,
-                                        type=OrderType.LIMIT,
+                                        type=tp_type,
                                         limit_price=new_tp_price,
                                         transaction_id=txn_id,
                                         good_for='day'
@@ -4158,31 +4220,32 @@ class TransactionsTab:
                                     # Submit to market via account
                                     # Note: account.submit_order() handles database persistence internally
                                     alpaca_order = account.submit_order(tp_order)
+                                    logger.info(f"[Batch TP] Transaction {txn_id}: submit_order result={alpaca_order is not None}")
                                     if alpaca_order:
                                         success_count += 1
                                         new_tp_created.append(txn_id)
-                                        logger.info(f"Successfully submitted TP limit order for transaction {txn_id}")
+                                        logger.info(f"[Batch TP] Transaction {txn_id}: ✓ Successfully submitted TP limit order")
                                     else:
                                         failed.append(txn_id)
-                                        logger.error(f"Failed to submit TP order for transaction {txn_id}")
+                                        logger.error(f"[Batch TP] Transaction {txn_id}: ✗ Failed to submit TP order (submit_order returned None)")
                                 except Exception as e:
-                                    logger.error(f"Error submitting TP order for transaction {txn_id}: {e}")
+                                    logger.error(f"[Batch TP] Transaction {txn_id}: ✗ Error submitting TP order: {e}", exc_info=True)
                                     failed.append(txn_id)
                             else:
                                 # Position not yet filled - just update the TP field for later
-                                logger.info(f"Position not yet filled for transaction {txn_id}. Updating TP field to ${new_tp_price:.2f}")
+                                logger.info(f"[Batch TP] Transaction {txn_id}: position not yet filled, updating TP field to ${new_tp_price:.2f}")
                                 try:
                                     txn.take_profit = new_tp_price
                                     update_instance(txn)
                                     success_count += 1
                                     new_tp_created.append(txn_id)
-                                    logger.info(f"Successfully updated TP field for transaction {txn_id}")
+                                    logger.info(f"[Batch TP] Transaction {txn_id}: ✓ Successfully updated TP field")
                                 except Exception as e:
-                                    logger.error(f"Error updating TP field for transaction {txn_id}: {e}")
+                                    logger.error(f"[Batch TP] Transaction {txn_id}: ✗ Error updating TP field: {e}", exc_info=True)
                                     failed.append(txn_id)
                     
                     except Exception as e:
-                        logger.error(f"Error processing transaction {txn_id}: {e}")
+                        logger.error(f"Error processing transaction {txn_id}: {e}", exc_info=True)
                         failed.append(txn_id)
                 
                 # Schedule UI update with detailed results
