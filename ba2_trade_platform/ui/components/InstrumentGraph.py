@@ -144,6 +144,32 @@ class InstrumentGraph:
                                    f"non-NaN values: {non_nan_count}/{total_values}")
             
             # Categorize indicators by type
+            # Static mapping based on indicator definitions from MarketIndicatorsInterface
+            INDICATOR_CATEGORIES = {
+                # Moving Averages - display on price chart
+                'close 50 sma': 'price',
+                'close 200 sma': 'price',
+                'close 10 ema': 'price',
+                
+                # MACD - display on momentum subplot
+                'macd': 'momentum',
+                'macds': 'momentum',
+                'macdh': 'momentum',
+                
+                # Oscillators - display on oscillator subplot
+                'rsi': 'oscillator',
+                'mfi': 'oscillator',
+                
+                # Volatility - ATR on momentum subplot
+                'atr': 'momentum',
+                'boll': 'price',
+                'boll ub': 'price',
+                'boll lb': 'price',
+                
+                # Volume - volume-weighted MA on price chart
+                'vwma': 'price',
+            }
+            
             price_indicators = []  # Same scale as price
             oscillators = []  # 0-100 scale (RSI, Stochastic, Williams %R, etc.)
             momentum_indicators = []  # MACD, momentum, etc.
@@ -155,28 +181,43 @@ class InstrumentGraph:
                     
                 indicator_lower = indicator_name.lower()
                 
-                # Categorize based on indicator name
-                if any(x in indicator_lower for x in ['ma_', 'ema_', 'sma_', 'wma', 'bollinger', 'vwap', 'keltner', 'envelope', 'pivot']):
+                # Try to find in static mapping first
+                category = INDICATOR_CATEGORIES.get(indicator_lower)
+                
+                if category == 'price':
                     price_indicators.append(indicator_name)
-                elif any(x in indicator_lower for x in ['rsi', 'stoch', 'williams', 'cci', 'roc', 'mfi']):
+                elif category == 'oscillator':
                     oscillators.append(indicator_name)
-                elif any(x in indicator_lower for x in ['macd', 'momentum', 'trix', 'ppo', 'atr']):
+                elif category == 'momentum':
                     momentum_indicators.append(indicator_name)
                 else:
-                    # Try to auto-detect by checking value ranges
-                    indicator_df = self.indicators_data[indicator_name]
-                    if not indicator_df.empty:
-                        for col in indicator_df.columns:
-                            if indicator_df[col].dtype in ['float64', 'int64']:
-                                values = indicator_df[col].dropna()
-                                if len(values) > 0:
-                                    min_val, max_val = values.min(), values.max()
-                                    # If values are in 0-100 range, likely an oscillator
-                                    if 0 <= min_val and max_val <= 100:
-                                        oscillators.append(indicator_name)
-                                    else:
-                                        other_indicators.append(indicator_name)
-                                break
+                    # Fallback: try pattern matching for unmapped indicators
+                    if any(x in indicator_lower for x in ['ma', 'ema', 'sma', 'wma', 'bollinger', 'vwap', 'keltner', 'envelope', 'pivot']):
+                        price_indicators.append(indicator_name)
+                        logger.debug(f"Indicator '{indicator_name}' mapped to price (pattern match)")
+                    elif any(x in indicator_lower for x in ['rsi', 'stoch', 'williams', 'cci', 'roc', 'mfi']):
+                        oscillators.append(indicator_name)
+                        logger.debug(f"Indicator '{indicator_name}' mapped to oscillator (pattern match)")
+                    elif any(x in indicator_lower for x in ['macd', 'momentum', 'trix', 'ppo', 'atr']):
+                        momentum_indicators.append(indicator_name)
+                        logger.debug(f"Indicator '{indicator_name}' mapped to momentum (pattern match)")
+                    else:
+                        # Try to auto-detect by checking value ranges as last resort
+                        indicator_df = self.indicators_data[indicator_name]
+                        if not indicator_df.empty:
+                            for col in indicator_df.columns:
+                                if indicator_df[col].dtype in ['float64', 'int64']:
+                                    values = indicator_df[col].dropna()
+                                    if len(values) > 0:
+                                        min_val, max_val = values.min(), values.max()
+                                        # If values are in 0-100 range, likely an oscillator
+                                        if 0 <= min_val and max_val <= 100:
+                                            oscillators.append(indicator_name)
+                                            logger.debug(f"Indicator '{indicator_name}' mapped to oscillator (auto-detect: 0-100 range)")
+                                        else:
+                                            other_indicators.append(indicator_name)
+                                            logger.debug(f"Indicator '{indicator_name}' mapped to other (auto-detect: range {min_val}-{max_val})")
+                                    break
             
             # Determine subplot structure
             subplot_titles = ['Price & Volume']

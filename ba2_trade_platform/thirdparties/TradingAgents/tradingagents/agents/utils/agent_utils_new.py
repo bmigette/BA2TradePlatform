@@ -295,7 +295,7 @@ class Toolkit:
             if lookback_days is None:
                 from ...dataflows.config import get_config
                 config = get_config()
-                lookback_days = config.get("news_lookback_days", 7)
+                lookback_days = config["news_lookback_days"]
             
             results = []
             for provider_class in self.provider_map["news"]:
@@ -368,7 +368,7 @@ class Toolkit:
             if lookback_days is None:
                 from ...dataflows.config import get_config
                 config = get_config()
-                lookback_days = config.get("news_lookback_days", 7)
+                lookback_days = config["news_lookback_days"]
             
             results = []
             for provider_class in self.provider_map["news"]:
@@ -450,7 +450,7 @@ class Toolkit:
             if lookback_days is None:
                 from ...dataflows.config import get_config
                 config = get_config()
-                lookback_days = config.get("news_lookback_days", 7)
+                lookback_days = config["news_lookback_days"]
             
             results = []
             for provider_class in self.provider_map["social_media"]:
@@ -528,7 +528,7 @@ class Toolkit:
             if lookback_days is None:
                 from ...dataflows.config import get_config
                 config = get_config()
-                lookback_days = config.get("economic_data_days", 90)
+                lookback_days = config["economic_data_days"]
             
             results = []
             for provider_class in self.provider_map["insider"]:
@@ -602,7 +602,7 @@ class Toolkit:
             if lookback_days is None:
                 from ...dataflows.config import get_config
                 config = get_config()
-                lookback_days = config.get("economic_data_days", 90)
+                lookback_days = config["economic_data_days"]
             
             results = []
             for provider_class in self.provider_map["insider"]:
@@ -1078,7 +1078,7 @@ class Toolkit:
             if interval is None:
                 from ...dataflows.config import get_config
                 config = get_config()
-                interval = config.get("timeframe", "1d")
+                interval = config["timeframe"]
             
             # Try each provider in order until one succeeds (fallback logic)
             for provider_class in self.provider_map["ohlcv"]:
@@ -1200,7 +1200,7 @@ class Toolkit:
             if interval is None:
                 from ...dataflows.config import get_config
                 config = get_config()
-                interval = config.get("timeframe", "1d")
+                interval = config["timeframe"]
             
             # Try each provider in order until one succeeds (fallback logic)
             for provider_class in self.provider_map["indicators"]:
@@ -1313,7 +1313,7 @@ class Toolkit:
             if lookback_days is None:
                 from ...dataflows.config import get_config
                 config = get_config()
-                lookback_days = config.get("economic_data_days", 90)
+                lookback_days = config["economic_data_days"]
             
             results = []
             for provider_class in self.provider_map["macro"]:
@@ -1389,7 +1389,7 @@ class Toolkit:
             if lookback_days is None:
                 from ...dataflows.config import get_config
                 config = get_config()
-                lookback_days = config.get("economic_data_days", 90)
+                lookback_days = config["economic_data_days"]
             
             results = []
             for provider_class in self.provider_map["macro"]:
@@ -1465,7 +1465,7 @@ class Toolkit:
             if lookback_days is None:
                 from ...dataflows.config import get_config
                 config = get_config()
-                lookback_days = config.get("economic_data_days", 90)
+                lookback_days = config["economic_data_days"]
             
             results = []
             for provider_class in self.provider_map["macro"]:

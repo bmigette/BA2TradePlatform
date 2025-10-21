@@ -120,7 +120,29 @@ logger.error("Error conditions", exc_info=True)  # Include exc_info=True ONLY in
    - Expected error conditions (e.g., "Record not found")
    - Any error logging outside an `except` block
 
-### 5. **Live Data Handling**
+### 5. **Configuration Access - NEVER Use Defaults**
+**CRITICAL RULE**: Always access configuration with explicit dict access `config["key"]`, NEVER with `config.get("key", default)`:
+- ✅ **ALWAYS DO THIS**: `model = config["quick_think_llm"]` - Will raise `KeyError` if missing
+- ✅ **ALWAYS DO THIS**: `lookback_days = config["news_lookback_days"]` - Fails loudly on missing config
+- ❌ **NEVER DO THIS**: `model = config.get("quick_think_llm", "gpt-3.5-turbo")` - Hides configuration errors
+- ❌ **NEVER DO THIS**: `lookback_days = config.get("news_lookback_days", 7)` - Uses unpredictable defaults
+
+**Rationale**: Silent fallbacks lead to unpredictable behavior. Configuration errors should fail immediately and explicitly. This ensures:
+- Missing required configuration is caught early during development
+- No silent mode switches (e.g., gpt-3.5-turbo instead of intended model)
+- Explicit error messages for troubleshooting (KeyError tells you exactly which config key is missing)
+
+**Exception Handling Pattern**:
+```python
+try:
+    model = config["quick_think_llm"]
+    lookback_days = config["news_lookback_days"]
+except KeyError as e:
+    logger.error(f"Missing required configuration key: {e}", exc_info=True)
+    raise  # Let it fail explicitly for operator to fix configuration
+```
+
+### 6. **Live Data Handling**
 **CRITICAL RULE**: Never use default values or fallbacks for live market data (prices, balances, quantities, etc.):
 - ❌ **NEVER DO THIS**: `price = recommendation.current_price or 1.0`
 - ❌ **NEVER DO THIS**: `balance = account.get_balance() or 0.0`
@@ -129,7 +151,7 @@ logger.error("Error conditions", exc_info=True)  # Include exc_info=True ONLY in
 
 **Rationale**: Using default values for financial data can lead to catastrophic trading errors, incorrect position sizing, and financial loss. Always fail explicitly rather than proceeding with fake data.
 
-### 6. **Confidence Level Handling**
+### 7. **Confidence Level Handling**
 **CRITICAL RULE**: Confidence values are **always stored as 1-100 scale** in the database, never divided or multiplied:
 - ✅ **ALWAYS DO THIS**: Store confidence as 1-100 (e.g., 78.1 means 78.1% confidence)
 - ✅ **ALWAYS DO THIS**: Display using `f"{confidence:.1f}%"` format (e.g., "78.1%")
@@ -154,7 +176,7 @@ print(f"Confidence: {confidence:.1%}")  # Expects 0-1, we have 1-100!
 
 **Rationale**: Consistency across all experts and UI components. All confidence values use the same 1-100 scale to avoid conversion errors and confusion.
 
-### 7. **Data Provider format_type Parameter**
+### 8. **Data Provider format_type Parameter**
 **CRITICAL RULE**: All providers with `format_type` parameter MUST support all three formats with consistent behavior:
 
 ```python

@@ -16,9 +16,9 @@ class FinancialSituationMemory:
             embedding_api_key_setting = None
         else:
             # Use embedding-specific config if available, otherwise fallback to main backend_url
-            self.embedding = config.get("embedding_model", "text-embedding-3-small")
-            embedding_backend_url = config.get("embedding_backend_url", config.get("backend_url", "https://api.openai.com/v1"))
-            embedding_api_key_setting = config.get("embedding_api_key_setting", config.get("api_key_setting", "openai_api_key"))
+            self.embedding = config["embedding_model"]
+            embedding_backend_url = config["embedding_backend_url"]
+            embedding_api_key_setting = config["embedding_api_key_setting"]
             
         # Get API key from config
         try:

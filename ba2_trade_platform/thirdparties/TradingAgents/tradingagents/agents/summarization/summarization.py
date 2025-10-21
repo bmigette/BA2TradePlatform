@@ -41,26 +41,20 @@ class ExpertRecommendation(BaseModel):
 
 def create_final_summarization_agent(llm):
     """
-    Create a summarization agent using LangChain's structured output
+    Create a summarization agent using JsonOutputParser for structured output.
+    Works reliably with OpenAI and NagaAI (OpenAI client) without requiring
+    provider-specific structured output APIs.
     
     Args:
-        llm: The language model to use
+        llm: The language model to use (OpenAI or NagaAI via OpenAI client)
         
     Returns:
         Function that can be used as a LangGraph node
     """
     
-    # Set up structured output using Pydantic
-    try:
-        # Try to use with_structured_output if available (newer LangChain versions)
-        structured_llm = llm.with_structured_output(ExpertRecommendation)
-        use_structured_output = True
-        logger.debug("Using LangChain structured output with Pydantic")
-    except AttributeError:
-        # Fallback to PydanticOutputParser for older versions
-        parser = PydanticOutputParser(pydantic_object=ExpertRecommendation)
-        use_structured_output = False
-        logger.debug("Using PydanticOutputParser fallback")
+    # Use JsonOutputParser for reliable JSON output extraction
+    # This works with both OpenAI and NagaAI without API compatibility issues
+    json_parser = JsonOutputParser(pydantic_object=ExpertRecommendation)
     
     def summarization_agent_node(state: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -78,32 +72,21 @@ def create_final_summarization_agent(llm):
             # Get the summarization prompt
             system_prompt = get_prompt("final_summarization")
             
-            if use_structured_output:
-                # Use structured output directly
-                prompt = ChatPromptTemplate.from_messages([
-                    ("system", system_prompt),
-                    ("human", "Analyze the following comprehensive trading analysis and generate a structured JSON recommendation:\n\n{analysis_context}")
-                ])
-                
-                chain = prompt | structured_llm
-                recommendation = chain.invoke({"analysis_context": analysis_context})
-                
-                # Convert Pydantic model to dict
-                if hasattr(recommendation, 'model_dump'):
-                    recommendation_dict = recommendation.model_dump()
-                else:
-                    recommendation_dict = recommendation.dict()
-                    
-            else:
-                # Use parser fallback
-                prompt = ChatPromptTemplate.from_messages([
-                    ("system", system_prompt + "\n\n" + parser.get_format_instructions()),
-                    ("human", "Analyze the following comprehensive trading analysis and generate a structured JSON recommendation:\n\n{analysis_context}")
-                ])
-                
-                chain = prompt | llm | parser
-                recommendation = chain.invoke({"analysis_context": analysis_context})
-                recommendation_dict = recommendation.dict() if hasattr(recommendation, 'dict') else dict(recommendation)
+            # Build prompt with JSON format instructions
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", system_prompt),
+                ("human", "Analyze the following comprehensive trading analysis and generate a structured JSON recommendation.\n\n{format_instructions}\n\nAnalysis:\n{analysis_context}")
+            ])
+            logger.debug(f"Json format instructions : {json_parser.get_format_instructions()}")
+            # Chain: prompt -> LLM -> JSON parser
+            chain = prompt | llm | json_parser
+            recommendation = chain.invoke({
+                "format_instructions": json_parser.get_format_instructions(),
+                "analysis_context": analysis_context
+            })
+            
+            # recommendation is already parsed as dict from JsonOutputParser
+            recommendation_dict = recommendation
             
             # Store in state
             state["expert_recommendation"] = recommendation_dict
@@ -218,7 +201,7 @@ def _prepare_analysis_context(state: Dict[str, Any], symbol: str, current_price:
 
 def _create_fallback_recommendation(state: Dict[str, Any], symbol: str, current_price: float, error_msg: str) -> Dict[str, Any]:
     """Create a fallback recommendation when structured output fails"""
-    
+    logger.error(f"Creating fallback recommendation due to error: {error_msg}")
     return {
         "symbol": symbol,
         "recommended_action": "HOLD",
@@ -252,13 +235,15 @@ def create_langgraph_summarization_node(config: Dict[str, Any]):
     """
     logger.warning("create_langgraph_summarization_node is deprecated. Use create_final_summarization_agent instead.")
     
-    # Try to get LLM from config
+    # Try to get LLM from config - require explicit config key, no defaults
     try:
         from langchain_openai import ChatOpenAI
-        llm = ChatOpenAI(model=config.get("quick_think_llm", "gpt-3.5-turbo"))
+        # Will raise KeyError if "quick_think_llm" is not configured
+        model = config["quick_think_llm"]
+        llm = ChatOpenAI(model=model)
         return create_final_summarization_agent(llm)
-    except Exception as e:
-        logger.error(f"Could not create summarization agent: {e}", exc_info=True)
+    except KeyError as e:
+        logger.error(f"Missing required configuration key: {e}", exc_info=True)
         
         def error_node(state: Dict[str, Any]) -> Dict[str, Any]:
             state["expert_recommendation"] = _create_fallback_recommendation(
