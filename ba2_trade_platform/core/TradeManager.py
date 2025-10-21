@@ -135,6 +135,12 @@ class TradeManager:
         try:
             from sqlmodel import select
             from .db import get_db
+            from ..modules.accounts import get_account_class
+            from .models import AccountDefinition
+            
+            # PHASE 1: Collect all orders to process WHILE session is open
+            orders_to_submit = []  # List of (order_id, order_data, account_def, symbol, parent_id, trigger_status)
+            status_updates = {}  # Map of order_id -> new_status for terminal status syncs
             
             with get_db() as session:
                 # Get all orders that have dependencies (depends_on_order is not None)
@@ -143,11 +149,8 @@ class TradeManager:
                 
                 self.logger.debug(f"Checking {len(dependent_orders)} orders with dependencies for triggering")
                 
-                triggered_orders = []
-                
                 for dependent_order in dependent_orders:
                     if dependent_order.status != OrderStatus.WAITING_TRIGGER:
-                        #self.logger.debug(f"Skipping order {dependent_order.id} - status is {dependent_order.status}, not WAITING_TRIGGER")
                         continue  # Only process orders waiting for triggers
                         
                     parent_order_id = dependent_order.depends_on_order
@@ -175,13 +178,10 @@ class TradeManager:
                             f"Parent order {parent_order_id} is in terminal status {current_status}. "
                             f"Syncing dependent order {dependent_order.id} from WAITING_TRIGGER to {current_status}"
                         )
-                        dependent_order.status = current_status
-                        session.add(dependent_order)
+                        status_updates[dependent_order.id] = current_status
                         continue
                     
                     # Check if parent order has reached the trigger status
-                    # We don't check pre_status because the order might have already been in this status,
-                    # or it might have transitioned through multiple states in a single refresh
                     if current_status == trigger_status:
                         self.logger.info(f"Order {parent_order_id} is in status {trigger_status}, triggering dependent order {dependent_order.id}")
                         
@@ -193,85 +193,111 @@ class TradeManager:
                                     f"(symbol: {parent_order.symbol}) to dependent order {dependent_order.id} (symbol: {dependent_order.symbol})"
                                 )
                                 dependent_order.quantity = parent_order.quantity
-                                session.add(dependent_order)
                             else:
                                 self.logger.error(
                                     f"Cannot submit dependent order {dependent_order.id} (symbol: {dependent_order.symbol}): "
                                     f"quantity is 0 and parent order {parent_order_id} (symbol: {parent_order.symbol}) "
                                     f"also has quantity 0. Setting dependent order to ERROR status."
                                 )
-                                dependent_order.status = OrderStatus.ERROR
-                                session.add(dependent_order)
+                                status_updates[dependent_order.id] = OrderStatus.ERROR
                                 continue
                         
-                        # Get the account for this dependent order using its account_id
-                        from ..modules.accounts import get_account_class
-                        from .models import AccountDefinition
-                        
-                        # Get the account definition for this order
+                        # Get the account for this dependent order
                         account_def = session.get(AccountDefinition, dependent_order.account_id)
                         if not account_def:
                             self.logger.error(f"Account definition {dependent_order.account_id} not found for dependent order {dependent_order.id}")
                             continue
-                            
-                        account_class = get_account_class(account_def.provider)
-                        if not account_class:
-                            self.logger.error(f"Account provider {account_def.provider} not found for dependent order {dependent_order.id}")
-                            continue
-                            
-                        account = account_class(account_def.id)
                         
-                        # Double-check quantity one more time before submit
+                        # Double-check quantity one more time before adding to submit list
                         if dependent_order.quantity <= 0:
                             self.logger.error(
                                 f"Dependent order {dependent_order.id} (symbol: {dependent_order.symbol}) "
-                                f"still has invalid quantity {dependent_order.quantity} after parent copy attempt. "
+                                f"still has invalid quantity {dependent_order.quantity}. "
                                 f"Parent order {parent_order_id} (symbol: {parent_order.symbol}) quantity: {parent_order.quantity}. "
                                 f"Setting to ERROR status."
                             )
-                            dependent_order.status = OrderStatus.ERROR
-                            session.add(dependent_order)
+                            status_updates[dependent_order.id] = OrderStatus.ERROR
                             continue
                         
-                        # Submit the dependent order
-                        try:
-                            self.logger.info(
-                                f"Submitting dependent order {dependent_order.id}: {dependent_order.side.value} "
-                                f"{dependent_order.quantity} {dependent_order.symbol} @ {dependent_order.order_type.value} "
-                                f"(triggered by parent order {parent_order_id})"
-                            )
-                            submitted_order = account.submit_order(dependent_order)
-                            
-                            if submitted_order:
-                                # Refresh dependent_order from database to get latest state (including broker_order_id)
-                                session.refresh(dependent_order)
-                                self.logger.info(f"Successfully submitted dependent order {dependent_order.id} triggered by parent order {parent_order_id}")
-                                triggered_orders.append(dependent_order.id)
-                            else:
-                                self.logger.error(
-                                    f"Failed to submit dependent order {dependent_order.id} (symbol: {dependent_order.symbol}) - "
-                                    f"setting to ERROR status"
-                                )
-                                # Set to ERROR status so it doesn't stay stuck
-                                dependent_order.status = OrderStatus.ERROR
-                                session.add(dependent_order)
-                        except Exception as submit_error:
-                            self.logger.error(
-                                f"Exception submitting dependent order {dependent_order.id} (symbol: {dependent_order.symbol}, "
-                                f"qty: {dependent_order.quantity}): {submit_error}",
-                                exc_info=True
-                            )
-                            # Set to ERROR status on exception
-                            dependent_order.status = OrderStatus.ERROR
-                            session.add(dependent_order)
-                        
-                if triggered_orders:
+                        # Add to submit list (all data needed is extracted - expunge dependent_order to reduce session load)
+                        # Store a copy of order data since we'll lose session access after closing
+                        order_copy = {
+                            'id': dependent_order.id,
+                            'side': dependent_order.side,
+                            'quantity': dependent_order.quantity,
+                            'symbol': dependent_order.symbol,
+                            'order_type': dependent_order.order_type,
+                            'account_id': dependent_order.account_id,
+                            'account_def': account_def,
+                        }
+                        orders_to_submit.append((dependent_order, parent_order_id))
+                
+                # PHASE 1 COMPLETE: Session is still open, now apply any status-only updates
+                for order_id, new_status in status_updates.items():
+                    order_obj = session.get(TradingOrder, order_id)
+                    if order_obj:
+                        order_obj.status = new_status
+                        session.add(order_obj)
+                
+                if status_updates:
                     session.commit()
-                    self.logger.info(f"Triggered {len(triggered_orders)} dependent orders: {triggered_orders}")
-                else:
-                    self.logger.debug("No dependent orders were triggered")
+                    self.logger.debug(f"Applied {len(status_updates)} status-only updates")
+                # Session will close here
+            
+            # PHASE 2: Process all order submissions OUTSIDE of session context
+            # This prevents the session from holding locks during broker API calls and writes
+            submitted_count = 0
+            for dependent_order, parent_order_id in orders_to_submit:
+                try:
+                    account_def = get_instance(AccountDefinition, dependent_order.account_id)
+                    if not account_def:
+                        self.logger.error(f"Account definition {dependent_order.account_id} not found for dependent order {dependent_order.id}")
+                        # Update status to ERROR
+                        dependent_order.status = OrderStatus.ERROR
+                        update_instance(dependent_order)
+                        continue
                     
-                session.close()
+                    account_class = get_account_class(account_def.provider)
+                    if not account_class:
+                        self.logger.error(f"Account provider {account_def.provider} not found for dependent order {dependent_order.id}")
+                        dependent_order.status = OrderStatus.ERROR
+                        update_instance(dependent_order)
+                        continue
+                    
+                    account = account_class(account_def.id)
+                    
+                    self.logger.info(
+                        f"Submitting dependent order {dependent_order.id}: {dependent_order.side.value} "
+                        f"{dependent_order.quantity} {dependent_order.symbol} @ {dependent_order.order_type.value} "
+                        f"(triggered by parent order {parent_order_id})"
+                    )
+                    submitted_order = account.submit_order(dependent_order)
+                    
+                    if submitted_order:
+                        self.logger.info(f"Successfully submitted dependent order {dependent_order.id} triggered by parent order {parent_order_id}")
+                        submitted_count += 1
+                    else:
+                        self.logger.error(
+                            f"Failed to submit dependent order {dependent_order.id} (symbol: {dependent_order.symbol}) - "
+                            f"setting to ERROR status"
+                        )
+                        dependent_order.status = OrderStatus.ERROR
+                        update_instance(dependent_order)
+                        
+                except Exception as submit_error:
+                    self.logger.error(
+                        f"Exception submitting dependent order {dependent_order.id} (symbol: {dependent_order.symbol}, "
+                        f"qty: {dependent_order.quantity}): {submit_error}",
+                        exc_info=True
+                    )
+                    dependent_order.status = OrderStatus.ERROR
+                    try:
+                        update_instance(dependent_order)
+                    except Exception as update_error:
+                        self.logger.error(f"Could not update order {dependent_order.id} to ERROR status: {update_error}")
+            
+            if submitted_count > 0:
+                self.logger.info(f"Triggered {submitted_count} dependent orders")
                 
         except Exception as e:
             self.logger.error(f"Error checking order status changes: {e}", exc_info=True)
@@ -286,6 +312,12 @@ class TradeManager:
         try:
             from sqlmodel import select
             from .db import get_db
+            from ..modules.accounts import get_account_class
+            from .models import AccountDefinition
+            
+            # PHASE 1: Collect all orders to process WHILE session is open
+            orders_to_submit = []  # List of (order, parent_order_id)
+            status_updates = {}  # Map of order_id -> new_status
             
             with get_db() as session:
                 # Get all orders in WAITING_TRIGGER status
@@ -302,8 +334,6 @@ class TradeManager:
                 
                 self.logger.info(f"Checking {len(waiting_orders)} orders in WAITING_TRIGGER status")
                 
-                triggered_orders = []
-                
                 for dependent_order in waiting_orders:
                     try:
                         parent_order_id = dependent_order.depends_on_order
@@ -313,8 +343,7 @@ class TradeManager:
                         parent_order = session.get(TradingOrder, parent_order_id)
                         if not parent_order:
                             self.logger.warning(f"Parent order {parent_order_id} not found for dependent order {dependent_order.id} - setting to ERROR")
-                            dependent_order.status = OrderStatus.ERROR
-                            session.add(dependent_order)
+                            status_updates[dependent_order.id] = OrderStatus.ERROR
                             continue
                         
                         current_status = parent_order.status
@@ -329,8 +358,7 @@ class TradeManager:
                                 f"Parent order {parent_order_id} is in terminal status {current_status}. "
                                 f"Syncing dependent order {dependent_order.id} from WAITING_TRIGGER to {current_status}"
                             )
-                            dependent_order.status = current_status
-                            session.add(dependent_order)
+                            status_updates[dependent_order.id] = current_status
                             continue
                         
                         # Check if parent order has reached the trigger status
@@ -338,24 +366,11 @@ class TradeManager:
                             self.logger.info(f"Parent order {parent_order_id} is in trigger status {trigger_status}, processing dependent order {dependent_order.id}")
                             
                             # Get the account for this dependent order
-                            from ..modules.accounts import get_account_class
-                            from .models import AccountDefinition
-                            
                             account_def = session.get(AccountDefinition, dependent_order.account_id)
                             if not account_def:
                                 self.logger.error(f"Account definition {dependent_order.account_id} not found for dependent order {dependent_order.id} - setting to ERROR")
-                                dependent_order.status = OrderStatus.ERROR
-                                session.add(dependent_order)
+                                status_updates[dependent_order.id] = OrderStatus.ERROR
                                 continue
-                            
-                            account_class = get_account_class(account_def.provider)
-                            if not account_class:
-                                self.logger.error(f"Account provider {account_def.provider} not found for dependent order {dependent_order.id} - setting to ERROR")
-                                dependent_order.status = OrderStatus.ERROR
-                                session.add(dependent_order)
-                                continue
-                            
-                            account = account_class(account_def.id)
                             
                             # Copy quantity from parent order if dependent order quantity is 0
                             if dependent_order.quantity == 0:
@@ -365,78 +380,97 @@ class TradeManager:
                                         f"(symbol: {parent_order.symbol}) to dependent order {dependent_order.id} (symbol: {dependent_order.symbol})"
                                     )
                                     dependent_order.quantity = parent_order.quantity
-                                    session.add(dependent_order)
                                 else:
                                     self.logger.error(
                                         f"Cannot submit dependent order {dependent_order.id} (symbol: {dependent_order.symbol}): "
                                         f"quantity is 0 and parent order {parent_order_id} (symbol: {parent_order.symbol}) "
                                         f"also has quantity 0. Setting dependent order to ERROR status."
                                     )
-                                    dependent_order.status = OrderStatus.ERROR
-                                    session.add(dependent_order)
+                                    status_updates[dependent_order.id] = OrderStatus.ERROR
                                     continue
                             
-                            # Double-check quantity one more time before submit
+                            # Double-check quantity one more time before adding to submit list
                             if dependent_order.quantity <= 0:
                                 self.logger.error(
                                     f"Dependent order {dependent_order.id} (symbol: {dependent_order.symbol}) "
-                                    f"still has invalid quantity {dependent_order.quantity} after parent copy attempt. "
+                                    f"still has invalid quantity {dependent_order.quantity}. "
                                     f"Parent order {parent_order_id} (symbol: {parent_order.symbol}) quantity: {parent_order.quantity}. "
                                     f"Setting to ERROR status."
                                 )
-                                dependent_order.status = OrderStatus.ERROR
-                                session.add(dependent_order)
+                                status_updates[dependent_order.id] = OrderStatus.ERROR
                                 continue
                             
-                            # Submit the dependent order
-                            try:
-                                self.logger.info(
-                                    f"Submitting dependent order {dependent_order.id}: {dependent_order.side.value} "
-                                    f"{dependent_order.quantity} {dependent_order.symbol} @ {dependent_order.order_type.value} "
-                                    f"(triggered by parent order {parent_order_id})"
-                                )
-                                submitted_order = account.submit_order(dependent_order)
-                                
-                                if submitted_order:
-                                    # Use the fresh order returned by submit_order (has broker_order_id)
-                                    # Refresh dependent_order from database to get latest state
-                                    session.refresh(dependent_order)
-                                    self.logger.info(f"Successfully submitted dependent order {dependent_order.id}")
-                                    triggered_orders.append(dependent_order.id)
-                                else:
-                                    self.logger.error(
-                                        f"Failed to submit dependent order {dependent_order.id} (symbol: {dependent_order.symbol}) - "
-                                        f"setting to ERROR status"
-                                    )
-                                    dependent_order.status = OrderStatus.ERROR
-                                    session.add(dependent_order)
-                            except Exception as submit_error:
-                                self.logger.error(
-                                    f"Exception submitting dependent order {dependent_order.id} (symbol: {dependent_order.symbol}, "
-                                    f"qty: {dependent_order.quantity}): {submit_error}",
-                                    exc_info=True
-                                )
-                                dependent_order.status = OrderStatus.ERROR
-                                session.add(dependent_order)
+                            # Add to submit list
+                            orders_to_submit.append((dependent_order, parent_order_id))
                     
                     except Exception as order_error:
                         self.logger.error(f"Error processing waiting order {dependent_order.id}: {order_error}", exc_info=True)
-                        # Set to ERROR on any exception during processing
-                        try:
-                            dependent_order.status = OrderStatus.ERROR
-                            session.add(dependent_order)
-                        except:
-                            pass  # If we can't even set error status, log and continue
+                        status_updates[dependent_order.id] = OrderStatus.ERROR
                 
-                if triggered_orders:
-                    session.commit()
-                    self.logger.info(f"Processed {len(triggered_orders)} waiting trigger orders: {triggered_orders}")
-                else:
-                    # Commit any ERROR status changes
-                    session.commit()
-                    self.logger.debug("No waiting trigger orders were ready to execute")
+                # PHASE 1 COMPLETE: Session is still open, now apply any status-only updates
+                for order_id, new_status in status_updates.items():
+                    order_obj = session.get(TradingOrder, order_id)
+                    if order_obj:
+                        order_obj.status = new_status
+                        session.add(order_obj)
                 
-                session.close()
+                if status_updates:
+                    session.commit()
+                    self.logger.debug(f"Applied {len(status_updates)} status-only updates")
+                # Session will close here
+            
+            # PHASE 2: Process all order submissions OUTSIDE of session context
+            submitted_count = 0
+            for dependent_order, parent_order_id in orders_to_submit:
+                try:
+                    account_def = get_instance(AccountDefinition, dependent_order.account_id)
+                    if not account_def:
+                        self.logger.error(f"Account definition {dependent_order.account_id} not found for dependent order {dependent_order.id}")
+                        dependent_order.status = OrderStatus.ERROR
+                        update_instance(dependent_order)
+                        continue
+                    
+                    account_class = get_account_class(account_def.provider)
+                    if not account_class:
+                        self.logger.error(f"Account provider {account_def.provider} not found for dependent order {dependent_order.id}")
+                        dependent_order.status = OrderStatus.ERROR
+                        update_instance(dependent_order)
+                        continue
+                    
+                    account = account_class(account_def.id)
+                    
+                    self.logger.info(
+                        f"Submitting dependent order {dependent_order.id}: {dependent_order.side.value} "
+                        f"{dependent_order.quantity} {dependent_order.symbol} @ {dependent_order.order_type.value} "
+                        f"(triggered by parent order {parent_order_id})"
+                    )
+                    submitted_order = account.submit_order(dependent_order)
+                    
+                    if submitted_order:
+                        self.logger.info(f"Successfully submitted dependent order {dependent_order.id}")
+                        submitted_count += 1
+                    else:
+                        self.logger.error(
+                            f"Failed to submit dependent order {dependent_order.id} (symbol: {dependent_order.symbol}) - "
+                            f"setting to ERROR status"
+                        )
+                        dependent_order.status = OrderStatus.ERROR
+                        update_instance(dependent_order)
+                        
+                except Exception as submit_error:
+                    self.logger.error(
+                        f"Exception submitting dependent order {dependent_order.id} (symbol: {dependent_order.symbol}, "
+                        f"qty: {dependent_order.quantity}): {submit_error}",
+                        exc_info=True
+                    )
+                    dependent_order.status = OrderStatus.ERROR
+                    try:
+                        update_instance(dependent_order)
+                    except Exception as update_error:
+                        self.logger.error(f"Could not update order {dependent_order.id} to ERROR status: {update_error}")
+            
+            if submitted_count > 0:
+                self.logger.info(f"Processed {submitted_count} waiting trigger orders")
                 
         except Exception as e:
             self.logger.error(f"Error checking all waiting trigger orders: {e}", exc_info=True)
@@ -666,9 +700,12 @@ class TradeManager:
                     # The submitted_order instance is now detached, but should have the ID set
                     # Create a simple return value to avoid detached instance issues
                     self.logger.info(f"Order {db_id} successfully placed for {order.symbol}")
-                    
+
                     # Return a fresh instance from the database to avoid detached instance errors
-                    from .db import get_instance
+                    # NOTE: do not import get_instance here - an inner import previously created a
+                    # local variable shadowing the module-level `get_instance`, which caused an
+                    # UnboundLocalError at runtime when exception handling referenced it. Using
+                    # the already-imported `get_instance` from the module scope avoids that bug.
                     return get_instance(TradingOrder, db_id)
                     
         except Exception as e:

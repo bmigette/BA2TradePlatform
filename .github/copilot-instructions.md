@@ -154,6 +154,52 @@ print(f"Confidence: {confidence:.1%}")  # Expects 0-1, we have 1-100!
 
 **Rationale**: Consistency across all experts and UI components. All confidence values use the same 1-100 scale to avoid conversion errors and confusion.
 
+### 7. **Data Provider format_type Parameter**
+**CRITICAL RULE**: All providers with `format_type` parameter MUST support all three formats with consistent behavior:
+
+```python
+format_type: Literal["dict", "markdown", "both"] = "markdown"
+```
+
+**Format Semantics**:
+1. **format_type="markdown"** (DEFAULT): Returns markdown string for LLM consumption
+2. **format_type="dict"** (CRITICAL): Returns JSON-serializable Python dict with STRUCTURED DATA ONLY (NO markdown)
+3. **format_type="both"**: Returns dict with `"text"` (markdown) and `"data"` (structured dict) keys
+
+**Dict Format MUST Be Clean**:
+- ✅ JSON-serializable types only (str, int, float, bool, list, dict, null)
+- ✅ ISO 8601 strings for dates (not datetime objects)
+- ✅ Direct arrays: `"dates": [...], "values": [...]` for visualization
+- ❌ NO markdown content wrapped in dict
+- ❌ NO Python objects (datetime, etc.)
+
+**Implementation Pattern**:
+```python
+def get_indicator(self, ..., format_type: Literal["dict", "markdown", "both"] = "markdown"):
+    # Build CLEAN structured response (no markdown)
+    structured_response = {
+        "symbol": "AAPL",
+        "dates": ["2025-09-22T09:30:00", ...],  # Direct arrays!
+        "values": [72.5, 71.2, ...],
+        "metadata": {"count": 2, "description": "..."}
+    }
+    
+    # Build markdown response (can include data points)
+    markdown_response = {
+        "data": [{"date": ..., "value": ...}],  # OK for markdown
+        "metadata": {...}
+    }
+    
+    if format_type == "dict":
+        return structured_response
+    elif format_type == "both":
+        return {"text": self._format_markdown(markdown_response), "data": structured_response}
+    else:  # markdown
+        return self._format_markdown(markdown_response)
+```
+
+**Rationale**: Separating concerns prevents visualization tools from parsing markdown. Structured dict enables direct data binding without string manipulation. See `docs/DATA_PROVIDER_FORMAT_SPECIFICATION.md` for complete specification.
+
 ## Dependencies
 - **Trading**: `alpaca-py` (primary broker), `yfinance`, `backtrader`
 - **AI/ML**: `langchain-*` ecosystem, `stockstats`

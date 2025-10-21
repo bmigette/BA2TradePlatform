@@ -179,6 +179,11 @@ class PandasIndicatorCalc(MarketIndicatorsInterface):
         
         Uses stockstats library to calculate indicators from Yahoo Finance data.
         Automatically adds buffer days for indicator calculation (moving averages need history).
+        
+        Returns:
+            - format_type="markdown": Markdown-formatted string (for LLM consumption)
+            - format_type="dict": Structured Python dict with dates/values/metadata (not markdown, JSON-serializable)
+            - format_type="both": Dict with "text" (markdown) and "data" (structured dict) keys
         """
         # Validate inputs
         if indicator not in self.SUPPORTED_INDICATOR_KEYS:
@@ -215,8 +220,11 @@ class PandasIndicatorCalc(MarketIndicatorsInterface):
                 interval=interval
             )
             
-            # Convert DataFrame to data points list
+            # Convert DataFrame to data points list and extract arrays for structured format
             data_points = []
+            iso_dates = []
+            values = []
+            
             for _, row in indicator_df.iterrows():
                 try:
                     # Parse date and value
@@ -224,10 +232,14 @@ class PandasIndicatorCalc(MarketIndicatorsInterface):
                     date_obj = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
                     value = float(row["value"])
                     
+                    iso_date = date_obj.isoformat()
                     data_points.append({
-                        "date": date_obj.isoformat(),
+                        "date": iso_date,
                         "value": round(value, 4)
                     })
+                    iso_dates.append(iso_date)
+                    values.append(round(value, 4))
+                    
                 except (ValueError, KeyError) as e:
                     logger.debug(f"Skipping row due to parsing error: {e}")
                     continue
@@ -235,15 +247,39 @@ class PandasIndicatorCalc(MarketIndicatorsInterface):
             # Get indicator metadata from centralized ALL_INDICATORS
             ind_meta = MarketIndicatorsInterface.ALL_INDICATORS[indicator]
             
-            # Build response
-            response = {
+            # Build structured dict response (JSON-serializable, no markdown)
+            # This is used for format_type="dict" and "both"
+            structured_response = {
                 "symbol": symbol.upper(),
                 "indicator": indicator,
                 "indicator_name": ind_meta["name"],
                 "interval": interval,
                 "start_date": actual_start_date.isoformat(),
                 "end_date": end_date.isoformat(),
-                "data": data_points,
+                "dates": iso_dates,  # Structured format: direct arrays
+                "values": values,    # Structured format: direct arrays
+                "metadata": {
+                    "count": len(data_points),
+                    "first_date": iso_dates[0] if iso_dates else None,
+                    "last_date": iso_dates[-1] if iso_dates else None,
+                    "data_type": "float",
+                    "precision": 4,
+                    "description": ind_meta["description"],
+                    "usage": ind_meta["usage"],
+                    "tips": ind_meta["tips"],
+                    "missing_periods": []  # TODO: Calculate from gaps in data
+                }
+            }
+            
+            # Build full response for markdown format (includes data points for reference)
+            markdown_response = {
+                "symbol": symbol.upper(),
+                "indicator": indicator,
+                "indicator_name": ind_meta["name"],
+                "interval": interval,
+                "start_date": actual_start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "data": data_points,  # Keep for backward compatibility
                 "metadata": {
                     "description": ind_meta["description"],
                     "usage": ind_meta["usage"],
@@ -253,14 +289,14 @@ class PandasIndicatorCalc(MarketIndicatorsInterface):
             }
             
             if format_type == "dict":
-                return response
+                return structured_response
             elif format_type == "both":
                 return {
-                    "text": self._format_markdown(response),
-                    "data": response
+                    "text": self._format_markdown(markdown_response),
+                    "data": structured_response
                 }
             else:  # markdown
-                return self._format_markdown(response)
+                return self._format_markdown(markdown_response)
                 
         except Exception as e:
             logger.error(f"Failed to get {indicator} for {symbol}: {e}")

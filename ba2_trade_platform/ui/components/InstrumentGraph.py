@@ -115,6 +115,17 @@ class InstrumentGraph:
             import plotly.graph_objects as go
             from plotly.subplots import make_subplots
             
+            # Align all indicators with price data date range for continuity
+            price_index = self.price_data.index if isinstance(self.price_data.index, pd.DatetimeIndex) else None
+            if price_index is not None:
+                for indicator_name in self.indicators_data.keys():
+                    indicator_df = self.indicators_data[indicator_name]
+                    if not indicator_df.empty and isinstance(indicator_df.index, pd.DatetimeIndex):
+                        # Reindex to match price data, filling with NaN for missing dates
+                        self.indicators_data[indicator_name] = indicator_df.reindex(price_index)
+                        logger.debug(f"Reindexed indicator '{indicator_name}' to match price data: "
+                                   f"before={len(indicator_df)} rows, after={len(self.indicators_data[indicator_name])} rows")
+            
             # Categorize indicators by type
             price_indicators = []  # Same scale as price
             oscillators = []  # 0-100 scale (RSI, Stochastic, Williams %R, etc.)

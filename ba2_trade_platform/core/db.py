@@ -59,7 +59,7 @@ def set_sqlite_pragma(dbapi_conn, connection_record):
 def retry_on_lock(func):
     """Decorator to retry database operations on lock errors with exponential backoff."""
     def wrapper(*args, **kwargs):
-        max_retries = 8  # Increased from 5 to 8 for better resilience
+        max_retries = 4  # Increased from 5 to 8 for better resilience
         base_delay = 1.0  # Start with 1 second (increased from 0.1s)
         max_delay = 30.0  # Cap maximum delay at 30 seconds
         

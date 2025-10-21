@@ -408,6 +408,16 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             return self.toolkit.get_insider_sentiment(symbol, end_date, lookback_days)
         
         @tool
+        def get_earnings_estimates(
+            symbol: str,
+            as_of_date: str,
+            lookback_periods: int = 4,
+            frequency: str = "quarterly"
+        ) -> str:
+            """Get forward earnings estimates from analysts for the next periods."""
+            return self.toolkit.get_earnings_estimates(symbol, as_of_date, lookback_periods, frequency)
+        
+        @tool
         def get_economic_indicators(
             end_date: str,
             lookback_days: int = None,
@@ -462,6 +472,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                     get_cashflow_statement,
                     get_insider_transactions,
                     get_insider_sentiment,
+                    get_earnings_estimates,
                 ],
                 self.market_analysis_id,
                 model_info=model_info
@@ -551,7 +562,8 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                     if len(chunk["messages"]) == 0:
                         pass
                     else:
-                        chunk["messages"][-1].pretty_print()
+                        # Log message to logger instead of printing to console
+                        self._log_message(chunk["messages"][-1])
                         trace.append(chunk)
                         step_count += 1
                         
@@ -817,3 +829,61 @@ class TradingAgentsGraph(DatabaseStorageMixin):
     def process_signal(self, full_signal):
         """Process a signal to extract the core decision."""
         return self.signal_processor.process_signal(full_signal)
+
+    def _log_message(self, message) -> None:
+        """
+        Log a LangChain message object to the logger instead of printing to stdout.
+        
+        This replaces pretty_print() to capture Tool Messages and all LLM communication
+        in the log files.
+        
+        Args:
+            message: A LangChain BaseMessage object to log
+        """
+        try:
+            from langchain_core.messages import (
+                HumanMessage, AIMessage, ToolMessage, SystemMessage, BaseMessage
+            )
+            
+            if isinstance(message, ToolMessage):
+                # Format Tool Messages
+                logger.info(f"{'=' * 80}")
+                logger.info(f"Tool Message")
+                logger.info(f"{'=' * 80}")
+                logger.info(f"Tool: {message.tool_calls[0]['name'] if hasattr(message, 'tool_calls') and message.tool_calls else 'Unknown'}")
+                logger.info(f"Tool ID: {message.tool_call_id if hasattr(message, 'tool_call_id') else 'N/A'}")
+                if hasattr(message, 'content') and message.content:
+                    content = message.content if isinstance(message.content, str) else str(message.content)
+                    logger.info(f"Result: {content}")
+                logger.info(f"{'=' * 80}")
+            elif isinstance(message, AIMessage):
+                # Format AI Messages
+                logger.info(f"{'=' * 80}")
+                logger.info(f"AI Message")
+                logger.info(f"{'=' * 80}")
+                if hasattr(message, 'content') and message.content:
+                    content = message.content if isinstance(message.content, str) else str(message.content)
+                    logger.info(f"Content: {content}")
+                if hasattr(message, 'tool_calls') and message.tool_calls:
+                    logger.info(f"Tool Calls: {len(message.tool_calls)}")
+                    for i, tc in enumerate(message.tool_calls, 1):
+                        logger.info(f"  {i}. {tc.get('name', 'Unknown')} - {tc.get('id', 'Unknown')}")
+                logger.info(f"{'=' * 80}")
+            elif isinstance(message, HumanMessage):
+                # Format Human Messages
+                logger.debug(f"Human Message: {str(message.content)}")
+            elif isinstance(message, SystemMessage):
+                # Format System Messages
+                logger.debug(f"System Message: {str(message.content)}")
+            else:
+                # Generic message handling
+                msg_type = message.__class__.__name__
+                logger.debug(f"{msg_type}: {str(message)}")
+                
+        except Exception as e:
+            logger.warning(f"Error logging message: {e}")
+            try:
+                logger.info(f"Message (fallback): {str(message)}")
+            except:
+                pass
+

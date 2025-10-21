@@ -989,6 +989,8 @@ class Toolkit:
             return "Error: No indicator providers configured"
         
         try:
+            import json as json_module
+            
             start_dt = datetime.strptime(start_date, "%Y-%m-%d")
             end_dt = datetime.strptime(end_date, "%Y-%m-%d")
             
@@ -1005,8 +1007,10 @@ class Toolkit:
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Trying indicator provider {provider_name} for {symbol} - {indicator}")
+                    
+                    # Get both markdown (for LLM) and JSON (for visualization/storage)
                     # Note: Interface signature is (symbol, indicator, start_date, end_date, ...)
-                    indicator_data = provider.get_indicator(
+                    markdown_data = provider.get_indicator(
                         symbol=symbol,
                         indicator=indicator,
                         start_date=start_dt,
@@ -1015,8 +1019,37 @@ class Toolkit:
                         format_type="markdown"
                     )
                     
+                    # Also get JSON format for storage and data visualization
+                    json_data = provider.get_indicator(
+                        symbol=symbol,
+                        indicator=indicator,
+                        start_date=start_dt,
+                        end_date=end_dt,
+                        interval=interval,
+                        format_type="json"
+                    )
+                    
                     logger.info(f"Successfully retrieved indicator data from {provider_name}")
-                    return f"## {indicator.upper()} from {provider_name.upper()}\n\n{indicator_data}"
+                    
+                    # Return internal format so LoggingToolNode stores both markdown and JSON
+                    text_for_agent = f"## {indicator.upper()} from {provider_name.upper()}\n\n{markdown_data}"
+                    
+                    json_for_storage = {
+                        "tool": "get_indicator_data",
+                        "symbol": symbol,
+                        "indicator": indicator,
+                        "start_date": start_date,
+                        "end_date": end_date,
+                        "interval": interval,
+                        "provider": provider_name,
+                        "data": json_data if isinstance(json_data, dict) else {"raw": str(json_data)}
+                    }
+                    
+                    return {
+                        "_internal": True,
+                        "text_for_agent": text_for_agent,
+                        "json_for_storage": json_for_storage
+                    }
                     
                 except Exception as e:
                     logger.warning(f"Indicator provider {provider_class.__name__} failed: {e}, trying next provider...")
@@ -1025,7 +1058,7 @@ class Toolkit:
             return f"Error: All indicator providers failed to retrieve {indicator} data"
             
         except Exception as e:
-            logger.error(f"Error in get_indicator_data: {e}")
+            logger.error(f"Error in get_indicator_data: {e}", exc_info=True)
             return f"Error retrieving indicator data: {str(e)}"
     
     # ========================================================================

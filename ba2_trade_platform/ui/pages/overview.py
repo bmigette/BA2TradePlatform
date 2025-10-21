@@ -122,7 +122,7 @@ class OverviewTab:
                 # Function to switch to Account Overview tab
                 def switch_to_account_overview():
                     if tabs_ref:
-                        tabs_ref.set_value('Account Overview')
+                        tabs_ref.set_value('account')
                 
                 # Create notification banner
                 with ui.card().classes('w-full bg-blue-50 border-l-4 border-blue-500 p-4 mb-4'):
@@ -1400,6 +1400,41 @@ class OverviewTab:
                         total_processed += len(updated_orders)
                         experts_processed += 1
                         logger.info(f"Processed {len(updated_orders)} orders for expert {expert_id}")
+                        
+                        # AUTO-SUBMIT: After risk management, auto-submit eligible orders to broker
+                        # (matching the behavior of the automated WorkerQueue workflow)
+                        try:
+                            from ...core.models import ExpertInstance, AccountDefinition
+                            from ...modules.accounts import get_account_class
+                            
+                            expert_instance = get_instance(ExpertInstance, expert_id)
+                            if expert_instance and expert_instance.account_id:
+                                account_def = get_instance(AccountDefinition, expert_instance.account_id)
+                                if account_def:
+                                    account_class = get_account_class(account_def.provider)
+                                    if account_class:
+                                        account = account_class(account_def.id)
+                                        
+                                        # Auto-submit orders with quantity > 0
+                                        submitted_count = 0
+                                        for order in updated_orders:
+                                            if order.quantity and order.quantity > 0:
+                                                try:
+                                                    logger.info(f"Auto-submitting order {order.id} for {order.symbol}: {order.quantity} shares")
+                                                    submitted_order = account.submit_order(order)
+                                                    if submitted_order:
+                                                        submitted_count += 1
+                                                        logger.info(f"Successfully submitted order {order.id} to broker")
+                                                    else:
+                                                        logger.warning(f"Failed to submit order {order.id} to broker")
+                                                except Exception as submit_error:
+                                                    logger.error(f"Error submitting order {order.id}: {submit_error}", exc_info=True)
+                                        
+                                        if submitted_count > 0:
+                                            logger.info(f"Auto-submitted {submitted_count}/{len(updated_orders)} orders to broker")
+                        except Exception as auto_submit_error:
+                            logger.error(f"Error during auto-submission for expert {expert_id}: {auto_submit_error}", exc_info=True)
+                    
                     except Exception as e:
                         logger.error(f"Error processing risk management for expert {expert_id}: {e}", exc_info=True)
                 
@@ -3105,11 +3140,11 @@ class TransactionsTab:
                     TransactionStatus.WAITING: 'orange'
                 }.get(txn.status, 'gray')
                 
-                # Get expert shortname
+                # Get expert shortname (alias + ID)
                 expert = transaction_experts.get(txn.id)
                 expert_shortname = ''
                 if expert:
-                    expert_shortname = expert.user_description if expert.user_description else f"{expert.expert}-{expert.id}"
+                    expert_shortname = f"{expert.alias}-{expert.id}" if expert.alias else f"Expert-{expert.id}"
                 
                 # Get all orders for this transaction
                 orders_data = []

@@ -870,11 +870,12 @@ class AccountInterface(ExtendableSettingsInterface):
                         all(order.status in terminal_statuses for order in market_entry_orders)
                     )
                     
-                    # Check if ALL orders (not just entry orders) are canceled or in non-executed terminal states
-                    canceled_statuses = {OrderStatus.CANCELED, OrderStatus.WAITING_TRIGGER, OrderStatus.REJECTED, OrderStatus.ERROR, OrderStatus.EXPIRED}
-                    all_orders_canceled = (
+                    # Check if ALL orders are in terminal states (canceled, rejected, error, expired, or closed)
+                    # Use get_terminal_statuses() to ensure consistency across the codebase
+                    terminal_statuses = OrderStatus.get_terminal_statuses()
+                    all_orders_terminal = (
                         len(orders) > 0 and
-                        all(order.status in canceled_statuses for order in orders)
+                        all(order.status in terminal_statuses for order in orders)
                     )
                     
                     # Check if we have a filled closing order (dependent order that closes position)
@@ -958,12 +959,12 @@ class AccountInterface(ExtendableSettingsInterface):
                         logger.debug(f"Transaction {transaction.id} has filled closing order, marking as CLOSED")
                         has_changes = True
                     
-                    # ANY STATUS -> CLOSED: If all orders are canceled/rejected/error/expired (no execution)
-                    elif all_orders_canceled and transaction.status != TransactionStatus.CLOSED:
+                    # ANY STATUS -> CLOSED: If all orders are in terminal state (canceled, rejected, error, expired, or closed)
+                    elif all_orders_terminal and transaction.status != TransactionStatus.CLOSED:
                         new_status = TransactionStatus.CLOSED
                         if not transaction.close_date:
                             transaction.close_date = datetime.now(timezone.utc)
-                        logger.info(f"Transaction {transaction.id} all orders canceled/rejected, marking as CLOSED")
+                        logger.info(f"Transaction {transaction.id} all orders in terminal state, marking as CLOSED")
                         has_changes = True
                     
                     # OPENED -> CLOSED: If filled buy and sell orders sum to match quantity (position balanced)

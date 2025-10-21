@@ -1797,9 +1797,9 @@ class OrderRecommendationsTab:
                 
                 # Apply expert filter if not 'all'
                 if self.expert_filter and self.expert_filter != 'all':
-                    # Extract expert ID from the filter string format: "ExpertName (ID: 123)"
+                    # expert_filter is already the expert ID (string) from the select options
                     try:
-                        expert_id = int(self.expert_filter.split('ID: ')[-1].rstrip(')'))
+                        expert_id = int(self.expert_filter)
                         statement = statement.where(ExpertRecommendation.instance_id == expert_id)
                     except (ValueError, IndexError):
                         pass  # If parsing fails, show all
@@ -1974,9 +1974,9 @@ class OrderRecommendationsTab:
                 
                 # Apply expert filter if not 'all'
                 if self.expert_filter and self.expert_filter != 'all':
-                    # Extract expert ID from the filter string format: "ExpertName (ID: 123)"
+                    # expert_filter is already the expert ID (string) from the select options
                     try:
-                        expert_id = int(self.expert_filter.split('ID: ')[-1].rstrip(')'))
+                        expert_id = int(self.expert_filter)
                         statement = statement.where(ExpertRecommendation.instance_id == expert_id)
                     except (ValueError, IndexError):
                         pass  # If parsing fails, show all
@@ -2369,9 +2369,10 @@ class OrderRecommendationsTab:
                 return
             
             # Extract expert instance ID from the selected value
-            # Format is "ExpertType - Description (ID: X)"
+            # Format is "alias/expertType-ID" (e.g., "taQuickGrok-9")
             selected_text = selected_value
-            expert_id = int(selected_text.split('ID: ')[-1].rstrip(')'))
+            # Get the ID by splitting on the last dash and taking the last part
+            expert_id = int(selected_text.split('-')[-1])
             
             # Show dialog to ask for days lookback period
             with ui.dialog() as config_dialog, ui.card().classes('p-4'):
@@ -2479,9 +2480,10 @@ class OrderRecommendationsTab:
                 return
             
             # Extract expert instance ID from the selected value
-            # Format is "ExpertType - Description (ID: X)"
+            # Format is "alias/expertType-ID" (e.g., "taQuickGrok-9")
             selected_text = selected_value
-            expert_id = int(selected_text.split('ID: ')[-1].rstrip(')'))
+            # Get the ID by splitting on the last dash and taking the last part
+            expert_id = int(selected_text.split('-')[-1])
             
             # Get the Risk Management system
             from ...core.TradeRiskManagement import get_risk_management
