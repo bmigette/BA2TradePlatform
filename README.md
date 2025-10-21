@@ -130,22 +130,77 @@ The platform requires certain API keys to function properly. Configure all API k
 
 ### 🟥 Mandatory API Keys
 
-**OpenAI API Key** (Required)
+**LLM Configuration** (Required - Choose One or Both)
+
+The platform supports both **OpenAI** and **NagaAI** for AI-driven market analysis. You must configure at least one LLM provider.
+
+#### Option 1: OpenAI (Standard)
 - **Purpose**: Powers all AI trading experts and analysis
 - **Used by**: TradingAgents multi-agent framework, market analysis, recommendation generation
 - **Get it**: [OpenAI API Platform](https://platform.openai.com/api-keys)
 - **Configure**: Settings → Application Settings → OpenAI API Key
-- **Without this**: Platform cannot generate trading recommendations or perform AI analysis
+
+#### Option 2: NagaAI (Alternative Provider)
+- **Purpose**: Cost-effective alternative to OpenAI with competitive models
+- **Used by**: TradingAgents multi-agent framework, market analysis, recommendation generation
+- **Get it**: [NagaAI Platform](https://www.nagaai.com) - Sign up and create API key
+- **Configure**: Settings → Application Settings → NagaAI API Key
+- **Backend URL**: `https://api.nagaai.com/v1` (automatically configured)
+
+#### Switching Between Providers
+
+**In Web Interface** (Recommended):
+1. Navigate to Settings → Application Settings
+2. Choose your LLM provider:
+   - Enter OpenAI API Key if using OpenAI
+   - Enter NagaAI API Key if using NagaAI
+3. Select your preferred model from the dropdown
+4. Click Save - the platform automatically uses the configured provider
+
+#### Performance Comparison
+
+| Feature | OpenAI | NagaAI |
+|---------|--------|--------|
+| **Cost** | Higher | Lower (often 50-70% cheaper) |
+| **Latency** | Very fast | Fast |
+| **Rate Limits** | Per-plan | Per-plan |
+| **Setup Time** | Immediate | Immediate |
+| **Best For** | Premium features | Budget-conscious users |
+
+#### Recommendation
+
+- **Production Trading**: Use OpenAI for reliability and latest models
+- **Testing/Development**: Use NagaAI for cost savings
+- **Hybrid Approach**: Configure both and switch based on market conditions
+
+#### Expert Settings and Model Selection
+
+- Model and provider selection for AI experts is managed per-expert in the "Expert Settings" section of the web UI (Settings → Experts or the specific expert configuration page).
+- Model names include a provider prefix so the platform can route requests to the correct backend:
+    - OpenAI models appear with the prefix `OpenAI/` (for example `OpenAI/gpt-4-turbo`)
+    - NagaAI models appear with the prefix `NagaAI/` (for example `NagaAI/claude-3-sonnet`)
+- You can also choose which provider an expert uses in the same Expert Settings UI. This is a per-expert selection — different experts may use different providers concurrently.
+- Important: It is the user's responsibility to add and configure valid API keys for any provider you select before enabling or running an expert. If an expert is configured to use a provider but no valid API key is present, the expert may receive empty responses or fail during execution.
 
 ### 🟡 Conditional API Keys (Required based on configuration)
 
 **Alpaca API Keys** (Required if using Alpaca account provider)
-- **Purpose**: Live and paper trading through Alpaca
-- **Used by**: AlpacaAccount provider for order execution, position tracking, market data
-- **Get it**: [Alpaca Markets](https://app.alpaca.markets/signup)
-- **Configure**: Settings → Accounts → Add Alpaca Account
-- **Keys needed**: API Key + Secret Key
-- **Without this**: Cannot trade through Alpaca (but can still use other providers)
+
+Alpaca API keys are used at two levels:
+
+1. **Application Level** (Optional - for market data/news):
+   - **Purpose**: Used by platform for real-time market prices and news data
+   - **Configure**: Settings → Application Settings → Alpaca API Key
+   - **Used by**: Market data retrieval, price feeds for analysis
+
+2. **Per-Account Level** (Required for trading):
+   - **Purpose**: Live or paper trading account credentials
+   - **Configure**: Settings → Accounts → Add Alpaca Account
+   - **Keys needed**: API Key + Secret Key for each trading account
+   - **Used by**: Order execution, position tracking, account management
+
+- **Without account-level keys**: Cannot trade through Alpaca (but can still use other trading providers or paper trading accounts)
+- **Without app-level keys**: Platform uses alternative data sources for market data; reduced real-time market data accuracy
 
 ### 🟢 Optional API Keys (Enhance functionality)
 
@@ -172,25 +227,15 @@ The platform requires certain API keys to function properly. Configure all API k
 
 ### 🔧 Configuration Methods
 
-1. **Web Interface** (Recommended):
-   - Navigate to `http://localhost:8080/settings`
-   - Enter API keys in respective sections
-   - Keys are encrypted and stored in database
-
-2. **Environment Variables**:
-   ```env
-   # Create .env file in project root
-   OPENAI_API_KEY=your_openai_key_here
-   ALPACA_API_KEY=your_alpaca_key_here
-   ALPACA_SECRET_KEY=your_alpaca_secret_here
-   FINNHUB_API_KEY=your_finnhub_key_here
-   FRED_API_KEY=your_fred_key_here
-   FMP_API_KEY=your_fmp_key_here
-   ```
+All API keys should be configured through the **Web Interface** (Recommended):
+- Navigate to `http://localhost:8080/settings`
+- Enter API keys in respective sections (OpenAI or NagaAI)
+- Select your preferred LLM model
+- Keys are stored in local database
 
 ### 🛡️ Security Notes
 
-- All API keys are stored encrypted in the local SQLite database
+- API keys are stored in the local SQLite database - keep the database file secure
 - Keys are never transmitted except to their respective API endpoints
 - Use paper trading accounts for testing (Alpaca provides free paper trading)
 - Keep your API keys secure and never share them publicly
@@ -465,55 +510,6 @@ The platform integrates the TradingAgents multi-agent framework for sophisticate
 5. **Risk Assessment**: Multi-perspective risk analysis
 6. **Final Recommendation**: Trading decision with confidence levels
 
-### Usage Examples
-
-**Standalone Analysis** (terminal output):
-```python
-from ba2_trade_platform.thirdparties.TradingAgents.tradingagents.graph.trading_graph import TradingAgentsGraph
-from ba2_trade_platform.thirdparties.TradingAgents.tradingagents.default_config import DEFAULT_CONFIG
-
-# Create analyzer without database storage
-ta = TradingAgentsGraph(debug=True, config=DEFAULT_CONFIG)
-
-# Run analysis
-final_state, decision = ta.propagate("AAPL", "2025-01-15")
-print(f"Decision: {decision}")
-```
-
-**Database-Stored Analysis**:
-```python
-# Create analyzer with expert instance ID for database storage
-ta = TradingAgentsGraph(
-    debug=True, 
-    config=DEFAULT_CONFIG,
-    expert_instance_id=1  # Links to ExpertInstance in database
-)
-
-# Analysis results automatically stored in database
-final_state, decision = ta.propagate("NVDA", "2025-01-15")
-```
-
-**Parallel Multi-Symbol Analysis**:
-```python
-# Analyze multiple symbols simultaneously
-symbols = ["AAPL", "GOOGL", "MSFT", "NVDA"]
-expert_instances = [1, 2, 3]  # Multiple experts
-
-# Platform automatically manages parallel analysis across symbols and experts
-# Results stored with risk levels, time horizons, and expert attribution
-```
-
-**Virtual Equity Management**:
-```python
-# Expert configuration with virtual equity allocation
-expert_config = {
-    "virtual_equity_percent": 25.0,  # 25% of total account
-    "max_position_percent": 5.0,    # Max 5% per position
-    "trading_mode": "semi_auto",     # Requires approval
-    "risk_tolerance": "MEDIUM"       # Risk level preference
-}
-```
-
 ## 🎛️ Configuration
 
 ### Web Interface
@@ -521,21 +517,6 @@ Access the settings page at http://localhost:8080/settings to configure:
 - API Keys (OpenAI, Finnhub, FRED)
 - Account Providers (Alpaca credentials)
 - Expert Settings (TradingAgents parameters)
-
-### Environment Variables
-```env
-# LLM Configuration
-OPENAI_API_KEY=your_key_here
-
-# Market Data
-FINNHUB_API_KEY=your_key_here
-FRED_API_KEY=your_key_here
-
-# Trading Accounts  
-ALPACA_API_KEY=your_key_here
-ALPACA_SECRET_KEY=your_secret_here
-ALPACA_BASE_URL=https://paper-api.alpaca.markets  # Paper trading
-```
 
 ### Logging Configuration
 Modify `ba2_trade_platform/config.py`:
@@ -664,11 +645,10 @@ pip freeze > requirements.txt
 
 ## 🚀 Production Deployment
 
-1. **Set production environment variables**
-2. **Configure proper API keys in database**
-3. **Enable file logging**: Set `FILE_LOGGING = True`
-4. **Run with production WSGI server** (if needed)
-5. **Set up proper database backup strategy**
+1. **Configure API keys via Settings page** at `/settings`
+2. **Enable file logging**: Set `FILE_LOGGING = True` in config.py
+3. **Run with production WSGI server** (if needed)
+4. **Set up proper database backup strategy**
 
 ## 🐛 Troubleshooting
 
@@ -678,7 +658,7 @@ pip freeze > requirements.txt
 
 2. **Database Issues**: Database auto-creates on first run. Check permissions in `~/Documents/`
 
-3. **API Key Issues**: Configure keys via web interface at `/settings` or environment variables
+3. **API Key Issues**: Configure keys via web interface at `/settings`
 
 4. **Unicode Console Errors**: Logger automatically falls back to ASCII on Windows
 
