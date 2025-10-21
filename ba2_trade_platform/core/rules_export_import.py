@@ -389,22 +389,23 @@ class RulesExportImportUI:
 
                 self.ui.label('Select JSON file to import:').classes('mb-2')
 
-                def handle_import(e):
+                async def handle_import(e):
                     try:
                         # Debug: Check what attributes the event has
                         logger.debug(f"Upload event type: {type(e)}")
                         logger.debug(f"Upload event attributes: {dir(e)}")
                         
                         # Read the uploaded file content
-                        # Handle both old and new NiceGUI API
-                        if hasattr(e, 'content'):
-                            e.content.seek(0)  # Ensure we're at the beginning of the file
-                            content = e.content.read().decode('utf-8')
-                        elif hasattr(e, 'sender') and hasattr(e.sender, 'content'):
-                            e.sender.content.seek(0)
-                            content = e.sender.content.read().decode('utf-8')
+                        # NiceGUI upload events have a 'file' attribute
+                        if hasattr(e, 'file') and e.file:
+                            # e.file is an UploadFile object with async read method
+                            file_content = await e.file.read()
+                            if isinstance(file_content, bytes):
+                                content = file_content.decode('utf-8')
+                            else:
+                                content = file_content
                         else:
-                            logger.error(f"Cannot find content in upload event. Available attributes: {dir(e)}")
+                            logger.error(f"Cannot find file in upload event. Available attributes: {dir(e)}")
                             self.ui.notify('Upload failed: Unsupported event format', type='negative')
                             return
                             
