@@ -2443,6 +2443,7 @@ class ExpertSettingsTab:
                 """Handle JSON file upload for settings import."""
                 try:
                     # Read the uploaded file
+                    e.content.seek(0)  # Ensure we're at the beginning of the file
                     import_json = e.content.read().decode('utf-8')
                     if not import_json.strip():
                         ui.notify('Uploaded file is empty', type='warning')

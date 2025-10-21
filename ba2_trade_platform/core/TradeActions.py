@@ -587,16 +587,31 @@ class AdjustTakeProfitAction(TradeAction):
                 
                 if self.reference_value == ReferenceValue.ORDER_OPEN_PRICE.value:
                     # Use the order's limit_price as open price
+                    # For market orders, limit_price is None, so fall back to open_price (filled price)
+                    # Or if still None, fall back to current market price
                     reference_price = self.existing_order.limit_price
+                    
                     if reference_price is None:
-                        logger.error(f"Order {self.existing_order.id} has no limit_price for ORDER_OPEN_PRICE reference")
-                        return self.create_and_save_action_result(
-                            action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
-                            success=False,
-                            message="Order has no open price (limit_price) available",
-                            data={}
-                        )
-                    logger.info(f"TP Reference: ORDER_OPEN_PRICE = ${reference_price:.2f} (from order.limit_price)")
+                        # Try using open_price (for filled orders) or current price
+                        reference_price = self.existing_order.open_price
+                        if reference_price:
+                            logger.info(f"TP Reference: ORDER_OPEN_PRICE = ${reference_price:.2f} (from order.open_price - filled order)")
+                        else:
+                            # Market order not yet filled, use current price as fallback
+                            logger.warning(f"Order {self.existing_order.id} is a market order with no filled price yet, falling back to current market price")
+                            reference_price = self.get_current_price()
+                            if reference_price:
+                                logger.info(f"TP Reference: ORDER_OPEN_PRICE → CURRENT_PRICE = ${reference_price:.2f} (market order fallback)")
+                            else:
+                                logger.error(f"Cannot get current price for {self.instrument_name}")
+                                return self.create_and_save_action_result(
+                                    action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
+                                    success=False,
+                                    message=f"Cannot determine reference price for market order - no filled price or current market price available",
+                                    data={}
+                                )
+                    else:
+                        logger.info(f"TP Reference: ORDER_OPEN_PRICE = ${reference_price:.2f} (from order.limit_price)")
                     
                 elif self.reference_value == ReferenceValue.CURRENT_PRICE.value:
                     reference_price = self.get_current_price()
@@ -707,26 +722,25 @@ class AdjustTakeProfitAction(TradeAction):
                 logger.info(f"TP Calculation COMPLETE for {self.instrument_name} - Final TP Price: ${self.take_profit_price:.2f}")
             
             # Use account's set_order_tp method to adjust take profit
-            tp_result = self.account.set_order_tp(self.existing_order, self.take_profit_price)
-            
-            if tp_result is not None:
+            # This method either returns a TradingOrder object or raises an exception
+            try:
+                logger.debug(f"Calling set_order_tp for order {self.existing_order.id} with price ${self.take_profit_price:.2f}")
+                tp_result = self.account.set_order_tp(self.existing_order, self.take_profit_price)
+                logger.info(f"✅ Successfully set take profit for {self.instrument_name}: TP order {tp_result.id if hasattr(tp_result, 'id') else 'unknown'} created/updated")
+                
                 return self.create_and_save_action_result(
                     action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
                     success=True,
                     message=f"Take profit adjusted for {self.instrument_name} to ${self.take_profit_price:.2f}",
                     data={
                         "order_id": self.existing_order.id, 
-                        "new_tp_price": self.take_profit_price,
-                        "tp_result": str(tp_result)
+                        "tp_order_id": tp_result.id if hasattr(tp_result, 'id') else None,
+                        "new_tp_price": self.take_profit_price
                     }
                 )
-            else:
-                return self.create_and_save_action_result(
-                    action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
-                    success=False,
-                    message=f"Failed to adjust take profit for {self.instrument_name}",
-                    data={"order_id": self.existing_order.id, "requested_tp_price": self.take_profit_price}
-                )
+            except Exception as set_tp_error:
+                logger.error(f"Failed to set take profit for order {self.existing_order.id}: {set_tp_error}", exc_info=True)
+                raise  # Re-raise to be caught by outer exception handler
             
         except Exception as e:
             logger.error(f"Error adjusting take profit for {self.instrument_name}: {e}", exc_info=True)
@@ -859,16 +873,31 @@ class AdjustStopLossAction(TradeAction):
                 
                 if self.reference_value == ReferenceValue.ORDER_OPEN_PRICE.value:
                     # Use the order's limit_price as open price
+                    # For market orders, limit_price is None, so fall back to open_price (filled price)
+                    # Or if still None, fall back to current market price
                     reference_price = self.existing_order.limit_price
+                    
                     if reference_price is None:
-                        logger.error(f"Order {self.existing_order.id} has no limit_price for ORDER_OPEN_PRICE reference")
-                        return self.create_and_save_action_result(
-                            action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
-                            success=False,
-                            message="Order has no open price (limit_price) available",
-                            data={}
-                        )
-                    logger.info(f"SL Reference: ORDER_OPEN_PRICE = ${reference_price:.2f} (from order.limit_price)")
+                        # Try using open_price (for filled orders) or current price
+                        reference_price = self.existing_order.open_price
+                        if reference_price:
+                            logger.info(f"SL Reference: ORDER_OPEN_PRICE = ${reference_price:.2f} (from order.open_price - filled order)")
+                        else:
+                            # Market order not yet filled, use current price as fallback
+                            logger.warning(f"Order {self.existing_order.id} is a market order with no filled price yet, falling back to current market price")
+                            reference_price = self.get_current_price()
+                            if reference_price:
+                                logger.info(f"SL Reference: ORDER_OPEN_PRICE → CURRENT_PRICE = ${reference_price:.2f} (market order fallback)")
+                            else:
+                                logger.error(f"Cannot get current price for {self.instrument_name}")
+                                return self.create_and_save_action_result(
+                                    action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
+                                    success=False,
+                                    message=f"Cannot determine reference price for market order - no filled price or current market price available",
+                                    data={}
+                                )
+                    else:
+                        logger.info(f"SL Reference: ORDER_OPEN_PRICE = ${reference_price:.2f} (from order.limit_price)")
                     
                 elif self.reference_value == ReferenceValue.CURRENT_PRICE.value:
                     reference_price = self.get_current_price()
