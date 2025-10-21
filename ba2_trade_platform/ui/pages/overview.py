@@ -3020,7 +3020,7 @@ class TransactionsTab:
     
     def _clean_pending_orders_dialog(self):
         """Show confirmation dialog for cleaning pending orders."""
-        logger.info("User clicked 'Clean Pending Orders' button")
+        logger.debug("User clicked 'Clean Pending Orders' button")
         
         def confirm_clean():
             """Execute the cleanup after confirmation."""

@@ -1138,12 +1138,18 @@ class TradeManager:
     
     def clean_pending_orders(self) -> Dict[str, Any]:
         """
-        Clean all pending, waiting trigger, and error orders.
+        Clean unsubmitted pending and error orders (PENDING and ERROR only).
         
-        For each pending order:
+        CRITICAL: Do NOT delete WAITING_TRIGGER orders unless their parent order is ALSO being deleted.
+        This prevents orphaning valid take-profit/stop-loss orders on existing open positions.
+        
+        For each PENDING/ERROR order:
         1. Find the associated transaction (if any)
         2. Close the transaction if it exists
-        3. Delete the order and all its dependent orders
+        3. Delete the order and ONLY its dependent orders that are WAITING_TRIGGER
+           (if the parent is being deleted, the dependent is also deleted)
+        
+        WAITING_TRIGGER orders whose parents are NOT being deleted are PRESERVED.
         
         Returns:
             Dict with cleanup statistics:
@@ -1167,17 +1173,21 @@ class TradeManager:
                 'errors': []
             }
             
-            self.logger.info("Starting cleanup of pending orders...")
+            self.logger.info("Starting cleanup of pending orders (PENDING and ERROR only - preserving valid WAITING_TRIGGER orders)...")
             
             with Session(get_db().bind) as session:
-                # Get all pending/waiting/error orders
-                pending_statuses = [OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER, OrderStatus.ERROR]
+                # CRITICAL: Only clean PENDING and ERROR orders - NOT WAITING_TRIGGER
+                # WAITING_TRIGGER orders are preserved unless their parent order is also being deleted
+                pending_statuses = [OrderStatus.PENDING, OrderStatus.ERROR]
                 statement = select(TradingOrder).where(
                     TradingOrder.status.in_(pending_statuses)
                 )
                 pending_orders = session.exec(statement).all()
                 
-                self.logger.info(f"Found {len(pending_orders)} pending orders to clean")
+                self.logger.info(f"Found {len(pending_orders)} PENDING/ERROR orders to clean")
+                
+                # Create a set of order IDs being deleted for quick lookup
+                orders_to_delete_ids = {order.id for order in pending_orders}
                 
                 # Track transactions to close
                 transactions_to_close = set()
@@ -1198,6 +1208,7 @@ class TradeManager:
                     
                     if dependents:
                         self.logger.debug(f"Order {order.id} has {len(dependents)} dependent orders")
+                        # Only delete dependents - don't preserve WAITING_TRIGGER orders if their parent is deleted
                         dependents_to_delete.extend(dependents)
                     
                     orders_to_delete.append(order)
@@ -1223,8 +1234,20 @@ class TradeManager:
                         stats['errors'].append(error_msg)
                 
                 # PHASE 2: Delete dependent orders
+                # CRITICAL SAFETY CHECK: Only delete dependents if their parent is being deleted
+                # This prevents orphaning valid TP/SL orders on existing open positions
                 for dependent_order in dependents_to_delete:
                     try:
+                        # Verify the parent order is actually being deleted
+                        parent_order_id = dependent_order.depends_on_order
+                        if parent_order_id not in orders_to_delete_ids:
+                            # Parent is NOT being deleted - PRESERVE this dependent order
+                            self.logger.debug(
+                                f"Skipping dependent order {dependent_order.id} "
+                                f"(parent order {parent_order_id} is not being deleted - preserving valid order)"
+                            )
+                            continue
+                        
                         session.delete(dependent_order)
                         self.logger.debug(f"Deleted dependent order {dependent_order.id}")
                         stats['dependents_deleted'] += 1
