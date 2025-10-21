@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 import logging
 import threading
 from ..logger import logger
-from .models import ExpertRecommendation, ExpertInstance, TradingOrder, Ruleset
+from .models import ExpertRecommendation, ExpertInstance, TradingOrder, Ruleset, Transaction
 from .types import OrderRecommendation, OrderStatus, OrderDirection, OrderOpenType, OrderType
 from .db import get_instance, get_all_instances, add_instance, update_instance
 
@@ -388,6 +388,96 @@ class TradeManager:
                                     )
                                     status_updates[dependent_order.id] = OrderStatus.ERROR
                                     continue
+                            
+                            # ===== NEW: Recalculate TP/SL prices from stored percent if available =====
+                            # This ensures TP/SL prices use the parent's filled price, not stale market data
+                            # If percent is not stored, it will be calculated and stored as a fallback
+                            transaction_updated = False
+                            if dependent_order.data and isinstance(dependent_order.data, dict):
+                                try:
+                                    # Check if this is a TP order (has tp_percent in data)
+                                    if "tp_percent" in dependent_order.data and parent_order.open_price:
+                                        tp_percent = dependent_order.data.get("tp_percent")
+                                        old_limit_price = dependent_order.limit_price
+                                        
+                                        # Recalculate TP price from parent's filled price: price = filled_price * (1 + percent/100)
+                                        new_limit_price = parent_order.open_price * (1 + tp_percent / 100)
+                                        
+                                        # Round price to 4 decimal places (standard for forex/stocks)
+                                        new_limit_price = round(new_limit_price, 4)
+                                        
+                                        # Update the limit price
+                                        dependent_order.limit_price = new_limit_price
+                                        
+                                        self.logger.info(
+                                            f"Recalculated TP price for order {dependent_order.id}: "
+                                            f"parent filled ${parent_order.open_price:.2f} * (1 + {tp_percent:.2f}%) "
+                                            f"= ${new_limit_price:.2f} (was ${old_limit_price:.2f})"
+                                        )
+                                        
+                                        # Update data field to record when recalculation happened
+                                        dependent_order.data["parent_filled_price"] = parent_order.open_price
+                                        dependent_order.data["recalculated_at_trigger"] = True
+                                        
+                                        # Mark transaction for update with new TP price
+                                        transaction_updated = True
+                                    
+                                    # Check if this is an SL order (has sl_percent in data)
+                                    elif "sl_percent" in dependent_order.data and parent_order.open_price:
+                                        sl_percent = dependent_order.data.get("sl_percent")
+                                        old_stop_price = dependent_order.stop_price
+                                        
+                                        # Recalculate SL price from parent's filled price: price = filled_price * (1 + percent/100)
+                                        # For SL, percent is typically negative, so 1 + (-5/100) = 0.95 for a 5% loss
+                                        new_stop_price = parent_order.open_price * (1 + sl_percent / 100)
+                                        
+                                        # Round price to 4 decimal places
+                                        new_stop_price = round(new_stop_price, 4)
+                                        
+                                        # Update the stop price
+                                        dependent_order.stop_price = new_stop_price
+                                        
+                                        self.logger.info(
+                                            f"Recalculated SL price for order {dependent_order.id}: "
+                                            f"parent filled ${parent_order.open_price:.2f} * (1 + {sl_percent:.2f}%) "
+                                            f"= ${new_stop_price:.2f} (was ${old_stop_price:.2f})"
+                                        )
+                                        
+                                        # Update data field to record when recalculation happened
+                                        dependent_order.data["parent_filled_price"] = parent_order.open_price
+                                        dependent_order.data["recalculated_at_trigger"] = True
+                                        
+                                        # Mark transaction for update with new SL price
+                                        transaction_updated = True
+                                    
+                                    else:
+                                        # No tp_percent or sl_percent in data - try to calculate as fallback
+                                        # This handles cases where TP/SL orders were created before percent storage was implemented
+                                        self.logger.debug(f"No TP/SL percent found in order {dependent_order.id}.data, attempting fallback calculation")
+                                        # Note: We can't call AccountInterface method here, but the calculation will happen
+                                        # when the account's submit_order is called in PHASE 2 below
+                                
+                                except (KeyError, TypeError, ValueError) as data_error:
+                                    self.logger.warning(
+                                        f"Could not recalculate TP/SL price for order {dependent_order.id} from data field: {data_error}"
+                                    )
+                            else:
+                                # No data field yet - will be populated when account submits the order
+                                self.logger.debug(f"No data field in order {dependent_order.id}, will ensure percent is calculated during submission")
+                            # ===== END: Price recalculation =====
+                            
+                            # Update the associated Transaction if TP/SL price was recalculated
+                            if transaction_updated and dependent_order.transaction_id:
+                                transaction = session.get(Transaction, dependent_order.transaction_id)
+                                if transaction:
+                                    # Update TP or SL price depending on order type
+                                    if "tp_percent" in dependent_order.data:
+                                        transaction.take_profit = dependent_order.limit_price
+                                        self.logger.info(f"Updated Transaction {dependent_order.transaction_id} take_profit to ${dependent_order.limit_price:.2f}")
+                                    elif "sl_percent" in dependent_order.data:
+                                        transaction.stop_loss = dependent_order.stop_price
+                                        self.logger.info(f"Updated Transaction {dependent_order.transaction_id} stop_loss to ${dependent_order.stop_price:.2f}")
+                                    session.add(transaction)
                             
                             # Double-check quantity one more time before adding to submit list
                             if dependent_order.quantity <= 0:

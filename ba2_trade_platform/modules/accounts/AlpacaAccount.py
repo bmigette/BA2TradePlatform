@@ -866,6 +866,7 @@ class AlpacaAccount(AccountInterface):
         - Creates a TP order with WAITING_TRIGGER status
         - Order will be automatically submitted when parent order reaches FILLED status
         - Quantity will be set at trigger time based on parent order's filled quantity
+        - Stores TP percent and parent filled price in order.data for recalculation on trigger
         
         Args:
             trading_order: The original TradingOrder object
@@ -882,6 +883,14 @@ class AlpacaAccount(AccountInterface):
             # Round take profit price to 4 decimal places
             tp_price = self._round_price(tp_price, trading_order.symbol)
             
+            # Calculate TP percent from filled price (for storage in order.data)
+            tp_percent = None
+            if trading_order.open_price and trading_order.open_price > 0:
+                tp_percent = ((tp_price - trading_order.open_price) / trading_order.open_price) * 100
+                logger.debug(f"Calculated TP percent: {tp_percent:.2f}% from filled price ${trading_order.open_price:.2f} to target ${tp_price:.2f} for {trading_order.symbol}")
+            else:
+                logger.debug(f"Cannot calculate TP percent for order {trading_order.id}: no filled price yet (status={trading_order.status})")
+            
             # Use a session context to ensure all database operations are in the same session
             with Session(get_db().bind) as session:
                 # Ensure trading_order is attached to this session
@@ -894,24 +903,51 @@ class AlpacaAccount(AccountInterface):
                     # Ensure existing TP order is attached to the session
                     existing_tp_order = self._ensure_order_in_session(existing_tp_order, session)
                     
-                    # Update existing take profit order price
+                    # Update existing take profit order price and metadata
                     logger.info(f"Updating existing TP order {existing_tp_order.id} to price ${tp_price}")
                     existing_tp_order.limit_price = tp_price
+                    
+                    # Update data field with new percent if calculated
+                    if tp_percent is not None and existing_tp_order.data:
+                        existing_tp_order.data["tp_percent"] = round(tp_percent, 2)
+                        logger.debug(f"Updated TP order {existing_tp_order.id} metadata: tp_percent={tp_percent:.2f}%")
+                    
                     session.add(existing_tp_order)
                     session.commit()
                     session.refresh(existing_tp_order)
+                    
+                    # Update the associated Transaction with the new TP price
+                    if trading_order.transaction_id:
+                        from ...core.models import Transaction
+                        transaction = session.get(Transaction, trading_order.transaction_id)
+                        if transaction:
+                            transaction.take_profit = tp_price
+                            session.add(transaction)
+                            session.commit()
+                            logger.info(f"Updated Transaction {trading_order.transaction_id} take_profit to ${tp_price}")
+                    
                     logger.info(f"Successfully updated TP order to ${tp_price}")
                     return existing_tp_order
                 
-                # Create new WAITING_TRIGGER take profit order
-                tp_order = self._create_tp_order_object(trading_order, tp_price)
+                # Create new WAITING_TRIGGER take profit order with percent metadata
+                tp_order = self._create_tp_order_object(trading_order, tp_price, tp_percent)
                 
                 # Add to session and flush to get the ID
                 session.add(tp_order)
                 session.commit()
                 session.refresh(tp_order)
                 
-                logger.info(f"Created WAITING_TRIGGER TP order {tp_order.id} at ${tp_price} (will submit when order {trading_order.id} is FILLED)")
+                # Update the associated Transaction with the TP price
+                if trading_order.transaction_id:
+                    from ...core.models import Transaction
+                    transaction = session.get(Transaction, trading_order.transaction_id)
+                    if transaction:
+                        transaction.take_profit = tp_price
+                        session.add(transaction)
+                        session.commit()
+                        logger.info(f"Updated Transaction {trading_order.transaction_id} take_profit to ${tp_price}")
+                
+                logger.info(f"Created WAITING_TRIGGER TP order {tp_order.id} at ${tp_price} with metadata: tp_percent={tp_percent:.2f}% if tp_percent else 'N/A' (will submit when order {trading_order.id} is FILLED)")
                 return tp_order
                 
         except Exception as e:
@@ -982,7 +1018,7 @@ class AlpacaAccount(AccountInterface):
             logger.error(f"Error finding existing TP order for transaction {transaction_id}: {e}", exc_info=True)
             return None
     
-    def _create_tp_order_object(self, original_order: TradingOrder, tp_price: float) -> TradingOrder:
+    def _create_tp_order_object(self, original_order: TradingOrder, tp_price: float, tp_percent: float | None = None) -> TradingOrder:
         """
         Create a take profit order object based on the original order.
         Creates a WAITING_TRIGGER order that will be submitted when the parent order is FILLED.
@@ -991,6 +1027,7 @@ class AlpacaAccount(AccountInterface):
         Args:
             original_order: The original trading order
             tp_price: The take profit price
+            tp_percent: Optional TP percent from filled price (stored in order.data for recalculation on trigger)
             
         Returns:
             TradingOrder: The take profit order object
@@ -1005,6 +1042,15 @@ class AlpacaAccount(AccountInterface):
         else:
             tp_side = OrderDirection.BUY
             tp_order_type = CoreOrderType.BUY_LIMIT
+        
+        # Build order data field with TP metadata
+        order_data = {}
+        if tp_percent is not None:
+            order_data = {
+                "tp_percent": round(tp_percent, 2),
+                "parent_filled_price": None,  # Will be set when parent order is FILLED
+                "type": "tp"  # Mark this as a TP order for triggering logic
+            }
         
         # Create take profit order in WAITING_TRIGGER status
         # Quantity will be set when parent order is FILLED
@@ -1022,7 +1068,196 @@ class AlpacaAccount(AccountInterface):
             expert_recommendation_id=original_order.expert_recommendation_id,  # Link to same expert recommendation
             open_type=OrderOpenType.AUTOMATIC,  # Automatically created by system
             comment=f"TP for order {original_order.id}",
+            data=order_data if order_data else None,  # Store TP metadata
             created_at=datetime.now(timezone.utc)
         )
         
         return tp_order
+    
+    def _set_order_sl_impl(self, trading_order: TradingOrder, sl_price: float) -> TradingOrder:
+        """
+        Set stop loss for an order by creating a WAITING_TRIGGER SL order.
+        
+        Logic:
+        - Creates a SL order with WAITING_TRIGGER status
+        - Order will be automatically submitted when parent order reaches FILLED status
+        - Quantity will be set at trigger time based on parent order's filled quantity
+        - Stores SL percent and parent filled price in order.data for recalculation on trigger
+        
+        Args:
+            trading_order: The original TradingOrder object
+            sl_price: The stop loss price
+            
+        Returns:
+            TradingOrder: The created WAITING_TRIGGER stop loss order
+        """
+        try:
+            from ...core.db import add_instance, get_instance, get_db
+            from ...core.types import OrderStatus
+            from sqlmodel import Session
+            
+            # Round stop loss price to 4 decimal places
+            sl_price = self._round_price(sl_price, trading_order.symbol)
+            
+            # Calculate SL percent from filled price (for storage in order.data)
+            sl_percent = None
+            if trading_order.open_price and trading_order.open_price > 0:
+                sl_percent = ((sl_price - trading_order.open_price) / trading_order.open_price) * 100
+                logger.debug(f"Calculated SL percent: {sl_percent:.2f}% from filled price ${trading_order.open_price:.2f} to target ${sl_price:.2f} for {trading_order.symbol}")
+            else:
+                logger.debug(f"Cannot calculate SL percent for order {trading_order.id}: no filled price yet (status={trading_order.status})")
+            
+            # Use a session context to ensure all database operations are in the same session
+            with Session(get_db().bind) as session:
+                # Ensure trading_order is attached to this session
+                trading_order = self._ensure_order_in_session(trading_order, session)
+                
+                # Check if there's already a stop loss order for this transaction
+                existing_sl_order = self._find_existing_sl_order(trading_order.transaction_id)
+                
+                if existing_sl_order:
+                    # Ensure existing SL order is attached to the session
+                    existing_sl_order = self._ensure_order_in_session(existing_sl_order, session)
+                    
+                    # Update existing stop loss order price and metadata
+                    logger.info(f"Updating existing SL order {existing_sl_order.id} to price ${sl_price}")
+                    existing_sl_order.stop_price = sl_price
+                    
+                    # Update data field with new percent if calculated
+                    if sl_percent is not None and existing_sl_order.data:
+                        existing_sl_order.data["sl_percent"] = round(sl_percent, 2)
+                        logger.debug(f"Updated SL order {existing_sl_order.id} metadata: sl_percent={sl_percent:.2f}%")
+                    
+                    session.add(existing_sl_order)
+                    session.commit()
+                    session.refresh(existing_sl_order)
+                    
+                    # Update the associated Transaction with the new SL price
+                    if trading_order.transaction_id:
+                        from ...core.models import Transaction
+                        transaction = session.get(Transaction, trading_order.transaction_id)
+                        if transaction:
+                            transaction.stop_loss = sl_price
+                            session.add(transaction)
+                            session.commit()
+                            logger.info(f"Updated Transaction {trading_order.transaction_id} stop_loss to ${sl_price}")
+                    
+                    logger.info(f"Successfully updated SL order to ${sl_price}")
+                    return existing_sl_order
+                
+                # Create new WAITING_TRIGGER stop loss order with percent metadata
+                sl_order = self._create_sl_order_object(trading_order, sl_price, sl_percent)
+                
+                # Add to session and flush to get the ID
+                session.add(sl_order)
+                session.commit()
+                session.refresh(sl_order)
+                
+                # Update the associated Transaction with the SL price
+                if trading_order.transaction_id:
+                    from ...core.models import Transaction
+                    transaction = session.get(Transaction, trading_order.transaction_id)
+                    if transaction:
+                        transaction.stop_loss = sl_price
+                        session.add(transaction)
+                        session.commit()
+                        logger.info(f"Updated Transaction {trading_order.transaction_id} stop_loss to ${sl_price}")
+                
+                logger.info(f"Created WAITING_TRIGGER SL order {sl_order.id} at ${sl_price} with metadata: sl_percent={sl_percent:.2f}% if sl_percent else 'N/A' (will submit when order {trading_order.id} is FILLED)")
+                return sl_order
+                
+        except Exception as e:
+            logger.error(f"Error setting stop loss for order {trading_order.id}: {e}", exc_info=True)
+            raise
+    
+    def _create_sl_order_object(self, original_order: TradingOrder, sl_price: float, sl_percent: float | None = None) -> TradingOrder:
+        """
+        Create a stop loss order object based on the original order.
+        Creates a WAITING_TRIGGER order that will be submitted when the parent order is FILLED.
+        Quantity will be set when trigger is hit based on the parent order's filled quantity.
+        
+        Args:
+            original_order: The original trading order
+            sl_price: The stop loss price
+            sl_percent: Optional SL percent from filled price (stored in order.data for recalculation on trigger)
+            
+        Returns:
+            TradingOrder: The stop loss order object
+        """
+        # Import OrderType enum from core.types
+        from ...core.types import OrderType as CoreOrderType, OrderOpenType
+        
+        # Determine opposite side and appropriate order type for stop loss
+        if original_order.side == OrderDirection.BUY:
+            sl_side = OrderDirection.SELL
+            sl_order_type = CoreOrderType.SELL_STOP
+        else:
+            sl_side = OrderDirection.BUY
+            sl_order_type = CoreOrderType.BUY_STOP
+        
+        # Build order data field with SL metadata
+        order_data = {}
+        if sl_percent is not None:
+            order_data = {
+                "sl_percent": round(sl_percent, 2),
+                "parent_filled_price": None,  # Will be set when parent order is FILLED
+                "type": "sl"  # Mark this as a SL order for triggering logic
+            }
+        
+        # Create stop loss order in WAITING_TRIGGER status
+        # Quantity will be set when parent order is FILLED
+        sl_order = TradingOrder(
+            account_id=self.id,
+            symbol=original_order.symbol,
+            quantity=0,  # Will be set when trigger is hit
+            side=sl_side,  # Opposite side
+            order_type=sl_order_type,  # BUY_STOP or SELL_STOP based on side
+            stop_price=sl_price,
+            transaction_id=original_order.transaction_id,  # Link to same transaction
+            status=OrderStatus.WAITING_TRIGGER,  # Wait for parent order to be FILLED
+            depends_on_order=original_order.id,  # Trigger when this order changes
+            depends_order_status_trigger=OrderStatus.FILLED,  # Trigger when parent is FILLED
+            expert_recommendation_id=original_order.expert_recommendation_id,  # Link to same expert recommendation
+            open_type=OrderOpenType.AUTOMATIC,  # Automatically created by system
+            comment=f"SL for order {original_order.id}",
+            data=order_data if order_data else None,  # Store SL metadata
+            created_at=datetime.now(timezone.utc)
+        )
+        
+        return sl_order
+    
+    def _find_existing_sl_order(self, transaction_id: int) -> Optional[TradingOrder]:
+        """
+        Find existing stop loss order for a transaction.
+        
+        Args:
+            transaction_id: The transaction ID to search for
+            
+        Returns:
+            Optional[TradingOrder]: Existing SL order if found, None otherwise
+        """
+        try:
+            with Session(get_db().bind) as session:
+                # Import OrderType enum from core.types
+                from ...core.types import OrderType as CoreOrderType
+                
+                # Look for stop orders linked to the same transaction
+                # Stop loss orders are typically stop orders on the opposite side
+                statement = select(TradingOrder).where(
+                    TradingOrder.transaction_id == transaction_id,
+                    TradingOrder.order_type.in_([CoreOrderType.BUY_STOP, CoreOrderType.SELL_STOP]),
+                    TradingOrder.status.in_([OrderStatus.OPEN, OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER])
+                )
+                orders = session.exec(statement).all()
+                
+                # Return the first active stop order (assuming it's the SL order)
+                for order in orders:
+                    result = get_instance(TradingOrder, order.id)
+                    if result:
+                        return result
+                
+                return None
+        
+        except Exception as e:
+            logger.warning(f"Error finding existing SL order for transaction {transaction_id}: {e}")
+            return None

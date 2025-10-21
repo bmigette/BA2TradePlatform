@@ -415,6 +415,11 @@ class TradingOrder(SQLModel, table=True):
     depends_on_order_rel: Optional["TradingOrder"] = Relationship(
         back_populates="dependent_orders"
     )
+    
+    # Optional JSON data field for storing order metadata
+    # For WAITING_TRIGGER TP/SL orders: stores {"tp_percent": float, "parent_filled_price": float}
+    # Allows recalculation of TP/SL from parent order fill price when order is triggered
+    data: dict | None = Field(sa_column=Column(JSON), default=None, description="Optional order metadata (e.g., TP/SL percent for WAITING_TRIGGER orders)")
 
     def as_string(self) -> str:
         return f"Order(id={self.id}, symbol={self.symbol}, quantity={self.quantity}, side={self.side}, type={self.order_type}, status={self.status})"

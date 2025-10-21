@@ -328,6 +328,67 @@ class AccountInterface(ExtendableSettingsInterface):
             logger.error(f"Error creating transaction for order: {e}", exc_info=True)
             raise ValueError(f"Failed to create transaction for order: {e}")
     
+    def _ensure_tp_sl_percent_stored(self, tp_or_sl_order: TradingOrder, parent_order: TradingOrder) -> None:
+        """
+        Ensure that TP/SL percent is stored in the order.data field.
+        If not already stored, calculate it from the limit_price/stop_price and parent's open_price.
+        This provides a fallback mechanism if the percent wasn't stored during action evaluation.
+        
+        Args:
+            tp_or_sl_order: The WAITING_TRIGGER TP or SL order
+            parent_order: The parent order to calculate percent from
+        """
+        try:
+            from ..types import OrderType
+            from ..db import update_instance
+            
+            # Skip if no data field or already has tp_percent/sl_percent
+            if not tp_or_sl_order.data:
+                tp_or_sl_order.data = {}
+            
+            # Check if this is a TP order (BUY_LIMIT or SELL_LIMIT)
+            if tp_or_sl_order.order_type in [OrderType.BUY_LIMIT, OrderType.SELL_LIMIT]:
+                if "tp_percent" not in tp_or_sl_order.data or tp_or_sl_order.data.get("tp_percent") is None:
+                    # Calculate TP percent from current limit_price and parent's open_price
+                    if parent_order.open_price and parent_order.open_price > 0 and tp_or_sl_order.limit_price:
+                        tp_percent = ((tp_or_sl_order.limit_price - parent_order.open_price) / parent_order.open_price) * 100
+                        tp_or_sl_order.data["tp_percent"] = round(tp_percent, 2)
+                        tp_or_sl_order.data["parent_filled_price"] = parent_order.open_price
+                        tp_or_sl_order.data["type"] = "tp"
+                        update_instance(tp_or_sl_order)
+                        logger.info(
+                            f"Calculated and stored TP percent for order {tp_or_sl_order.id}: "
+                            f"{tp_percent:.2f}% (parent filled ${parent_order.open_price:.2f} → TP target ${tp_or_sl_order.limit_price:.2f}) - FALLBACK calculation"
+                        )
+                    else:
+                        logger.warning(
+                            f"Cannot calculate TP percent for order {tp_or_sl_order.id}: "
+                            f"parent open_price=${parent_order.open_price}, tp limit_price=${tp_or_sl_order.limit_price}"
+                        )
+            
+            # Check if this is an SL order (BUY_STOP or SELL_STOP)
+            elif tp_or_sl_order.order_type in [OrderType.BUY_STOP, OrderType.SELL_STOP]:
+                if "sl_percent" not in tp_or_sl_order.data or tp_or_sl_order.data.get("sl_percent") is None:
+                    # Calculate SL percent from current stop_price and parent's open_price
+                    if parent_order.open_price and parent_order.open_price > 0 and tp_or_sl_order.stop_price:
+                        sl_percent = ((tp_or_sl_order.stop_price - parent_order.open_price) / parent_order.open_price) * 100
+                        tp_or_sl_order.data["sl_percent"] = round(sl_percent, 2)
+                        tp_or_sl_order.data["parent_filled_price"] = parent_order.open_price
+                        tp_or_sl_order.data["type"] = "sl"
+                        update_instance(tp_or_sl_order)
+                        logger.info(
+                            f"Calculated and stored SL percent for order {tp_or_sl_order.id}: "
+                            f"{sl_percent:.2f}% (parent filled ${parent_order.open_price:.2f} → SL target ${tp_or_sl_order.stop_price:.2f}) - FALLBACK calculation"
+                        )
+                    else:
+                        logger.warning(
+                            f"Cannot calculate SL percent for order {tp_or_sl_order.id}: "
+                            f"parent open_price=${parent_order.open_price}, sl stop_price=${tp_or_sl_order.stop_price}"
+                        )
+        
+        except Exception as e:
+            logger.warning(f"Error ensuring TP/SL percent stored for order {tp_or_sl_order.id}: {e}")
+    
     def _submit_pending_tp_sl_orders(self, trading_order: TradingOrder) -> None:
         """
         Check if the order's transaction has pending TP/SL values and submit them to the broker.
@@ -348,6 +409,10 @@ class AccountInterface(ExtendableSettingsInterface):
             if transaction.take_profit:
                 logger.info(f"Submitting pending TP order (${transaction.take_profit}) to broker for order {trading_order.id}")
                 try:
+                    # Ensure TP percent is stored in the order data (fallback calculation if not already set)
+                    # This will be used when the WAITING_TRIGGER order is triggered
+                    self._ensure_tp_sl_percent_stored(trading_order, trading_order)  # Pass same order since we're calculating from current state
+                    
                     # Call the implementation method directly to create TP order at broker
                     # Skip the check for PENDING status since order is now submitted
                     from ..types import OrderStatus
@@ -362,6 +427,10 @@ class AccountInterface(ExtendableSettingsInterface):
             if transaction.stop_loss:
                 logger.info(f"Submitting pending SL order (${transaction.stop_loss}) to broker for order {trading_order.id}")
                 try:
+                    # Ensure SL percent is stored in the order data (fallback calculation if not already set)
+                    # This will be used when the WAITING_TRIGGER order is triggered
+                    self._ensure_tp_sl_percent_stored(trading_order, trading_order)  # Pass same order since we're calculating from current state
+                    
                     # Call the implementation method if it exists
                     if hasattr(self, '_set_order_sl_impl'):
                         from ..types import OrderStatus
