@@ -1675,7 +1675,9 @@ class AccountOverviewTab:
             
             # Pending Orders Table
             with ui.card().classes('mt-4'):
-                ui.label('Pending Orders (PENDING, WAITING_TRIGGER, or ERROR)').classes('text-h6 mb-4')
+                with ui.row().classes('w-full items-center justify-between'):
+                    ui.label('Pending Orders (PENDING, WAITING_TRIGGER, or ERROR)').classes('text-h6 mb-4')
+                    ui.button('Clean Pending Orders', icon='delete_sweep', on_click=self._clean_pending_orders_dialog).props('outline color=warning')
                 self._render_pending_orders_table()
     
     def _render_live_orders_table(self):
@@ -2816,6 +2818,67 @@ class AccountOverviewTab:
             return None
         finally:
             session.close()
+    
+    def _clean_pending_orders_dialog(self):
+        """Show confirmation dialog for cleaning pending orders."""
+        logger.debug("User clicked 'Clean Pending Orders' button")
+        
+        def confirm_clean():
+            """Execute the cleanup after confirmation."""
+            logger.info("User confirmed pending orders cleanup")
+            try:
+                from ...core.TradeManager import get_trade_manager
+                trade_manager = get_trade_manager()
+                
+                # Execute cleanup
+                stats = trade_manager.clean_pending_orders()
+                
+                # Show results
+                if stats['errors']:
+                    error_msg = '\n'.join(stats['errors'][:5])  # Show first 5 errors
+                    ui.notify(
+                        f"Cleanup completed with issues:\n{error_msg}",
+                        type='warning'
+                    )
+                else:
+                    ui.notify(
+                        f"✓ Cleaned {stats['orders_deleted']} pending orders\n"
+                        f"✓ Deleted {stats['dependents_deleted']} dependent orders\n"
+                        f"✓ Closed {stats['transactions_closed']} transactions",
+                        type='positive'
+                    )
+                
+                logger.info(
+                    f"Pending orders cleanup completed: deleted {stats['orders_deleted']} orders, "
+                    f"deleted {stats['dependents_deleted']} dependents, "
+                    f"closed {stats['transactions_closed']} transactions"
+                )
+                
+                # Refresh pending orders table
+                if hasattr(self, 'pending_orders_container') and self.pending_orders_container:
+                    self.pending_orders_container.clear()
+                    with self.pending_orders_container:
+                        self._render_pending_orders_content()
+                        
+            except Exception as e:
+                logger.error(f"Error during pending order cleanup: {e}", exc_info=True)
+                ui.notify(f'Error cleaning pending orders: {str(e)}', type='negative')
+        
+        # Show confirmation dialog
+        with ui.dialog() as dialog:
+            with ui.card().classes('w-96'):
+                ui.label('Clean Pending Orders?').classes('text-lg font-bold')
+                ui.label(
+                    'This will delete all PENDING and ERROR orders (not submitted to broker), '
+                    'plus their dependent orders. WAITING_TRIGGER orders whose parents are NOT being deleted will be preserved.'
+                ).classes('text-sm text-gray-600')
+                ui.label('⚠️ This action cannot be undone!').classes('text-sm font-bold text-orange-600')
+                
+                with ui.row().classes('w-full justify-end gap-2 mt-4'):
+                    ui.button('Cancel', on_click=dialog.close).props('flat')
+                    ui.button('Confirm', on_click=lambda: [confirm_clean(), dialog.close()]).props('color=warning')
+        
+        dialog.open()
 
 class TransactionsTab:
     """Comprehensive transactions management tab with full control over positions."""
@@ -2884,8 +2947,6 @@ class TransactionsTab:
                     ui.button('Refresh', icon='refresh', on_click=lambda: self._refresh_transactions()).props('outline')
                     
                     ui.button('Force Refresh Account', icon='cloud_download', on_click=self._force_refresh_account_now).props('outline')
-                    
-                    ui.button('Clean Pending Orders', icon='delete_sweep', on_click=self._clean_pending_orders_dialog).props('outline color=warning')
                     
                     # Batch operation buttons
                     self.batch_operations_container = ui.row().classes('gap-2 ml-4')

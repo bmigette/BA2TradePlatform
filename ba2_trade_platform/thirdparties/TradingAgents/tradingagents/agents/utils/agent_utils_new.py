@@ -140,7 +140,119 @@ class Toolkit:
         else:
             return ohlcv_provider_class()
     
-    # ========================================================================
+    def _format_ohlcv_dataframe(self, df, symbol: str) -> tuple:
+        """
+        Convert OHLCV DataFrame to markdown text and JSON dict.
+        
+        Args:
+            df: DataFrame with columns: Date, Open, High, Low, Close, Volume
+            symbol: Stock symbol (for metadata)
+        
+        Returns:
+            Tuple of (markdown_text, json_dict)
+        """
+        import pandas as pd
+        
+        try:
+            # Ensure Date is datetime
+            if 'Date' in df.columns:
+                df['Date'] = pd.to_datetime(df['Date'])
+            
+            # Create markdown representation
+            markdown_lines = [f"# OHLCV Data for {symbol}"]
+            markdown_lines.append(f"**Records**: {len(df)}")
+            markdown_lines.append(f"**Date Range**: {df['Date'].min()} to {df['Date'].max()}")
+            markdown_lines.append("")
+            markdown_lines.append("| Date | Open | High | Low | Close | Volume |")
+            markdown_lines.append("|------|------|------|-----|-------|--------|")
+            
+            # Show first 10, last 10 rows in markdown (limit output)
+            rows_to_show = min(10, len(df))
+            for idx in range(rows_to_show):
+                row = df.iloc[idx]
+                date_str = row['Date'].strftime('%Y-%m-%d')
+                markdown_lines.append(
+                    f"| {date_str} | {row['Open']:.2f} | {row['High']:.2f} | {row['Low']:.2f} | {row['Close']:.2f} | {int(row['Volume'])} |"
+                )
+            
+            if len(df) > 20:
+                markdown_lines.append("| ... | ... | ... | ... | ... | ... |")
+                for idx in range(len(df) - rows_to_show, len(df)):
+                    row = df.iloc[idx]
+                    date_str = row['Date'].strftime('%Y-%m-%d')
+                    markdown_lines.append(
+                        f"| {date_str} | {row['Open']:.2f} | {row['High']:.2f} | {row['Low']:.2f} | {row['Close']:.2f} | {int(row['Volume'])} |"
+                    )
+            
+            markdown_text = "\n".join(markdown_lines)
+            
+            # Create JSON structure (clean, JSON-serializable)
+            json_dict = {
+                "symbol": symbol,
+                "dates": df['Date'].dt.strftime('%Y-%m-%d').tolist(),
+                "opens": df['Open'].round(4).tolist(),
+                "highs": df['High'].round(4).tolist(),
+                "lows": df['Low'].round(4).tolist(),
+                "closes": df['Close'].round(4).tolist(),
+                "volumes": df['Volume'].astype(int).tolist(),
+                "metadata": {
+                    "total_records": len(df),
+                    "start_date": df['Date'].min().strftime('%Y-%m-%d'),
+                    "end_date": df['Date'].max().strftime('%Y-%m-%d')
+                }
+            }
+            
+            return markdown_text, json_dict
+            
+        except Exception as e:
+            logger.error(f"Error formatting OHLCV DataFrame: {e}", exc_info=True)
+            return f"Error formatting data: {str(e)}", {"error": str(e)}
+    
+    def _call_provider_with_both_format(self, provider, method_name: str, **kwargs) -> tuple:
+        """
+        Call a provider method with format_type="both" and handle response extraction.
+        
+        Args:
+            provider: Instantiated provider instance
+            method_name: Name of the method to call (e.g., 'get_company_news')
+            **kwargs: Arguments to pass to the method (will add format_type="both")
+        
+        Returns:
+            Tuple of (markdown_text, data_dict or None)
+        """
+        try:
+            # Add format_type="both" to kwargs
+            kwargs["format_type"] = "both"
+            
+            # Call the provider method
+            method = getattr(provider, method_name)
+            result = method(**kwargs)
+            
+            # Handle result that has both text and data
+            if isinstance(result, dict):
+                if "text" in result and "data" in result:
+                    return result["text"], result["data"]
+                else:
+                    # Result doesn't have expected structure, return as is
+                    logger.warning(f"Provider result missing 'text' or 'data' keys: {type(result)}")
+                    return str(result), None
+            else:
+                # Result is plain string, no structured data
+                return str(result), None
+                
+        except Exception as e:
+            logger.warning(f"Provider call failed with format_type='both': {e}")
+            # Fallback: try with format_type="markdown" only
+            try:
+                kwargs["format_type"] = "markdown"
+                method = getattr(provider, method_name)
+                result = method(**kwargs)
+                return str(result), None
+            except Exception as e2:
+                logger.error(f"Provider call also failed with format_type='markdown': {e2}")
+                return None, None
+    
+    
     # NEWS PROVIDERS - Aggregate results from all providers
     # ========================================================================
     
@@ -192,14 +304,21 @@ class Toolkit:
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching company news from {provider_name} for {symbol}")
-                    news_data = provider.get_company_news(
+                    
+                    # Call provider with format_type="both" to get both markdown and structured data
+                    markdown_data, data_dict = self._call_provider_with_both_format(
+                        provider,
+                        "get_company_news",
                         symbol=symbol,
                         end_date=end_dt,
-                        lookback_days=lookback_days,
-                        format_type="markdown"
+                        lookback_days=lookback_days
                     )
                     
-                    results.append(f"## News from {provider_name.upper()}\n\n{news_data}")
+                    if markdown_data is None:
+                        results.append(f"## {provider_name} - Error\n\nFailed to fetch news")
+                        continue
+                    
+                    results.append(f"## News from {provider_name.upper()}\n\n{markdown_data}")
                     
                 except Exception as e:
                     logger.error(f"Error fetching company news from {provider_class.__name__}: {e}")
@@ -258,13 +377,20 @@ class Toolkit:
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching global news from {provider_name}")
-                    news_data = provider.get_global_news(
+                    
+                    # Call provider with format_type="both" to get both markdown and structured data
+                    markdown_data, data_dict = self._call_provider_with_both_format(
+                        provider,
+                        "get_global_news",
                         end_date=end_dt,
-                        lookback_days=lookback_days,
-                        format_type="markdown"
+                        lookback_days=lookback_days
                     )
                     
-                    results.append(f"## Global News from {provider_name.upper()}\n\n{news_data}")
+                    if markdown_data is None:
+                        results.append(f"## {provider_name} - Error\n\nFailed to fetch news")
+                        continue
+                    
+                    results.append(f"## Global News from {provider_name.upper()}\n\n{markdown_data}")
                     
                 except Exception as e:
                     logger.error(f"Error fetching global news from {provider_class.__name__}: {e}")
@@ -334,15 +460,20 @@ class Toolkit:
                     
                     logger.debug(f"Fetching social media sentiment from {provider_name} for {symbol}")
                     
-                    # Use get_social_media_sentiment method from the social media provider
-                    sentiment_data = provider.get_social_media_sentiment(
+                    # Call provider with format_type="both" to get both markdown and structured data
+                    markdown_data, data_dict = self._call_provider_with_both_format(
+                        provider,
+                        "get_social_media_sentiment",
                         symbol=symbol,
                         end_date=end_dt,
-                        lookback_days=lookback_days,
-                        format_type="markdown"
+                        lookback_days=lookback_days
                     )
                     
-                    results.append(f"## Social Media Sentiment from {provider_name.upper()}\n\n{sentiment_data}")
+                    if markdown_data is None:
+                        results.append(f"## {provider_name} - Error\n\nFailed to fetch sentiment")
+                        continue
+                    
+                    results.append(f"## Social Media Sentiment from {provider_name.upper()}\n\n{markdown_data}")
                     
                 except Exception as e:
                     logger.error(f"Error fetching social media sentiment from {provider_class.__name__}: {e}")
@@ -406,14 +537,21 @@ class Toolkit:
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching insider transactions from {provider_name} for {symbol}")
-                    insider_data = provider.get_insider_transactions(
+                    
+                    # Call provider with format_type="both" to get both markdown and structured data
+                    markdown_data, data_dict = self._call_provider_with_both_format(
+                        provider,
+                        "get_insider_transactions",
                         symbol=symbol,
                         end_date=end_dt,
-                        lookback_days=lookback_days,
-                        format_type="markdown"
+                        lookback_days=lookback_days
                     )
                     
-                    results.append(f"## Insider Transactions from {provider_name.upper()}\n\n{insider_data}")
+                    if markdown_data is None:
+                        results.append(f"## {provider_name} - Error\n\nFailed to fetch transactions")
+                        continue
+                    
+                    results.append(f"## Insider Transactions from {provider_name.upper()}\n\n{markdown_data}")
                     
                 except Exception as e:
                     logger.error(f"Error fetching insider transactions from {provider_class.__name__}: {e}")
@@ -473,14 +611,21 @@ class Toolkit:
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching insider sentiment from {provider_name} for {symbol}")
-                    sentiment_data = provider.get_insider_sentiment(
+                    
+                    # Call provider with format_type="both" to get both markdown and structured data
+                    markdown_data, data_dict = self._call_provider_with_both_format(
+                        provider,
+                        "get_insider_sentiment",
                         symbol=symbol,
                         end_date=end_dt,
-                        lookback_days=lookback_days,
-                        format_type="markdown"
+                        lookback_days=lookback_days
                     )
                     
-                    results.append(f"## Insider Sentiment from {provider_name.upper()}\n\n{sentiment_data}")
+                    if markdown_data is None:
+                        results.append(f"## {provider_name} - Error\n\nFailed to fetch sentiment")
+                        continue
+                    
+                    results.append(f"## Insider Sentiment from {provider_name.upper()}\n\n{markdown_data}")
                     
                 except Exception as e:
                     logger.error(f"Error fetching insider sentiment from {provider_class.__name__}: {e}")
@@ -547,15 +692,22 @@ class Toolkit:
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching balance sheet from {provider_name} for {symbol}")
-                    balance_data = provider.get_balance_sheet(
+                    
+                    # Call provider with format_type="both" to get both markdown and structured data
+                    markdown_data, data_dict = self._call_provider_with_both_format(
+                        provider,
+                        "get_balance_sheet",
                         symbol=symbol,
                         frequency=frequency,
                         end_date=end_dt,
-                        lookback_periods=lookback_periods,
-                        format_type="markdown"
+                        lookback_periods=lookback_periods
                     )
                     
-                    results.append(f"## Balance Sheet from {provider_name.upper()}\n\n{balance_data}")
+                    if markdown_data is None:
+                        results.append(f"## {provider_name} - Error\n\nFailed to fetch balance sheet")
+                        continue
+                    
+                    results.append(f"## Balance Sheet from {provider_name.upper()}\n\n{markdown_data}")
                     
                 except Exception as e:
                     logger.error(f"Error fetching balance sheet from {provider_class.__name__}: {e}")
@@ -619,15 +771,22 @@ class Toolkit:
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching income statement from {provider_name} for {symbol}")
-                    income_data = provider.get_income_statement(
+                    
+                    # Call provider with format_type="both" to get both markdown and structured data
+                    markdown_data, data_dict = self._call_provider_with_both_format(
+                        provider,
+                        "get_income_statement",
                         symbol=symbol,
                         frequency=frequency,
                         end_date=end_dt,
-                        lookback_periods=lookback_periods,
-                        format_type="markdown"
+                        lookback_periods=lookback_periods
                     )
                     
-                    results.append(f"## Income Statement from {provider_name.upper()}\n\n{income_data}")
+                    if markdown_data is None:
+                        results.append(f"## {provider_name} - Error\n\nFailed to fetch income statement")
+                        continue
+                    
+                    results.append(f"## Income Statement from {provider_name.upper()}\n\n{markdown_data}")
                     
                 except Exception as e:
                     logger.error(f"Error fetching income statement from {provider_class.__name__}: {e}")
@@ -691,15 +850,22 @@ class Toolkit:
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching cash flow statement from {provider_name} for {symbol}")
-                    cashflow_data = provider.get_cashflow_statement(
+                    
+                    # Call provider with format_type="both" to get both markdown and structured data
+                    markdown_data, data_dict = self._call_provider_with_both_format(
+                        provider,
+                        "get_cashflow_statement",
                         symbol=symbol,
                         frequency=frequency,
                         end_date=end_dt,
-                        lookback_periods=lookback_periods,
-                        format_type="markdown"
+                        lookback_periods=lookback_periods
                     )
                     
-                    results.append(f"## Cash Flow Statement from {provider_name.upper()}\n\n{cashflow_data}")
+                    if markdown_data is None:
+                        results.append(f"## {provider_name} - Error\n\nFailed to fetch cash flow")
+                        continue
+                    
+                    results.append(f"## Cash Flow Statement from {provider_name.upper()}\n\n{markdown_data}")
                     
                 except Exception as e:
                     logger.error(f"Error fetching cash flow from {provider_class.__name__}: {e}")
@@ -758,15 +924,22 @@ class Toolkit:
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching past earnings from {provider_name} for {symbol}")
-                    earnings_data = provider.get_past_earnings(
+                    
+                    # Call provider with format_type="both" to get both markdown and structured data
+                    markdown_data, data_dict = self._call_provider_with_both_format(
+                        provider,
+                        "get_past_earnings",
                         symbol=symbol,
                         frequency=frequency,
                         end_date=end_dt,
-                        lookback_periods=lookback_periods,
-                        format_type="markdown"
+                        lookback_periods=lookback_periods
                     )
                     
-                    results.append(f"## Past Earnings from {provider_name.upper()}\n\n{earnings_data}")
+                    if markdown_data is None:
+                        results.append(f"## {provider_name} - Error\n\nFailed to fetch past earnings")
+                        continue
+                    
+                    results.append(f"## Past Earnings from {provider_name.upper()}\n\n{markdown_data}")
                     
                 except Exception as e:
                     logger.error(f"Error fetching past earnings from {provider_class.__name__}: {e}")
@@ -825,15 +998,22 @@ class Toolkit:
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching earnings estimates from {provider_name} for {symbol}")
-                    estimates_data = provider.get_earnings_estimates(
+                    
+                    # Call provider with format_type="both" to get both markdown and structured data
+                    markdown_data, data_dict = self._call_provider_with_both_format(
+                        provider,
+                        "get_earnings_estimates",
                         symbol=symbol,
                         frequency=frequency,
                         as_of_date=as_of_dt,
-                        lookback_periods=lookback_periods,
-                        format_type="markdown"
+                        lookback_periods=lookback_periods
                     )
                     
-                    results.append(f"## Earnings Estimates from {provider_name.upper()}\n\n{estimates_data}")
+                    if markdown_data is None:
+                        results.append(f"## {provider_name} - Error\n\nFailed to fetch earnings estimates")
+                        continue
+                    
+                    results.append(f"## Earnings Estimates from {provider_name.upper()}\n\n{markdown_data}")
                     
                 except Exception as e:
                     logger.error(f"Error fetching earnings estimates from {provider_class.__name__}: {e}")
@@ -908,24 +1088,40 @@ class Toolkit:
                     
                     logger.debug(f"Trying OHLCV provider {provider_name} for {symbol}")
                     
-                    # Call provider's get_ohlcv_data_formatted method with format_type="both"
-                    # This returns {"text": markdown, "data": dict} for loggingToolNode optimization
-                    result = provider.get_ohlcv_data_formatted(
+                    # Call provider's get_ohlcv_data method (returns DataFrame)
+                    # Note: OHLCV providers do NOT support format_type parameter
+                    df = provider.get_ohlcv_data(
                         symbol=symbol,
                         start_date=start_dt,
                         end_date=end_dt,
-                        interval=interval,
-                        format_type="both"
+                        interval=interval
                     )
                     
-                    # Extract both text and data
-                    if isinstance(result, dict) and "text" in result and "data" in result:
-                        logger.info(f"Successfully retrieved OHLCV data from {provider_name}")
-                        # Return markdown text for LLM consumption
-                        # (The data dict can be logged by loggingToolNode)
-                        return result["text"]
-                    else:
-                        raise ValueError("Provider did not return expected format")
+                    # Check if data was retrieved successfully
+                    if df is None or df.empty:
+                        logger.warning(f"OHLCV provider {provider_name} returned empty data, trying next provider...")
+                        continue
+                    
+                    logger.info(f"Successfully retrieved OHLCV data from {provider_name}")
+                    
+                    # Convert DataFrame to markdown and JSON using helper method
+                    markdown_text, json_data = self._format_ohlcv_dataframe(df, symbol)
+                    
+                    # Return structured format for LoggingToolNode to store both text and data
+                    # This allows the database to store complete OHLCV data in JSON format
+                    return {
+                        "_internal": True,
+                        "text_for_agent": markdown_text,
+                        "json_for_storage": {
+                            "tool": "get_ohlcv_data",
+                            "symbol": symbol,
+                            "start_date": start_date,
+                            "end_date": end_date,
+                            "interval": interval,
+                            "provider": provider_name,
+                            "data": json_data
+                        }
+                    }
                     
                 except Exception as e:
                     logger.warning(f"OHLCV provider {provider_class.__name__} failed: {e}, trying next provider...")
@@ -946,10 +1142,16 @@ class Toolkit:
         symbol: Annotated[str, "Stock ticker symbol (e.g., 'AAPL', 'MSFT')"],
         indicator: Annotated[
             str,
-            "Technical indicator name: 'rsi' (Relative Strength Index), 'macd' (Moving Average Convergence Divergence), "
-            "'close_50_sma' (50-day Simple Moving Average), 'close_200_sma' (200-day SMA), 'close_10_ema' (10-day Exponential MA), "
-            "'boll' (Bollinger Bands middle), 'boll_ub' (Bollinger upper band), 'boll_lb' (Bollinger lower band), "
-            "'atr' (Average True Range), 'vwma' (Volume Weighted MA), 'mfi' (Money Flow Index), etc."
+            "Technical indicator name. Available indicators: "
+            "MOVING AVERAGES: 'close_50_sma' (50-day Simple Moving Average - medium-term trend), "
+            "'close_200_sma' (200-day SMA - long-term trend), 'close_10_ema' (10-day EMA - fast short-term). "
+            "MACD: 'macd' (MACD line - momentum), 'macds' (Signal line - smoother MACD), 'macdh' (Histogram - momentum strength). "
+            "MOMENTUM: 'rsi' (Relative Strength Index - overbought/oversold 0-100 scale). "
+            "VOLATILITY: 'boll' (Bollinger middle band), 'boll_ub' (Bollinger upper band), 'boll_lb' (Bollinger lower band), "
+            "'atr' (Average True Range - volatility measure). "
+            "VOLUME: 'vwma' (Volume Weighted MA), 'mfi' (Money Flow Index - volume + price pressure). "
+            "USAGE NOTES: RSI extremes (>70 or <30) signal overbought/oversold. MACD crossovers signal trend changes. "
+            "Bollinger bands signal volatility extremes. ATR helps size positions based on volatility."
         ],
         start_date: Annotated[str, "Start date in YYYY-MM-DD format"],
         end_date: Annotated[str, "End date in YYYY-MM-DD format"],
@@ -1008,30 +1210,27 @@ class Toolkit:
                     
                     logger.debug(f"Trying indicator provider {provider_name} for {symbol} - {indicator}")
                     
-                    # Get both markdown (for LLM) and JSON (for visualization/storage)
-                    # Note: Interface signature is (symbol, indicator, start_date, end_date, ...)
-                    markdown_data = provider.get_indicator(
+                    # Get both markdown (for LLM) and structured data (for storage) in single call
+                    # format_type="both" returns {"text": markdown_str, "data": dict}
+                    result = provider.get_indicator(
                         symbol=symbol,
                         indicator=indicator,
                         start_date=start_dt,
                         end_date=end_dt,
                         interval=interval,
-                        format_type="markdown"
+                        format_type="both"
                     )
                     
-                    # Also get JSON format for storage and data visualization
-                    json_data = provider.get_indicator(
-                        symbol=symbol,
-                        indicator=indicator,
-                        start_date=start_dt,
-                        end_date=end_dt,
-                        interval=interval,
-                        format_type="json"
-                    )
+                    # Extract markdown and data from result
+                    if isinstance(result, dict) and "text" in result and "data" in result:
+                        markdown_data = result["text"]
+                        indicator_data = result["data"]
+                    else:
+                        raise ValueError(f"Provider did not return expected format with 'text' and 'data' keys. Got: {type(result)}")
                     
                     logger.info(f"Successfully retrieved indicator data from {provider_name}")
                     
-                    # Return internal format so LoggingToolNode stores both markdown and JSON
+                    # Return structured format for LoggingToolNode storage
                     text_for_agent = f"## {indicator.upper()} from {provider_name.upper()}\n\n{markdown_data}"
                     
                     json_for_storage = {
@@ -1042,7 +1241,7 @@ class Toolkit:
                         "end_date": end_date,
                         "interval": interval,
                         "provider": provider_name,
-                        "data": json_data if isinstance(json_data, dict) else {"raw": str(json_data)}
+                        "data": indicator_data if isinstance(indicator_data, dict) else {"raw": str(indicator_data)}
                     }
                     
                     return {
@@ -1123,14 +1322,21 @@ class Toolkit:
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching economic indicators from {provider_name}")
-                    econ_data = provider.get_economic_indicators(
+                    
+                    # Call provider with format_type="both" to get both markdown and structured data
+                    markdown_data, data_dict = self._call_provider_with_both_format(
+                        provider,
+                        "get_economic_indicators",
                         end_date=end_dt,
                         lookback_days=lookback_days,
-                        indicators=indicators,
-                        format_type="markdown"
+                        indicators=indicators
                     )
                     
-                    results.append(f"## Economic Indicators from {provider_name.upper()}\n\n{econ_data}")
+                    if markdown_data is None:
+                        results.append(f"## {provider_name} - Error\n\nFailed to fetch indicators")
+                        continue
+                    
+                    results.append(f"## Economic Indicators from {provider_name.upper()}\n\n{markdown_data}")
                     
                 except Exception as e:
                     logger.error(f"Error fetching economic indicators from {provider_class.__name__}: {e}")
@@ -1192,13 +1398,20 @@ class Toolkit:
                     provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching yield curve from {provider_name}")
-                    yield_data = provider.get_yield_curve(
+                    
+                    # Call provider with format_type="both" to get both markdown and structured data
+                    markdown_data, data_dict = self._call_provider_with_both_format(
+                        provider,
+                        "get_yield_curve",
                         end_date=end_dt,
-                        lookback_days=lookback_days,
-                        format_type="markdown"
+                        lookback_days=lookback_days
                     )
                     
-                    results.append(f"## Yield Curve from {provider_name.upper()}\n\n{yield_data}")
+                    if markdown_data is None:
+                        results.append(f"## {provider_name} - Error\n\nFailed to fetch yield curve")
+                        continue
+                    
+                    results.append(f"## Yield Curve from {provider_name.upper()}\n\n{markdown_data}")
                     
                 except Exception as e:
                     logger.error(f"Error fetching yield curve from {provider_class.__name__}: {e}")

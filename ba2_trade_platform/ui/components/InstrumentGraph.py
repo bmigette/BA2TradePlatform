@@ -117,14 +117,31 @@ class InstrumentGraph:
             
             # Align all indicators with price data date range for continuity
             price_index = self.price_data.index if isinstance(self.price_data.index, pd.DatetimeIndex) else None
+            
+            # Debug: Log price index info
+            if price_index is not None:
+                logger.debug(f"Price index: {len(price_index)} rows, tz={price_index.tz}, "
+                           f"first={price_index[0] if len(price_index) > 0 else 'N/A'}, "
+                           f"last={price_index[-1] if len(price_index) > 0 else 'N/A'}")
+            
             if price_index is not None:
                 for indicator_name in self.indicators_data.keys():
                     indicator_df = self.indicators_data[indicator_name]
                     if not indicator_df.empty and isinstance(indicator_df.index, pd.DatetimeIndex):
+                        # Debug: Log indicator index before reindex
+                        logger.debug(f"Indicator '{indicator_name}' before reindex: {len(indicator_df)} rows, tz={indicator_df.index.tz}, "
+                                   f"first={indicator_df.index[0]}, last={indicator_df.index[-1]}")
+                        
                         # Reindex to match price data, filling with NaN for missing dates
                         self.indicators_data[indicator_name] = indicator_df.reindex(price_index)
+                        
+                        # Debug: Log after reindex and check for NaN
+                        reindexed_df = self.indicators_data[indicator_name]
+                        non_nan_count = reindexed_df.notna().sum().sum()
+                        total_values = reindexed_df.shape[0] * reindexed_df.shape[1]
                         logger.debug(f"Reindexed indicator '{indicator_name}' to match price data: "
-                                   f"before={len(indicator_df)} rows, after={len(self.indicators_data[indicator_name])} rows")
+                                   f"before={len(indicator_df)} rows, after={len(reindexed_df)} rows, "
+                                   f"non-NaN values: {non_nan_count}/{total_values}")
             
             # Categorize indicators by type
             price_indicators = []  # Same scale as price
@@ -316,6 +333,11 @@ class InstrumentGraph:
                             break
                     
                     if value_col:
+                        # Debug: Check for NaN values
+                        non_nan_count = indicator_df[value_col].notna().sum()
+                        logger.debug(f"Oscillator '{indicator_name}': value_col='{value_col}', non-NaN values: {non_nan_count}/{len(indicator_df)}, "
+                                   f"min={indicator_df[value_col].min()}, max={indicator_df[value_col].max()}")
+                        
                         # Convert indicator x-axis to same datetime string format
                         if isinstance(indicator_df.index, pd.DatetimeIndex):
                             indicator_x = indicator_df.index.strftime('%Y-%m-%d %H:%M:%S').tolist()
@@ -359,6 +381,10 @@ class InstrumentGraph:
                     # MACD often has multiple columns (MACD, Signal, Histogram)
                     for col in indicator_df.columns:
                         if indicator_df[col].dtype in ['float64', 'int64']:
+                            non_nan_count = indicator_df[col].notna().sum()
+                            logger.debug(f"Momentum '{indicator_name}' column '{col}': non-NaN values: {non_nan_count}/{len(indicator_df)}, "
+                                       f"min={indicator_df[col].min()}, max={indicator_df[col].max()}")
+                            
                             # Convert indicator x-axis to same datetime string format
                             if isinstance(indicator_df.index, pd.DatetimeIndex):
                                 indicator_x = indicator_df.index.strftime('%Y-%m-%d %H:%M:%S').tolist()
