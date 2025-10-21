@@ -2368,6 +2368,9 @@ class ExpertSettingsTab:
                     return
                 
                 try:
+                    import tempfile
+                    import os
+                    
                     export_data = {}
                     
                     # Export general settings
@@ -2404,57 +2407,45 @@ class ExpertSettingsTab:
                     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                     filename = f"expert_settings_{expert_instance.expert}_{expert_instance.id}_{timestamp}.json"
                     
-                    # Log exported data
-                    logger.info(f'Exporting expert settings to {filename}')
-                    
-                    # Create download link by storing in memory and creating data URL
-                    json_str = json.dumps(export_data, indent=2)
-                    ui.notify(f'✅ Settings exported to: {filename}', type='positive')
-                    
-                    # Simulate download by logging and showing in UI
-                    logger.debug(f'Export data: {json_str}')
-                    
-                    # Show export data in UI for copy-paste
-                    export_data_container.clear()
-                    with export_data_container:
-                        ui.label('Export Data (copy to save as JSON file):').classes('text-body2 font-semibold mb-2')
-                        ui.textarea(
-                            value=json_str,
-                            placeholder='Export data will appear here'
-                        ).classes('w-full h-48').props('readonly')
+                    # Create temporary file for download
+                    temp_fd, temp_path = tempfile.mkstemp(suffix='.json', prefix='expert_settings_')
+                    try:
+                        # Write JSON data to temp file
+                        json_str = json.dumps(export_data, indent=2)
+                        os.write(temp_fd, json_str.encode('utf-8'))
+                        os.close(temp_fd)
                         
-                        ui.button(
-                            'Copy to Clipboard',
-                            icon='content_copy',
-                            on_click=lambda: ui.run_javascript(
-                                f"navigator.clipboard.writeText('{json_str.replace(chr(39), chr(92)+chr(39))}')"
-                            )
-                        ).props('outlined')
+                        # Log and notify
+                        logger.info(f'Exporting expert settings: {filename}')
+                        ui.notify(f'✅ Starting download: {filename}', type='positive')
+                        
+                        # Trigger download via browser
+                        ui.download(temp_path, filename)
+                        
+                    except Exception as e:
+                        if os.path.exists(temp_path):
+                            os.unlink(temp_path)
+                        raise
                 
                 except Exception as e:
                     logger.error(f'Error exporting expert settings: {e}', exc_info=True)
                     ui.notify(f'Error exporting settings: {str(e)}', type='negative')
             
             ui.button('Export Settings', icon='download', on_click=export_settings_click).classes('mb-4')
-            
-            export_data_container = ui.column().classes('w-full')
         
         # Import section
         with ui.card().classes('w-full mb-4'):
             ui.label('Import Settings').classes('text-subtitle2 mb-4')
             
-            ui.label('Paste previously exported JSON settings to restore them:').classes('text-body2 mb-2')
-            import_textarea = ui.textarea(
-                placeholder='Paste JSON export data here',
-                value=''
-            ).classes('w-full h-40 mb-4')
+            ui.label('Upload a previously exported JSON settings file to restore settings:').classes('text-body2 mb-2')
             
-            def import_settings_click():
-                """Import expert settings from JSON."""
+            def handle_import_upload(e: UploadEventArguments):
+                """Handle JSON file upload for settings import."""
                 try:
-                    import_json = import_textarea.value.strip()
-                    if not import_json:
-                        ui.notify('Please paste JSON data to import', type='warning')
+                    # Read the uploaded file
+                    import_json = e.content.read().decode('utf-8')
+                    if not import_json.strip():
+                        ui.notify('Uploaded file is empty', type='warning')
                         return
                     
                     import_data = json.loads(import_json)
@@ -2494,6 +2485,7 @@ class ExpertSettingsTab:
                             self.instrument_selector.set_selected_instruments(instrument_configs)
                     
                     ui.notify('✅ Settings imported successfully! Click Save to apply all changes.', type='positive')
+                    logger.info(f'Successfully imported expert settings from file')
                     
                 except json.JSONDecodeError as e:
                     logger.error(f'Invalid JSON format: {e}')
@@ -2502,7 +2494,12 @@ class ExpertSettingsTab:
                     logger.error(f'Error importing expert settings: {e}', exc_info=True)
                     ui.notify(f'Error importing settings: {str(e)}', type='negative')
             
-            ui.button('Import Settings', icon='upload', on_click=import_settings_click).classes('mb-2')
+            ui.upload(
+                label='Upload Settings (.json)',
+                on_upload=handle_import_upload,
+                max_files=1,
+                auto_upload=True
+            ).classes('w-full')
     
     def _render_cleanup_tab(self, expert_instance=None):
         """Render the cleanup tab for managing old analysis data."""

@@ -466,10 +466,42 @@ class JobMonitoringTab:
             worker_count = worker_queue.get_worker_count()
             all_tasks = worker_queue.get_all_tasks()
             
+            logger.debug(f"All tasks count: {len(all_tasks)}")
+            
+            # Debug: Log first few tasks to see their structure
+            if all_tasks:
+                for i, t in enumerate(all_tasks[:3]):
+                    logger.debug(f"Task {i}: type={type(t)}, dir={[attr for attr in dir(t) if not attr.startswith('_')]}")
+                    if hasattr(t, 'status'):
+                        logger.debug(f"  status={t.status}, status_type={type(t.status)}")
+                    if hasattr(t, 'state'):
+                        logger.debug(f"  state={t.state}, state_type={type(t.state)}")
+            
             # Filter tasks safely, checking if they have status attribute
-            running_tasks = len([t for t in all_tasks if hasattr(t, 'status') and t.status == WorkerTaskStatus.RUNNING])
-            pending_tasks = len([t for t in all_tasks if hasattr(t, 'status') and t.status == WorkerTaskStatus.PENDING])
+            # Status can be string or enum, so check both
+            running_tasks = 0
+            pending_tasks = 0
+            
+            for t in all_tasks:
+                task_status = None
+                
+                # Try status attribute first
+                if hasattr(t, 'status'):
+                    task_status = t.status
+                # Try state attribute as fallback
+                elif hasattr(t, 'state'):
+                    task_status = t.state
+                
+                if task_status:
+                    # Handle both enum and string comparisons
+                    if task_status == WorkerTaskStatus.RUNNING or task_status == 'running':
+                        running_tasks += 1
+                    elif task_status == WorkerTaskStatus.PENDING or task_status == 'pending':
+                        pending_tasks += 1
+            
             total_tasks = len(all_tasks)
+            
+            logger.info(f"Queue info: workers={worker_count}, running={running_tasks}, pending={pending_tasks}, total={total_tasks}")
             
             return {
                 'worker_count': worker_count,
@@ -1096,6 +1128,7 @@ class ScheduledJobsTab:
         self.total_pages = 1
         self.total_records = 0
         self.expert_filter = 'all'  # Filter by expert instance ID
+        self.analysis_type_filter = 'all'  # Filter by analysis type (Enter Market / Open Positions)
         self.render()
 
     def render(self):
@@ -1114,6 +1147,28 @@ class ScheduledJobsTab:
                         label='Expert Filter'
                     ).classes('w-48')
                     self.expert_select.on_value_change(self._on_expert_filter_change)
+                    
+                    # Analysis type filter
+                    analysis_type_options = {
+                        'all': 'All Types',
+                        'enter_market': 'Enter Market',
+                        'open_positions': 'Open Positions'
+                    }
+                    self.analysis_type_select = ui.select(
+                        options=analysis_type_options,
+                        value='all',
+                        label='Analysis Type'
+                    ).classes('w-48')
+                    self.analysis_type_select.on_value_change(self._on_analysis_type_filter_change)
+                    
+                    # Page size selector
+                    page_size_options = {10: '10', 25: '25', 50: '50', 100: '100'}
+                    self.page_size_select = ui.select(
+                        options=page_size_options,
+                        value=self.page_size,
+                        label='Rows per page'
+                    ).classes('w-32')
+                    self.page_size_select.on_value_change(self._on_page_size_change)
                     
                     # Text filter
                     self.filter_input = ui.input('Search', placeholder='Filter by symbol...').classes('w-40')
@@ -1162,12 +1217,27 @@ class ScheduledJobsTab:
         self.current_page = 1  # Reset to first page when filtering
         self.refresh_data()
     
+    def _on_analysis_type_filter_change(self, event):
+        """Handle analysis type filter change."""
+        self.analysis_type_filter = event.value
+        self.current_page = 1  # Reset to first page when filtering
+        self.refresh_data()
+    
+    def _on_page_size_change(self, event):
+        """Handle page size change."""
+        self.page_size = int(event.value)
+        self.current_page = 1  # Reset to first page when changing page size
+        self.refresh_data()
+    
     def _clear_filters(self):
         """Clear all filters."""
         self.expert_filter = 'all'
+        self.analysis_type_filter = 'all'
         self.current_page = 1
         if hasattr(self, 'expert_select'):
             self.expert_select.value = 'all'
+        if hasattr(self, 'analysis_type_select'):
+            self.analysis_type_select.value = 'all'
         if hasattr(self, 'filter_input'):
             self.filter_input.value = ''
         self.refresh_data()
@@ -1269,6 +1339,13 @@ class ScheduledJobsTab:
                     ]
                     
                     for schedule_key, job_type_display, subtype in schedule_configs:
+                        # Apply analysis type filter
+                        if self.analysis_type_filter != 'all':
+                            if self.analysis_type_filter == 'enter_market' and schedule_key != 'execution_schedule_enter_market':
+                                continue
+                            elif self.analysis_type_filter == 'open_positions' and schedule_key != 'execution_schedule_open_positions':
+                                continue
+                        
                         schedule_setting = expert.settings.get(schedule_key)
                         
                         if not schedule_setting:

@@ -353,6 +353,12 @@ class Transaction(SQLModel, table=True):
                         # logger.debug(f"  Order {order.id}: Skipped (dependent order)")
                         continue
                     
+                    # Skip limit orders (SELL_LIMIT, BUY_LIMIT) - these are take profit orders
+                    from .types import OrderType
+                    if order.order_type in [OrderType.SELL_LIMIT, OrderType.BUY_LIMIT]:
+                        # logger.debug(f"  Order {order.id}: Skipped (take profit order, type={order.order_type})")
+                        continue
+                    
                     # Calculate remaining quantity
                     remaining_qty = order.quantity
                     if order.filled_qty:
