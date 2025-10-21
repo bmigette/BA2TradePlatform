@@ -2885,6 +2885,8 @@ class TransactionsTab:
                     
                     ui.button('Force Refresh Account', icon='cloud_download', on_click=self._force_refresh_account_now).props('outline')
                     
+                    ui.button('Clean Pending Orders', icon='delete_sweep', on_click=self._clean_pending_orders_dialog).props('outline color=warning')
+                    
                     # Batch operation buttons
                     self.batch_operations_container = ui.row().classes('gap-2 ml-4')
                     self.batch_select_all_btn = ui.button(
@@ -3015,6 +3017,68 @@ class TransactionsTab:
         except Exception as e:
             ui.notify(f'Error starting account refresh: {str(e)}', type='negative')
             logger.error(f"Error executing account refresh: {e}", exc_info=True)
+    
+    def _clean_pending_orders_dialog(self):
+        """Show confirmation dialog for cleaning pending orders."""
+        logger.info("User clicked 'Clean Pending Orders' button")
+        
+        def confirm_clean():
+            """Execute the cleanup after confirmation."""
+            logger.info("User confirmed pending orders cleanup")
+            try:
+                from ...core.TradeManager import get_trade_manager
+                trade_manager = get_trade_manager()
+                
+                # Execute cleanup
+                stats = trade_manager.clean_pending_orders()
+                
+                # Show results
+                if stats['errors']:
+                    error_msg = '\n'.join(stats['errors'][:5])  # Show first 5 errors
+                    ui.notify(
+                        f"Cleanup completed with issues:\n{error_msg}",
+                        type='warning'
+                    )
+                else:
+                    ui.notify(
+                        f"✓ Cleaned {stats['orders_deleted']} pending orders\n"
+                        f"✓ Deleted {stats['dependents_deleted']} dependent orders\n"
+                        f"✓ Closed {stats['transactions_closed']} transactions",
+                        type='positive'
+                    )
+                
+                logger.info(
+                    f"Pending orders cleanup complete: "
+                    f"orders={stats['orders_deleted']}, "
+                    f"dependents={stats['dependents_deleted']}, "
+                    f"transactions_closed={stats['transactions_closed']}, "
+                    f"errors={len(stats['errors'])}"
+                )
+                
+                # Refresh the table
+                self._refresh_transactions()
+                
+            except Exception as e:
+                ui.notify(f'Error cleaning pending orders: {str(e)}', type='negative')
+                logger.error(f"Error during pending orders cleanup: {e}", exc_info=True)
+        
+        # Show confirmation dialog
+        with ui.dialog() as dialog:
+            with ui.card():
+                ui.label('Clean Pending Orders?').classes('text-lg font-bold')
+                ui.label(
+                    'This will delete all PENDING, WAITING_TRIGGER, and ERROR orders, '
+                    'along with their dependent orders. Any associated transactions will be marked as CLOSED.'
+                ).classes('text-sm text-gray-600')
+                ui.label(
+                    '⚠️ This action cannot be undone!'
+                ).classes('text-sm text-red-600 font-bold mt-2')
+                
+                with ui.row().classes('gap-2 mt-4'):
+                    ui.button('Cancel', on_click=dialog.close).props('outline')
+                    ui.button('Clean', on_click=lambda: [confirm_clean(), dialog.close()]).props('color=negative')
+        
+        dialog.open()
     
     def _get_transactions_data(self):
         """Get transactions data for the table.

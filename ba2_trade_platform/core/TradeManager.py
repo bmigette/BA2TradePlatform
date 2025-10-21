@@ -1135,6 +1135,139 @@ class TradeManager:
             
         except Exception as e:
             self.logger.error(f"Error during force sync of transactions: {e}", exc_info=True)
+    
+    def clean_pending_orders(self) -> Dict[str, Any]:
+        """
+        Clean all pending, waiting trigger, and error orders.
+        
+        For each pending order:
+        1. Find the associated transaction (if any)
+        2. Close the transaction if it exists
+        3. Delete the order and all its dependent orders
+        
+        Returns:
+            Dict with cleanup statistics:
+            {
+                'orders_deleted': int,
+                'transactions_closed': int,
+                'dependents_deleted': int,
+                'errors': List[str]
+            }
+        """
+        try:
+            from sqlmodel import select, Session
+            from .db import get_db
+            from .models import Transaction, TradingOrder
+            from .types import TransactionStatus, OrderStatus
+            
+            stats = {
+                'orders_deleted': 0,
+                'transactions_closed': 0,
+                'dependents_deleted': 0,
+                'errors': []
+            }
+            
+            self.logger.info("Starting cleanup of pending orders...")
+            
+            with Session(get_db().bind) as session:
+                # Get all pending/waiting/error orders
+                pending_statuses = [OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER, OrderStatus.ERROR]
+                statement = select(TradingOrder).where(
+                    TradingOrder.status.in_(pending_statuses)
+                )
+                pending_orders = session.exec(statement).all()
+                
+                self.logger.info(f"Found {len(pending_orders)} pending orders to clean")
+                
+                # Track transactions to close
+                transactions_to_close = set()
+                orders_to_delete = []
+                dependents_to_delete = []
+                
+                for order in pending_orders:
+                    # Track associated transaction
+                    if order.transaction_id:
+                        transactions_to_close.add(order.transaction_id)
+                        self.logger.debug(f"Order {order.id} linked to transaction {order.transaction_id}")
+                    
+                    # Find all dependent orders (orders that depend on this order)
+                    dependent_statement = select(TradingOrder).where(
+                        TradingOrder.depends_on_order == order.id
+                    )
+                    dependents = session.exec(dependent_statement).all()
+                    
+                    if dependents:
+                        self.logger.debug(f"Order {order.id} has {len(dependents)} dependent orders")
+                        dependents_to_delete.extend(dependents)
+                    
+                    orders_to_delete.append(order)
+                
+                # PHASE 1: Close transactions
+                for txn_id in transactions_to_close:
+                    try:
+                        txn = session.get(Transaction, txn_id)
+                        if txn:
+                            # Close the transaction
+                            txn.status = TransactionStatus.CLOSED
+                            txn.close_date = datetime.now(timezone.utc)
+                            session.add(txn)
+                            self.logger.info(f"Marked transaction {txn_id} as CLOSED")
+                            stats['transactions_closed'] += 1
+                        else:
+                            error_msg = f"Transaction {txn_id} not found"
+                            self.logger.warning(error_msg)
+                            stats['errors'].append(error_msg)
+                    except Exception as e:
+                        error_msg = f"Error closing transaction {txn_id}: {e}"
+                        self.logger.error(error_msg)
+                        stats['errors'].append(error_msg)
+                
+                # PHASE 2: Delete dependent orders
+                for dependent_order in dependents_to_delete:
+                    try:
+                        session.delete(dependent_order)
+                        self.logger.debug(f"Deleted dependent order {dependent_order.id}")
+                        stats['dependents_deleted'] += 1
+                    except Exception as e:
+                        error_msg = f"Error deleting dependent order {dependent_order.id}: {e}"
+                        self.logger.error(error_msg)
+                        stats['errors'].append(error_msg)
+                
+                # PHASE 3: Delete main orders
+                for order in orders_to_delete:
+                    try:
+                        session.delete(order)
+                        self.logger.debug(f"Deleted pending order {order.id} (symbol: {order.symbol}, status: {order.status})")
+                        stats['orders_deleted'] += 1
+                    except Exception as e:
+                        error_msg = f"Error deleting order {order.id}: {e}"
+                        self.logger.error(error_msg)
+                        stats['errors'].append(error_msg)
+                
+                # Commit all changes
+                try:
+                    session.commit()
+                    self.logger.info(
+                        f"Cleanup completed: deleted {stats['orders_deleted']} orders, "
+                        f"{stats['dependents_deleted']} dependents, "
+                        f"closed {stats['transactions_closed']} transactions"
+                    )
+                except Exception as e:
+                    error_msg = f"Error committing cleanup: {e}"
+                    self.logger.error(error_msg)
+                    stats['errors'].append(error_msg)
+                    session.rollback()
+            
+            return stats
+            
+        except Exception as e:
+            self.logger.error(f"Error during pending order cleanup: {e}", exc_info=True)
+            return {
+                'orders_deleted': 0,
+                'transactions_closed': 0,
+                'dependents_deleted': 0,
+                'errors': [str(e)]
+            }
 
 
 # Global trade manager instance
