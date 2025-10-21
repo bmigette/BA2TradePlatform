@@ -2,7 +2,25 @@
 
 A sophisticated Python-based algorithmic trading platform featuring AI-driven market analysis, multi-agent trading strategies, and a comprehensive plugin architecture for accounts and market experts.
 
-## 🚧 ALPHA SOFTWARE - UNSTABLE
+## � Screenshots
+
+### Dashboard Overview
+![Dashboard Overview](docs/screenshots/overview.png)
+*Main dashboard showing account summary and position overview*
+
+### AI Analysis Details
+![Analysis Details](docs/screenshots/analysis_detail.png)
+*Multi-agent AI analysis with detailed recommendations and technical indicators*
+
+### Order Recommendations
+![Order Recommendations](docs/screenshots/order_recommendations.png)
+*AI-generated trading recommendations with confidence levels and action items*
+
+### Recommendation History
+![Recommendation History](docs/screenshots/recommendation_history.png)
+*Historical view of all generated recommendations and their performance*
+
+## �🚧 ALPHA SOFTWARE - UNSTABLE
 
 **⚠️ THIS PROJECT IS CURRENTLY IN ALPHA STAGE AND CONSIDERED UNSTABLE ⚠️**
 
