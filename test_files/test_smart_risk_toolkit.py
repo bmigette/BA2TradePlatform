@@ -33,7 +33,7 @@ def print_separator(title: str):
 
 def print_result(tool_name: str, result: any, success: bool = True):
     """Print tool result in a formatted way."""
-    status = "✅ SUCCESS" if success else "❌ FAILED"
+    status = "[SUCCESS]" if success else "[FAILED]"
     print(f"\n{status} - {tool_name}")
     print("-" * 80)
     
@@ -67,8 +67,8 @@ def get_test_expert_and_account():
         if not expert or not account:
             raise ValueError("No expert or account found in database. Please create one first.")
         
-        print(f"📊 Using Expert: {expert.expert} (ID: {expert.id})")
-        print(f"💰 Using Account: {account.provider} - {account.name} (ID: {account.id})")
+        print(f"Using Expert: {expert.expert} (ID: {expert.id})")
+        print(f"Using Account: {account.provider} - {account.name} (ID: {account.id})")
         
         return expert.id, account.id
 
@@ -209,7 +209,7 @@ def test_trading_tools(toolkit: SmartRiskManagerToolkit):
         
         if result.get("success"):
             transaction_id = result.get("transaction_id")
-            print(f"✅ Position opened! Transaction ID: {transaction_id}")
+            print(f"[SUCCESS] Position opened! Transaction ID: {transaction_id}")
             time.sleep(2)  # Wait for order to settle
             
             # Test 2: Get Portfolio Status (should show new position)
@@ -248,7 +248,7 @@ def test_trading_tools(toolkit: SmartRiskManagerToolkit):
                 print_result("close_position", result)
                 
                 if result.get("success"):
-                    print("✅ Position closed successfully!")
+                    print("[SUCCESS] Position closed successfully!")
                     transaction_id = None  # Mark as closed
                 else:
                     print("⚠️  Close failed - position may still be open!")
@@ -269,7 +269,7 @@ def test_trading_tools(toolkit: SmartRiskManagerToolkit):
                     reason="Cleanup after test failure"
                 )
                 if result.get("success"):
-                    print("✅ Cleanup successful - position closed")
+                    print("[SUCCESS] Cleanup successful - position closed")
                 else:
                     print(f"⚠️  Cleanup failed: {result.get('message')}")
                     print(f"   Please manually close transaction {transaction_id}")
@@ -287,9 +287,9 @@ def main():
         expert_id, account_id = get_test_expert_and_account()
         
         # Initialize toolkit
-        print(f"\n🔧 Initializing SmartRiskManagerToolkit...")
+        print(f"\nInitializing SmartRiskManagerToolkit...")
         toolkit = SmartRiskManagerToolkit(expert_id, account_id)
-        print(f"✅ Toolkit initialized successfully!\n")
+        print(f"[SUCCESS] Toolkit initialized successfully!\n")
         
         # Run tests
         test_portfolio_tools(toolkit)
@@ -299,14 +299,14 @@ def main():
         test_trading_tools(toolkit)
         
         print_separator("TEST COMPLETE")
-        print("✅ All tests completed!")
+        print("[SUCCESS] All tests completed!")
         print("\nCheck the logs for detailed execution information:")
         print("  - app.log (INFO level)")
         print("  - app.debug.log (DEBUG level)")
         
     except Exception as e:
         print_separator("TEST FAILED")
-        print(f"❌ Fatal error: {e}")
+        print(f"[FAILED] Fatal error: {e}")
         logger.error(f"Test script failed: {e}", exc_info=True)
         raise
 

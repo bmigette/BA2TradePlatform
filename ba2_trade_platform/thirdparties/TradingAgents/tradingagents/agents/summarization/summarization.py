@@ -238,9 +238,15 @@ def create_langgraph_summarization_node(config: Dict[str, Any]):
     # Try to get LLM from config - require explicit config key, no defaults
     try:
         from langchain_openai import ChatOpenAI
-        # Will raise KeyError if "quick_think_llm" is not configured
+        from ...dataflows.config import get_api_key_from_database
+        
+        # Will raise KeyError if required keys are not configured
         model = config["quick_think_llm"]
-        llm = ChatOpenAI(model=model)
+        base_url = config["backend_url"]
+        api_key_setting = config.get("api_key_setting", "openai_api_key")
+        api_key = get_api_key_from_database(api_key_setting)
+        
+        llm = ChatOpenAI(model=model, base_url=base_url, api_key=api_key)
         return create_final_summarization_agent(llm)
     except KeyError as e:
         logger.error(f"Missing required configuration key: {e}", exc_info=True)

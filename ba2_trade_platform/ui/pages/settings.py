@@ -1434,10 +1434,10 @@ class ExpertSettingsTab:
                         
                         with ui.column().classes('w-full gap-2'):
                             self.risk_manager_mode_select = ui.select(
-                                options=[
-                                    {'label': 'Classic (Rules)', 'value': 'classic'},
-                                    {'label': 'Smart (Agentic)', 'value': 'smart'}
-                                ],
+                                options={
+                                    'classic': 'Classic (Rules)',
+                                    'smart': 'Smart (Agentic)'
+                                },
                                 label='Risk Management Mode',
                                 value='classic'
                             ).classes('w-full')
