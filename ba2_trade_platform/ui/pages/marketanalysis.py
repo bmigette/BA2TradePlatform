@@ -567,16 +567,16 @@ class JobMonitoringTab:
             # Convert dict to list of tasks for easier iteration
             all_tasks = list(all_tasks_dict.values()) if isinstance(all_tasks_dict, dict) else all_tasks_dict
             
-            logger.debug(f"All tasks count: {len(all_tasks)}")
+            # logger.debug(f"All tasks count: {len(all_tasks)}")
             
             # Debug: Log first few tasks to see their structure
-            if all_tasks:
-                for i, t in enumerate(all_tasks[:3]):
-                    logger.debug(f"Task {i}: type={type(t)}, dir={[attr for attr in dir(t) if not attr.startswith('_')]}")
-                    if hasattr(t, 'status'):
-                        logger.debug(f"  status={t.status}, status_type={type(t.status)}")
-                    if hasattr(t, 'state'):
-                        logger.debug(f"  state={t.state}, state_type={type(t.state)}")
+            # if all_tasks:
+            #     for i, t in enumerate(all_tasks[:3]):
+            #         logger.debug(f"Task {i}: type={type(t)}, dir={[attr for attr in dir(t) if not attr.startswith('_')]}")
+            #         if hasattr(t, 'status'):
+            #             logger.debug(f"  status={t.status}, status_type={type(t.status)}")
+            #         if hasattr(t, 'state'):
+            #             logger.debug(f"  state={t.state}, state_type={type(t.state)}")
             
             # Filter tasks safely, checking if they have status attribute
             # Status can be string or enum, so check both
@@ -600,9 +600,10 @@ class JobMonitoringTab:
                     elif task_status == WorkerTaskStatus.PENDING or task_status == 'pending':
                         pending_tasks += 1
             
-            total_tasks = len(all_tasks)
+            # Total should only include active tasks (pending + running), not completed/failed
+            total_tasks = running_tasks + pending_tasks
             
-            logger.info(f"Queue info: workers={worker_count}, running={running_tasks}, pending={pending_tasks}, total={total_tasks}")
+            # logger.info(f"Queue info: workers={worker_count}, running={running_tasks}, pending={pending_tasks}, total={total_tasks}")
             
             return {
                 'worker_count': worker_count,

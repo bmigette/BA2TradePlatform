@@ -511,3 +511,65 @@ class TradeActionResult(SQLModel, table=True):
     
     # Relationships
     expert_recommendation: "ExpertRecommendation" = Relationship(back_populates="trade_action_results")
+
+
+class SmartRiskManagerJob(SQLModel, table=True):
+    """
+    Tracks Smart Risk Manager execution sessions.
+    Links to MarketAnalysis records that were analyzed during the session.
+    """
+    __tablename__ = "smartriskmanagerjob"
+    
+    # Primary Key
+    id: Optional[int] = Field(default=None, primary_key=True)
+    
+    # Relations
+    expert_instance_id: int = Field(foreign_key="expertinstance.id", index=True, ondelete="CASCADE")
+    account_id: int = Field(foreign_key="accountdefinition.id", index=True, ondelete="CASCADE")
+    
+    # Execution Context
+    run_date: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
+    model_used: str = Field(description="Snapshot of risk_manager_model at execution time")
+    user_instructions: str = Field(description="Snapshot of smart_risk_manager_user_instructions at execution time")
+    
+    # State Preservation
+    graph_state: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict, description="Complete LangGraph state as JSON")
+    
+    # Execution Metrics
+    duration_seconds: float = Field(default=0.0)
+    iteration_count: int = Field(default=0)
+    
+    # Portfolio Snapshot
+    initial_portfolio_value: float = Field(description="Virtual equity at start")
+    final_portfolio_value: float = Field(description="Virtual equity at end")
+    
+    # Results
+    actions_taken_count: int = Field(default=0, description="Number of trading actions executed")
+    actions_summary: str = Field(default="", description="Human-readable summary of actions taken")
+    
+    # Status & Error Handling
+    status: str = Field(default="RUNNING", description="RUNNING, COMPLETED, FAILED, INTERRUPTED, TIMEOUT")
+    error_message: Optional[str] = Field(default=None)
+    
+    # Relationships
+    market_analyses: List["SmartRiskManagerJobAnalysis"] = Relationship(back_populates="smart_risk_job")
+
+
+class SmartRiskManagerJobAnalysis(SQLModel, table=True):
+    """
+    Junction table linking SmartRiskManagerJob to MarketAnalysis records.
+    Tracks which market analyses were consulted during the smart risk manager session.
+    """
+    __tablename__ = "smartriskmanagerjobanalysis"
+    
+    # Composite Primary Key
+    id: Optional[int] = Field(default=None, primary_key=True)
+    smart_risk_job_id: int = Field(foreign_key="smartriskmanagerjob.id", index=True, ondelete="CASCADE")
+    market_analysis_id: int = Field(foreign_key="marketanalysis.id", index=True, ondelete="CASCADE")
+    
+    # Metadata
+    consulted_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc))
+    outputs_accessed: Optional[List[str]] = Field(sa_column=Column(JSON), default=None, description="JSON list of output keys accessed")
+    
+    # Relationships
+    smart_risk_job: "SmartRiskManagerJob" = Relationship(back_populates="market_analyses")

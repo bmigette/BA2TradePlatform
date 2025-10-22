@@ -20,6 +20,7 @@ Import all interfaces from this module for easy access:
 from .AccountInterface import AccountInterface
 from .MarketExpertInterface import MarketExpertInterface
 from .ExtendableSettingsInterface import ExtendableSettingsInterface
+from .SmartRiskExpertInterface import SmartRiskExpertInterface
 
 # Data provider interfaces
 from .DataProviderInterface import DataProviderInterface
@@ -38,6 +39,7 @@ __all__ = [
     "AccountInterface",
     "MarketExpertInterface",
     "ExtendableSettingsInterface",
+    "SmartRiskExpertInterface",
     
     # Data provider interfaces
     "DataProviderInterface",

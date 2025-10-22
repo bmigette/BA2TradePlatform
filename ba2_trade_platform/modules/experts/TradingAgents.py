@@ -1,8 +1,9 @@
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 import json
+from sqlmodel import select
 
-from ...core.interfaces import MarketExpertInterface
+from ...core.interfaces import MarketExpertInterface, SmartRiskExpertInterface
 from ...core.models import ExpertInstance, MarketAnalysis, AnalysisOutput, ExpertRecommendation
 from ...core.db import get_db, get_instance, update_instance, add_instance
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, RiskLevel, TimeHorizon, AnalysisUseCase
@@ -1831,3 +1832,167 @@ Please check back in a few minutes for results."""
                 "status": "error",
                 "message": f"Error clearing memory collections: {str(e)}"
             }
+    
+    # ==================== SmartRiskExpertInterface Implementation ====================
+    
+    def get_analysis_summary(self, market_analysis_id: int) -> str:
+        """
+        Get a concise summary of a market analysis for Smart Risk Manager.
+        
+        Args:
+            market_analysis_id: ID of the MarketAnalysis record
+            
+        Returns:
+            str: Human-readable summary (2-3 sentences) covering symbol, recommendation,
+                 confidence, and key insights
+        """
+        try:
+            with get_db() as session:
+                analysis = session.get(MarketAnalysis, market_analysis_id)
+                if not analysis:
+                    return f"Analysis {market_analysis_id} not found"
+                
+                # Get recommendation if exists
+                recommendation = None
+                if analysis.expert_recommendations:
+                    recommendation = analysis.expert_recommendations[0]
+                
+                # Build summary
+                symbol = analysis.symbol
+                status = analysis.status.value if hasattr(analysis.status, 'value') else str(analysis.status)
+                
+                if recommendation:
+                    action = recommendation.action.value if hasattr(recommendation.action, 'value') else str(recommendation.action)
+                    confidence = recommendation.confidence
+                    
+                    # Extract key insight from reasoning
+                    reasoning = recommendation.reasoning or ""
+                    key_insight = reasoning.split('.')[0] if reasoning else "No additional details"
+                    
+                    return (
+                        f"Analysis for {symbol}: {action} recommendation with {confidence:.1f}% confidence. "
+                        f"Status: {status}. {key_insight}."
+                    )
+                else:
+                    return f"Analysis for {symbol} (Status: {status}) - No recommendation available yet."
+                    
+        except Exception as e:
+            self.logger.error(f"Error getting analysis summary for {market_analysis_id}: {e}", exc_info=True)
+            return f"Error retrieving summary for analysis {market_analysis_id}: {str(e)}"
+    
+    def get_available_outputs(self, market_analysis_id: int) -> Dict[str, str]:
+        """
+        List all available analysis outputs with descriptions.
+        
+        Args:
+            market_analysis_id: ID of the MarketAnalysis record
+            
+        Returns:
+            Dict[str, str]: Map of output_key -> description
+        """
+        try:
+            with get_db() as session:
+                analysis = session.get(MarketAnalysis, market_analysis_id)
+                if not analysis:
+                    return {}
+                
+                # Get all analysis outputs
+                outputs = session.exec(
+                    select(AnalysisOutput)
+                    .where(AnalysisOutput.market_analysis_id == market_analysis_id)
+                ).all()
+                
+                # Build output map with descriptions
+                output_map = {}
+                
+                for output in outputs:
+                    # Parse use_case to determine type
+                    use_case = output.use_case.value if hasattr(output.use_case, 'value') else str(output.use_case)
+                    
+                    # Create friendly description based on use_case and agent
+                    if use_case == "tool_output":
+                        description = f"Data/tool output from {output.agent}"
+                    elif use_case == "llm_output":
+                        description = f"AI analysis from {output.agent}"
+                    elif use_case == "final_recommendation":
+                        description = "Final synthesized recommendation from all analysts"
+                    else:
+                        description = f"Output from {output.agent}"
+                    
+                    # Use output_key as key
+                    output_key = f"{output.agent}_{use_case}_{output.id}"
+                    output_map[output_key] = description
+                
+                # Add a special key for the complete trading state
+                if analysis.state:
+                    output_map["complete_trading_state"] = "Complete internal state with all agent communications and intermediate results"
+                
+                self.logger.debug(f"Found {len(output_map)} outputs for analysis {market_analysis_id}")
+                return output_map
+                
+        except Exception as e:
+            self.logger.error(f"Error getting available outputs for {market_analysis_id}: {e}", exc_info=True)
+            return {}
+    
+    def get_output_detail(self, market_analysis_id: int, output_key: str) -> str:
+        """
+        Get the full content of a specific analysis output.
+        
+        Args:
+            market_analysis_id: ID of the MarketAnalysis record
+            output_key: Key of the output to retrieve (from get_available_outputs)
+            
+        Returns:
+            str: Complete output content
+            
+        Raises:
+            KeyError: If output_key is not valid for this analysis
+        """
+        try:
+            with get_db() as session:
+                analysis = session.get(MarketAnalysis, market_analysis_id)
+                if not analysis:
+                    raise KeyError(f"Analysis {market_analysis_id} not found")
+                
+                # Handle special case: complete trading state
+                if output_key == "complete_trading_state":
+                    if analysis.state:
+                        return json.dumps(analysis.state, indent=2)
+                    else:
+                        raise KeyError("Trading state not available")
+                
+                # Parse output_key to extract agent, use_case, and id
+                # Format: {agent}_{use_case}_{id}
+                parts = output_key.rsplit('_', 2)
+                if len(parts) != 3:
+                    raise KeyError(f"Invalid output_key format: {output_key}")
+                
+                agent_name = parts[0]
+                use_case_str = parts[1]
+                output_id = int(parts[2])
+                
+                # Get the specific output
+                output = session.get(AnalysisOutput, output_id)
+                if not output or output.market_analysis_id != market_analysis_id:
+                    raise KeyError(f"Output not found: {output_key}")
+                
+                # Return the output text
+                if output.output_text:
+                    return output.output_text
+                else:
+                    return f"Output {output_key} has no text content"
+                    
+        except KeyError:
+            raise
+        except Exception as e:
+            self.logger.error(f"Error getting output detail for {output_key}: {e}", exc_info=True)
+            raise KeyError(f"Error retrieving output {output_key}: {str(e)}")
+    
+    def supports_smart_risk_manager(self) -> bool:
+        """
+        Check if this expert implements SmartRiskExpertInterface.
+        
+        Returns:
+            True (TradingAgents fully implements the interface)
+        """
+        return True

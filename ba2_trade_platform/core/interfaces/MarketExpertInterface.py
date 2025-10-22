@@ -145,6 +145,19 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "allow_custom": True,
                     "help": "For more information, see [OpenAI Docs](https://platform.openai.com/docs/models) and [Naga AI Web Search](https://docs.naga.ac/features/web-search)",
                     "tooltip": "The model used for dynamic AI-powered instrument selection with web search capabilities. Format: Provider/ModelName. Optimized for market research: GPT-5 (best general search), GPT-4o-search (web-optimized), Grok-4 (real-time with X/Twitter integration). You can also enter custom model names."
+                },
+                "risk_manager_mode": {
+                    "type": "str", "required": True, "default": "classic",
+                    "description": "Risk Manager Mode",
+                    "valid_values": ["classic", "smart"],
+                    "help": "Classic: Rule-based risk management using automation rulesets. Smart: AI-powered agentic risk management using the configured risk_manager_model.",
+                    "tooltip": "Classic (Rules): Traditional rule-based risk management using automation rulesets you configure. Smart (Agentic): AI-powered intelligent risk management that uses the risk_manager_model to make dynamic decisions based on market conditions and portfolio state."
+                },
+                "smart_risk_manager_user_instructions": {
+                    "type": "str", "required": False, "default": "Maximize short term profit with medium risk taking",
+                    "description": "Smart Risk Manager User Instructions",
+                    "help": "Instructions for the AI-powered smart risk manager. This guides the risk manager's decision-making strategy when in Smart mode.",
+                    "tooltip": "Provide high-level instructions to guide the smart risk manager's behavior. Examples: 'Maximize short term profit with medium risk taking', 'Focus on capital preservation with conservative risk', 'Aggressive growth with high risk tolerance'. Only used when risk_manager_mode is set to 'smart'."
                 }
                 
             }

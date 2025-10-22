@@ -10,7 +10,7 @@ from ...logger import logger
 from ...core.db import get_db, get_all_instances, delete_instance, add_instance, update_instance, get_instance
 from ...modules.accounts import providers
 from ...core.interfaces import AccountInterface
-from ...core.utils import get_account_instance_from_id
+from ...core.utils import get_account_instance_from_id, get_expert_instance_from_id
 from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, is_share_adjustment_action, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label
 from ...core.cleanup import preview_cleanup, execute_cleanup, get_cleanup_statistics
 from yahooquery import Ticker, search as yq_search
@@ -998,18 +998,25 @@ class ExpertSettingsTab:
                 # Ensure alias is displayed (no truncation needed, max 100 chars)
                 row['alias'] = instance.alias or ''
                 
+                # Check if risk manager is in Smart mode
+                expert = get_expert_instance_from_id(instance.id)
+                risk_manager_mode = expert.settings.get('risk_manager_mode', 'classic') if expert else 'classic'
+                is_smart_mode = risk_manager_mode == 'smart'
+                
                 # Fetch and add ruleset names
                 if instance.enter_market_ruleset_id:
                     enter_market_ruleset = get_instance(Ruleset, instance.enter_market_ruleset_id)
-                    row['enter_market_ruleset_name'] = enter_market_ruleset.name if enter_market_ruleset else '(Not found)'
+                    ruleset_name = enter_market_ruleset.name if enter_market_ruleset else '(Not found)'
+                    row['enter_market_ruleset_name'] = f"{ruleset_name} (Smart)" if is_smart_mode else ruleset_name
                 else:
-                    row['enter_market_ruleset_name'] = '(None)'
+                    row['enter_market_ruleset_name'] = 'Smart' if is_smart_mode else '(None)'
                 
                 if instance.open_positions_ruleset_id:
                     open_positions_ruleset = get_instance(Ruleset, instance.open_positions_ruleset_id)
-                    row['open_positions_ruleset_name'] = open_positions_ruleset.name if open_positions_ruleset else '(Not found)'
+                    ruleset_name = open_positions_ruleset.name if open_positions_ruleset else '(Not found)'
+                    row['open_positions_ruleset_name'] = f"{ruleset_name} (Smart)" if is_smart_mode else ruleset_name
                 else:
-                    row['open_positions_ruleset_name'] = '(None)'
+                    row['open_positions_ruleset_name'] = 'Smart' if is_smart_mode else '(None)'
                 
                 rows.append(row)
             logger.debug(f'Fetched {len(rows)} expert instances')
@@ -1418,6 +1425,32 @@ class ExpertSettingsTab:
                                 with_input=True
                             ).classes('w-full')
                             ui.label('AI model used for dynamically selecting trading instruments based on market conditions').classes('text-body2 text-grey-7 ml-2')
+                        
+                        ui.separator().classes('my-4')
+                        
+                        # Risk Manager Mode
+                        ui.label('Risk Manager Mode:').classes('text-subtitle2 mb-2')
+                        ui.label('Select how risk management decisions are made:').classes('text-body2 mb-2')
+                        
+                        with ui.column().classes('w-full gap-2'):
+                            self.risk_manager_mode_select = ui.select(
+                                options=[
+                                    {'label': 'Classic (Rules)', 'value': 'classic'},
+                                    {'label': 'Smart (Agentic)', 'value': 'smart'}
+                                ],
+                                label='Risk Management Mode',
+                                value='classic'
+                            ).classes('w-full')
+                            ui.label('Classic: Rule-based risk management using automation rulesets. Smart: AI-powered agentic risk management.').classes('text-body2 text-grey-7 ml-2')
+                            
+                            # Smart Risk Manager User Instructions
+                            ui.label('Smart Risk Manager User Instructions:').classes('text-sm font-medium mt-2')
+                            self.smart_risk_manager_user_instructions_input = ui.textarea(
+                                label='Instructions for Smart Risk Manager',
+                                value='Maximize short term profit with medium risk taking',
+                                placeholder='Enter your risk management strategy instructions...'
+                            ).classes('w-full').props('rows=3')
+                            ui.label('Provide high-level instructions to guide the smart risk manager when in Smart mode (e.g., focus areas, risk tolerance, time horizon)').classes('text-body2 text-grey-7 ml-2')
                         
                         ui.separator().classes('my-4')
                         
@@ -1865,6 +1898,16 @@ class ExpertSettingsTab:
             dynamic_instrument_selection_model = expert.settings.get('dynamic_instrument_selection_model', 'NagaAI/gpt-5-2025-08-07')
             if hasattr(self, 'dynamic_instrument_selection_model_select'):
                 self.dynamic_instrument_selection_model_select.value = dynamic_instrument_selection_model
+            
+            # Load risk manager mode
+            risk_manager_mode = expert.settings.get('risk_manager_mode', 'classic')
+            if hasattr(self, 'risk_manager_mode_select'):
+                self.risk_manager_mode_select.value = risk_manager_mode
+            
+            # Load smart risk manager user instructions
+            smart_risk_manager_user_instructions = expert.settings.get('smart_risk_manager_user_instructions', 'Maximize short term profit with medium risk taking')
+            if hasattr(self, 'smart_risk_manager_user_instructions_input'):
+                self.smart_risk_manager_user_instructions_input.value = smart_risk_manager_user_instructions
             
             # Load ruleset assignments from ExpertInstance model
             if hasattr(self, 'enter_market_ruleset_select') and hasattr(self, 'enter_market_ruleset_map'):
@@ -2998,6 +3041,16 @@ class ExpertSettingsTab:
         if hasattr(self, 'dynamic_instrument_selection_model_select'):
             expert.save_setting('dynamic_instrument_selection_model', self.dynamic_instrument_selection_model_select.value, setting_type="str")
             logger.debug(f'Saved AI model setting: dynamic_instrument_selection_model={self.dynamic_instrument_selection_model_select.value}')
+        
+        # Save risk manager mode
+        if hasattr(self, 'risk_manager_mode_select'):
+            expert.save_setting('risk_manager_mode', self.risk_manager_mode_select.value, setting_type="str")
+            logger.debug(f'Saved risk manager mode: risk_manager_mode={self.risk_manager_mode_select.value}')
+        
+        # Save smart risk manager user instructions
+        if hasattr(self, 'smart_risk_manager_user_instructions_input'):
+            expert.save_setting('smart_risk_manager_user_instructions', self.smart_risk_manager_user_instructions_input.value, setting_type="str")
+            logger.debug(f'Saved smart risk manager user instructions: {self.smart_risk_manager_user_instructions_input.value}')
         
         # Save instrument selection method (moved to main panel)
         if hasattr(self, 'instrument_selection_method_select'):
