@@ -396,8 +396,8 @@ class TradeManager:
                             if dependent_order.data and isinstance(dependent_order.data, dict):
                                 try:
                                     # Check if this is a TP order (has tp_percent in data)
-                                    if "tp_percent" in dependent_order.data and parent_order.open_price:
-                                        tp_percent = dependent_order.data.get("tp_percent")
+                                    if dependent_order.data and "TP_SL" in dependent_order.data and "tp_percent" in dependent_order.data["TP_SL"] and parent_order.open_price:
+                                        tp_percent = dependent_order.data["TP_SL"].get("tp_percent")
                                         old_limit_price = dependent_order.limit_price
                                         
                                         # Recalculate TP price from parent's filled price: price = filled_price * (1 + percent/100)
@@ -423,8 +423,8 @@ class TradeManager:
                                         transaction_updated = True
                                     
                                     # Check if this is an SL order (has sl_percent in data)
-                                    elif "sl_percent" in dependent_order.data and parent_order.open_price:
-                                        sl_percent = dependent_order.data.get("sl_percent")
+                                    elif dependent_order.data and "TP_SL" in dependent_order.data and "sl_percent" in dependent_order.data["TP_SL"] and parent_order.open_price:
+                                        sl_percent = dependent_order.data["TP_SL"].get("sl_percent")
                                         old_stop_price = dependent_order.stop_price
                                         
                                         # Recalculate SL price from parent's filled price: price = filled_price * (1 + percent/100)
@@ -444,8 +444,10 @@ class TradeManager:
                                         )
                                         
                                         # Update data field to record when recalculation happened
-                                        dependent_order.data["parent_filled_price"] = parent_order.open_price
-                                        dependent_order.data["recalculated_at_trigger"] = True
+                                        if "TP_SL" not in dependent_order.data:
+                                            dependent_order.data["TP_SL"] = {}
+                                        dependent_order.data["TP_SL"]["parent_filled_price"] = parent_order.open_price
+                                        dependent_order.data["TP_SL"]["recalculated_at_trigger"] = True
                                         
                                         # Mark transaction for update with new SL price
                                         transaction_updated = True
@@ -471,10 +473,10 @@ class TradeManager:
                                 transaction = session.get(Transaction, dependent_order.transaction_id)
                                 if transaction:
                                     # Update TP or SL price depending on order type
-                                    if "tp_percent" in dependent_order.data:
+                                    if dependent_order.data and "TP_SL" in dependent_order.data and "tp_percent" in dependent_order.data["TP_SL"]:
                                         transaction.take_profit = dependent_order.limit_price
                                         self.logger.info(f"Updated Transaction {dependent_order.transaction_id} take_profit to ${dependent_order.limit_price:.2f}")
-                                    elif "sl_percent" in dependent_order.data:
+                                    elif dependent_order.data and "TP_SL" in dependent_order.data and "sl_percent" in dependent_order.data["TP_SL"]:
                                         transaction.stop_loss = dependent_order.stop_price
                                         self.logger.info(f"Updated Transaction {dependent_order.transaction_id} stop_loss to ${dependent_order.stop_price:.2f}")
                                     session.add(transaction)

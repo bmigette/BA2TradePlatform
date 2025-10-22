@@ -97,6 +97,7 @@ class ExpertRecommendation(SQLModel, table=True):
     confidence: float | None
     risk_level: RiskLevel = Field(description="LOW|MEDIUM|HIGH")
     time_horizon: TimeHorizon = Field(description="SHORT_TERM|MEDIUM_TERM|LONG_TERM")
+    data: Dict[str, Any] | None = Field(default=None, sa_column=Column(JSON), description="Expert-specific data (nested by expert name)")
     created_at: DateTime | None = Field(default_factory=lambda: DateTime.now(timezone.utc))
     
     # Relationship back to market analysis

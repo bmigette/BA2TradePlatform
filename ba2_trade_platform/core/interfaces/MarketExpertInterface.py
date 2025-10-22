@@ -460,6 +460,9 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         1. If symbol price is higher than available balance, skip analysis
         2. If available balance is lower than 5% of account balance, skip analysis
         
+        Note: For expert-recommended instruments (dynamic symbols like "EXPERT"), 
+        price checks are bypassed since these don't have real market prices.
+        
         Args:
             symbol (str): The instrument symbol to check
             
@@ -486,15 +489,29 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             
             # Get current symbol price
             current_price = account.get_instrument_current_price(symbol)
+            
+            # For expert-recommended instruments (dynamic symbols), bypass price check
+            # These don't have real market prices, so we use 0
             if current_price is None:
-                logger.warning(f"Could not get current price for {symbol}, skipping analysis")
-                return True, f"Could not get current price for {symbol}"
+                # Check if this is an expert-recommended instrument (typically uppercase like "EXPERT", "MULTI", etc.)
+                # or starts with non-standard prefixes
+                if symbol.isupper() and len(symbol) > 4:
+                    logger.info(f"Using price=0 for expert-recommended instrument: {symbol}")
+                    current_price = 0  # Use 0 for expert instruments, bypass price validation
+                else:
+                    logger.warning(f"Could not get current price for {symbol}, skipping analysis")
+                    return True, f"Could not get current price for {symbol}"
             
             # Get available balance for this expert
             available_balance = self.get_available_balance()
             if available_balance is None:
                 logger.warning(f"Could not get available balance for expert {self.id}")
                 return True, "Could not get available balance"
+            
+            # Skip balance checks for expert-recommended instruments (price = 0)
+            if current_price == 0:
+                logger.debug(f"Skipping balance validation for expert-recommended instrument: {symbol}")
+                return False, ""
             
             # Check 1: If symbol price is higher than available balance, skip
             if current_price > available_balance:

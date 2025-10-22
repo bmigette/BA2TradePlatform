@@ -134,7 +134,11 @@ class JobMonitoringTab:
             self.analysis_table.add_slot('body-cell-status', '''
                 <q-td :props="props">
                     <div class="row items-center no-wrap">
-                        <span v-html="props.row.status_display"></span>
+                        <div v-if="props.row.skip_reason" class="cursor-help">
+                            <span v-html="props.row.status_display"></span>
+                            <q-tooltip max-width="300px">{{ props.row.skip_reason }}</q-tooltip>
+                        </div>
+                        <span v-else v-html="props.row.status_display"></span>
                     </div>
                 </q-td>
             ''')
@@ -225,10 +229,14 @@ class JobMonitoringTab:
                     # Get expert instance info (handle missing instances gracefully)
                     try:
                         expert_instance = get_instance(ExpertInstance, analysis.expert_instance_id)
-                        expert_name = expert_instance.alias or expert_instance.expert if expert_instance else "Unknown"
+                        if expert_instance:
+                            expert_alias = expert_instance.alias or expert_instance.expert
+                            expert_name = f"{expert_alias}-{analysis.expert_instance_id}"
+                        else:
+                            expert_name = f"Unknown-{analysis.expert_instance_id}"
                     except Exception as e:
                         logger.warning(f"Expert instance {analysis.expert_instance_id} not found for analysis {analysis.id}: {e}")
-                        expert_name = f"[Deleted Expert {analysis.expert_instance_id}]"
+                        expert_name = f"[Deleted]-{analysis.expert_instance_id}"
                         expert_instance = None
                     
                     # Convert UTC to local time for display
@@ -246,6 +254,13 @@ class JobMonitoringTab:
                     status_value = analysis.status.value if analysis.status else 'unknown'
                     status_icon = status_icons.get(status_value, '❓')
                     status_display = f'{status_icon} {status_value.title()}'
+                    
+                    # Add skip reason to status if this is a skipped analysis
+                    skip_reason = None
+                    if analysis.state and isinstance(analysis.state, dict):
+                        if analysis.state.get('skipped'):
+                            skip_reason = analysis.state.get('skip_reason', 'Analysis was skipped')
+                            status_display = f'⊘ Skipped'  # Use different icon for skipped
                     
                     # Determine if can cancel
                     can_cancel = analysis.status in [MarketAnalysisStatus.PENDING]
@@ -341,6 +356,7 @@ class JobMonitoringTab:
                         'expert_name': expert_name,
                         'status': status_value,
                         'status_display': status_display,
+                        'skip_reason': skip_reason,  # Include skip reason for tooltip/display
                         'recommendation': recommendation_display,
                         'confidence': confidence_display,
                         'expected_profit': expected_profit_display,
@@ -1905,6 +1921,7 @@ class OrderRecommendationsTab:
                         {'name': 'risk_level', 'label': 'Risk Level', 'field': 'risk_level', 'align': 'center'},
                         {'name': 'time_horizon', 'label': 'Time Horizon', 'field': 'time_horizon', 'align': 'center'},
                         {'name': 'expert', 'label': 'Expert', 'field': 'expert_name', 'align': 'left'},
+                        {'name': 'trader_name', 'label': 'Trader', 'field': 'trader_name', 'align': 'left'},
                         {'name': 'created_at', 'label': 'Created', 'field': 'created_at', 'align': 'left'},
                         {'name': 'actions', 'label': 'Actions', 'field': 'actions', 'align': 'center'}
                     ]
@@ -2029,6 +2046,20 @@ class OrderRecommendationsTab:
                     action = action_mapping.get(action_raw, action_raw)
                     created_at = recommendation.created_at.strftime('%Y-%m-%d %H:%M:%S') if recommendation.created_at else ''
                     
+                    # Extract trader name from analysis state if available (for SenateCopy expert)
+                    trader_name = None
+                    if analysis and analysis.state:
+                        # Check for multi-instrument copy trade analysis
+                        if 'copy_trade_multi' in analysis.state:
+                            traders_by_symbol = analysis.state['copy_trade_multi'].get('traders_by_symbol', {})
+                            trader_name = traders_by_symbol.get(recommendation.symbol)
+                        # Check for single-symbol copy trade analysis (legacy)
+                        elif 'copy_trade' in analysis.state:
+                            trader_name = analysis.state['copy_trade'].get('trader_name')
+                    
+                    # Format trader name for display
+                    trader_display = f" (Trader: {trader_name})" if trader_name else ""
+                    
                     recommendations.append({
                         'id': recommendation.id,
                         'symbol': recommendation.symbol,
@@ -2040,6 +2071,7 @@ class OrderRecommendationsTab:
                         'risk_level': recommendation.risk_level.value.title() if hasattr(recommendation.risk_level, 'value') else (recommendation.risk_level.name.title() if hasattr(recommendation.risk_level, 'name') else str(recommendation.risk_level)),
                         'time_horizon': recommendation.time_horizon.value.replace('_', ' ').title() if hasattr(recommendation.time_horizon, 'value') else str(recommendation.time_horizon),
                         'expert_name': expert_instance.alias or expert_instance.expert,
+                        'trader_name': trader_name,  # Store trader name for display
                         'created_at': created_at,
                         'analysis_id': analysis.id if analysis else None,
                         'can_place_order': can_place_order,

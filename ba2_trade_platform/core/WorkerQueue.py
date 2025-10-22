@@ -496,9 +496,14 @@ class WorkerQueue:
                     market_analysis = MarketAnalysis(
                         symbol=task.symbol,
                         expert_instance_id=task.expert_instance_id,
-                        status=MarketAnalysisStatus.CANCELLED,
+                        status=MarketAnalysisStatus.FAILED,  # Changed from CANCELLED to FAILED for visibility
                         subtype=AnalysisUseCase(task.subtype),
-                        state={"reason": "symbol_price_balance_check", "message": f"Skipped: {skip_reason}"}
+                        state={
+                            "skipped": True,
+                            "skip_reason": skip_reason,  # Store actual skip reason
+                            "skip_type": "symbol_price_balance_check",
+                            "analysis_timestamp": datetime.now(timezone.utc).isoformat()
+                        }
                     )
                     market_analysis_id = add_instance(market_analysis)
                     task.market_analysis_id = market_analysis_id

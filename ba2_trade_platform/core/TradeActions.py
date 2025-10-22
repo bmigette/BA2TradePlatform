@@ -102,6 +102,38 @@ class TradeAction(ABC):
             logger.error(f"Error getting current position for {self.instrument_name}: {e}", exc_info=True)
             return None
     
+    def _build_order_data(self, expert_recommendation_id: Optional[int]) -> Optional[Dict[str, Any]]:
+        """
+        Build order data field by copying expert recommendation data.
+        
+        If expert recommendation has data, copy it to order.data with expert name as key.
+        Never override existing values - store each expert's data separately using expert name as key.
+        
+        Args:
+            expert_recommendation_id: ID of expert recommendation (if any)
+            
+        Returns:
+            Dictionary with structure {"ExpertName": {...expert data...}}, or None if no data
+        """
+        if not expert_recommendation_id:
+            return None
+        
+        try:
+            from .db import get_instance
+            from .models import ExpertRecommendation
+            
+            expert_rec = get_instance(ExpertRecommendation, expert_recommendation_id)
+            if not expert_rec or not expert_rec.data:
+                return None
+            
+            # Expert recommendation should have data with structure like {"SenateCopy": {...}}
+            # Return as-is since it's already keyed by expert name
+            return expert_rec.data
+            
+        except Exception as e:
+            logger.debug(f"Could not copy data from expert recommendation {expert_recommendation_id}: {e}")
+            return None
+    
     def create_order_record(self, side: str, quantity: float, order_type: str = "market", 
                           limit_price: Optional[float] = None, stop_price: Optional[float] = None,
                           linked_order_id: Optional[int] = None) -> Optional[TradingOrder]:
@@ -174,7 +206,8 @@ class TradeAction(ABC):
                 expert_recommendation_id=expert_recommendation_id,
                 open_type=open_type,
                 comment=comment,
-                created_at=datetime.now(timezone.utc)
+                created_at=datetime.now(timezone.utc),
+                data=self._build_order_data(expert_recommendation_id)  # Copy expert recommendation data
             )
             
             order_id = add_instance(order)

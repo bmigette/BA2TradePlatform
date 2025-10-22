@@ -272,6 +272,26 @@ class OverviewTab:
                             if symbol and qty:
                                 broker_positions[symbol] = float(qty)
                         
+                        # Sync current prices to transactions for symbols with open positions
+                        for symbol in broker_positions.keys():
+                            try:
+                                current_price = provider_obj.get_instrument_current_price(symbol)
+                                if current_price:
+                                    # Update all open transactions for this symbol with current price
+                                    price_update_stmt = select(Transaction).where(
+                                        Transaction.symbol == symbol,
+                                        Transaction.status == TransactionStatus.OPENED,
+                                        Transaction.account_id == acc.id
+                                    )
+                                    price_transactions = session.exec(price_update_stmt).all()
+                                    for txn in price_transactions:
+                                        txn.current_price = current_price
+                                        session.add(txn)
+                                    if price_transactions:
+                                        session.commit()
+                            except Exception as pe:
+                                logger.debug(f"Could not sync current price for {symbol}: {pe}")
+                        
                         # Get all open transactions for this account
                         # First, get all trading orders for this account to find their transaction IDs
                         orders_stmt = select(TradingOrder).where(
@@ -3231,6 +3251,7 @@ class TransactionsTab:
             for txn in transactions:
                 # Calculate current P/L for open positions using cached/batch-fetched price
                 current_pnl = ''
+                current_pnl_numeric = 0  # Numeric value for sorting
                 current_price_str = ''
                 
                 # Use batch-fetched prices for open transactions
@@ -3245,17 +3266,20 @@ class TransactionsTab:
                             else:  # Short position
                                 pnl_current = (txn.open_price - current_price) * abs(txn.quantity)
                             current_pnl = f"${pnl_current:+.2f}"
+                            current_pnl_numeric = pnl_current  # Store numeric value for sorting
                     except Exception as e:
                         logger.debug(f"Could not calculate P/L for {txn.symbol}: {e}")
                 
                 # Closed P/L - calculate from open/close prices
                 closed_pnl = ''
+                closed_pnl_numeric = 0  # Numeric value for sorting
                 if txn.close_price and txn.open_price and txn.quantity:
                     if txn.quantity > 0:  # Long position
                         pnl_closed = (txn.close_price - txn.open_price) * abs(txn.quantity)
                     else:  # Short position
                         pnl_closed = (txn.open_price - txn.close_price) * abs(txn.quantity)
                     closed_pnl = f"${pnl_closed:+.2f}"
+                    closed_pnl_numeric = pnl_closed  # Store numeric value for sorting
                 
                 # Status styling
                 status_color = {
@@ -3327,7 +3351,9 @@ class TransactionsTab:
                     'take_profit': f"${txn.take_profit:.2f}" if txn.take_profit else '',
                     'stop_loss': f"${txn.stop_loss:.2f}" if txn.stop_loss else '',
                     'current_pnl': current_pnl,
+                    'current_pnl_numeric': current_pnl_numeric,  # Numeric value for sorting
                     'closed_pnl': closed_pnl,
+                    'closed_pnl_numeric': closed_pnl_numeric,  # Numeric value for sorting
                     'status': txn.status.value,
                     'status_color': status_color,
                     'created_at': txn.created_at.strftime('%Y-%m-%d %H:%M') if txn.created_at else '',
@@ -3371,8 +3397,8 @@ class TransactionsTab:
             {'name': 'close_price', 'label': 'Close Price', 'field': 'close_price', 'align': 'right'},
             {'name': 'take_profit', 'label': 'TP', 'field': 'take_profit', 'align': 'right'},
             {'name': 'stop_loss', 'label': 'SL', 'field': 'stop_loss', 'align': 'right'},
-            {'name': 'current_pnl', 'label': 'Current P/L', 'field': 'current_pnl', 'align': 'right'},
-            {'name': 'closed_pnl', 'label': 'Closed P/L', 'field': 'closed_pnl', 'align': 'right'},
+            {'name': 'current_pnl', 'label': 'Current P/L', 'field': 'current_pnl', 'align': 'right', 'sortable': True, 'sort_by': 'current_pnl_numeric'},
+            {'name': 'closed_pnl', 'label': 'Closed P/L', 'field': 'closed_pnl', 'align': 'right', 'sortable': True, 'sort_by': 'closed_pnl_numeric'},
             {'name': 'status', 'label': 'Status', 'field': 'status', 'align': 'center', 'sortable': True},
             {'name': 'order_count', 'label': 'Orders', 'field': 'order_count', 'align': 'center'},
             {'name': 'created_at', 'label': 'Created', 'field': 'created_at', 'align': 'left', 'sortable': True},

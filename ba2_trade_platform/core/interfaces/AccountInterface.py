@@ -346,15 +346,19 @@ class AccountInterface(ExtendableSettingsInterface):
             if not tp_or_sl_order.data:
                 tp_or_sl_order.data = {}
             
+            # Ensure "TP_SL" key exists for TP/SL data
+            if "TP_SL" not in tp_or_sl_order.data:
+                tp_or_sl_order.data["TP_SL"] = {}
+            
             # Check if this is a TP order (BUY_LIMIT or SELL_LIMIT)
             if tp_or_sl_order.order_type in [OrderType.BUY_LIMIT, OrderType.SELL_LIMIT]:
-                if "tp_percent" not in tp_or_sl_order.data or tp_or_sl_order.data.get("tp_percent") is None:
+                if "tp_percent" not in tp_or_sl_order.data["TP_SL"] or tp_or_sl_order.data["TP_SL"].get("tp_percent") is None:
                     # Calculate TP percent from current limit_price and parent's open_price
                     if parent_order.open_price and parent_order.open_price > 0 and tp_or_sl_order.limit_price:
                         tp_percent = ((tp_or_sl_order.limit_price - parent_order.open_price) / parent_order.open_price) * 100
-                        tp_or_sl_order.data["tp_percent"] = round(tp_percent, 2)
-                        tp_or_sl_order.data["parent_filled_price"] = parent_order.open_price
-                        tp_or_sl_order.data["type"] = "tp"
+                        tp_or_sl_order.data["TP_SL"]["tp_percent"] = round(tp_percent, 2)
+                        tp_or_sl_order.data["TP_SL"]["parent_filled_price"] = parent_order.open_price
+                        tp_or_sl_order.data["TP_SL"]["type"] = "tp"
                         update_instance(tp_or_sl_order)
                         logger.info(
                             f"Calculated and stored TP percent for order {tp_or_sl_order.id}: "
@@ -368,13 +372,13 @@ class AccountInterface(ExtendableSettingsInterface):
             
             # Check if this is an SL order (BUY_STOP or SELL_STOP)
             elif tp_or_sl_order.order_type in [OrderType.BUY_STOP, OrderType.SELL_STOP]:
-                if "sl_percent" not in tp_or_sl_order.data or tp_or_sl_order.data.get("sl_percent") is None:
+                if "sl_percent" not in tp_or_sl_order.data["TP_SL"] or tp_or_sl_order.data["TP_SL"].get("sl_percent") is None:
                     # Calculate SL percent from current stop_price and parent's open_price
                     if parent_order.open_price and parent_order.open_price > 0 and tp_or_sl_order.stop_price:
                         sl_percent = ((tp_or_sl_order.stop_price - parent_order.open_price) / parent_order.open_price) * 100
-                        tp_or_sl_order.data["sl_percent"] = round(sl_percent, 2)
-                        tp_or_sl_order.data["parent_filled_price"] = parent_order.open_price
-                        tp_or_sl_order.data["type"] = "sl"
+                        tp_or_sl_order.data["TP_SL"]["sl_percent"] = round(sl_percent, 2)
+                        tp_or_sl_order.data["TP_SL"]["parent_filled_price"] = parent_order.open_price
+                        tp_or_sl_order.data["TP_SL"]["type"] = "sl"
                         update_instance(tp_or_sl_order)
                         logger.info(
                             f"Calculated and stored SL percent for order {tp_or_sl_order.id}: "

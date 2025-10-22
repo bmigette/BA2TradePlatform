@@ -909,7 +909,9 @@ class AlpacaAccount(AccountInterface):
                     
                     # Update data field with new percent if calculated
                     if tp_percent is not None and existing_tp_order.data:
-                        existing_tp_order.data["tp_percent"] = round(tp_percent, 2)
+                        if "TP_SL" not in existing_tp_order.data:
+                            existing_tp_order.data["TP_SL"] = {}
+                        existing_tp_order.data["TP_SL"]["tp_percent"] = round(tp_percent, 2)
                         logger.debug(f"Updated TP order {existing_tp_order.id} metadata: tp_percent={tp_percent:.2f}%")
                     
                     session.add(existing_tp_order)
@@ -1047,9 +1049,11 @@ class AlpacaAccount(AccountInterface):
         order_data = {}
         if tp_percent is not None:
             order_data = {
-                "tp_percent": round(tp_percent, 2),
-                "parent_filled_price": None,  # Will be set when parent order is FILLED
-                "type": "tp"  # Mark this as a TP order for triggering logic
+                "TP_SL": {
+                    "tp_percent": round(tp_percent, 2),
+                    "parent_filled_price": None,  # Will be set when parent order is FILLED
+                    "type": "tp"  # Mark this as a TP order for triggering logic
+                }
             }
         
         # Create take profit order in WAITING_TRIGGER status
@@ -1125,7 +1129,9 @@ class AlpacaAccount(AccountInterface):
                     
                     # Update data field with new percent if calculated
                     if sl_percent is not None and existing_sl_order.data:
-                        existing_sl_order.data["sl_percent"] = round(sl_percent, 2)
+                        if "TP_SL" not in existing_sl_order.data:
+                            existing_sl_order.data["TP_SL"] = {}
+                        existing_sl_order.data["TP_SL"]["sl_percent"] = round(sl_percent, 2)
                         logger.debug(f"Updated SL order {existing_sl_order.id} metadata: sl_percent={sl_percent:.2f}%")
                     
                     session.add(existing_sl_order)
@@ -1199,9 +1205,11 @@ class AlpacaAccount(AccountInterface):
         order_data = {}
         if sl_percent is not None:
             order_data = {
-                "sl_percent": round(sl_percent, 2),
-                "parent_filled_price": None,  # Will be set when parent order is FILLED
-                "type": "sl"  # Mark this as a SL order for triggering logic
+                "TP_SL": {
+                    "sl_percent": round(sl_percent, 2),
+                    "parent_filled_price": None,  # Will be set when parent order is FILLED
+                    "type": "sl"  # Mark this as a SL order for triggering logic
+                }
             }
         
         # Create stop loss order in WAITING_TRIGGER status

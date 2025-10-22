@@ -192,21 +192,52 @@ def _render_cancelled_state(market_analysis: MarketAnalysis) -> None:
 
 def _render_error_state(market_analysis: MarketAnalysis) -> None:
     """Render UI for error analysis."""
-    with ui.card().classes('w-full p-8 text-center'):
-        ui.icon('error', size='3rem', color='negative').classes('mb-4')
-        ui.label('Analysis encountered an error').classes('text-h5 text-negative')
-        ui.label(f'Error time: {market_analysis.created_at.strftime("%Y-%m-%d %H:%M:%S") if market_analysis.created_at else "Unknown"}').classes('text-grey-7')
-        
-        # Show error details if available in state
-        error_message = _extract_error_message(market_analysis.state)
-        if error_message:
-            with ui.card().classes('w-full max-w-4xl mt-4 bg-red-50 border-l-4 border-red-500'):
+    # Check if this is a skipped analysis (due to pre-checks)
+    is_skipped = False
+    skip_reason = None
+    
+    if market_analysis.state and isinstance(market_analysis.state, dict):
+        is_skipped = market_analysis.state.get('skipped', False)
+        skip_reason = market_analysis.state.get('skip_reason')
+    
+    if is_skipped and skip_reason:
+        # Render skipped analysis (pre-check failure)
+        with ui.card().classes('w-full p-8 text-center'):
+            ui.icon('info', size='3rem', color='orange').classes('mb-4')
+            ui.label('Analysis was skipped').classes('text-h5 text-orange-700')
+            ui.label(f'Reason: {skip_reason}').classes('text-subtitle1 text-orange-600 mt-2')
+            ui.label(f'Skipped on: {market_analysis.created_at.strftime("%Y-%m-%d %H:%M:%S") if market_analysis.created_at else "Unknown"}').classes('text-grey-7 mt-1')
+            
+            # Provide context and action
+            with ui.card().classes('w-full max-w-2xl mt-4 bg-orange-50 border-l-4 border-orange-500'):
                 with ui.row().classes('items-start p-4'):
-                    ui.icon('error_outline', color='negative').classes('mt-1 mr-3')
+                    ui.icon('lightbulb', color='orange').classes('mt-1 mr-3')
                     with ui.column().classes('flex-1'):
-                        ui.label('Error Details:').classes('font-medium text-red-800 mb-2')
-                        with ui.element('pre').classes('bg-red-100 p-3 rounded text-sm overflow-auto max-h-48 whitespace-pre-wrap font-mono text-red-900'):
-                            ui.label(error_message)
+                        ui.label('Why was this analysis skipped?').classes('font-medium text-orange-800 mb-2')
+                        ui.label(skip_reason).classes('text-orange-700 text-sm')
+                        
+                        # Show actionable advice based on skip reason
+                        if "price" in skip_reason.lower() and "balance" not in skip_reason.lower():
+                            ui.label('💡 Tip: This instrument\'s price exceeds your available balance. Try with a lower-priced instrument or increase your balance.').classes('text-sm text-orange-600 mt-2')
+                        elif "balance" in skip_reason.lower():
+                            ui.label('💡 Tip: Your available balance is too low. Please fund your account or reduce equity allocation to this expert.').classes('text-sm text-orange-600 mt-2')
+    else:
+        # Render regular error (actual analysis failure)
+        with ui.card().classes('w-full p-8 text-center'):
+            ui.icon('error', size='3rem', color='negative').classes('mb-4')
+            ui.label('Analysis encountered an error').classes('text-h5 text-negative')
+            ui.label(f'Error time: {market_analysis.created_at.strftime("%Y-%m-%d %H:%M:%S") if market_analysis.created_at else "Unknown"}').classes('text-grey-7')
+            
+            # Show error details if available in state
+            error_message = _extract_error_message(market_analysis.state)
+            if error_message:
+                with ui.card().classes('w-full max-w-4xl mt-4 bg-red-50 border-l-4 border-red-500'):
+                    with ui.row().classes('items-start p-4'):
+                        ui.icon('error_outline', color='negative').classes('mt-1 mr-3')
+                        with ui.column().classes('flex-1'):
+                            ui.label('Error Details:').classes('font-medium text-red-800 mb-2')
+                            with ui.element('pre').classes('bg-red-100 p-3 rounded text-sm overflow-auto max-h-48 whitespace-pre-wrap font-mono text-red-900'):
+                                ui.label(error_message)
 
 
 def _check_for_analysis_errors(market_analysis: MarketAnalysis) -> bool:

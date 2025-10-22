@@ -23,7 +23,7 @@ import requests
 from ...core.interfaces import MarketExpertInterface
 from ...core.models import ExpertInstance, MarketAnalysis, AnalysisOutput, ExpertRecommendation
 from ...core.db import get_db, get_instance, update_instance, add_instance
-from ...core.types import MarketAnalysisStatus, OrderRecommendation, RiskLevel, TimeHorizon
+from ...core.types import MarketAnalysisStatus, OrderRecommendation, RiskLevel, TimeHorizon, AnalysisUseCase
 from ...logger import get_expert_logger
 from ...config import get_app_setting
 
@@ -110,7 +110,13 @@ class FMPSenateTraderCopy(MarketExpertInterface):
                 "description": "Maximum days since trade execution",
                 "tooltip": "Trades executed more than this many days ago will be filtered out. Helps focus on recent trading activity."
             },
-
+            "close_only_for_same_trader": {
+                "type": "bool",
+                "required": True,
+                "default": True,
+                "description": "For Open Positions: Only close if same trader reverses",
+                "tooltip": "When True, SELL/BUY recommendations for closing positions only trigger if the original trader reverses direction. When False, uses standard averaging logic for the lookback interval."
+            },
         }
     
     def _fetch_senate_trades(self, symbol: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
@@ -303,6 +309,68 @@ class FMPSenateTraderCopy(MarketExpertInterface):
         self.logger.info(f"Filtered {len(filtered_trades)} trades from {len(trades)} total based on age criteria")
         return filtered_trades
     
+    def _filter_trades(self, trades: List[Dict[str, Any]], 
+                      copy_trade_names: List[str],
+                      max_disclose_days: int, 
+                      max_exec_days: int) -> List[Dict[str, Any]]:
+        """
+        Filter trades based on trader names and age criteria.
+        
+        Args:
+            trades: List of trade records
+            copy_trade_names: List of trader names to copy (lowercase)
+            max_disclose_days: Maximum days since disclosure
+            max_exec_days: Maximum days since execution
+            
+        Returns:
+            Filtered list of trades
+        """
+        now = datetime.now(timezone.utc)
+        filtered_trades = []
+        max_exec_days = int(max_exec_days)
+        max_disclose_days = int(max_disclose_days)
+        
+        for trade in trades:
+            try:
+                # Parse dates
+                disclose_date_str = trade.get('disclosureDate', '')
+                exec_date_str = trade.get('transactionDate', '')
+                
+                trader_name = f"{trade.get('firstName', '')} {trade.get('lastName', '')}".strip() or 'Unknown'
+                trader_name_lower = trader_name.lower()
+
+                if not disclose_date_str or not exec_date_str:
+                    self.logger.debug(f"Trade missing dates, skipping: {trader_name}")
+                    continue
+                
+                # Filter by trader name first (before date calculations to save time)
+                if trader_name_lower not in copy_trade_names:
+                    continue
+                
+                # Parse dates (FMP returns YYYY-MM-DD format)
+                disclose_date = datetime.strptime(disclose_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                exec_date = datetime.strptime(exec_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
+                # Check disclose date
+                days_since_disclose = (now - disclose_date).days
+                if days_since_disclose > max_disclose_days:
+                    continue
+                
+                # Check execution date
+                days_since_exec = (now - exec_date).days
+                if days_since_exec > max_exec_days:
+                    continue
+                
+                # Trade passed all filters
+                filtered_trades.append(trade)
+                
+            except Exception as e:
+                self.logger.warning(f"Error processing trade {trade}: {e}")
+                continue
+        
+        self.logger.info(f"Filtered {len(filtered_trades)} trades from {len(trades)} total by trader names and age")
+        return filtered_trades
+    
     def _filter_trades_by_age_multi(self, trades: List[Dict[str, Any]], 
                                    max_disclose_days: int, 
                                    max_exec_days: int) -> List[Dict[str, Any]]:
@@ -443,23 +511,43 @@ class FMPSenateTraderCopy(MarketExpertInterface):
                 'copy_trades_found': len(copy_trades)
             }
         
-        # Determine signal based on the most recent trade
-        # If multiple trades exist, use the most recent one
-        most_recent_trade = max(symbol_trades, key=lambda t: t.get('exec_date', ''))
+        # Determine signal based on the trades
+        # If multiple trades exist, analyze all of them
+        # Group by signal direction
+        buy_trades = [t for t in symbol_trades if 'purchase' in t.get('type', '').lower() or 'buy' in t.get('type', '').lower()]
+        sell_trades = [t for t in symbol_trades if 'sale' in t.get('type', '').lower() or 'sell' in t.get('type', '').lower()]
         
-        transaction_type = most_recent_trade.get('type', '').lower()
-        trader_name = f"{most_recent_trade.get('firstName', '')} {most_recent_trade.get('lastName', '')}".strip() or 'Unknown'
-        
-        # Determine signal
-        is_buy = 'purchase' in transaction_type or 'buy' in transaction_type
-        is_sell = 'sale' in transaction_type or 'sell' in transaction_type
-        
-        if is_buy:
+        # Determine dominant signal
+        if len(buy_trades) > len(sell_trades):
             signal = OrderRecommendation.BUY
-        elif is_sell:
+            dominant_trades = buy_trades
+        elif len(sell_trades) > len(buy_trades):
             signal = OrderRecommendation.SELL
+            dominant_trades = sell_trades
+        elif len(buy_trades) > 0:
+            # Equal trades, use most recent
+            most_recent_trade = max(symbol_trades, key=lambda t: t.get('exec_date', ''))
+            transaction_type = most_recent_trade.get('type', '').lower()
+            is_buy = 'purchase' in transaction_type or 'buy' in transaction_type
+            signal = OrderRecommendation.BUY if is_buy else OrderRecommendation.SELL
+            dominant_trades = symbol_trades
         else:
             signal = OrderRecommendation.HOLD
+            dominant_trades = []
+        
+        # Collect all unique traders for this symbol with the dominant signal
+        trader_names = []
+        for trade in dominant_trades:
+            trader_name_detail = f"{trade.get('firstName', '')} {trade.get('lastName', '')}".strip() or 'Unknown'
+            if trader_name_detail not in trader_names:
+                trader_names.append(trader_name_detail)
+        
+        # Primary trader is the first one (most recent)
+        if dominant_trades:
+            most_recent_trade = max(dominant_trades, key=lambda t: t.get('exec_date', ''))
+            primary_trader = f"{most_recent_trade.get('firstName', '')} {most_recent_trade.get('lastName', '')}".strip() or 'Unknown'
+        else:
+            primary_trader = 'Unknown'
         
         # Copy trade: 100% confidence, 50% expected profit (always positive)
         confidence = 100.0
@@ -491,7 +579,8 @@ Current Price: ${current_price:.2f}
 Symbol {symbol} Analysis:
 - Trades Found: {len(symbol_trades)}
 - Most Recent Signal: {signal.value}
-- Primary Trader: {trader_name}
+- Primary Trader: {primary_trader}
+- Number of Traders with {signal.value}: {len(trader_names)}
 
 Trade Details for {symbol}:
 """
@@ -532,7 +621,9 @@ Note: If multiple trades exist for the same instrument, the most recent trade de
             'trades': trade_details,
             'trade_count': len(symbol_trades),
             'copy_trades_found': len(copy_trades),
-            'trader_name': trader_name  # Primary trader for this recommendation
+            'trader_name': primary_trader,  # Primary trader for this recommendation
+            'trader_names': trader_names,  # All traders with same signal direction
+            'num_traders': len(trader_names)  # Count of unique traders
         }
     
     def _create_expert_recommendation(self, recommendation_data: Dict[str, Any], 
@@ -540,6 +631,14 @@ Note: If multiple trades exist for the same instrument, the most recent trade de
                                      current_price: Optional[float]) -> int:
         """Create ExpertRecommendation record in database."""
         try:
+            # Store senate copy specific data
+            senate_copy_data = {
+                'trader_names': recommendation_data.get('trader_names', []),
+                'num_traders': recommendation_data.get('num_traders', 1),
+                'trade_count': recommendation_data.get('trade_count', 0),
+                'trades': recommendation_data.get('trades', [])
+            }
+            
             expert_recommendation = ExpertRecommendation(
                 instance_id=self.id,
                 symbol=symbol,
@@ -551,13 +650,14 @@ Note: If multiple trades exist for the same instrument, the most recent trade de
                 risk_level=RiskLevel.MEDIUM,  # Copy trades are medium risk
                 time_horizon=TimeHorizon.MEDIUM_TERM,  # Medium term based on disclosure lag
                 market_analysis_id=market_analysis_id,
+                data={'SenateCopy': senate_copy_data},  # Store with "SenateCopy" key
                 created_at=datetime.now(timezone.utc)
             )
             
             recommendation_id = add_instance(expert_recommendation)
             self.logger.info(f"Created ExpertRecommendation (ID: {recommendation_id}) for {symbol}: "
                        f"{recommendation_data['signal'].value} with {recommendation_data['confidence']:.1f}% confidence, "
-                       f"based on {recommendation_data['trade_count']} copy trades")
+                       f"based on {recommendation_data['trade_count']} copy trades from {recommendation_data.get('num_traders', 1)} trader(s)")
             return recommendation_id
             
         except Exception as e:
@@ -739,12 +839,44 @@ Recommendations Generated:"""
         followed traders and creates separate ExpertRecommendation records for each 
         symbol traded by those traders.
         
+        Supports different analysis use cases:
+        - ENTER_MARKET: Generate BUY/SELL recommendations based on trader activity
+        - OPEN_POSITIONS: Generate SELL/BUY recommendations to close existing positions
+        
         Args:
             symbol: Placeholder symbol (typically "MULTI" for multi-instrument analysis)
-            market_analysis: MarketAnalysis instance to update with results
+            market_analysis: MarketAnalysis instance to update with results (includes subtype)
         """
-        self.logger.info(f"Starting FMPSenateTraderCopy multi-instrument analysis (Analysis ID: {market_analysis.id})")
+        self.logger.info(f"Starting FMPSenateTraderCopy analysis (Analysis ID: {market_analysis.id}, "
+                        f"SubType: {market_analysis.subtype.value if market_analysis.subtype else 'ENTER_MARKET'})")
         
+        try:
+            # Route based on analysis use case
+            if market_analysis.subtype == AnalysisUseCase.OPEN_POSITIONS:
+                self._run_open_positions_analysis(symbol, market_analysis)
+            else:
+                # Default: ENTER_MARKET analysis
+                self._run_enter_market_analysis(symbol, market_analysis)
+                
+        except Exception as e:
+            self.logger.error(f"FMPSenateTraderCopy analysis failed: {e}", exc_info=True)
+            
+            # Update status to failed
+            market_analysis.state = {
+                'error': str(e),
+                'error_timestamp': datetime.now(timezone.utc).isoformat(),
+                'analysis_failed': True
+            }
+            market_analysis.status = MarketAnalysisStatus.FAILED
+            update_instance(market_analysis)
+            raise
+    
+    def _run_enter_market_analysis(self, symbol: str, market_analysis: MarketAnalysis) -> None:
+        """
+        Run ENTER_MARKET analysis: Generate BUY/SELL recommendations based on trader activity.
+        
+        This is the standard analysis mode that generates recommendations to enter positions.
+        """
         try:
             # Update status to running
             market_analysis.status = MarketAnalysisStatus.RUNNING
@@ -912,6 +1044,186 @@ Recommendations Generated:"""
             
             raise
     
+    def _run_open_positions_analysis(self, symbol: str, market_analysis: MarketAnalysis) -> None:
+        """
+        Run OPEN_POSITIONS analysis: Generate SELL/BUY recommendations to close existing positions.
+        
+        Logic:
+        - If "close_only_for_same_trader" is True (default):
+          - Only generate SELL recommendations if a trader who previously BUY'ed is now SELL'ing (same trader reversal)
+          - Only generate BUY recommendations if a trader who previously SELL'ed is now BUY'ing (same trader reversal)
+          - If we have existing positions with no trader name (backward compatibility), fall back to averaging logic
+        - If "close_only_for_same_trader" is False:
+          - Use standard averaging logic from lookback interval (compare BUY vs SELL counts)
+        """
+        try:
+            # Update status to running
+            market_analysis.status = MarketAnalysisStatus.RUNNING
+            update_instance(market_analysis)
+            
+            # Get settings
+            copy_trade_names_setting = self.settings.get('copy_trade_names', '').strip()
+            if not copy_trade_names_setting:
+                raise ValueError("No copy trade names configured. Please set 'copy_trade_names' in expert settings.")
+            
+            close_only_for_same_trader = self.settings.get('close_only_for_same_trader', True)
+            
+            # Parse copy trade names
+            copy_trade_names = [name.strip().lower() for name in copy_trade_names_setting.split(',') if name.strip()]
+            if not copy_trade_names:
+                raise ValueError("No valid copy trade names found after parsing.")
+            
+            max_disclose_days = self.settings.get('max_disclose_date_days', 30)
+            max_exec_days = self.settings.get('max_trade_exec_days', 60)
+            
+            # Fetch current trades
+            senate_trades = self._fetch_senate_trades(symbol=None)
+            house_trades = self._fetch_house_trades(symbol=None)
+            
+            if senate_trades is None and house_trades is None:
+                raise ValueError("Failed to fetch trades from FMP API (both senate and house failed)")
+            
+            # Combine trades
+            all_trades = (senate_trades or []) + (house_trades or [])
+            self.logger.info(f"Fetched {len(all_trades)} total trades from senate and house")
+            
+            # Filter trades by settings
+            filtered_trades = self._filter_trades(all_trades, copy_trade_names, max_disclose_days, max_exec_days)
+            self.logger.info(f"Filtered to {len(filtered_trades)} trades within age criteria")
+            
+            # Group trades by symbol for close recommendations
+            trades_by_symbol = {}
+            for trade in filtered_trades:
+                trade_symbol = trade.get('symbol', '').upper()
+                if trade_symbol and len(trade_symbol) > 0:
+                    if trade_symbol not in trades_by_symbol:
+                        trades_by_symbol[trade_symbol] = []
+                    trades_by_symbol[trade_symbol].append(trade)
+            
+            copy_trades = filtered_trades  # All filtered trades are relevant for close recommendations
+            self.logger.info(f"Found copy trades for {len(trades_by_symbol)} symbols")
+            
+            # Create recommendations for each symbol
+            recommendation_ids = []
+            symbol_recommendations = {}
+            
+            for trade_symbol, symbol_trades in trades_by_symbol.items():
+                try:
+                    # Generate close recommendations based on mode
+                    if close_only_for_same_trader:
+                        # NEW MODE: Check for same trader reversals
+                        recommendation_data = self._generate_close_recommendations_same_trader(
+                            symbol_trades, trade_symbol
+                        )
+                    else:
+                        # OLD MODE: Use averaging logic
+                        recommendation_data = self._generate_close_recommendations_averaging(
+                            symbol_trades, trade_symbol
+                        )
+                    
+                    if not recommendation_data:
+                        # No recommendation for this symbol in this mode
+                        self.logger.debug(f"No close recommendation for {trade_symbol} in {('same_trader' if close_only_for_same_trader else 'averaging')} mode")
+                        continue
+                    
+                    # Get current price
+                    current_price = self._get_current_price(trade_symbol)
+                    if not current_price:
+                        self.logger.warning(f"Unable to get current price for {trade_symbol}, using 0.0")
+                        current_price = 0.0
+                    
+                    # Create ExpertRecommendation record
+                    recommendation_id = self._create_expert_recommendation(
+                        recommendation_data, trade_symbol, market_analysis.id, current_price
+                    )
+                    
+                    recommendation_ids.append(recommendation_id)
+                    symbol_recommendations[trade_symbol] = {
+                        'recommendation_id': recommendation_id,
+                        'signal': recommendation_data['signal'].value,
+                        'confidence': recommendation_data['confidence'],
+                        'expected_profit_percent': recommendation_data['expected_profit_percent'],
+                        'current_price': current_price,
+                        'trade_count': len(symbol_trades),
+                        'trader_name': recommendation_data.get('trader_name', 'Unknown'),
+                        'trader_names': recommendation_data.get('trader_names', []),
+                        'num_traders': recommendation_data.get('num_traders', 1)
+                    }
+                    
+                    self.logger.info(f"Created close recommendation for {trade_symbol}: {recommendation_data['signal'].value}")
+                    
+                except Exception as e:
+                    self.logger.error(f"Error creating close recommendation for {trade_symbol}: {e}", exc_info=True)
+                    continue
+            
+            # Store analysis state
+            market_analysis.state = {
+                'copy_trade_multi': {
+                    'analysis_type': 'open_positions_close',
+                    'close_mode': 'same_trader' if close_only_for_same_trader else 'averaging',
+                    'total_symbols': len(trades_by_symbol),
+                    'symbols_analyzed': sorted(trades_by_symbol.keys()),
+                    'symbol_recommendations': symbol_recommendations,
+                    'trade_statistics': {
+                        'total_trades': len(all_trades),
+                        'filtered_trades': len(filtered_trades),
+                        'copy_trades_found': len(copy_trades),
+                        'symbols_with_trades': len(trades_by_symbol)
+                    },
+                    'settings': {
+                        'copy_trade_names': copy_trade_names_setting,
+                        'close_only_for_same_trader': close_only_for_same_trader,
+                        'max_disclose_date_days': max_disclose_days,
+                        'max_trade_exec_days': max_exec_days
+                    },
+                    'expert_recommendation_ids': recommendation_ids,
+                    'analysis_timestamp': datetime.now(timezone.utc).isoformat()
+                }
+            }
+            
+            # Update status to completed
+            market_analysis.status = MarketAnalysisStatus.COMPLETED
+            update_instance(market_analysis)
+            
+            self.logger.info(f"Completed FMPSenateTraderCopy OPEN_POSITIONS analysis: "
+                           f"found {len(symbol_recommendations)} close opportunities")
+            
+        except Exception as e:
+            self.logger.error(f"FMPSenateTraderCopy OPEN_POSITIONS analysis failed: {e}", exc_info=True)
+            
+            # Update status to failed
+            market_analysis.state = {
+                'error': str(e),
+                'error_timestamp': datetime.now(timezone.utc).isoformat(),
+                'analysis_failed': True
+            }
+            market_analysis.status = MarketAnalysisStatus.FAILED
+            update_instance(market_analysis)
+            raise
+    
+    def _generate_close_recommendations_same_trader(self, symbol_trades: List[Dict[str, Any]], 
+                                                    symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        Generate close recommendations only if same trader reverses direction.
+        
+        Returns None if no valid reversal found.
+        """
+        # TODO: Implement same-trader reversal detection
+        # This requires checking historical positions and matching trader names
+        # For now, return None to skip recommendations in this mode
+        return None
+    
+    def _generate_close_recommendations_averaging(self, symbol_trades: List[Dict[str, Any]], 
+                                                 symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        Generate close recommendations using standard averaging logic.
+        
+        Compare BUY vs SELL counts in the lookback period to generate recommendations.
+        """
+        # TODO: Implement averaging logic
+        # Count BUY vs SELL trades and generate opposite signal if one dominates
+        return None
+    
     def render_market_analysis(self, market_analysis: MarketAnalysis) -> None:
         """
         Render FMPSenateTraderCopy market analysis results in the UI.
@@ -1046,55 +1358,85 @@ Recommendations Generated:"""
             # Recommendations by Symbol
             if symbol_recommendations:
                 with ui.card_section():
-                    ui.label(f'Recommendations Generated ({len(symbol_recommendations)})').classes('text-subtitle1 text-weight-medium mb-3')
+                    # Get trader names from state
+                    traders_by_symbol = state.get('traders_by_symbol', {})
                     
-                    for symbol, rec_data in sorted(symbol_recommendations.items()):
-                        signal = rec_data.get('signal', 'HOLD')
-                        confidence = rec_data.get('confidence', 0.0)
-                        expected_profit = rec_data.get('expected_profit_percent', 0.0)
-                        current_price = rec_data.get('current_price', 0.0)
-                        trade_count = rec_data.get('trade_count', 0)
-                        
-                        # Signal colors
-                        if signal == 'BUY':
-                            signal_color = 'positive'
-                            signal_icon = 'trending_up'
-                            bg_color = 'bg-green-50'
-                        elif signal == 'SELL':
-                            signal_color = 'negative'
-                            signal_icon = 'trending_down'
-                            bg_color = 'bg-red-50'
-                        else:
-                            signal_color = 'grey'
-                            signal_icon = 'trending_flat'
-                            bg_color = 'bg-grey-50'
-                        
-                        with ui.card().classes(f'w-full {bg_color} mb-2'):
-                            with ui.row().classes('w-full items-center justify-between p-2'):
-                                # Symbol and Signal
-                                with ui.column():
-                                    ui.label(symbol).classes('text-h6 text-weight-bold')
-                                    with ui.row().classes('items-center gap-2'):
-                                        ui.icon(signal_icon, color=signal_color, size='1.2rem')
-                                        ui.label(signal).classes(f'text-weight-medium text-{signal_color}')
-                                
-                                # Stats
-                                with ui.column().classes('text-center'):
-                                    ui.label(f'{confidence:.1f}%').classes('text-weight-medium')
-                                    ui.label('Confidence').classes('text-xs text-grey-6')
-                                
-                                with ui.column().classes('text-center'):
-                                    profit_color = 'positive' if expected_profit > 0 else 'negative' if expected_profit < 0 else 'grey'
-                                    ui.label(f'{expected_profit:+.1f}%').classes(f'text-weight-medium text-{profit_color}')
-                                    ui.label('Expected').classes('text-xs text-grey-6')
-                                
-                                with ui.column().classes('text-center'):
-                                    ui.label(f'${current_price:.2f}' if current_price > 0 else 'N/A').classes('text-weight-medium')
-                                    ui.label('Price').classes('text-xs text-grey-6')
-                                
-                                with ui.column().classes('text-center'):
-                                    ui.label(str(trade_count)).classes('text-weight-medium text-orange-600')
-                                    ui.label('Trades').classes('text-xs text-grey-6')
+                    ui.label(f'Recommendations Generated ({len(symbol_recommendations)})').classes('text-subtitle1 text-weight-medium mb-4')
+                    
+                    # Display recommendations in a grid (3 per row - balanced size)
+                    with ui.grid(columns=3).classes('w-full gap-4'):
+                        for symbol, rec_data in sorted(symbol_recommendations.items()):
+                            signal = rec_data.get('signal', 'HOLD')
+                            confidence = rec_data.get('confidence', 0.0)
+                            expected_profit = rec_data.get('expected_profit_percent', 0.0)
+                            current_price = rec_data.get('current_price', 0.0)
+                            trade_count = rec_data.get('trade_count', 0)
+                            trader_name = rec_data.get('trader_name', traders_by_symbol.get(symbol, 'Unknown'))
+                            
+                            # Signal colors
+                            if signal == 'BUY':
+                                signal_color = 'positive'
+                                signal_icon = 'trending_up'
+                                bg_color = 'bg-green-50'
+                            elif signal == 'SELL':
+                                signal_color = 'negative'
+                                signal_icon = 'trending_down'
+                                bg_color = 'bg-red-50'
+                            else:
+                                signal_color = 'grey'
+                                signal_icon = 'trending_flat'
+                                bg_color = 'bg-grey-50'
+                            
+                            with ui.card().classes(f'w-full {bg_color} shadow-sm'):
+                                with ui.column().classes('w-full gap-3 p-4'):
+                                    # Header: Symbol and Signal
+                                    with ui.row().classes('w-full items-center justify-between mb-2'):
+                                        ui.label(symbol).classes('text-h5 text-weight-bold')
+                                        ui.icon(signal_icon, color=signal_color, size='1.8rem')
+                                    
+                                    # Signal and Trader name(s)
+                                    num_traders = rec_data.get('num_traders', 1)
+                                    trader_names_list = rec_data.get('trader_names', [trader_name])
+                                    
+                                    with ui.column().classes('w-full mb-3'):
+                                        with ui.row().classes('w-full items-center gap-2'):
+                                            ui.label(signal).classes(f'text-h6 text-weight-bold text-{signal_color}')
+                                            if num_traders > 1:
+                                                ui.badge(str(num_traders), color='blue').classes('text-xs')
+                                        
+                                        # Show trader names
+                                        if num_traders == 1:
+                                            ui.label(f'by {trader_name}').classes('text-sm text-grey-7 italic mt-1')
+                                        else:
+                                            # Multiple traders
+                                            traders_text = ', '.join(trader_names_list[:3])
+                                            if len(trader_names_list) > 3:
+                                                traders_text += f' +{len(trader_names_list) - 3}'
+                                            ui.label(f'by {traders_text}').classes('text-sm text-grey-7 italic mt-1')
+                                    
+                                    # Trade count
+                                    with ui.row().classes('items-center gap-2 mb-3 pb-3 border-b border-grey-3'):
+                                        ui.icon('receipt', size='sm', color='orange')
+                                        ui.label(f'{trade_count} Trade{"s" if trade_count != 1 else ""}').classes('text-sm text-orange-700 text-weight-medium')
+                                    
+                                    # Stats grid - more spacious
+                                    with ui.grid(columns=3).classes('w-full gap-3'):
+                                        # Confidence
+                                        with ui.column().classes('text-center'):
+                                            ui.label(f'{confidence:.0f}%').classes('text-h6 text-weight-bold text-blue-700')
+                                            ui.label('Confidence').classes('text-xs text-grey-7')
+                                        
+                                        # Expected Profit
+                                        with ui.column().classes('text-center'):
+                                            profit_color = 'positive' if expected_profit > 0 else 'negative' if expected_profit < 0 else 'grey'
+                                            ui.label(f'{expected_profit:+.1f}%').classes(f'text-h6 text-weight-bold text-{profit_color}')
+                                            ui.label('Expected').classes('text-xs text-grey-7')
+                                        
+                                        # Current Price
+                                        with ui.column().classes('text-center'):
+                                            price_label = f'${current_price:.2f}' if current_price > 0 else 'N/A'
+                                            ui.label(price_label).classes('text-h6 text-weight-bold')
+                                            ui.label('Price').classes('text-xs text-grey-7')
             
             # Followed Traders
             copy_trade_names = settings.get('copy_trade_names', '')
