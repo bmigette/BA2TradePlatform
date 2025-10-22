@@ -405,10 +405,47 @@ class WorkerQueue:
                 # Check if we should skip this task based on existing transactions
                 should_skip = self._should_skip_task(task)
                 if should_skip:
+                    # Create or update MarketAnalysis record for skipped analysis
+                    try:
+                        from .db import get_instance, add_instance, update_instance
+                        from .models import MarketAnalysis
+                        from .types import MarketAnalysisStatus, AnalysisUseCase
+                        
+                        if task.market_analysis_id:
+                            # Update existing MarketAnalysis record
+                            market_analysis = get_instance(MarketAnalysis, task.market_analysis_id)
+                            if market_analysis:
+                                market_analysis.status = MarketAnalysisStatus.FAILED
+                                if market_analysis.state is None:
+                                    market_analysis.state = {}
+                                market_analysis.state["skipped"] = True
+                                market_analysis.state["skip_reason"] = should_skip
+                                market_analysis.state["skip_type"] = "transaction_check"
+                                update_instance(market_analysis)
+                                logger.debug(f"Updated MarketAnalysis {task.market_analysis_id} status to FAILED due to skip")
+                        else:
+                            # Create new MarketAnalysis record for pre-check skips
+                            market_analysis = MarketAnalysis(
+                                symbol=task.symbol,
+                                expert_instance_id=task.expert_instance_id,
+                                status=MarketAnalysisStatus.FAILED,
+                                subtype=AnalysisUseCase(task.subtype),
+                                state={
+                                    "skipped": True,
+                                    "skip_reason": should_skip,
+                                    "skip_type": "transaction_check"
+                                }
+                            )
+                            market_analysis_id = add_instance(market_analysis)
+                            task.market_analysis_id = market_analysis_id
+                            logger.debug(f"Created MarketAnalysis {market_analysis_id} with FAILED status due to skip")
+                    except Exception as e:
+                        logger.error(f"Error creating/updating MarketAnalysis for skipped task: {e}", exc_info=True)
+                    
                     # Mark task as completed since we're skipping it
                     with self._task_lock:
                         task.status = WorkerTaskStatus.COMPLETED
-                        task.result = {"status": "skipped", "reason": should_skip}
+                        task.result = {"status": "skipped", "reason": should_skip, "market_analysis_id": task.market_analysis_id}
                         task.completed_at = time.time()
                         
                         # Clean up task key mapping
@@ -684,6 +721,10 @@ class WorkerQueue:
         """
         Determine if a task should be skipped based on existing transactions and analysis type.
         
+        For OPEN_POSITIONS analysis:
+        - If symbol is "EXPERT" or "DYNAMIC": Skip only if NO open positions exist (any symbol)
+        - If symbol is a regular symbol: Skip only if NO existing transactions exist
+        
         Args:
             task: The analysis task to check
             
@@ -696,24 +737,70 @@ class WorkerQueue:
                 logger.debug(f"Bypassing transaction check for expert {task.expert_instance_id}, symbol {task.symbol} (manual analysis)")
                 return None
             
-            has_transactions = self.has_existing_transactions(task.expert_instance_id, task.symbol)
-            
             if task.subtype == AnalysisUseCase.ENTER_MARKET:
-                # ENTER_MARKET: Skip if there ARE existing transactions (OPENED or WAITING)
+                # ENTER_MARKET: Check if there are existing transactions for this specific symbol
+                has_transactions = self.has_existing_transactions(task.expert_instance_id, task.symbol)
                 if has_transactions:
                     logger.info(f"Skipping ENTER_MARKET analysis for expert {task.expert_instance_id}, symbol {task.symbol}: existing transactions found (OPENED or WAITING)")
                     return "existing transactions found for enter_market analysis"
+            
             elif task.subtype == AnalysisUseCase.OPEN_POSITIONS:
-                # OPEN_POSITIONS: Skip if there are NO existing transactions (inverted logic)
-                if not has_transactions:
-                    logger.info(f"Skipping OPEN_POSITIONS analysis for expert {task.expert_instance_id}, symbol {task.symbol}: no existing transactions found")
-                    return "no existing transactions found for open_positions analysis"
+                # OPEN_POSITIONS: Check based on symbol type
+                if task.symbol in ("EXPERT", "DYNAMIC"):
+                    # For special symbols, check if ANY open positions exist for this expert
+                    has_any_open_positions = self._has_any_open_positions(task.expert_instance_id)
+                    if not has_any_open_positions:
+                        logger.info(f"Skipping OPEN_POSITIONS analysis for expert {task.expert_instance_id}, symbol {task.symbol}: no open positions found for any symbol")
+                        return "no open positions found for open_positions analysis"
+                else:
+                    # For regular symbols, check if transactions exist for this specific symbol
+                    has_transactions = self.has_existing_transactions(task.expert_instance_id, task.symbol)
+                    if not has_transactions:
+                        logger.info(f"Skipping OPEN_POSITIONS analysis for expert {task.expert_instance_id}, symbol {task.symbol}: no existing transactions found")
+                        return "no existing transactions found for open_positions analysis"
             
             return None  # Task should proceed
             
         except Exception as e:
             logger.error(f"Error checking if task should be skipped: {e}", exc_info=True)
             return None  # Default to proceeding if error occurs
+    
+    def _has_any_open_positions(self, expert_id: int) -> bool:
+        """
+        Check if there are ANY open positions for the given expert (regardless of symbol).
+        Used for EXPERT and DYNAMIC symbol analysis.
+        
+        Args:
+            expert_id: The expert instance ID
+            
+        Returns:
+            True if any open positions exist, False otherwise
+        """
+        try:
+            from sqlmodel import select, Session
+            from .db import get_db
+            from .models import Transaction
+            from .types import TransactionStatus
+            
+            with Session(get_db().bind) as session:
+                # Check for ANY transactions with this expert_id that are open
+                statement = select(Transaction).where(
+                    Transaction.expert_id == expert_id,
+                    Transaction.status.in_([
+                        TransactionStatus.WAITING,
+                        TransactionStatus.OPENED
+                    ])
+                )
+                
+                transaction = session.exec(statement).first()
+                has_positions = transaction is not None
+                
+                logger.debug(f"Open positions check for expert {expert_id}: {'found' if has_positions else 'not found'}")
+                return has_positions
+                
+        except Exception as e:
+            logger.error(f"Error checking for open positions for expert {expert_id}: {e}", exc_info=True)
+            return False  # Default to False if error occurs
 
 
 # Global worker queue instance
