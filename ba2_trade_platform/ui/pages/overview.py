@@ -290,7 +290,7 @@ class OverviewTab:
                                     if price_transactions:
                                         session.commit()
                             except Exception as pe:
-                                logger.debug(f"Could not sync current price for {symbol}: {pe}")
+                                logger.debug(f"Could not sync current price for {symbol}: {pe}", exc_info=True)
                         
                         # Get all open transactions for this account
                         # First, get all trading orders for this account to find their transaction IDs

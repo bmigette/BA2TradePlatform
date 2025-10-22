@@ -823,6 +823,58 @@ class AccountInterface(ExtendableSettingsInterface):
         """
         pass
 
+    def _update_broker_tp_order(self, tp_order: TradingOrder, new_tp_price: float) -> Any:
+        """
+        Update an already-submitted broker TP order with a new price.
+        
+        Called when a TP order is already OPEN at the broker (has broker_order_id) and 
+        needs to be updated to a new price. Override to implement broker-specific logic
+        like cancel+replace or direct order modification.
+        
+        Default implementation raises NotImplementedError - brokers must override if they
+        support updating live orders.
+        
+        Args:
+            tp_order: The TP order TradingOrder object (with broker_order_id set)
+            new_tp_price: The new take profit price
+            
+        Returns:
+            Any: Any broker-specific result (optional)
+            
+        Raises:
+            NotImplementedError: If broker doesn't support updating live orders
+        """
+        raise NotImplementedError(
+            f"Broker {self.__class__.__name__} does not support updating live TP orders. "
+            f"Must implement _update_broker_tp_order() to support manual TP/SL updates."
+        )
+
+    def _update_broker_sl_order(self, sl_order: TradingOrder, new_sl_price: float) -> Any:
+        """
+        Update an already-submitted broker SL order with a new price.
+        
+        Called when a SL order is already OPEN at the broker (has broker_order_id) and 
+        needs to be updated to a new price. Override to implement broker-specific logic
+        like cancel+replace or direct order modification.
+        
+        Default implementation raises NotImplementedError - brokers must override if they
+        support updating live orders.
+        
+        Args:
+            sl_order: The SL order TradingOrder object (with broker_order_id set)
+            new_sl_price: The new stop loss price
+            
+        Returns:
+            Any: Any broker-specific result (optional)
+            
+        Raises:
+            NotImplementedError: If broker doesn't support updating live orders
+        """
+        raise NotImplementedError(
+            f"Broker {self.__class__.__name__} does not support updating live SL orders. "
+            f"Must implement _update_broker_sl_order() to support manual TP/SL updates."
+        )
+
     def set_order_tp(self, trading_order: TradingOrder, tp_price: float) -> TradingOrder:
         """
         Set take profit for an existing order.
@@ -853,7 +905,7 @@ class AccountInterface(ExtendableSettingsInterface):
             # Enforce minimum TP percent based on open price
             # This is a safety check in case market price slipped after TradeAction was issued
             if trading_order.open_price:
-                from ..config import get_min_tp_sl_percent
+                from ...config import get_min_tp_sl_percent
                 min_tp_percent = get_min_tp_sl_percent()
                 
                 open_price = float(trading_order.open_price)
@@ -932,6 +984,21 @@ class AccountInterface(ExtendableSettingsInterface):
                     session.commit()
                     session.refresh(existing_tp_order)
                     tp_order = existing_tp_order
+                    
+                    # Check if the TP order is already submitted at broker (has broker_order_id and not in terminal state)
+                    # If so, we need to update the actual broker order, not just the database record
+                    if existing_tp_order.broker_order_id and existing_tp_order.status not in OrderStatus.get_terminal_statuses():
+                        logger.info(f"TP order {existing_tp_order.id} is active at broker with ID {existing_tp_order.broker_order_id} (status: {existing_tp_order.status.value}), calling broker update")
+                        # Call the broker-specific update method
+                        # Note: This may need to be implemented in broker-specific classes to cancel/replace
+                        try:
+                            self._update_broker_tp_order(existing_tp_order, tp_price)
+                        except NotImplementedError:
+                            logger.warning(f"Broker {self.__class__.__name__} does not support updating live TP orders - may need to cancel and replace")
+                        except Exception as e:
+                            logger.error(f"Error updating broker TP order: {e}", exc_info=True)
+                            raise
+                    
                     logger.info(f"Successfully updated TP order {tp_order.id} to ${tp_price}")
                 else:
                     # Create new TP order
@@ -952,15 +1019,18 @@ class AccountInterface(ExtendableSettingsInterface):
                             'tp_reference_price': round(trading_order.open_price, 2)
                         }
                     
+                    # Check if parent order is already FILLED - if so, submit TP immediately
+                    should_submit_immediately = (trading_order.status == OrderStatus.FILLED)
+                    
                     tp_order = TradingOrder(
                         account_id=self.id,
                         symbol=trading_order.symbol,
-                        quantity=0,  # Will be set when trigger is hit
+                        quantity=trading_order.quantity if should_submit_immediately else 0,  # Set quantity only if submitting
                         side=tp_side,
                         order_type=tp_order_type,
                         limit_price=tp_price,
                         transaction_id=trading_order.transaction_id,
-                        status=OrderStatus.WAITING_TRIGGER,
+                        status=OrderStatus.PENDING if should_submit_immediately else OrderStatus.WAITING_TRIGGER,
                         depends_on_order=trading_order.id,
                         depends_order_status_trigger=OrderStatus.FILLED,
                         expert_recommendation_id=trading_order.expert_recommendation_id,
@@ -973,7 +1043,21 @@ class AccountInterface(ExtendableSettingsInterface):
                     session.add(tp_order)
                     session.commit()
                     session.refresh(tp_order)
-                    logger.info(f"Created WAITING_TRIGGER TP order {tp_order.id} at ${tp_price} (will submit when order {trading_order.id} is FILLED)")
+                    
+                    if should_submit_immediately:
+                        logger.info(f"Created PENDING TP order {tp_order.id} at ${tp_price} - parent order {trading_order.id} already FILLED, will submit to broker now")
+                        # Submit immediately to broker
+                        session.close()
+                        try:
+                            result = self.submit_order(tp_order)
+                            logger.info(f"Successfully submitted TP order {tp_order.id} to broker (broker_order_id: {tp_order.broker_order_id})")
+                        except Exception as submit_error:
+                            logger.error(f"Error submitting TP order {tp_order.id} to broker: {submit_error}", exc_info=True)
+                            raise
+                        # Reopen session for return
+                        session = Session(get_db().bind)
+                    else:
+                        logger.info(f"Created WAITING_TRIGGER TP order {tp_order.id} at ${tp_price} (will submit when order {trading_order.id} is FILLED)")
             
             # Call broker-specific implementation (may be no-op for most brokers)
             self._set_order_tp_impl(trading_order, tp_price)
@@ -1014,7 +1098,7 @@ class AccountInterface(ExtendableSettingsInterface):
             # Enforce minimum SL percent based on open price
             # This is a safety check in case market price slipped after TradeAction was issued
             if trading_order.open_price:
-                from ..config import get_min_tp_sl_percent
+                from ...config import get_min_tp_sl_percent
                 min_tp_sl_percent = get_min_tp_sl_percent()
                 
                 open_price = float(trading_order.open_price)
@@ -1093,6 +1177,21 @@ class AccountInterface(ExtendableSettingsInterface):
                     session.commit()
                     session.refresh(existing_sl_order)
                     sl_order = existing_sl_order
+                    
+                    # Check if the SL order is already submitted at broker (has broker_order_id and not in terminal state)
+                    # If so, we need to update the actual broker order, not just the database record
+                    if existing_sl_order.broker_order_id and existing_sl_order.status not in OrderStatus.get_terminal_statuses():
+                        logger.info(f"SL order {existing_sl_order.id} is active at broker with ID {existing_sl_order.broker_order_id} (status: {existing_sl_order.status.value}), calling broker update")
+                        # Call the broker-specific update method
+                        # Note: This may need to be implemented in broker-specific classes to cancel/replace
+                        try:
+                            self._update_broker_sl_order(existing_sl_order, sl_price)
+                        except NotImplementedError:
+                            logger.warning(f"Broker {self.__class__.__name__} does not support updating live SL orders - may need to cancel and replace")
+                        except Exception as e:
+                            logger.error(f"Error updating broker SL order: {e}", exc_info=True)
+                            raise
+                    
                     logger.info(f"Successfully updated SL order {sl_order.id} to ${sl_price}")
                 else:
                     # Create new SL order
@@ -1113,15 +1212,18 @@ class AccountInterface(ExtendableSettingsInterface):
                             'sl_reference_price': round(trading_order.open_price, 2)
                         }
                     
+                    # Check if parent order is already FILLED - if so, submit SL immediately
+                    should_submit_immediately = (trading_order.status == OrderStatus.FILLED)
+                    
                     sl_order = TradingOrder(
                         account_id=self.id,
                         symbol=trading_order.symbol,
-                        quantity=0,  # Will be set when trigger is hit
+                        quantity=trading_order.quantity if should_submit_immediately else 0,  # Set quantity only if submitting
                         side=sl_side,
                         order_type=sl_order_type,
                         stop_price=sl_price,
                         transaction_id=trading_order.transaction_id,
-                        status=OrderStatus.WAITING_TRIGGER,
+                        status=OrderStatus.PENDING if should_submit_immediately else OrderStatus.WAITING_TRIGGER,
                         depends_on_order=trading_order.id,
                         depends_order_status_trigger=OrderStatus.FILLED,
                         expert_recommendation_id=trading_order.expert_recommendation_id,
@@ -1134,7 +1236,21 @@ class AccountInterface(ExtendableSettingsInterface):
                     session.add(sl_order)
                     session.commit()
                     session.refresh(sl_order)
-                    logger.info(f"Created WAITING_TRIGGER SL order {sl_order.id} at ${sl_price} (will submit when order {trading_order.id} is FILLED)")
+                    
+                    if should_submit_immediately:
+                        logger.info(f"Created PENDING SL order {sl_order.id} at ${sl_price} - parent order {trading_order.id} already FILLED, will submit to broker now")
+                        # Submit immediately to broker
+                        session.close()
+                        try:
+                            result = self.submit_order(sl_order)
+                            logger.info(f"Successfully submitted SL order {sl_order.id} to broker (broker_order_id: {sl_order.broker_order_id})")
+                        except Exception as submit_error:
+                            logger.error(f"Error submitting SL order {sl_order.id} to broker: {submit_error}", exc_info=True)
+                            raise
+                        # Reopen session for return
+                        session = Session(get_db().bind)
+                    else:
+                        logger.info(f"Created WAITING_TRIGGER SL order {sl_order.id} at ${sl_price} (will submit when order {trading_order.id} is FILLED)")
             
             # Call broker-specific implementation (may be no-op for most brokers)
             self._set_order_sl_impl(trading_order, sl_price)

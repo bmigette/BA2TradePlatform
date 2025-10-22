@@ -887,3 +887,81 @@ class AlpacaAccount(AccountInterface):
         """
         # No broker-specific operations needed - base class handles all SL logic
         pass
+
+    def _update_broker_tp_order(self, tp_order: TradingOrder, new_tp_price: float) -> None:
+        """
+        Update an already-submitted Alpaca TP order with a new price.
+        
+        Uses Alpaca's modify_order API to update the limit price directly without
+        canceling and recreating the order. This ensures continuity and maintains
+        the order ID at the broker.
+        
+        Args:
+            tp_order: The TP order TradingOrder object (with broker_order_id set)
+            new_tp_price: The new take profit price
+        """
+        try:
+            if not self.client:
+                raise ValueError("Alpaca client not initialized")
+            
+            if not tp_order.broker_order_id:
+                logger.warning(f"TP order {tp_order.id} has no broker_order_id, cannot update at Alpaca")
+                return
+            
+            # Modify the order at Alpaca with the new limit price
+            logger.info(
+                f"Modifying Alpaca TP order {tp_order.broker_order_id} (database ID: {tp_order.id}) "
+                f"from ${tp_order.limit_price:.2f} to ${new_tp_price:.2f}"
+            )
+            
+            modified_order = self.modify_order(tp_order.broker_order_id, {"limit_price": new_tp_price})
+            
+            logger.info(
+                f"Successfully modified Alpaca TP order {tp_order.broker_order_id} to new price ${new_tp_price:.2f}"
+            )
+            
+        except Exception as e:
+            logger.error(
+                f"Error updating broker TP order {tp_order.broker_order_id} from ${tp_order.limit_price:.2f} to ${new_tp_price:.2f}: {e}",
+                exc_info=True
+            )
+            raise
+
+    def _update_broker_sl_order(self, sl_order: TradingOrder, new_sl_price: float) -> None:
+        """
+        Update an already-submitted Alpaca SL order with a new price.
+        
+        Uses Alpaca's modify_order API to update the stop price directly without
+        canceling and recreating the order. This ensures continuity and maintains
+        the order ID at the broker.
+        
+        Args:
+            sl_order: The SL order TradingOrder object (with broker_order_id set)
+            new_sl_price: The new stop loss price
+        """
+        try:
+            if not self.client:
+                raise ValueError("Alpaca client not initialized")
+            
+            if not sl_order.broker_order_id:
+                logger.warning(f"SL order {sl_order.id} has no broker_order_id, cannot update at Alpaca")
+                return
+            
+            # Modify the order at Alpaca with the new stop price
+            logger.info(
+                f"Modifying Alpaca SL order {sl_order.broker_order_id} (database ID: {sl_order.id}) "
+                f"from ${sl_order.stop_price:.2f} to ${new_sl_price:.2f}"
+            )
+            
+            modified_order = self.modify_order(sl_order.broker_order_id, {"stop_price": new_sl_price})
+            
+            logger.info(
+                f"Successfully modified Alpaca SL order {sl_order.broker_order_id} to new price ${new_sl_price:.2f}"
+            )
+            
+        except Exception as e:
+            logger.error(
+                f"Error updating broker SL order {sl_order.broker_order_id} from ${sl_order.stop_price:.2f} to ${new_sl_price:.2f}: {e}",
+                exc_info=True
+            )
+            raise
