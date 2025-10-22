@@ -57,15 +57,15 @@ class SmartRiskManagerToolkit:
             
             # Get account info
             account_info = self.account.get_account_info()
-            virtual_equity = account_info.get("virtual_equity", 0.0)
-            available_balance = account_info.get("available_balance", 0.0)
+            virtual_equity = float(account_info.equity) if account_info else 0.0
+            available_balance = float(account_info.cash) if account_info else 0.0
             
-            # Get open transactions
+            # Get open transactions (transactions are per expert, not per account)
             with get_db() as session:
                 transactions = session.exec(
                     select(Transaction)
-                    .where(Transaction.account_id == self.account_id)
-                    .where(Transaction.status == TransactionStatus.OPEN)
+                    .where(Transaction.expert_id == self.expert_instance_id)
+                    .where(Transaction.status == TransactionStatus.OPENED)
                 ).all()
                 
                 open_positions = []
@@ -79,16 +79,29 @@ class SmartRiskManagerToolkit:
                         current_price = self.account.get_instrument_current_price(trans.symbol)
                     except Exception as e:
                         logger.error(f"Failed to get current price for {trans.symbol}: {e}")
-                        current_price = trans.entry_price  # Fallback
+                        current_price = trans.open_price  # Fallback
+                    
+                    # Get actual quantity from filled orders
+                    quantity = trans.get_current_open_qty()
+                    
+                    # Infer direction from first order
+                    direction = None
+                    if trans.trading_orders:
+                        first_order = sorted(trans.trading_orders, key=lambda o: o.created_at)[0]
+                        direction = first_order.side
+                    
+                    if not direction or not trans.open_price or quantity == 0:
+                        logger.warning(f"Skipping transaction {trans.id} - missing direction or price or zero quantity")
+                        continue
                     
                     # Calculate P&L
-                    if trans.direction == OrderDirection.BUY:
-                        unrealized_pnl = (current_price - trans.entry_price) * trans.quantity
+                    if direction == OrderDirection.BUY:
+                        unrealized_pnl = (current_price - trans.open_price) * quantity
                     else:  # SELL
-                        unrealized_pnl = (trans.entry_price - current_price) * trans.quantity
+                        unrealized_pnl = (trans.open_price - current_price) * quantity
                     
-                    unrealized_pnl_pct = (unrealized_pnl / (trans.entry_price * trans.quantity)) * 100 if trans.entry_price > 0 else 0.0
-                    position_value = current_price * trans.quantity
+                    unrealized_pnl_pct = (unrealized_pnl / (trans.open_price * quantity)) * 100 if trans.open_price > 0 else 0.0
+                    position_value = current_price * quantity
                     
                     # Get TP/SL orders
                     tp_order = session.exec(
@@ -108,9 +121,9 @@ class SmartRiskManagerToolkit:
                     position_data = {
                         "transaction_id": trans.id,
                         "symbol": trans.symbol,
-                        "direction": trans.direction.value,
-                        "quantity": trans.quantity,
-                        "entry_price": trans.entry_price,
+                        "direction": direction.value,
+                        "quantity": quantity,
+                        "entry_price": trans.open_price,
                         "current_price": current_price,
                         "unrealized_pnl": round(unrealized_pnl, 2),
                         "unrealized_pnl_pct": round(unrealized_pnl_pct, 2),
@@ -181,11 +194,11 @@ class SmartRiskManagerToolkit:
                 if symbol:
                     symbols = [symbol]
                 else:
-                    # Get all symbols from open positions
+                    # Get all symbols from open positions (transactions are per expert)
                     transactions = session.exec(
                         select(Transaction.symbol)
-                        .where(Transaction.account_id == self.account_id)
-                        .where(Transaction.status == TransactionStatus.OPEN)
+                        .where(Transaction.expert_id == self.expert_instance_id)
+                        .where(Transaction.status == TransactionStatus.OPENED)
                         .distinct()
                     ).all()
                     symbols = list(transactions)
@@ -194,19 +207,21 @@ class SmartRiskManagerToolkit:
                     logger.debug("No symbols to query")
                     return []
                 
-                # Query market analyses
+                # Query market analyses (use created_at, not analysis_timestamp)
                 cutoff_time = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
                 
                 analyses = session.exec(
                     select(MarketAnalysis)
                     .where(MarketAnalysis.symbol.in_(symbols))
-                    .where(MarketAnalysis.analysis_timestamp >= cutoff_time)
-                    .order_by(MarketAnalysis.analysis_timestamp.desc())
+                    .where(MarketAnalysis.created_at >= cutoff_time)
+                    .order_by(MarketAnalysis.created_at.desc())
                 ).all()
                 
                 results = []
                 for analysis in analyses:
-                    age_hours = (datetime.now(timezone.utc) - analysis.analysis_timestamp).total_seconds() / 3600
+                    # Handle timezone-naive datetime
+                    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+                    age_hours = (now_utc - analysis.created_at).total_seconds() / 3600
                     
                     # Get expert to call get_analysis_summary
                     try:
@@ -219,12 +234,21 @@ class SmartRiskManagerToolkit:
                         logger.error(f"Failed to get summary for analysis {analysis.id}: {e}")
                         summary = f"Analysis for {analysis.symbol} (summary unavailable)"
                     
+                    # Get expert name from ExpertInstance
+                    expert_name = "Unknown"
+                    try:
+                        expert_instance = session.get(ExpertInstance, analysis.expert_instance_id)
+                        if expert_instance:
+                            expert_name = expert_instance.expert
+                    except Exception:
+                        pass
+                    
                     results.append({
                         "analysis_id": analysis.id,
                         "symbol": analysis.symbol,
-                        "timestamp": analysis.analysis_timestamp.isoformat(),
+                        "timestamp": analysis.created_at.isoformat(),
                         "age_hours": round(age_hours, 1),
-                        "expert_name": analysis.expert,
+                        "expert_name": expert_name,
                         "expert_instance_id": analysis.expert_instance_id,
                         "status": analysis.status.value if hasattr(analysis.status, 'value') else str(analysis.status),
                         "summary": summary
@@ -333,14 +357,16 @@ class SmartRiskManagerToolkit:
                 analyses = session.exec(
                     select(MarketAnalysis)
                     .where(MarketAnalysis.symbol == symbol)
-                    .order_by(MarketAnalysis.analysis_timestamp.desc())
+                    .order_by(MarketAnalysis.created_at.desc())
                     .offset(offset)
                     .limit(limit)
                 ).all()
                 
                 results = []
                 for analysis in analyses:
-                    age_hours = (datetime.now(timezone.utc) - analysis.analysis_timestamp).total_seconds() / 3600
+                    # Handle timezone-naive datetime
+                    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+                    age_hours = (now_utc - analysis.created_at).total_seconds() / 3600
                     
                     # Get summary
                     try:
@@ -353,12 +379,21 @@ class SmartRiskManagerToolkit:
                         logger.error(f"Failed to get summary for analysis {analysis.id}: {e}")
                         summary = f"Analysis for {analysis.symbol} (summary unavailable)"
                     
+                    # Get expert name from ExpertInstance
+                    expert_name = "Unknown"
+                    try:
+                        expert_instance = session.get(ExpertInstance, analysis.expert_instance_id)
+                        if expert_instance:
+                            expert_name = expert_instance.expert
+                    except Exception:
+                        pass
+                    
                     results.append({
                         "analysis_id": analysis.id,
                         "symbol": analysis.symbol,
-                        "timestamp": analysis.analysis_timestamp.isoformat(),
+                        "timestamp": analysis.created_at.isoformat(),
                         "age_hours": round(age_hours, 1),
-                        "expert_name": analysis.expert,
+                        "expert_name": expert_name,
                         "expert_instance_id": analysis.expert_instance_id,
                         "status": analysis.status.value if hasattr(analysis.status, 'value') else str(analysis.status),
                         "summary": summary
