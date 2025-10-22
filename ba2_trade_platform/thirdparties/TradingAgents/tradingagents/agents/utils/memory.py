@@ -166,14 +166,14 @@ class FinancialSituationMemory:
             ids=ids,
         )
 
-    def get_memories(self, current_situation, n_matches=1, aggregate_chunks=True):
+    def get_memories(self, current_situation, n_matches=1, aggregate_chunks=False):
         """Find matching recommendations using OpenAI embeddings
         
         Args:
             current_situation (str): The current financial situation to match
             n_matches (int): Number of matches to return per chunk (default: 1)
-            aggregate_chunks (bool): If True, averages chunk embeddings before querying.
-                                    If False, queries with each chunk separately and merges results.
+            aggregate_chunks (bool): If True, averages chunk embeddings before querying (faster but less accurate).
+                                    If False, queries with each chunk separately and merges results (default, more accurate).
         
         Returns:
             list: List of matched results with similarity scores

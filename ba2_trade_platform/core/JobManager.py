@@ -663,6 +663,13 @@ class JobManager:
                 return
             
             # Regular symbol processing
+            # For ENTER_MARKET analysis, skip if existing transactions exist for this expert and symbol
+            if subtype == AnalysisUseCase.ENTER_MARKET:
+                from .utils import has_existing_transactions_for_expert_and_symbol
+                if has_existing_transactions_for_expert_and_symbol(expert_instance_id, symbol):
+                    logger.info(f"Skipping ENTER_MARKET analysis for expert {expert_instance_id}, symbol {symbol}: existing transactions found (OPENED or WAITING)")
+                    return
+            
             # For OPEN_POSITIONS analysis, only proceed if there are actual open transactions for this symbol
             if subtype == AnalysisUseCase.OPEN_POSITIONS:
                 if not self._has_open_transactions_for_symbol(expert_instance_id, symbol):

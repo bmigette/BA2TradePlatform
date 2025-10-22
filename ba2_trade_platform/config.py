@@ -90,6 +90,32 @@ def get_app_setting(key: str, default: Optional[str] = None) -> Optional[str]:
         return default
 
 
+def get_min_tp_sl_percent() -> float:
+    """
+    Get the minimum TP/SL percent setting from the database.
+    
+    This setting ensures that even when TP/SL is calculated from current market price,
+    if prices slip overnight, the TP/SL will be enforced to maintain at least this
+    percent above the order's open price.
+    
+    Returns:
+        float: Minimum TP/SL percent (default 3.0 if not configured)
+    
+    Example:
+        >>> min_percent = get_min_tp_sl_percent()  # Returns 3.0 or configured value
+        >>> print(f"Minimum TP/SL: {min_percent}%")
+    """
+    try:
+        value_str = get_app_setting('min_tp_sl_percent')
+        if value_str:
+            return float(value_str)
+    except (ValueError, TypeError):
+        pass
+    
+    # Default to 3.0 if not set or invalid
+    return 3.0
+
+
 def set_app_setting(key: str, value: str) -> None:
     """
     Set an application setting in the database.

@@ -14,7 +14,7 @@ def create_trader(llm, memory):
         fundamentals_report = state["fundamentals_report"]
 
         curr_situation = f"{market_research_report}\n\n{sentiment_report}\n\n{news_report}\n\n{fundamentals_report}"
-        past_memories = memory.get_memories(curr_situation, n_matches=2)
+        past_memories = memory.get_memories(curr_situation, n_matches=2, aggregate_chunks=False)
 
         past_memory_str = ""
         if past_memories:

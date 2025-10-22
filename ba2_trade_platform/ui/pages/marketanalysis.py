@@ -23,6 +23,13 @@ class JobMonitoringTab:
         self.analysis_table = None
         self.refresh_timer = None
         self.pagination_container = None  # Container for pagination controls
+        # Queue status labels for live updates
+        self.queue_status_labels = {
+            'worker_count': None,
+            'running_tasks': None,
+            'pending_tasks': None,
+            'total_tasks': None
+        }
         # Pagination and filtering state
         self.current_page = 1
         self.page_size = 25
@@ -30,6 +37,8 @@ class JobMonitoringTab:
         self.total_records = 0
         self.status_filter = 'all'
         self.expert_filter = 'all'  # Filter by expert
+        self.type_filter = 'all'  # Filter by analysis type (ENTER_MARKET or OPEN_POSITIONS)
+        self.recommendation_filter = 'all'  # Filter by recommendation (BUY, SELL, HOLD)
         self.render()
     
     def _get_worker_queue(self):
@@ -69,6 +78,33 @@ class JobMonitoringTab:
                         label='Expert Filter'
                     ).classes('w-48')
                     self.expert_select.on_value_change(self._on_expert_filter_change)
+                    
+                    # Type filter (ENTER_MARKET vs OPEN_POSITIONS)
+                    type_options = {
+                        'all': 'All Types',
+                        'enter_market': '📊 Enter Market',
+                        'open_positions': '📈 Open Positions'
+                    }
+                    self.type_select = ui.select(
+                        options=type_options,
+                        value='all',
+                        label='Analysis Type'
+                    ).classes('w-40')
+                    self.type_select.on_value_change(self._on_type_filter_change)
+                    
+                    # Recommendation filter (BUY, SELL, HOLD)
+                    recommendation_options = {
+                        'all': 'All Actions',
+                        'BUY': '📈 BUY',
+                        'SELL': '📉 SELL',
+                        'HOLD': '⏸️ HOLD'
+                    }
+                    self.recommendation_select = ui.select(
+                        options=recommendation_options,
+                        value='all',
+                        label='Recommendation'
+                    ).classes('w-40')
+                    self.recommendation_select.on_value_change(self._on_recommendation_filter_change)
                     
                     # Symbol filter
                     self.symbol_input = ui.input(
@@ -179,19 +215,19 @@ class JobMonitoringTab:
             self.analysis_table.on('rerun_analysis', self.rerun_analysis)
 
     def _create_queue_status(self):
-        """Create worker queue status display."""
+        """Create worker queue status display with live-updating labels."""
         queue_info = self._get_queue_info()
         
         with ui.row().classes('w-full'):
             with ui.card().classes('flex-1'):
                 ui.label('Worker Status')
-                ui.label(f"Workers: {queue_info['worker_count']}")
-                ui.label(f"Running: {queue_info['running_tasks']}")
+                self.queue_status_labels['worker_count'] = ui.label(f"Workers: {queue_info['worker_count']}")
+                self.queue_status_labels['running_tasks'] = ui.label(f"Running: {queue_info['running_tasks']}")
                 
             with ui.card().classes('flex-1'):
                 ui.label('Queue Status')
-                ui.label(f"Pending: {queue_info['pending_tasks']}")
-                ui.label(f"Total Tasks: {queue_info['total_tasks']}")
+                self.queue_status_labels['pending_tasks'] = ui.label(f"Pending: {queue_info['pending_tasks']}")
+                self.queue_status_labels['total_tasks'] = ui.label(f"Total Tasks: {queue_info['total_tasks']}")
 
     def _get_analysis_data(self) -> tuple[List[dict], int]:
         """Get analysis jobs data for the table with pagination and filtering."""
@@ -207,13 +243,41 @@ class JobMonitoringTab:
                 # Apply expert filter
                 if self.expert_filter != 'all':
                     statement = statement.where(MarketAnalysis.expert_instance_id == int(self.expert_filter))
+                
+                # Apply analysis type filter (ENTER_MARKET vs OPEN_POSITIONS)
+                if self.type_filter != 'all':
+                    from ...core.types import AnalysisUseCase
+                    if self.type_filter == 'enter_market':
+                        statement = statement.where(MarketAnalysis.subtype == AnalysisUseCase.ENTER_MARKET)
+                    elif self.type_filter == 'open_positions':
+                        statement = statement.where(MarketAnalysis.subtype == AnalysisUseCase.OPEN_POSITIONS)
+                
+                # Apply recommendation filter (BUY, SELL, HOLD) - filter analyses that have at least one recommendation matching the filter
+                if self.recommendation_filter != 'all':
+                    from ...core.types import OrderRecommendation
+                    # Only include analyses that have recommendations with the selected action
+                    from sqlmodel import and_
+                    statement = statement.join(ExpertRecommendation).where(
+                        ExpertRecommendation.recommended_action == OrderRecommendation[self.recommendation_filter]
+                    ).distinct()
           
                 # Get total count for pagination
-                count_statement = select(func.count(MarketAnalysis.id))
+                count_statement = select(func.count(MarketAnalysis.id).distinct())
                 if self.status_filter != 'all':
                     count_statement = count_statement.where(MarketAnalysis.status == MarketAnalysisStatus(self.status_filter))
                 if self.expert_filter != 'all':
                     count_statement = count_statement.where(MarketAnalysis.expert_instance_id == int(self.expert_filter))
+                if self.type_filter != 'all':
+                    from ...core.types import AnalysisUseCase
+                    if self.type_filter == 'enter_market':
+                        count_statement = count_statement.where(MarketAnalysis.subtype == AnalysisUseCase.ENTER_MARKET)
+                    elif self.type_filter == 'open_positions':
+                        count_statement = count_statement.where(MarketAnalysis.subtype == AnalysisUseCase.OPEN_POSITIONS)
+                if self.recommendation_filter != 'all':
+                    from ...core.types import OrderRecommendation
+                    count_statement = count_statement.join(ExpertRecommendation).where(
+                        ExpertRecommendation.recommended_action == OrderRecommendation[self.recommendation_filter]
+                    ).distinct()
  
                 total_count = session.exec(count_statement).first() or 0
                 
@@ -461,16 +525,34 @@ class JobMonitoringTab:
         self.expert_filter = event.value
         self.current_page = 1  # Reset to first page when filtering
         self.refresh_data()
+    
+    def _on_type_filter_change(self, event):
+        """Handle analysis type filter change."""
+        self.type_filter = event.value
+        self.current_page = 1  # Reset to first page when filtering
+        self.refresh_data()
+    
+    def _on_recommendation_filter_change(self, event):
+        """Handle recommendation filter change."""
+        self.recommendation_filter = event.value
+        self.current_page = 1  # Reset to first page when filtering
+        self.refresh_data()
 
     def _clear_filters(self):
         """Clear all filters."""
         self.status_filter = 'all'
         self.expert_filter = 'all'
+        self.type_filter = 'all'
+        self.recommendation_filter = 'all'
         self.current_page = 1
         if hasattr(self, 'status_select'):
             self.status_select.value = 'all'
         if hasattr(self, 'expert_select'):
             self.expert_select.value = 'all'
+        if hasattr(self, 'type_select'):
+            self.type_select.value = 'all'
+        if hasattr(self, 'recommendation_select'):
+            self.recommendation_select.value = 'all'
         if hasattr(self, 'symbol_input'):
             self.symbol_input.value = ''
         self.refresh_data()
@@ -533,6 +615,23 @@ class JobMonitoringTab:
                 'pending_tasks': 0,
                 'total_tasks': 0
             }
+
+    def _update_queue_status_display(self):
+        """Update the queue status display labels with current queue info."""
+        try:
+            queue_info = self._get_queue_info()
+            
+            # Update labels if they exist (they are created in _create_queue_status)
+            if self.queue_status_labels['worker_count']:
+                self.queue_status_labels['worker_count'].set_text(f"Workers: {queue_info['worker_count']}")
+            if self.queue_status_labels['running_tasks']:
+                self.queue_status_labels['running_tasks'].set_text(f"Running: {queue_info['running_tasks']}")
+            if self.queue_status_labels['pending_tasks']:
+                self.queue_status_labels['pending_tasks'].set_text(f"Pending: {queue_info['pending_tasks']}")
+            if self.queue_status_labels['total_tasks']:
+                self.queue_status_labels['total_tasks'].set_text(f"Total Tasks: {queue_info['total_tasks']}")
+        except Exception as e:
+            logger.error(f"Error updating queue status display: {e}", exc_info=True)
 
     def cancel_analysis(self, event_data):
         """Cancel an analysis job."""
@@ -736,6 +835,9 @@ class JobMonitoringTab:
                 
                 # Re-create pagination controls to update button states
                 self._create_pagination_controls()
+            
+            # Update worker queue status display
+            self._update_queue_status_display()
             
             #logger.debug("Job monitoring data refreshed")
             

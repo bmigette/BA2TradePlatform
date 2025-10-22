@@ -1384,6 +1384,183 @@ class TradeManager:
                 'errors': [str(e)]
             }
 
+    def process_open_positions_recommendations(self, expert_instance_id: int, lookback_days: int = 1) -> List[TradingOrder]:
+        """
+        Process expert recommendations for OPEN_POSITIONS analysis.
+        
+        This function evaluates recommendations against the open_positions ruleset
+        and executes resulting trade actions (if automated trading is enabled).
+        
+        For OPEN_POSITIONS:
+        - Process recommendations for symbols with existing positions
+        - Use open_positions_ruleset_id instead of enter_market_ruleset_id
+        - Consider all action types (CLOSE, SELL, BUY, HOLD)
+        - Load existing transactions for each symbol
+        
+        Args:
+            expert_instance_id: The expert instance ID to process recommendations for
+            lookback_days: Number of days to look back for recommendations (default: 1)
+            
+        Returns:
+            List of TradingOrder objects that were created
+        """
+        # Use open_positions as the use case for this method
+        lock_key = f"expert_{expert_instance_id}_usecase_open_positions"
+        
+        # Get or create a lock for this expert/use_case combination
+        with self._locks_dict_lock:
+            if lock_key not in self._processing_locks:
+                self._processing_locks[lock_key] = threading.Lock()
+            processing_lock = self._processing_locks[lock_key]
+        
+        # Try to acquire the lock with a very short timeout (0.5 seconds)
+        lock_acquired = processing_lock.acquire(blocking=True, timeout=0.5)
+        
+        if not lock_acquired:
+            self.logger.info(f"Could not acquire lock for expert {expert_instance_id} (open_positions) - another thread is already processing. Skipping.")
+            return []
+        
+        created_orders = []
+        
+        try:
+            self.logger.debug(f"Acquired processing lock for expert {expert_instance_id} (open_positions)")
+            
+            from sqlmodel import select, Session
+            from .db import get_db
+            from .models import Transaction, AccountDefinition, ExpertInstance
+            from .types import AnalysisUseCase, TransactionStatus
+            from .utils import get_expert_instance_from_id
+            from datetime import timedelta
+            from .TradeActionEvaluator import TradeActionEvaluator
+            from ..modules.accounts import get_account_class
+            
+            # Get the expert instance (with loaded settings)
+            expert = get_expert_instance_from_id(expert_instance_id)
+            if not expert:
+                self.logger.error(f"Expert instance {expert_instance_id} not found", exc_info=True)
+                return created_orders
+            
+            # Get the expert instance model (for ruleset IDs)
+            expert_instance = get_instance(ExpertInstance, expert_instance_id)
+            if not expert_instance:
+                self.logger.error(f"Expert instance model {expert_instance_id} not found", exc_info=True)
+                return created_orders
+            
+            # Check if "Allow automated trade modification" is enabled
+            allow_automated_trade_modification = expert.settings.get('allow_automated_trade_modification', False)
+            if not allow_automated_trade_modification:
+                self.logger.debug(f"Automated trade modification disabled for expert {expert_instance_id}, skipping recommendation processing")
+                return created_orders
+            
+            # Check if there's an open_positions ruleset configured
+            if not expert_instance.open_positions_ruleset_id:
+                self.logger.debug(f"No open_positions ruleset configured for expert {expert_instance_id}, skipping automated trade modification")
+                return created_orders
+            
+            # Get the account instance for this expert
+            account_def = get_instance(AccountDefinition, expert_instance.account_id)
+            if not account_def:
+                self.logger.error(f"Account definition {expert_instance.account_id} not found", exc_info=True)
+                return created_orders
+                
+            account_class = get_account_class(account_def.provider)
+            if not account_class:
+                self.logger.error(f"Account provider {account_def.provider} not found", exc_info=True)
+                return created_orders
+                
+            account = account_class(account_def.id)
+            
+            # Get recent recommendations based on lookback_days parameter
+            cutoff_time = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+            
+            with Session(get_db().bind) as session:
+                # Get all recommendations for this expert instance within the time window
+                statement = select(ExpertRecommendation).where(
+                    ExpertRecommendation.instance_id == expert_instance_id,
+                    ExpertRecommendation.created_at >= cutoff_time
+                ).order_by(ExpertRecommendation.created_at.desc())
+                
+                all_recommendations = session.exec(statement).all()
+                
+                if not all_recommendations:
+                    self.logger.info(f"No recommendations found for expert {expert_instance_id}")
+                    return created_orders
+                
+                # Filter to get only the latest recommendation per instrument
+                latest_per_instrument = {}
+                for rec in all_recommendations:
+                    if rec.symbol not in latest_per_instrument:
+                        latest_per_instrument[rec.symbol] = rec
+                
+                # Convert to list
+                recommendations = list(latest_per_instrument.values())
+                
+                self.logger.info(f"Found {len(recommendations)} unique instruments with open_positions recommendations for expert {expert_instance_id} (filtered from {len(all_recommendations)} total recommendations)")
+                self.logger.info(f"Evaluating recommendations through open_positions ruleset: {expert_instance.open_positions_ruleset_id}")
+                
+                # Process each recommendation through the open_positions ruleset
+                for recommendation in recommendations:
+                    try:
+                        # Check if this symbol has existing transactions
+                        statement = select(Transaction).where(
+                            Transaction.symbol == recommendation.symbol,
+                            Transaction.status.in_([TransactionStatus.WAITING, TransactionStatus.OPENED])
+                        )
+                        existing_transactions = session.exec(statement).all()
+                        
+                        if not existing_transactions:
+                            self.logger.debug(f"No existing transactions for {recommendation.symbol}, skipping recommendation {recommendation.id}")
+                            continue
+                        
+                        # Create TradeActionEvaluator with existing transactions for open_positions use case
+                        evaluator = TradeActionEvaluator(
+                            account=account,
+                            instrument_name=recommendation.symbol,
+                            existing_transactions=existing_transactions
+                        )
+                        
+                        # Evaluate recommendation through the open_positions ruleset
+                        self.logger.debug(f"Evaluating recommendation {recommendation.id} for {recommendation.symbol} (open_positions)")
+                        
+                        action_summaries = evaluator.evaluate(
+                            instrument_name=recommendation.symbol,
+                            expert_recommendation=recommendation,
+                            ruleset_id=expert_instance.open_positions_ruleset_id,
+                            existing_order=None
+                        )
+                        
+                        # Check if evaluation produced any actions
+                        if not action_summaries:
+                            self.logger.debug(f"Recommendation {recommendation.id} for {recommendation.symbol} - no actions to execute (conditions not met)")
+                        else:
+                            self.logger.info(f"Recommendation {recommendation.id} for {recommendation.symbol} passed ruleset - {len(action_summaries)} action(s) to execute")
+                            
+                            # Execute the actions with submit_to_broker flag set based on permission setting
+                            try:
+                                execution_results = evaluator.execute(submit_to_broker=allow_automated_trade_modification)
+                                if execution_results:
+                                    created_count = sum(1 for r in execution_results if r.get('success'))
+                                    pending_count = sum(1 for r in execution_results if not allow_automated_trade_modification and r.get('success'))
+                                    if allow_automated_trade_modification:
+                                        self.logger.info(f"Executed {created_count} action(s) for {recommendation.symbol}")
+                                    else:
+                                        self.logger.info(f"Created {created_count} pending action(s) for {recommendation.symbol} (awaiting manual review)")
+                                    created_orders.extend(execution_results)
+                                else:
+                                    self.logger.debug(f"No orders created from actions for {recommendation.symbol}")
+                            except Exception as e:
+                                self.logger.error(f"Error executing actions for recommendation {recommendation.id}: {e}", exc_info=True)
+                        
+                    except Exception as e:
+                        self.logger.error(f"Error evaluating open_positions recommendation {recommendation.id}: {e}", exc_info=True)
+                
+                return created_orders
+                
+        finally:
+            # Release the lock
+            processing_lock.release()
+            self.logger.debug(f"Released processing lock for expert {expert_instance_id} (open_positions)")
+
 
 # Global trade manager instance
 _trade_manager = None

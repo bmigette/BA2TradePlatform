@@ -12,8 +12,9 @@ import time
 from typing import Callable, Any, Optional, Dict, Set
 from dataclasses import dataclass
 from enum import Enum
+from sqlmodel import Session
 from ..logger import logger
-from .db import get_setting, add_instance, update_instance
+from .db import get_setting, add_instance, update_instance, get_db
 from .models import AppSetting
 from .types import WorkerTaskStatus, AnalysisUseCase
 
@@ -316,6 +317,37 @@ class WorkerQueue:
                     logger.info(f"Analysis task for expert {expert_instance_id}, symbol {symbol} cancelled")
                     return True, "Task cancelled successfully"
         
+        # Task not found - update MarketAnalysis to FAILED if it exists
+        try:
+            from .db import get_instance, update_instance
+            from .models import MarketAnalysis
+            from .types import MarketAnalysisStatus
+            
+            # Try to find MarketAnalysis by expert_instance_id and symbol
+            with Session(get_db().bind) as session:
+                from sqlmodel import select
+                statement = select(MarketAnalysis).where(
+                    MarketAnalysis.expert_instance_id == expert_instance_id,
+                    MarketAnalysis.symbol == symbol,
+                    MarketAnalysis.status.in_([
+                        MarketAnalysisStatus.PENDING,
+                        MarketAnalysisStatus.RUNNING
+                    ])
+                ).order_by(MarketAnalysis.id.desc()).limit(1)
+                
+                market_analysis = session.exec(statement).first()
+                if market_analysis:
+                    market_analysis.status = MarketAnalysisStatus.FAILED
+                    if market_analysis.state is None:
+                        market_analysis.state = {}
+                    market_analysis.state["cancelled"] = True
+                    market_analysis.state["cancel_reason"] = "Task not found in queue (may have already started or completed)"
+                    session.add(market_analysis)
+                    session.commit()
+                    logger.info(f"Updated MarketAnalysis to FAILED for expert {expert_instance_id}, symbol {symbol} (task not found)")
+        except Exception as e:
+            logger.error(f"Error updating MarketAnalysis to FAILED for expert {expert_instance_id}, symbol {symbol}: {e}", exc_info=True)
+        
         return False, "Task not found in queue - it may have already started or completed"
     
     def cancel_analysis_by_market_analysis_id(self, market_analysis_id: int) -> tuple[bool, str]:
@@ -353,6 +385,25 @@ class WorkerQueue:
                     
                     logger.info(f"Analysis task with market_analysis_id {market_analysis_id} cancelled")
                     return True, "Task cancelled successfully"
+        
+        # Task not found - update MarketAnalysis to FAILED if it exists
+        try:
+            from .db import get_instance, update_instance
+            from .models import MarketAnalysis
+            from .types import MarketAnalysisStatus
+            
+            market_analysis = get_instance(MarketAnalysis, market_analysis_id)
+            if market_analysis:
+                if market_analysis.status not in [MarketAnalysisStatus.FAILED, MarketAnalysisStatus.COMPLETED]:
+                    market_analysis.status = MarketAnalysisStatus.FAILED
+                    if market_analysis.state is None:
+                        market_analysis.state = {}
+                    market_analysis.state["cancelled"] = True
+                    market_analysis.state["cancel_reason"] = "Task not found in queue (may have already started or completed)"
+                    update_instance(market_analysis)
+                    logger.info(f"Updated MarketAnalysis {market_analysis_id} to FAILED (task not found)")
+        except Exception as e:
+            logger.error(f"Error updating MarketAnalysis {market_analysis_id} to FAILED: {e}", exc_info=True)
         
         return False, "Task not found in queue - it may have already started or completed"
         
@@ -602,10 +653,12 @@ class WorkerQueue:
             execution_time = task.completed_at - task.started_at
             logger.debug(f"Analysis task '{task.id}' completed successfully in {execution_time:.2f}s")
             
-            # Check if this was the last ENTER_MARKET analysis task for this expert
+            # Check if all analysis tasks are completed for this expert
             # If so, trigger automated order processing
             if task.subtype == AnalysisUseCase.ENTER_MARKET:
-                self._check_and_process_expert_recommendations(task.expert_instance_id)
+                self._check_and_process_expert_recommendations(task.expert_instance_id, AnalysisUseCase.ENTER_MARKET)
+            elif task.subtype == AnalysisUseCase.OPEN_POSITIONS:
+                self._check_and_process_expert_recommendations(task.expert_instance_id, AnalysisUseCase.OPEN_POSITIONS)
             
         except Exception as e:
             # Update task with failure
@@ -625,22 +678,23 @@ class WorkerQueue:
                     if task_key in self._task_keys and self._task_keys[task_key] == task.id:
                         del self._task_keys[task_key]
     
-    def _check_and_process_expert_recommendations(self, expert_instance_id: int) -> None:
+    def _check_and_process_expert_recommendations(self, expert_instance_id: int, use_case: AnalysisUseCase = AnalysisUseCase.ENTER_MARKET) -> None:
         """
-        Check if there are any pending ENTER_MARKET analysis tasks for an expert.
+        Check if there are any pending analysis tasks for an expert.
         If not, trigger automated order processing via TradeManager.
         
         Args:
             expert_instance_id: The expert instance ID to check
+            use_case: The analysis use case (ENTER_MARKET or OPEN_POSITIONS)
         """
         try:
-            # Check if there are any pending ENTER_MARKET tasks for this expert
-            # If not, trigger automated order processing
+            # Check if there are any pending tasks for this expert
             # Use lock to prevent race condition when multiple jobs complete simultaneously
             with self._risk_manager_lock:
                 # Check if this expert is already being processed by another thread
-                if expert_instance_id in self._processing_experts:
-                    logger.debug(f"Expert {expert_instance_id} is already being processed for risk management, skipping")
+                lock_key = f"expert_{expert_instance_id}_{use_case.value}"
+                if lock_key in self._processing_experts:
+                    logger.debug(f"Expert {expert_instance_id} ({use_case.value}) is already being processed, skipping")
                     return
                 
                 # Check for pending tasks
@@ -648,35 +702,42 @@ class WorkerQueue:
                 with self._task_lock:
                     for task in self._tasks.values():
                         if (task.expert_instance_id == expert_instance_id and
-                            task.subtype == AnalysisUseCase.ENTER_MARKET and
+                            task.subtype == use_case and
                             task.status in [WorkerTaskStatus.PENDING, WorkerTaskStatus.RUNNING]):
                             has_pending = True
                             break
                 
                 if not has_pending:
                     # Mark this expert as being processed
-                    self._processing_experts.add(expert_instance_id)
+                    self._processing_experts.add(lock_key)
                     
                     try:
-                        logger.info(f"All ENTER_MARKET analysis tasks completed for expert {expert_instance_id}, triggering automated order processing")
+                        logger.info(f"All {use_case.value} analysis tasks completed for expert {expert_instance_id}, triggering automated processing")
                         
                         # Import TradeManager and process recommendations
                         from .TradeManager import get_trade_manager
                         trade_manager = get_trade_manager()
-                        created_orders = trade_manager.process_expert_recommendations_after_analysis(expert_instance_id)
+                        
+                        if use_case == AnalysisUseCase.ENTER_MARKET:
+                            created_orders = trade_manager.process_expert_recommendations_after_analysis(expert_instance_id)
+                        elif use_case == AnalysisUseCase.OPEN_POSITIONS:
+                            created_orders = trade_manager.process_open_positions_recommendations(expert_instance_id)
+                        else:
+                            logger.error(f"Unknown use case: {use_case}")
+                            return
                         
                         if created_orders:
-                            logger.info(f"Automated order processing created {len(created_orders)} orders for expert {expert_instance_id}")
+                            logger.info(f"Automated processing created {len(created_orders)} orders for expert {expert_instance_id}")
                         else:
                             logger.debug(f"No orders created by automated processing for expert {expert_instance_id}")
                     finally:
                         # Always remove from processing set, even if an error occurred
-                        self._processing_experts.discard(expert_instance_id)
+                        self._processing_experts.discard(lock_key)
                 else:
-                    logger.debug(f"Still has pending ENTER_MARKET tasks for expert {expert_instance_id}, skipping automated order processing")
+                    logger.debug(f"Still has pending {use_case.value} tasks for expert {expert_instance_id}, skipping automated processing")
                 
         except Exception as e:
-            logger.error(f"Error checking and processing expert recommendations for expert {expert_instance_id}: {e}", exc_info=True)
+            logger.error(f"Error checking and processing recommendations for expert {expert_instance_id} ({use_case.value}): {e}", exc_info=True)
     
     def has_existing_transactions(self, expert_id: int, symbol: str) -> bool:
         """

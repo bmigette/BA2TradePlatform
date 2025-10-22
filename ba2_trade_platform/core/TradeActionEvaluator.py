@@ -51,6 +51,8 @@ class TradeActionEvaluator:
         self.trade_actions = []
         # Store instrument name for transaction lookup
         self.instrument_name = None
+        # Flag to control whether orders are submitted to broker or created as PENDING
+        self.submit_to_broker = True
     
     def evaluate(self, instrument_name: str, expert_recommendation: ExpertRecommendation,
                  ruleset_id: int, existing_order: Optional[TradingOrder] = None) -> List[Dict[str, Any]]:
@@ -153,7 +155,7 @@ class TradeActionEvaluator:
             logger.error(f"Error evaluating ruleset {ruleset_id}: {e}", exc_info=True)
             return [{"error": f"Error evaluating ruleset: {str(e)}"}]
     
-    def execute(self) -> List[Dict[str, Any]]:
+    def execute(self, submit_to_broker: bool = True) -> List[Dict[str, Any]]:
         """
         Execute the TradeAction objects that were previously created and stored by evaluate().
         
@@ -161,13 +163,20 @@ class TradeActionEvaluator:
         1. entering_markets: Execute BUY/SELL actions first, then use created orders for TP/SL
         2. open_positions: Use existing transactions to find orders for TP/SL adjustments
         
+        Args:
+            submit_to_broker: If True, submit orders to broker immediately. If False, create orders
+                            as PENDING without submission (for manual review/execution).
+        
         Returns:
             List of action execution results
         """
         action_results = []
         created_order_ids = []  # Track orders created during this execution
         
-        logger.info(f"🚀 EXECUTE() CALLED with {len(self.trade_actions)} trade actions for {self.instrument_name}")
+        # Store the submit_to_broker flag for use by actions
+        self.submit_to_broker = submit_to_broker
+        
+        logger.info(f"🚀 EXECUTE() CALLED with {len(self.trade_actions)} trade actions for {self.instrument_name} (submit_to_broker={submit_to_broker})")
         
         # Prepare evaluation details for storage in TradeActionResult
         # This includes condition evaluations, rule evaluations, and action calculations
@@ -222,6 +231,8 @@ class TradeActionEvaluator:
                     
                     # Attach evaluation details to the action for storage in TradeActionResult
                     action.evaluation_details = evaluation_details
+                    # Set the submit_to_broker flag on the action
+                    action.submit_to_broker = self.submit_to_broker
                     
                     execution_result = action.execute()
                     action_type = self._get_action_type_from_action(action)
@@ -311,6 +322,8 @@ class TradeActionEvaluator:
                             
                             # Attach evaluation details to the action for storage in TradeActionResult
                             action.evaluation_details = evaluation_details
+                            # Set the submit_to_broker flag on the action
+                            action.submit_to_broker = self.submit_to_broker
                             
                             logger.info(f"Phase 2 - Adjusting order {order.id}: {action.get_description()}")
                             

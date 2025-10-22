@@ -431,6 +431,62 @@ class FMPSenateTraderCopy(MarketExpertInterface):
         self.logger.info(f"Filtered {len(filtered_trades)} trades from {len(trades)} total based on age criteria (multi-symbol)")
         return filtered_trades
     
+    def _check_open_positions_trader_status(self, symbol: str) -> tuple[int, int]:
+        """
+        Check the trader name status of open positions for a given symbol.
+        
+        This is used for backward compatibility: if orders were created before trader name linking
+        was implemented, they won't have trader names. In mixed state (some with, some without),
+        we should fall back to averaging logic.
+        
+        Args:
+            symbol: The trading symbol
+            
+        Returns:
+            Tuple of (total_orders_count, orders_with_trader_names_count)
+            - total_orders_count: Total number of open positions
+            - orders_with_trader_names_count: Count of orders with trader names linked
+        """
+        try:
+            from sqlmodel import Session, select
+            from ...core.db import get_db
+            from ...core.models import Order
+            from ...core.types import OrderStatus
+            
+            with Session(get_db().bind) as session:
+                # Query for orders with this symbol that are open
+                statement = select(Order).where(
+                    Order.expert_id == self.id,
+                    Order.symbol == symbol,
+                    Order.status.in_([
+                        OrderStatus.OPENED,
+                        OrderStatus.WAITING
+                    ])
+                )
+                
+                orders = session.exec(statement).all()
+                total_orders = len(orders)
+                
+                # Count orders with trader names linked
+                orders_with_trader_names = 0
+                for order in orders:
+                    if order.data and 'trader_name' in order.data:
+                        trader_name = order.data.get('trader_name', '').strip()
+                        if trader_name:
+                            orders_with_trader_names += 1
+                
+                if total_orders > 0:
+                    self.logger.debug(f"Open positions check for {symbol}: {total_orders} total, {orders_with_trader_names} with trader names")
+                else:
+                    self.logger.debug(f"No open positions for {symbol}")
+                
+                return total_orders, orders_with_trader_names
+                
+        except Exception as e:
+            self.logger.error(f"Error checking open positions trader status for {symbol}: {e}", exc_info=True)
+            # Default to (0, 0) (no orders) if error occurs - this will cause same_trader mode to proceed
+            return 0, 0
+    
     def _find_copy_trades(self, filtered_trades: List[Dict[str, Any]], 
                          copy_trade_names: List[str]) -> List[Dict[str, Any]]:
         """
@@ -1109,21 +1165,46 @@ Recommendations Generated:"""
             
             for trade_symbol, symbol_trades in trades_by_symbol.items():
                 try:
-                    # Generate close recommendations based on mode
+                    # Determine the effective mode based on whether orders have trader names
+                    effective_close_only_for_same_trader = close_only_for_same_trader
+                    use_fallback_mode = False
+                    
                     if close_only_for_same_trader:
+                        # Check if we have ANY open positions (with or without trader names)
+                        # This method returns (has_any_orders, has_orders_with_trader_names)
+                        has_any_orders, has_orders_with_trader_names = self._check_open_positions_trader_status(trade_symbol)
+                        
+                        if has_any_orders and not has_orders_with_trader_names:
+                            # Mixed state: We have orders but none with trader names
+                            # Fall back to averaging logic for backward compatibility
+                            self.logger.debug(f"Found {has_any_orders} open positions for {trade_symbol} but none have trader names, "
+                                            f"falling back to averaging logic (backward compatibility)")
+                            effective_close_only_for_same_trader = False
+                            use_fallback_mode = True
+                        elif not has_any_orders:
+                            # No orders exist, can use same_trader mode with current trades
+                            self.logger.debug(f"No open positions for {trade_symbol}, using same_trader mode with current Senate/House trades")
+                            pass
+                        # else: has_orders_with_trader_names is True, continue with same_trader mode
+                    
+                    # Generate close recommendations based on effective mode
+                    if effective_close_only_for_same_trader:
                         # NEW MODE: Check for same trader reversals
                         recommendation_data = self._generate_close_recommendations_same_trader(
                             symbol_trades, trade_symbol
                         )
                     else:
-                        # OLD MODE: Use averaging logic
+                        # OLD MODE: Use averaging logic (or fallback mode)
                         recommendation_data = self._generate_close_recommendations_averaging(
                             symbol_trades, trade_symbol
                         )
                     
                     if not recommendation_data:
                         # No recommendation for this symbol in this mode
-                        self.logger.debug(f"No close recommendation for {trade_symbol} in {('same_trader' if close_only_for_same_trader else 'averaging')} mode")
+                        mode_name = 'same_trader' if effective_close_only_for_same_trader else 'averaging'
+                        if use_fallback_mode:
+                            mode_name = 'averaging (fallback - no trader names)'
+                        self.logger.debug(f"No close recommendation for {trade_symbol} in {mode_name} mode")
                         continue
                     
                     # Get current price

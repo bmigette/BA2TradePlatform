@@ -46,6 +46,8 @@ class TradeAction(ABC):
         self.order_recommendation = order_recommendation
         self.existing_order = existing_order
         self.expert_recommendation = expert_recommendation
+        # Flag indicating whether orders should be submitted to broker (True) or created as PENDING (False)
+        self.submit_to_broker = True
         
     @abstractmethod
     def execute(self) -> "TradeActionResult":
@@ -510,6 +512,16 @@ class CloseAction(TradeAction):
                     data={}
                 )
             
+            # Check if we should submit to broker or leave as PENDING
+            if not self.submit_to_broker:
+                logger.info(f"Automated trade modification disabled - leaving order {order_id} in PENDING state for manual review")
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.CLOSE.value,
+                    success=True,
+                    message=f"Close order created in PENDING state for {self.instrument_name} (awaiting manual review)",
+                    data={"order_id": order_id, "status": "PENDING"}
+                )
+            
             # Submit order through account interface
             submit_result = self.account.submit_order(order_record)
             
@@ -760,6 +772,24 @@ class AdjustTakeProfitAction(TradeAction):
                 logger.debug(f"Calling set_order_tp for order {self.existing_order.id} with price ${self.take_profit_price:.2f}")
                 tp_result = self.account.set_order_tp(self.existing_order, self.take_profit_price)
                 logger.info(f"✅ Successfully set take profit for {self.instrument_name}: TP order {tp_result.id if hasattr(tp_result, 'id') else 'unknown'} created/updated")
+                
+                # Store TP percent target in order.data if reference is ORDER_OPEN_PRICE
+                # This allows us to enforce minimum percent during triggered TP/SL
+                if self.reference_value and self.percent is not None and self.existing_order:
+                    from .types import ReferenceValue
+                    if self.reference_value == ReferenceValue.ORDER_OPEN_PRICE.value:
+                        # Only store percent when using open price as reference
+                        # This ensures we can apply minimum percent checks later
+                        if not self.existing_order.data:
+                            self.existing_order.data = {}
+                        
+                        self.existing_order.data['tp_percent_target'] = round(self.percent, 2)
+                        self.existing_order.data['tp_reference_type'] = self.reference_value
+                        self.existing_order.data['tp_reference_price'] = round(self.existing_order.open_price, 2) if self.existing_order.open_price else None
+                        
+                        # Update the order record with the stored percent
+                        update_instance(self.existing_order)
+                        logger.info(f"Stored TP percent target: {self.percent:.2f}% (reference: {self.reference_value}) in order {self.existing_order.id}")
                 
                 return self.create_and_save_action_result(
                     action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
@@ -1040,71 +1070,79 @@ class AdjustStopLossAction(TradeAction):
                 
                 logger.info(f"SL Calculation COMPLETE for {self.instrument_name} - Final SL Price: ${self.stop_loss_price:.2f}")
             
-            # Determine SL order side (opposite of main order)
-            sl_side = "sell" if self.existing_order.side == "buy" else "buy"
-            
-            # Create stop loss order record
-            sl_order_id = self.create_order_record(
-                side=sl_side,
-                quantity=self.existing_order.quantity,
-                order_type="stop",
-                stop_price=self.stop_loss_price,
-                linked_order_id=self.existing_order.id
-            )
-            
-            if not sl_order_id:
-                return self.create_and_save_action_result(
-                    action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
-                    success=False,
-                    message="Failed to create stop loss order record",
-                    data={}
-                )
-            
-            # Retrieve the order object for submission (needs to be in a session)
-            sl_order_record = get_instance(TradingOrder, sl_order_id)
-            if not sl_order_record:
-                logger.error(f"Failed to retrieve stop loss order {sl_order_id} after creation")
-                return self.create_and_save_action_result(
-                    action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
-                    success=False,
-                    message="Failed to retrieve stop loss order record",
-                    data={}
-                )
-            
-            # Submit SL order through account interface
-            submit_result = self.account.submit_order(sl_order_record)
-            
-            if submit_result is not None:
-                # Update SL order record with broker order ID (only if not already set)
-                if hasattr(submit_result, 'account_order_id') and submit_result.account_order_id:
-                    new_broker_id = str(submit_result.account_order_id)
-                    if sl_order_record.broker_order_id and sl_order_record.broker_order_id != new_broker_id:
+            # Enforce minimum TP/SL percent based on open price
+            # This ensures even if market price slipped overnight, SL maintains minimum risk protection
+            if self.existing_order and self.existing_order.open_price and self.stop_loss_price:
+                from ..config import get_min_tp_sl_percent
+                min_tp_percent = get_min_tp_sl_percent()
+                
+                # Calculate actual percent from open price to SL price
+                open_price = float(self.existing_order.open_price)
+                is_long = (self.existing_order.side.upper() == "BUY")
+                
+                if is_long:
+                    # For LONG: SL should be below open, loss percent = (Open - SL) / Open * 100
+                    actual_percent = ((open_price - self.stop_loss_price) / open_price) * 100
+                    
+                    if actual_percent < min_tp_percent:
+                        # SL is too close to open, enforce minimum distance
+                        enforced_sl = open_price * (1 - min_tp_percent / 100)
                         logger.warning(
-                            f"Stop loss order {sl_order_record.id} already has broker_order_id={sl_order_record.broker_order_id}, "
-                            f"not overwriting with: {new_broker_id}"
+                            f"SL enforcement: Maximum loss {actual_percent:.2f}% below minimum {min_tp_percent}%. "
+                            f"Adjusting SL from ${self.stop_loss_price:.2f} to ${enforced_sl:.2f} (open: ${open_price:.2f})"
                         )
-                    else:
-                        sl_order_record.broker_order_id = new_broker_id
-                    sl_order_record.status = OrderStatus.OPEN.value
-                    update_instance(sl_order_record)
+                        self.stop_loss_price = enforced_sl
+                else:
+                    # For SHORT: SL should be above open, loss percent = (SL - Open) / Open * 100
+                    actual_percent = ((self.stop_loss_price - open_price) / open_price) * 100
+                    
+                    if actual_percent < min_tp_percent:
+                        # SL is too close to open, enforce minimum distance
+                        enforced_sl = open_price * (1 + min_tp_percent / 100)
+                        logger.warning(
+                            f"SL enforcement: Maximum loss {actual_percent:.2f}% below minimum {min_tp_percent}%. "
+                            f"Adjusting SL from ${self.stop_loss_price:.2f} to ${enforced_sl:.2f} (open: ${open_price:.2f})"
+                        )
+                        self.stop_loss_price = enforced_sl
+            
+            # Use account's set_order_sl method to adjust stop loss
+            # This method either returns a TradingOrder object or raises an exception
+            try:
+                logger.debug(f"Calling set_order_sl for order {self.existing_order.id} with price ${self.stop_loss_price:.2f}")
+                sl_result = self.account.set_order_sl(self.existing_order, self.stop_loss_price)
+                logger.info(f"✅ Successfully set stop loss for {self.instrument_name}: SL order {sl_result.id if hasattr(sl_result, 'id') else 'unknown'} created/updated")
+                
+                # Store SL percent target in order.data if reference is ORDER_OPEN_PRICE
+                # This allows us to enforce minimum percent during triggered TP/SL
+                if self.reference_value and self.percent is not None and self.existing_order:
+                    from .types import ReferenceValue
+                    if self.reference_value == ReferenceValue.ORDER_OPEN_PRICE.value:
+                        # Only store percent when using open price as reference
+                        # This ensures we can apply minimum percent checks later
+                        if not self.existing_order.data:
+                            self.existing_order.data = {}
+                        
+                        self.existing_order.data['sl_percent_target'] = round(self.percent, 2)
+                        self.existing_order.data['sl_reference_type'] = self.reference_value
+                        self.existing_order.data['sl_reference_price'] = round(self.existing_order.open_price, 2) if self.existing_order.open_price else None
+                        
+                        # Update the order record with the stored percent
+                        update_instance(self.existing_order)
+                        logger.info(f"Stored SL percent target: {self.percent:.2f}% (reference: {self.reference_value}) in order {self.existing_order.id}")
                 
                 return self.create_and_save_action_result(
                     action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
                     success=True,
-                    message=f"Stop loss order created for {self.instrument_name} at ${self.stop_loss_price}",
-                    data={"order_id": sl_order_id, "broker_order_id": submit_result.account_order_id}
+                    message=f"Stop loss adjusted for {self.instrument_name} to ${self.stop_loss_price:.2f}",
+                    data={
+                        "order_id": self.existing_order.id, 
+                        "sl_order_id": sl_result.id if hasattr(sl_result, 'id') else None,
+                        "new_sl_price": self.stop_loss_price
+                    }
                 )
-            else:
-                # Update SL order status to failed
-                sl_order_record.status = OrderStatus.CANCELED.value
-                update_instance(sl_order_record)
-                
-                return self.create_and_save_action_result(
-                    action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
-                    success=False,
-                    message=f"Failed to submit stop loss order",
-                    data={}
-                )
+            except Exception as set_sl_error:
+                logger.error(f"Failed to set stop loss for order {self.existing_order.id}: {set_sl_error}", exc_info=True)
+                raise  # Re-raise to be caught by outer exception handler
                 
         except Exception as e:
             logger.error(f"Error executing adjust stop loss action for {self.instrument_name}: {e}", exc_info=True)

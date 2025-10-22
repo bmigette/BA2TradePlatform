@@ -804,39 +804,85 @@ class AccountInterface(ExtendableSettingsInterface):
     @abstractmethod
     def _set_order_tp_impl(self, trading_order: TradingOrder, tp_price: float) -> Any:
         """
-        Internal implementation of take profit order setting. This method should be implemented by child classes.
-        The public set_order_tp method will call this after updating the transaction.
-
+        Broker-specific implementation hook for take profit order setting.
+        
+        This method is called AFTER the base class has:
+        - Enforced minimum TP percent
+        - Created/updated the WAITING_TRIGGER TP order in the database
+        - Updated the transaction's take_profit value
+        
+        For most brokers, this method can be a no-op (just pass). Override only if your broker
+        needs special handling beyond database order creation.
+        
         Args:
-            trading_order: The original TradingOrder object
-            tp_price: The take profit price
-
+            trading_order: The original TradingOrder object (for reference/context)
+            tp_price: The validated and enforced TP price
+            
         Returns:
-            Any: The created/modified take profit order object if successful. Returns None or raises an exception if failed.
+            Any: Any broker-specific result (optional). Base class will not use this value.
         """
         pass
 
-    def set_order_tp(self, trading_order: TradingOrder, tp_price: float) -> Any:
+    def set_order_tp(self, trading_order: TradingOrder, tp_price: float) -> TradingOrder:
         """
         Set take profit for an existing order.
         
         This method:
-        1. Updates the linked transaction's take_profit value
-        2. Calls the implementation to create/modify the take profit order at the broker
+        1. Enforces minimum TP percent to protect profitability
+        2. Creates or updates a WAITING_TRIGGER TP order in the database
+        3. Updates the linked transaction's take_profit value
+        4. Calls broker-specific implementation (if needed)
         
         Args:
             trading_order: The original TradingOrder object
-            tp_price: The take profit price
+            tp_price: The take profit price (may be adjusted upward if below minimum)
             
         Returns:
-            Any: The created/modified take profit order object if successful. Returns None or raises an exception if failed.
+            TradingOrder: The created/updated take profit order object
         """
         try:
+            from sqlmodel import Session
+            from ..db import get_db
+            
             # Validate inputs
             if not trading_order:
                 raise ValueError("trading_order cannot be None")
             if not isinstance(tp_price, (int, float)) or tp_price <= 0:
                 raise ValueError("tp_price must be a positive number")
+            
+            # Enforce minimum TP percent based on open price
+            # This is a safety check in case market price slipped after TradeAction was issued
+            if trading_order.open_price:
+                from ..config import get_min_tp_sl_percent
+                min_tp_percent = get_min_tp_sl_percent()
+                
+                open_price = float(trading_order.open_price)
+                is_long = (trading_order.side.upper() == "BUY")
+                
+                original_tp = tp_price
+                
+                if is_long:
+                    # For LONG: TP should be above open, profit percent = (TP - Open) / Open * 100
+                    actual_percent = ((tp_price - open_price) / open_price) * 100
+                    
+                    if actual_percent < min_tp_percent:
+                        # Enforce minimum by adjusting TP upward
+                        tp_price = open_price * (1 + min_tp_percent / 100)
+                        logger.warning(
+                            f"[Account {self.id}] TP enforcement (LONG): Profit {actual_percent:.2f}% below minimum {min_tp_percent}%. "
+                            f"Adjusting TP from ${original_tp:.2f} to ${tp_price:.2f} (open: ${open_price:.2f})"
+                        )
+                else:
+                    # For SHORT: TP should be below open, profit percent = (Open - TP) / Open * 100
+                    actual_percent = ((open_price - tp_price) / open_price) * 100
+                    
+                    if actual_percent < min_tp_percent:
+                        # Enforce minimum by adjusting TP downward
+                        tp_price = open_price * (1 - min_tp_percent / 100)
+                        logger.warning(
+                            f"[Account {self.id}] TP enforcement (SHORT): Profit {actual_percent:.2f}% below minimum {min_tp_percent}%. "
+                            f"Adjusting TP from ${original_tp:.2f} to ${tp_price:.2f} (open: ${open_price:.2f})"
+                        )
             
             # Get the linked transaction
             if not trading_order.transaction_id:
@@ -852,12 +898,274 @@ class AccountInterface(ExtendableSettingsInterface):
             
             logger.info(f"Updated transaction {transaction.id} take_profit to ${tp_price}")
             
-            # Call implementation to handle broker-side take profit order
-            return self._set_order_tp_impl(trading_order, tp_price)
+            # Create or update the TP order in the database
+            with Session(get_db().bind) as session:
+                # Calculate TP percent from open price (for storage in order.data)
+                tp_percent = None
+                if trading_order.open_price and trading_order.open_price > 0:
+                    tp_percent = ((tp_price - trading_order.open_price) / trading_order.open_price) * 100
+                    logger.debug(f"Calculated TP percent: {tp_percent:.2f}% for {trading_order.symbol}")
+                
+                # Check if there's already a take profit order for this transaction
+                from sqlmodel import select
+                existing_tp_order = session.exec(
+                    select(TradingOrder).where(
+                        TradingOrder.transaction_id == trading_order.transaction_id,
+                        TradingOrder.status.in_([OrderStatus.OPEN, OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER]),
+                        TradingOrder.depends_on_order == trading_order.id,
+                        TradingOrder.limit_price.isnot(None)
+                    )
+                ).first()
+                
+                if existing_tp_order:
+                    # Update existing TP order
+                    logger.info(f"Updating existing TP order {existing_tp_order.id} to price ${tp_price}")
+                    existing_tp_order.limit_price = tp_price
+                    
+                    if tp_percent is not None:
+                        if not existing_tp_order.data:
+                            existing_tp_order.data = {}
+                        existing_tp_order.data['tp_percent_target'] = round(tp_percent, 2)
+                        existing_tp_order.data['tp_reference_price'] = round(trading_order.open_price, 2)
+                    
+                    session.add(existing_tp_order)
+                    session.commit()
+                    session.refresh(existing_tp_order)
+                    tp_order = existing_tp_order
+                    logger.info(f"Successfully updated TP order {tp_order.id} to ${tp_price}")
+                else:
+                    # Create new TP order
+                    if trading_order.side.upper() == "BUY":
+                        tp_side = OrderDirection.SELL
+                        from ..types import OrderType as CoreOrderType
+                        tp_order_type = CoreOrderType.SELL_LIMIT
+                    else:
+                        tp_side = OrderDirection.BUY
+                        from ..types import OrderType as CoreOrderType
+                        tp_order_type = CoreOrderType.BUY_LIMIT
+                    
+                    # Build order data with TP metadata
+                    order_data = {}
+                    if tp_percent is not None:
+                        order_data = {
+                            'tp_percent_target': round(tp_percent, 2),
+                            'tp_reference_price': round(trading_order.open_price, 2)
+                        }
+                    
+                    tp_order = TradingOrder(
+                        account_id=self.id,
+                        symbol=trading_order.symbol,
+                        quantity=0,  # Will be set when trigger is hit
+                        side=tp_side,
+                        order_type=tp_order_type,
+                        limit_price=tp_price,
+                        transaction_id=trading_order.transaction_id,
+                        status=OrderStatus.WAITING_TRIGGER,
+                        depends_on_order=trading_order.id,
+                        depends_order_status_trigger=OrderStatus.FILLED,
+                        expert_recommendation_id=trading_order.expert_recommendation_id,
+                        open_type=OrderOpenType.AUTOMATIC,
+                        comment=f"TP for order {trading_order.id}",
+                        data=order_data if order_data else None,
+                        created_at=datetime.now(timezone.utc)
+                    )
+                    
+                    session.add(tp_order)
+                    session.commit()
+                    session.refresh(tp_order)
+                    logger.info(f"Created WAITING_TRIGGER TP order {tp_order.id} at ${tp_price} (will submit when order {trading_order.id} is FILLED)")
+            
+            # Call broker-specific implementation (may be no-op for most brokers)
+            self._set_order_tp_impl(trading_order, tp_price)
+            
+            return tp_order
             
         except Exception as e:
             logger.error(f"Error setting take profit for order {trading_order.id if trading_order else 'None'}: {e}", exc_info=True)
             raise
+
+    def set_order_sl(self, trading_order: TradingOrder, sl_price: float) -> TradingOrder:
+        """
+        Set stop loss for an existing order.
+        
+        This method:
+        1. Enforces minimum SL percent to protect profitability
+        2. Creates or updates a WAITING_TRIGGER SL order in the database
+        3. Updates the linked transaction's stop_loss value
+        4. Calls broker-specific implementation (if needed)
+        
+        Args:
+            trading_order: The original TradingOrder object
+            sl_price: The stop loss price (may be adjusted away from entry if below minimum)
+            
+        Returns:
+            TradingOrder: The created/updated stop loss order object
+        """
+        try:
+            from sqlmodel import Session
+            from ..db import get_db
+            
+            # Validate inputs
+            if not trading_order:
+                raise ValueError("trading_order cannot be None")
+            if not isinstance(sl_price, (int, float)) or sl_price <= 0:
+                raise ValueError("sl_price must be a positive number")
+            
+            # Enforce minimum SL percent based on open price
+            # This is a safety check in case market price slipped after TradeAction was issued
+            if trading_order.open_price:
+                from ..config import get_min_tp_sl_percent
+                min_tp_sl_percent = get_min_tp_sl_percent()
+                
+                open_price = float(trading_order.open_price)
+                is_long = (trading_order.side.upper() == "BUY")
+                
+                original_sl = sl_price
+                
+                if is_long:
+                    # For LONG: SL should be below open, loss percent = (Open - SL) / Open * 100
+                    actual_percent = ((open_price - sl_price) / open_price) * 100
+                    
+                    if actual_percent < min_tp_sl_percent:
+                        # Enforce minimum by adjusting SL downward (larger loss)
+                        sl_price = open_price * (1 - min_tp_sl_percent / 100)
+                        logger.warning(
+                            f"[Account {self.id}] SL enforcement (LONG): Risk {actual_percent:.2f}% below minimum {min_tp_sl_percent}%. "
+                            f"Adjusting SL from ${original_sl:.2f} to ${sl_price:.2f} (open: ${open_price:.2f})"
+                        )
+                else:
+                    # For SHORT: SL should be above open, loss percent = (SL - Open) / Open * 100
+                    actual_percent = ((sl_price - open_price) / open_price) * 100
+                    
+                    if actual_percent < min_tp_sl_percent:
+                        # Enforce minimum by adjusting SL upward (larger loss)
+                        sl_price = open_price * (1 + min_tp_sl_percent / 100)
+                        logger.warning(
+                            f"[Account {self.id}] SL enforcement (SHORT): Risk {actual_percent:.2f}% below minimum {min_tp_sl_percent}%. "
+                            f"Adjusting SL from ${original_sl:.2f} to ${sl_price:.2f} (open: ${open_price:.2f})"
+                        )
+            
+            # Get the linked transaction
+            if not trading_order.transaction_id:
+                raise ValueError("Order must have a linked transaction to set stop loss")
+            
+            transaction = get_instance(Transaction, trading_order.transaction_id)
+            if not transaction:
+                raise ValueError(f"Transaction {trading_order.transaction_id} not found")
+            
+            # Update transaction's stop_loss value
+            transaction.stop_loss = sl_price
+            update_instance(transaction)
+            
+            logger.info(f"Updated transaction {transaction.id} stop_loss to ${sl_price}")
+            
+            # Create or update the SL order in the database
+            with Session(get_db().bind) as session:
+                # Calculate SL percent from open price (for storage in order.data)
+                sl_percent = None
+                if trading_order.open_price and trading_order.open_price > 0:
+                    sl_percent = ((sl_price - trading_order.open_price) / trading_order.open_price) * 100
+                    logger.debug(f"Calculated SL percent: {sl_percent:.2f}% for {trading_order.symbol}")
+                
+                # Check if there's already a stop loss order for this transaction
+                from sqlmodel import select
+                existing_sl_order = session.exec(
+                    select(TradingOrder).where(
+                        TradingOrder.transaction_id == trading_order.transaction_id,
+                        TradingOrder.status.in_([OrderStatus.OPEN, OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER]),
+                        TradingOrder.depends_on_order == trading_order.id,
+                        TradingOrder.stop_price.isnot(None)
+                    )
+                ).first()
+                
+                if existing_sl_order:
+                    # Update existing SL order
+                    logger.info(f"Updating existing SL order {existing_sl_order.id} to price ${sl_price}")
+                    existing_sl_order.stop_price = sl_price
+                    
+                    if sl_percent is not None:
+                        if not existing_sl_order.data:
+                            existing_sl_order.data = {}
+                        existing_sl_order.data['sl_percent_target'] = round(sl_percent, 2)
+                        existing_sl_order.data['sl_reference_price'] = round(trading_order.open_price, 2)
+                    
+                    session.add(existing_sl_order)
+                    session.commit()
+                    session.refresh(existing_sl_order)
+                    sl_order = existing_sl_order
+                    logger.info(f"Successfully updated SL order {sl_order.id} to ${sl_price}")
+                else:
+                    # Create new SL order
+                    if trading_order.side.upper() == "BUY":
+                        sl_side = OrderDirection.SELL
+                        from ..types import OrderType as CoreOrderType
+                        sl_order_type = CoreOrderType.SELL_STOP
+                    else:
+                        sl_side = OrderDirection.BUY
+                        from ..types import OrderType as CoreOrderType
+                        sl_order_type = CoreOrderType.BUY_STOP
+                    
+                    # Build order data with SL metadata
+                    order_data = {}
+                    if sl_percent is not None:
+                        order_data = {
+                            'sl_percent_target': round(sl_percent, 2),
+                            'sl_reference_price': round(trading_order.open_price, 2)
+                        }
+                    
+                    sl_order = TradingOrder(
+                        account_id=self.id,
+                        symbol=trading_order.symbol,
+                        quantity=0,  # Will be set when trigger is hit
+                        side=sl_side,
+                        order_type=sl_order_type,
+                        stop_price=sl_price,
+                        transaction_id=trading_order.transaction_id,
+                        status=OrderStatus.WAITING_TRIGGER,
+                        depends_on_order=trading_order.id,
+                        depends_order_status_trigger=OrderStatus.FILLED,
+                        expert_recommendation_id=trading_order.expert_recommendation_id,
+                        open_type=OrderOpenType.AUTOMATIC,
+                        comment=f"SL for order {trading_order.id}",
+                        data=order_data if order_data else None,
+                        created_at=datetime.now(timezone.utc)
+                    )
+                    
+                    session.add(sl_order)
+                    session.commit()
+                    session.refresh(sl_order)
+                    logger.info(f"Created WAITING_TRIGGER SL order {sl_order.id} at ${sl_price} (will submit when order {trading_order.id} is FILLED)")
+            
+            # Call broker-specific implementation (may be no-op for most brokers)
+            self._set_order_sl_impl(trading_order, sl_price)
+            
+            return sl_order
+            
+        except Exception as e:
+            logger.error(f"Error setting stop loss for order {trading_order.id if trading_order else 'None'}: {e}", exc_info=True)
+            raise
+
+    @abstractmethod
+    def _set_order_sl_impl(self, trading_order: TradingOrder, sl_price: float) -> Any:
+        """
+        Broker-specific implementation hook for stop loss order setting.
+        
+        This method is called AFTER the base class has:
+        - Enforced minimum SL percent
+        - Created/updated the WAITING_TRIGGER SL order in the database
+        - Updated the transaction's stop_loss value
+        
+        For most brokers, this method can be a no-op (just pass). Override only if your broker
+        needs special handling beyond database order creation.
+        
+        Args:
+            trading_order: The original TradingOrder object (for reference/context)
+            sl_price: The validated and enforced SL price
+            
+        Returns:
+            Any: Any broker-specific result (optional). Base class will not use this value.
+        """
+        pass
 
     @abstractmethod
     def refresh_positions(self) -> bool:
