@@ -944,6 +944,9 @@ class AccountInterface(ExtendableSettingsInterface):
             if not transaction:
                 raise ValueError(f"Transaction {trading_order.transaction_id} not found")
             
+            # Store original transaction take_profit for rollback if broker update fails
+            original_transaction_tp = transaction.take_profit
+            
             # Update transaction's take_profit value
             transaction.take_profit = tp_price
             update_instance(transaction)
@@ -959,17 +962,22 @@ class AccountInterface(ExtendableSettingsInterface):
                     logger.debug(f"Calculated TP percent: {tp_percent:.2f}% for {trading_order.symbol}")
                 
                 # Check if there's already a take profit order for this transaction
+                # Look for any TP order in the transaction that is still active (not terminal)
                 from sqlmodel import select
                 existing_tp_order = session.exec(
                     select(TradingOrder).where(
                         TradingOrder.transaction_id == trading_order.transaction_id,
-                        TradingOrder.status.in_([OrderStatus.OPEN, OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER]),
-                        TradingOrder.depends_on_order == trading_order.id,
-                        TradingOrder.limit_price.isnot(None)
+                        TradingOrder.status.notin_(OrderStatus.get_terminal_statuses()),
+                        TradingOrder.limit_price.isnot(None),
+                        TradingOrder.stop_price.is_(None)  # Ensure it's a limit order (TP), not a stop order (SL)
                     )
                 ).first()
                 
                 if existing_tp_order:
+                    # Store original values for rollback if broker update fails
+                    original_limit_price = existing_tp_order.limit_price
+                    original_data = existing_tp_order.data.copy() if existing_tp_order.data else None
+                    
                     # Update existing TP order
                     logger.info(f"Updating existing TP order {existing_tp_order.id} to price ${tp_price}")
                     existing_tp_order.limit_price = tp_price
@@ -979,6 +987,19 @@ class AccountInterface(ExtendableSettingsInterface):
                             existing_tp_order.data = {}
                         existing_tp_order.data['tp_percent_target'] = round(tp_percent, 2)
                         existing_tp_order.data['tp_reference_price'] = round(trading_order.open_price, 2)
+                    
+                    # Check if parent order is now active and TP order is still WAITING_TRIGGER
+                    # If so, update quantity and status to PENDING, then submit immediately
+                    should_submit_immediately = (
+                        trading_order.broker_order_id is not None and 
+                        trading_order.status not in OrderStatus.get_terminal_statuses() and
+                        existing_tp_order.status == OrderStatus.WAITING_TRIGGER
+                    )
+                    
+                    if should_submit_immediately:
+                        logger.info(f"Parent order {trading_order.id} is now active at broker, promoting TP order {existing_tp_order.id} from WAITING_TRIGGER to PENDING")
+                        existing_tp_order.quantity = trading_order.quantity
+                        existing_tp_order.status = OrderStatus.PENDING
                     
                     session.add(existing_tp_order)
                     session.commit()
@@ -997,7 +1018,30 @@ class AccountInterface(ExtendableSettingsInterface):
                             logger.warning(f"Broker {self.__class__.__name__} does not support updating live TP orders - may need to cancel and replace")
                         except Exception as e:
                             logger.error(f"Error updating broker TP order: {e}", exc_info=True)
+                            # ROLLBACK: Restore original values in database
+                            logger.warning(f"Rolling back TP order {existing_tp_order.id} to original limit_price ${original_limit_price}")
+                            existing_tp_order.limit_price = original_limit_price
+                            existing_tp_order.data = original_data
+                            session.add(existing_tp_order)
+                            session.commit()
+                            
+                            # ROLLBACK: Restore transaction take_profit
+                            logger.warning(f"Rolling back transaction {transaction.id} take_profit to ${original_transaction_tp}")
+                            transaction.take_profit = original_transaction_tp
+                            update_instance(transaction)
                             raise
+                    elif should_submit_immediately:
+                        # Parent order is active and TP was WAITING_TRIGGER, submit it now
+                        logger.info(f"Submitting TP order {existing_tp_order.id} to broker now that parent order {trading_order.id} is active")
+                        session.close()
+                        try:
+                            result = self.submit_order(existing_tp_order)
+                            logger.info(f"Successfully submitted TP order {existing_tp_order.id} to broker (broker_order_id: {existing_tp_order.broker_order_id})")
+                        except Exception as submit_error:
+                            logger.error(f"Error submitting TP order {existing_tp_order.id} to broker: {submit_error}", exc_info=True)
+                            raise
+                        # Reopen session for return
+                        session = Session(get_db().bind)
                     
                     logger.info(f"Successfully updated TP order {tp_order.id} to ${tp_price}")
                 else:
@@ -1019,8 +1063,12 @@ class AccountInterface(ExtendableSettingsInterface):
                             'tp_reference_price': round(trading_order.open_price, 2)
                         }
                     
-                    # Check if parent order is already FILLED - if so, submit TP immediately
-                    should_submit_immediately = (trading_order.status == OrderStatus.FILLED)
+                    # Check if parent order has broker_order_id and is not in terminal status
+                    # This means the order is active at the broker and we can submit TP immediately
+                    should_submit_immediately = (
+                        trading_order.broker_order_id is not None and 
+                        trading_order.status not in OrderStatus.get_terminal_statuses()
+                    )
                     
                     tp_order = TradingOrder(
                         account_id=self.id,
@@ -1137,6 +1185,9 @@ class AccountInterface(ExtendableSettingsInterface):
             if not transaction:
                 raise ValueError(f"Transaction {trading_order.transaction_id} not found")
             
+            # Store original transaction stop_loss for rollback if broker update fails
+            original_transaction_sl = transaction.stop_loss
+            
             # Update transaction's stop_loss value
             transaction.stop_loss = sl_price
             update_instance(transaction)
@@ -1152,17 +1203,22 @@ class AccountInterface(ExtendableSettingsInterface):
                     logger.debug(f"Calculated SL percent: {sl_percent:.2f}% for {trading_order.symbol}")
                 
                 # Check if there's already a stop loss order for this transaction
+                # Look for any SL order in the transaction that is still active (not terminal)
                 from sqlmodel import select
                 existing_sl_order = session.exec(
                     select(TradingOrder).where(
                         TradingOrder.transaction_id == trading_order.transaction_id,
-                        TradingOrder.status.in_([OrderStatus.OPEN, OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER]),
-                        TradingOrder.depends_on_order == trading_order.id,
-                        TradingOrder.stop_price.isnot(None)
+                        TradingOrder.status.notin_(OrderStatus.get_terminal_statuses()),
+                        TradingOrder.stop_price.isnot(None),
+                        TradingOrder.limit_price.is_(None)  # Ensure it's a stop order (SL), not a limit order (TP)
                     )
                 ).first()
                 
                 if existing_sl_order:
+                    # Store original values for rollback if broker update fails
+                    original_stop_price = existing_sl_order.stop_price
+                    original_data = existing_sl_order.data.copy() if existing_sl_order.data else None
+                    
                     # Update existing SL order
                     logger.info(f"Updating existing SL order {existing_sl_order.id} to price ${sl_price}")
                     existing_sl_order.stop_price = sl_price
@@ -1172,6 +1228,19 @@ class AccountInterface(ExtendableSettingsInterface):
                             existing_sl_order.data = {}
                         existing_sl_order.data['sl_percent_target'] = round(sl_percent, 2)
                         existing_sl_order.data['sl_reference_price'] = round(trading_order.open_price, 2)
+                    
+                    # Check if parent order is now active and SL order is still WAITING_TRIGGER
+                    # If so, update quantity and status to PENDING, then submit immediately
+                    should_submit_immediately = (
+                        trading_order.broker_order_id is not None and 
+                        trading_order.status not in OrderStatus.get_terminal_statuses() and
+                        existing_sl_order.status == OrderStatus.WAITING_TRIGGER
+                    )
+                    
+                    if should_submit_immediately:
+                        logger.info(f"Parent order {trading_order.id} is now active at broker, promoting SL order {existing_sl_order.id} from WAITING_TRIGGER to PENDING")
+                        existing_sl_order.quantity = trading_order.quantity
+                        existing_sl_order.status = OrderStatus.PENDING
                     
                     session.add(existing_sl_order)
                     session.commit()
@@ -1190,7 +1259,30 @@ class AccountInterface(ExtendableSettingsInterface):
                             logger.warning(f"Broker {self.__class__.__name__} does not support updating live SL orders - may need to cancel and replace")
                         except Exception as e:
                             logger.error(f"Error updating broker SL order: {e}", exc_info=True)
+                            # ROLLBACK: Restore original values in database
+                            logger.warning(f"Rolling back SL order {existing_sl_order.id} to original stop_price ${original_stop_price}")
+                            existing_sl_order.stop_price = original_stop_price
+                            existing_sl_order.data = original_data
+                            session.add(existing_sl_order)
+                            session.commit()
+                            
+                            # ROLLBACK: Restore transaction stop_loss
+                            logger.warning(f"Rolling back transaction {transaction.id} stop_loss to ${original_transaction_sl}")
+                            transaction.stop_loss = original_transaction_sl
+                            update_instance(transaction)
                             raise
+                    elif should_submit_immediately:
+                        # Parent order is active and SL was WAITING_TRIGGER, submit it now
+                        logger.info(f"Submitting SL order {existing_sl_order.id} to broker now that parent order {trading_order.id} is active")
+                        session.close()
+                        try:
+                            result = self.submit_order(existing_sl_order)
+                            logger.info(f"Successfully submitted SL order {existing_sl_order.id} to broker (broker_order_id: {existing_sl_order.broker_order_id})")
+                        except Exception as submit_error:
+                            logger.error(f"Error submitting SL order {existing_sl_order.id} to broker: {submit_error}", exc_info=True)
+                            raise
+                        # Reopen session for return
+                        session = Session(get_db().bind)
                     
                     logger.info(f"Successfully updated SL order {sl_order.id} to ${sl_price}")
                 else:
@@ -1212,8 +1304,12 @@ class AccountInterface(ExtendableSettingsInterface):
                             'sl_reference_price': round(trading_order.open_price, 2)
                         }
                     
-                    # Check if parent order is already FILLED - if so, submit SL immediately
-                    should_submit_immediately = (trading_order.status == OrderStatus.FILLED)
+                    # Check if parent order has broker_order_id and is not in terminal status
+                    # This means the order is active at the broker and we can submit SL immediately
+                    should_submit_immediately = (
+                        trading_order.broker_order_id is not None and 
+                        trading_order.status not in OrderStatus.get_terminal_statuses()
+                    )
                     
                     sl_order = TradingOrder(
                         account_id=self.id,

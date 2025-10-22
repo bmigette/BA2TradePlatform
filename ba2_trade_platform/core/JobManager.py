@@ -210,13 +210,27 @@ class JobManager:
             bypass_transaction_check: If True, skip existing transaction checks (used for manual analysis)
             
         Returns:
-            Task ID for tracking
+            Task ID for tracking, or None if submission was skipped
             
         Raises:
             ValueError: If expert instance not found or duplicate task exists
             RuntimeError: If worker queue is not running
         """
         
+        # Handle special symbols - if manually triggered, expand immediately
+        if symbol in ["DYNAMIC", "EXPERT", "OPEN_POSITIONS"]:
+            logger.info(f"Special symbol '{symbol}' detected - expanding to individual instruments")
+            
+            # Call appropriate expansion method based on symbol type
+            if symbol == "DYNAMIC":
+                self._execute_dynamic_analysis(expert_instance_id, subtype)
+            elif symbol == "EXPERT":
+                self._execute_expert_driven_analysis(expert_instance_id, subtype)
+            elif symbol == "OPEN_POSITIONS":
+                self._execute_open_positions_analysis(expert_instance_id, subtype)
+            
+            # Return a pseudo task ID to indicate processing started
+            return f"expansion_{symbol.lower()}_{expert_instance_id}"
         
         # Validate expert instance exists
         expert_instance = get_instance(ExpertInstance, expert_instance_id)
@@ -458,37 +472,36 @@ class JobManager:
         try:
             logger.debug(f"Starting job scheduling for expert instance {expert_instance.id}")
             
-            # Get enabled instruments for this expert
-            enabled_instruments = self._get_enabled_instruments(expert_instance.id)
-            if not enabled_instruments:
-                logger.debug(f"No enabled instruments found for expert instance {expert_instance.id}")
-                return
-            
-            logger.debug(f"Found {len(enabled_instruments)} enabled instruments for expert {expert_instance.id}: {enabled_instruments}")
-            
-            # Schedule jobs for enter_market
+            # Schedule jobs for enter_market (depends on instrument selection method)
             enter_market_schedule = self._get_expert_setting(expert_instance.id, "execution_schedule_enter_market")
             if enter_market_schedule:
                 logger.debug(f"Found execution_schedule_enter_market for expert {expert_instance.id}: {enter_market_schedule}")
-                logger.debug(f"Creating {len(enabled_instruments)} enter_market jobs...")
                 
-                for i, instrument in enumerate(enabled_instruments):
-                    logger.debug(f"Creating enter_market job {i+1}/{len(enabled_instruments)} for instrument {instrument}")
-                    self._create_scheduled_job(expert_instance, instrument, enter_market_schedule, AnalysisUseCase.ENTER_MARKET)
-                    logger.debug(f"Completed enter_market job creation for instrument {instrument}")
+                # Get enabled instruments for this expert
+                enabled_instruments = self._get_enabled_instruments(expert_instance.id)
+                if enabled_instruments:
+                    logger.debug(f"Found {len(enabled_instruments)} enabled instruments for expert {expert_instance.id}: {enabled_instruments}")
+                    logger.debug(f"Creating {len(enabled_instruments)} enter_market jobs...")
+                    
+                    for i, instrument in enumerate(enabled_instruments):
+                        logger.debug(f"Creating enter_market job {i+1}/{len(enabled_instruments)} for instrument {instrument}")
+                        self._create_scheduled_job(expert_instance, instrument, enter_market_schedule, AnalysisUseCase.ENTER_MARKET)
+                        logger.debug(f"Completed enter_market job creation for instrument {instrument}")
+                else:
+                    logger.debug(f"No enabled instruments found for expert instance {expert_instance.id} - skipping enter_market job creation")
             else:
                 logger.debug(f"No execution_schedule_enter_market setting found for expert instance {expert_instance.id}")
             
-            # Schedule jobs for open_positions
+            # Schedule jobs for open_positions (ALWAYS created regardless of instrument selection method)
             open_positions_schedule = self._get_expert_setting(expert_instance.id, "execution_schedule_open_positions")
             if open_positions_schedule:
                 logger.debug(f"Found execution_schedule_open_positions for expert {expert_instance.id}: {open_positions_schedule}")
-                logger.debug(f"Creating {len(enabled_instruments)} open_positions jobs...")
                 
-                for i, instrument in enumerate(enabled_instruments):
-                    logger.debug(f"Creating open_positions job {i+1}/{len(enabled_instruments)} for instrument {instrument}")
-                    self._create_scheduled_job(expert_instance, instrument, open_positions_schedule, AnalysisUseCase.OPEN_POSITIONS)
-                    logger.debug(f"Completed open_positions job creation for instrument {instrument}")
+                # For OPEN_POSITIONS, use special "OPEN_POSITIONS" symbol instead of enabled_instruments
+                # This will be expanded at execution time to only analyze instruments with actual open positions
+                logger.debug(f"Creating OPEN_POSITIONS job (will expand to open positions at execution time)")
+                self._create_scheduled_job(expert_instance, "OPEN_POSITIONS", open_positions_schedule, AnalysisUseCase.OPEN_POSITIONS)
+                logger.debug(f"Completed OPEN_POSITIONS job creation")
             else:
                 logger.debug(f"No execution_schedule_open_positions setting found for expert instance {expert_instance.id}")
             
@@ -661,6 +674,9 @@ class JobManager:
             elif symbol == "EXPERT":
                 self._execute_expert_driven_analysis(expert_instance_id, subtype)
                 return
+            elif symbol == "OPEN_POSITIONS":
+                self._execute_open_positions_analysis(expert_instance_id, subtype)
+                return
             
             # Regular symbol processing
             # For ENTER_MARKET analysis, skip if existing transactions exist for this expert and symbol
@@ -712,9 +728,17 @@ class JobManager:
                 logger.warning(f"No AI prompt found for expert {expert_instance_id} - using default")
                 ai_prompt = None
             
-            # Use AI to select instruments
+            # Get model configuration from expert settings
+            model_string = expert.settings.get('dynamic_instrument_selection_model')
+            if not model_string:
+                logger.warning(f"No dynamic_instrument_selection_model setting found for expert {expert_instance_id} - using default")
+                model_string = None  # Will use config.OPENAI_MODEL
+            
+            logger.debug(f"Using model for dynamic selection: {model_string or 'default'}")
+            
+            # Use AI to select instruments with configured model
             from .AIInstrumentSelector import AIInstrumentSelector
-            ai_selector = AIInstrumentSelector()
+            ai_selector = AIInstrumentSelector(model_string=model_string)
             selected_instruments = ai_selector.select_instruments(ai_prompt)
             
             if not selected_instruments:
@@ -844,6 +868,61 @@ class JobManager:
                     
         except Exception as e:
             logger.error(f"Error in expert-driven analysis for expert {expert_instance_id}: {e}", exc_info=True)
+    
+    def _execute_open_positions_analysis(self, expert_instance_id: int, subtype: str):
+        """
+        Execute open positions analysis by expanding into individual jobs for each open position.
+        
+        This method:
+        1. Queries all currently open transactions for the expert (WAITING or OPENED status)
+        2. Extracts unique symbols from those transactions
+        3. Creates individual analysis jobs for each symbol
+        
+        This reuses the same logic as ENTER_MARKET's "no existing open positions" check,
+        but inverted - we only analyze symbols that HAVE open positions.
+        
+        Args:
+            expert_instance_id: The expert instance ID
+            subtype: The analysis subtype (should be OPEN_POSITIONS)
+        """
+        try:
+            logger.info(f"Executing open positions analysis for expert {expert_instance_id}")
+            
+            from sqlmodel import select, Session
+            from .db import get_db
+            from .models import Transaction
+            from .types import TransactionStatus
+            
+            # Get all symbols with open transactions for this expert
+            with Session(get_db().bind) as session:
+                statement = select(Transaction.symbol).distinct().where(
+                    Transaction.expert_id == expert_instance_id,
+                    Transaction.status.in_([TransactionStatus.WAITING, TransactionStatus.OPENED])
+                )
+                open_symbols = session.exec(statement).all()
+            
+            if not open_symbols:
+                logger.info(f"No open positions found for expert {expert_instance_id} - skipping OPEN_POSITIONS analysis")
+                return
+            
+            logger.info(f"Found {len(open_symbols)} symbols with open positions for expert {expert_instance_id}: {open_symbols}")
+            
+            # Submit analysis jobs for each symbol with open positions
+            for symbol in open_symbols:
+                try:
+                    task_id = self.submit_market_analysis(
+                        expert_instance_id=expert_instance_id,
+                        symbol=symbol,
+                        subtype=subtype,
+                        priority=10
+                    )
+                    logger.debug(f"Submitted open positions analysis for {symbol}: {task_id}")
+                    
+                except Exception as e:
+                    logger.error(f"Error submitting open positions analysis for {symbol}: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Error in open positions analysis for expert {expert_instance_id}: {e}", exc_info=True)
     
     def _has_open_transactions_for_symbol(self, expert_instance_id: int, symbol: str) -> bool:
         """Check if there are open transactions for a specific expert and symbol."""

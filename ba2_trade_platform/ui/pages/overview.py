@@ -272,23 +272,29 @@ class OverviewTab:
                             if symbol and qty:
                                 broker_positions[symbol] = float(qty)
                         
+                        # Get all expert IDs for this account (needed to find transactions)
+                        from ba2_trade_platform.core.models import ExpertInstance
+                        expert_ids_stmt = select(ExpertInstance.id).where(ExpertInstance.account_id == acc.id)
+                        account_expert_ids = list(session.exec(expert_ids_stmt).all())
+                        
                         # Sync current prices to transactions for symbols with open positions
                         for symbol in broker_positions.keys():
                             try:
                                 current_price = provider_obj.get_instrument_current_price(symbol)
                                 if current_price:
-                                    # Update all open transactions for this symbol with current price
-                                    price_update_stmt = select(Transaction).where(
-                                        Transaction.symbol == symbol,
-                                        Transaction.status == TransactionStatus.OPENED,
-                                        Transaction.account_id == acc.id
-                                    )
-                                    price_transactions = session.exec(price_update_stmt).all()
-                                    for txn in price_transactions:
-                                        txn.current_price = current_price
-                                        session.add(txn)
-                                    if price_transactions:
-                                        session.commit()
+                                    # Update all open transactions for this symbol (for experts belonging to this account)
+                                    if account_expert_ids:
+                                        price_update_stmt = select(Transaction).where(
+                                            Transaction.symbol == symbol,
+                                            Transaction.status == TransactionStatus.OPENED,
+                                            Transaction.expert_id.in_(account_expert_ids)
+                                        )
+                                        price_transactions = session.exec(price_update_stmt).all()
+                                        for txn in price_transactions:
+                                            txn.current_price = current_price
+                                            session.add(txn)
+                                        if price_transactions:
+                                            session.commit()
                             except Exception as pe:
                                 logger.debug(f"Could not sync current price for {symbol}: {pe}", exc_info=True)
                         

@@ -562,7 +562,10 @@ class JobMonitoringTab:
         try:
             worker_queue = self._get_worker_queue()
             worker_count = worker_queue.get_worker_count()
-            all_tasks = worker_queue.get_all_tasks()
+            all_tasks_dict = worker_queue.get_all_tasks()
+            
+            # Convert dict to list of tasks for easier iteration
+            all_tasks = list(all_tasks_dict.values()) if isinstance(all_tasks_dict, dict) else all_tasks_dict
             
             logger.debug(f"All tasks count: {len(all_tasks)}")
             
@@ -1494,13 +1497,14 @@ class ScheduledJobsTab:
                             if days.get(day_name, False):
                                 enabled_weekdays.append(short_weekday_names[i])
                         
-                        # Create one entry per instrument for this expert instance and job type
-                        for symbol in enabled_instruments:
-                            combination_key = f"{expert_instance.id}_{symbol}_{schedule_key}"
+                        # For OPEN_POSITIONS schedule, create single job entry with OPEN_POSITIONS symbol
+                        # (will expand to individual symbols at execution time)
+                        if schedule_key == 'execution_schedule_open_positions':
+                            combination_key = f"{expert_instance.id}_OPEN_POSITIONS_{schedule_key}"
                             
                             jobs_by_combination[combination_key] = {
                                 'id': combination_key,
-                                'symbol': symbol,
+                                'symbol': 'OPEN_POSITIONS',
                                 'expert_name': expert_instance.alias or expert_instance.expert,
                                 'expert_instance_id': expert_instance.id,
                                 'job_type': job_type_display,
@@ -1509,6 +1513,22 @@ class ScheduledJobsTab:
                                 'times': ', '.join(times) if times else 'Not specified',
                                 'expert_disabled': False
                             }
+                        else:
+                            # For ENTER_MARKET and other schedules, create one entry per instrument
+                            for symbol in enabled_instruments:
+                                combination_key = f"{expert_instance.id}_{symbol}_{schedule_key}"
+                                
+                                jobs_by_combination[combination_key] = {
+                                    'id': combination_key,
+                                    'symbol': symbol,
+                                    'expert_name': expert_instance.alias or expert_instance.expert,
+                                    'expert_instance_id': expert_instance.id,
+                                    'job_type': job_type_display,
+                                    'subtype': subtype.value,
+                                    'weekdays': ', '.join(enabled_weekdays) if enabled_weekdays else 'None',
+                                    'times': ', '.join(times) if times else 'Not specified',
+                                    'expert_disabled': False
+                                }
                 
                 except Exception as e:
                     logger.error(f"Error processing schedule for expert instance {expert_instance.id}: {e}", exc_info=True)

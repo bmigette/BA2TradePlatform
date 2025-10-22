@@ -1,5 +1,6 @@
 """
-AI-powered instrument selector using OpenAI to dynamically select trading instruments.
+AI-powered instrument selector using OpenAI or NagaAI to dynamically select trading instruments.
+Supports web search for both OpenAI (responses API) and NagaAI (chat completions API).
 """
 
 import json
@@ -13,39 +14,182 @@ from .. import config
 
 class AIInstrumentSelector:
     """
-    AI-powered instrument selector that uses OpenAI to generate curated lists of trading instruments
-    based on user-defined prompts and criteria.
+    AI-powered instrument selector that uses OpenAI or NagaAI to generate curated lists 
+    of trading instruments based on user-defined prompts and criteria.
+    Supports web search capabilities for real-time market data.
     """
 
-    def __init__(self):
-        """Initialize the AI instrument selector with OpenAI client."""
+    def __init__(self, model_string: Optional[str] = None):
+        """
+        Initialize the AI instrument selector with OpenAI client.
+        
+        Args:
+            model_string: Model to use in format "Provider/ModelName" (e.g., "NagaAI/gpt-5-2025-08-07" or "OpenAI/gpt-5")
+                         If None, uses config.OPENAI_MODEL
+        """
         self.client = None
-        self._initialize_openai_client()
+        self.model_string = model_string or config.OPENAI_MODEL
+        self.provider = None  # "openai" or "nagaai"
+        self.model = None     # Model name without provider prefix
+        self.api_type = None  # "responses" (OpenAI) or "chat" (NagaAI)
+        
+        self._parse_model_string()
+        self._initialize_client()
 
-    def _initialize_openai_client(self):
+    def _parse_model_string(self):
+        """Parse model string to extract provider and model name."""
+        try:
+            if "/" in self.model_string:
+                provider_part, model_part = self.model_string.split("/", 1)
+                self.provider = provider_part.lower()
+                self.model = model_part
+            else:
+                # No provider specified, assume it's just a model name for OpenAI
+                self.provider = "openai"
+                self.model = self.model_string
+            
+            # Determine API type based on provider
+            if self.provider == "openai":
+                self.api_type = "responses"  # Use responses API with web_search_preview
+            elif self.provider == "nagaai":
+                self.api_type = "chat"  # Use chat completions API with web_search_options
+            else:
+                logger.warning(f"Unknown provider '{self.provider}' in model string '{self.model_string}', defaulting to OpenAI")
+                self.provider = "openai"
+                self.api_type = "responses"
+            
+            logger.debug(f"Parsed model string '{self.model_string}': provider={self.provider}, model={self.model}, api_type={self.api_type}")
+            
+        except Exception as e:
+            logger.error(f"Error parsing model string '{self.model_string}': {e}")
+            self.provider = "openai"
+            self.model = "gpt-5"
+            self.api_type = "responses"
+
+    def _initialize_client(self):
         """Initialize OpenAI client with API key from database settings."""
         try:
-            # Get OpenAI API key from database
             from sqlmodel import select
             session = get_db()
-            openai_key_setting = session.exec(select(AppSetting).where(AppSetting.key == 'openai_api_key')).first()
+            
+            # Get appropriate API key based on provider
+            if self.provider == "openai":
+                key_setting = session.exec(select(AppSetting).where(AppSetting.key == 'openai_api_key')).first()
+                base_url = None
+            elif self.provider == "nagaai":
+                key_setting = session.exec(select(AppSetting).where(AppSetting.key == 'naga_ai_api_key')).first()
+                base_url = "https://api.naga.ac/v1"
+            else:
+                key_setting = session.exec(select(AppSetting).where(AppSetting.key == 'openai_api_key')).first()
+                base_url = None
+            
             session.close()
             
-            if not openai_key_setting or not openai_key_setting.value_str:
-                # API key not configured - this is expected in some cases
-                logger.debug("OpenAI API key not found in settings. AI selection will not be available.")
+            if not key_setting or not key_setting.value_str:
+                logger.debug(f"{self.provider.upper()} API key not found in settings. AI selection will not be available.")
                 return
 
-            self.client = OpenAI(api_key=openai_key_setting.value_str)
-            logger.debug(f"OpenAI client initialized successfully with model: {config.OPENAI_MODEL}")
+            # Initialize client with appropriate configuration
+            if base_url:
+                self.client = OpenAI(api_key=key_setting.value_str, base_url=base_url)
+            else:
+                self.client = OpenAI(api_key=key_setting.value_str)
+            
+            logger.debug(f"OpenAI client initialized successfully for {self.provider}/{self.model}")
 
         except Exception as e:
-            # Check if this is just a missing API key (expected) vs other errors (unexpected)
-            if "openai_api_key" in str(e) and "not found" in str(e):
-                logger.debug("OpenAI API key not configured - AI selection will be unavailable")
-            else:
-                logger.error(f"Failed to initialize OpenAI client: {e}")
+            logger.error(f"Failed to initialize OpenAI client for {self.provider}: {e}")
             self.client = None
+
+    def _call_openai_responses_api(self, prompt: str) -> str:
+        """Call OpenAI Responses API with web search."""
+        response = self.client.responses.create(
+            model=self.model,
+            input=[
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": prompt,
+                        }
+                    ],
+                }
+            ],
+            text={"format": {"type": "text"}},
+            reasoning={},
+            tools=[
+                {
+                    "type": "web_search_preview",
+                    "user_location": {"type": "approximate"},
+                    "search_context_size": "low",
+                }
+            ],
+            temperature=1,
+            max_output_tokens=4096,
+            top_p=1,
+            store=True,
+        )
+        
+        # Extract text from response
+        result_text = ""
+        try:
+            if hasattr(response, 'output') and response.output:
+                for item in response.output:
+                    if hasattr(item, 'content'):
+                        if isinstance(item.content, list):
+                            for content_item in item.content:
+                                if hasattr(content_item, 'text'):
+                                    result_text += content_item.text
+                        elif hasattr(item.content, 'text'):
+                            result_text += item.content.text
+        except Exception as extract_error:
+            logger.error(f"Error extracting text from OpenAI Responses API: {extract_error}")
+            raise
+        
+        return result_text.strip()
+    
+    def _call_nagaai_chat_api(self, prompt: str) -> str:
+        """Call NagaAI Chat Completions API with web_search_options."""
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            web_search_options={
+                # Enable web search with default options
+                # For Grok models, optionally add: "return_citations": True
+            },
+            temperature=1.0,
+            max_tokens=4096,
+            top_p=1.0
+        )
+        
+        # Extract text from chat completion response
+        try:
+            if hasattr(response, 'choices') and response.choices:
+                choice = response.choices[0]
+                if hasattr(choice, 'message') and hasattr(choice.message, 'content'):
+                    return choice.message.content
+        except Exception as extract_error:
+            logger.error(f"Error extracting text from NagaAI Chat API: {extract_error}")
+            raise
+        
+        return ""
+    
+    def _call_ai_api(self, prompt: str) -> str:
+        """Call appropriate AI API based on provider type."""
+        try:
+            if self.api_type == 'responses':
+                return self._call_openai_responses_api(prompt)
+            else:  # chat
+                return self._call_nagaai_chat_api(prompt)
+        except Exception as e:
+            logger.error(f"Error calling {self.api_type} API for {self.model_string}: {e}", exc_info=True)
+            raise
 
     def get_default_prompt(self) -> str:
         """
@@ -82,47 +226,18 @@ Your response:"""
             Optional[List[str]]: List of selected instrument symbols, or None if failed
         """
         if not self.client:
-            raise Exception("OpenAI API key not configured. Please set up your OpenAI API key in the application settings.")
+            raise Exception(f"{self.provider.upper()} API key not configured. Please set up your API key in the application settings.")
 
         try:
             # Use provided prompt or default
             selection_prompt = prompt if prompt else self.get_default_prompt()
             
-            logger.info(f"Requesting AI instrument selection using model: {config.OPENAI_MODEL}")
+            logger.info(f"Requesting AI instrument selection using model: {self.model_string}")
             logger.debug(f"Using prompt: {selection_prompt[:200]}...")
 
-            # Make request to OpenAI using configured model
-            # Use appropriate parameters based on model
-            is_gpt5 = "gpt-5" in config.OPENAI_MODEL.lower()
-            
-            request_params = {
-                "model": config.OPENAI_MODEL,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are a professional financial advisor with expertise in stock market analysis and portfolio construction."
-                    },
-                    {
-                        "role": "user", 
-                        "content": selection_prompt
-                    }
-                ]
-            }
-            
-            # Add model-specific parameters
-            if is_gpt5:
-                # GPT-5 only supports default temperature (1) and uses max_completion_tokens
-                request_params["max_completion_tokens"] = 50000
-                # Don't set temperature for GPT-5 (uses default 1)
-            else:
-                # Other models support custom temperature and use max_tokens
-                request_params["temperature"] = 0.3
-                request_params["max_tokens"] = 50000
-            
-            response = self.client.chat.completions.create(**request_params)
-
-            # Extract response content
-            response_content = response.choices[0].message.content
+            # Call appropriate API with web search enabled
+            response_content = self._call_ai_api(selection_prompt)
+                
             if not response_content:
                 logger.error("AI returned empty response")
                 return None
@@ -181,55 +296,7 @@ Your response:"""
                 return self._extract_symbols_from_text(response_content)
 
         except Exception as e:
-            logger.error(f"Error during AI instrument selection with {config.OPENAI_MODEL}: {e}")
-            
-            # Try fallback model if primary model fails and it's not already the fallback
-            if hasattr(config, 'OPENAI_FALLBACK_MODEL') and config.OPENAI_MODEL != config.OPENAI_FALLBACK_MODEL:
-                logger.info(f"Trying fallback model: {config.OPENAI_FALLBACK_MODEL}")
-                try:
-                    fallback_params = {
-                        "model": config.OPENAI_FALLBACK_MODEL,
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": "You are a professional financial advisor with expertise in stock market analysis and portfolio construction."
-                            },
-                            {
-                                "role": "user", 
-                                "content": selection_prompt
-                            }
-                        ],
-                        "temperature": 0.3,
-                        "max_tokens": 1000
-                    }
-                    
-                    fallback_response = self.client.chat.completions.create(**fallback_params)
-                    response_content = fallback_response.choices[0].message.content
-                    
-                    if response_content:
-                        response_content = response_content.strip()
-                        logger.debug(f"Fallback AI response: {response_content}")
-                        
-                        try:
-                            instruments = json.loads(response_content)
-                            if isinstance(instruments, list):
-                                valid_instruments = []
-                                for item in instruments:
-                                    if isinstance(item, str) and len(item) > 0:
-                                        symbol = item.strip().upper()
-                                        if symbol.isalpha() and len(symbol) <= 10:
-                                            valid_instruments.append(symbol)
-                                
-                                if valid_instruments:
-                                    logger.info(f"Fallback model selected {len(valid_instruments)} instruments: {valid_instruments}")
-                                    return valid_instruments
-                        except json.JSONDecodeError:
-                            logger.warning("Fallback model also returned invalid JSON, trying text extraction")
-                            return self._extract_symbols_from_text(response_content)
-                            
-                except Exception as fallback_e:
-                    logger.error(f"Fallback model also failed: {fallback_e}")
-            
+            logger.error(f"Error during AI instrument selection with {self.model_string}: {e}")
             return None
 
     def _extract_symbols_from_text(self, text: str) -> Optional[List[str]]:
@@ -302,7 +369,7 @@ Your response:"""
 
     def test_connection(self) -> bool:
         """
-        Test the OpenAI connection with a simple request.
+        Test the AI API connection with a simple request.
         
         Returns:
             bool: True if connection successful, False otherwise
@@ -311,34 +378,43 @@ Your response:"""
             return False
             
         try:
-            # Use appropriate parameters based on model
-            is_gpt5 = "gpt-5" in config.OPENAI_MODEL.lower()
+            # Simple test prompt
+            test_prompt = "Hello"
             
-            request_params = {
-                "model": config.OPENAI_MODEL,
-                "messages": [{"role": "user", "content": "Hello"}]
-            }
-            
-            # Add model-specific parameters
-            if is_gpt5:
-                request_params["max_completion_tokens"] = 10
-                # Don't set temperature for GPT-5
-            else:
-                request_params["max_tokens"] = 10
-                request_params["temperature"] = 0.3
-            
-            response = self.client.chat.completions.create(**request_params)
+            # Call appropriate API
+            if self.api_type == 'responses':
+                response = self.client.responses.create(
+                    model=self.model,
+                    input=[
+                        {
+                            "role": "system",
+                            "content": [{"type": "input_text", "text": test_prompt}]
+                        }
+                    ],
+                    text={"format": {"type": "text"}},
+                    max_output_tokens=10
+                )
+            else:  # chat
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": test_prompt}],
+                    max_tokens=10
+                )
             return True
         except Exception as e:
-            logger.error(f"OpenAI connection test failed: {e}")
+            logger.error(f"{self.provider.upper()} connection test failed: {e}")
             return False
 
 
-def get_ai_instrument_selector() -> AIInstrumentSelector:
+def get_ai_instrument_selector(model_string: Optional[str] = None) -> AIInstrumentSelector:
     """
     Factory function to get an AI instrument selector instance.
+    
+    Args:
+        model_string: Model to use in format "Provider/ModelName" (e.g., "NagaAI/gpt-5-2025-08-07")
+                     If None, uses config.OPENAI_MODEL
     
     Returns:
         AIInstrumentSelector: Configured AI instrument selector instance
     """
-    return AIInstrumentSelector()
+    return AIInstrumentSelector(model_string=model_string)

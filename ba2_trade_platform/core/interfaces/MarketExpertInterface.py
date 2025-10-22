@@ -100,6 +100,51 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "type": "float", "required": False, "default": 10.0,
                     "description": "Maximum virtual equity allocation per instrument (%)",
                     "tooltip": "Maximum percentage of virtual trading balance that can be allocated to a single instrument. This helps maintain portfolio diversification. Recommended: 5-15%. Lower values (5-10%) provide better diversification, higher values (10-15%) allow larger positions in high-confidence trades."
+                },
+                # AI Model Settings
+                "risk_manager_model": {
+                    "type": "str", "required": True, "default": "NagaAI/gpt-5-2025-08-07",
+                    "description": "Model for risk management analysis",
+                    "valid_values": [
+                        # OpenAI GPT-5 (direct - best for analysis)
+                        "OpenAI/gpt-5", "OpenAI/gpt-5-mini", "OpenAI/gpt-5-nano",
+                        # NagaAI GPT-5 (latest, excellent analysis)
+                        "NagaAI/gpt-5-2025-08-07",
+                        "NagaAI/gpt-5-mini-2025-08-07",
+                        "NagaAI/gpt-5-chat-latest",
+                        "NagaAI/gpt-5-codex",
+                        # NagaAI GPT-4o Search (optimized for web search)
+                        "NagaAI/gpt-4o-search-preview-2025-03-11",
+                        # NagaAI Grok-4 (excellent for real-time search with X integration)
+                        "NagaAI/grok-4-0709",
+                        "NagaAI/grok-4-fast-non-reasoning",
+                        "NagaAI/grok-4-fast-reasoning",
+                    ],
+                    "allow_custom": True,
+                    "help": "For more information, see [OpenAI Docs](https://platform.openai.com/docs/models) and [Naga AI Web Search](https://docs.naga.ac/features/web-search)",
+                    "tooltip": "The model used for risk management analysis with web search capabilities. Format: Provider/ModelName. Optimized for risk analysis: GPT-5 (best reasoning), GPT-4o-search (web-optimized), Grok-4 (real-time data). You can also enter custom model names."
+                },
+                "dynamic_instrument_selection_model": {
+                    "type": "str", "required": True, "default": "NagaAI/gpt-5-2025-08-07",
+                    "description": "Model for dynamic AI instrument selection",
+                    "valid_values": [
+                        # OpenAI GPT-5 (direct - best for search)
+                        "OpenAI/gpt-5", "OpenAI/gpt-5-mini", "OpenAI/gpt-5-nano",
+                        # NagaAI GPT-5 (latest, excellent search)
+                        "NagaAI/gpt-5-2025-08-07",
+                        "NagaAI/gpt-5-mini-2025-08-07",
+                        "NagaAI/gpt-5-chat-latest",
+                        "NagaAI/gpt-5-codex",
+                        # NagaAI GPT-4o Search (optimized for web search)
+                        "NagaAI/gpt-4o-search-preview-2025-03-11",
+                        # NagaAI Grok-4 (excellent for real-time search with X integration)
+                        "NagaAI/grok-4-0709",
+                        "NagaAI/grok-4-fast-non-reasoning",
+                        "NagaAI/grok-4-fast-reasoning",
+                    ],
+                    "allow_custom": True,
+                    "help": "For more information, see [OpenAI Docs](https://platform.openai.com/docs/models) and [Naga AI Web Search](https://docs.naga.ac/features/web-search)",
+                    "tooltip": "The model used for dynamic AI-powered instrument selection with web search capabilities. Format: Provider/ModelName. Optimized for market research: GPT-5 (best general search), GPT-4o-search (web-optimized), Grok-4 (real-time with X/Twitter integration). You can also enter custom model names."
                 }
                 
             }

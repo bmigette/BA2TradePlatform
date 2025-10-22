@@ -319,6 +319,9 @@ FINAL_SUMMARIZATION_AGENT_PROMPT = """You are the Final Summarization Agent for 
 **Risk Levels**: LOW (high certainty in final decision) | MEDIUM (moderate certainty) | HIGH (low certainty or volatile conditions)
 
 **Time Horizons**: Extract from the analysis context or default to MEDIUM_TERM
+- SHORT_TERM: Less than 3 months investment period
+- MEDIUM_TERM: 3 to 9 months investment period  
+- LONG_TERM: Greater than 9 months investment period
 
 **NEVER suggest actions that contradict the final_trade_decision. Your role is to format and support the decision, not to override it.**"""
 

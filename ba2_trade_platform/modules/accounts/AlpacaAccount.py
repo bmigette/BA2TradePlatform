@@ -1,5 +1,5 @@
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, LimitOrderRequest, StopOrderRequest
+from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, LimitOrderRequest, StopOrderRequest, ReplaceOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
 from alpaca.common.exceptions import APIError
 from typing import Any, Dict, Optional
@@ -11,7 +11,7 @@ from ...logger import logger
 from ...core.models import TradingOrder, Position, Transaction
 from ...core.types import OrderDirection, OrderStatus, OrderOpenType
 from ...core.interfaces import AccountInterface
-from ...core.db import get_db, get_instance, update_instance
+from ...core.db import get_db, get_instance, update_instance, add_instance
 from sqlmodel import Session, select
 
 def alpaca_api_retry(func):
@@ -497,6 +497,9 @@ class AlpacaAccount(AccountInterface):
         """
         Modify an existing order in Alpaca.
         
+        Note: Alpaca's replace_order_by_id() replaces an order by canceling the existing one
+        and creating a new one with the updated parameters.
+        
         Args:
             order_id (str): The ID of the order to modify.
             trading_order (TradingOrder): The new order details.
@@ -509,13 +512,42 @@ class AlpacaAccount(AccountInterface):
             limit_price = self._round_price(trading_order.limit_price, trading_order.symbol) if trading_order.limit_price is not None else None
             stop_price = self._round_price(trading_order.stop_price, trading_order.symbol) if trading_order.stop_price is not None else None
             
-            order = self.client.replace_order(
-                order_id=order_id,
+            # Map good_for to TimeInForce enum if provided
+            time_in_force = None
+            if trading_order.good_for:
+                good_for_value = trading_order.good_for.lower()
+                tif_map = {
+                    'day': TimeInForce.DAY,
+                    'gtc': TimeInForce.GTC,
+                    'opg': TimeInForce.OPG,
+                    'ioc': TimeInForce.IOC,
+                    'fok': TimeInForce.FOK,
+                    'cls': TimeInForce.CLS,
+                }
+                time_in_force = tif_map.get(good_for_value, TimeInForce.GTC)
+            
+            # Regenerate tracking comment with new epoch time to ensure unique client_order_id
+            # This prevents Alpaca's "client_order_id must be unique" error when modifying orders
+            new_tracking_comment = self._generate_tracking_comment(trading_order)
+            
+            # Create ReplaceOrderRequest
+            replace_request = ReplaceOrderRequest(
                 qty=trading_order.quantity,
-                time_in_force=trading_order.good_for,
+                time_in_force=time_in_force,
                 limit_price=limit_price,
-                stop_price=stop_price
+                stop_price=stop_price,
+                client_order_id=new_tracking_comment
             )
+            
+            # Alpaca uses replace_order_by_id() method
+            order = self.client.replace_order_by_id(
+                order_id=order_id,
+                order_data=replace_request
+            )
+            
+            # Update the trading_order comment with the new tracking comment
+            trading_order.comment = new_tracking_comment
+            
             logger.info(f"Modified Alpaca order: {order.id}")
             return self.alpaca_order_to_tradingorder(order)
         except Exception as e:
@@ -892,15 +924,20 @@ class AlpacaAccount(AccountInterface):
         """
         Update an already-submitted Alpaca TP order with a new price.
         
-        Uses Alpaca's modify_order API to update the limit price directly without
-        canceling and recreating the order. This ensures continuity and maintains
-        the order ID at the broker.
+        Alpaca's replace_order API creates a NEW replacement order and marks the original as REPLACED.
+        This method:
+        1. Sends replace request to Alpaca (creates NEW order, marks old as REPLACED)
+        2. Creates NEW database TradingOrder record with new broker_order_id
+        3. Calls refresh_orders() to sync the old order status (REPLACED)
         
         Args:
             tp_order: The TP order TradingOrder object (with broker_order_id set)
             new_tp_price: The new take profit price
         """
         try:
+            from ..db import add_instance
+            from datetime import datetime, timezone
+            
             if not self.client:
                 raise ValueError("Alpaca client not initialized")
             
@@ -908,32 +945,96 @@ class AlpacaAccount(AccountInterface):
                 logger.warning(f"TP order {tp_order.id} has no broker_order_id, cannot update at Alpaca")
                 return
             
-            # Modify the order at Alpaca with the new limit price
+            old_broker_order_id = tp_order.broker_order_id
+            old_order_id = tp_order.id
+            
+            # Log replacement operation
             logger.info(
-                f"Modifying Alpaca TP order {tp_order.broker_order_id} (database ID: {tp_order.id}) "
+                f"Replacing Alpaca TP order {old_broker_order_id} (database ID: {old_order_id}) "
                 f"from ${tp_order.limit_price:.2f} to ${new_tp_price:.2f}"
             )
             
-            modified_order = self.modify_order(tp_order.broker_order_id, {"limit_price": new_tp_price})
+            # Clone the tp_order for the replacement request
+            temp_order = TradingOrder(
+                account_id=tp_order.account_id,
+                symbol=tp_order.symbol,
+                quantity=tp_order.quantity,
+                side=tp_order.side,
+                order_type=tp_order.order_type,
+                limit_price=new_tp_price,  # New price
+                stop_price=tp_order.stop_price,
+                transaction_id=tp_order.transaction_id,
+                status=tp_order.status,
+                good_for=tp_order.good_for,
+                comment=tp_order.comment
+            )
+            
+            # Send replace request to Alpaca - this creates a NEW order and marks old one as REPLACED
+            replacement_order = self.modify_order(old_broker_order_id, temp_order)
+            
+            if not replacement_order:
+                raise Exception(f"Failed to replace Alpaca TP order {old_broker_order_id} - modify_order returned None")
+            
+            # Create NEW database order record with the replacement order details
+            new_broker_order_id = replacement_order.broker_order_id
+            new_tp_order = TradingOrder(
+                account_id=tp_order.account_id,
+                symbol=tp_order.symbol,
+                quantity=tp_order.quantity,
+                side=tp_order.side,
+                order_type=tp_order.order_type,
+                limit_price=new_tp_price,
+                stop_price=tp_order.stop_price,
+                transaction_id=tp_order.transaction_id,
+                status=replacement_order.status,  # Use status from Alpaca
+                broker_order_id=new_broker_order_id,
+                depends_on_order=tp_order.depends_on_order,
+                depends_order_status_trigger=tp_order.depends_order_status_trigger,
+                expert_recommendation_id=tp_order.expert_recommendation_id,
+                open_type=tp_order.open_type,
+                comment=replacement_order.comment,  # Use new tracking comment from replacement
+                data=tp_order.data,  # Preserve TP/SL metadata
+                good_for=tp_order.good_for,
+                created_at=datetime.now(timezone.utc)
+            )
+            
+            new_order_id = add_instance(new_tp_order, expunge_after_flush=True)
             
             logger.info(
-                f"Successfully modified Alpaca TP order {tp_order.broker_order_id} to new price ${new_tp_price:.2f}"
+                f"Successfully replaced Alpaca TP order: "
+                f"Old database_id={old_order_id}, broker_order_id={old_broker_order_id} → "
+                f"New database_id={new_order_id}, broker_order_id={new_broker_order_id}, "
+                f"New price=${new_tp_price:.2f}"
             )
+            
+            # Refresh orders from broker to sync the old order status (should now be REPLACED)
+            logger.debug(f"Refreshing orders from broker to sync old TP order {old_broker_order_id} status to REPLACED")
+            self.refresh_orders()
             
         except Exception as e:
             logger.error(
-                f"Error updating broker TP order {tp_order.broker_order_id} from ${tp_order.limit_price:.2f} to ${new_tp_price:.2f}: {e}",
+                f"Error replacing broker TP order {tp_order.broker_order_id}: {e}",
                 exc_info=True
             )
             raise
 
     def _update_broker_sl_order(self, sl_order: TradingOrder, new_sl_price: float) -> None:
         """
-        Update an already-submitted Alpaca SL order with a new price.
+        Replace an already-submitted Alpaca SL order with a new price.
         
-        Uses Alpaca's modify_order API to update the stop price directly without
-        canceling and recreating the order. This ensures continuity and maintains
-        the order ID at the broker.
+        Alpaca's replace_order API creates a NEW replacement order and marks the original as REPLACED.
+        This method creates a NEW database record for the replacement order to preserve order history.
+        
+        Process:
+        1. Store old order details (database ID and broker_order_id)
+        2. Create temporary order with new stop_price for API call
+        3. Submit replacement request to Alpaca (creates NEW order at broker)
+        4. Create NEW TradingOrder database record with replacement broker_order_id
+        5. Call refresh_orders() to mark old order as REPLACED
+        
+        After this method:
+        - Old database order: status=REPLACED (synced by refresh_orders)
+        - New database order: status=NEW/ACCEPTED with new broker_order_id
         
         Args:
             sl_order: The SL order TradingOrder object (with broker_order_id set)
@@ -947,21 +1048,74 @@ class AlpacaAccount(AccountInterface):
                 logger.warning(f"SL order {sl_order.id} has no broker_order_id, cannot update at Alpaca")
                 return
             
-            # Modify the order at Alpaca with the new stop price
+            # Store old order identifiers for logging
+            old_order_id = sl_order.id
+            old_broker_order_id = sl_order.broker_order_id
+            
             logger.info(
-                f"Modifying Alpaca SL order {sl_order.broker_order_id} (database ID: {sl_order.id}) "
+                f"Replacing Alpaca SL order {old_broker_order_id} (database ID: {old_order_id}) "
                 f"from ${sl_order.stop_price:.2f} to ${new_sl_price:.2f}"
             )
             
-            modified_order = self.modify_order(sl_order.broker_order_id, {"stop_price": new_sl_price})
+            # Create temporary order for API call with new price
+            # We don't modify sl_order itself since we'll create a NEW database record
+            temp_order = TradingOrder(
+                transaction_id=sl_order.transaction_id,
+                broker_order_id=old_broker_order_id,  # For the API call
+                symbol=sl_order.symbol,
+                quantity=sl_order.quantity,
+                side=sl_order.side,
+                order_type=sl_order.order_type,
+                time_in_force=sl_order.time_in_force,
+                stop_price=new_sl_price,  # New price
+                limit_price=sl_order.limit_price,
+                status=sl_order.status,
+                comment=sl_order.comment,
+                submitted_at=sl_order.submitted_at
+            )
+            
+            # Send replace request to Alpaca - this creates a NEW order and marks old one as REPLACED
+            replacement_order = self.modify_order(old_broker_order_id, temp_order)
+            
+            if not replacement_order:
+                raise Exception(f"Failed to replace Alpaca SL order {old_broker_order_id} - modify_order returned None")
+            
+            # Create NEW database record for the replacement order
+            new_tp_order = TradingOrder(
+                transaction_id=sl_order.transaction_id,
+                broker_order_id=replacement_order.broker_order_id,  # NEW broker order ID
+                symbol=sl_order.symbol,
+                quantity=sl_order.quantity,
+                side=sl_order.side,
+                order_type=sl_order.order_type,
+                time_in_force=sl_order.time_in_force,
+                stop_price=new_sl_price,
+                limit_price=sl_order.limit_price,
+                status=replacement_order.status,  # Status from broker (typically NEW or ACCEPTED)
+                comment=replacement_order.comment,  # Tracking comment from broker
+                submitted_at=replacement_order.submitted_at
+            )
+            
+            # Add NEW order to database
+            new_order_id = add_instance(new_tp_order, expunge_after_flush=True)
             
             logger.info(
-                f"Successfully modified Alpaca SL order {sl_order.broker_order_id} to new price ${new_sl_price:.2f}"
+                f"Successfully replaced Alpaca SL order - created NEW database record: "
+                f"Old database_id={old_order_id}, Old broker_order_id={old_broker_order_id} → "
+                f"New database_id={new_order_id}, New broker_order_id={replacement_order.broker_order_id}, "
+                f"New price=${new_sl_price:.2f}"
             )
+            
+            # Refresh orders from broker to sync the old order status (will be marked REPLACED)
+            logger.debug(
+                f"Refreshing orders from broker to sync old SL order {old_broker_order_id} "
+                f"(database ID: {old_order_id}) status to REPLACED"
+            )
+            self.refresh_orders()
             
         except Exception as e:
             logger.error(
-                f"Error updating broker SL order {sl_order.broker_order_id} from ${sl_order.stop_price:.2f} to ${new_sl_price:.2f}: {e}",
+                f"Error replacing broker SL order {sl_order.broker_order_id}: {e}",
                 exc_info=True
             )
             raise

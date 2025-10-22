@@ -1368,6 +1368,59 @@ class ExpertSettingsTab:
                         
                         ui.separator().classes('my-4')
                         
+                        # AI Model Settings
+                        ui.label('AI Model Settings:').classes('text-subtitle2 mb-2')
+                        ui.label('Configure AI models used by this expert for various tasks:').classes('text-body2 mb-2')
+                        
+                        with ui.column().classes('w-full gap-2'):
+                            # Risk Manager Model
+                            ui.label('Risk Manager Model:').classes('text-sm font-medium')
+                            self.risk_manager_model_select = ui.select(
+                                options=[
+                                    'NagaAI/gpt-5-2025-08-07',
+                                    'NagaAI/gpt-5-mini-2025-08-07',
+                                    'NagaAI/claude-opus-4-20250514',
+                                    'NagaAI/claude-sonnet-4-20250514',
+                                    'NagaAI/o1-2024-12-17',
+                                    'NagaAI/o1-mini-2024-09-12',
+                                    'NagaAI/o3-mini-2025-01-31',
+                                    'OpenAI/gpt-4o',
+                                    'OpenAI/gpt-4o-mini',
+                                    'OpenAI/o1',
+                                    'OpenAI/o1-mini',
+                                    'OpenAI/o3-mini'
+                                ],
+                                label='Model for risk analysis',
+                                value='NagaAI/gpt-5-2025-08-07',
+                                with_input=True
+                            ).classes('w-full')
+                            ui.label('AI model used for risk management analysis and decision-making').classes('text-body2 text-grey-7 ml-2')
+                            
+                            # Dynamic Instrument Selection Model
+                            ui.label('Dynamic Instrument Selection Model:').classes('text-sm font-medium mt-2')
+                            self.dynamic_instrument_selection_model_select = ui.select(
+                                options=[
+                                    'NagaAI/gpt-5-2025-08-07',
+                                    'NagaAI/gpt-5-mini-2025-08-07',
+                                    'NagaAI/claude-opus-4-20250514',
+                                    'NagaAI/claude-sonnet-4-20250514',
+                                    'NagaAI/o1-2024-12-17',
+                                    'NagaAI/o1-mini-2024-09-12',
+                                    'NagaAI/o3-mini-2025-01-31',
+                                    'OpenAI/gpt-4o',
+                                    'OpenAI/gpt-4o-mini',
+                                    'OpenAI/o1',
+                                    'OpenAI/o1-mini',
+                                    'OpenAI/o3-mini'
+                                ],
+                                label='Model for dynamic instrument selection',
+                                value='NagaAI/gpt-5-2025-08-07',
+                                with_input=True
+                            ).classes('w-full')
+                            ui.label('AI model used for dynamically selecting trading instruments based on market conditions').classes('text-body2 text-grey-7 ml-2')
+                        
+                        ui.separator().classes('my-4')
+                        
                         # Ruleset assignment settings
                         ui.label('Automation Rulesets:').classes('text-subtitle2 mb-2')
                         ui.label('Assign rulesets to control automated trading behavior:').classes('text-body2 mb-2')
@@ -1804,6 +1857,15 @@ class ExpertSettingsTab:
             if hasattr(self, 'max_virtual_equity_per_instrument_input'):
                 self.max_virtual_equity_per_instrument_input.value = str(max_virtual_equity_per_instrument)
             
+            # Load AI model settings
+            risk_manager_model = expert.settings.get('risk_manager_model', 'NagaAI/gpt-5-2025-08-07')
+            if hasattr(self, 'risk_manager_model_select'):
+                self.risk_manager_model_select.value = risk_manager_model
+            
+            dynamic_instrument_selection_model = expert.settings.get('dynamic_instrument_selection_model', 'NagaAI/gpt-5-2025-08-07')
+            if hasattr(self, 'dynamic_instrument_selection_model_select'):
+                self.dynamic_instrument_selection_model_select.value = dynamic_instrument_selection_model
+            
             # Load ruleset assignments from ExpertInstance model
             if hasattr(self, 'enter_market_ruleset_select') and hasattr(self, 'enter_market_ruleset_map'):
                 if expert_instance.enter_market_ruleset_id:
@@ -2118,7 +2180,7 @@ class ExpertSettingsTab:
                     
                     with ui.row().classes('w-full justify-between mt-2'):
                         ui.button('Reset to Default', on_click=lambda: self.ai_prompt_textarea.set_value(default_prompt), icon='refresh').classes('bg-gray-500')
-                        ui.button('Test AI Selection', on_click=self._test_ai_selection, icon='auto_awesome').classes('bg-green-600')
+                        self.test_ai_button = ui.button('Test AI Selection', on_click=self._test_ai_selection, icon='auto_awesome').classes('bg-green-600')
 
                 self.instrument_selector = None  # Will be created after AI selection
                 
@@ -2136,7 +2198,7 @@ class ExpertSettingsTab:
         if is_edit and expert_instance:
             self._load_expert_instrument_config(expert_instance)
 
-    def _test_ai_selection(self):
+    async def _test_ai_selection(self):
         """Test AI instrument selection with current prompt."""
         try:
             prompt = self.ai_prompt_textarea.value
@@ -2144,22 +2206,29 @@ class ExpertSettingsTab:
                 ui.notify('Please enter a prompt for AI selection', type='warning')
                 return
             
-            # Show loading notification
-            with ui.dialog() as test_dialog, ui.card():
-                ui.label('Testing AI Selection...').classes('text-lg font-semibold mb-4')
-                ui.spinner(size='lg')
-                ui.label('This may take a few seconds...').classes('text-sm text-gray-600')
-            
-            test_dialog.open()
+            # Disable button and show loading state
+            if hasattr(self, 'test_ai_button'):
+                self.test_ai_button.props('loading disable')
             
             from ...core.AIInstrumentSelector import AIInstrumentSelector
-            ai_selector = AIInstrumentSelector()
             
-            # Use a simple synchronous approach since OpenAI requests are typically fast
-            # and we handle the "not found" case gracefully
+            # Get the model from the dropdown (use current value even if not saved yet)
+            model_string = None
+            if hasattr(self, 'dynamic_instrument_selection_model_select'):
+                model_string = self.dynamic_instrument_selection_model_select.value
+            
+            # Initialize with the selected model (or default if not set)
+            ai_selector = AIInstrumentSelector(model_string=model_string) if model_string else AIInstrumentSelector()
+            
+            # Run AI selection in executor to avoid blocking the UI
             try:
-                result = ai_selector.select_instruments(prompt)
-                test_dialog.close()
+                import asyncio
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(None, ai_selector.select_instruments, prompt)
+                
+                # Re-enable button
+                if hasattr(self, 'test_ai_button'):
+                    self.test_ai_button.props(remove='loading disable')
                 
                 if result:
                     with ui.dialog() as result_dialog, ui.card().classes('w-96'):
@@ -2178,7 +2247,10 @@ class ExpertSettingsTab:
                     ui.notify('AI selection failed. Please check your OpenAI API key configuration.', type='warning')
                     
             except Exception as ai_error:
-                test_dialog.close()
+                # Re-enable button on error
+                if hasattr(self, 'test_ai_button'):
+                    self.test_ai_button.props(remove='loading disable')
+                    
                 logger.error(f'AI selection test failed: {ai_error}')
                 if "openai_api_key" in str(ai_error):
                     ui.notify('OpenAI API key not configured. Please set up your API key in the application settings.', type='warning')
@@ -2186,6 +2258,10 @@ class ExpertSettingsTab:
                     ui.notify(f'AI selection test failed: {str(ai_error)}', type='negative')
             
         except Exception as e:
+            # Re-enable button on error
+            if hasattr(self, 'test_ai_button'):
+                self.test_ai_button.props(remove='loading disable')
+                
             logger.error(f'Error testing AI selection: {e}', exc_info=True)
             ui.notify(f'Error testing AI selection: {str(e)}', type='negative')
     
@@ -2204,7 +2280,7 @@ class ExpertSettingsTab:
             return
         
         try:
-            # Get settings definitions
+            # Get settings definitions (only expert-specific, not builtin)
             settings_def = expert_class.get_settings_definitions()
             current_settings = {}
             
@@ -2913,6 +2989,15 @@ class ExpertSettingsTab:
             max_equity_value = float(self.max_virtual_equity_per_instrument_input.value or 10.0)
             expert.save_setting('max_virtual_equity_per_instrument_percent', max_equity_value, setting_type="float")
             logger.debug(f'Saved risk management: max_virtual_equity_per_instrument_percent={max_equity_value}%')
+        
+        # Save AI model settings
+        if hasattr(self, 'risk_manager_model_select'):
+            expert.save_setting('risk_manager_model', self.risk_manager_model_select.value, setting_type="str")
+            logger.debug(f'Saved AI model setting: risk_manager_model={self.risk_manager_model_select.value}')
+        
+        if hasattr(self, 'dynamic_instrument_selection_model_select'):
+            expert.save_setting('dynamic_instrument_selection_model', self.dynamic_instrument_selection_model_select.value, setting_type="str")
+            logger.debug(f'Saved AI model setting: dynamic_instrument_selection_model={self.dynamic_instrument_selection_model_select.value}')
         
         # Save instrument selection method (moved to main panel)
         if hasattr(self, 'instrument_selection_method_select'):
