@@ -1839,12 +1839,18 @@ Please check back in a few minutes for results."""
         """
         Get a concise summary of a market analysis for Smart Risk Manager.
         
+        Returns structured format that can be parsed by SmartRiskManagerGraph:
+        - Action: BUY/SELL/HOLD
+        - Confidence: XX.X%
+        - Expected Profit: XX.X% (if applicable)
+        - Time Horizon: SHORT_TERM/MEDIUM_TERM/LONG_TERM
+        - Key Insight: Brief description
+        
         Args:
             market_analysis_id: ID of the MarketAnalysis record
             
         Returns:
-            str: Human-readable summary (2-3 sentences) covering symbol, recommendation,
-                 confidence, and key insights
+            str: Structured summary formatted for SmartRiskManager parsing
         """
         try:
             with get_db() as session:
@@ -1862,19 +1868,45 @@ Please check back in a few minutes for results."""
                 status = analysis.status.value if hasattr(analysis.status, 'value') else str(analysis.status)
                 
                 if recommendation:
-                    action = recommendation.action.value if hasattr(recommendation.action, 'value') else str(recommendation.action)
+                    action = recommendation.recommended_action.value if hasattr(recommendation.recommended_action, 'value') else str(recommendation.recommended_action)
                     confidence = recommendation.confidence
                     
-                    # Extract key insight from reasoning
-                    reasoning = recommendation.reasoning or ""
-                    key_insight = reasoning.split('.')[0] if reasoning else "No additional details"
+                    # Extract key insight from details field
+                    details = recommendation.details or ""
+                    key_insight = details.split('.')[0] if details else "No additional details"
                     
-                    return (
-                        f"Analysis for {symbol}: {action} recommendation with {confidence:.1f}% confidence. "
-                        f"Status: {status}. {key_insight}."
-                    )
+                    # Get time horizon (default to MEDIUM_TERM if not specified)
+                    time_horizon = getattr(recommendation, 'time_horizon', 'MEDIUM_TERM')
+                    if hasattr(time_horizon, 'value'):
+                        time_horizon = time_horizon.value
+                    
+                    # Get expected profit if available
+                    expected_profit = getattr(recommendation, 'expected_profit', None)
+                    
+                    # Build structured summary (format for SmartRiskManager parsing)
+                    lines = [
+                        f"Symbol: {symbol}",
+                        f"Action: {action}",
+                        f"Confidence: {confidence:.1f}%",
+                    ]
+                    
+                    if expected_profit is not None and action != "HOLD":
+                        lines.append(f"Expected Profit: {expected_profit:.2f}%")
+                    
+                    lines.extend([
+                        f"Time Horizon: {time_horizon}",
+                        f"Status: {status}",
+                        f"Key Insight: {key_insight}"
+                    ])
+                    
+                    return "\n".join(lines)
                 else:
-                    return f"Analysis for {symbol} (Status: {status}) - No recommendation available yet."
+                    return (
+                        f"Symbol: {symbol}\n"
+                        f"Action: HOLD\n"
+                        f"Status: {status}\n"
+                        f"Note: No recommendation available yet"
+                    )
                     
         except Exception as e:
             self.logger.error(f"Error getting analysis summary for {market_analysis_id}: {e}", exc_info=True)
@@ -1882,7 +1914,10 @@ Please check back in a few minutes for results."""
     
     def get_available_outputs(self, market_analysis_id: int) -> Dict[str, str]:
         """
-        List all available analysis outputs with descriptions.
+        List available agent outputs from the analysis (matching UI tabs structure).
+        
+        Returns agent-level outputs, not raw tool outputs. For debates, all rounds are
+        included in a single output with speaker indications.
         
         Args:
             market_analysis_id: ID of the MarketAnalysis record
@@ -1896,38 +1931,82 @@ Please check back in a few minutes for results."""
                 if not analysis:
                     return {}
                 
-                # Get all analysis outputs
-                outputs = session.exec(
-                    select(AnalysisOutput)
-                    .where(AnalysisOutput.market_analysis_id == market_analysis_id)
-                ).all()
+                # Get state data
+                state = analysis.state if analysis.state else {}
+                trading_state = state.get('trading_agent_graph', {}) if isinstance(state, dict) else {}
                 
-                # Build output map with descriptions
+                # Build output map matching UI tabs structure
                 output_map = {}
                 
-                for output in outputs:
-                    # Parse use_case to determine type
-                    use_case = output.use_case.value if hasattr(output.use_case, 'value') else str(output.use_case)
-                    
-                    # Create friendly description based on use_case and agent
-                    if use_case == "tool_output":
-                        description = f"Data/tool output from {output.agent}"
-                    elif use_case == "llm_output":
-                        description = f"AI analysis from {output.agent}"
-                    elif use_case == "final_recommendation":
-                        description = "Final synthesized recommendation from all analysts"
-                    else:
-                        description = f"Output from {output.agent}"
-                    
-                    # Use output_key as key
-                    output_key = f"{output.agent}_{use_case}_{output.id}"
-                    output_map[output_key] = description
+                # 1. Overall analysis summary (from AnalysisOutput)
+                summary_output = session.exec(
+                    select(AnalysisOutput)
+                    .where(AnalysisOutput.market_analysis_id == market_analysis_id)
+                    .where(AnalysisOutput.type == 'tradingagents_analysis_summary')
+                ).first()
                 
-                # Add a special key for the complete trading state
-                if analysis.state:
-                    output_map["complete_trading_state"] = "Complete internal state with all agent communications and intermediate results"
+                if summary_output:
+                    output_map['analysis_summary'] = "TradingAgents Analysis Summary"
                 
-                self.logger.debug(f"Found {len(output_map)} outputs for analysis {market_analysis_id}")
+                # 2. Individual analyst reports (matching UI tabs)
+                analyst_keys = {
+                    'market_report': 'Market Analysis',
+                    'sentiment_report': 'Social Sentiment Analysis',
+                    'news_report': 'News Analysis',
+                    'fundamentals_report': 'Fundamental Analysis',
+                    'macro_report': 'Macroeconomic Analysis'
+                }
+                
+                for key, description in analyst_keys.items():
+                    if key in trading_state and trading_state[key]:
+                        output_map[key] = description
+                
+                # 3. Investment debate (combined with speaker indications)
+                if 'investment_debate_state' in trading_state:
+                    debate_state = trading_state['investment_debate_state']
+                    if isinstance(debate_state, dict) and debate_state:
+                        # Check for both new format (bull_messages/bear_messages) and legacy format (bull_history/bear_history)
+                        bull_messages = debate_state.get('bull_messages', [])
+                        bear_messages = debate_state.get('bear_messages', [])
+                        
+                        # Legacy format fallback
+                        if not bull_messages and not bear_messages:
+                            bull_history = debate_state.get('bull_history', '')
+                            bear_history = debate_state.get('bear_history', '')
+                            if bull_history or bear_history or debate_state.get('history'):
+                                output_map['investment_debate'] = 'Investment Research Debate (Bull vs Bear)'
+                        elif bull_messages or bear_messages:
+                            output_map['investment_debate'] = 'Investment Research Debate (Bull vs Bear)'
+                
+                # 4. Research manager summary
+                if 'investment_plan' in trading_state and trading_state['investment_plan']:
+                    output_map['investment_plan'] = 'Research Manager Summary'
+                
+                # 5. Trader investment plan
+                if 'trader_investment_plan' in trading_state and trading_state['trader_investment_plan']:
+                    output_map['trader_investment_plan'] = 'Trader Investment Plan'
+                
+                # 6. Risk debate (combined with speaker indications)
+                if 'risk_debate_state' in trading_state:
+                    debate_state = trading_state['risk_debate_state']
+                    if isinstance(debate_state, dict) and debate_state:
+                        # Check for both new format and legacy format
+                        risky_messages = debate_state.get('risky_messages', [])
+                        safe_messages = debate_state.get('safe_messages', [])
+                        neutral_messages = debate_state.get('neutral_messages', [])
+                        
+                        # Legacy format fallback
+                        if not risky_messages and not safe_messages and not neutral_messages:
+                            if debate_state.get('history') or debate_state.get('current_response'):
+                                output_map['risk_debate'] = 'Risk Management Debate (Risky/Safe/Neutral)'
+                        elif risky_messages or safe_messages or neutral_messages:
+                            output_map['risk_debate'] = 'Risk Management Debate (Risky/Safe/Neutral)'
+                
+                # 7. Final trading decision
+                if 'final_trade_decision' in trading_state and trading_state['final_trade_decision']:
+                    output_map['final_trade_decision'] = 'Final Trading Decision'
+                
+                self.logger.debug(f"Found {len(output_map)} agent outputs for analysis {market_analysis_id}")
                 return output_map
                 
         except Exception as e:
@@ -1936,57 +2015,244 @@ Please check back in a few minutes for results."""
     
     def get_output_detail(self, market_analysis_id: int, output_key: str) -> str:
         """
-        Get the full content of a specific analysis output.
+        Get the full content of a specific analysis output or agent summary.
+        
+        For debate outputs, formats all messages with speaker indications (bull/bear, risky/safe/neutral).
+        Implements truncation at ~300K characters (~100K tokens) with <truncated> marker.
         
         Args:
             market_analysis_id: ID of the MarketAnalysis record
             output_key: Key of the output to retrieve (from get_available_outputs)
             
         Returns:
-            str: Complete output content
+            str: Complete output content (truncated if > 300K chars)
             
         Raises:
             KeyError: If output_key is not valid for this analysis
         """
+        MAX_CHARS = 300_000  # Approximately 100K tokens
+        
         try:
             with get_db() as session:
                 analysis = session.get(MarketAnalysis, market_analysis_id)
                 if not analysis:
                     raise KeyError(f"Analysis {market_analysis_id} not found")
                 
-                # Handle special case: complete trading state
-                if output_key == "complete_trading_state":
-                    if analysis.state:
-                        return json.dumps(analysis.state, indent=2)
-                    else:
-                        raise KeyError("Trading state not available")
+                state = analysis.state if analysis.state else {}
+                trading_state = state.get('trading_agent_graph', {}) if isinstance(state, dict) else {}
                 
-                # Parse output_key to extract agent, use_case, and id
-                # Format: {agent}_{use_case}_{id}
-                parts = output_key.rsplit('_', 2)
-                if len(parts) != 3:
-                    raise KeyError(f"Invalid output_key format: {output_key}")
-                
-                agent_name = parts[0]
-                use_case_str = parts[1]
-                output_id = int(parts[2])
-                
-                # Get the specific output
-                output = session.get(AnalysisOutput, output_id)
-                if not output or output.market_analysis_id != market_analysis_id:
-                    raise KeyError(f"Output not found: {output_key}")
-                
-                # Return the output text
-                if output.output_text:
-                    return output.output_text
-                else:
-                    return f"Output {output_key} has no text content"
+                # Handle analysis summary from AnalysisOutput
+                if output_key == 'analysis_summary':
+                    summary_output = session.exec(
+                        select(AnalysisOutput)
+                        .where(AnalysisOutput.market_analysis_id == market_analysis_id)
+                        .where(AnalysisOutput.type == 'tradingagents_analysis_summary')
+                    ).first()
                     
+                    if summary_output and summary_output.text:
+                        result = summary_output.text
+                        if len(result) > MAX_CHARS:
+                            result = result[:MAX_CHARS] + "\n\n<truncated>"
+                        return result
+                    else:
+                        raise KeyError("Analysis summary not found")
+                
+                # Handle analyst reports (simple text from state)
+                analyst_keys = [
+                    'market_report', 'sentiment_report', 'news_report',
+                    'fundamentals_report', 'macro_report', 'investment_plan',
+                    'trader_investment_plan', 'final_trade_decision'
+                ]
+                
+                if output_key in analyst_keys:
+                    if output_key not in trading_state:
+                        raise KeyError(f"Output not found for key: {output_key}")
+                    
+                    content = trading_state[output_key]
+                    if not content or not content.strip():
+                        raise KeyError(f"Output is empty for key: {output_key}")
+                    
+                    # Truncate if necessary
+                    if len(content) > MAX_CHARS:
+                        content = content[:MAX_CHARS] + "\n\n<truncated>"
+                    
+                    return content
+                
+                # Handle investment debate (format with speaker indications)
+                if output_key == 'investment_debate':
+                    if 'investment_debate_state' not in trading_state:
+                        raise KeyError("Investment debate not found")
+                    
+                    debate_state = trading_state['investment_debate_state']
+                    if not isinstance(debate_state, dict):
+                        raise KeyError("Investment debate state is invalid")
+                    
+                    # Try new format first (bull_messages/bear_messages)
+                    bull_messages = debate_state.get('bull_messages', [])
+                    bear_messages = debate_state.get('bear_messages', [])
+                    judge_decision = debate_state.get('judge_decision', '')
+                    
+                    # If new format has data, use it
+                    if bull_messages or bear_messages:
+                        # Format debate with speaker indications
+                        debate_output = "# Investment Research Debate (Bull vs Bear)\n\n"
+                        debate_output += f"**Total Messages:** {len(bull_messages) + len(bear_messages)}\n\n"
+                        debate_output += "---\n\n"
+                        
+                        # Interleave messages: Bull speaks first, then alternates
+                        max_len = max(len(bull_messages), len(bear_messages))
+                        for i in range(max_len):
+                            if i < len(bull_messages):
+                                debate_output += f"## 🐂 Bull Researcher - Message {i+1}\n\n"
+                                debate_output += f"{bull_messages[i]}\n\n"
+                                debate_output += "---\n\n"
+                            
+                            if i < len(bear_messages):
+                                debate_output += f"## 🐻 Bear Researcher - Message {i+1}\n\n"
+                                debate_output += f"{bear_messages[i]}\n\n"
+                                debate_output += "---\n\n"
+                        
+                        # Add judge decision if available
+                        if judge_decision:
+                            debate_output += "## ⚖️ Judge Decision\n\n"
+                            debate_output += f"{judge_decision}\n\n"
+                    else:
+                        # Legacy format fallback (bull_history/bear_history or combined history)
+                        debate_output = "# Investment Research Debate (Bull vs Bear)\n\n"
+                        
+                        bull_history = debate_state.get('bull_history', '')
+                        bear_history = debate_state.get('bear_history', '')
+                        combined_history = debate_state.get('history', '')
+                        
+                        if bull_history:
+                            debate_output += "## 🐂 Bull Researcher History\n\n"
+                            debate_output += f"{bull_history}\n\n"
+                            debate_output += "---\n\n"
+                        
+                        if bear_history:
+                            debate_output += "## 🐻 Bear Researcher History\n\n"
+                            debate_output += f"{bear_history}\n\n"
+                            debate_output += "---\n\n"
+                        
+                        if combined_history and not bull_history and not bear_history:
+                            debate_output += "## Debate History\n\n"
+                            debate_output += f"{combined_history}\n\n"
+                            debate_output += "---\n\n"
+                        
+                        # Add judge decision if available
+                        if judge_decision:
+                            debate_output += "## ⚖️ Judge Decision\n\n"
+                            debate_output += f"{judge_decision}\n\n"
+                        
+                        # Add current response if available (legacy format)
+                        current_response = debate_state.get('current_response', '')
+                        if current_response:
+                            debate_output += "## Current Response\n\n"
+                            debate_output += f"{current_response}\n\n"
+                    
+                    # Truncate if necessary
+                    if len(debate_output) > MAX_CHARS:
+                        debate_output = debate_output[:MAX_CHARS] + "\n\n<truncated>"
+                    
+                    return debate_output
+                
+                # Handle risk debate (format with speaker indications)
+                if output_key == 'risk_debate':
+                    if 'risk_debate_state' not in trading_state:
+                        raise KeyError("Risk debate not found")
+                    
+                    debate_state = trading_state['risk_debate_state']
+                    if not isinstance(debate_state, dict):
+                        raise KeyError("Risk debate state is invalid")
+                    
+                    # Try new format first (risky_messages/safe_messages/neutral_messages)
+                    risky_messages = debate_state.get('risky_messages', [])
+                    safe_messages = debate_state.get('safe_messages', [])
+                    neutral_messages = debate_state.get('neutral_messages', [])
+                    judge_decision = debate_state.get('judge_decision', '')
+                    
+                    # If new format has data, use it
+                    if risky_messages or safe_messages or neutral_messages:
+                        # Format debate with speaker indications
+                        debate_output = "# Risk Management Debate (Risky/Safe/Neutral)\n\n"
+                        debate_output += f"**Total Messages:** {len(risky_messages) + len(safe_messages) + len(neutral_messages)}\n\n"
+                        debate_output += "---\n\n"
+                        
+                        # Interleave messages: Risky → Safe → Neutral cycle
+                        max_len = max(len(risky_messages), len(safe_messages), len(neutral_messages))
+                        for i in range(max_len):
+                            if i < len(risky_messages):
+                                debate_output += f"## ⚡ Risky Analyst - Message {i+1}\n\n"
+                                debate_output += f"{risky_messages[i]}\n\n"
+                                debate_output += "---\n\n"
+                            
+                            if i < len(safe_messages):
+                                debate_output += f"## 🛡️ Safe Analyst - Message {i+1}\n\n"
+                                debate_output += f"{safe_messages[i]}\n\n"
+                                debate_output += "---\n\n"
+                            
+                            if i < len(neutral_messages):
+                                debate_output += f"## ⚖️ Neutral Analyst - Message {i+1}\n\n"
+                                debate_output += f"{neutral_messages[i]}\n\n"
+                                debate_output += "---\n\n"
+                        
+                        # Add judge decision if available
+                        if judge_decision:
+                            debate_output += "## ⚖️ Judge Decision\n\n"
+                            debate_output += f"{judge_decision}\n\n"
+                    else:
+                        # Legacy format fallback (combined history)
+                        debate_output = "# Risk Management Debate (Risky/Safe/Neutral)\n\n"
+                        
+                        history = debate_state.get('history', '')
+                        current_risky = debate_state.get('current_risky_response', '')
+                        current_safe = debate_state.get('current_safe_response', '')
+                        current_neutral = debate_state.get('current_neutral_response', '')
+                        
+                        if history:
+                            debate_output += "## Debate History\n\n"
+                            debate_output += f"{history}\n\n"
+                            debate_output += "---\n\n"
+                        
+                        if current_risky:
+                            debate_output += "## ⚡ Current Risky Response\n\n"
+                            debate_output += f"{current_risky}\n\n"
+                            debate_output += "---\n\n"
+                        
+                        if current_safe:
+                            debate_output += "## 🛡️ Current Safe Response\n\n"
+                            debate_output += f"{current_safe}\n\n"
+                            debate_output += "---\n\n"
+                        
+                        if current_neutral:
+                            debate_output += "## ⚖️ Current Neutral Response\n\n"
+                            debate_output += f"{current_neutral}\n\n"
+                            debate_output += "---\n\n"
+                        
+                        # Add judge decision if available
+                        if judge_decision:
+                            debate_output += "## ⚖️ Judge Decision\n\n"
+                            debate_output += f"{judge_decision}\n\n"
+                        
+                        # Add current response if available (legacy format)
+                        current_response = debate_state.get('current_response', '')
+                        if current_response:
+                            debate_output += "## Current Response\n\n"
+                            debate_output += f"{current_response}\n\n"
+                    
+                    # Truncate if necessary
+                    if len(debate_output) > MAX_CHARS:
+                        debate_output = debate_output[:MAX_CHARS] + "\n\n<truncated>"
+                    
+                    return debate_output
+                
+                raise KeyError(f"Invalid output_key: {output_key}")
+                
         except KeyError:
             raise
         except Exception as e:
-            self.logger.error(f"Error getting output detail for {output_key}: {e}", exc_info=True)
-            raise KeyError(f"Error retrieving output {output_key}: {str(e)}")
+            self.logger.error(f"Error getting output detail: {e}", exc_info=True)
+            raise KeyError(f"Error retrieving output: {str(e)}")
     
     def supports_smart_risk_manager(self) -> bool:
         """
@@ -1996,3 +2262,39 @@ Please check back in a few minutes for results."""
             True (TradingAgents fully implements the interface)
         """
         return True
+    
+    def get_expert_specific_instructions(self, node_name: str) -> str:
+        """
+        Get TradingAgents-specific instructions for Smart Risk Manager nodes.
+        
+        Args:
+            node_name: Name of the node requesting instructions
+            
+        Returns:
+            Expert-specific guidance for the node
+        """
+        if node_name == "research_node":
+            return """
+**TradingAgents Analysis Structure:**
+
+When analyzing TradingAgents outputs, follow this recommended approach:
+
+1. **Start with Overview**: Use `get_analysis_outputs_batch()` to fetch all 'final_trade_decision' outputs across all recent analyses. This gives you a portfolio-wide view of the expert's recommendations.
+
+2. **Dive Deeper as Needed**: If you need more context on specific recommendations, retrieve additional analysis outputs:
+   - `market_report`: Technical analysis and price action
+   - `sentiment_report`: Market sentiment and news analysis
+   - `fundamentals_report`: Company fundamentals and valuation
+   - `news_report`: Recent news and events
+   - `macro_report`: Macroeconomic factors
+   - `investment_plan`: Strategic investment plan
+   - `trader_investment_plan`: Tactical trading plan
+
+3. **Batch Fetching**: Use the batch tool to fetch multiple outputs efficiently and stay within token limits.
+
+**Key Outputs:**
+- `final_trade_decision`: The expert's final recommendation (BUY/SELL/HOLD with confidence)
+- `analysis_summary`: Concise summary of the complete analysis
+"""
+        
+        return ""

@@ -93,6 +93,37 @@ class SmartRiskExpertInterface:
         """
         pass
     
+    def get_expert_specific_instructions(self, node_name: str) -> str:
+        """
+        Get expert-specific instructions for a particular Smart Risk Manager node.
+        
+        This method allows experts to provide custom guidance to the Smart Risk Manager
+        about how to best utilize their analysis outputs. Different nodes may require
+        different approaches based on the expert's data structure and analysis methodology.
+        
+        Args:
+            node_name: Name of the node requesting instructions (e.g., "research_node", "action_node")
+            
+        Returns:
+            str: Expert-specific instructions to be included in the node's prompt.
+                 Return empty string if no special instructions are needed.
+                 
+        Example for TradingAgents in research_node:
+            "When analyzing TradingAgents outputs, start by fetching all 'final_trade_decision' 
+             outputs across all analyses to get a portfolio-wide overview. Then retrieve 
+             additional detailed analysis outputs (fundamentals, technical, sentiment) as needed 
+             for deeper investigation of specific positions or recommendations."
+             
+        Example for other experts:
+            Return "" if no special instructions are needed (default behavior).
+            
+        Note:
+            This method is optional - the default implementation returns empty string.
+            Override this method to provide node-specific guidance that helps the
+            Smart Risk Manager make better use of your expert's analysis structure.
+        """
+        return ""
+    
     def supports_smart_risk_manager(self) -> bool:
         """
         Check if this expert supports Smart Risk Manager integration.

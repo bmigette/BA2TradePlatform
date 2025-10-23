@@ -129,15 +129,15 @@ class JobMonitoringTab:
             
             ui.separator().classes('my-4')
             
-            # Smart Risk Manager jobs table
-            self._create_smart_risk_manager_table()
-            
-            ui.separator().classes('my-4')
-            
             # Worker queue status
             with ui.card().classes('w-full'):
                 ui.label('Worker Queue Status').classes('text-md font-bold')
                 self._create_queue_status()
+            
+            ui.separator().classes('my-4')
+            
+            # Smart Risk Manager jobs table
+            self._create_smart_risk_manager_table()
         
         # Start auto-refresh
         self.start_auto_refresh()
@@ -2797,8 +2797,17 @@ class OrderRecommendationsTab:
     def _run_smart_risk_manager(self, expert_id: int, expert_instance):
         """Enqueue AI-powered Smart Risk Manager workflow to SmartRiskManagerQueue."""
         try:
-            # Get account_id from expert instance
-            account_id = expert_instance.account_id
+            # Get expert instance record from database to access account_id
+            from ...core.db import get_instance
+            from ...core.models import ExpertInstance
+            
+            expert_record = get_instance(ExpertInstance, expert_id)
+            if not expert_record:
+                logger.error(f"Expert instance {expert_id} not found in database")
+                ui.notify(f'Error: Expert instance not found', type='negative')
+                return
+            
+            account_id = expert_record.account_id
             
             # Enqueue Smart Risk Manager job to dedicated queue
             from ...core.SmartRiskManagerQueue import get_smart_risk_manager_queue

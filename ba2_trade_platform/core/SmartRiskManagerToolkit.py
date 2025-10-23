@@ -129,10 +129,16 @@ class SmartRiskManagerToolkit:
         try:
             logger.debug(f"Getting portfolio status for account {self.account_id}")
             
-            # Get account info
-            account_info = self.account.get_account_info()
-            virtual_equity = float(account_info.equity) if account_info else 0.0
-            available_balance = float(account_info.cash) if account_info else 0.0
+            # Get expert virtual balance and available balance using expert methods
+            # These methods already handle virtual equity percentage calculation
+            virtual_balance = self.expert.get_virtual_balance()
+            available_balance = self.expert.get_available_balance()
+            
+            if virtual_balance is None or available_balance is None:
+                logger.error(f"Could not get balance information for expert {self.expert_instance_id}")
+                raise ValueError("Failed to get expert balance information")
+            
+            logger.debug(f"Expert virtual balance: ${virtual_balance:,.2f}, Available balance: ${available_balance:,.2f}")
             
             # Get open transactions (transactions are per expert, not per account)
             with get_db() as session:
@@ -231,12 +237,12 @@ class SmartRiskManagerToolkit:
                     total_position_value += position_value
                     largest_position_value = max(largest_position_value, position_value)
                 
-                # Calculate risk metrics
-                balance_pct_available = (available_balance / virtual_equity * 100) if virtual_equity > 0 else 0.0
-                largest_position_pct = (largest_position_value / virtual_equity * 100) if virtual_equity > 0 else 0.0
+                # Calculate risk metrics using virtual_balance from expert
+                balance_pct_available = (available_balance / virtual_balance * 100) if virtual_balance > 0 else 0.0
+                largest_position_pct = (largest_position_value / virtual_balance * 100) if virtual_balance > 0 else 0.0
                 
                 result = {
-                    "account_virtual_equity": round(virtual_equity, 2),
+                    "account_virtual_equity": round(virtual_balance, 2),
                     "account_available_balance": round(available_balance, 2),
                     "account_balance_pct_available": round(balance_pct_available, 2),
                     "open_positions": open_positions,
@@ -248,7 +254,7 @@ class SmartRiskManagerToolkit:
                     }
                 }
                 
-                logger.debug(f"Portfolio status: {len(open_positions)} positions, equity={virtual_equity}, unrealized_pnl={total_unrealized_pnl}")
+                logger.debug(f"Portfolio status: {len(open_positions)} positions, virtual_balance=${virtual_balance:,.2f}, available_balance=${available_balance:,.2f}, unrealized_pnl={total_unrealized_pnl}")
                 return result
                 
         except Exception as e:
@@ -257,39 +263,36 @@ class SmartRiskManagerToolkit:
 
     def get_recent_analyses(
         self,
-        symbol: Annotated[Optional[str], "Specific symbol to query (None = all recent analyses for this expert)"] = None,
         max_age_hours: Annotated[int, "Maximum age of analyses to return in hours"] = 24
     ) -> List[Dict[str, Any]]:
         """
-        Get recent market analyses for this expert instance.
+        Get recent market analyses for ALL symbols (not filtered by symbol).
         
-        Returns all recent COMPLETED analyses (not just for open positions) since the risk manager
-        needs to evaluate opportunities for opening new positions. If the most recent analysis for
-        a symbol failed, falls back to the previous completed analysis within the time window.
+        Returns all recent COMPLETED analyses for this expert instance within the time window.
+        This allows the risk manager to see the full picture of recent market research across
+        all instruments. If the most recent analysis for a symbol failed, falls back to the
+        previous completed analysis within the time window.
+        
+        Use get_historical_analyses(symbol) to get deeper history for a specific symbol.
         
         Args:
-            symbol: Specific symbol to query (None = all recent analyses for this expert)
-            max_age_hours: Maximum age of analyses to return (default 24 hours)
+            max_age_hours: Maximum age of analyses to return (default 72 hours)
             
         Returns:
             List of analysis summaries with metadata, sorted by timestamp DESC
         """
         try:
-            logger.debug(f"Getting recent analyses for symbol={symbol}, max_age={max_age_hours}h")
+            logger.debug(f"Getting recent analyses for all symbols, max_age={max_age_hours}h")
             
             with get_db() as session:
                 # Query market analyses (use created_at, not analysis_timestamp)
                 cutoff_time = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
                 
-                # Build query - filter by expert instance and time
+                # Build query - filter by expert instance and time only (no symbol filter)
                 query = select(MarketAnalysis).where(
                     MarketAnalysis.expert_instance_id == self.expert_instance_id,
                     MarketAnalysis.created_at >= cutoff_time
                 )
-                
-                # Add symbol filter if specified
-                if symbol:
-                    query = query.where(MarketAnalysis.symbol == symbol)
                 
                 # Order by most recent first
                 query = query.order_by(MarketAnalysis.created_at.desc())
@@ -443,6 +446,173 @@ class SmartRiskManagerToolkit:
                     
         except Exception as e:
             logger.error(f"Error getting analysis output detail: {e}", exc_info=True)
+            raise
+
+    def get_analysis_outputs_batch(
+        self,
+        requests: Annotated[
+            List[Dict[str, Any]], 
+            "List of dicts with 'analysis_id' and 'output_keys' (list of keys to fetch)"
+        ],
+        max_tokens: Annotated[int, "Maximum tokens in response (approximate, using 4 chars/token)"] = 100000
+    ) -> Dict[str, Any]:
+        """
+        Fetch multiple analysis outputs in a single call with automatic truncation.
+        
+        This method allows efficient batch fetching of analysis outputs while preventing
+        token limit overflow. If the combined output exceeds max_tokens, it will truncate
+        and report which items were skipped.
+        
+        Args:
+            requests: List of dicts, each with:
+                - analysis_id (int): MarketAnalysis ID
+                - output_keys (List[str]): List of output keys to fetch
+            max_tokens: Maximum tokens in response (default 100K, ~400K chars)
+            
+        Returns:
+            Dict with:
+                - outputs: List of dicts with analysis_id, output_key, content
+                - truncated: bool - whether truncation occurred
+                - skipped_items: List of (analysis_id, output_key) tuples that were skipped
+                - total_chars: Total characters in response
+                - total_tokens_estimate: Estimated tokens (chars / 4)
+                
+        Example:
+            requests = [
+                {"analysis_id": 123, "output_keys": ["analysis_summary", "market_report"]},
+                {"analysis_id": 124, "output_keys": ["news_report"]}
+            ]
+            result = toolkit.get_analysis_outputs_batch(requests)
+        """
+        try:
+            max_chars = max_tokens * 4  # Approximate: 1 token ≈ 4 chars
+            
+            logger.debug(f"Fetching batch outputs: {len(requests)} requests, max_chars={max_chars:,}")
+            
+            outputs = []
+            skipped_items = []
+            total_chars = 0
+            truncated = False
+            
+            with get_db() as session:
+                for req in requests:
+                    analysis_id = req.get("analysis_id")
+                    output_keys = req.get("output_keys", [])
+                    
+                    if not analysis_id:
+                        logger.warning(f"Skipping request with missing analysis_id: {req}")
+                        continue
+                    
+                    if not output_keys:
+                        logger.warning(f"Skipping request with empty output_keys for analysis {analysis_id}")
+                        continue
+                    
+                    # Get analysis
+                    analysis = session.get(MarketAnalysis, analysis_id)
+                    if not analysis:
+                        logger.warning(f"MarketAnalysis {analysis_id} not found, skipping")
+                        for key in output_keys:
+                            skipped_items.append({"analysis_id": analysis_id, "output_key": key, "reason": "analysis_not_found"})
+                        continue
+                    
+                    # Get expert instance
+                    expert_inst = get_expert_instance_from_id(analysis.expert_instance_id)
+                    if not expert_inst:
+                        logger.warning(f"Expert instance {analysis.expert_instance_id} not found for analysis {analysis_id}")
+                        for key in output_keys:
+                            skipped_items.append({"analysis_id": analysis_id, "output_key": key, "reason": "expert_not_found"})
+                        continue
+                    
+                    # Check if expert implements required methods
+                    if not hasattr(expert_inst, 'get_output_detail'):
+                        logger.warning(f"Expert does not implement get_output_detail() for analysis {analysis_id}")
+                        for key in output_keys:
+                            skipped_items.append({"analysis_id": analysis_id, "output_key": key, "reason": "method_not_implemented"})
+                        continue
+                    
+                    # Fetch each output key
+                    for output_key in output_keys:
+                        # Check if we've exceeded the limit
+                        if total_chars >= max_chars:
+                            truncated = True
+                            skipped_items.append({
+                                "analysis_id": analysis_id, 
+                                "output_key": output_key, 
+                                "reason": "truncated_due_to_size_limit"
+                            })
+                            logger.debug(f"Truncating at analysis {analysis_id}, key {output_key} (reached {total_chars:,} chars)")
+                            continue
+                        
+                        try:
+                            # Fetch the output
+                            detail = expert_inst.get_output_detail(analysis_id, output_key)
+                            detail_length = len(detail)
+                            
+                            # Check if adding this output would exceed limit
+                            if total_chars + detail_length > max_chars:
+                                # Try to fit partial content
+                                remaining_chars = max_chars - total_chars
+                                if remaining_chars > 1000:  # Only include if we can fit at least 1K chars
+                                    truncated_detail = detail[:remaining_chars] + "\n\n<TRUNCATED - Content exceeded size limit>"
+                                    outputs.append({
+                                        "analysis_id": analysis_id,
+                                        "output_key": output_key,
+                                        "symbol": analysis.symbol,
+                                        "content": truncated_detail,
+                                        "truncated": True,
+                                        "original_length": detail_length,
+                                        "included_length": len(truncated_detail)
+                                    })
+                                    total_chars += len(truncated_detail)
+                                else:
+                                    skipped_items.append({
+                                        "analysis_id": analysis_id,
+                                        "output_key": output_key,
+                                        "reason": "insufficient_space_remaining"
+                                    })
+                                
+                                truncated = True
+                                logger.debug(f"Partially included output for analysis {analysis_id}, key {output_key}")
+                            else:
+                                # Add full output
+                                outputs.append({
+                                    "analysis_id": analysis_id,
+                                    "output_key": output_key,
+                                    "symbol": analysis.symbol,
+                                    "content": detail,
+                                    "truncated": False,
+                                    "original_length": detail_length,
+                                    "included_length": detail_length
+                                })
+                                total_chars += detail_length
+                                logger.debug(f"Added output for analysis {analysis_id}, key {output_key} ({detail_length:,} chars)")
+                        
+                        except Exception as e:
+                            logger.error(f"Error fetching output for analysis {analysis_id}, key {output_key}: {e}")
+                            skipped_items.append({
+                                "analysis_id": analysis_id,
+                                "output_key": output_key,
+                                "reason": f"error: {str(e)}"
+                            })
+            
+            total_tokens_estimate = total_chars // 4
+            
+            result = {
+                "outputs": outputs,
+                "truncated": truncated,
+                "skipped_items": skipped_items,
+                "total_chars": total_chars,
+                "total_tokens_estimate": total_tokens_estimate,
+                "items_included": len(outputs),
+                "items_skipped": len(skipped_items)
+            }
+            
+            logger.info(f"Batch fetch complete: {len(outputs)} outputs ({total_chars:,} chars, ~{total_tokens_estimate:,} tokens), {len(skipped_items)} skipped, truncated={truncated}")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error in batch output fetch: {e}", exc_info=True)
             raise
 
     def get_historical_analyses(
@@ -733,6 +903,25 @@ class SmartRiskManagerToolkit:
                         }
                     
                     entry_direction = transaction.trading_orders[0].side
+                    
+                    # Check if adding to position is allowed based on expert settings
+                    settings = self.expert.settings
+                    if entry_direction == OrderDirection.BUY and not settings.get("enable_buy", True):
+                        return {
+                            "success": False,
+                            "message": "Cannot add to long position: BUY orders are disabled in expert settings",
+                            "order_id": None,
+                            "old_quantity": old_quantity,
+                            "new_quantity": new_quantity
+                        }
+                    if entry_direction == OrderDirection.SELL and not settings.get("enable_sell", True):
+                        return {
+                            "success": False,
+                            "message": "Cannot add to short position: SELL orders are disabled in expert settings",
+                            "order_id": None,
+                            "old_quantity": old_quantity,
+                            "new_quantity": new_quantity
+                        }
                     
                     # Create add-to-position order (same direction as entry)
                     add_order = self._create_trading_order(
@@ -1337,14 +1526,15 @@ class SmartRiskManagerToolkit:
         Get all tools as a list for LangChain agent.
         
         Returns:
-            List of LangChain tool objects (all 12 tools)
+            List of LangChain tool objects (all 13 tools)
         """
         return [
-            # Portfolio & Analysis Tools (5)
+            # Portfolio & Analysis Tools (6)
             self.get_portfolio_status,
             self.get_recent_analyses,
             self.get_analysis_outputs,
             self.get_analysis_output_detail,
+            self.get_analysis_outputs_batch,
             self.get_historical_analyses,
             # Trading Action Tools (7)
             self.close_position,

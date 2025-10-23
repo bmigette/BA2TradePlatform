@@ -293,18 +293,39 @@ class SmartRiskManagerQueue:
         try:
             # Import here to avoid circular imports
             from .db import get_instance, add_instance, update_instance
-            from .models import ExpertInstance, SmartRiskManagerJob
+            from .models import SmartRiskManagerJob, ExpertInstance
             from .SmartRiskManagerGraph import run_smart_risk_manager
+            from .utils import get_expert_instance_from_id, get_account_instance_from_id
             
-            # Get the expert instance to retrieve settings
-            expert_instance = get_instance(ExpertInstance, task.expert_instance_id)
+            # Get the expert instance class (not database record) to retrieve settings
+            expert_instance = get_expert_instance_from_id(task.expert_instance_id)
             if not expert_instance:
                 raise ValueError(f"Expert instance {task.expert_instance_id} not found")
             
-            # Get model and user instructions from settings
+            # Get expert database record for virtual_equity_pct
+            expert_record = get_instance(ExpertInstance, task.expert_instance_id)
+            if not expert_record:
+                raise ValueError(f"Expert record {task.expert_instance_id} not found")
+            
+            # Get model and user instructions from settings (via property that loads from ExpertSetting table)
             settings = expert_instance.settings or {}
             model_used = settings.get("llm_model", "")
             user_instructions = settings.get("user_instructions", "")
+            
+            # Get initial portfolio equity (expert virtual equity = account equity × virtual_equity_pct)
+            initial_portfolio_equity = None
+            try:
+                account = get_account_instance_from_id(task.account_id)
+                if account:
+                    account_info = account.get_account_info()
+                    if account_info and account_info.equity:
+                        account_equity = float(account_info.equity)
+                        # Calculate expert virtual equity based on percentage allocation
+                        virtual_equity_pct = expert_record.virtual_equity_pct if expert_record.virtual_equity_pct else 100.0
+                        initial_portfolio_equity = account_equity * (virtual_equity_pct / 100.0)
+                        logger.debug(f"Initial portfolio equity: Account=${account_equity:,.2f} × {virtual_equity_pct}% = ${initial_portfolio_equity:,.2f}")
+            except Exception as e:
+                logger.warning(f"Could not get initial portfolio equity: {e}")
             
             # Create SmartRiskManagerJob record with RUNNING status
             smart_risk_job = SmartRiskManagerJob(
@@ -313,7 +334,8 @@ class SmartRiskManagerQueue:
                 status="RUNNING",
                 model_used=model_used,
                 user_instructions=user_instructions,
-                run_date=datetime.now(timezone.utc)
+                run_date=datetime.now(timezone.utc),
+                initial_portfolio_equity=initial_portfolio_equity
             )
             job_id = add_instance(smart_risk_job)
             task.job_id = job_id
@@ -328,12 +350,28 @@ class SmartRiskManagerQueue:
             if not smart_risk_job:
                 raise ValueError(f"SmartRiskManagerJob {job_id} not found after execution")
             
+            # Get final portfolio equity (expert virtual equity = account equity × virtual_equity_pct)
+            final_portfolio_equity = None
+            try:
+                account = get_account_instance_from_id(task.account_id)
+                if account:
+                    account_info = account.get_account_info()
+                    if account_info and account_info.equity:
+                        account_equity = float(account_info.equity)
+                        # Calculate expert virtual equity based on percentage allocation
+                        virtual_equity_pct = expert_record.virtual_equity_pct if expert_record.virtual_equity_pct else 100.0
+                        final_portfolio_equity = account_equity * (virtual_equity_pct / 100.0)
+                        logger.debug(f"Final portfolio equity: Account=${account_equity:,.2f} × {virtual_equity_pct}% = ${final_portfolio_equity:,.2f}")
+            except Exception as e:
+                logger.warning(f"Could not get final portfolio equity: {e}")
+            
             # Update job with results
             if result["success"]:
                 smart_risk_job.status = "COMPLETED"
                 smart_risk_job.iteration_count = result.get("iterations", 0)
                 smart_risk_job.actions_taken_count = result.get("actions_count", 0)
                 smart_risk_job.actions_summary = result.get("summary", "")
+                smart_risk_job.final_portfolio_equity = final_portfolio_equity
                 
                 # Store actions log if available
                 if "actions" in result and result["actions"]:

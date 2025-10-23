@@ -73,6 +73,30 @@ class SmartRiskManagerTask:
         return f"smart_risk_{self.expert_instance_id}"
 
 
+@dataclass
+class InstrumentExpansionTask:
+    """Represents an instrument expansion task (DYNAMIC/EXPERT/OPEN_POSITIONS) to be executed by a worker."""
+    id: str
+    expert_instance_id: int
+    expansion_type: str  # "DYNAMIC", "EXPERT", or "OPEN_POSITIONS"
+    subtype: str = AnalysisUseCase.ENTER_MARKET  # Analysis use case for expanded instruments
+    priority: int = 5  # Lower priority than individual analysis to allow processing
+    status: WorkerTaskStatus = WorkerTaskStatus.PENDING
+    result: Any = None
+    error: Optional[Exception] = None
+    created_at: float = None
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+    
+    def __post_init__(self):
+        if self.created_at is None:
+            self.created_at = time.time()
+    
+    def get_task_key(self) -> str:
+        """Get a unique key for this task."""
+        return f"expansion_{self.expansion_type}_{self.expert_instance_id}_{self.subtype}"
+
+
 
 class WorkerQueue:
     """
@@ -287,6 +311,66 @@ class WorkerQueue:
         self._queue.put(queue_entry)
         
         logger.info(f"Smart Risk Manager task '{task_id}' submitted for expert {expert_instance_id}, priority {priority}")
+        return task_id
+        
+    def submit_instrument_expansion_task(self, expert_instance_id: int, expansion_type: str, 
+                                        subtype: str = "ENTER_MARKET", priority: int = 5, 
+                                        task_id: Optional[str] = None) -> str:
+        """
+        Submit an instrument expansion task (DYNAMIC/EXPERT/OPEN_POSITIONS) to be processed by worker queue.
+        
+        Args:
+            expert_instance_id: The expert instance ID to expand instruments for
+            expansion_type: Type of expansion ("DYNAMIC", "EXPERT", or "OPEN_POSITIONS")
+            subtype: Analysis use case subtype (default "ENTER_MARKET")
+            priority: Task priority (lower numbers = higher priority, default 5)
+            task_id: Optional custom task ID
+            
+        Returns:
+            Task ID that can be used to track the task
+            
+        Raises:
+            RuntimeError: If WorkerQueue is not running
+            ValueError: If expansion task for same expert/type/subtype is already pending/running
+        """
+        if not self._running:
+            raise RuntimeError("WorkerQueue is not running. Call start() first.")
+            
+        with self._task_lock:
+            # Check for duplicate task using expansion-specific key
+            task_key = f"expansion_{expansion_type}_{expert_instance_id}_{subtype}"
+            if task_key in self._task_keys:
+                existing_task_id = self._task_keys[task_key]
+                existing_task = self._tasks[existing_task_id]
+                if existing_task.status in [WorkerTaskStatus.PENDING, WorkerTaskStatus.RUNNING]:
+                    raise ValueError(f"Expansion task ({expansion_type}) for expert {expert_instance_id} is already {existing_task.status.value}")
+            
+            # Generate task ID if not provided
+            if task_id is None:
+                self._task_counter += 1
+                task_id = f"expansion_{expansion_type.lower()}_{self._task_counter}"
+            elif task_id in self._tasks:
+                raise ValueError(f"Task ID '{task_id}' already exists")
+                
+            task = InstrumentExpansionTask(
+                id=task_id,
+                expert_instance_id=expert_instance_id,
+                expansion_type=expansion_type,
+                subtype=subtype,
+                priority=priority
+            )
+            
+            self._tasks[task_id] = task
+            self._task_keys[task_key] = task_id
+            
+        # Add to priority queue with tiebreaker
+        with self._task_lock:
+            self._queue_counter += 1
+            queue_entry = (priority, self._queue_counter, task)
+        
+        self._queue.put(queue_entry)
+        
+        logger.info(f"Instrument expansion task '{task_id}' ({expansion_type}) submitted for expert {expert_instance_id}, priority {priority}")
         return task_id
         
     def get_task_status(self, task_id: str) -> Optional[AnalysisTask]:
@@ -543,6 +627,16 @@ class WorkerQueue:
                         self._execute_smart_risk_manager_task(task, worker_name)
                     except Exception as e:
                         logger.error(f"Error executing Smart Risk Manager task in worker {worker_name}: {e}", exc_info=True)
+                    finally:
+                        self._queue.task_done()
+                    continue
+                
+                if isinstance(task, InstrumentExpansionTask):
+                    # Execute instrument expansion task
+                    try:
+                        self._execute_instrument_expansion_task(task, worker_name)
+                    except Exception as e:
+                        logger.error(f"Error executing instrument expansion task in worker {worker_name}: {e}", exc_info=True)
                     finally:
                         self._queue.task_done()
                     continue
@@ -898,10 +992,73 @@ class WorkerQueue:
                     if task_key in self._task_keys and self._task_keys[task_key] == task.id:
                         del self._task_keys[task_key]
     
+    def _execute_instrument_expansion_task(self, task: InstrumentExpansionTask, worker_name: str):
+        """Execute an instrument expansion task (DYNAMIC/EXPERT/OPEN_POSITIONS)."""
+        logger.debug(f"Worker {worker_name} executing instrument expansion task '{task.id}' ({task.expansion_type}) for expert {task.expert_instance_id}")
+        
+        # Update task status
+        with self._task_lock:
+            task.status = WorkerTaskStatus.RUNNING
+            task.started_at = time.time()
+        
+        try:
+            # Import JobManager to access expansion methods
+            from .JobManager import JobManager
+            
+            # Get the JobManager singleton instance
+            job_manager = JobManager.get_instance()
+            
+            # Execute appropriate expansion method based on type
+            if task.expansion_type == "DYNAMIC":
+                job_manager._execute_dynamic_analysis(task.expert_instance_id, task.subtype)
+                logger.info(f"Dynamic analysis expansion completed for expert {task.expert_instance_id}")
+            elif task.expansion_type == "EXPERT":
+                job_manager._execute_expert_driven_analysis(task.expert_instance_id, task.subtype)
+                logger.info(f"Expert-driven analysis expansion completed for expert {task.expert_instance_id}")
+            elif task.expansion_type == "OPEN_POSITIONS":
+                job_manager._execute_open_positions_analysis(task.expert_instance_id, task.subtype)
+                logger.info(f"Open positions analysis expansion completed for expert {task.expert_instance_id}")
+            else:
+                raise ValueError(f"Unknown expansion type: {task.expansion_type}")
+            
+            # Update task with success
+            with self._task_lock:
+                task.status = WorkerTaskStatus.COMPLETED
+                task.result = {
+                    "expansion_type": task.expansion_type,
+                    "expert_instance_id": task.expert_instance_id,
+                    "subtype": task.subtype,
+                    "status": "completed"
+                }
+                task.completed_at = time.time()
+            
+            execution_time = task.completed_at - task.started_at
+            logger.debug(f"Instrument expansion task '{task.id}' ({task.expansion_type}) completed in {execution_time:.2f}s")
+            
+        except Exception as e:
+            # Update task with failure
+            with self._task_lock:
+                task.status = WorkerTaskStatus.FAILED
+                task.error = e
+                task.completed_at = time.time()
+            
+            execution_time = task.completed_at - task.started_at
+            logger.error(f"Instrument expansion task '{task.id}' ({task.expansion_type}) failed after {execution_time:.2f}s: {e}", exc_info=True)
+        
+        finally:
+            # Clean up task key mapping for completed/failed tasks
+            with self._task_lock:
+                if task.status in [WorkerTaskStatus.COMPLETED, WorkerTaskStatus.FAILED]:
+                    task_key = task.get_task_key()
+                    if task_key in self._task_keys and self._task_keys[task_key] == task.id:
+                        del self._task_keys[task_key]
+    
     def _check_and_process_expert_recommendations(self, expert_instance_id: int, use_case: AnalysisUseCase = AnalysisUseCase.ENTER_MARKET) -> None:
         """
         Check if there are any pending analysis tasks for an expert.
-        If not, trigger automated order processing via TradeManager.
+        If not, trigger automated order processing based on expert's risk_manager_mode setting:
+        - "smart": Queue SmartRiskManager task for agentic portfolio management
+        - "classic": Use TradeManager for direct recommendation processing
         
         Args:
             expert_instance_id: The expert instance ID to check
@@ -934,22 +1091,53 @@ class WorkerQueue:
                     try:
                         logger.info(f"All {use_case.value} analysis tasks completed for expert {expert_instance_id}, triggering automated processing")
                         
-                        # Import TradeManager and process recommendations
-                        from .TradeManager import get_trade_manager
-                        trade_manager = get_trade_manager()
+                        # Get expert instance with loaded settings (MarketExpertInterface)
+                        from .utils import get_expert_instance_from_id
                         
-                        if use_case == AnalysisUseCase.ENTER_MARKET:
-                            created_orders = trade_manager.process_expert_recommendations_after_analysis(expert_instance_id)
-                        elif use_case == AnalysisUseCase.OPEN_POSITIONS:
-                            created_orders = trade_manager.process_open_positions_recommendations(expert_instance_id)
-                        else:
-                            logger.error(f"Unknown use case: {use_case}")
+                        expert = get_expert_instance_from_id(expert_instance_id)
+                        if not expert:
+                            logger.error(f"Expert instance {expert_instance_id} not found or invalid expert type")
                             return
                         
-                        if created_orders:
-                            logger.info(f"Automated processing created {len(created_orders)} orders for expert {expert_instance_id}")
+                        # Check risk_manager_mode setting
+                        settings = expert.settings or {}
+                        risk_manager_mode = settings.get("risk_manager_mode", "classic")
+                        
+                        if risk_manager_mode == "smart":
+                            # Use Smart Risk Manager for automated processing
+                            logger.info(f"Expert {expert_instance_id} using Smart Risk Manager mode, triggering SmartRiskManager")
+                            
+                            # Get account_id from expert instance
+                            account_id = expert.account_id
+                            if not account_id:
+                                logger.error(f"Expert instance {expert_instance_id} has no account_id")
+                                return
+                            
+                            # Add Smart Risk Manager task to queue
+                            try:
+                                task_id = self.add_smart_risk_manager_task(expert_instance_id, account_id)
+                                logger.info(f"Queued Smart Risk Manager task {task_id} for expert {expert_instance_id}")
+                            except Exception as e:
+                                logger.error(f"Failed to queue Smart Risk Manager task for expert {expert_instance_id}: {e}", exc_info=True)
                         else:
-                            logger.debug(f"No orders created by automated processing for expert {expert_instance_id}")
+                            # Use classic TradeManager for automated processing
+                            logger.info(f"Expert {expert_instance_id} using classic risk manager mode, triggering TradeManager")
+                            
+                            from .TradeManager import get_trade_manager
+                            trade_manager = get_trade_manager()
+                            
+                            if use_case == AnalysisUseCase.ENTER_MARKET:
+                                created_orders = trade_manager.process_expert_recommendations_after_analysis(expert_instance_id)
+                            elif use_case == AnalysisUseCase.OPEN_POSITIONS:
+                                created_orders = trade_manager.process_open_positions_recommendations(expert_instance_id)
+                            else:
+                                logger.error(f"Unknown use case: {use_case}")
+                                return
+                            
+                            if created_orders:
+                                logger.info(f"Automated processing created {len(created_orders)} orders for expert {expert_instance_id}")
+                            else:
+                                logger.debug(f"No orders created by automated processing for expert {expert_instance_id}")
                     finally:
                         # Always remove from processing set, even if an error occurred
                         self._processing_experts.discard(lock_key)

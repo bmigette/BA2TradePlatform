@@ -1438,8 +1438,18 @@ class OverviewTab:
                             logger.info(f"Enqueueing Smart Risk Manager for expert {expert_id}")
                             try:
                                 from ...core.SmartRiskManagerQueue import get_smart_risk_manager_queue
+                                from ...core.db import get_instance
+                                from ...core.models import ExpertInstance
+                                
                                 smart_queue = get_smart_risk_manager_queue()
-                                account_id = expert_instance.account_id
+                                
+                                # Get expert record from database to access account_id
+                                expert_record = get_instance(ExpertInstance, expert_id)
+                                if not expert_record:
+                                    logger.error(f"Expert instance {expert_id} not found in database")
+                                    continue
+                                
+                                account_id = expert_record.account_id
                                 
                                 task_id = smart_queue.submit_task(expert_id, account_id)
                                 
@@ -1537,7 +1547,7 @@ class OverviewTab:
                             ui.separator().classes('mt-2')
                             ui.label('Jobs are running in the background. Check Job Monitoring page for progress.').classes('text-xs text-gray-600')
                             with ui.row().classes('mt-2 gap-2'):
-                                ui.button('Job Monitoring', on_click=lambda: ui.navigate.to('/jobmonitoring')).props('flat color=primary')
+                                ui.button('Job Monitoring', on_click=lambda: ui.navigate.to('/marketanalysis#monitoring')).props('flat color=primary')
                                 ui.button('Close', on_click=smart_summary_dialog.close).props('flat')
                         smart_summary_dialog.open()
                 else:

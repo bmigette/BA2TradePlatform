@@ -28,7 +28,7 @@ def test_single_url_extraction():
     
     print(f"Extracting: {url}\n")
     
-    result = extract_single_url(url, timeout=10)
+    result = extract_single_url(url)
     
     if result["success"]:
         print(f"✓ SUCCESS")
@@ -63,8 +63,7 @@ def test_parallel_extraction():
     result = extract_urls_parallel(
         urls=urls,
         max_workers=3,
-        max_tokens=50000,  # Limit to 50K tokens for test
-        timeout=10
+        max_tokens=50000  # Limit to 50K tokens for test
     )
     
     if result["success"]:
@@ -106,8 +105,7 @@ def test_token_limit():
     result = extract_urls_parallel(
         urls=urls,
         max_workers=3,
-        max_tokens=max_tokens,
-        timeout=10
+        max_tokens=max_tokens
     )
     
     if result["success"]:
@@ -142,8 +140,7 @@ def test_markdown_output():
     result = extract_urls_parallel(
         urls=urls,
         max_workers=1,
-        max_tokens=128000,
-        timeout=10
+        max_tokens=128000
     )
     
     if result["success"]:

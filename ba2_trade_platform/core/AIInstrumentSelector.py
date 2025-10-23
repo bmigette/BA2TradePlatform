@@ -233,7 +233,7 @@ Your response:"""
             selection_prompt = prompt if prompt else self.get_default_prompt()
             
             logger.info(f"Requesting AI instrument selection using model: {self.model_string}")
-            logger.debug(f"Using prompt: {selection_prompt[:200]}...")
+            logger.debug(f"Using prompt: {selection_prompt}...")
 
             # Call appropriate API with web search enabled
             response_content = self._call_ai_api(selection_prompt)
@@ -325,7 +325,7 @@ Your response:"""
                     valid_symbols.append(symbol)
             
             # Remove duplicates and limit to reasonable number
-            unique_symbols = list(dict.fromkeys(valid_symbols))[:20]
+            unique_symbols = list(dict.fromkeys(valid_symbols))[:100]
             
             if unique_symbols:
                 logger.info(f"Extracted {len(unique_symbols)} symbols from text: {unique_symbols}")

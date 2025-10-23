@@ -217,20 +217,24 @@ class JobManager:
             RuntimeError: If worker queue is not running
         """
         
-        # Handle special symbols - if manually triggered, expand immediately
+        # Handle special symbols - if manually triggered, queue expansion task to worker
         if symbol in ["DYNAMIC", "EXPERT", "OPEN_POSITIONS"]:
-            logger.info(f"Special symbol '{symbol}' detected - expanding to individual instruments")
+            logger.info(f"Special symbol '{symbol}' detected - queuing instrument expansion task")
             
-            # Call appropriate expansion method based on symbol type
-            if symbol == "DYNAMIC":
-                self._execute_dynamic_analysis(expert_instance_id, subtype)
-            elif symbol == "EXPERT":
-                self._execute_expert_driven_analysis(expert_instance_id, subtype)
-            elif symbol == "OPEN_POSITIONS":
-                self._execute_open_positions_analysis(expert_instance_id, subtype)
-            
-            # Return a pseudo task ID to indicate processing started
-            return f"expansion_{symbol.lower()}_{expert_instance_id}"
+            # Queue expansion task to worker instead of executing synchronously
+            try:
+                task_id = self.worker_queue.submit_instrument_expansion_task(
+                    expert_instance_id=expert_instance_id,
+                    expansion_type=symbol,
+                    subtype=subtype,
+                    priority=5  # Medium priority (analysis tasks are 10)
+                )
+                logger.info(f"Queued instrument expansion task '{task_id}' for {symbol} analysis")
+                return task_id
+            except ValueError as e:
+                # Task already pending/running
+                logger.warning(f"Expansion task for {symbol} already queued: {e}")
+                return f"expansion_{symbol.lower()}_{expert_instance_id}_existing"
         
         # Validate expert instance exists
         expert_instance = get_instance(ExpertInstance, expert_instance_id)
@@ -296,19 +300,19 @@ class JobManager:
     
     def clear_running_analysis_on_startup(self):
         """
-        Mark all running analysis as failed on startup.
-        This handles cases where the application was stopped while analysis was running.
+        Mark all running analysis and Smart Risk Manager jobs as failed on startup.
+        This handles cases where the application was stopped while analysis or jobs were running.
         """
-        logger.info("Clearing running analysis on startup...")
+        logger.info("Clearing running analysis and jobs on startup...")
         
         try:
             from sqlmodel import select, Session
             from .db import get_db
-            from .models import MarketAnalysis
+            from .models import MarketAnalysis, SmartRiskManagerJob
             from .types import MarketAnalysisStatus
             
             with Session(get_db().bind) as session:
-                # Find all analysis with RUNNING status
+                # Clear running MarketAnalysis records
                 statement = select(MarketAnalysis).where(
                     MarketAnalysis.status == MarketAnalysisStatus.RUNNING
                 )
@@ -337,11 +341,29 @@ class JobManager:
                         
                         session.add(analysis)
                         logger.debug(f"Marked analysis {analysis.id} (symbol: {analysis.symbol}) as failed")
+                
+                # Clear running SmartRiskManagerJob records
+                statement = select(SmartRiskManagerJob).where(
+                    SmartRiskManagerJob.status == "RUNNING"
+                )
+                running_jobs = session.exec(statement).all()
+                
+                if running_jobs:
+                    logger.info(f"Found {len(running_jobs)} running Smart Risk Manager jobs to mark as failed")
                     
+                    for job in running_jobs:
+                        job.status = "FAILED"
+                        job.error_message = "Application was restarted while Smart Risk Manager was running"
+                        session.add(job)
+                        logger.debug(f"Marked Smart Risk Manager job {job.id} as failed")
+                
+                # Commit all changes
+                if running_analyses or running_jobs:
                     session.commit()
-                    logger.info(f"Successfully marked {len(running_analyses)} running analysis as failed")
+                    total_marked = len(running_analyses) + len(running_jobs)
+                    logger.info(f"Successfully marked {total_marked} running items as failed ({len(running_analyses)} analyses, {len(running_jobs)} Smart Risk Manager jobs)")
                 else:
-                    logger.info("No running analysis found to clean up")
+                    logger.info("No running analysis or jobs found to clean up")
                     
         except Exception as e:
             logger.error(f"Error clearing running analysis on startup: {e}", exc_info=True)
@@ -667,15 +689,20 @@ class JobManager:
         try:
             logger.info(f"Executing scheduled analysis: expert={expert_instance_id}, symbol={symbol}, subtype={subtype}")
             
-            # Handle special symbols for dynamic and expert-driven selection
-            if symbol == "DYNAMIC":
-                self._execute_dynamic_analysis(expert_instance_id, subtype)
-                return
-            elif symbol == "EXPERT":
-                self._execute_expert_driven_analysis(expert_instance_id, subtype)
-                return
-            elif symbol == "OPEN_POSITIONS":
-                self._execute_open_positions_analysis(expert_instance_id, subtype)
+            # Handle special symbols for dynamic and expert-driven selection - queue to worker
+            if symbol in ["DYNAMIC", "EXPERT", "OPEN_POSITIONS"]:
+                logger.info(f"Special symbol '{symbol}' detected in scheduled analysis - queuing expansion task")
+                try:
+                    task_id = self.worker_queue.submit_instrument_expansion_task(
+                        expert_instance_id=expert_instance_id,
+                        expansion_type=symbol,
+                        subtype=subtype,
+                        priority=10  # Lower priority for scheduled tasks (higher number = lower priority)
+                    )
+                    logger.info(f"Queued scheduled expansion task '{task_id}' for {symbol} analysis")
+                except ValueError as e:
+                    # Task already pending/running
+                    logger.warning(f"Scheduled expansion task for {symbol} already queued: {e}")
                 return
             
             # Regular symbol processing
@@ -772,7 +799,7 @@ class JobManager:
                         expert_instance_id=expert_instance_id,
                         symbol=instrument,
                         subtype=subtype,
-                        priority=10
+                        priority=0  # High priority - execute expansion results ASAP
                     )
                     logger.debug(f"Submitted dynamic analysis for {instrument}: {task_id}")
                     
@@ -811,7 +838,7 @@ class JobManager:
                         expert_instance_id=expert_instance_id,
                         symbol="EXPERT",
                         subtype=subtype,
-                        priority=10
+                        priority=0  # High priority - execute expansion results ASAP
                     )
                     logger.info(f"Submitted expert-driven analysis with EXPERT symbol: {task_id}")
                 except Exception as e:
@@ -859,7 +886,7 @@ class JobManager:
                         expert_instance_id=expert_instance_id,
                         symbol=instrument,
                         subtype=subtype,
-                        priority=10
+                        priority=0  # High priority - execute expansion results ASAP
                     )
                     logger.debug(f"Submitted expert-driven analysis for {instrument}: {task_id}")
                     
@@ -914,7 +941,7 @@ class JobManager:
                         expert_instance_id=expert_instance_id,
                         symbol=symbol,
                         subtype=subtype,
-                        priority=10
+                        priority=0  # High priority - execute expansion results ASAP
                     )
                     logger.debug(f"Submitted open positions analysis for {symbol}: {task_id}")
                     

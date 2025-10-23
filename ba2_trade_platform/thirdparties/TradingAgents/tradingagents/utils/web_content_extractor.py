@@ -18,13 +18,12 @@ except ImportError:
 from ba2_trade_platform.logger import logger
 
 
-def extract_single_url(url: str, timeout: int = 10) -> Dict[str, Any]:
+def extract_single_url(url: str) -> Dict[str, Any]:
     """
     Extract content from a single URL.
     
     Args:
         url: URL to extract content from
-        timeout: Request timeout in seconds
         
     Returns:
         Dict with success status, url, text, and metadata
@@ -42,8 +41,8 @@ def extract_single_url(url: str, timeout: int = 10) -> Dict[str, Any]:
         logger.debug(f"Extracting content from: {url}")
         start_time = time.time()
         
-        # Fetch webpage
-        downloaded = trafilatura.fetch_url(url, timeout=timeout)
+        # Fetch webpage (trafilatura.fetch_url doesn't accept timeout parameter)
+        downloaded = trafilatura.fetch_url(url)
         
         if not downloaded:
             return {
@@ -112,8 +111,7 @@ def extract_single_url(url: str, timeout: int = 10) -> Dict[str, Any]:
 def extract_urls_parallel(
     urls: List[str],
     max_workers: int = 5,
-    max_tokens: int = 128000,
-    timeout: int = 10
+    max_tokens: int = 128000
 ) -> Dict[str, Any]:
     """
     Extract content from multiple URLs in parallel with token limit management.
@@ -122,7 +120,6 @@ def extract_urls_parallel(
         urls: List of URLs to extract content from
         max_workers: Maximum number of parallel threads
         max_tokens: Maximum total tokens to extract (stops when limit reached)
-        timeout: Request timeout per URL in seconds
         
     Returns:
         Dict with extracted content, statistics, and skipped URLs
@@ -162,7 +159,7 @@ def extract_urls_parallel(
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all tasks
         future_to_url = {
-            executor.submit(extract_single_url, url, timeout): url 
+            executor.submit(extract_single_url, url): url 
             for url in urls
         }
         

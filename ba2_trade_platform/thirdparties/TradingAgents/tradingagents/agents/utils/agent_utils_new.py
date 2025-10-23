@@ -460,8 +460,7 @@ class Toolkit:
             result = extract_urls_parallel(
                 urls=urls,
                 max_workers=5,
-                max_tokens=max_tokens,
-                timeout=10
+                max_tokens=max_tokens
             )
             
             if not result["success"]:

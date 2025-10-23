@@ -539,9 +539,9 @@ class SmartRiskManagerJob(SQLModel, table=True):
     duration_seconds: float = Field(default=0.0)
     iteration_count: int = Field(default=0)
     
-    # Portfolio Snapshot
-    initial_portfolio_value: float = Field(description="Virtual equity at start")
-    final_portfolio_value: float = Field(description="Virtual equity at end")
+    # Portfolio Snapshot (equity/balance tracking)
+    initial_portfolio_equity: Optional[float] = Field(default=None, description="Account virtual equity at start of execution")
+    final_portfolio_equity: Optional[float] = Field(default=None, description="Account virtual equity at end of execution")
     
     # Results
     actions_taken_count: int = Field(default=0, description="Number of trading actions executed")

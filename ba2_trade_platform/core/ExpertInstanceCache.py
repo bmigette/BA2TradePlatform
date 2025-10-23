@@ -48,7 +48,7 @@ class ExpertInstanceCache:
         with cls._lock:
             # Check if instance exists and force_new is not set
             if not force_new and expert_instance_id in cls._cache:
-                logger.debug(f"Returning cached expert instance for expert {expert_instance_id}")
+                #logger.debug(f"Returning cached expert instance for expert {expert_instance_id}")
                 return cls._cache[expert_instance_id]
             
             # Create new instance

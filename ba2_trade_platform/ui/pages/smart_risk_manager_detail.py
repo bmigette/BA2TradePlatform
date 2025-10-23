@@ -54,7 +54,7 @@ def content(job_id: int) -> None:
         if not job:
             with ui.card().classes('w-full p-8 text-center'):
                 ui.label(f'Smart Risk Manager Job {job_id} not found').classes('text-h5 text-negative')
-                ui.button('Back to Job Monitoring', on_click=lambda: ui.navigate.to('/jobmonitoring')).classes('mt-4')
+                ui.button('Back to Job Monitoring', on_click=lambda: ui.navigate.to('/marketanalysis#monitoring')).classes('mt-4')
             return
         
         # Load the expert instance
@@ -76,7 +76,7 @@ def content(job_id: int) -> None:
                 ui.badge(job.status, color=_get_status_color(job.status)).props('size="lg"')
                 
                 # Back button
-                ui.button('Back to Monitoring', icon='arrow_back', on_click=lambda: ui.navigate.to('/jobmonitoring')).props('flat')
+                ui.button('Back to Monitoring', icon='arrow_back', on_click=lambda: ui.navigate.to('/marketanalysis#monitoring')).props('flat')
         
         # Job metadata card
         with ui.card().classes('w-full mb-4'):
@@ -109,7 +109,7 @@ def content(job_id: int) -> None:
                         ui.label(f"Actions Taken: {job.actions_taken_count or 0}").classes('text-sm')
         
         # Portfolio snapshot card (if available)
-        if job.initial_portfolio_value is not None or job.final_portfolio_value is not None:
+        if job.initial_portfolio_equity is not None or job.final_portfolio_equity is not None:
             with ui.card().classes('w-full mb-4'):
                 ui.label('Portfolio Snapshot').classes('text-h6 mb-2')
                 ui.separator()
@@ -117,20 +117,20 @@ def content(job_id: int) -> None:
                 with ui.grid(columns=3).classes('w-full gap-4 mt-2'):
                     # Initial value
                     with ui.column().classes('text-center'):
-                        ui.label('Initial Portfolio Value').classes('text-sm text-grey-7')
-                        ui.label(f"${job.initial_portfolio_value:,.2f}" if job.initial_portfolio_value else "N/A").classes('text-h6')
+                        ui.label('Initial Portfolio Equity').classes('text-sm text-grey-7')
+                        ui.label(f"${job.initial_portfolio_equity:,.2f}" if job.initial_portfolio_equity else "N/A").classes('text-h6')
                     
                     # Final value
                     with ui.column().classes('text-center'):
-                        ui.label('Final Portfolio Value').classes('text-sm text-grey-7')
-                        ui.label(f"${job.final_portfolio_value:,.2f}" if job.final_portfolio_value else "N/A").classes('text-h6')
+                        ui.label('Final Portfolio Equity').classes('text-sm text-grey-7')
+                        ui.label(f"${job.final_portfolio_equity:,.2f}" if job.final_portfolio_equity else "N/A").classes('text-h6')
                     
                     # Change
                     with ui.column().classes('text-center'):
                         ui.label('Change').classes('text-sm text-grey-7')
-                        if job.initial_portfolio_value and job.final_portfolio_value:
-                            change = job.final_portfolio_value - job.initial_portfolio_value
-                            change_pct = (change / job.initial_portfolio_value * 100) if job.initial_portfolio_value > 0 else 0
+                        if job.initial_portfolio_equity and job.final_portfolio_equity:
+                            change = job.final_portfolio_equity - job.initial_portfolio_equity
+                            change_pct = (change / job.initial_portfolio_equity * 100) if job.initial_portfolio_equity > 0 else 0
                             color = 'positive' if change >= 0 else 'negative'
                             sign = '+' if change >= 0 else ''
                             ui.label(f"{sign}${change:,.2f} ({sign}{change_pct:.2f}%)").classes(f'text-h6 text-{color}')
@@ -150,45 +150,6 @@ def content(job_id: int) -> None:
                 ui.label('Actions Summary').classes('text-h6 mb-2')
                 ui.separator()
                 ui.label(job.actions_summary).classes('text-sm whitespace-pre-wrap mt-2')
-        
-        # Actions log (collapsible)
-        if job.actions_log:
-            with ui.expansion('Actions Log', icon='list_alt').classes('w-full mb-4'):
-                try:
-                    # Try to parse as JSON
-                    actions = json.loads(job.actions_log) if isinstance(job.actions_log, str) else job.actions_log
-                    
-                    if isinstance(actions, list):
-                        # Display as table
-                        columns = [
-                            {'name': 'timestamp', 'label': 'Timestamp', 'field': 'timestamp', 'align': 'left'},
-                            {'name': 'action', 'label': 'Action', 'field': 'action', 'align': 'left'},
-                            {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left'},
-                            {'name': 'details', 'label': 'Details', 'field': 'details', 'align': 'left'},
-                        ]
-                        
-                        # Format rows
-                        rows = []
-                        for action in actions:
-                            if isinstance(action, dict):
-                                rows.append({
-                                    'timestamp': action.get('timestamp', 'N/A'),
-                                    'action': action.get('action_type', 'N/A'),
-                                    'symbol': action.get('symbol', 'N/A'),
-                                    'details': action.get('details', '')
-                                })
-                        
-                        if rows:
-                            ui.table(columns=columns, rows=rows).classes('w-full')
-                        else:
-                            ui.label('No actions recorded').classes('text-sm text-grey-6')
-                    else:
-                        # Display as formatted JSON
-                        ui.json_editor({'content': {'json': actions}}).classes('w-full')
-                
-                except (json.JSONDecodeError, TypeError):
-                    # Display as plain text if not valid JSON
-                    ui.label(str(job.actions_log)).classes('text-sm whitespace-pre-wrap')
         
         # Graph state (collapsible JSON viewer)
         if job.graph_state:
@@ -223,4 +184,4 @@ def content(job_id: int) -> None:
         logger.error(f"Error loading Smart Risk Manager job detail for job_id {job_id}: {e}", exc_info=True)
         with ui.card().classes('w-full p-8 text-center'):
             ui.label(f'Error loading job details: {str(e)}').classes('text-h5 text-negative')
-            ui.button('Back to Job Monitoring', on_click=lambda: ui.navigate.to('/jobmonitoring')).classes('mt-4')
+            ui.button('Back to Job Monitoring', on_click=lambda: ui.navigate.to('/marketanalysis#monitoring')).classes('mt-4')

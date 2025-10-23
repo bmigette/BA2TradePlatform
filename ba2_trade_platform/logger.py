@@ -45,14 +45,16 @@ if FILE_LOGGING:
     logger.addHandler(handlerfile2)
 
 
-# Create a shared all.debug.log handler for all loggers (app + expert specific)
-# This handler will be added to both the app logger and all expert loggers
+# Create shared handlers for all loggers (app + expert specific)
+# These handlers will be added to both the app logger and all expert loggers
 _all_debug_handler: Optional[RotatingFileHandler] = None
+_all_error_handler: Optional[RotatingFileHandler] = None
 
 def _get_all_debug_handler() -> Optional[RotatingFileHandler]:
     """
     Get or create the shared all.debug.log handler.
     This handler is used by all loggers (app logger and expert loggers).
+    Captures all log levels (DEBUG and above).
     
     Returns:
         RotatingFileHandler: The shared handler, or None if FILE_LOGGING is disabled
@@ -83,11 +85,50 @@ def _get_all_debug_handler() -> Optional[RotatingFileHandler]:
     
     return _all_debug_handler
 
-# Add the all.debug.log handler to the main app logger
+def _get_all_error_handler() -> Optional[RotatingFileHandler]:
+    """
+    Get or create the shared all.error.log handler.
+    This handler is used by all loggers (app logger and expert loggers).
+    Captures only ERROR level logs and above (ERROR, CRITICAL).
+    
+    Returns:
+        RotatingFileHandler: The shared handler, or None if FILE_LOGGING is disabled
+    """
+    global _all_error_handler
+    
+    if _all_error_handler is not None:
+        return _all_error_handler
+    
+    if not FILE_LOGGING:
+        return None
+    
+    # Create the shared handler
+    logs_dir = os.path.join(HOME_PARENT, "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    
+    _all_error_handler = RotatingFileHandler(
+        os.path.join(logs_dir, "all.error.log"),
+        maxBytes=(1024*1024*10),  # 10MB
+        backupCount=7,
+        encoding='utf-8'
+    )
+    
+    fmt_string = '%(asctime)s - %(name)s - %(module)s - %(levelname)s - %(message)s'
+    all_error_formatter = logging.Formatter(fmt_string)
+    _all_error_handler.setFormatter(all_error_formatter)
+    _all_error_handler.setLevel(logging.ERROR)  # Only ERROR and above
+    
+    return _all_error_handler
+
+# Add the shared handlers to the main app logger
 if FILE_LOGGING:
     all_debug_handler = _get_all_debug_handler()
     if all_debug_handler:
         logger.addHandler(all_debug_handler)
+    
+    all_error_handler = _get_all_error_handler()
+    if all_error_handler:
+        logger.addHandler(all_error_handler)
 
 
 # Cache for expert loggers to avoid recreation
@@ -187,6 +228,11 @@ def get_expert_logger(expert_class: str, expert_id: int) -> logging.Logger:
         all_debug_handler = _get_all_debug_handler()
         if all_debug_handler:
             expert_logger.addHandler(all_debug_handler)
+        
+        # Add the shared all.error.log handler to this expert logger
+        all_error_handler = _get_all_error_handler()
+        if all_error_handler:
+            expert_logger.addHandler(all_error_handler)
     
     # Cache the logger
     _expert_loggers[cache_key] = expert_logger
