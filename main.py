@@ -2,6 +2,7 @@ import os
 import warnings
 from ba2_trade_platform.core.db import init_db, get_db
 from ba2_trade_platform.core.WorkerQueue import initialize_worker_queue
+from ba2_trade_platform.core.SmartRiskManagerQueue import initialize_smart_risk_manager_queue
 from ba2_trade_platform.core.JobManager import get_job_manager
 from ba2_trade_platform.logger import logger
 from ba2_trade_platform.config import LOG_FOLDER
@@ -41,6 +42,10 @@ def initialize_system():
     # Initialize worker queue system
     logger.info("Initializing worker queue system...")
     initialize_worker_queue()
+    
+    # Initialize Smart Risk Manager queue system
+    logger.info("Initializing Smart Risk Manager queue system...")
+    initialize_smart_risk_manager_queue()
     
     logger.info("BA2 Trade Platform initialization complete")
 

@@ -1414,52 +1414,86 @@ class OverviewTab:
             
             try:
                 from ...core.TradeRiskManagement import get_risk_management
+                from ...core.utils import get_expert_instance_from_id
                 risk_management = get_risk_management()
                 
                 total_processed = 0
                 experts_processed = 0
+                smart_manager_results = []
                 
                 # Run risk management for each expert
                 for expert_id, expert_orders in orders_by_expert.items():
                     try:
-                        updated_orders = risk_management.review_and_prioritize_pending_orders(expert_id)
-                        total_processed += len(updated_orders)
-                        experts_processed += 1
-                        logger.info(f"Processed {len(updated_orders)} orders for expert {expert_id}")
+                        # Load expert instance and check risk_manager_mode
+                        expert_instance = get_expert_instance_from_id(expert_id)
+                        if not expert_instance:
+                            logger.warning(f"Expert instance {expert_id} not found, skipping")
+                            continue
                         
-                        # AUTO-SUBMIT: After risk management, auto-submit eligible orders to broker
-                        # (matching the behavior of the automated WorkerQueue workflow)
-                        try:
-                            from ...core.models import ExpertInstance, AccountDefinition
-                            from ...modules.accounts import get_account_class
+                        # Check risk_manager_mode setting (default to "classic" if not set)
+                        risk_manager_mode = expert_instance.settings.get("risk_manager_mode", "classic")
+                        
+                        if risk_manager_mode == "smart":
+                            # Enqueue Smart Risk Manager job for this expert to dedicated queue
+                            logger.info(f"Enqueueing Smart Risk Manager for expert {expert_id}")
+                            try:
+                                from ...core.SmartRiskManagerQueue import get_smart_risk_manager_queue
+                                smart_queue = get_smart_risk_manager_queue()
+                                account_id = expert_instance.account_id
+                                
+                                task_id = smart_queue.submit_task(expert_id, account_id)
+                                
+                                if task_id:
+                                    smart_manager_results.append({
+                                        "expert_id": expert_id,
+                                        "task_id": task_id,
+                                        "status": "enqueued"
+                                    })
+                                    experts_processed += 1
+                                    logger.info(f"Smart Risk Manager job enqueued for expert {expert_id} (Task ID: {task_id})")
+                                else:
+                                    logger.warning(f"Smart Risk Manager job already running for expert {expert_id}")
+                            except Exception as smart_error:
+                                logger.error(f"Error enqueueing Smart Risk Manager for expert {expert_id}: {smart_error}", exc_info=True)
+                        else:
+                            # Run classic rule-based risk management
+                            updated_orders = risk_management.review_and_prioritize_pending_orders(expert_id)
+                            total_processed += len(updated_orders)
+                            experts_processed += 1
+                            logger.info(f"Processed {len(updated_orders)} orders for expert {expert_id} using classic risk management")
                             
-                            expert_instance = get_instance(ExpertInstance, expert_id)
-                            if expert_instance and expert_instance.account_id:
-                                account_def = get_instance(AccountDefinition, expert_instance.account_id)
-                                if account_def:
-                                    account_class = get_account_class(account_def.provider)
-                                    if account_class:
-                                        account = account_class(account_def.id)
-                                        
-                                        # Auto-submit orders with quantity > 0
-                                        submitted_count = 0
-                                        for order in updated_orders:
-                                            if order.quantity and order.quantity > 0:
-                                                try:
-                                                    logger.info(f"Auto-submitting order {order.id} for {order.symbol}: {order.quantity} shares")
-                                                    submitted_order = account.submit_order(order)
-                                                    if submitted_order:
-                                                        submitted_count += 1
-                                                        logger.info(f"Successfully submitted order {order.id} to broker")
-                                                    else:
-                                                        logger.warning(f"Failed to submit order {order.id} to broker")
-                                                except Exception as submit_error:
-                                                    logger.error(f"Error submitting order {order.id}: {submit_error}", exc_info=True)
-                                        
-                                        if submitted_count > 0:
-                                            logger.info(f"Auto-submitted {submitted_count}/{len(updated_orders)} orders to broker")
-                        except Exception as auto_submit_error:
-                            logger.error(f"Error during auto-submission for expert {expert_id}: {auto_submit_error}", exc_info=True)
+                            # AUTO-SUBMIT: After risk management, auto-submit eligible orders to broker
+                            # (matching the behavior of the automated WorkerQueue workflow)
+                            try:
+                                from ...core.models import ExpertInstance, AccountDefinition
+                                from ...modules.accounts import get_account_class
+                                
+                                if expert_instance.account_id:
+                                    account_def = get_instance(AccountDefinition, expert_instance.account_id)
+                                    if account_def:
+                                        account_class = get_account_class(account_def.provider)
+                                        if account_class:
+                                            account = account_class(account_def.id)
+                                            
+                                            # Auto-submit orders with quantity > 0
+                                            submitted_count = 0
+                                            for order in updated_orders:
+                                                if order.quantity and order.quantity > 0:
+                                                    try:
+                                                        logger.info(f"Auto-submitting order {order.id} for {order.symbol}: {order.quantity} shares")
+                                                        submitted_order = account.submit_order(order)
+                                                        if submitted_order:
+                                                            submitted_count += 1
+                                                            logger.info(f"Successfully submitted order {order.id} to broker")
+                                                        else:
+                                                            logger.warning(f"Failed to submit order {order.id} to broker")
+                                                    except Exception as submit_error:
+                                                        logger.error(f"Error submitting order {order.id}: {submit_error}", exc_info=True)
+                                            
+                                            if submitted_count > 0:
+                                                logger.info(f"Auto-submitted {submitted_count}/{len(updated_orders)} orders to broker")
+                            except Exception as auto_submit_error:
+                                logger.error(f"Error during auto-submission for expert {expert_id}: {auto_submit_error}", exc_info=True)
                     
                     except Exception as e:
                         logger.error(f"Error processing risk management for expert {expert_id}: {e}", exc_info=True)
@@ -1467,16 +1501,45 @@ class OverviewTab:
                 processing_dialog.close()
                 
                 # Report results
-                if total_processed > 0:
+                if total_processed > 0 or smart_manager_results:
+                    # Build notification message
+                    message_parts = [f'Risk Management completed!']
+                    message_parts.append(f'• Experts processed: {experts_processed}')
+                    
+                    if total_processed > 0:
+                        message_parts.append(f'• Orders updated (classic): {total_processed}')
+                    
+                    if smart_manager_results:
+                        total_smart_jobs = len(smart_manager_results)
+                        message_parts.append(f'• Smart Manager jobs enqueued: {total_smart_jobs}')
+                    
+                    if total_processed > 0:
+                        message_parts.append('Check the Account Overview tab to review and submit orders.')
+                    
+                    if smart_manager_results:
+                        message_parts.append('Check the Job Monitoring page for Smart Risk Manager progress.')
+                    
                     ui.notify(
-                        f'Risk Management completed!\n'
-                        f'• Experts processed: {experts_processed}\n'
-                        f'• Orders updated: {total_processed}\n'
-                        f'Check the Account Overview tab to review and submit orders.',
+                        '\n'.join(message_parts),
                         type='positive',
                         close_button=True,
                         timeout=7000
                     )
+                    
+                    # If there are smart manager results, show detailed summary with link to job monitoring
+                    if smart_manager_results:
+                        with ui.dialog() as smart_summary_dialog, ui.card().classes('w-96 max-h-96 overflow-auto'):
+                            ui.label('Smart Risk Manager Jobs Enqueued').classes('text-h6 text-green-600')
+                            ui.separator()
+                            for result in smart_manager_results:
+                                ui.label(f'Expert {result["expert_id"]} (Task {result["task_id"]}):').classes('text-sm font-bold mt-2')
+                                ui.label(f'  Status: {result["status"]}').classes('text-sm')
+                            ui.separator().classes('mt-2')
+                            ui.label('Jobs are running in the background. Check Job Monitoring page for progress.').classes('text-xs text-gray-600')
+                            with ui.row().classes('mt-2 gap-2'):
+                                ui.button('Job Monitoring', on_click=lambda: ui.navigate.to('/jobmonitoring')).props('flat color=primary')
+                                ui.button('Close', on_click=smart_summary_dialog.close).props('flat')
+                        smart_summary_dialog.open()
                 else:
                     ui.notify(
                         'No orders were updated. All orders may already have quantities assigned or risk management criteria not met.',

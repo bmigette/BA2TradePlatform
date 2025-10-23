@@ -12,12 +12,12 @@ import time
 from typing import Callable, Any, Optional, Dict, Set
 from dataclasses import dataclass
 from enum import Enum
+from datetime import datetime, timezone
 from sqlmodel import Session
 from ..logger import logger
 from .db import get_setting, add_instance, update_instance, get_db
 from .models import AppSetting
 from .types import WorkerTaskStatus, AnalysisUseCase
-
 
 
 
@@ -47,6 +47,31 @@ class AnalysisTask:
     def get_task_key(self) -> str:
         """Get a unique key for this task based on expert instance and symbol."""
         return f"{self.expert_instance_id}_{self.symbol}"
+
+
+@dataclass
+class SmartRiskManagerTask:
+    """Represents a Smart Risk Manager task to be executed by a worker."""
+    id: str
+    expert_instance_id: int
+    account_id: int
+    priority: int = -10  # Higher priority than analysis tasks (negative = higher priority)
+    status: WorkerTaskStatus = WorkerTaskStatus.PENDING
+    result: Any = None
+    error: Optional[Exception] = None
+    created_at: float = None
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+    job_id: Optional[int] = None  # Reference to SmartRiskManagerJob record
+    
+    def __post_init__(self):
+        if self.created_at is None:
+            self.created_at = time.time()
+    
+    def get_task_key(self) -> str:
+        """Get a unique key for this task based on expert instance."""
+        return f"smart_risk_{self.expert_instance_id}"
+
 
 
 class WorkerQueue:
@@ -204,6 +229,64 @@ class WorkerQueue:
         self._queue.put(queue_entry)
         
         logger.debug(f"Analysis task '{task_id}' submitted for expert {expert_instance_id}, symbol {symbol}, priority {priority}")
+        return task_id
+    
+    def submit_smart_risk_manager_task(self, expert_instance_id: int, account_id: int, 
+                                      priority: int = -10, task_id: Optional[str] = None) -> str:
+        """
+        Submit a Smart Risk Manager task to be processed by the worker queue.
+        Smart Risk Manager tasks have higher priority than regular analysis tasks (default priority = -10).
+        
+        Args:
+            expert_instance_id: The expert instance ID to run Smart Risk Manager for
+            account_id: The account ID associated with the expert
+            priority: Task priority (lower numbers = higher priority, default -10 for high priority)
+            task_id: Optional custom task ID
+            
+        Returns:
+            Task ID that can be used to track the task
+            
+        Raises:
+            RuntimeError: If WorkerQueue is not running
+            ValueError: If a Smart Risk Manager task for the same expert is already pending/running
+        """
+        if not self._running:
+            raise RuntimeError("WorkerQueue is not running. Call start() first.")
+            
+        with self._task_lock:
+            # Check for duplicate task
+            task_key = f"smart_risk_{expert_instance_id}"
+            if task_key in self._task_keys:
+                existing_task_id = self._task_keys[task_key]
+                existing_task = self._tasks[existing_task_id]
+                if existing_task.status in [WorkerTaskStatus.PENDING, WorkerTaskStatus.RUNNING]:
+                    raise ValueError(f"Smart Risk Manager task for expert {expert_instance_id} is already {existing_task.status.value}")
+            
+            if task_id is None:
+                self._task_counter += 1
+                task_id = f"smart_risk_{self._task_counter}"
+            elif task_id in self._tasks:
+                raise ValueError(f"Task ID '{task_id}' already exists")
+                
+            task = SmartRiskManagerTask(
+                id=task_id,
+                expert_instance_id=expert_instance_id,
+                account_id=account_id,
+                priority=priority
+            )
+            
+            self._tasks[task_id] = task
+            self._task_keys[task_key] = task_id
+            
+        # Add to priority queue with tiebreaker (priority, counter, task)
+        # Lower priority numbers are processed first (higher priority)
+        with self._task_lock:
+            self._queue_counter += 1
+            queue_entry = (priority, self._queue_counter, task)
+        
+        self._queue.put(queue_entry)
+        
+        logger.info(f"Smart Risk Manager task '{task_id}' submitted for expert {expert_instance_id}, priority {priority}")
         return task_id
         
     def get_task_status(self, task_id: str) -> Optional[AnalysisTask]:
@@ -453,7 +536,18 @@ class WorkerQueue:
                     self._queue.task_done()  # Mark sentinel task as done
                     break
                 
-                # Check if we should skip this task based on existing transactions
+                # Handle different task types
+                if isinstance(task, SmartRiskManagerTask):
+                    # Execute Smart Risk Manager task
+                    try:
+                        self._execute_smart_risk_manager_task(task, worker_name)
+                    except Exception as e:
+                        logger.error(f"Error executing Smart Risk Manager task in worker {worker_name}: {e}", exc_info=True)
+                    finally:
+                        self._queue.task_done()
+                    continue
+                
+                # For AnalysisTask, check if we should skip based on existing transactions
                 should_skip = self._should_skip_task(task)
                 if should_skip:
                     # Create or update MarketAnalysis record for skipped analysis
@@ -669,6 +763,132 @@ class WorkerQueue:
                 
             execution_time = task.completed_at - task.started_at
             logger.error(f"Analysis task '{task.id}' failed after {execution_time:.2f}s: {e}", exc_info=True)
+        
+        finally:
+            # Clean up task key mapping for completed/failed tasks
+            with self._task_lock:
+                if task.status in [WorkerTaskStatus.COMPLETED, WorkerTaskStatus.FAILED]:
+                    task_key = task.get_task_key()
+                    if task_key in self._task_keys and self._task_keys[task_key] == task.id:
+                        del self._task_keys[task_key]
+    
+    def _execute_smart_risk_manager_task(self, task: SmartRiskManagerTask, worker_name: str):
+        """Execute a Smart Risk Manager task."""
+        logger.debug(f"Worker {worker_name} executing Smart Risk Manager task '{task.id}' for expert {task.expert_instance_id}")
+        
+        # Update task status
+        with self._task_lock:
+            task.status = WorkerTaskStatus.RUNNING
+            task.started_at = time.time()
+        
+        job_id = None
+        try:
+            # Import here to avoid circular imports
+            from .db import get_instance, add_instance, update_instance
+            from .models import ExpertInstance, SmartRiskManagerJob
+            from .SmartRiskManagerGraph import run_smart_risk_manager
+            
+            # Get the expert instance to retrieve settings
+            expert_instance = get_instance(ExpertInstance, task.expert_instance_id)
+            if not expert_instance:
+                raise ValueError(f"Expert instance {task.expert_instance_id} not found")
+            
+            # Get model and user instructions from settings
+            settings = expert_instance.settings or {}
+            model_used = settings.get("llm_model", "")
+            user_instructions = settings.get("user_instructions", "")
+            
+            # Create SmartRiskManagerJob record with RUNNING status
+            smart_risk_job = SmartRiskManagerJob(
+                expert_instance_id=task.expert_instance_id,
+                account_id=task.account_id,
+                status="RUNNING",
+                model_used=model_used,
+                user_instructions=user_instructions,
+                run_date=datetime.now(timezone.utc)
+            )
+            job_id = add_instance(smart_risk_job)
+            task.job_id = job_id
+            
+            logger.info(f"Created SmartRiskManagerJob {job_id} for expert {task.expert_instance_id}")
+            
+            # Run the Smart Risk Manager
+            result = run_smart_risk_manager(task.expert_instance_id, task.account_id)
+            
+            # Reload the job to update it
+            smart_risk_job = get_instance(SmartRiskManagerJob, job_id)
+            if not smart_risk_job:
+                raise ValueError(f"SmartRiskManagerJob {job_id} not found after execution")
+            
+            # Update job with results
+            if result["success"]:
+                smart_risk_job.status = "COMPLETED"
+                smart_risk_job.iteration_count = result.get("iterations", 0)
+                smart_risk_job.actions_taken_count = result.get("actions_count", 0)
+                smart_risk_job.actions_summary = result.get("summary", "")
+                
+                # Store actions log if available
+                if "actions" in result and result["actions"]:
+                    smart_risk_job.actions_log = result["actions"]
+                
+                # Update duration
+                if smart_risk_job.run_date:
+                    duration = (datetime.now(timezone.utc) - smart_risk_job.run_date).total_seconds()
+                    smart_risk_job.duration_seconds = int(duration)
+                
+                logger.info(f"SmartRiskManagerJob {job_id} completed successfully: {result.get('iterations', 0)} iterations, {result.get('actions_count', 0)} actions")
+            else:
+                smart_risk_job.status = "FAILED"
+                error_message = result.get("error", "Unknown error")
+                smart_risk_job.error_message = error_message
+                logger.error(f"SmartRiskManagerJob {job_id} failed: {error_message}")
+            
+            update_instance(smart_risk_job)
+            
+            # Update task with success
+            with self._task_lock:
+                task.status = WorkerTaskStatus.COMPLETED
+                task.result = {
+                    "job_id": job_id,
+                    "status": "completed" if result["success"] else "failed",
+                    "iterations": result.get("iterations", 0),
+                    "actions_count": result.get("actions_count", 0),
+                    "summary": result.get("summary", ""),
+                    "error": result.get("error") if not result["success"] else None
+                }
+                task.completed_at = time.time()
+            
+            execution_time = task.completed_at - task.started_at
+            logger.debug(f"Smart Risk Manager task '{task.id}' completed in {execution_time:.2f}s")
+            
+        except Exception as e:
+            # Update job with failure if job was created
+            if job_id:
+                try:
+                    from .db import get_instance, update_instance
+                    from .models import SmartRiskManagerJob
+                    smart_risk_job = get_instance(SmartRiskManagerJob, job_id)
+                    if smart_risk_job:
+                        smart_risk_job.status = "FAILED"
+                        smart_risk_job.error_message = str(e)
+                        
+                        # Update duration
+                        if smart_risk_job.run_date:
+                            duration = (datetime.now(timezone.utc) - smart_risk_job.run_date).total_seconds()
+                            smart_risk_job.duration_seconds = int(duration)
+                        
+                        update_instance(smart_risk_job)
+                except Exception as update_error:
+                    logger.error(f"Failed to update SmartRiskManagerJob {job_id} with error status: {update_error}")
+            
+            # Update task with failure
+            with self._task_lock:
+                task.status = WorkerTaskStatus.FAILED
+                task.error = e
+                task.completed_at = time.time()
+            
+            execution_time = task.completed_at - task.started_at
+            logger.error(f"Smart Risk Manager task '{task.id}' failed after {execution_time:.2f}s: {e}", exc_info=True)
         
         finally:
             # Clean up task key mapping for completed/failed tasks

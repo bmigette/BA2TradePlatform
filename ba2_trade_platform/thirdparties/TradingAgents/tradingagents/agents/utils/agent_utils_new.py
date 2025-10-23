@@ -402,6 +402,86 @@ class Toolkit:
             logger.error(f"Error in get_global_news: {e}")
             return f"Error retrieving global news: {str(e)}"
     
+    def extract_web_content(
+        self,
+        urls: Annotated[List[str], "List of news article URLs to extract full content from. Provide URLs from news articles to get complete article text for deeper analysis."],
+        max_tokens: Annotated[int, "Maximum total tokens to extract across all URLs. Default is 128000 (128K tokens). Content extraction stops when this limit is reached."] = 128000
+    ) -> str:
+        """
+        Extract full article content from multiple news URLs in parallel.
+        
+        This tool fetches and extracts the main content from news article URLs,
+        filtering out ads, navigation, and boilerplate to provide clean article text.
+        Ideal for deep analysis of specific news articles beyond summaries.
+        
+        The extraction:
+        - Runs in parallel for fast processing (up to 5 URLs simultaneously)
+        - Automatically manages token limits (stops at max_tokens)
+        - Returns clean markdown format for LLM analysis
+        - Skips URLs that would exceed the token limit
+        - Handles errors gracefully (blocked sites, timeouts, etc.)
+        
+        Use this when you need full article details beyond the summary provided by
+        news APIs. Particularly useful for analyzing detailed earnings reports,
+        in-depth investigative pieces, or comprehensive market analysis articles.
+        
+        Args:
+            urls: List of article URLs to extract (e.g., from get_company_news results)
+            max_tokens: Maximum total tokens across all articles (default: 128000)
+        
+        Returns:
+            str: Markdown-formatted content with all extracted articles and metadata
+        
+        Example:
+            >>> # Get news URLs first
+            >>> news = get_company_news("AAPL", "2024-03-15", lookback_days=3)
+            >>> # Extract full articles (you would parse URLs from news first)
+            >>> content = extract_web_content(
+            ...     urls=["https://example.com/article1", "https://example.com/article2"],
+            ...     max_tokens=50000
+            ... )
+            >>> # Returns full article text for deeper analysis
+        
+        Note:
+            - Some sites block automated access (403/401 errors) - these will be skipped
+            - Extraction stops automatically when token limit is reached
+            - Results are logged as Analysis Output in the database
+        """
+        from ...utils.web_content_extractor import extract_urls_parallel
+        
+        if not urls:
+            logger.warning("extract_web_content called with empty URL list")
+            return "**No URLs Provided**\n\nPlease provide at least one URL to extract content from."
+        
+        logger.info(f"Extracting web content from {len(urls)} URLs (max_tokens={max_tokens})")
+        
+        try:
+            # Extract content in parallel
+            result = extract_urls_parallel(
+                urls=urls,
+                max_workers=5,
+                max_tokens=max_tokens,
+                timeout=10
+            )
+            
+            if not result["success"]:
+                error_msg = result.get("error", "Unknown error")
+                logger.error(f"Web content extraction failed: {error_msg}")
+                return f"**Extraction Failed**\n\n{error_msg}"
+            
+            # Log success metrics
+            logger.info(
+                f"Web content extraction complete: {result['extracted_count']}/{len(urls)} URLs, "
+                f"{result['total_tokens']:,} tokens in {result['duration']:.2f}s"
+            )
+            
+            # Return markdown content
+            return result["content_markdown"]
+            
+        except Exception as e:
+            logger.error(f"Error in extract_web_content: {e}", exc_info=True)
+            return f"**Error Extracting Web Content**\n\n{str(e)}"
+    
     # ========================================================================
     # SOCIAL MEDIA PROVIDERS - Aggregate results from all providers
     # ========================================================================

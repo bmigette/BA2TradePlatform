@@ -13,7 +13,7 @@ from ...thirdparties.TradingAgents.tradingagents.default_config import DEFAULT_C
 from ...thirdparties.TradingAgents.tradingagents.db_storage import update_market_analysis_status
 
 
-class TradingAgents(MarketExpertInterface):
+class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
     """
     TradingAgents Expert Implementation
     

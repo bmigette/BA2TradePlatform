@@ -1,6 +1,6 @@
 import logging
 from nicegui import ui, Client, app
-from .pages import overview, settings, marketanalysis, market_analysis_detail, rulesettest, marketanalysishistory
+from .pages import overview, settings, marketanalysis, market_analysis_detail, rulesettest, marketanalysishistory, smart_risk_manager_detail
 from .layout import layout_render
 from pathlib import Path
 from ..logger import logger
@@ -97,6 +97,12 @@ def market_analysis_history_page(symbol: str) -> None:
     logger.debug(f"[ROUTE] /marketanalysishistory/{symbol} - Loading market analysis history page")
     with layout_render(f'Market Analysis History - {symbol}'):
         marketanalysishistory.render_market_analysis_history(symbol)
+
+@ui.page('/smartriskmanagerdetail/{job_id}')
+def smart_risk_manager_detail_page(job_id: int) -> None:
+    logger.debug(f"[ROUTE] /smartriskmanagerdetail/{job_id} - Loading Smart Risk Manager detail page")
+    with layout_render(f'Smart Risk Manager Job #{job_id}'):
+        smart_risk_manager_detail.content(job_id)
 
 STATICPATH = Path(__file__).parent / 'static'
 FAVICO = (STATICPATH / 'favicon.ico')

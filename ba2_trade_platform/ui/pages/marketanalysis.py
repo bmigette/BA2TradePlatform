@@ -129,6 +129,11 @@ class JobMonitoringTab:
             
             ui.separator().classes('my-4')
             
+            # Smart Risk Manager jobs table
+            self._create_smart_risk_manager_table()
+            
+            ui.separator().classes('my-4')
+            
             # Worker queue status
             with ui.card().classes('w-full'):
                 ui.label('Worker Queue Status').classes('text-md font-bold')
@@ -213,6 +218,133 @@ class JobMonitoringTab:
             self.analysis_table.on('view_details', self.view_analysis_details)
             self.analysis_table.on('troubleshoot_ruleset', self.troubleshoot_ruleset)
             self.analysis_table.on('rerun_analysis', self.rerun_analysis)
+    
+    def _create_smart_risk_manager_table(self):
+        """Create the Smart Risk Manager jobs table."""
+        columns = [
+            {'name': 'id', 'label': 'Job ID', 'field': 'id', 'sortable': True, 'style': 'width: 80px'},
+            {'name': 'expert', 'label': 'Expert', 'field': 'expert_name', 'sortable': True, 'style': 'width: 150px'},
+            {'name': 'status', 'label': 'Status', 'field': 'status_display', 'sortable': True, 'style': 'width: 120px'},
+            {'name': 'run_date', 'label': 'Run Date', 'field': 'run_date_local', 'sortable': True, 'style': 'width: 160px'},
+            {'name': 'duration', 'label': 'Duration', 'field': 'duration_display', 'sortable': True, 'style': 'width: 100px'},
+            {'name': 'iterations', 'label': 'Iterations', 'field': 'iteration_count', 'sortable': True, 'style': 'width: 100px'},
+            {'name': 'actions', 'label': 'Actions Taken', 'field': 'actions_taken_count', 'sortable': True, 'style': 'width: 120px'},
+            {'name': 'detail', 'label': '', 'field': 'detail', 'sortable': False, 'style': 'width: 80px'}
+        ]
+        
+        smart_risk_data = self._get_smart_risk_manager_data()
+        
+        with ui.card().classes('w-full'):
+            with ui.row().classes('w-full justify-between items-center mb-2'):
+                ui.label('Smart Risk Manager Jobs').classes('text-md font-bold')
+                ui.label(f'Showing {len(smart_risk_data)} jobs').classes('text-sm text-gray-600')
+            
+            self.smart_risk_table = ui.table(
+                columns=columns,
+                rows=smart_risk_data,
+                row_key='id'
+            ).classes('w-full')
+            
+            # Add status badge slot
+            self.smart_risk_table.add_slot('body-cell-status', '''
+                <q-td :props="props">
+                    <q-badge :color="props.row.status_color" :label="props.row.status" />
+                </q-td>
+            ''')
+            
+            # Add detail button slot
+            self.smart_risk_table.add_slot('body-cell-detail', '''
+                <q-td :props="props">
+                    <q-btn flat dense icon="visibility" 
+                           color="primary" 
+                           @click="$parent.$emit('view_smart_risk_detail', props.row.id)">
+                        <q-tooltip>View Job Details</q-tooltip>
+                    </q-btn>
+                </q-td>
+            ''')
+            
+            # Handle events
+            self.smart_risk_table.on('view_smart_risk_detail', self.view_smart_risk_detail)
+    
+    def _get_smart_risk_manager_data(self) -> List[dict]:
+        """Get Smart Risk Manager jobs data for the table."""
+        try:
+            from ...core.models import SmartRiskManagerJob, ExpertInstance
+            from sqlmodel import select, desc
+            
+            with get_db() as session:
+                # Get recent Smart Risk Manager jobs (last 50)
+                statement = select(SmartRiskManagerJob).order_by(desc(SmartRiskManagerJob.run_date)).limit(50)
+                jobs = session.exec(statement).all()
+                
+                rows = []
+                for job in jobs:
+                    # Get expert name
+                    expert_name = "Unknown"
+                    try:
+                        expert_instance = session.get(ExpertInstance, job.expert_instance_id)
+                        if expert_instance:
+                            expert_name = expert_instance.expert
+                    except Exception:
+                        pass
+                    
+                    # Format duration
+                    duration_display = "N/A"
+                    if job.duration_seconds is not None:
+                        if job.duration_seconds < 60:
+                            duration_display = f"{job.duration_seconds}s"
+                        else:
+                            minutes = job.duration_seconds // 60
+                            seconds = job.duration_seconds % 60
+                            duration_display = f"{minutes}m {seconds}s"
+                    
+                    # Format run date
+                    run_date_local = job.run_date.strftime('%Y-%m-%d %H:%M:%S') if job.run_date else "N/A"
+                    
+                    # Status badge color
+                    status_color = 'positive' if job.status == 'COMPLETED' else ('negative' if job.status == 'FAILED' else 'warning')
+                    
+                    rows.append({
+                        'id': job.id,
+                        'expert_name': expert_name,
+                        'expert_instance_id': job.expert_instance_id,
+                        'status': job.status,
+                        'status_display': job.status,
+                        'status_color': status_color,
+                        'run_date_local': run_date_local,
+                        'duration_display': duration_display,
+                        'iteration_count': job.iteration_count or 0,
+                        'actions_taken_count': job.actions_taken_count or 0
+                    })
+                
+                return rows
+                
+        except Exception as e:
+            logger.error(f"Error getting Smart Risk Manager jobs data: {e}", exc_info=True)
+            return []
+    
+    def view_smart_risk_detail(self, event_data):
+        """Navigate to the Smart Risk Manager job detail page."""
+        job_id = None
+        try:
+            # Extract job_id from event data
+            if hasattr(event_data, 'args') and hasattr(event_data.args, '__len__') and len(event_data.args) > 0:
+                job_id = int(event_data.args[0])
+            elif isinstance(event_data, int):
+                job_id = event_data
+            elif hasattr(event_data, 'args') and isinstance(event_data.args, int):
+                job_id = event_data.args
+            else:
+                logger.error(f"Invalid event data for view_smart_risk_detail: {event_data}", exc_info=True)
+                ui.notify("Invalid event data", type='negative')
+                return
+            
+            # Navigate to the detail page
+            ui.navigate.to(f'/smartriskmanagerdetail/{job_id}')
+            
+        except Exception as e:
+            logger.error(f"Error navigating to Smart Risk Manager detail {job_id if job_id else 'unknown'}: {e}", exc_info=True)
+            ui.notify(f"Error opening details: {str(e)}", type='negative')
 
     def _create_queue_status(self):
         """Create worker queue status display with live-updating labels."""
@@ -2640,6 +2772,66 @@ class OrderRecommendationsTab:
             # Get the ID by splitting on the last dash and taking the last part
             expert_id = int(selected_text.split('-')[-1])
             
+            # Load expert instance and check risk_manager_mode setting
+            from ...core.utils import get_expert_instance_from_id
+            expert_instance = get_expert_instance_from_id(expert_id)
+            
+            if not expert_instance:
+                ui.notify(f'Expert instance {expert_id} not found', type='negative')
+                return
+            
+            # Check risk_manager_mode setting (default to "classic" if not set)
+            risk_manager_mode = expert_instance.settings.get("risk_manager_mode", "classic")
+            
+            if risk_manager_mode == "smart":
+                # Run Smart Risk Manager (AI-powered agentic workflow)
+                self._run_smart_risk_manager(expert_id, expert_instance)
+            else:
+                # Run classic rule-based risk management
+                self._run_classic_risk_management(expert_id)
+                
+        except Exception as e:
+            logger.error(f"Error in _handle_risk_management_and_submit: {e}", exc_info=True)
+            ui.notify(f'Error: {str(e)}', type='negative')
+    
+    def _run_smart_risk_manager(self, expert_id: int, expert_instance):
+        """Enqueue AI-powered Smart Risk Manager workflow to SmartRiskManagerQueue."""
+        try:
+            # Get account_id from expert instance
+            account_id = expert_instance.account_id
+            
+            # Enqueue Smart Risk Manager job to dedicated queue
+            from ...core.SmartRiskManagerQueue import get_smart_risk_manager_queue
+            smart_queue = get_smart_risk_manager_queue()
+            
+            task_id = smart_queue.submit_task(expert_id, account_id)
+            
+            if task_id:
+                # Show success notification with link to monitoring page
+                ui.notify(
+                    f'Smart Risk Manager job enqueued (Task ID: {task_id}). Check Job Monitoring tab for progress.',
+                    type='positive',
+                    timeout=5000,
+                    close_button=True
+                )
+                
+                # Switch to Job Monitoring tab
+                # Note: This assumes we're in the market analysis page with tabs
+                # The tab switching will be handled by the user manually
+            else:
+                ui.notify(
+                    'Smart Risk Manager job already running for this expert',
+                    type='warning',
+                    timeout=5000
+                )
+                
+        except Exception as e:
+            logger.error(f"Error enqueueing Smart Risk Manager for expert {expert_id}: {e}", exc_info=True)
+            ui.notify(f'Error enqueueing Smart Risk Manager: {str(e)}', type='negative', timeout=5000)
+    
+    def _run_classic_risk_management(self, expert_id: int):
+        """Run classic rule-based risk management."""
+        try:
             # Get the Risk Management system
             from ...core.TradeRiskManagement import get_risk_management
             
@@ -2671,8 +2863,12 @@ class OrderRecommendationsTab:
                 
             except Exception as e:
                 processing_dialog.close()
-                logger.error(f"Error in risk management for expert {expert_id}: {e}", exc_info=True)
+                logger.error(f"Error in classic risk management for expert {expert_id}: {e}", exc_info=True)
                 ui.notify(f'Error in risk management: {str(e)}', type='negative')
+                
+        except Exception as e:
+            logger.error(f"Error in _run_classic_risk_management: {e}", exc_info=True)
+            ui.notify(f'Error: {str(e)}', type='negative')
                 
         except Exception as e:
             logger.error(f"Error in _handle_risk_management_and_submit: {e}", exc_info=True)

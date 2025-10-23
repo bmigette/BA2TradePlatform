@@ -14,7 +14,7 @@ from .models import (
     Transaction, TradingOrder, MarketAnalysis, ExpertInstance,
     SmartRiskManagerJob, SmartRiskManagerJobAnalysis
 )
-from .types import TransactionStatus, OrderStatus, OrderType, OrderDirection
+from .types import TransactionStatus, OrderStatus, OrderType, OrderDirection, MarketAnalysisStatus
 from .db import get_db, get_instance
 from .utils import get_expert_instance_from_id, get_account_instance_from_id
 
@@ -257,14 +257,18 @@ class SmartRiskManagerToolkit:
 
     def get_recent_analyses(
         self,
-        symbol: Annotated[Optional[str], "Specific symbol to query (None = all symbols with open positions)"] = None,
+        symbol: Annotated[Optional[str], "Specific symbol to query (None = all recent analyses for this expert)"] = None,
         max_age_hours: Annotated[int, "Maximum age of analyses to return in hours"] = 24
     ) -> List[Dict[str, Any]]:
         """
-        Get recent market analyses for open positions or a specific symbol.
+        Get recent market analyses for this expert instance.
+        
+        Returns all recent COMPLETED analyses (not just for open positions) since the risk manager
+        needs to evaluate opportunities for opening new positions. If the most recent analysis for
+        a symbol failed, falls back to the previous completed analysis within the time window.
         
         Args:
-            symbol: Specific symbol to query (None = all symbols with open positions)
+            symbol: Specific symbol to query (None = all recent analyses for this expert)
             max_age_hours: Maximum age of analyses to return (default 24 hours)
             
         Returns:
@@ -274,35 +278,49 @@ class SmartRiskManagerToolkit:
             logger.debug(f"Getting recent analyses for symbol={symbol}, max_age={max_age_hours}h")
             
             with get_db() as session:
-                # Get symbols to query
-                if symbol:
-                    symbols = [symbol]
-                else:
-                    # Get all symbols from open positions (transactions are per expert)
-                    transactions = session.exec(
-                        select(Transaction.symbol)
-                        .where(Transaction.expert_id == self.expert_instance_id)
-                        .where(Transaction.status == TransactionStatus.OPENED)
-                        .distinct()
-                    ).all()
-                    symbols = list(transactions)
-                
-                if not symbols:
-                    logger.debug("No symbols to query")
-                    return []
-                
                 # Query market analyses (use created_at, not analysis_timestamp)
                 cutoff_time = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
                 
-                analyses = session.exec(
-                    select(MarketAnalysis)
-                    .where(MarketAnalysis.symbol.in_(symbols))
-                    .where(MarketAnalysis.created_at >= cutoff_time)
-                    .order_by(MarketAnalysis.created_at.desc())
-                ).all()
+                # Build query - filter by expert instance and time
+                query = select(MarketAnalysis).where(
+                    MarketAnalysis.expert_instance_id == self.expert_instance_id,
+                    MarketAnalysis.created_at >= cutoff_time
+                )
                 
+                # Add symbol filter if specified
+                if symbol:
+                    query = query.where(MarketAnalysis.symbol == symbol)
+                
+                # Order by most recent first
+                query = query.order_by(MarketAnalysis.created_at.desc())
+                
+                all_analyses = session.exec(query).all()
+                
+                # Group analyses by symbol to handle fallback logic
+                analyses_by_symbol = {}
+                for analysis in all_analyses:
+                    if analysis.symbol not in analyses_by_symbol:
+                        analyses_by_symbol[analysis.symbol] = []
+                    analyses_by_symbol[analysis.symbol].append(analysis)
+                
+                # Select the best analysis for each symbol (completed, or most recent completed if latest failed)
+                selected_analyses = []
+                for sym, sym_analyses in analyses_by_symbol.items():
+                    # Find first completed analysis (most recent due to ordering)
+                    completed_analysis = next(
+                        (a for a in sym_analyses if a.status == MarketAnalysisStatus.COMPLETED),
+                        None
+                    )
+                    
+                    if completed_analysis:
+                        selected_analyses.append(completed_analysis)
+                    else:
+                        # No completed analysis found within time window - log warning
+                        logger.warning(f"No completed analysis found for {sym} within {max_age_hours}h window")
+                
+                # Build results from selected analyses
                 results = []
-                for analysis in analyses:
+                for analysis in selected_analyses:
                     # Handle timezone-naive datetime
                     now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
                     age_hours = (now_utc - analysis.created_at).total_seconds() / 3600
@@ -338,7 +356,10 @@ class SmartRiskManagerToolkit:
                         "summary": summary
                     })
                 
-                logger.debug(f"Found {len(results)} recent analyses")
+                # Sort results by timestamp DESC
+                results.sort(key=lambda x: x["timestamp"], reverse=True)
+                
+                logger.debug(f"Found {len(results)} completed recent analyses")
                 return results
                 
         except Exception as e:
@@ -433,6 +454,9 @@ class SmartRiskManagerToolkit:
         """
         Get historical market analyses for deeper research.
         
+        Returns only COMPLETED analyses. If the most recent analysis failed, returns
+        the previous completed ones.
+        
         Args:
             symbol: Symbol to query
             limit: Max number of results (default 10)
@@ -445,9 +469,13 @@ class SmartRiskManagerToolkit:
             logger.debug(f"Getting historical analyses for {symbol}, limit={limit}, offset={offset}")
             
             with get_db() as session:
+                # Query only COMPLETED analyses
                 analyses = session.exec(
                     select(MarketAnalysis)
-                    .where(MarketAnalysis.symbol == symbol)
+                    .where(
+                        MarketAnalysis.symbol == symbol,
+                        MarketAnalysis.status == MarketAnalysisStatus.COMPLETED
+                    )
                     .order_by(MarketAnalysis.created_at.desc())
                     .offset(offset)
                     .limit(limit)
@@ -490,7 +518,7 @@ class SmartRiskManagerToolkit:
                         "summary": summary
                     })
                 
-                logger.debug(f"Found {len(results)} historical analyses")
+                logger.debug(f"Found {len(results)} completed historical analyses")
                 return results
                 
         except Exception as e:

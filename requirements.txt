@@ -39,3 +39,4 @@ rich
 questionary
 langchain-anthropic
 langchain-google-genai
+trafilatura  # Web content extraction for LLMs
