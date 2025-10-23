@@ -1545,6 +1545,12 @@ class Toolkit:
                 from ...dataflows.config import get_config
                 config = get_config()
                 lookback_days = config["economic_data_days"]
+                logger.debug(f"Using default lookback_days from config: {lookback_days}")
+            
+            # Ensure lookback_days is not None
+            if lookback_days is None:
+                logger.error("lookback_days is None even after config lookup")
+                return "Error: Unable to determine lookback_days for Fed calendar"
             
             results = []
             for provider_class in self.provider_map["macro"]:
@@ -1552,7 +1558,7 @@ class Toolkit:
                     provider = self._instantiate_provider(provider_class)
                     provider_name = provider.__class__.__name__
                     
-                    logger.debug(f"Fetching Fed calendar from {provider_name}")
+                    logger.debug(f"Fetching Fed calendar from {provider_name} with lookback_days={lookback_days}")
                     fed_data = provider.get_fed_calendar(
                         end_date=end_dt,
                         lookback_days=lookback_days,

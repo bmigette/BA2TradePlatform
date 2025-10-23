@@ -1899,6 +1899,11 @@ class ExpertSettingsTab:
             if hasattr(self, 'dynamic_instrument_selection_model_select'):
                 self.dynamic_instrument_selection_model_select.value = dynamic_instrument_selection_model
             
+            # Load AI instrument prompt (for dynamic instrument selection)
+            ai_instrument_prompt = expert.settings.get('ai_instrument_prompt')
+            if ai_instrument_prompt and hasattr(self, 'ai_prompt_textarea'):
+                self.ai_prompt_textarea.value = ai_instrument_prompt
+            
             # Load risk manager mode
             risk_manager_mode = expert.settings.get('risk_manager_mode', 'classic')
             if hasattr(self, 'risk_manager_mode_select'):

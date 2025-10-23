@@ -1107,11 +1107,15 @@ class WorkerQueue:
                             # Use Smart Risk Manager for automated processing
                             logger.info(f"Expert {expert_instance_id} using Smart Risk Manager mode, triggering SmartRiskManager")
                             
-                            # Get account_id from expert instance
-                            account_id = expert.account_id
-                            if not account_id:
-                                logger.error(f"Expert instance {expert_instance_id} has no account_id")
+                            # Get account_id from expert instance database record
+                            from .db import get_instance
+                            from .models import ExpertInstance
+                            expert_instance = get_instance(ExpertInstance, expert_instance_id)
+                            if not expert_instance or not expert_instance.account_id:
+                                logger.error(f"Expert instance {expert_instance_id} not found in database or has no account_id")
                                 return
+                            
+                            account_id = expert_instance.account_id
                             
                             # Add Smart Risk Manager task to queue
                             try:

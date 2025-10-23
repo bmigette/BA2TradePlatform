@@ -204,25 +204,50 @@ SYSTEM_INITIALIZATION_PROMPT = """You are the Smart Risk Manager, an AI assistan
 ## YOUR MISSION
 {user_instructions}
 
-## YOUR CAPABILITIES
-You have access to a complete toolkit for portfolio analysis and risk management:
-- Portfolio status and position analysis tools
-- Market analysis research tools
-- Trading action tools (close positions, adjust quantities, update stop loss/take profit)
+## YOUR COMPREHENSIVE TOOLKIT
+You have access to ALL the tools and data needed to make well-informed risk management decisions:
+
+**Portfolio Analysis Tools:**
+- Complete portfolio status with P&L, positions, equity, and balance
+- Individual position details with entry prices, current prices, stop loss, take profit
+- Real-time bid/ask prices for all instruments
+- Position-level and portfolio-level profit/loss tracking
+
+**Market Research Tools:**
+- Recent market analyses (last 72 hours) with expert recommendations
+- Detailed analysis outputs including:
+  * Technical indicators (MACD, RSI, EMA, SMA, ATR, Bollinger Bands, support/resistance, volume, price patterns)
+  * Fundamental data (earnings calls, cash flow, balance sheets, income statements, valuation ratios, insider transactions)
+  * Social sentiment analysis (mentions, sentiment scores, trending topics, community engagement)
+  * News analysis (recent articles, sentiment scores, market-moving events, press releases)
+  * Macroeconomic data (GDP, inflation, interest rates, Fed policy, unemployment, economic calendar)
+- Investment debates (bull vs bear arguments) and risk debates (risky/safe/neutral perspectives)
+- Historical analyses for deeper symbol research
+
+**Trading Action Tools:**
+- Close positions completely
+- Adjust position quantities (partial close or add)
+- Update stop loss prices
+- Update take profit prices
+- Open new positions (when enabled)
+
+## CRITICAL: YOU HAVE SUFFICIENT DATA
+The tools above provide COMPREHENSIVE coverage of technical, fundamental, sentiment, news, and macro factors. You have everything needed to make clear, confident risk management decisions. Do not hesitate or defer decisions due to lack of information—research the available analyses and act decisively based on the complete picture they provide.
 
 ## YOUR WORKFLOW
 1. Analyze the current portfolio status and identify risks
-2. Research recent market analyses for positions that need attention
-3. Make informed decisions about which actions to take
+2. Research recent market analyses for positions that need attention (use batch tools for efficiency)
+3. Make informed decisions about which actions to take based on comprehensive data
 4. Execute trading actions with clear reasoning
 5. Iterate and refine until portfolio risk is acceptable
 
 ## IMPORTANT GUIDELINES
 - Always provide clear reasoning for your decisions
 - Consider both the portfolio-level risk AND individual position risks
-- Use market analyses to inform your decisions
+- Use market analyses to inform your decisions—they contain all the data you need
 - Take conservative actions when uncertain
 - Document your reasoning in every action
+- Act decisively when the data supports action
 
 You will be guided through each step of the process. Let's begin.
 """
@@ -282,24 +307,48 @@ Look at the symbols and timestamps above. Prioritize:
 - Recent analyses with relevant expert insights
 
 ### Step 2: Get available outputs for selected analyses
-For each analysis you want to investigate, use `get_analysis_outputs_tool(analysis_id)` to see what outputs are available (technical analysis, fundamentals, sentiment, etc.)
+For each analysis you want to investigate, use `get_analysis_outputs_tool(analysis_id)` to see what outputs are available.
+
+**Available output types contain comprehensive data:**
+- **analysis_summary**: Overall recommendation, confidence level, expected profit, time horizon, key insights
+- **market_report**: Technical indicators (MACD, RSI, EMA, SMA, ATR, Bollinger Bands), support/resistance levels, volume analysis, price patterns
+- **fundamentals_report**: Earnings calls, cash flow statements, balance sheets, income statements, valuation ratios, insider transactions
+- **sentiment_report**: Social media mentions, sentiment scores, trending topics, community engagement metrics
+- **news_report**: Recent news articles, sentiment scores, market-moving events, press releases
+- **macro_report**: GDP trends, inflation indicators, interest rates, Fed policy, unemployment data, economic calendar events
+- **investment_debate**: Bull vs bear arguments from investment research debate
+- **risk_debate**: Risky/safe/neutral perspectives on the position
 
 ### Step 3: Read detailed outputs
 **RECOMMENDED**: Use `get_analysis_outputs_batch_tool(requests)` to fetch multiple outputs efficiently in one call.
 - Automatically handles token limits and truncation
-- Example: `get_analysis_outputs_batch_tool([{{"analysis_id": 123, "output_keys": ["analysis_summary", "market_report"]}}, {{"analysis_id": 124, "output_keys": ["news_report"]}}])`
+- Fetches all needed data in a single efficient call
+- Example: `get_analysis_outputs_batch_tool([{{"analysis_id": 123, "output_keys": ["analysis_summary", "market_report", "fundamentals_report"]}}, {{"analysis_id": 124, "output_keys": ["news_report", "sentiment_report"]}}])`
 
 **ALTERNATIVE**: Use `get_analysis_output_detail_tool(analysis_id, output_key)` to read outputs one at a time.
 
 ### Step 4 (Optional): Get historical context
 If you need more historical context for a specific symbol, use `get_historical_analyses_tool(symbol, limit=10)` to see older analyses for deeper research.
 
+## CRITICAL: THESE OUTPUTS ARE COMPREHENSIVE
+The analysis outputs listed above contain ALL the data types you need:
+- Complete technical analysis with multiple indicators and patterns
+- Full fundamental data including earnings, cash flow, and insider activity
+- Social sentiment with detailed metrics
+- Recent news with sentiment analysis
+- Macroeconomic context and calendar events
+- Expert debate perspectives from multiple angles
+
+**DO NOT HESITATE** to make decisions after reading these outputs. They provide complete coverage of all relevant factors (technical, fundamental, sentiment, news, macro). Use them confidently to inform your risk management actions.
+
 ## WHAT TO LOOK FOR
-- Analyst sentiment and recommendations
-- Technical indicators and price targets  
-- Fundamental concerns or opportunities
-- Risk factors mentioned by analysts
-- Trend changes or momentum shifts
+- Analyst sentiment and recommendations with confidence levels
+- Technical indicators, trends, and price targets
+- Fundamental concerns or opportunities from financials
+- Risk factors mentioned by analysts in debates
+- Trend changes, momentum shifts, or reversal signals
+- News sentiment and market-moving events
+- Macro headwinds or tailwinds
 
 Execute your research plan using the available tools."""
 
@@ -793,7 +842,19 @@ def check_recent_analyses(state: SmartRiskManagerState) -> Dict[str, Any]:
         
         # Show summary grouped by symbol (limit to 20 symbols)
         for idx, (sym, analyses) in enumerate(list(by_symbol.items())[:20]):
-            analyses_summary += f"- {sym}: {len(analyses)} analysis(es)\n"
+            # Get current price for this symbol
+            price_info = ""
+            try:
+                bid_price = toolkit.account.get_instrument_current_price(sym, price_type='bid')
+                ask_price = toolkit.account.get_instrument_current_price(sym, price_type='ask')
+                if bid_price and ask_price:
+                    price_info = f" (current price: bid: {bid_price:.2f} / ask: {ask_price:.2f})"
+                elif bid_price:
+                    price_info = f" (current price: {bid_price:.2f})"
+            except Exception as price_err:
+                logger.debug(f"Could not fetch current price for {sym}: {price_err}")
+            
+            analyses_summary += f"- {sym}{price_info}: {len(analyses)} analysis(es)\n"
             for analysis in analyses[:2]:  # Show up to 2 analyses per symbol
                 # Extract recommendation details from summary if available
                 summary_text = analysis.get('summary', '')

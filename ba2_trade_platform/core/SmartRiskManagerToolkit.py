@@ -494,106 +494,91 @@ class SmartRiskManagerToolkit:
             total_chars = 0
             truncated = False
             
-            with get_db() as session:
-                for req in requests:
-                    analysis_id = req.get("analysis_id")
-                    output_keys = req.get("output_keys", [])
-                    
-                    if not analysis_id:
-                        logger.warning(f"Skipping request with missing analysis_id: {req}")
+            # Process each request by calling get_analysis_output_detail
+            for req in requests:
+                analysis_id = req.get("analysis_id")
+                output_keys = req.get("output_keys", [])
+                
+                if not analysis_id:
+                    logger.warning(f"Skipping request with missing analysis_id: {req}")
+                    continue
+                
+                if not output_keys:
+                    logger.warning(f"Skipping request with empty output_keys for analysis {analysis_id}")
+                    continue
+                
+                # Fetch each output key using get_analysis_output_detail
+                for output_key in output_keys:
+                    # Check if we've exceeded the limit
+                    if total_chars >= max_chars:
+                        truncated = True
+                        skipped_items.append({
+                            "analysis_id": analysis_id, 
+                            "output_key": output_key, 
+                            "reason": "truncated_due_to_size_limit"
+                        })
+                        logger.debug(f"Truncating at analysis {analysis_id}, key {output_key} (reached {total_chars:,} chars)")
                         continue
                     
-                    if not output_keys:
-                        logger.warning(f"Skipping request with empty output_keys for analysis {analysis_id}")
-                        continue
-                    
-                    # Get analysis
-                    analysis = session.get(MarketAnalysis, analysis_id)
-                    if not analysis:
-                        logger.warning(f"MarketAnalysis {analysis_id} not found, skipping")
-                        for key in output_keys:
-                            skipped_items.append({"analysis_id": analysis_id, "output_key": key, "reason": "analysis_not_found"})
-                        continue
-                    
-                    # Get expert instance
-                    expert_inst = get_expert_instance_from_id(analysis.expert_instance_id)
-                    if not expert_inst:
-                        logger.warning(f"Expert instance {analysis.expert_instance_id} not found for analysis {analysis_id}")
-                        for key in output_keys:
-                            skipped_items.append({"analysis_id": analysis_id, "output_key": key, "reason": "expert_not_found"})
-                        continue
-                    
-                    # Check if expert implements required methods
-                    if not hasattr(expert_inst, 'get_output_detail'):
-                        logger.warning(f"Expert does not implement get_output_detail() for analysis {analysis_id}")
-                        for key in output_keys:
-                            skipped_items.append({"analysis_id": analysis_id, "output_key": key, "reason": "method_not_implemented"})
-                        continue
-                    
-                    # Fetch each output key
-                    for output_key in output_keys:
-                        # Check if we've exceeded the limit
-                        if total_chars >= max_chars:
-                            truncated = True
-                            skipped_items.append({
-                                "analysis_id": analysis_id, 
-                                "output_key": output_key, 
-                                "reason": "truncated_due_to_size_limit"
-                            })
-                            logger.debug(f"Truncating at analysis {analysis_id}, key {output_key} (reached {total_chars:,} chars)")
-                            continue
+                    try:
+                        # Use get_analysis_output_detail to fetch the content
+                        result = self.get_analysis_output_detail(analysis_id, output_key)
                         
-                        try:
-                            # Fetch the output
-                            detail = expert_inst.get_output_detail(analysis_id, output_key)
-                            detail_length = len(detail)
-                            
-                            # Check if adding this output would exceed limit
-                            if total_chars + detail_length > max_chars:
-                                # Try to fit partial content
-                                remaining_chars = max_chars - total_chars
-                                if remaining_chars > 1000:  # Only include if we can fit at least 1K chars
-                                    truncated_detail = detail[:remaining_chars] + "\n\n<TRUNCATED - Content exceeded size limit>"
-                                    outputs.append({
-                                        "analysis_id": analysis_id,
-                                        "output_key": output_key,
-                                        "symbol": analysis.symbol,
-                                        "content": truncated_detail,
-                                        "truncated": True,
-                                        "original_length": detail_length,
-                                        "included_length": len(truncated_detail)
-                                    })
-                                    total_chars += len(truncated_detail)
-                                else:
-                                    skipped_items.append({
-                                        "analysis_id": analysis_id,
-                                        "output_key": output_key,
-                                        "reason": "insufficient_space_remaining"
-                                    })
-                                
-                                truncated = True
-                                logger.debug(f"Partially included output for analysis {analysis_id}, key {output_key}")
-                            else:
-                                # Add full output
-                                outputs.append({
-                                    "analysis_id": analysis_id,
-                                    "output_key": output_key,
-                                    "symbol": analysis.symbol,
-                                    "content": detail,
-                                    "truncated": False,
-                                    "original_length": detail_length,
-                                    "included_length": detail_length
-                                })
-                                total_chars += detail_length
-                                logger.debug(f"Added output for analysis {analysis_id}, key {output_key} ({detail_length:,} chars)")
-                        
-                        except Exception as e:
-                            logger.error(f"Error fetching output for analysis {analysis_id}, key {output_key}: {e}")
+                        # Check if the result indicates an error
+                        if result.startswith("Error:") or result.startswith("Analysis") and "not found" in result:
                             skipped_items.append({
                                 "analysis_id": analysis_id,
                                 "output_key": output_key,
-                                "reason": f"error: {str(e)}"
+                                "reason": result
                             })
+                            continue
+                        
+                        detail_length = len(result)
+                        
+                        # Check if adding this output would exceed limit
+                        if total_chars + detail_length > max_chars:
+                            # Try to fit partial content
+                            remaining_chars = max_chars - total_chars
+                            if remaining_chars > 1000:  # Only include if we can fit at least 1K chars
+                                truncated_detail = result[:remaining_chars] + "\n\n<TRUNCATED - Content exceeded size limit>"
+                                outputs.append({
+                                    "analysis_id": analysis_id,
+                                    "output_key": output_key,
+                                    "content": truncated_detail,
+                                    "truncated": True,
+                                    "original_length": detail_length,
+                                    "included_length": len(truncated_detail)
+                                })
+                                total_chars += len(truncated_detail)
+                            else:
+                                skipped_items.append({
+                                    "analysis_id": analysis_id,
+                                    "output_key": output_key,
+                                    "reason": "insufficient_space_remaining"
+                                })
+                            
+                            truncated = True
+                            logger.debug(f"Partially included output for analysis {analysis_id}, key {output_key}")
+                        else:
+                            # Add full output
+                            outputs.append({
+                                "analysis_id": analysis_id,
+                                "output_key": output_key,
+                                "content": result,
+                                "truncated": False,
+                                "original_length": detail_length,
+                                "included_length": detail_length
+                            })
+                            total_chars += detail_length
+                            logger.debug(f"Added output for analysis {analysis_id}, key {output_key} ({detail_length:,} chars)")
+                    
+                    except Exception as e:
+                        logger.error(f"Error fetching output for analysis {analysis_id}, key {output_key}: {e}")
+                        skipped_items.append({
+                            "analysis_id": analysis_id,
+                            "output_key": output_key,
+                            "reason": f"error: {str(e)}"
+                        })
             
             total_tokens_estimate = total_chars // 4
             

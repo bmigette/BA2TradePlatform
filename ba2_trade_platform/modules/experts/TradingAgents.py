@@ -1840,6 +1840,7 @@ Please check back in a few minutes for results."""
         Get a concise summary of a market analysis for Smart Risk Manager.
         
         Returns structured format that can be parsed by SmartRiskManagerGraph:
+        - Symbol: SYMBOL (current price: bid: XXX / ask: XXX)
         - Action: BUY/SELL/HOLD
         - Confidence: XX.X%
         - Expected Profit: XX.X% (if applicable)
@@ -1867,6 +1868,21 @@ Please check back in a few minutes for results."""
                 symbol = analysis.symbol
                 status = analysis.status.value if hasattr(analysis.status, 'value') else str(analysis.status)
                 
+                # Get current market price (bid/ask)
+                price_info = ""
+                try:
+                    from ...core.utils import get_account_instance_from_id
+                    account = get_account_instance_from_id(analysis.account_id)
+                    if account:
+                        bid_price = account.get_instrument_current_price(symbol, price_type='bid')
+                        ask_price = account.get_instrument_current_price(symbol, price_type='ask')
+                        if bid_price and ask_price:
+                            price_info = f" (current price: bid: {bid_price:.2f} / ask: {ask_price:.2f})"
+                        elif bid_price:
+                            price_info = f" (current price: {bid_price:.2f})"
+                except Exception as price_err:
+                    self.logger.debug(f"Could not fetch current price for {symbol}: {price_err}")
+                
                 if recommendation:
                     action = recommendation.recommended_action.value if hasattr(recommendation.recommended_action, 'value') else str(recommendation.recommended_action)
                     confidence = recommendation.confidence
@@ -1880,12 +1896,12 @@ Please check back in a few minutes for results."""
                     if hasattr(time_horizon, 'value'):
                         time_horizon = time_horizon.value
                     
-                    # Get expected profit if available
-                    expected_profit = getattr(recommendation, 'expected_profit', None)
+                    # Get expected profit if available (field is named expected_profit_percent in database)
+                    expected_profit = recommendation.expected_profit_percent
                     
                     # Build structured summary (format for SmartRiskManager parsing)
                     lines = [
-                        f"Symbol: {symbol}",
+                        f"Symbol: {symbol}{price_info}",
                         f"Action: {action}",
                         f"Confidence: {confidence:.1f}%",
                     ]
@@ -1902,7 +1918,7 @@ Please check back in a few minutes for results."""
                     return "\n".join(lines)
                 else:
                     return (
-                        f"Symbol: {symbol}\n"
+                        f"Symbol: {symbol}{price_info}\n"
                         f"Action: HOLD\n"
                         f"Status: {status}\n"
                         f"Note: No recommendation available yet"
@@ -1950,11 +1966,11 @@ Please check back in a few minutes for results."""
                 
                 # 2. Individual analyst reports (matching UI tabs)
                 analyst_keys = {
-                    'market_report': 'Market Analysis',
-                    'sentiment_report': 'Social Sentiment Analysis',
-                    'news_report': 'News Analysis',
-                    'fundamentals_report': 'Fundamental Analysis',
-                    'macro_report': 'Macroeconomic Analysis'
+                    'market_report': 'Market Analysis (Technical Indicators: MACD, RSI, EMA, SMA, ATR, Bollinger Bands, support/resistance levels, volume analysis, price patterns)',
+                    'sentiment_report': 'Social Sentiment Analysis (Social media mentions, sentiment scores, trending topics, community engagement metrics)',
+                    'news_report': 'News Analysis (Recent news articles, sentiment scores, market-moving events, press releases)',
+                    'fundamentals_report': 'Fundamental Analysis (Earnings calls, cash flow statements, balance sheet data, income statements, valuation ratios, insider transactions)',
+                    'macro_report': 'Macroeconomic Analysis (GDP trends, inflation indicators, interest rates, Fed policy, unemployment data, economic calendar events)'
                 }
                 
                 for key, description in analyst_keys.items():
