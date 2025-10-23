@@ -4,7 +4,7 @@ from openai import OpenAI
 import numpy as np
 from ... import logger
 import os
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
 class FinancialSituationMemory:
