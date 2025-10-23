@@ -516,7 +516,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         
         This function performs two checks:
         1. If symbol price is higher than available balance, skip analysis
-        2. If available balance is lower than 5% of account balance, skip analysis
+        2. If available balance is lower than 5% of virtual balance, skip analysis
         
         Note: For expert-recommended instruments (dynamic symbols like "EXPERT"), 
         price checks are bypassed since these don't have real market prices.
@@ -576,22 +576,22 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 logger.info(f"Skipping analysis for {symbol}: price ${current_price:.2f} > available balance ${available_balance:.2f}")
                 return True, f"Symbol price ${current_price:.2f} exceeds available balance ${available_balance:.2f}"
             
-            # Check 2: If available balance is lower than 5% of account balance, skip
-            account_balance = account.get_balance()
-            if account_balance is None:
-                logger.warning(f"Could not get account balance, skipping 5% check")
-                return True, "Could not get account balance for 5% check"
+            # Check 2: If available balance is lower than 5% of virtual balance, skip
+            virtual_balance = self.get_virtual_balance()
+            if virtual_balance is None:
+                logger.warning(f"Could not get virtual balance, skipping 5% check")
+                return True, "Could not get virtual balance for 5% check"
             
-            min_balance_threshold = account_balance * 0.05  # 5% of account balance
+            min_balance_threshold = virtual_balance * 0.05  # 5% of virtual balance
             if available_balance < min_balance_threshold:
-                available_pct = (available_balance / account_balance) * 100.0 if account_balance > 0 else 0.0
+                available_pct = (available_balance / virtual_balance) * 100.0 if virtual_balance > 0 else 0.0
                 logger.info(f"Skipping analysis for {symbol}: available balance ${available_balance:.2f} "
                            f"({available_pct:.1f}%) < 5% threshold ${min_balance_threshold:.2f}")
                 return True, f"Available balance ${available_balance:.2f} ({available_pct:.1f}%) below 5% threshold"
             
             # All checks passed - analysis should proceed
             logger.debug(f"Analysis checks passed for {symbol}: price=${current_price:.2f}, "
-                        f"available=${available_balance:.2f}, account_balance=${account_balance:.2f}")
+                        f"available=${available_balance:.2f}, virtual_balance=${virtual_balance:.2f}")
             return False, ""
             
         except Exception as e:
