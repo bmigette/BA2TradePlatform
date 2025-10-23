@@ -223,7 +223,8 @@ class JobManager:
             
             # Queue expansion task to worker instead of executing synchronously
             try:
-                task_id = self.worker_queue.submit_instrument_expansion_task(
+                worker_queue = get_worker_queue()
+                task_id = worker_queue.submit_instrument_expansion_task(
                     expert_instance_id=expert_instance_id,
                     expansion_type=symbol,
                     subtype=subtype,
@@ -693,7 +694,8 @@ class JobManager:
             if symbol in ["DYNAMIC", "EXPERT", "OPEN_POSITIONS"]:
                 logger.info(f"Special symbol '{symbol}' detected in scheduled analysis - queuing expansion task")
                 try:
-                    task_id = self.worker_queue.submit_instrument_expansion_task(
+                    worker_queue = get_worker_queue()
+                    task_id = worker_queue.submit_instrument_expansion_task(
                         expert_instance_id=expert_instance_id,
                         expansion_type=symbol,
                         subtype=subtype,

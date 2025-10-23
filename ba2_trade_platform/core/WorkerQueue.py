@@ -1003,10 +1003,10 @@ class WorkerQueue:
         
         try:
             # Import JobManager to access expansion methods
-            from .JobManager import JobManager
+            from .JobManager import get_job_manager
             
             # Get the JobManager singleton instance
-            job_manager = JobManager.get_instance()
+            job_manager = get_job_manager()
             
             # Execute appropriate expansion method based on type
             if task.expansion_type == "DYNAMIC":
