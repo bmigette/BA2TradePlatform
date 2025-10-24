@@ -395,6 +395,61 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             logger.error(f"Error calculating available balance for expert {self.id}: {e}", exc_info=True)
             return None
     
+    def has_sufficient_equity_for_trading(self) -> tuple[bool, str]:
+        """
+        Check if expert has sufficient available equity to create new positions.
+        
+        Uses the minimum_equity_threshold_percent setting from account settings.
+        Default threshold is 5% if not configured.
+        
+        Returns:
+            tuple[bool, str]: (has_sufficient_equity, reason_if_not)
+                - has_sufficient_equity: True if available balance >= threshold, False otherwise
+                - reason_if_not: String explaining why equity is insufficient (empty if sufficient)
+        """
+        try:
+            # Get available balance
+            available_balance = self.get_available_balance()
+            if available_balance is None:
+                return False, "Could not calculate available balance"
+            
+            # Get virtual balance
+            virtual_balance = self.get_virtual_balance()
+            if virtual_balance is None:
+                return False, "Could not calculate virtual balance"
+            
+            # Get threshold from account settings (default to 5%)
+            from ..utils import get_account_instance_from_id
+            from ..db import get_instance
+            from ..models import ExpertInstance
+            
+            expert_instance = get_instance(ExpertInstance, self.id)
+            if not expert_instance:
+                return False, f"Expert instance {self.id} not found"
+            
+            account = get_account_instance_from_id(expert_instance.account_id)
+            if not account:
+                return False, f"Account {expert_instance.account_id} not found"
+            
+            # Get threshold from account settings (backward compatible default: 5%)
+            threshold_percent = account.settings.get("minimum_equity_threshold_percent", 5.0)
+            min_balance_threshold = virtual_balance * (threshold_percent / 100.0)
+            
+            # Check if available balance meets threshold
+            if available_balance < min_balance_threshold:
+                available_pct = (available_balance / virtual_balance) * 100.0 if virtual_balance > 0 else 0.0
+                reason = (f"Available balance ${available_balance:.2f} ({available_pct:.1f}%) "
+                         f"below {threshold_percent}% threshold ${min_balance_threshold:.2f}. "
+                         f"Close existing positions or increase virtual equity percentage.")
+                return False, reason
+            
+            # Sufficient equity available
+            return True, ""
+            
+        except Exception as e:
+            logger.error(f"Error checking equity sufficiency for expert {self.id}: {e}", exc_info=True)
+            return False, f"Error checking equity: {str(e)}"
+    
     def _calculate_used_balance(self, account: AccountInterface) -> Optional[float]:
         """
         Calculate the used balance from all open transactions for this expert. Uses bulk price fetching.
@@ -516,7 +571,8 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         
         This function performs two checks:
         1. If symbol price is higher than available balance, skip analysis
-        2. If available balance is lower than 5% of virtual balance, skip analysis
+        2. If available balance is below threshold % of virtual balance, skip analysis
+           (threshold configurable via minimum_equity_threshold_percent account setting, default 5%)
         
         Note: For expert-recommended instruments (dynamic symbols like "EXPERT"), 
         price checks are bypassed since these don't have real market prices.
@@ -576,22 +632,15 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 logger.info(f"Skipping analysis for {symbol}: price ${current_price:.2f} > available balance ${available_balance:.2f}")
                 return True, f"Symbol price ${current_price:.2f} exceeds available balance ${available_balance:.2f}"
             
-            # Check 2: If available balance is lower than 5% of virtual balance, skip
-            virtual_balance = self.get_virtual_balance()
-            if virtual_balance is None:
-                logger.warning(f"Could not get virtual balance, skipping 5% check")
-                return True, "Could not get virtual balance for 5% check"
-            
-            min_balance_threshold = virtual_balance * 0.05  # 5% of virtual balance
-            if available_balance < min_balance_threshold:
-                available_pct = (available_balance / virtual_balance) * 100.0 if virtual_balance > 0 else 0.0
-                logger.info(f"Skipping analysis for {symbol}: available balance ${available_balance:.2f} "
-                           f"({available_pct:.1f}%) < 5% threshold ${min_balance_threshold:.2f}")
-                return True, f"Available balance ${available_balance:.2f} ({available_pct:.1f}%) below 5% threshold"
+            # Check 2: If available balance is below threshold percentage of virtual balance, skip
+            has_sufficient, reason = self.has_sufficient_equity_for_trading()
+            if not has_sufficient:
+                logger.info(f"Skipping analysis for {symbol}: {reason}")
+                return True, reason
             
             # All checks passed - analysis should proceed
             logger.debug(f"Analysis checks passed for {symbol}: price=${current_price:.2f}, "
-                        f"available=${available_balance:.2f}, virtual_balance=${virtual_balance:.2f}")
+                        f"available=${available_balance:.2f}")
             return False, ""
             
         except Exception as e:

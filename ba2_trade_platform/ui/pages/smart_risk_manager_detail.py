@@ -151,7 +151,36 @@ def content(job_id: int) -> None:
                 ui.separator()
                 ui.label(job.actions_summary).classes('text-sm whitespace-pre-wrap mt-2')
         
-        # Graph state (collapsible JSON viewer)
+        # Extract research findings and final summary from graph_state
+        research_findings = None
+        final_summary = None
+        if job.graph_state:
+            try:
+                state = json.loads(job.graph_state) if isinstance(job.graph_state, str) else job.graph_state
+                research_findings = state.get("research_findings")
+                final_summary = state.get("final_summary")
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                pass
+        
+        # Research Node Analysis card
+        if research_findings:
+            with ui.card().classes('w-full mb-4'):
+                with ui.row().classes('items-center gap-2 mb-2'):
+                    ui.icon('psychology', color='primary').props('size=md')
+                    ui.label('Research Node Analysis').classes('text-h6')
+                ui.separator()
+                ui.label(research_findings).classes('text-sm whitespace-pre-wrap mt-2')
+        
+        # Final Summary card
+        if final_summary:
+            with ui.card().classes('w-full mb-4'):
+                with ui.row().classes('items-center gap-2 mb-2'):
+                    ui.icon('summarize', color='primary').props('size=md')
+                    ui.label('Final Summary').classes('text-h6')
+                ui.separator()
+                ui.label(final_summary).classes('text-sm whitespace-pre-wrap mt-2')
+        
+        # Graph state (collapsible JSON viewer) - now showing full technical details
         if job.graph_state:
             with ui.expansion('Graph State (Technical Details)', icon='account_tree').classes('w-full mb-4'):
                 try:

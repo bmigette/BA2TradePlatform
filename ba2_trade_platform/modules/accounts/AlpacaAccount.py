@@ -935,7 +935,7 @@ class AlpacaAccount(AccountInterface):
             new_tp_price: The new take profit price
         """
         try:
-            from ..db import add_instance
+            from ...core.db import add_instance
             from datetime import datetime, timezone
             
             if not self.client:

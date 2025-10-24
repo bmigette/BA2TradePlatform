@@ -450,64 +450,57 @@ class SmartRiskManagerToolkit:
 
     def get_analysis_outputs_batch(
         self,
-        requests: Annotated[
-            List[Dict[str, Any]], 
-            "List of dicts with 'analysis_id' and 'output_keys' (list of keys to fetch)"
+        analysis_ids: Annotated[
+            List[int], 
+            "List of MarketAnalysis IDs to fetch outputs from"
+        ],
+        output_keys: Annotated[
+            List[str],
+            "List of output keys to fetch for each analysis (e.g., ['analysis_summary', 'market_report'])"
         ],
         max_tokens: Annotated[int, "Maximum tokens in response (approximate, using 4 chars/token)"] = 100000
     ) -> Dict[str, Any]:
         """
         Fetch multiple analysis outputs in a single call with automatic truncation.
         
-        This method allows efficient batch fetching of analysis outputs while preventing
-        token limit overflow. If the combined output exceeds max_tokens, it will truncate
-        and report which items were skipped.
+        This method fetches the SAME output keys from ALL specified analyses.
+        For example, if you request analysis_ids=[123, 124] and output_keys=['analysis_summary', 'market_report'],
+        it will fetch both keys from both analyses (4 outputs total).
         
         Args:
-            requests: List of dicts, each with:
-                - analysis_id (int): MarketAnalysis ID
-                - output_keys (List[str]): List of output keys to fetch
+            analysis_ids: List of MarketAnalysis IDs to fetch from
+            output_keys: List of output keys to fetch from each analysis
             max_tokens: Maximum tokens in response (default 100K, ~400K chars)
             
         Returns:
             Dict with:
-                - outputs: List of dicts with analysis_id, output_key, content
+                - outputs: List of dicts with analysis_id, output_key, symbol, content
                 - truncated: bool - whether truncation occurred
-                - skipped_items: List of (analysis_id, output_key) tuples that were skipped
+                - skipped_items: List of items skipped due to size/errors
                 - total_chars: Total characters in response
                 - total_tokens_estimate: Estimated tokens (chars / 4)
+                - items_included: Count of outputs included
+                - items_skipped: Count of outputs skipped
                 
         Example:
-            requests = [
-                {"analysis_id": 123, "output_keys": ["analysis_summary", "market_report"]},
-                {"analysis_id": 124, "output_keys": ["news_report"]}
-            ]
-            result = toolkit.get_analysis_outputs_batch(requests)
+            # Fetch analysis_summary and market_report from analyses 123 and 124
+            result = toolkit.get_analysis_outputs_batch(
+                analysis_ids=[123, 124],
+                output_keys=['analysis_summary', 'market_report']
+            )
         """
         try:
             max_chars = max_tokens * 4  # Approximate: 1 token ≈ 4 chars
             
-            logger.debug(f"Fetching batch outputs: {len(requests)} requests, max_chars={max_chars:,}")
+            logger.debug(f"Fetching batch outputs: {len(analysis_ids)} analyses x {len(output_keys)} keys, max_chars={max_chars:,}")
             
             outputs = []
             skipped_items = []
             total_chars = 0
             truncated = False
             
-            # Process each request by calling get_analysis_output_detail
-            for req in requests:
-                analysis_id = req.get("analysis_id")
-                output_keys = req.get("output_keys", [])
-                
-                if not analysis_id:
-                    logger.warning(f"Skipping request with missing analysis_id: {req}")
-                    continue
-                
-                if not output_keys:
-                    logger.warning(f"Skipping request with empty output_keys for analysis {analysis_id}")
-                    continue
-                
-                # Fetch each output key using get_analysis_output_detail
+            # Process each analysis_id and output_key combination
+            for analysis_id in analysis_ids:
                 for output_key in output_keys:
                     # Check if we've exceeded the limit
                     if total_chars >= max_chars:
@@ -680,6 +673,200 @@ class SmartRiskManagerToolkit:
             logger.error(f"Error getting historical analyses: {e}", exc_info=True)
             raise
     
+    def get_analysis_at_open_time(
+        self,
+        symbol: Annotated[str, "Stock symbol for the open position"],
+        open_time: Annotated[datetime, "Timestamp when the position was opened"]
+    ) -> Dict[str, Any]:
+        """
+        Get the most recent market analysis and Smart Risk Manager job analysis 
+        for a symbol just before a position was opened.
+        
+        This is useful for understanding what analysis led to a position being opened.
+        Returns both:
+        1. Latest market analysis for the symbol before open_time
+        2. Latest Smart Risk Manager job that completed before open_time
+        
+        Args:
+            symbol: Symbol of the open position
+            open_time: Timestamp when the position was opened
+            
+        Returns:
+            Dictionary with:
+                - market_analysis: Latest analysis for symbol before open_time (or None)
+                - risk_manager_job: Latest SRM job before open_time (or None)
+                - market_analysis_details: Available outputs from the market analysis
+                - risk_manager_summary: Summary from the SRM job
+        """
+        try:
+            logger.debug(f"Getting analysis at open time for {symbol} at {open_time}")
+            
+            result = {
+                "symbol": symbol,
+                "open_time": open_time.isoformat() if open_time else None,
+                "market_analysis": None,
+                "risk_manager_job": None,
+                "market_analysis_details": {},
+                "risk_manager_summary": None
+            }
+            
+            # Ensure open_time is timezone-naive for comparison
+            if open_time and open_time.tzinfo:
+                open_time = open_time.replace(tzinfo=None)
+            
+            with get_db() as session:
+                # 1. Get latest market analysis for symbol before open_time
+                market_analysis = session.exec(
+                    select(MarketAnalysis)
+                    .where(
+                        MarketAnalysis.symbol == symbol,
+                        MarketAnalysis.status == MarketAnalysisStatus.COMPLETED,
+                        MarketAnalysis.created_at < open_time
+                    )
+                    .order_by(MarketAnalysis.created_at.desc())
+                    .limit(1)
+                ).first()
+                
+                if market_analysis:
+                    # Get expert name
+                    expert_name = "Unknown"
+                    try:
+                        expert_instance = session.get(ExpertInstance, market_analysis.expert_instance_id)
+                        if expert_instance:
+                            expert_name = expert_instance.expert
+                    except Exception:
+                        pass
+                    
+                    # Get summary
+                    summary = f"Analysis for {symbol}"
+                    try:
+                        expert_inst = get_expert_instance_from_id(market_analysis.expert_instance_id)
+                        if expert_inst and hasattr(expert_inst, 'get_analysis_summary'):
+                            summary = expert_inst.get_analysis_summary(market_analysis.id)
+                    except Exception as e:
+                        logger.debug(f"Could not get summary for analysis {market_analysis.id}: {e}")
+                    
+                    result["market_analysis"] = {
+                        "analysis_id": market_analysis.id,
+                        "symbol": market_analysis.symbol,
+                        "created_at": market_analysis.created_at.isoformat(),
+                        "expert_name": expert_name,
+                        "expert_instance_id": market_analysis.expert_instance_id,
+                        "summary": summary
+                    }
+                    
+                    # Get available outputs for this analysis
+                    try:
+                        outputs_info = self.get_analysis_outputs(market_analysis.id)
+                        result["market_analysis_details"] = outputs_info
+                    except Exception as e:
+                        logger.debug(f"Could not get outputs for analysis {market_analysis.id}: {e}")
+                
+                # 2. Get latest Smart Risk Manager job before open_time
+                srm_job = session.exec(
+                    select(SmartRiskManagerJob)
+                    .where(
+                        SmartRiskManagerJob.account_id == self.account_id,
+                        SmartRiskManagerJob.expert_instance_id == self.expert_instance_id,
+                        SmartRiskManagerJob.status == "COMPLETED",
+                        SmartRiskManagerJob.run_date < open_time
+                    )
+                    .order_by(SmartRiskManagerJob.run_date.desc())
+                    .limit(1)
+                ).first()
+                
+                if srm_job:
+                    result["risk_manager_job"] = {
+                        "job_id": srm_job.id,
+                        "run_date": srm_job.run_date.isoformat(),
+                        "model_used": srm_job.model_used,
+                        "iteration_count": srm_job.iteration_count,
+                        "actions_taken_count": srm_job.actions_taken_count,
+                        "initial_equity": srm_job.initial_portfolio_equity,
+                        "final_equity": srm_job.final_portfolio_equity
+                    }
+                    result["risk_manager_summary"] = srm_job.actions_summary
+                
+                logger.debug(f"Found market_analysis={result['market_analysis'] is not None}, "
+                           f"srm_job={result['risk_manager_job'] is not None}")
+                
+                return result
+                
+        except Exception as e:
+            logger.error(f"Error getting analysis at open time: {e}", exc_info=True)
+            raise
+    
+    def get_last_risk_manager_summary(self) -> Dict[str, Any]:
+        """
+        Get the summary from the last completed Smart Risk Manager job for this expert.
+        
+        This provides historical context about what the risk manager analyzed and 
+        recommended in the previous run, helping maintain continuity across runs.
+        
+        Returns:
+            Dictionary with:
+                - job_id: ID of the last completed job (or None)
+                - run_date: When the job was executed
+                - research_findings: Research node output from graph_state
+                - final_summary: Finalization node output from graph_state
+                - actions_summary: Summary of actions taken
+                - actions_taken_count: Number of actions executed
+                - iteration_count: Number of iterations
+                - initial_equity: Portfolio value at start
+                - final_equity: Portfolio value at end
+        """
+        try:
+            logger.debug(f"Getting last risk manager summary for expert {self.expert_instance_id}")
+            
+            result = {
+                "job_id": None,
+                "run_date": None,
+                "research_findings": None,
+                "final_summary": None,
+                "actions_summary": None,
+                "actions_taken_count": 0,
+                "iteration_count": 0,
+                "initial_equity": None,
+                "final_equity": None
+            }
+            
+            with get_db() as session:
+                # Get the most recent completed SRM job for this expert
+                srm_job = session.exec(
+                    select(SmartRiskManagerJob)
+                    .where(
+                        SmartRiskManagerJob.account_id == self.account_id,
+                        SmartRiskManagerJob.expert_instance_id == self.expert_instance_id,
+                        SmartRiskManagerJob.status == "COMPLETED"
+                    )
+                    .order_by(SmartRiskManagerJob.run_date.desc())
+                    .limit(1)
+                ).first()
+                
+                if srm_job:
+                    result["job_id"] = srm_job.id
+                    result["run_date"] = srm_job.run_date.isoformat() if srm_job.run_date else None
+                    result["actions_summary"] = srm_job.actions_summary
+                    result["actions_taken_count"] = srm_job.actions_taken_count or 0
+                    result["iteration_count"] = srm_job.iteration_count or 0
+                    result["initial_equity"] = srm_job.initial_portfolio_equity
+                    result["final_equity"] = srm_job.final_portfolio_equity
+                    
+                    # Extract research findings and final summary from graph_state
+                    if srm_job.graph_state:
+                        result["research_findings"] = srm_job.graph_state.get("research_findings")
+                        result["final_summary"] = srm_job.graph_state.get("final_summary")
+                    
+                    logger.debug(f"Found last SRM job {srm_job.id} from {result['run_date']}")
+                else:
+                    logger.debug("No previous SRM job found for this expert")
+                
+                return result
+                
+        except Exception as e:
+            logger.error(f"Error getting last risk manager summary: {e}", exc_info=True)
+            raise
+    
     # ==================== Trading Action Tools ====================
 
     def close_position(
@@ -752,9 +939,19 @@ class SmartRiskManagerToolkit:
         """
         try:
             logger.debug(f"Getting current price for {symbol}")
-            price = self.account.get_instrument_current_price(symbol)
+            price = self.account.get_instrument_current_price(symbol, price_type='bid')
+            
+            # Handle case where method might return dict instead of float
+            if isinstance(price, dict):
+                logger.error(f"get_instrument_current_price returned dict instead of float for {symbol}: {price}")
+                raise ValueError(f"Expected float price for {symbol}, got dict: {price}")
+            
+            if price is None:
+                logger.error(f"get_instrument_current_price returned None for {symbol}")
+                raise ValueError(f"No price available for {symbol}")
+            
             logger.debug(f"Current price for {symbol}: {price}")
-            return price
+            return float(price)
         except Exception as e:
             logger.error(f"Error getting current price for {symbol}: {e}", exc_info=True)
             raise

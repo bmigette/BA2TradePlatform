@@ -1651,15 +1651,16 @@ class AccountOverviewTab:
                             # Keep raw copy for chart
                             all_positions_raw.append(pos_dict.copy())
                             
-                            # Format all float values to 2 decimal places for display
-                            # Special handling for percentage fields - multiply by 100
-                            for k, v in pos_dict.items():
+                            # Store raw numeric values for sorting, add formatted versions for display
+                            for k, v in list(pos_dict.items()):
                                 if isinstance(v, float):
                                     if k in ['unrealized_plpc', 'change_today', 'unrealized_intraday_plpc']:
-                                        # Percentage fields: multiply by 100 for display
-                                        pos_dict[k] = f"{v * 100:.2f}%"
+                                        # Keep raw value for sorting, add display version
+                                        pos_dict[f'{k}_display'] = f"{v * 100:.2f}%"
+                                        pos_dict[k] = v * 100  # Store as percentage number for sorting
                                     else:
-                                        pos_dict[k] = f"{v:.2f}"
+                                        # Keep raw value for sorting, add display version
+                                        pos_dict[f'{k}_display'] = f"{v:.2f}"
                             all_positions.append(pos_dict)
                 except Exception as e:
                     logger.warning(f"Failed to load account {acc.name} (ID: {acc.id}): {e}")
@@ -1699,19 +1700,53 @@ class AccountOverviewTab:
                 # Bind filter to table after table is created
                 filter_input.bind_value(positions_table, 'filter')
                 
+                # Add custom cell rendering for numeric columns with proper formatting
+                # Quantity, prices - format to 2 decimals
+                positions_table.add_slot('body-cell-qty', r'''
+                    <q-td :props="props">
+                        {{ props.row.qty_display || props.value.toFixed(2) }}
+                    </q-td>
+                ''')
+                
+                positions_table.add_slot('body-cell-current_price', r'''
+                    <q-td :props="props">
+                        {{ props.row.current_price_display || props.value.toFixed(2) }}
+                    </q-td>
+                ''')
+                
+                positions_table.add_slot('body-cell-avg_entry_price', r'''
+                    <q-td :props="props">
+                        {{ props.row.avg_entry_price_display || props.value.toFixed(2) }}
+                    </q-td>
+                ''')
+                
+                positions_table.add_slot('body-cell-market_value', r'''
+                    <q-td :props="props">
+                        {{ props.row.market_value_display || props.value.toFixed(2) }}
+                    </q-td>
+                ''')
+                
                 # Add custom cell rendering for P/L columns with color coding
                 positions_table.add_slot('body-cell-unrealized_pl', r'''
                     <q-td :props="props">
-                        <span :style="parseFloat(props.value) >= 0 ? 'color: green; font-weight: 500;' : 'color: red; font-weight: 500;'">
-                            {{ props.value }}
+                        <span :style="props.value >= 0 ? 'color: green; font-weight: 500;' : 'color: red; font-weight: 500;'">
+                            {{ props.row.unrealized_pl_display || '$' + props.value.toFixed(2) }}
                         </span>
                     </q-td>
                 ''')
                 
                 positions_table.add_slot('body-cell-unrealized_plpc', r'''
                     <q-td :props="props">
-                        <span :style="parseFloat(props.value) >= 0 ? 'color: green; font-weight: 500;' : 'color: red; font-weight: 500;'">
-                            {{ props.value }}
+                        <span :style="props.value >= 0 ? 'color: green; font-weight: 500;' : 'color: red; font-weight: 500;'">
+                            {{ props.row.unrealized_plpc_display || props.value.toFixed(2) + '%' }}
+                        </span>
+                    </q-td>
+                ''')
+                
+                positions_table.add_slot('body-cell-change_today', r'''
+                    <q-td :props="props">
+                        <span :style="props.value >= 0 ? 'color: green; font-weight: 500;' : 'color: red; font-weight: 500;'">
+                            {{ props.row.change_today_display || props.value.toFixed(2) + '%' }}
                         </span>
                     </q-td>
                 ''')
@@ -1721,9 +1756,9 @@ class AccountOverviewTab:
                 
                 # Calculate totals from all positions
                 def calculate_totals():
-                    total_qty = sum(float(pos['qty']) for pos in all_positions)
-                    total_pl = sum(float(pos['unrealized_pl'].replace('$', '').replace(',', '')) if pos['unrealized_pl'] else 0 for pos in all_positions)
-                    total_mv = sum(float(pos['market_value'].replace('$', '').replace(',', '')) if pos['market_value'] else 0 for pos in all_positions)
+                    total_qty = sum(float(pos['qty']) if isinstance(pos['qty'], (int, float)) else 0 for pos in all_positions)
+                    total_pl = sum(float(pos['unrealized_pl']) if isinstance(pos['unrealized_pl'], (int, float)) else 0 for pos in all_positions)
+                    total_mv = sum(float(pos['market_value']) if isinstance(pos['market_value'], (int, float)) else 0 for pos in all_positions)
                     return total_qty, total_pl, total_mv
                 
                 total_qty, total_pl, total_mv = calculate_totals()

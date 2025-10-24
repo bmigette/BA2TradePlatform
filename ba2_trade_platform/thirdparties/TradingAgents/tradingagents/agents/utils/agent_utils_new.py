@@ -241,7 +241,7 @@ class Toolkit:
                 return str(result), None
                 
         except Exception as e:
-            logger.warning(f"Provider call failed with format_type='both': {e}")
+            logger.warning(f"Provider call failed with format_type='both': {e}", exc_info=True)
             # Fallback: try with format_type="markdown" only
             try:
                 kwargs["format_type"] = "markdown"
@@ -249,7 +249,7 @@ class Toolkit:
                 result = method(**kwargs)
                 return str(result), None
             except Exception as e2:
-                logger.error(f"Provider call also failed with format_type='markdown': {e2}")
+                logger.error(f"Provider call also failed with format_type='markdown': {e2}", exc_info=True)
                 return None, None
     
     
@@ -291,11 +291,9 @@ class Toolkit:
         try:
             end_dt = datetime.strptime(end_date, "%Y-%m-%d")
             
-            # Default lookback_days from config if not provided
+            # Default lookback_days from provider_args (expert settings) if not provided
             if lookback_days is None:
-                from ...dataflows.config import get_config
-                config = get_config()
-                lookback_days = config["news_lookback_days"]
+                lookback_days = self.provider_args.get("news_lookback_days", 7)
             
             results = []
             for provider_class in self.provider_map["news"]:
@@ -364,11 +362,9 @@ class Toolkit:
         try:
             end_dt = datetime.strptime(end_date, "%Y-%m-%d")
             
-            # Default lookback_days from config if not provided
+            # Default lookback_days from provider_args (expert settings) if not provided
             if lookback_days is None:
-                from ...dataflows.config import get_config
-                config = get_config()
-                lookback_days = config["news_lookback_days"]
+                lookback_days = self.provider_args.get("news_lookback_days", 7)
             
             results = []
             for provider_class in self.provider_map["news"]:
@@ -525,11 +521,9 @@ class Toolkit:
         try:
             end_dt = datetime.strptime(end_date, "%Y-%m-%d")
             
-            # Default lookback_days from config if not provided
+            # Default lookback_days from provider_args (expert settings) if not provided
             if lookback_days is None:
-                from ...dataflows.config import get_config
-                config = get_config()
-                lookback_days = config["news_lookback_days"]
+                lookback_days = self.provider_args.get("social_sentiment_days", 3)
             
             results = []
             for provider_class in self.provider_map["social_media"]:
@@ -603,11 +597,9 @@ class Toolkit:
         try:
             end_dt = datetime.strptime(end_date, "%Y-%m-%d")
             
-            # Default lookback_days from config if not provided
+            # Default lookback_days from provider_args (expert settings) if not provided
             if lookback_days is None:
-                from ...dataflows.config import get_config
-                config = get_config()
-                lookback_days = config["economic_data_days"]
+                lookback_days = self.provider_args.get("economic_data_days", 90)
             
             results = []
             for provider_class in self.provider_map["insider"]:
@@ -677,11 +669,9 @@ class Toolkit:
         try:
             end_dt = datetime.strptime(end_date, "%Y-%m-%d")
             
-            # Default lookback_days from config if not provided
+            # Default lookback_days from provider_args (expert settings) if not provided
             if lookback_days is None:
-                from ...dataflows.config import get_config
-                config = get_config()
-                lookback_days = config["economic_data_days"]
+                lookback_days = self.provider_args.get("economic_data_days", 90)
             
             results = []
             for provider_class in self.provider_map["insider"]:
@@ -1388,11 +1378,9 @@ class Toolkit:
         try:
             end_dt = datetime.strptime(end_date, "%Y-%m-%d")
             
-            # Default lookback_days from config if not provided
+            # Default lookback_days from provider_args (expert settings) if not provided
             if lookback_days is None:
-                from ...dataflows.config import get_config
-                config = get_config()
-                lookback_days = config["economic_data_days"]
+                lookback_days = self.provider_args.get("economic_data_days", 90)
             
             results = []
             for provider_class in self.provider_map["macro"]:
@@ -1464,11 +1452,9 @@ class Toolkit:
         try:
             end_dt = datetime.strptime(end_date, "%Y-%m-%d")
             
-            # Default lookback_days from config if not provided
+            # Default lookback_days from provider_args (expert settings) if not provided
             if lookback_days is None:
-                from ...dataflows.config import get_config
-                config = get_config()
-                lookback_days = config["economic_data_days"]
+                lookback_days = self.provider_args.get("economic_data_days", 90)
             
             results = []
             for provider_class in self.provider_map["macro"]:
@@ -1540,16 +1526,14 @@ class Toolkit:
         try:
             end_dt = datetime.strptime(end_date, "%Y-%m-%d")
             
-            # Default lookback_days from config if not provided
+            # Default lookback_days from provider_args (expert settings) if not provided
             if lookback_days is None:
-                from ...dataflows.config import get_config
-                config = get_config()
-                lookback_days = config["economic_data_days"]
-                logger.debug(f"Using default lookback_days from config: {lookback_days}")
+                lookback_days = self.provider_args.get("economic_data_days", 90)
+                logger.debug(f"Using default lookback_days from expert settings: {lookback_days}")
             
             # Ensure lookback_days is not None
             if lookback_days is None:
-                logger.error("lookback_days is None even after config lookup")
+                logger.error("lookback_days is None even after expert settings lookup")
                 return "Error: Unable to determine lookback_days for Fed calendar"
             
             results = []

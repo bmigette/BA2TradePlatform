@@ -36,15 +36,15 @@ class SmartRiskManagerDebugCallback(BaseCallbackHandler):
     
     def on_llm_start(self, serialized: Dict[str, Any], prompts: List[str], **kwargs) -> None:
         """Log LLM call start."""
-        logger.debug("\n" + "=" * 80)
+        logger.debug("=" * 80)
         logger.debug("🤖 LLM CALL START")
         logger.debug("=" * 80)
         if prompts:
-            logger.debug(f"\n📝 Prompt:\n{prompts[0]}")
+            logger.debug(f"📝 Prompt:\n{prompts[0]}")
     
     def on_llm_end(self, response, **kwargs) -> None:
         """Log LLM response in human-readable format."""
-        logger.debug("\n" + "=" * 80)
+        logger.debug("=" * 80)
         logger.debug("✅ LLM RESPONSE")
         logger.debug("=" * 80)
         
@@ -204,6 +204,14 @@ SYSTEM_INITIALIZATION_PROMPT = """You are the Smart Risk Manager, an AI assistan
 ## YOUR MISSION
 {user_instructions}
 
+## YOUR TRADING PERMISSIONS
+**CRITICAL - Know Your Boundaries:**
+- **BUY orders:** {buy_status}
+- **SELL orders:** {sell_status}
+- **Automated trading:** {auto_trading_status}
+
+{trading_focus_guidance}
+
 ## YOUR COMPREHENSIVE TOOLKIT
 You have access to ALL the tools and data needed to make well-informed risk management decisions:
 
@@ -248,6 +256,7 @@ The tools above provide COMPREHENSIVE coverage of technical, fundamental, sentim
 - Take conservative actions when uncertain
 - Document your reasoning in every action
 - Act decisively when the data supports action
+- **RESPECT YOUR TRADING PERMISSIONS** - Focus on actions you're allowed to take
 
 You will be guided through each step of the process. Let's begin.
 """
@@ -268,126 +277,94 @@ Review the portfolio and create an initial assessment covering:
 Be concise but thorough. This assessment will guide your next steps.
 """
 
-DECISION_LOOP_PROMPT = """Based on the information you have gathered so far, decide your next action.
+# DECISION_LOOP_PROMPT removed - no longer using decision loop node
 
-## CONTEXT
-User Instructions: {user_instructions}
-Iteration: {iteration_count}/{max_iterations}
+RESEARCH_PROMPT = """You are a research specialist for portfolio risk management.
 
-## PORTFOLIO STATUS SUMMARY
-{portfolio_summary}
+## YOUR MISSION
+Investigate market analyses to gather detailed information that will help make risk management decisions.
+When you have gathered enough information, you MUST recommend specific trading actions.
 
-## WHAT YOU KNOW SO FAR
+## PORTFOLIO CONTEXT
 {agent_scratchpad}
 
-## ACTIONS TAKEN SO FAR
-{actions_log_summary}
-
-## YOUR OPTIONS
-1. **research_more** - You need to investigate specific market analyses in more detail before making decisions
-2. **take_action** - You have enough information and are ready to execute trading actions
-3. **finish** - You have completed all necessary risk management actions
-
-## YOUR DECISION
-Choose one of the three options above and explain your reasoning. What do you need to do next and why?
-"""
-
-RESEARCH_PROMPT = """You need to gather more detailed information from market analyses.
-
-## AVAILABLE RECENT ANALYSES (Last 72 hours, all symbols)
+## AVAILABLE ANALYSES
 {recent_analyses_summary}
 
 ## YOUR TASK
-Review the recent analyses listed above and investigate the ones most relevant to your risk management decisions.
+Use the available tools to investigate analyses that are most relevant to the portfolio's risk management needs.
+You can call tools multiple times to gather information iteratively.
 
-### Step 1: Identify analyses to investigate
-Look at the symbols and timestamps above. Prioritize:
-- Analyses for positions you currently hold
-- Analyses for symbols mentioned in your risk management instructions
-- Recent analyses with relevant expert insights
+**CRITICAL: After gathering information, you MUST call recommend_actions_tool() with specific actions to take.**
+Even if you decide no actions are needed, call recommend_actions_tool([]) with an empty list.
 
-### Step 2: Get available outputs for selected analyses
-For each analysis you want to investigate, use `get_analysis_outputs_tool(analysis_id)` to see what outputs are available.
+**IMMEDIATE ACTION PRIORITY:**
+When you identify positions or opportunities that meet the user's risk criteria, you should recommend IMMEDIATE actions rather than waiting or deferring.
+Examples of situations requiring immediate action:
+- Stop loss levels are breached or close to being breached
+- Take profit targets are reached
+- Position size exceeds risk limits
+- High-confidence signals (>70%) for new opportunities
+- Portfolio concentration risks detected
+- Significant P&L changes requiring rebalancing
 
-**Available output types contain comprehensive data:**
-- **analysis_summary**: Overall recommendation, confidence level, expected profit, time horizon, key insights
-- **market_report**: Technical indicators (MACD, RSI, EMA, SMA, ATR, Bollinger Bands), support/resistance levels, volume analysis, price patterns
-- **fundamentals_report**: Earnings calls, cash flow statements, balance sheets, income statements, valuation ratios, insider transactions
-- **sentiment_report**: Social media mentions, sentiment scores, trending topics, community engagement metrics
-- **news_report**: Recent news articles, sentiment scores, market-moving events, press releases
-- **macro_report**: GDP trends, inflation indicators, interest rates, Fed policy, unemployment data, economic calendar events
-- **investment_debate**: Bull vs bear arguments from investment research debate
-- **risk_debate**: Risky/safe/neutral perspectives on the position
+Do NOT wait for "better conditions" or "more data" when risk criteria are already met.
+The purpose of risk management is to ACT when triggers are hit, not to analyze indefinitely.
 
-### Step 3: Read detailed outputs
-**RECOMMENDED**: Use `get_analysis_outputs_batch_tool(requests)` to fetch multiple outputs efficiently in one call.
-- Automatically handles token limits and truncation
-- Fetches all needed data in a single efficient call
-- Example: `get_analysis_outputs_batch_tool([{{"analysis_id": 123, "output_keys": ["analysis_summary", "market_report", "fundamentals_report"]}}, {{"analysis_id": 124, "output_keys": ["news_report", "sentiment_report"]}}])`
+Focus on:
+- Positions currently held in the portfolio
+- High-confidence recommendations (BUY/SELL with >70% confidence)
+- Recent analyses with significant profit expectations
+- Risk factors and stop loss recommendations
+- User's specific risk management instructions
 
-**ALTERNATIVE**: Use `get_analysis_output_detail_tool(analysis_id, output_key)` to read outputs one at a time.
+{expert_instructions}
 
-### Step 4 (Optional): Get historical context
-If you need more historical context for a specific symbol, use `get_historical_analyses_tool(symbol, limit=10)` to see older analyses for deeper research.
-
-## CRITICAL: THESE OUTPUTS ARE COMPREHENSIVE
-The analysis outputs listed above contain ALL the data types you need:
-- Complete technical analysis with multiple indicators and patterns
-- Full fundamental data including earnings, cash flow, and insider activity
-- Social sentiment with detailed metrics
-- Recent news with sentiment analysis
-- Macroeconomic context and calendar events
-- Expert debate perspectives from multiple angles
-
-**DO NOT HESITATE** to make decisions after reading these outputs. They provide complete coverage of all relevant factors (technical, fundamental, sentiment, news, macro). Use them confidently to inform your risk management actions.
-
-## WHAT TO LOOK FOR
-- Analyst sentiment and recommendations with confidence levels
-- Technical indicators, trends, and price targets
-- Fundamental concerns or opportunities from financials
-- Risk factors mentioned by analysts in debates
-- Trend changes, momentum shifts, or reversal signals
-- News sentiment and market-moving events
-- Macro headwinds or tailwinds
-
-Execute your research plan using the available tools."""
+When you have enough information, call recommend_actions_tool() followed by finish_research_tool()."""
 
 ACTION_PROMPT = """You are ready to execute risk management actions.
+
+## CRITICAL INSTRUCTION
+You have been directed to the action node because a decision has been made to take action.
+Your job is to EXECUTE the actions that have been determined necessary, NOT to reconsider whether to act.
 
 ## CURRENT SITUATION
 {portfolio_summary}
 
-## RESEARCH FINDINGS
+## RESEARCH FINDINGS & ACTION RATIONALE
 {agent_scratchpad}
 
-## TRADING RESTRICTIONS
-**IMPORTANT**: The following trading restrictions are configured for this expert:
-- BUY orders: {buy_status}
-- SELL orders: {sell_status}
-- Enabled instruments: {enabled_instruments}
-- Max position size: {max_position_pct}% of equity per symbol
+## YOUR TRADING PERMISSIONS - CRITICAL
+**Know what you can and cannot do:**
+- **BUY orders:** {buy_status}
+- **SELL orders:** {sell_status}
+- **Automated trading:** {auto_trading_status}
+- **Enabled instruments:** {enabled_instruments}
+- **Max position size:** {max_position_pct}% of equity per symbol
+
+{trading_focus_guidance}
 
 **You MUST respect these restrictions. Do not attempt actions that violate them.**
 
 ## AVAILABLE ACTIONS
 You have access to these trading tools:
-- **close_position(transaction_id, reason)** - Close an entire position
-- **adjust_quantity(transaction_id, new_quantity, reason)** - Partial close or add to position
-- **update_stop_loss(transaction_id, new_sl_price, reason)** - Update stop loss
-- **update_take_profit(transaction_id, new_tp_price, reason)** - Update take profit
-- **open_new_position(symbol, direction, quantity, tp_price, sl_price, reason)** - Open new position (respects restrictions above)
+- **close_position(transaction_id, reason)** - Close an entire position {close_position_note}
+- **adjust_quantity(transaction_id, new_quantity, reason)** - Partial close or add to position {adjust_quantity_note}
+- **update_stop_loss(transaction_id, new_sl_price, reason)** - Update stop loss {update_sl_tp_note}
+- **update_take_profit(transaction_id, new_tp_price, reason)** - Update take profit {update_sl_tp_note}
+- **open_new_position(symbol, direction, quantity, tp_price, sl_price, reason)** - Open new position {open_position_note}
 
 ## GUIDELINES FOR ACTIONS
 {user_instructions}
 
 ## YOUR TASK
-1. Decide which action(s) to take
-2. For EACH action, provide clear reasoning that references your research
-3. Be specific about parameters (transaction_id, prices, quantities)
-4. Execute the actions using the appropriate tools
-5. RESPECT the trading restrictions listed above
+Based on the research findings and rationale above, execute the appropriate trading actions.
 
-Remember: Every action must include a "reason" parameter explaining your decision.
+DO NOT second-guess the decision to act - you are here because action is warranted.
+DO NOT defer or wait for better conditions - implement the risk management actions now.
+DO use the available tools to execute the trades that address the identified risks and opportunities.
+
+For EACH action, provide clear reasoning that references your research findings.
 """
 
 FINALIZATION_PROMPT = """Summarize your risk management session.
@@ -433,11 +410,12 @@ class SmartRiskManagerState(TypedDict):
     # Analysis Data
     recent_analyses: List[Dict[str, Any]]
     detailed_outputs_cache: Dict[int, Dict[str, str]]  # analysis_id -> {output_key: content}
+    last_risk_manager_summary: Dict[str, Any]  # Summary from previous SRM run
     
     # Agent State
     messages: Annotated[List[BaseMessage], add]  # Message history
     agent_scratchpad: str  # Agent's reasoning notes
-    next_action: str  # "research_more", "take_action", "finish"
+    recommended_actions: List[Dict[str, Any]]  # Actions recommended by research node for action node to execute
     
     # Actions Taken
     actions_log: List[Dict[str, Any]]  # Record of all actions executed
@@ -488,14 +466,16 @@ def create_toolkit_tools(toolkit: SmartRiskManagerToolkit) -> List:
         }
     
     @tool
-    def get_analysis_outputs_batch_tool(requests: List[Dict[str, Any]], max_tokens: int = 100000) -> Dict[str, Any]:
+    def get_analysis_outputs_batch_tool(analysis_ids: List[int], output_keys: List[str], max_tokens: int = 100000) -> Dict[str, Any]:
         """Fetch multiple analysis outputs efficiently in a single call.
         
         Use this instead of calling get_analysis_output_detail_tool multiple times.
+        Fetches the SAME output keys from ALL specified analyses.
         Automatically handles truncation if content exceeds max_tokens limit.
         
         Args:
-            requests: List of dicts, each with 'analysis_id' (int) and 'output_keys' (list of strings)
+            analysis_ids: List of MarketAnalysis IDs to fetch from (e.g., [123, 124, 125])
+            output_keys: List of output keys to fetch from each analysis (e.g., ["analysis_summary", "market_report"])
             max_tokens: Maximum tokens in response (default: 100000)
             
         Returns:
@@ -509,12 +489,13 @@ def create_toolkit_tools(toolkit: SmartRiskManagerToolkit) -> List:
                 - items_skipped: Count of outputs skipped
                 
         Example:
-            requests = [
-                {"analysis_id": 123, "output_keys": ["analysis_summary", "market_report"]},
-                {"analysis_id": 124, "output_keys": ["news_report"]}
-            ]
+            # Fetch analysis_summary and market_report from analyses 123, 124, 125
+            result = get_analysis_outputs_batch_tool(
+                analysis_ids=[123, 124, 125],
+                output_keys=["analysis_summary", "market_report"]
+            )
         """
-        return toolkit.get_analysis_outputs_batch(requests, max_tokens)
+        return toolkit.get_analysis_outputs_batch(analysis_ids, output_keys, max_tokens)
     
     @tool
     def get_historical_analyses_tool(symbol: str, limit: int = 10, offset: int = 0) -> List[Dict[str, Any]]:
@@ -597,26 +578,6 @@ def create_toolkit_tools(toolkit: SmartRiskManagerToolkit) -> List:
         """
         return toolkit.update_take_profit(transaction_id, new_tp_price, reason)
     
-    @tool
-    def calculate_position_metrics_tool(
-        entry_price: float,
-        current_price: float,
-        quantity: float,
-        direction: str
-    ) -> Dict[str, float]:
-        """Calculate position metrics without modifying anything.
-        
-        Args:
-            entry_price: Entry price of the position
-            current_price: Current market price
-            quantity: Position size (number of shares/units)
-            direction: Position direction: 'buy' or 'sell'
-            
-        Returns:
-            Dict with pnl, pnl_percent, position_value, unrealized_pnl
-        """
-        return toolkit.calculate_position_metrics(entry_price, current_price, quantity, direction)
-    
     return [
         get_analysis_outputs_tool,
         get_analysis_output_detail_tool,
@@ -626,8 +587,7 @@ def create_toolkit_tools(toolkit: SmartRiskManagerToolkit) -> List:
         close_position_tool,
         adjust_quantity_tool,
         update_stop_loss_tool,
-        update_take_profit_tool,
-        calculate_position_metrics_tool
+        update_take_profit_tool
     ]
 
 
@@ -705,9 +665,54 @@ def initialize_context(state: SmartRiskManagerState) -> Dict[str, Any]:
         job_id = add_instance(job)
         logger.info(f"Created SmartRiskManagerJob {job_id}")
         
+        # Prepare trading permission status messages
+        enable_buy = expert_config.get("enable_buy", True)
+        enable_sell = expert_config.get("enable_sell", True)
+        auto_trade_opening = settings.get("allow_automated_trade_opening", False)
+        auto_trade_modification = settings.get("allow_automated_trade_modification", False)
+        auto_trading = auto_trade_opening and auto_trade_modification
+        
+        buy_status = "✅ ENABLED" if enable_buy else "❌ DISABLED"
+        sell_status = "✅ ENABLED" if enable_sell else "❌ DISABLED"
+        auto_trading_status = "✅ ENABLED" if auto_trading else "❌ DISABLED"
+        
+        # Generate focused guidance based on permissions
+        # Note: auto_trade_modification allows closing/modifying existing positions regardless of enable_buy/enable_sell
+        # enable_buy/enable_sell only affect NEW position opening when auto_trade_opening is True
+        if auto_trade_modification and auto_trade_opening:
+            # Full automation enabled
+            if enable_buy and enable_sell:
+                trading_focus_guidance = "**Your Focus:** Full automation enabled. You can open new positions (both BUY and SELL), close existing positions, and modify them. Manage the full portfolio lifecycle."
+            elif enable_buy:
+                trading_focus_guidance = "**Your Focus:** You can open new LONG positions (BUY only), close any existing positions, and modify them. Focus on long entry opportunities and managing all positions."
+            elif enable_sell:
+                trading_focus_guidance = "**Your Focus:** You can open new SHORT positions (SELL only), close any existing positions, and modify them. Focus on short entry opportunities and managing all positions."
+            else:
+                trading_focus_guidance = "**Your Focus:** You can close and modify existing positions, but cannot open new ones (both BUY and SELL disabled). Focus on managing existing positions only."
+        elif auto_trade_modification:
+            # Can modify/close existing positions but not open new ones
+            trading_focus_guidance = "**Your Focus:** You can close and modify existing positions (update stop-loss, take-profit, adjust quantities), but cannot open new positions. Focus on managing existing positions: closing losing trades, taking profits, and adjusting protective orders."
+        elif auto_trade_opening:
+            # Can open new positions but not modify existing ones
+            if enable_buy and enable_sell:
+                trading_focus_guidance = "**Your Focus:** You can open new positions (both BUY and SELL), but cannot close or modify existing ones. Focus on new entry opportunities only."
+            elif enable_buy:
+                trading_focus_guidance = "**Your Focus:** You can open new LONG positions (BUY only), but cannot close or modify existing ones. Focus on long entry opportunities only."
+            elif enable_sell:
+                trading_focus_guidance = "**Your Focus:** You can open new SHORT positions (SELL only), but cannot close or modify existing ones. Focus on short entry opportunities only."
+            else:
+                trading_focus_guidance = "**Your Focus:** Both BUY and SELL are disabled. You cannot perform any trading actions. Focus on analysis only."
+        else:
+            # No automation enabled
+            trading_focus_guidance = "**Your Focus:** Automated trading is DISABLED. You can only provide analysis and recommendations, but cannot execute any trades."
+        
         # Create initial system message
         system_msg = SystemMessage(content=SYSTEM_INITIALIZATION_PROMPT.format(
-            user_instructions=user_instructions
+            user_instructions=user_instructions,
+            buy_status=buy_status,
+            sell_status=sell_status,
+            auto_trading_status=auto_trading_status,
+            trading_focus_guidance=trading_focus_guidance
         ))
         
         return {
@@ -723,9 +728,10 @@ def initialize_context(state: SmartRiskManagerState) -> Dict[str, Any]:
             "open_positions": open_positions,
             "recent_analyses": [],
             "detailed_outputs_cache": {},
+            "last_risk_manager_summary": {},
             "messages": [system_msg],
             "agent_scratchpad": "",
-            "next_action": "",
+            "recommended_actions": [],
             "actions_log": [],
             "iteration_count": 0,
             "max_iterations": max_iterations
@@ -741,10 +747,11 @@ def analyze_portfolio(state: SmartRiskManagerState) -> Dict[str, Any]:
     Analyze current portfolio and generate initial assessment.
     
     Steps:
-    1. Calculate portfolio-level metrics
-    2. Identify positions with significant P&L
-    3. Check risk concentrations
-    4. Generate prompt for LLM to assess portfolio health
+    1. Get summary from last risk manager run (for continuity)
+    2. Calculate portfolio-level metrics
+    3. Identify positions with significant P&L
+    4. Check risk concentrations
+    5. Generate prompt for LLM to assess portfolio health
     """
     logger.info("Analyzing portfolio...")
     
@@ -753,6 +760,31 @@ def analyze_portfolio(state: SmartRiskManagerState) -> Dict[str, Any]:
         risk_manager_model = state["risk_manager_model"]
         backend_url = state["backend_url"]
         api_key = state["api_key"]
+        expert_instance_id = state["expert_instance_id"]
+        account_id = state["account_id"]
+        
+        # Create toolkit
+        toolkit = SmartRiskManagerToolkit(expert_instance_id, account_id)
+        
+        # Get summary from last risk manager run
+        last_run_summary = toolkit.get_last_risk_manager_summary()
+        
+        # Build context about previous run
+        previous_run_context = ""
+        if last_run_summary.get("job_id"):
+            previous_run_context = f"""
+
+## Previous Risk Manager Run
+Run Date: {last_run_summary['run_date']}
+Actions Taken: {last_run_summary['actions_taken_count']}
+Portfolio Change: ${last_run_summary['initial_equity']:.2f} → ${last_run_summary['final_equity']:.2f}
+
+Previous Research Findings:
+{last_run_summary['research_findings'] or 'No research findings available'}
+
+Previous Final Summary:
+{last_run_summary['final_summary'] or 'No final summary available'}
+"""
         
         # Create LLM
         llm = create_llm(risk_manager_model, 0.1, backend_url, api_key)
@@ -775,7 +807,7 @@ Open Positions:
         
         # Get LLM analysis
         analysis_prompt = PORTFOLIO_ANALYSIS_PROMPT.format(
-            portfolio_status=portfolio_summary
+            portfolio_status=portfolio_summary + previous_run_context
         )
         
         response = llm.invoke([
@@ -786,12 +818,16 @@ Open Positions:
         # Update scratchpad with analysis
         scratchpad = state["agent_scratchpad"] + "\n\n## Initial Portfolio Analysis\n" + response.content
         
+        # Store last run summary in state for research node access
+        state_update = {
+            "messages": [HumanMessage(content=analysis_prompt), response],
+            "agent_scratchpad": scratchpad,
+            "last_risk_manager_summary": last_run_summary
+        }
+        
         logger.info("Portfolio analysis complete")
         
-        return {
-            "messages": [HumanMessage(content=analysis_prompt), response],
-            "agent_scratchpad": scratchpad
-        }
+        return state_update
         
     except Exception as e:
         logger.error(f"Error analyzing portfolio: {e}", exc_info=True)
@@ -815,6 +851,7 @@ def check_recent_analyses(state: SmartRiskManagerState) -> Dict[str, Any]:
     1. Call get_recent_analyses() once to get all recent analyses (no symbol filter)
     2. Store in recent_analyses
     3. Add summaries to agent_scratchpad
+    4. Route directly to research_node for detailed investigation
     """
     logger.info("Checking recent market analyses for all symbols...")
     
@@ -878,7 +915,7 @@ def check_recent_analyses(state: SmartRiskManagerState) -> Dict[str, Any]:
         
         scratchpad = state["agent_scratchpad"] + analyses_summary
         
-        logger.info(f"Found {len(all_analyses)} recent analyses across {len(by_symbol)} symbols")
+        logger.info(f"Found {len(all_analyses)} recent analyses across {len(by_symbol)} symbols - routing to research_node")
         
         return {
             "recent_analyses": all_analyses,
@@ -893,106 +930,7 @@ def check_recent_analyses(state: SmartRiskManagerState) -> Dict[str, Any]:
         raise
 
 
-def agent_decision_loop(state: SmartRiskManagerState) -> Dict[str, Any]:
-    """
-    Main agent reasoning loop - decides next action.
-    
-    Steps:
-    1. Build prompt with context
-    2. Call LLM with tools available
-    3. LLM decides to: research_more, take_action, or finish
-    4. Update next_action in state
-    5. Increment iteration_count
-    """
-    logger.info(f"Agent decision loop - iteration {state['iteration_count'] + 1}")
-    
-    try:
-        risk_manager_model = state["risk_manager_model"]
-        backend_url = state["backend_url"]
-        api_key = state["api_key"]
-        
-        # Create LLM
-        llm = create_llm(risk_manager_model, 0.2, backend_url, api_key)
-        
-        # Build portfolio summary
-        portfolio_status = state["portfolio_status"]
-        portfolio_summary = f"Virtual Equity: ${portfolio_status['account_virtual_equity']:.2f} | "
-        portfolio_summary += f"Positions: {len(state['open_positions'])}"
-        
-        # Build actions log summary
-        actions_log_summary = "None yet" if not state["actions_log"] else "\n".join(
-            f"- {action['action_type']}: {action.get('summary', 'No summary')}"
-            for action in state["actions_log"]
-        )
-        
-        # Build decision prompt
-        decision_prompt = DECISION_LOOP_PROMPT.format(
-            user_instructions=state["user_instructions"],
-            iteration_count=state["iteration_count"] + 1,
-            max_iterations=state["max_iterations"],
-            portfolio_summary=portfolio_summary,
-            agent_scratchpad=state["agent_scratchpad"],
-            actions_log_summary=actions_log_summary
-        )
-        
-        # Minimal logging - just track iteration
-        logger.debug(f"Decision loop iteration {state['iteration_count'] + 1}: {len(state['messages'])} messages in context")
-        
-        # CRITICAL FIX: Filter out AIMessages with tool_calls and their corresponding ToolMessages
-        # The decision loop LLM has no tools bound, so it can't process tool call history
-        # We only need the conversational context, not the tool execution details
-        filtered_messages = []
-        skip_next_tool_messages = set()
-        
-        for msg in state["messages"]:
-            if isinstance(msg, AIMessage) and hasattr(msg, 'tool_calls') and msg.tool_calls:
-                # Mark tool call IDs to skip corresponding ToolMessages
-                for tc in msg.tool_calls:
-                    skip_next_tool_messages.add(tc["id"])
-                # Create a version without tool calls for context
-                filtered_messages.append(AIMessage(content=msg.content))
-            elif isinstance(msg, ToolMessage):
-                # Skip ToolMessages that correspond to filtered tool calls
-                if msg.tool_call_id in skip_next_tool_messages:
-                    continue
-                filtered_messages.append(msg)
-            else:
-                filtered_messages.append(msg)
-        
-        logger.debug(f"Filtered {len(state['messages']) - len(filtered_messages)} tool-related messages from context")
-        
-        response = llm.invoke([
-            *filtered_messages,
-            HumanMessage(content=decision_prompt)
-        ])
-        
-        # Parse decision from response
-        content = response.content.lower()
-        if "research_more" in content or "research more" in content:
-            next_action = "research_more"
-        elif "take_action" in content or "take action" in content:
-            next_action = "take_action"
-        elif "finish" in content:
-            next_action = "finish"
-        else:
-            # Default to finish if unclear
-            next_action = "finish"
-            logger.warning(f"Unclear decision from LLM, defaulting to finish: {response.content}")
-        
-        logger.info(f"Agent decision: {next_action}")
-        
-        return {
-            "messages": [HumanMessage(content=decision_prompt), response],
-            "next_action": next_action,
-            "iteration_count": state["iteration_count"] + 1
-        }
-        
-    except Exception as e:
-        logger.error(f"Error in agent decision loop: {e}", exc_info=True)
-        job_id = state.get("job_id")
-        if job_id:
-            mark_job_as_failed(job_id, f"Error in agent_decision_loop: {str(e)}")
-        raise
+# agent_decision_loop function REMOVED - no longer needed in sequential flow
 
 
 def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
@@ -1001,13 +939,13 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
     
     The research agent has its own conversation context and can call tools multiple times
     to gather information iteratively. It continues until it has enough data, then returns
-    a summary to the main decision loop.
+    recommended actions directly to action_node for execution.
     
     Steps:
     1. Create isolated conversation context for research
     2. Give research agent access to all research tools
-    3. Let agent iteratively call tools to gather data (up to 5 iterations)
-    4. Return concise summary to main agent, not full conversation
+    3. Let agent iteratively call tools to gather data (up to 15 iterations)
+    4. Return concise summary and recommended actions to action_node
     """
     logger.info("Entering research mode - autonomous research agent starting...")
     
@@ -1053,33 +991,29 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             }
         
         @tool
-        def get_analysis_outputs_batch_tool(requests: List[Dict[str, Any]], max_tokens: int = 100000) -> Dict[str, Any]:
+        def get_analysis_outputs_batch_tool(analysis_ids: List[int], output_keys: List[str], max_tokens: int = 100000) -> Dict[str, Any]:
             """Fetch multiple analysis outputs efficiently in a single call.
             
             Use this instead of calling get_analysis_output_detail_tool multiple times.
+            Fetches the SAME output keys from ALL specified analyses.
             Automatically handles truncation if content exceeds max_tokens limit.
             
             Args:
-                requests: List of dicts, each with 'analysis_id' (int) and 'output_keys' (list of strings)
+                analysis_ids: List of MarketAnalysis IDs to fetch from (e.g., [123, 124, 125])
+                output_keys: List of output keys to fetch from each analysis (e.g., ["analysis_summary", "market_report"])
                 max_tokens: Maximum tokens in response (default: 100000)
                 
             Returns:
-                Dictionary with:
-                    - outputs: List of output dicts with analysis_id, output_key, symbol, content
-                    - truncated: Whether truncation occurred
-                    - skipped_items: List of items skipped due to size/errors
-                    - total_chars: Total characters included
-                    - total_tokens_estimate: Estimated tokens
-                    - items_included: Count of outputs included
-                    - items_skipped: Count of outputs skipped
-                    
+                Dictionary with outputs, truncated status, and metadata
+                
             Example:
-                requests = [
-                    {"analysis_id": 123, "output_keys": ["analysis_summary", "market_report"]},
-                    {"analysis_id": 124, "output_keys": ["news_report"]}
-                ]
+                # Fetch analysis_summary and market_report from analyses 123, 124, 125
+                result = get_analysis_outputs_batch_tool(
+                    analysis_ids=[123, 124, 125],
+                    output_keys=["analysis_summary", "market_report"]
+                )
             """
-            return toolkit.get_analysis_outputs_batch(requests, max_tokens)
+            return toolkit.get_analysis_outputs_batch(analysis_ids, output_keys, max_tokens)
         
         @tool
         def get_historical_analyses_tool(symbol: str, limit: int = 10, offset: int = 0) -> List[Dict[str, Any]]:
@@ -1119,12 +1053,55 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             """
             return f"Research complete. Summary recorded: {summary[:100]}..."
         
+        # Track recommended actions in closure scope
+        recommended_actions_list = []
+        
+        @tool
+        def recommend_actions_tool(actions: List[Dict[str, Any]]) -> str:
+            """Recommend specific trading actions based on your research findings.
+            
+            CRITICAL: This is the PRIMARY PURPOSE of your research. After gathering information,
+            you MUST call this tool to recommend actions.
+            
+            Args:
+                actions: List of recommended actions, each with:
+                    - action_type: One of ['close_position', 'adjust_quantity', 'update_stop_loss', 
+                                           'update_take_profit', 'open_new_position']
+                    - parameters: Dict with required parameters for that action
+                        * close_position: {"transaction_id": int}
+                        * adjust_quantity: {"transaction_id": int, "new_quantity": float}
+                        * update_stop_loss: {"transaction_id": int, "new_sl_price": float}
+                        * update_take_profit: {"transaction_id": int, "new_tp_price": float}
+                        * open_new_position: {"symbol": str, "direction": str, "quantity": float, 
+                                             "tp_price": float (optional), "sl_price": float (optional)}
+                    - reason: Clear explanation referencing your research findings
+                    - confidence: Your confidence level (1-100) in this recommendation
+                    
+            Returns:
+                Confirmation message with action count
+                
+            Example:
+                recommend_actions_tool([
+                    {
+                        "action_type": "close_position",
+                        "parameters": {"transaction_id": 123},
+                        "reason": "Analysis #456 shows bearish reversal with 85% confidence",
+                        "confidence": 85
+                    }
+                ])
+            """
+            # Store in closure variable
+            recommended_actions_list.clear()
+            recommended_actions_list.extend(actions)
+            return f"Recorded {len(actions)} recommended actions. Call finish_research_tool() to complete research."
+        
         research_tools = [
             get_analysis_outputs_tool,
             get_analysis_output_detail_tool,
             get_analysis_outputs_batch_tool,
             get_historical_analyses_tool,
             get_current_price_tool,
+            recommend_actions_tool,
             finish_research_tool
         ]
         
@@ -1267,16 +1244,39 @@ Focus on:
                           (research_messages[-1].content if research_messages else "No findings.")
         
         logger.info(f"Research complete after {iteration + 1} iterations")
+        logger.info(f"Research node recommended {len(recommended_actions_list)} actions")
         
-        # Return ONLY summary to main agent, not the full research conversation
+        # Update scratchpad with research summary
+        updated_scratchpad = state["agent_scratchpad"] + f"\n\n## Research Findings\n{final_summary}\n"
+        
+        # Store research findings in job record for UI display
+        job_id = state.get("job_id")
+        if job_id:
+            try:
+                with get_db() as session:
+                    job = session.get(SmartRiskManagerJob, job_id)
+                    if job:
+                        # Store research findings in graph_state for later retrieval
+                        current_state = job.graph_state or {}
+                        current_state["research_findings"] = final_summary
+                        current_state["recommended_actions_count"] = len(recommended_actions_list)
+                        job.graph_state = current_state
+                        session.add(job)
+                        session.commit()
+                        logger.debug(f"Stored research findings in job {job_id}")
+            except Exception as e:
+                logger.warning(f"Failed to store research findings in job: {e}")
+        
+        # Return summary and pass recommended actions to action_node
         return {
             "messages": [
                 HumanMessage(content="Research findings summary:"),
                 AIMessage(content=final_summary)
             ],
             "detailed_outputs_cache": detailed_cache,
-            "agent_scratchpad": state["agent_scratchpad"] + f"\n\n## Research Findings\n{final_summary}\n",
-            "next_action": ""  # Force return to decision loop
+            "agent_scratchpad": updated_scratchpad,
+            "recommended_actions": recommended_actions_list,  # Pass to action_node
+            "iteration_count": state["iteration_count"] + 1  # Increment iteration
         }
         
     except Exception as e:
@@ -1291,11 +1291,19 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
     """
     Action mode - execute trading operations.
     
+    CRITICAL BEHAVIOR CHANGE:
+    - When research_node provides recommended_actions: Execute them directly without LLM re-decision
+    - When decision_loop routes here with "take_action": Execute actions without second-guessing
+    
+    The LLM should ONLY be consulted if no specific actions are recommended AND we need
+    to determine what to do. Otherwise, we execute what was decided.
+    
     Steps:
-    1. LLM decides which action(s) to take using tools
-    2. Execute tool calls for trading actions
-    3. Record results in actions_log
-    4. Update portfolio_status with new data
+    1. Check if research_node provided recommended_actions - if yes, execute them directly
+    2. Otherwise, parse agent_scratchpad for action intent from decision_loop
+    3. Execute all intended trading operations
+    4. Record results in actions_log
+    5. Update portfolio_status with new data
     """
     logger.info("Entering action mode...")
     
@@ -1306,6 +1314,13 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
         
         # Create toolkit
         toolkit = SmartRiskManagerToolkit(expert_instance_id, account_id)
+        
+        # Check if we have recommended actions from research node
+        recommended_actions = state.get("recommended_actions", [])
+        if recommended_actions:
+            logger.info(f"Action node executing {len(recommended_actions)} actions recommended by research node (direct execution)")
+        else:
+            logger.info("Action node will use LLM to determine actions from decision loop context")
         
         # Create action-specific tools directly
         @tool
@@ -1376,24 +1391,28 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             return toolkit.get_current_price(symbol)
         
         @tool
-        def calculate_position_metrics_tool(
-            entry_price: float,
-            current_price: float,
+        def open_new_position_tool(
+            symbol: str,
+            direction: str,
             quantity: float,
-            direction: str
-        ) -> Dict[str, float]:
-            """Calculate position metrics without modifying anything.
+            tp_price: float = None,
+            sl_price: float = None,
+            reason: str = ""
+        ) -> Dict[str, Any]:
+            """Open a new trading position.
             
             Args:
-                entry_price: Entry price of the position
-                current_price: Current market price
-                quantity: Position size (number of shares/units)
-                direction: Position direction: 'buy' or 'sell'
+                symbol: Instrument symbol to trade
+                direction: Trade direction - 'BUY' or 'SELL'
+                quantity: Number of shares/units to trade
+                tp_price: Optional take profit price
+                sl_price: Optional stop loss price
+                reason: Explanation for opening this position (for audit trail)
                 
             Returns:
-                Dict with pnl, pnl_percent, position_value, unrealized_pnl
+                Result dict with success, message, transaction_id, order_id
             """
-            return toolkit.calculate_position_metrics(entry_price, current_price, quantity, direction)
+            return toolkit.open_new_position(symbol, direction, quantity, tp_price, sl_price, reason)
         
         action_tools = [
             close_position_tool,
@@ -1401,7 +1420,7 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             update_stop_loss_tool,
             update_take_profit_tool,
             get_current_price_tool,
-            calculate_position_metrics_tool
+            open_new_position_tool
         ]
         
         # Create LLM with tools
@@ -1432,11 +1451,71 @@ Open Positions:
         # Get action plan from LLM
         expert_settings = state["expert_settings"]
         
-        # Format trading restrictions
-        buy_status = "✅ ENABLED" if expert_settings.get("enable_buy", True) else "❌ DISABLED - DO NOT attempt to open long positions"
-        sell_status = "✅ ENABLED" if expert_settings.get("enable_sell", True) else "❌ DISABLED - DO NOT attempt to open short positions"
+        # Get the full expert settings to access automation flags
+        expert = get_expert_instance_from_id(state["expert_instance_id"])
+        full_settings = expert.settings if expert else {}
+        
+        # Format trading permissions with clear status
+        enable_buy = expert_settings.get("enable_buy", True)
+        enable_sell = expert_settings.get("enable_sell", True)
+        auto_trade_opening = full_settings.get("allow_automated_trade_opening", False)
+        auto_trade_modification = full_settings.get("allow_automated_trade_modification", False)
+        auto_trading = auto_trade_opening and auto_trade_modification
+        
+        buy_status = "✅ ENABLED" if enable_buy else "❌ DISABLED"
+        sell_status = "✅ ENABLED" if enable_sell else "❌ DISABLED"
+        auto_trading_status = "✅ ENABLED" if auto_trading else "❌ DISABLED"
         enabled_instruments = expert_settings.get("enabled_instruments", [])
         max_position_pct = expert_settings.get("max_virtual_equity_per_instrument_percent", 100.0)
+        
+        # Generate action-specific notes based on permissions
+        # Note: auto_trade_modification allows closing/modifying regardless of enable_buy/enable_sell
+        close_position_note = "✅ Available" if auto_trade_modification else "(requires automated modification enabled)"
+        adjust_quantity_note = "✅ Available" if auto_trade_modification else "(requires automated modification enabled)"
+        update_sl_tp_note = "✅ Available" if auto_trade_modification else "(requires automated modification enabled)"
+        
+        # Opening new positions requires auto_trade_opening AND appropriate enable_buy/enable_sell
+        if auto_trade_opening:
+            if enable_buy and enable_sell:
+                open_position_note = "✅ Available (both BUY and SELL)"
+            elif enable_buy:
+                open_position_note = "✅ Available (BUY only, SELL disabled)"
+            elif enable_sell:
+                open_position_note = "✅ Available (SELL only, BUY disabled)"
+            else:
+                open_position_note = "(requires BUY or SELL enabled)"
+        else:
+            open_position_note = "(requires automated opening enabled)"
+        
+        # Generate focused guidance based on permissions
+        # Note: auto_trade_modification allows closing/modifying existing positions regardless of enable_buy/enable_sell
+        # enable_buy/enable_sell only affect NEW position opening when auto_trade_opening is True
+        if auto_trade_modification and auto_trade_opening:
+            # Full automation enabled
+            if enable_buy and enable_sell:
+                trading_focus_guidance = "**Your Focus:** Full automation enabled. You can open new positions (both BUY and SELL), close existing positions, and modify them. Manage the full portfolio lifecycle."
+            elif enable_buy:
+                trading_focus_guidance = "**Your Focus:** You can open new LONG positions (BUY only), close any existing positions, and modify them. Focus on long entry opportunities and managing all positions."
+            elif enable_sell:
+                trading_focus_guidance = "**Your Focus:** You can open new SHORT positions (SELL only), close any existing positions, and modify them. Focus on short entry opportunities and managing all positions."
+            else:
+                trading_focus_guidance = "**Your Focus:** You can close and modify existing positions, but cannot open new ones (both BUY and SELL disabled). Focus on managing existing positions only."
+        elif auto_trade_modification:
+            # Can modify/close existing positions but not open new ones
+            trading_focus_guidance = "**Your Focus:** You can close and modify existing positions (update stop-loss, take-profit, adjust quantities), but cannot open new positions. Focus on managing existing positions: closing losing trades, taking profits, and adjusting protective orders."
+        elif auto_trade_opening:
+            # Can open new positions but not modify existing ones
+            if enable_buy and enable_sell:
+                trading_focus_guidance = "**Your Focus:** You can open new positions (both BUY and SELL), but cannot close or modify existing ones. Focus on new entry opportunities only."
+            elif enable_buy:
+                trading_focus_guidance = "**Your Focus:** You can open new LONG positions (BUY only), but cannot close or modify existing ones. Focus on long entry opportunities only."
+            elif enable_sell:
+                trading_focus_guidance = "**Your Focus:** You can open new SHORT positions (SELL only), but cannot close or modify existing ones. Focus on short entry opportunities only."
+            else:
+                trading_focus_guidance = "**Your Focus:** Both BUY and SELL are disabled. You cannot perform any trading actions. Focus on analysis only."
+        else:
+            # No automation enabled
+            trading_focus_guidance = "**Your Focus:** Automated trading is DISABLED. You can only provide analysis and recommendations, but cannot execute any trades."
         
         action_prompt = ACTION_PROMPT.format(
             portfolio_summary=portfolio_summary,
@@ -1444,118 +1523,249 @@ Open Positions:
             user_instructions=state["user_instructions"],
             buy_status=buy_status,
             sell_status=sell_status,
+            auto_trading_status=auto_trading_status,
+            trading_focus_guidance=trading_focus_guidance,
+            close_position_note=close_position_note,
+            adjust_quantity_note=adjust_quantity_note,
+            update_sl_tp_note=update_sl_tp_note,
+            open_position_note=open_position_note,
             enabled_instruments=enabled_instruments,
             max_position_pct=max_position_pct
         )
         
-        # First call: Let LLM decide which actions to take (tools bound locally)
-        response = llm_with_tools.invoke([
-            *state["messages"],
-            HumanMessage(content=action_prompt)
-        ])
-        
-        logger.info(f"Action agent: LLM returned {len(response.tool_calls) if response.tool_calls else 0} tool calls")
-
         actions_log = state["actions_log"].copy()
         detailed_action_reports = []
+        
+        # PRIORITY: Execute recommended actions from research node (if any)
+        if recommended_actions:
+            logger.info(f"Executing {len(recommended_actions)} actions recommended by research node")
+            
+            for idx, action in enumerate(recommended_actions):
+                action_type = action.get("action_type")
+                parameters = action.get("parameters", {})
+                reason = action.get("reason", "Recommended by research node")
+                confidence = action.get("confidence", 0)
+                
+                logger.info(f"Executing recommended action {idx+1}/{len(recommended_actions)}: {action_type} (confidence: {confidence}%)")
+                
+                try:
+                    result = None
+                    
+                    # Execute the appropriate toolkit method based on action_type
+                    if action_type == "close_position":
+                        transaction_id = parameters["transaction_id"]
+                        result = toolkit.close_position(transaction_id, reason)
+                        
+                    elif action_type == "adjust_quantity":
+                        transaction_id = parameters["transaction_id"]
+                        new_quantity = parameters["new_quantity"]
+                        result = toolkit.adjust_quantity(transaction_id, new_quantity, reason)
+                        
+                    elif action_type == "update_stop_loss":
+                        transaction_id = parameters["transaction_id"]
+                        new_sl_price = parameters["new_sl_price"]
+                        result = toolkit.update_stop_loss(transaction_id, new_sl_price, reason)
+                        
+                    elif action_type == "update_take_profit":
+                        transaction_id = parameters["transaction_id"]
+                        new_tp_price = parameters["new_tp_price"]
+                        result = toolkit.update_take_profit(transaction_id, new_tp_price, reason)
+                        
+                    elif action_type == "open_new_position":
+                        symbol = parameters["symbol"]
+                        direction = parameters["direction"]
+                        quantity = parameters["quantity"]
+                        tp_price = parameters.get("tp_price")
+                        sl_price = parameters.get("sl_price")
+                        result = toolkit.open_new_position(symbol, direction, quantity, tp_price, sl_price, reason)
+                    
+                    else:
+                        logger.warning(f"Unknown action_type: {action_type}")
+                        result = {"success": False, "message": f"Unknown action_type: {action_type}"}
+                    
+                    # Record action in log
+                    action_record = {
+                        "iteration": state["iteration_count"],
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "action_type": action_type,
+                        "arguments": parameters,
+                        "reason": reason,
+                        "confidence": confidence,
+                        "source": "research_node_recommendation",
+                        "result": result,
+                        "success": result.get("success", False) if result else False
+                    }
+                    actions_log.append(action_record)
+                    
+                    logger.info(f"✅ Recommended action executed: {action_type} - success={result.get('success', False)}")
+                    
+                    detailed_action_reports.append({
+                        "tool": action_type,
+                        "args": parameters,
+                        "reason": reason,
+                        "confidence": confidence,
+                        "result": result,
+                        "source": "research_recommendation"
+                    })
+                    
+                except Exception as e:
+                    logger.error(f"Error executing recommended action {action_type}: {e}", exc_info=True)
+                    action_record = {
+                        "iteration": state["iteration_count"],
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "action_type": action_type,
+                        "arguments": parameters,
+                        "reason": reason,
+                        "confidence": confidence,
+                        "source": "research_node_recommendation",
+                        "error": str(e),
+                        "success": False
+                    }
+                    actions_log.append(action_record)
+                    
+                    detailed_action_reports.append({
+                        "tool": action_type,
+                        "args": parameters,
+                        "error": str(e),
+                        "source": "research_recommendation"
+                    })
+            
+            # Build summary for recommended actions
+            summary_lines = [f"Executed {len(recommended_actions)} actions recommended by research node:"]
+            for r in detailed_action_reports:
+                tool_label = r.get("tool")
+                if r.get("result"):
+                    res = r["result"]
+                    summary_lines.append(f"- {tool_label}: success={res.get('success', 'unknown')}, {res.get('message', 'no message')}")
+                else:
+                    summary_lines.append(f"- {tool_label}: error={r.get('error', 'unknown error')}")
+            
+            actions_summary = "\n".join(summary_lines)
+            
+        else:
+            # No recommended actions from research - let LLM decide
+            logger.info("No recommended actions from research node - LLM will decide")
+        
+        # If we had recommended actions, skip LLM decision (actions already executed)
+        if not recommended_actions:
+            # First call: Let LLM decide which actions to take (tools bound locally)
+            response = llm_with_tools.invoke([
+                *state["messages"],
+                HumanMessage(content=action_prompt)
+            ])
+            
+            logger.info(f"Action agent: LLM returned {len(response.tool_calls) if response.tool_calls else 0} tool calls")
 
-        # Execute all tool calls locally and record results (tools are local to this node)
-        if response.tool_calls:
-            logger.info(f"Executing {len(response.tool_calls)} trading actions")
-            for tool_call in response.tool_calls:
-                tool_name = tool_call.get("name")
-                tool_args = tool_call.get("args", {})
-                tool_call_id = tool_call.get("id")
+            # Execute all tool calls locally and record results (tools are local to this node)
+            if response.tool_calls:
+                logger.info(f"Executing {len(response.tool_calls)} trading actions")
+                for tool_call in response.tool_calls:
+                    tool_name = tool_call.get("name")
+                    tool_args = tool_call.get("args", {})
+                    tool_call_id = tool_call.get("id")
 
-                logger.debug(f"Action tool call: {tool_name} id={tool_call_id} args={tool_args}")
+                    logger.debug(f"Action tool call: {tool_name} id={tool_call_id} args={tool_args}")
 
-                matching_tool = next((t for t in action_tools if t.name == tool_name), None)
-                if matching_tool:
-                    try:
-                        logger.info(f"🔧 Action Tool Call: {tool_name} | Args: {json.dumps(tool_args)}")
-                        result = matching_tool.invoke(tool_args)
-                        logger.info(f"✅ Action Tool Result: {tool_name} | Success: {result.get('success', 'N/A')} | {result.get('message', str(result)[:100])}")
+                    matching_tool = next((t for t in action_tools if t.name == tool_name), None)
+                    if matching_tool:
+                        try:
+                            logger.info(f"🔧 Action Tool Call: {tool_name} | Args: {json.dumps(tool_args)}")
+                            result = matching_tool.invoke(tool_args)
+                            
+                            # Handle both dict and non-dict results for logging
+                            if isinstance(result, dict):
+                                logger.info(f"✅ Action Tool Result: {tool_name} | Success: {result.get('success', 'N/A')} | {result.get('message', str(result)[:100])}")
+                            else:
+                                logger.info(f"✅ Action Tool Result: {tool_name} | Result: {str(result)[:100]}")
 
-                        # Record action in log (for trading actions)
-                        if tool_name in ['close_position_tool', 'adjust_quantity_tool',
-                                         'update_stop_loss_tool', 'update_take_profit_tool']:
+                            # Record action in log (for trading actions)
+                            if tool_name in ['close_position_tool', 'adjust_quantity_tool',
+                                             'update_stop_loss_tool', 'update_take_profit_tool']:
+                                action_record = {
+                                    "iteration": state["iteration_count"],
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    "action_type": tool_name.replace("_tool", ""),
+                                    "arguments": tool_args,
+                                    "result": result,
+                                    "success": result.get("success", False) if isinstance(result, dict) else False
+                                }
+                                actions_log.append(action_record)
+                                success_status = result.get('success', False) if isinstance(result, dict) else "N/A"
+                                logger.info(f"Action executed: {tool_name} - success={success_status}")
+
+                            # Save a human-readable report for LLM summary
+                            detailed_action_reports.append({
+                                "tool": tool_name,
+                                "args": tool_args,
+                                "result": result
+                            })
+
+                        except Exception as e:
+                            logger.error(f"Error executing action tool {tool_name}: {e}", exc_info=True)
                             action_record = {
                                 "iteration": state["iteration_count"],
                                 "timestamp": datetime.now(timezone.utc).isoformat(),
                                 "action_type": tool_name.replace("_tool", ""),
                                 "arguments": tool_args,
-                                "result": result,
-                                "success": result.get("success", False)
+                                "error": str(e),
+                                "success": False
                             }
                             actions_log.append(action_record)
-                            logger.info(f"Action executed: {tool_name} - success={result.get('success', False)}")
-
-                        # Save a human-readable report for LLM summary
-                        detailed_action_reports.append({
-                            "tool": tool_name,
-                            "args": tool_args,
-                            "result": result
-                        })
-
-                    except Exception as e:
-                        logger.error(f"Error executing action tool {tool_name}: {e}", exc_info=True)
+                            detailed_action_reports.append({
+                                "tool": tool_name,
+                                "args": tool_args,
+                                "error": str(e)
+                            })
+                    else:
+                        logger.warning(f"Requested tool {tool_name} not available in action_tools")
                         action_record = {
                             "iteration": state["iteration_count"],
                             "timestamp": datetime.now(timezone.utc).isoformat(),
                             "action_type": tool_name.replace("_tool", ""),
                             "arguments": tool_args,
-                            "error": str(e),
+                            "error": f"Tool {tool_name} not found",
                             "success": False
                         }
                         actions_log.append(action_record)
                         detailed_action_reports.append({
                             "tool": tool_name,
                             "args": tool_args,
-                            "error": str(e)
+                            "error": f"Tool {tool_name} not found"
                         })
-                else:
-                    logger.warning(f"Requested tool {tool_name} not available in action_tools")
-                    action_record = {
-                        "iteration": state["iteration_count"],
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "action_type": tool_name.replace("_tool", ""),
-                        "arguments": tool_args,
-                        "error": f"Tool {tool_name} not found",
-                        "success": False
-                    }
-                    actions_log.append(action_record)
-                    detailed_action_reports.append({
-                        "tool": tool_name,
-                        "args": tool_args,
-                        "error": f"Tool {tool_name} not found"
-                    })
-        else:
-            # No tool calls - record LLM reasoning as no_action
-            logger.info("LLM decided not to take any actions")
-            action_record = {
-                "iteration": state["iteration_count"],
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "action_type": "no_action",
-                "summary": "Agent decided no actions needed",
-                "llm_reasoning": response.content
-            }
-            actions_log.append(action_record)
-            detailed_action_reports.append({
-                "tool": "no_action",
-                "reasoning": response.content
-            })
-
-        # Build an AI-summary of actions for the decision loop
-        summary_lines = [f"Actions executed: {len(detailed_action_reports)} items"]
-        for r in detailed_action_reports:
-            tool_label = r.get("tool")
-            if r.get("result"):
-                res = r["result"]
-                summary_lines.append(f"- {tool_label}: success={res.get('success', 'unknown')}, details={str(res)}")
             else:
-                summary_lines.append(f"- {tool_label}: error={r.get('error', r.get('reasoning', 'no details'))}")
+                # No tool calls - record LLM reasoning as no_action
+                logger.info("LLM decided not to take any actions")
+                action_record = {
+                    "iteration": state["iteration_count"],
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "action_type": "no_action",
+                    "summary": "Agent decided no actions needed",
+                    "llm_reasoning": response.content
+                }
+                actions_log.append(action_record)
+                detailed_action_reports.append({
+                    "tool": "no_action",
+                    "reasoning": response.content
+                })
+        
+        # Build an AI-summary of actions for the decision loop (handle both LLM and recommended actions cases)
+        if not recommended_actions:
+            # LLM-driven actions
+            summary_lines = [f"Actions executed: {len(detailed_action_reports)} items"]
+            for r in detailed_action_reports:
+                tool_label = r.get("tool")
+                if r.get("result"):
+                    res = r["result"]
+                    # Handle both dict and non-dict results
+                    if isinstance(res, dict):
+                        summary_lines.append(f"- {tool_label}: success={res.get('success', 'unknown')}, details={str(res)}")
+                    else:
+                        summary_lines.append(f"- {tool_label}: result={str(res)}")
+                else:
+                    summary_lines.append(f"- {tool_label}: error={r.get('error', r.get('reasoning', 'no details'))}")
 
-        actions_summary = "\n".join(summary_lines)
+            actions_summary = "\n".join(summary_lines)
+        # else: actions_summary already built for recommended actions
 
         # Refresh portfolio status after actions
         portfolio_status = toolkit.get_portfolio_status()
@@ -1563,16 +1773,19 @@ Open Positions:
 
         logger.info(f"Action mode complete. {len(actions_log) - len(state['actions_log'])} new actions recorded")
 
-        # Return only HumanMessage + AIMessage (no ToolMessage objects)
+        # Return updated state
+        # Clear recommended_actions to prevent re-execution
+        # Increment iteration count for tracking
         return {
             "messages": [
-                HumanMessage(content=action_prompt),
+                HumanMessage(content=action_prompt if not recommended_actions else "Executing recommended actions from research node"),
                 AIMessage(content=actions_summary)
             ],
             "actions_log": actions_log,
             "portfolio_status": portfolio_status,
             "open_positions": open_positions,
-            "next_action": ""  # Force return to decision loop
+            "recommended_actions": [],  # Clear after execution
+            "iteration_count": state["iteration_count"] + 1  # Increment iteration
         }
         
     except Exception as e:
@@ -1641,11 +1854,16 @@ def finalize(state: SmartRiskManagerState) -> Dict[str, Any]:
                 job.actions_taken_count = len(state["actions_log"])
                 job.actions_summary = response.content
                 job.iteration_count = state["iteration_count"]
-                job.graph_state = {
-                    "open_positions": state["open_positions"],
-                    "actions_log": state["actions_log"],
-                    "final_scratchpad": state["agent_scratchpad"]
-                }
+                
+                # Store complete state including research findings and final summary
+                current_state = job.graph_state or {}
+                current_state["open_positions"] = state["open_positions"]
+                current_state["actions_log"] = state["actions_log"]
+                current_state["final_scratchpad"] = state["agent_scratchpad"]
+                current_state["final_summary"] = response.content  # Store final summary separately
+                # research_findings already stored by research_node
+                
+                job.graph_state = current_state
                 session.add(job)
                 session.commit()
                 logger.info(f"Updated SmartRiskManagerJob {job_id} to COMPLETED")
@@ -1670,40 +1888,37 @@ def finalize(state: SmartRiskManagerState) -> Dict[str, Any]:
 
 # ==================== CONDITIONAL ROUTING ====================
 
-def should_continue(state: SmartRiskManagerState) -> str:
+def should_continue_or_finalize(state: SmartRiskManagerState) -> str:
     """
-    Determine which node to execute next based on agent's decision.
+    Determine if we should finalize or continue with the workflow.
     
-    Logic:
-    - If iteration_count >= max_iterations: return "finalize"
-    - If next_action == "research_more": return "research_node"
-    - If next_action == "take_action": return "action_node"
-    - If next_action == "finish": return "finalize"
-    - Else: return "agent_decision_loop"
+    Simple iteration limit check - if we've exceeded max iterations, finalize.
+    Otherwise, the sequential flow continues.
+    
+    Returns:
+        "finalize" if max iterations reached, otherwise shouldn't be called
     """
     # Check iteration limit
     if state["iteration_count"] >= state["max_iterations"]:
         logger.warning(f"Max iterations ({state['max_iterations']}) reached, finalizing")
         return "finalize"
     
-    next_action = state.get("next_action", "")
-    
-    if next_action == "research_more":
-        return "research_node"
-    elif next_action == "take_action":
-        return "action_node"
-    elif next_action == "finish":
-        return "finalize"
-    else:
-        # Shouldn't happen, but loop back to decision
-        return "agent_decision_loop"
+    # This shouldn't be reached in normal flow
+    logger.warning("should_continue_or_finalize called unexpectedly, finalizing")
+    return "finalize"
 
 
 # ==================== GRAPH CONSTRUCTION ====================
 
 def build_smart_risk_manager_graph(expert_instance_id: int, account_id: int) -> StateGraph:
     """
-    Build the complete LangGraph workflow.
+    Build the complete LangGraph workflow with SEQUENTIAL FLOW.
+    
+    Flow: initialize → analyze_portfolio → check_recent_analyses → research_node → action_node → finalize
+    
+    - research_node iterates on itself until research is complete
+    - action_node executes all recommended actions
+    - Simple one-way flow with iteration limit check
     
     Args:
         expert_instance_id: ID of the ExpertInstance
@@ -1721,37 +1936,30 @@ def build_smart_risk_manager_graph(expert_instance_id: int, account_id: int) -> 
     workflow.add_node("initialize_context", initialize_context)
     workflow.add_node("analyze_portfolio", analyze_portfolio)
     workflow.add_node("check_recent_analyses", check_recent_analyses)
-    workflow.add_node("agent_decision_loop", agent_decision_loop)
     workflow.add_node("research_node", research_node)
     workflow.add_node("action_node", action_node)
     workflow.add_node("finalize", finalize)
     
-    # Add edges
+    # Sequential flow edges
     workflow.set_entry_point("initialize_context")
     workflow.add_edge("initialize_context", "analyze_portfolio")
     workflow.add_edge("analyze_portfolio", "check_recent_analyses")
-    workflow.add_edge("check_recent_analyses", "agent_decision_loop")
+    workflow.add_edge("check_recent_analyses", "research_node")
+    workflow.add_edge("research_node", "action_node")
     
-    # Conditional routing from agent_decision_loop
+    # Action node checks iteration limit then finalizes
     workflow.add_conditional_edges(
-        "agent_decision_loop",
-        should_continue,
+        "action_node",
+        should_continue_or_finalize,
         {
-            "research_node": "research_node",
-            "action_node": "action_node",
-            "finalize": "finalize",
-            "agent_decision_loop": "agent_decision_loop"
+            "finalize": "finalize"
         }
     )
-    
-    # Loop back to decision loop
-    workflow.add_edge("research_node", "agent_decision_loop")
-    workflow.add_edge("action_node", "agent_decision_loop")
     
     # End
     workflow.add_edge("finalize", END)
     
-    logger.info("Smart Risk Manager graph built successfully")
+    logger.info("Smart Risk Manager graph built successfully with sequential flow")
     
     return workflow.compile()
 
@@ -1795,7 +2003,7 @@ def run_smart_risk_manager(expert_instance_id: int, account_id: int) -> Dict[str
             "detailed_outputs_cache": {},
             "messages": [],
             "agent_scratchpad": "",
-            "next_action": "",
+            "recommended_actions": [],  # Actions recommended by research node
             "actions_log": [],
             "iteration_count": 0,
             "max_iterations": 10

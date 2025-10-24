@@ -862,9 +862,15 @@ Analysis completed at: {self._get_current_timestamp()}"""
             websearch_model = settings_def['dataprovider_websearch_model']['default']
         
         alpha_vantage_source = self.settings.get('alpha_vantage_source', settings_def['alpha_vantage_source']['default'])
+        economic_data_days = int(self.settings.get('economic_data_days', settings_def['economic_data_days']['default']))
+        news_lookback_days = int(self.settings.get('news_lookback_days', settings_def['news_lookback_days']['default']))
+        social_sentiment_days = int(self.settings.get('social_sentiment_days', settings_def['social_sentiment_days']['default']))
         provider_args = {
             'websearch_model': websearch_model,
-            'alpha_vantage_source': alpha_vantage_source
+            'alpha_vantage_source': alpha_vantage_source,
+            'economic_data_days': economic_data_days,  # Pass expert setting for default lookback_days
+            'news_lookback_days': news_lookback_days,  # Pass expert setting for news tools
+            'social_sentiment_days': social_sentiment_days  # Pass expert setting for social media tools
         }
         
         # Log provider_map configuration
@@ -1872,14 +1878,19 @@ Please check back in a few minutes for results."""
                 price_info = ""
                 try:
                     from ...core.utils import get_account_instance_from_id
-                    account = get_account_instance_from_id(analysis.account_id)
-                    if account:
-                        bid_price = account.get_instrument_current_price(symbol, price_type='bid')
-                        ask_price = account.get_instrument_current_price(symbol, price_type='ask')
-                        if bid_price and ask_price:
-                            price_info = f" (current price: bid: {bid_price:.2f} / ask: {ask_price:.2f})"
-                        elif bid_price:
-                            price_info = f" (current price: {bid_price:.2f})"
+                    from ...core.models import ExpertInstance
+                    
+                    # Get account_id from expert instance
+                    expert_instance = session.get(ExpertInstance, analysis.expert_instance_id)
+                    if expert_instance:
+                        account = get_account_instance_from_id(expert_instance.account_id)
+                        if account:
+                            bid_price = account.get_instrument_current_price(symbol, price_type='bid')
+                            ask_price = account.get_instrument_current_price(symbol, price_type='ask')
+                            if bid_price and ask_price:
+                                price_info = f" (current price: bid: {bid_price:.2f} / ask: {ask_price:.2f})"
+                            elif bid_price:
+                                price_info = f" (current price: {bid_price:.2f})"
                 except Exception as price_err:
                     self.logger.debug(f"Could not fetch current price for {symbol}: {price_err}")
                 

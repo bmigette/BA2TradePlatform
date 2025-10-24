@@ -1050,6 +1050,17 @@ class TradeManager:
                             )
                             continue
                         
+                        # EQUITY CHECK: Verify expert has sufficient available equity before creating orders
+                        # Uses minimum_equity_threshold_percent from account settings (default 5%)
+                        # Skip execution if insufficient funds to avoid creating pending orders that can't be filled
+                        has_sufficient_equity, equity_reason = expert.has_sufficient_equity_for_trading()
+                        if not has_sufficient_equity:
+                            self.logger.warning(
+                                f"EQUITY CHECK: Skipping recommendation {recommendation.id} for {recommendation.symbol} - "
+                                f"expert {expert_instance_id}: {equity_reason}"
+                            )
+                            continue
+                        
                         # Execute the actions using TradeActionEvaluator
                         # Actions are already sorted by priority (BUY/SELL first, then TP/SL)
                         # Thanks to _sort_actions_by_priority in execute() method

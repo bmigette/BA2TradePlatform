@@ -74,7 +74,7 @@ def log_provider_call(func: Callable) -> Callable:
             return result
             
         except Exception as e:
-            logger.error(f"{provider_name}.{func.__name__} failed with error: {e}")
+            logger.error(f"{provider_name}.{func.__name__} failed with error: {e}", exc_info=True)
             raise
     
     return wrapper
