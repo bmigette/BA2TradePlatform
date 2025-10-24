@@ -352,7 +352,8 @@ You have access to these trading tools:
 - **adjust_quantity(transaction_id, new_quantity, reason)** - Partial close or add to position {adjust_quantity_note}
 - **update_stop_loss(transaction_id, new_sl_price, reason)** - Update stop loss {update_sl_tp_note}
 - **update_take_profit(transaction_id, new_tp_price, reason)** - Update take profit {update_sl_tp_note}
-- **open_new_position(symbol, direction, quantity, tp_price, sl_price, reason)** - Open new position {open_position_note}
+- **open_buy_position(symbol, quantity, tp_price, sl_price, reason)** - Open new LONG (BUY) position {open_position_note}
+- **open_sell_position(symbol, quantity, tp_price, sl_price, reason)** - Open new SHORT (SELL) position {open_position_note}
 
 ## GUIDELINES FOR ACTIONS
 {user_instructions}
@@ -1087,14 +1088,16 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             Args:
                 actions: List of recommended actions, each with:
                     - action_type: One of ['close_position', 'adjust_quantity', 'update_stop_loss', 
-                                           'update_take_profit', 'open_new_position']
+                                           'update_take_profit', 'open_buy_position', 'open_sell_position']
                     - parameters: Dict with required parameters for that action
                         * close_position: {"transaction_id": int}
                         * adjust_quantity: {"transaction_id": int, "new_quantity": float}
                         * update_stop_loss: {"transaction_id": int, "new_sl_price": float}
                         * update_take_profit: {"transaction_id": int, "new_tp_price": float}
-                        * open_new_position: {"symbol": str, "direction": str, "quantity": float, 
+                        * open_buy_position: {"symbol": str, "quantity": float, 
                                              "tp_price": float (optional), "sl_price": float (optional)}
+                        * open_sell_position: {"symbol": str, "quantity": float, 
+                                              "tp_price": float (optional), "sl_price": float (optional)}
                     - reason: Clear explanation referencing your research findings
                     - confidence: Your confidence level (1-100) in this recommendation
                     
@@ -1412,20 +1415,18 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             return toolkit.get_current_price(symbol)
         
         @tool
-        def open_new_position_tool(
+        def open_buy_position_tool(
             symbol: str,
-            direction: str,
             quantity: float,
             tp_price: float = None,
             sl_price: float = None,
             reason: str = ""
         ) -> Dict[str, Any]:
-            """Open a new trading position.
+            """Open a new LONG (BUY) trading position.
             
             Args:
                 symbol: Instrument symbol to trade
-                direction: Trade direction - 'BUY' or 'SELL'
-                quantity: Number of shares/units to trade
+                quantity: Number of shares/units to buy
                 tp_price: Optional take profit price
                 sl_price: Optional stop loss price
                 reason: Explanation for opening this position (for audit trail)
@@ -1433,7 +1434,29 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             Returns:
                 Result dict with success, message, transaction_id, order_id
             """
-            return toolkit.open_new_position(symbol, direction, quantity, tp_price, sl_price, reason)
+            return toolkit.open_buy_position(symbol, quantity, tp_price, sl_price, reason)
+        
+        @tool
+        def open_sell_position_tool(
+            symbol: str,
+            quantity: float,
+            tp_price: float = None,
+            sl_price: float = None,
+            reason: str = ""
+        ) -> Dict[str, Any]:
+            """Open a new SHORT (SELL) trading position.
+            
+            Args:
+                symbol: Instrument symbol to trade
+                quantity: Number of shares/units to sell short
+                tp_price: Optional take profit price
+                sl_price: Optional stop loss price
+                reason: Explanation for opening this position (for audit trail)
+                
+            Returns:
+                Result dict with success, message, transaction_id, order_id
+            """
+            return toolkit.open_sell_position(symbol, quantity, tp_price, sl_price, reason)
         
         action_tools = [
             close_position_tool,
@@ -1441,7 +1464,8 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             update_stop_loss_tool,
             update_take_profit_tool,
             get_current_price_tool,
-            open_new_position_tool
+            open_buy_position_tool,
+            open_sell_position_tool
         ]
         
         # Create LLM with tools
@@ -1592,19 +1616,48 @@ Open Positions:
                         new_tp_price = parameters["new_tp_price"]
                         result = toolkit.update_take_profit(transaction_id, new_tp_price, reason)
                         
-                    elif action_type == "open_new_position":
+                    elif action_type == "open_buy_position":
                         symbol = parameters["symbol"]
-                        direction = parameters["direction"]
                         quantity = parameters["quantity"]
                         tp_price = parameters.get("tp_price")
                         sl_price = parameters.get("sl_price")
-                        result = toolkit.open_new_position(symbol, direction, quantity, tp_price, sl_price, reason)
+                        result = toolkit.open_buy_position(symbol, quantity, tp_price, sl_price, reason)
+                    
+                    elif action_type == "open_sell_position":
+                        symbol = parameters["symbol"]
+                        quantity = parameters["quantity"]
+                        tp_price = parameters.get("tp_price")
+                        sl_price = parameters.get("sl_price")
+                        result = toolkit.open_sell_position(symbol, quantity, tp_price, sl_price, reason)
                     
                     else:
                         logger.warning(f"Unknown action_type: {action_type}")
                         result = {"success": False, "message": f"Unknown action_type: {action_type}"}
                     
                     # Record action in log
+                    # Create a concise summary from the result
+                    if result and result.get("success"):
+                        # Build summary based on action type
+                        if action_type in ["open_buy_position", "open_sell_position"]:
+                            direction = result.get('direction', 'BUY' if action_type == "open_buy_position" else 'SELL')
+                            summary = f"{result.get('symbol')} {direction} {result.get('quantity')} @ ${result.get('entry_price', 0):.2f}"
+                            if result.get('tp_price'):
+                                summary += f" TP@${result.get('tp_price'):.2f}"
+                            if result.get('sl_price'):
+                                summary += f" SL@${result.get('sl_price'):.2f}"
+                        elif action_type == "close_position":
+                            summary = f"Closed transaction {result.get('transaction_id')}"
+                        elif action_type == "adjust_quantity":
+                            summary = f"Adjusted {parameters.get('transaction_id')} from {result.get('old_quantity')} to {result.get('new_quantity')}"
+                        elif action_type == "update_stop_loss":
+                            summary = f"Updated SL from ${result.get('old_sl_price', 0):.2f} to ${result.get('new_sl_price', 0):.2f}"
+                        elif action_type == "update_take_profit":
+                            summary = f"Updated TP from ${result.get('old_tp_price', 0):.2f} to ${result.get('new_tp_price', 0):.2f}"
+                        else:
+                            summary = result.get('message', 'Completed')
+                    else:
+                        summary = result.get('message', 'Failed') if result else 'Failed'
+                    
                     action_record = {
                         "iteration": state["iteration_count"],
                         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -1614,7 +1667,8 @@ Open Positions:
                         "confidence": confidence,
                         "source": "research_node_recommendation",
                         "result": result,
-                        "success": result.get("success", False) if result else False
+                        "success": result.get("success", False) if result else False,
+                        "summary": summary
                     }
                     actions_log.append(action_record)
                     
@@ -1640,7 +1694,8 @@ Open Positions:
                         "confidence": confidence,
                         "source": "research_node_recommendation",
                         "error": str(e),
-                        "success": False
+                        "success": False,
+                        "summary": f"Error: {str(e)}"
                     }
                     actions_log.append(action_record)
                     
@@ -1701,14 +1756,42 @@ Open Positions:
 
                             # Record action in log (for trading actions)
                             if tool_name in ['close_position_tool', 'adjust_quantity_tool',
-                                             'update_stop_loss_tool', 'update_take_profit_tool']:
+                                             'update_stop_loss_tool', 'update_take_profit_tool',
+                                             'open_buy_position_tool', 'open_sell_position_tool']:
+                                # Create a concise summary from the result
+                                if isinstance(result, dict):
+                                    if result.get("success"):
+                                        action_name = tool_name.replace("_tool", "")
+                                        if action_name == "close_position":
+                                            summary = f"Closed transaction {result.get('transaction_id')}"
+                                        elif action_name == "adjust_quantity":
+                                            summary = f"Adjusted quantity from {result.get('old_quantity')} to {result.get('new_quantity')}"
+                                        elif action_name == "update_stop_loss":
+                                            summary = f"Updated SL from ${result.get('old_sl_price', 0):.2f} to ${result.get('new_sl_price', 0):.2f}"
+                                        elif action_name == "update_take_profit":
+                                            summary = f"Updated TP from ${result.get('old_tp_price', 0):.2f} to ${result.get('new_tp_price', 0):.2f}"
+                                        elif action_name in ["open_buy_position", "open_sell_position"]:
+                                            direction = result.get('direction', 'BUY' if action_name == "open_buy_position" else 'SELL')
+                                            summary = f"{result.get('symbol')} {direction} {result.get('quantity')} @ ${result.get('entry_price', 0):.2f}"
+                                            if result.get('tp_price'):
+                                                summary += f" TP@${result.get('tp_price'):.2f}"
+                                            if result.get('sl_price'):
+                                                summary += f" SL@${result.get('sl_price'):.2f}"
+                                        else:
+                                            summary = result.get('message', 'Completed')
+                                    else:
+                                        summary = result.get('message', 'Failed')
+                                else:
+                                    summary = str(result)[:100]
+                                
                                 action_record = {
                                     "iteration": state["iteration_count"],
                                     "timestamp": datetime.now(timezone.utc).isoformat(),
                                     "action_type": tool_name.replace("_tool", ""),
                                     "arguments": tool_args,
                                     "result": result,
-                                    "success": result.get("success", False) if isinstance(result, dict) else False
+                                    "success": result.get("success", False) if isinstance(result, dict) else False,
+                                    "summary": summary
                                 }
                                 actions_log.append(action_record)
                                 success_status = result.get('success', False) if isinstance(result, dict) else "N/A"
@@ -1729,7 +1812,8 @@ Open Positions:
                                 "action_type": tool_name.replace("_tool", ""),
                                 "arguments": tool_args,
                                 "error": str(e),
-                                "success": False
+                                "success": False,
+                                "summary": f"Error: {str(e)}"
                             }
                             actions_log.append(action_record)
                             detailed_action_reports.append({
@@ -1745,7 +1829,8 @@ Open Positions:
                             "action_type": tool_name.replace("_tool", ""),
                             "arguments": tool_args,
                             "error": f"Tool {tool_name} not found",
-                            "success": False
+                            "success": False,
+                            "summary": f"Tool not found: {tool_name}"
                         }
                         actions_log.append(action_record)
                         detailed_action_reports.append({

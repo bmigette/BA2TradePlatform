@@ -163,6 +163,111 @@ def content(job_id: int) -> None:
                 ui.separator()
                 ui.label(job.actions_summary).classes('text-sm whitespace-pre-wrap mt-2')
         
+        # Detailed Actions Log
+        if job.graph_state:
+            try:
+                state = json.loads(job.graph_state) if isinstance(job.graph_state, str) else job.graph_state
+                actions_log = state.get("actions_log", [])
+                
+                if actions_log:
+                    with ui.card().classes('w-full mb-4'):
+                        ui.label(f'Detailed Actions Log ({len(actions_log)} actions)').classes('text-h6 mb-2')
+                        ui.separator()
+                        
+                        # Display each action with full details
+                        for i, action in enumerate(actions_log):
+                            with ui.expansion(
+                                f"{i+1}. {action.get('action_type', 'Unknown')} - "
+                                f"{'✓ Success' if action.get('success') else '✗ Failed'}",
+                                icon='check_circle' if action.get('success') else 'error'
+                            ).classes('w-full mt-2'):
+                                with ui.column().classes('gap-2 p-2'):
+                                    # Timestamp and iteration
+                                    with ui.row().classes('gap-4'):
+                                        ui.label(f"Iteration: {action.get('iteration', 'N/A')}").classes('text-sm text-grey-7')
+                                        if action.get('timestamp'):
+                                            try:
+                                                ts = datetime.fromisoformat(action['timestamp'].replace('Z', '+00:00'))
+                                                local_ts = ts.astimezone()
+                                                ui.label(f"Time: {local_ts.strftime('%Y-%m-%d %H:%M:%S')}").classes('text-sm text-grey-7')
+                                            except:
+                                                ui.label(f"Time: {action.get('timestamp')}").classes('text-sm text-grey-7')
+                                    
+                                    # Confidence and source
+                                    with ui.row().classes('gap-4'):
+                                        if action.get('confidence') is not None:
+                                            conf = action['confidence']
+                                            ui.label(f"Confidence: {conf:.1f}%").classes('text-sm text-grey-7')
+                                        if action.get('source'):
+                                            ui.label(f"Source: {action['source']}").classes('text-sm text-grey-7')
+                                    
+                                    # Reason
+                                    if action.get('reason'):
+                                        ui.label('Reason:').classes('text-sm font-bold mt-2')
+                                        ui.label(action['reason']).classes('text-sm whitespace-pre-wrap')
+                                    
+                                    # Arguments
+                                    if action.get('arguments'):
+                                        ui.label('Arguments:').classes('text-sm font-bold mt-2')
+                                        with ui.column().classes('gap-1'):
+                                            for key, value in action['arguments'].items():
+                                                ui.label(f"  • {key}: {value}").classes('text-sm')
+                                    
+                                    # Result details
+                                    result = action.get('result', {})
+                                    if result:
+                                        ui.label('Result:').classes('text-sm font-bold mt-2')
+                                        
+                                        # Success status with color
+                                        success = result.get('success', False)
+                                        status_color = 'positive' if success else 'negative'
+                                        ui.label(f"Status: {'Success' if success else 'Failed'}").classes(f'text-sm text-{status_color}')
+                                        
+                                        # Message
+                                        if result.get('message'):
+                                            ui.label(f"Message: {result['message']}").classes('text-sm whitespace-pre-wrap')
+                                        
+                                        # Additional details from open_new_position
+                                        if result.get('symbol'):
+                                            with ui.column().classes('gap-1 mt-1'):
+                                                ui.label(f"  • Symbol: {result.get('symbol')}").classes('text-sm')
+                                                if result.get('quantity'):
+                                                    ui.label(f"  • Quantity: {result.get('quantity')}").classes('text-sm')
+                                                if result.get('direction'):
+                                                    ui.label(f"  • Direction: {result.get('direction')}").classes('text-sm')
+                                                if result.get('entry_price'):
+                                                    ui.label(f"  • Entry Price: ${result.get('entry_price'):.2f}").classes('text-sm')
+                                                if result.get('tp_price'):
+                                                    ui.label(f"  • Take Profit: ${result.get('tp_price'):.2f}").classes('text-sm')
+                                                if result.get('sl_price'):
+                                                    ui.label(f"  • Stop Loss: ${result.get('sl_price'):.2f}").classes('text-sm')
+                                                if result.get('transaction_id'):
+                                                    ui.label(f"  • Transaction ID: {result.get('transaction_id')}").classes('text-sm')
+                                                if result.get('order_id'):
+                                                    ui.label(f"  • Order ID: {result.get('order_id')}").classes('text-sm')
+                                        
+                                        # Additional details from other actions
+                                        if result.get('old_quantity') is not None:
+                                            ui.label(f"  • Old Quantity: {result.get('old_quantity')}").classes('text-sm')
+                                        if result.get('new_quantity') is not None:
+                                            ui.label(f"  • New Quantity: {result.get('new_quantity')}").classes('text-sm')
+                                        if result.get('old_sl_price') is not None:
+                                            ui.label(f"  • Old Stop Loss: ${result.get('old_sl_price'):.2f}").classes('text-sm')
+                                        if result.get('new_sl_price') is not None:
+                                            ui.label(f"  • New Stop Loss: ${result.get('new_sl_price'):.2f}").classes('text-sm')
+                                        if result.get('old_tp_price') is not None:
+                                            ui.label(f"  • Old Take Profit: ${result.get('old_tp_price'):.2f}").classes('text-sm')
+                                        if result.get('new_tp_price') is not None:
+                                            ui.label(f"  • New Take Profit: ${result.get('new_tp_price'):.2f}").classes('text-sm')
+                                    
+                                    # Error (if present)
+                                    if action.get('error'):
+                                        ui.label('Error:').classes('text-sm font-bold mt-2 text-negative')
+                                        ui.label(action['error']).classes('text-sm text-negative whitespace-pre-wrap')
+            
+            except (json.JSONDecodeError, TypeError, AttributeError) as e:
+                logger.debug(f"Could not extract actions_log from graph_state: {e}")
+        
         # Extract research findings and final summary from graph_state
         research_findings = None
         final_summary = None

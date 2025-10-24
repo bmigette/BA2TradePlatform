@@ -1470,21 +1470,67 @@ class SmartRiskManagerToolkit:
                 "new_tp_price": new_tp_price
             }
 
-    def open_new_position(
+    def open_buy_position(
         self,
-        symbol: Annotated[str, "Instrument symbol to trade"],
-        direction: Annotated[str, "Trade direction: 'buy' or 'sell' (case-insensitive)"],
-        quantity: Annotated[float, "Number of shares/units to trade"],
-        tp_price: Annotated[Optional[float], "Optional take profit price"] = None,
-        sl_price: Annotated[Optional[float], "Optional stop loss price"] = None,
-        reason: Annotated[str, "Reason for opening this position"] = ""
+        symbol: Annotated[str, "Instrument symbol to buy"],
+        quantity: Annotated[float, "Number of shares/units to buy"],
+        tp_price: Annotated[Optional[float], "Optional take profit price (must be above entry price)"] = None,
+        sl_price: Annotated[Optional[float], "Optional stop loss price (must be below entry price)"] = None,
+        reason: Annotated[str, "Reason for opening this long position"] = ""
     ) -> Dict[str, Any]:
         """
-        Open a new trading position.
+        Open a new LONG (BUY) position.
+        
+        Args:
+            symbol: Instrument symbol to buy
+            quantity: Number of shares to buy
+            tp_price: Take profit price (optional, must be above entry)
+            sl_price: Stop loss price (optional, must be below entry)
+            reason: Explanation for opening this long position
+            
+        Returns:
+            Result dict with success, message, transaction_id, order_id, symbol, quantity, direction
+        """
+        return self._open_position_internal(symbol, OrderDirection.BUY, quantity, tp_price, sl_price, reason)
+    
+    def open_sell_position(
+        self,
+        symbol: Annotated[str, "Instrument symbol to sell short"],
+        quantity: Annotated[float, "Number of shares/units to sell short"],
+        tp_price: Annotated[Optional[float], "Optional take profit price (must be below entry price)"] = None,
+        sl_price: Annotated[Optional[float], "Optional stop loss price (must be above entry price)"] = None,
+        reason: Annotated[str, "Reason for opening this short position"] = ""
+    ) -> Dict[str, Any]:
+        """
+        Open a new SHORT (SELL) position.
+        
+        Args:
+            symbol: Instrument symbol to sell short
+            quantity: Number of shares to sell short
+            tp_price: Take profit price (optional, must be below entry)
+            sl_price: Stop loss price (optional, must be above entry)
+            reason: Explanation for opening this short position
+            
+        Returns:
+            Result dict with success, message, transaction_id, order_id, symbol, quantity, direction
+        """
+        return self._open_position_internal(symbol, OrderDirection.SELL, quantity, tp_price, sl_price, reason)
+    
+    def _open_position_internal(
+        self,
+        symbol: str,
+        order_direction: OrderDirection,
+        quantity: float,
+        tp_price: Optional[float] = None,
+        sl_price: Optional[float] = None,
+        reason: str = ""
+    ) -> Dict[str, Any]:
+        """
+        Internal method to open a new trading position.
         
         Args:
             symbol: Instrument symbol
-            direction: "BUY" or "SELL" (case-insensitive)
+            order_direction: OrderDirection.BUY or OrderDirection.SELL
             quantity: Position size
             tp_price: Take profit price (optional)
             sl_price: Stop loss price (optional)
@@ -1494,9 +1540,7 @@ class SmartRiskManagerToolkit:
             Result dict with success, message, transaction_id, order_id, symbol, quantity, direction
         """
         try:
-            # Normalize direction to uppercase for case-insensitive handling
-            direction = direction.upper()
-            
+            direction = order_direction.value
             logger.info(f"Opening new {direction} position for {symbol}, quantity={quantity}. Reason: {reason}")
             
             # Check for existing open transaction on this symbol
@@ -1519,23 +1563,10 @@ class SmartRiskManagerToolkit:
                         "direction": direction
                     }
             
-            # Validate direction
-            try:
-                order_direction = OrderDirection(direction)
-            except ValueError:
-                return {
-                    "success": False,
-                    "message": f"Invalid direction: {direction}. Must be 'BUY' or 'SELL'",
-                    "transaction_id": None,
-                    "order_id": None,
-                    "symbol": symbol,
-                    "quantity": quantity,
-                    "direction": direction
-                }
-            
             # Check if symbol is enabled in expert settings
+            # Skip check for dynamic/expert instrument selection modes
             enabled_instruments = self.expert.get_enabled_instruments()
-            if symbol not in enabled_instruments:
+            if enabled_instruments not in [["DYNAMIC"], ["EXPERT"]] and symbol not in enabled_instruments:
                 return {
                     "success": False,
                     "message": f"Symbol {symbol} is not enabled in expert settings",

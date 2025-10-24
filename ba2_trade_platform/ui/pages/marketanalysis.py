@@ -982,6 +982,11 @@ class JobMonitoringTab:
                 # Re-create pagination controls to update button states
                 self._create_pagination_controls()
             
+            # Update Smart Risk Manager table
+            if hasattr(self, 'smart_risk_table') and self.smart_risk_table:
+                smart_risk_data = self._get_smart_risk_manager_data()
+                self.smart_risk_table.rows = smart_risk_data
+            
             # Update worker queue status display
             self._update_queue_status_display()
             

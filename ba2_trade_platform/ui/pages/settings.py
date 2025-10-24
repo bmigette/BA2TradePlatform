@@ -976,12 +976,20 @@ class ExpertSettingsTab:
             
             self.experts_table.add_slot('body-cell-actions', """
                 <q-td :props="props">
-                    <q-btn @click="$parent.$emit('edit', props)" icon="edit" flat dense color='blue'/>
-                    <q-btn @click="$parent.$emit('del', props)" icon="delete" flat dense color='red'/>
+                    <q-btn @click="$parent.$emit('edit', props)" icon="edit" flat dense color='blue'>
+                        <q-tooltip>Edit Expert</q-tooltip>
+                    </q-btn>
+                    <q-btn @click="$parent.$emit('duplicate', props)" icon="content_copy" flat dense color='green'>
+                        <q-tooltip>Duplicate Expert</q-tooltip>
+                    </q-btn>
+                    <q-btn @click="$parent.$emit('del', props)" icon="delete" flat dense color='red'>
+                        <q-tooltip>Delete Expert</q-tooltip>
+                    </q-btn>
                 </q-td>
             """)
             
             self.experts_table.on('edit', self._on_table_edit_click)
+            self.experts_table.on('duplicate', self._on_table_duplicate_click)
             self.experts_table.on('del', self._on_table_del_click)
         
         logger.debug('ExpertSettingsTab UI rendered')
@@ -3173,6 +3181,95 @@ class ExpertSettingsTab:
         else:
             logger.warning(f'Expert instance with id {expert_id} not found')
             ui.notify('Expert instance not found', type='error')
+    
+    def _on_table_duplicate_click(self, msg):
+        """Handle duplicate button click from table."""
+        logger.debug(f'Duplicate expert table click: {msg}')
+        row = msg.args['row']
+        expert_id = row['id']
+        source_expert = get_instance(ExpertInstance, expert_id)
+        
+        if source_expert:
+            self._duplicate_expert(source_expert)
+        else:
+            logger.warning(f'Expert instance with id {expert_id} not found')
+            ui.notify('Expert instance not found', type='error')
+    
+    def _duplicate_expert(self, source_expert: ExpertInstance):
+        """Duplicate an expert instance with all its settings."""
+        try:
+            logger.info(f'Duplicating expert instance {source_expert.id} ({source_expert.expert})')
+            
+            # Create new expert instance with copied fields
+            new_expert = ExpertInstance(
+                expert=source_expert.expert,
+                alias=f"{source_expert.alias or source_expert.expert} (Copy)" if source_expert.alias else f"{source_expert.expert} (Copy)",
+                enabled=False,  # Start disabled for safety
+                account_id=source_expert.account_id,
+                enter_market_ruleset_id=source_expert.enter_market_ruleset_id,
+                open_positions_ruleset_id=source_expert.open_positions_ruleset_id,
+                user_description=source_expert.user_description,
+                virtual_equity_pct=source_expert.virtual_equity_pct
+            )
+            
+            # Save the new expert to get an ID
+            new_expert_id = add_instance(new_expert)
+            
+            # Copy all settings from source expert
+            from ...core.models import ExpertSetting
+            from sqlmodel import select
+            import json
+            
+            with get_db() as session:
+                # Delete any existing settings for the new expert (in case of previous failed attempt)
+                existing_settings = session.exec(
+                    select(ExpertSetting).where(ExpertSetting.instance_id == new_expert_id)
+                ).all()
+                for existing in existing_settings:
+                    session.delete(existing)
+                session.commit()
+                
+                # Get all settings from source expert
+                source_settings = session.exec(
+                    select(ExpertSetting).where(ExpertSetting.instance_id == source_expert.id)
+                ).all()
+                
+                # Create duplicate settings for new expert
+                for setting in source_settings:
+                    # Handle value_json - it might be a dict, string, or None
+                    if setting.value_json:
+                        if isinstance(setting.value_json, str):
+                            # Parse JSON string and make a copy
+                            value_json_copy = json.loads(setting.value_json)
+                        elif isinstance(setting.value_json, dict):
+                            # Make a copy of the dict
+                            value_json_copy = setting.value_json.copy()
+                        else:
+                            value_json_copy = {}
+                    else:
+                        value_json_copy = {}
+                    
+                    new_setting = ExpertSetting(
+                        instance_id=new_expert_id,
+                        key=setting.key,
+                        value_str=setting.value_str,
+                        value_json=value_json_copy,
+                        value_float=setting.value_float
+                    )
+                    session.add(new_setting)
+                
+                session.commit()
+                
+                logger.info(f'Successfully duplicated expert {source_expert.id} to new expert {new_expert_id} with {len(source_settings)} settings')
+                ui.notify(f'Expert duplicated successfully! New expert ID: {new_expert_id} ({len(source_settings)} settings copied)', type='positive')
+            
+            # Refresh the experts table
+            if hasattr(self, 'experts_table') and self.experts_table:
+                self.experts_table.rows = self._get_all_expert_instances()
+                
+        except Exception as e:
+            logger.error(f'Error duplicating expert {source_expert.id}: {e}', exc_info=True)
+            ui.notify(f'Error duplicating expert: {str(e)}', type='negative')
     
     def _show_delete_confirmation(self, expert_instance, row):
         """Show confirmation dialog before deleting expert."""

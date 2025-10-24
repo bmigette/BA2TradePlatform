@@ -222,6 +222,34 @@ def get_indicator(self, ..., format_type: Literal["dict", "markdown", "both"] = 
 
 **Rationale**: Separating concerns prevents visualization tools from parsing markdown. Structured dict enables direct data binding without string manipulation. See `docs/DATA_PROVIDER_FORMAT_SPECIFICATION.md` for complete specification.
 
+### 9. **AI-Friendly API Design**
+**CRITICAL RULE**: When designing APIs for AI agents (like Smart Risk Manager), prefer explicit function names over string parameters:
+
+- ✅ **ALWAYS DO THIS**: Create separate functions (`open_buy_position()`, `open_sell_position()`)
+- ❌ **NEVER DO THIS**: Single function with string parameter (`open_position(direction="BUY")`)
+
+**Rationale**: AI models can confuse semantically equivalent terms (e.g., "LONG" vs "BUY", "SHORT" vs "SELL"). Explicit function names:
+1. Are self-documenting
+2. Eliminate parameter validation errors
+3. Make invalid states unrepresentable
+4. Provide better IDE/AI autocomplete
+
+**Example Pattern:**
+```python
+# ❌ Error-prone: AI might use "LONG" instead of "BUY"
+def open_position(self, symbol, direction: str, quantity, ...):
+    direction = OrderDirection(direction)  # Can fail!
+
+# ✅ Clear: No ambiguity possible
+def open_buy_position(self, symbol, quantity, ...):
+    return self._open_internal(symbol, OrderDirection.BUY, quantity, ...)
+
+def open_sell_position(self, symbol, quantity, ...):
+    return self._open_internal(symbol, OrderDirection.SELL, quantity, ...)
+```
+
+See `docs/SMART_RISK_MANAGER_FUNCTION_SPLIT.md` for complete case study.
+
 ## Dependencies
 - **Trading**: `alpaca-py` (primary broker), `yfinance`, `backtrader`
 - **AI/ML**: `langchain-*` ecosystem, `stockstats`
