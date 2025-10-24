@@ -1,26 +1,22 @@
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.tools import tool
 import time
 import json
 from ...prompts import format_analyst_prompt, get_prompt
 
 
-def create_social_media_analyst(llm, toolkit):
+def create_social_media_analyst(llm, toolkit, tools):
+    """
+    Create social media analyst node.
+    
+    Args:
+        llm: Language model
+        toolkit: Toolkit instance (backward compat, not used)
+        tools: List of pre-defined tool objects
+    """
     def social_media_analyst_node(state):
         current_date = state["trade_date"]
         ticker = state["company_of_interest"]
         company_name = state["company_of_interest"]
-
-        # Wrap toolkit method with @tool decorator
-        @tool
-        def get_social_media_sentiment(symbol: str, end_date: str, lookback_days: int = None) -> str:
-            """Retrieve social media sentiment and discussions about a specific company."""
-            return toolkit.get_social_media_sentiment(symbol, end_date, lookback_days)
-
-        # Use wrapped tools
-        tools = [
-            get_social_media_sentiment,
-        ]
 
         # Get system prompt from centralized prompts
         system_message = get_prompt("social_media_analyst")

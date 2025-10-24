@@ -351,6 +351,13 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             return self.toolkit.get_global_news(end_date, lookback_days)
         
         @tool
+        def extract_web_content(
+            url: str
+        ) -> str:
+            """Extract full content from a web page URL for detailed article reading."""
+            return self.toolkit.extract_web_content(url)
+        
+        @tool
         def get_social_media_sentiment(
             symbol: str,
             end_date: str,
@@ -460,7 +467,9 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             ),
             "news": LoggingToolNode(
                 [
+                    get_company_news,  # For company-specific news
                     get_global_news,  # For global/macro news
+                    extract_web_content,  # For extracting full article content from URLs
                 ],
                 self.market_analysis_id,
                 model_info=model_info
@@ -854,7 +863,11 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                 logger.info(f"Tool ID: {message.tool_call_id if hasattr(message, 'tool_call_id') else 'N/A'}")
                 if hasattr(message, 'content') and message.content:
                     content = message.content if isinstance(message.content, str) else str(message.content)
-                    logger.info(f"Result: {content}")
+                    # Log as error if content starts with "Error:"
+                    if content.startswith("Error:"):
+                        logger.error(f"Result: {content}")
+                    else:
+                        logger.info(f"Result: {content}")
                 logger.info(f"{'=' * 80}")
             elif isinstance(message, AIMessage):
                 # Format AI Messages

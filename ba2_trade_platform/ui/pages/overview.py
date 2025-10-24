@@ -8,7 +8,7 @@ import asyncio
 import json
 
 from ...core.db import get_all_instances, get_db, get_instance, update_instance
-from ...core.models import AccountDefinition, MarketAnalysis, ExpertRecommendation, ExpertInstance, AppSetting, TradingOrder
+from ...core.models import AccountDefinition, MarketAnalysis, ExpertRecommendation, ExpertInstance, AppSetting, TradingOrder, Transaction
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, OrderStatus, OrderOpenType
 from ...core.utils import get_expert_instance_from_id, get_market_analysis_id_from_order_id, get_account_instance_from_id
 from ...modules.accounts import providers
@@ -2023,15 +2023,123 @@ class AccountOverviewTab:
             if not order:
                 ui.notify('Order not found', type='negative')
                 return
-                
+            
+            # Only allow submission for PENDING status
             if order.status != OrderStatus.PENDING:
-                ui.notify('Can only submit orders with PENDING status', type='negative')
+                ui.notify(f'Can only submit orders with PENDING status (current: {order.status.value})', type='negative')
                 return
                 
             if order.broker_order_id:
                 ui.notify('Order already submitted to broker', type='warning')
                 return
             
+            # Check if quantity is 0 and show dialog to input quantity
+            if order.quantity == 0:
+                self._show_quantity_input_dialog(order)
+                return
+            
+            # Proceed with normal submission
+            self._submit_order_to_broker(order)
+                
+        except Exception as e:
+            logger.error(f"Error handling submit order: {e}", exc_info=True)
+            ui.notify(f'Error: {str(e)}', type='negative')
+    
+    def _show_quantity_input_dialog(self, order: TradingOrder):
+        """Show dialog to input quantity for zero-quantity orders."""
+        try:
+            quantity_input = None
+            
+            with ui.dialog() as dialog, ui.card().classes('p-6 min-w-96'):
+                ui.label('Order has Quantity = 0').classes('text-h6 mb-2')
+                ui.label(f'Order #{order.id} - {order.symbol} ({order.side})').classes('text-subtitle1 mb-4 text-gray-700')
+                ui.label('This order has quantity = 0 and cannot be submitted. Please enter the desired quantity:').classes('mb-4')
+                
+                # Get current price for reference
+                try:
+                    account = get_instance(AccountDefinition, order.account_id)
+                    if account:
+                        provider_obj = get_account_instance_from_id(account.id)
+                        if provider_obj:
+                            current_price = provider_obj.get_instrument_current_price(order.symbol)
+                            if current_price:
+                                ui.label(f'Current Price: ${current_price:.2f}').classes('mb-2 text-sm text-gray-600')
+                except Exception as price_error:
+                    logger.warning(f"Could not fetch current price for {order.symbol}: {price_error}")
+                
+                # Quantity input
+                quantity_input = ui.number(
+                    label='Quantity',
+                    value=1,
+                    min=1,
+                    step=1,
+                    precision=0
+                ).classes('w-full mb-4').props('outlined')
+                
+                ui.label('Note: The order and its linked transaction will be updated with the new quantity.').classes('text-sm text-gray-600 mb-4')
+                
+                with ui.row().classes('w-full justify-end gap-2'):
+                    ui.button('Cancel', on_click=dialog.close).props('flat')
+                    ui.button(
+                        'Update & Submit',
+                        on_click=lambda: self._update_quantity_and_submit(order, quantity_input.value, dialog)
+                    ).props('color=primary')
+            
+            dialog.open()
+            
+        except Exception as e:
+            logger.error(f"Error showing quantity input dialog: {e}", exc_info=True)
+            ui.notify(f'Error: {str(e)}', type='negative')
+    
+    def _update_quantity_and_submit(self, order: TradingOrder, new_quantity: float, dialog):
+        """Update order quantity, update linked transaction, and submit."""
+        try:
+            from ...core.db import update_instance
+            
+            if not new_quantity or new_quantity <= 0:
+                ui.notify('Please enter a valid quantity (must be greater than 0)', type='warning')
+                return
+            
+            # Convert to integer for whole shares
+            new_quantity = int(new_quantity)
+            
+            logger.info(f"Updating order {order.id} quantity from {order.quantity} to {new_quantity}")
+            
+            # Update the order quantity
+            order.quantity = new_quantity
+            update_instance(order)
+            
+            # Update linked transaction if exists (order has transaction_id pointing to transaction)
+            if order.transaction_id:
+                session = get_db()
+                try:
+                    transaction = session.get(Transaction, order.transaction_id)
+                    
+                    if transaction:
+                        logger.info(f"Updating linked transaction {transaction.id} quantity from {transaction.quantity} to {new_quantity}")
+                        transaction.quantity = new_quantity
+                        update_instance(transaction)
+                    else:
+                        logger.warning(f"Transaction {order.transaction_id} not found for order {order.id}")
+                        
+                finally:
+                    session.close()
+            else:
+                logger.debug(f"Order {order.id} has no linked transaction")
+            
+            # Close dialog
+            dialog.close()
+            
+            # Submit the order to broker
+            self._submit_order_to_broker(order)
+            
+        except Exception as e:
+            logger.error(f"Error updating quantity and submitting order: {e}", exc_info=True)
+            ui.notify(f'Error: {str(e)}', type='negative')
+    
+    def _submit_order_to_broker(self, order: TradingOrder):
+        """Submit order to broker via account provider."""
+        try:
             # Mark this order as manually submitted
             if order.open_type != OrderOpenType.MANUAL:
                 from ...core.db import update_instance
@@ -2059,18 +2167,18 @@ class AccountOverviewTab:
                 submitted_order = provider_obj.submit_order(order)
                 
                 if submitted_order:
-                    ui.notify(f'Order {order_id} submitted successfully to {account.provider}', type='positive')
+                    ui.notify(f'Order {order.id} submitted successfully to {account.provider}', type='positive')
                     # Refresh the table
                     self.render()
                 else:
-                    ui.notify(f'Failed to submit order {order_id} to broker', type='negative')
+                    ui.notify(f'Failed to submit order {order.id} to broker', type='negative')
                     
             except Exception as e:
-                logger.error(f"Error submitting order {order_id}: {e}", exc_info=True)
+                logger.error(f"Error submitting order {order.id}: {e}", exc_info=True)
                 ui.notify(f'Error submitting order: {str(e)}', type='negative')
                 
         except Exception as e:
-            logger.error(f"Error handling submit order: {e}", exc_info=True)
+            logger.error(f"Error submitting order to broker: {e}", exc_info=True)
             ui.notify(f'Error: {str(e)}', type='negative')
     
     def _handle_retry_selected_orders(self, selected_rows):
@@ -2116,6 +2224,7 @@ class AccountOverviewTab:
         try:
             retried_count = 0
             errors = []
+            zero_qty_orders = []
             
             for order_id in order_ids:
                 try:
@@ -2128,6 +2237,12 @@ class AccountOverviewTab:
                     # Only retry ERROR orders
                     if order.status != OrderStatus.ERROR:
                         errors.append(f"Order {order_id} is not in ERROR status (status: {order.status.value})")
+                        continue
+                    
+                    # Check if quantity is 0 - cannot retry these automatically
+                    if order.quantity == 0:
+                        zero_qty_orders.append(order_id)
+                        logger.warning(f"Order {order_id} has quantity=0, skipping retry. User must manually set quantity.")
                         continue
                     
                     # Get the account
@@ -2161,6 +2276,9 @@ class AccountOverviewTab:
             # Show results
             if retried_count > 0:
                 ui.notify(f'Successfully retried {retried_count} order(s)', type='positive')
+            
+            if zero_qty_orders:
+                ui.notify(f'{len(zero_qty_orders)} order(s) with quantity=0 skipped. Please update quantity manually and submit.', type='warning')
             
             if errors:
                 error_msg = '; '.join(errors[:3])  # Show first 3 errors

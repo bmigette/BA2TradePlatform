@@ -88,7 +88,19 @@ def content(job_id: int) -> None:
                 with ui.column().classes('gap-2'):
                     with ui.row().classes('items-center gap-2'):
                         ui.icon('event').classes('text-grey-7')
-                        ui.label(f"Run Date: {job.run_date.strftime('%Y-%m-%d %H:%M:%S') if job.run_date else 'N/A'}").classes('text-sm')
+                        # Convert UTC to local time for display
+                        if job.run_date:
+                            # Ensure the datetime is timezone-aware (treat as UTC if naive)
+                            if job.run_date.tzinfo is None:
+                                from datetime import timezone
+                                utc_time = job.run_date.replace(tzinfo=timezone.utc)
+                            else:
+                                utc_time = job.run_date
+                            local_time = utc_time.astimezone()
+                            run_date_str = local_time.strftime('%Y-%m-%d %H:%M:%S')
+                        else:
+                            run_date_str = 'N/A'
+                        ui.label(f"Run Date: {run_date_str}").classes('text-sm')
                     
                     with ui.row().classes('items-center gap-2'):
                         ui.icon('schedule').classes('text-grey-7')

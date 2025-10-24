@@ -298,8 +298,18 @@ class JobMonitoringTab:
                             seconds = job.duration_seconds % 60
                             duration_display = f"{minutes}m {seconds}s"
                     
-                    # Format run date
-                    run_date_local = job.run_date.strftime('%Y-%m-%d %H:%M:%S') if job.run_date else "N/A"
+                    # Format run date - convert UTC to local time
+                    if job.run_date:
+                        # Ensure the datetime is timezone-aware (treat as UTC if naive)
+                        if job.run_date.tzinfo is None:
+                            from datetime import timezone
+                            utc_time = job.run_date.replace(tzinfo=timezone.utc)
+                        else:
+                            utc_time = job.run_date
+                        local_time = utc_time.astimezone()
+                        run_date_local = local_time.strftime('%Y-%m-%d %H:%M:%S')
+                    else:
+                        run_date_local = "N/A"
                     
                     # Status badge color
                     status_color = 'positive' if job.status == 'COMPLETED' else ('negative' if job.status == 'FAILED' else 'warning')

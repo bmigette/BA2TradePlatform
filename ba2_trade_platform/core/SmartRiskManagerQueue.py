@@ -342,8 +342,8 @@ class SmartRiskManagerQueue:
             
             logger.info(f"{worker_name} created SmartRiskManagerJob {job_id} for expert {task.expert_instance_id}")
             
-            # Run the Smart Risk Manager
-            result = run_smart_risk_manager(task.expert_instance_id, task.account_id)
+            # Run the Smart Risk Manager with the existing job_id
+            result = run_smart_risk_manager(task.expert_instance_id, task.account_id, job_id=job_id)
             
             # Reload the job to update it
             smart_risk_job = get_instance(SmartRiskManagerJob, job_id)

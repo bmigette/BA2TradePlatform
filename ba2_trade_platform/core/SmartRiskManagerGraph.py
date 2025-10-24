@@ -624,13 +624,17 @@ def initialize_context(state: SmartRiskManagerState) -> Dict[str, Any]:
         backend_url = os.getenv("OPENAI_BACKEND_URL", "https://api.openai.com/v1")
         api_key_setting_name = "openai_api_key"  # Default to OpenAI
         
+        logger.info(f"Smart Risk Manager initialized with model: {risk_manager_model}")
+        
         # If using NagaAI models, update backend URL
         if risk_manager_model.startswith("NagaAI/"):
             backend_url = "https://api.naga.ac/v1"
             api_key_setting_name = "naga_ai_api_key"
             risk_manager_model = risk_manager_model.replace("NagaAI/", "")
+            logger.info(f"Using NagaAI backend with model: {risk_manager_model}")
         elif risk_manager_model.startswith("OpenAI/"):
             risk_manager_model = risk_manager_model.replace("OpenAI/", "")
+            logger.info(f"Using OpenAI backend with model: {risk_manager_model}")
         
         # Get API key from database
         api_key = get_api_key_from_database(api_key_setting_name)
@@ -652,18 +656,35 @@ def initialize_context(state: SmartRiskManagerState) -> Dict[str, Any]:
         portfolio_status = toolkit.get_portfolio_status()
         open_positions = portfolio_status.get("positions", [])
         
-        # Create SmartRiskManagerJob record
-        job = SmartRiskManagerJob(
-            expert_instance_id=expert_instance_id,
-            account_id=account_id,
-            model_used=risk_manager_model,
-            user_instructions=user_instructions,
-            initial_portfolio_equity=float(portfolio_status["account_virtual_equity"]),
-            final_portfolio_equity=float(portfolio_status["account_virtual_equity"]),
-            status="RUNNING"
-        )
-        job_id = add_instance(job)
-        logger.info(f"Created SmartRiskManagerJob {job_id}")
+        # Create or update SmartRiskManagerJob record
+        job_id = state.get("job_id", 0)
+        if job_id:
+            # Job already created by queue worker - update it with current context
+            job = get_instance(SmartRiskManagerJob, job_id)
+            if not job:
+                raise ValueError(f"SmartRiskManagerJob {job_id} not found")
+            
+            # Update job fields that may not have been set by queue
+            job.model_used = risk_manager_model
+            job.user_instructions = user_instructions
+            job.initial_portfolio_equity = float(portfolio_status["account_virtual_equity"])
+            job.final_portfolio_equity = float(portfolio_status["account_virtual_equity"])
+            job.status = "RUNNING"
+            update_instance(job)
+            logger.info(f"Updated existing SmartRiskManagerJob {job_id}")
+        else:
+            # Create new job record (legacy path when called without job_id)
+            job = SmartRiskManagerJob(
+                expert_instance_id=expert_instance_id,
+                account_id=account_id,
+                model_used=risk_manager_model,
+                user_instructions=user_instructions,
+                initial_portfolio_equity=float(portfolio_status["account_virtual_equity"]),
+                final_portfolio_equity=float(portfolio_status["account_virtual_equity"]),
+                status="RUNNING"
+            )
+            job_id = add_instance(job)
+            logger.info(f"Created SmartRiskManagerJob {job_id}")
         
         # Prepare trading permission status messages
         enable_buy = expert_config.get("enable_buy", True)
@@ -1966,13 +1987,14 @@ def build_smart_risk_manager_graph(expert_instance_id: int, account_id: int) -> 
 
 # ==================== EXECUTION ENTRY POINT ====================
 
-def run_smart_risk_manager(expert_instance_id: int, account_id: int) -> Dict[str, Any]:
+def run_smart_risk_manager(expert_instance_id: int, account_id: int, job_id: int | None = None) -> Dict[str, Any]:
     """
     Main entry point for running the Smart Risk Manager.
     
     Args:
         expert_instance_id: ID of the ExpertInstance
         account_id: ID of the AccountDefinition
+        job_id: Optional existing SmartRiskManagerJob ID to update (if None, creates new job)
         
     Returns:
         Final state dictionary with summary and results
@@ -1996,7 +2018,7 @@ def run_smart_risk_manager(expert_instance_id: int, account_id: int) -> Dict[str
             "risk_manager_model": "",  # Will be loaded in initialize_context
             "backend_url": "",  # Will be loaded in initialize_context
             "api_key": "",  # Will be loaded in initialize_context
-            "job_id": 0,  # Will be created in initialize_context
+            "job_id": job_id or 0,  # Use provided job_id or create in initialize_context
             "portfolio_status": {},
             "open_positions": [],
             "recent_analyses": [],

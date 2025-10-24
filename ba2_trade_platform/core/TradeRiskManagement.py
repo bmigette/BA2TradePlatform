@@ -356,15 +356,18 @@ class TradeRiskManagement:
                 # Get current market price from bulk-fetched prices
                 current_price = symbol_prices.get(symbol) if symbol_prices else None
                 if current_price is None:
-                    self.logger.error(f"Could not get current price for {symbol}, skipping order {order.id}", exc_info=True)
+                    self.logger.error(f"Could not get current price for {symbol}, skipping order {order.id}")
                     order.quantity = 0
                     updated_orders.append(order)
                     continue
                 
-                self.logger.debug(f"Processing order {order.id} for {symbol}: "
-                                f"price=${current_price:.2f}, ROI={recommendation.expected_profit_percent:.2f}%, "
-                                f"current_allocation=${current_allocation:.2f}, "
-                                f"available=${available_for_instrument:.2f}")
+                # Log calculation inputs
+                self.logger.info(f"Order {order.id} ({symbol}) - Calculating quantity:")
+                self.logger.info(f"  Inputs: price=${current_price:.2f}, remaining_balance=${remaining_balance:.2f}, "
+                               f"max_per_instrument=${max_equity_per_instrument:.2f}, "
+                               f"current_allocation=${current_allocation:.2f}, "
+                               f"available_for_instrument=${available_for_instrument:.2f}")
+                self.logger.debug(f"  ROI={recommendation.expected_profit_percent:.2f}%")
                 
                 # Calculate maximum affordable quantity based on available equity per instrument
                 max_quantity_by_instrument = max(0, available_for_instrument / current_price) if current_price > 0 else 0
@@ -372,8 +375,8 @@ class TradeRiskManagement:
                 # Calculate maximum affordable quantity based on remaining total balance
                 max_quantity_by_balance = max(0, remaining_balance / current_price) if current_price > 0 else 0
                 
-                self.logger.debug(f"  Max quantities: by_instrument={max_quantity_by_instrument:.2f}, "
-                                f"by_balance={max_quantity_by_balance:.2f}")
+                self.logger.info(f"  Calculated: max_qty_by_instrument={max_quantity_by_instrument:.2f} shares, "
+                               f"max_qty_by_balance={max_quantity_by_balance:.2f} shares")
                 
                 # Special case: Top 3 ROI exception
                 if (symbol in top_3_symbols and 
@@ -392,13 +395,14 @@ class TradeRiskManagement:
                     # Standard allocation logic
                     if available_for_instrument <= 0:
                         quantity = 0
-                        self.logger.debug(f"  No available equity for {symbol} (limit exceeded)")
+                        self.logger.info(f"  Result: quantity=0 (no available equity for {symbol}, limit exceeded)")
                     elif remaining_balance <= current_price:
                         quantity = 0
-                        self.logger.debug(f"  Insufficient remaining balance for {symbol}")
+                        self.logger.info(f"  Result: quantity=0 (insufficient remaining balance: ${remaining_balance:.2f} < ${current_price:.2f})")
                     else:
                         # Use the minimum of the two constraints
                         max_quantity = min(max_quantity_by_instrument, max_quantity_by_balance)
+                        self.logger.info(f"  Using min of constraints: max_quantity={max_quantity:.2f} shares")
                         
                         # For diversification, prefer smaller positions when multiple instruments available
                         num_remaining_instruments = len([s for s in orders_by_symbol.keys() 
@@ -407,32 +411,52 @@ class TradeRiskManagement:
                         if num_remaining_instruments > 1:
                             # Reserve some balance for other instruments
                             diversification_factor = 0.7  # Use 70% of available, save 30% for others
+                            original_max = max_quantity
                             max_quantity *= diversification_factor
-                            self.logger.debug(f"  Applied diversification factor (0.7): new_max={max_quantity:.2f}")
+                            self.logger.info(f"  Diversification ({num_remaining_instruments} remaining instruments): "
+                                          f"applied factor 0.7: {original_max:.2f} -> {max_quantity:.2f} shares")
                         
+                        # First rounding: float to int
                         quantity = max(0, int(max_quantity))
+                        self.logger.info(f"  First rounding: {max_quantity:.2f} -> {quantity} shares (int conversion)")
                         
                         # Ensure we don't allocate less than 1 share unless we can't afford it
                         if quantity == 0 and max_quantity_by_balance >= 1 and max_quantity_by_instrument >= 1:
                             quantity = 1
-                            self.logger.debug(f"  Minimum allocation: setting quantity to 1 share")
+                            self.logger.info(f"  Minimum allocation enforced: setting quantity to 1 share "
+                                          f"(had funds: max_by_balance={max_quantity_by_balance:.2f}, "
+                                          f"max_by_instrument={max_quantity_by_instrument:.2f})")
                 
                 # Apply instrument weight (formula: result * (weight/100))
                 if quantity > 0 and symbol in instrument_configs:
                     instrument_weight = instrument_configs[symbol].get('weight', 100.0)
-                    if instrument_weight != 100.0:  # Only log if weight is non-default
+                    if instrument_weight != 100.0:  # Only apply if weight is non-default
                         original_quantity = quantity
                         weighted_quantity = quantity * (instrument_weight / 100.0)
+                        self.logger.info(f"  Instrument weight {instrument_weight}%: "
+                                       f"{original_quantity} shares * {instrument_weight/100:.2f} = {weighted_quantity:.2f} shares")
+                        
+                        # Second rounding: weighted quantity to int
                         quantity = max(0, int(weighted_quantity))
+                        self.logger.info(f"  Second rounding: {weighted_quantity:.2f} -> {quantity} shares (int conversion)")
+                        
+                        # CRITICAL: Ensure minimum quantity of 1 if we have funds for at least 1 share
+                        # This covers the case where weighting reduces quantity below 1 after rounding
+                        if quantity == 0 and max_quantity_by_balance >= 1:
+                            quantity = 1
+                            self.logger.info(f"  Minimum allocation enforced after weighting: setting quantity to 1 share "
+                                          f"(weighted calc gave 0 but max_by_balance={max_quantity_by_balance:.2f})")
                         
                         # Check if we can afford the weighted quantity
                         weighted_cost = quantity * current_price
                         if weighted_cost > remaining_balance or weighted_cost > available_for_instrument:
                             # Revert to original quantity if weighted amount exceeds limits
                             quantity = original_quantity
-                            self.logger.debug(f"  Weight {instrument_weight}% would exceed limits, keeping original quantity {quantity}")
+                            self.logger.info(f"  Weight {instrument_weight}% would exceed limits "
+                                          f"(cost ${weighted_cost:.2f} > remaining ${remaining_balance:.2f} or available ${available_for_instrument:.2f}), "
+                                          f"keeping original quantity {quantity}")
                         else:
-                            self.logger.info(f"  Applied instrument weight {instrument_weight}%: {original_quantity} -> {quantity} shares")
+                            self.logger.info(f"  Final after weighting: {quantity} shares (cost ${weighted_cost:.2f})")
                 
                 # Update order with calculated quantity
                 order.quantity = quantity
@@ -442,11 +466,12 @@ class TradeRiskManagement:
                     remaining_balance -= total_cost
                     instrument_allocations[symbol] = current_allocation + total_cost
                     
-                    self.logger.info(f"  ALLOCATED {quantity} shares of {symbol} at ${current_price:.2f} "
-                                   f"(total: ${total_cost:.2f}, ROI: {recommendation.expected_profit_percent:.2f}%) "
-                                   f"- Remaining balance: ${remaining_balance:.2f}")
+                    self.logger.info(f"  ✓ FINAL: Allocated {quantity} shares of {symbol} at ${current_price:.2f} "
+                                   f"(cost: ${total_cost:.2f}, ROI: {recommendation.expected_profit_percent:.2f}%)")
+                    self.logger.info(f"  Updated balances: remaining=${remaining_balance:.2f}, "
+                                   f"{symbol}_allocation=${instrument_allocations[symbol]:.2f}")
                 else:
-                    self.logger.debug(f"  Set quantity to 0 for {symbol} - insufficient funds or limits")
+                    self.logger.warning(f"  ✗ FINAL: Set quantity to 0 for {symbol} - insufficient funds or limits reached")
                 
                 updated_orders.append(order)
                 

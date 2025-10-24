@@ -62,35 +62,45 @@ class GraphSetup:
 
         if "market" in selected_analysts:
             analyst_nodes["market"] = create_market_analyst(
-                self.quick_thinking_llm, self.toolkit
+                self.quick_thinking_llm, 
+                self.toolkit,
+                list(self.tool_nodes["market"].original_tools.values())
             )
             delete_nodes["market"] = create_msg_delete()
             tool_nodes["market"] = self.tool_nodes["market"]
 
         if "social" in selected_analysts:
             analyst_nodes["social"] = create_social_media_analyst(
-                self.quick_thinking_llm, self.toolkit
+                self.quick_thinking_llm, 
+                self.toolkit,
+                list(self.tool_nodes["social"].original_tools.values())
             )
             delete_nodes["social"] = create_msg_delete()
             tool_nodes["social"] = self.tool_nodes["social"]
 
         if "news" in selected_analysts:
             analyst_nodes["news"] = create_news_analyst(
-                self.quick_thinking_llm, self.toolkit
+                self.quick_thinking_llm, 
+                self.toolkit,
+                list(self.tool_nodes["news"].original_tools.values())
             )
             delete_nodes["news"] = create_msg_delete()
             tool_nodes["news"] = self.tool_nodes["news"]
 
         if "fundamentals" in selected_analysts:
             analyst_nodes["fundamentals"] = create_fundamentals_analyst(
-                self.quick_thinking_llm, self.toolkit
+                self.quick_thinking_llm, 
+                self.toolkit,
+                list(self.tool_nodes["fundamentals"].original_tools.values())
             )
             delete_nodes["fundamentals"] = create_msg_delete()
             tool_nodes["fundamentals"] = self.tool_nodes["fundamentals"]
 
         if "macro" in selected_analysts:
             analyst_nodes["macro"] = create_macro_analyst(
-                self.quick_thinking_llm, self.toolkit
+                self.quick_thinking_llm, 
+                self.toolkit,
+                list(self.tool_nodes["macro"].original_tools.values())
             )
             delete_nodes["macro"] = create_msg_delete()
             tool_nodes["macro"] = self.tool_nodes["macro"]

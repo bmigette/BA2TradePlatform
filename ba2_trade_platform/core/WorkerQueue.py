@@ -906,8 +906,8 @@ class WorkerQueue:
             
             logger.info(f"Created SmartRiskManagerJob {job_id} for expert {task.expert_instance_id}")
             
-            # Run the Smart Risk Manager
-            result = run_smart_risk_manager(task.expert_instance_id, task.account_id)
+            # Run the Smart Risk Manager with the existing job_id
+            result = run_smart_risk_manager(task.expert_instance_id, task.account_id, job_id=job_id)
             
             # Reload the job to update it
             smart_risk_job = get_instance(SmartRiskManagerJob, job_id)
@@ -1119,7 +1119,7 @@ class WorkerQueue:
                             
                             # Add Smart Risk Manager task to queue
                             try:
-                                task_id = self.add_smart_risk_manager_task(expert_instance_id, account_id)
+                                task_id = self.submit_smart_risk_manager_task(expert_instance_id, account_id)
                                 logger.info(f"Queued Smart Risk Manager task {task_id} for expert {expert_instance_id}")
                             except Exception as e:
                                 logger.error(f"Failed to queue Smart Risk Manager task for expert {expert_instance_id}: {e}", exc_info=True)

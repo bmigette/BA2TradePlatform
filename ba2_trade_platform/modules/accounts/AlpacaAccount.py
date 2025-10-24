@@ -463,7 +463,7 @@ class AlpacaAccount(AccountInterface):
                 return None
                     
         except Exception as e:
-            logger.error(f"Error submitting order to Alpaca: {e}", exc_info=True)
+            logger.error(f"Error submitting order {trading_order} to Alpaca: {e}", exc_info=True)
             
             # Step 4: Mark order as ERROR in database using thread-safe function
             try:

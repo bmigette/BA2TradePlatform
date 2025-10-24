@@ -603,16 +603,23 @@ class TradeManager:
                 return None
                 
             # Note: Ruleset evaluation is handled by TradeActionEvaluator in process_expert_recommendations_after_analysis()
-            # This method (_process_recommendation) is a legacy path and should eventually be deprecated
+            # This method (process_recommendation) is a legacy path and should eventually be deprecated
+            self.logger.warning(f"Using legacy process_recommendation() for recommendation {recommendation.id} - "
+                              f"this path is deprecated, use process_expert_recommendations_after_analysis() instead")
                 
-            # Create the order. Do npt place it yet.
+            # Create the order. Do not place it yet.
             order = self._create_order_from_recommendation(recommendation, expert_instance)
-
+            
+            if order:
+                self.logger.info(f"Created order from recommendation {recommendation.id} via legacy path")
+                return order
+            else:
+                self.logger.debug(f"No order created from recommendation {recommendation.id}")
+                return None
                     
         except Exception as e:
             self.logger.error(f"Error processing recommendation {recommendation.id}: {e}", exc_info=True)
-            
-        return None
+            return None
         
     def _get_expert_trading_permissions(self, expert_instance: ExpertInstance) -> Dict[str, Any]:
         """
@@ -729,7 +736,13 @@ class TradeManager:
             else:
                 return None
 
+            # NOTE: This is a LEGACY path that doesn't use TradeRiskManagement for quantity calculation
+            # Quantity will be set to 0 here and should be calculated later by risk management
+            # The proper path is process_expert_recommendations_after_analysis() which handles this correctly
             quantity = 0
+            
+            self.logger.warning(f"Creating order with quantity=0 for {recommendation.symbol} - "
+                              f"quantity should be calculated by TradeRiskManagement.review_and_prioritize_pending_orders()")
             
             # Create the order
             # Convert side to uppercase to match OrderDirection enum

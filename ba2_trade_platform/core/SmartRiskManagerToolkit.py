@@ -1473,7 +1473,7 @@ class SmartRiskManagerToolkit:
     def open_new_position(
         self,
         symbol: Annotated[str, "Instrument symbol to trade"],
-        direction: Annotated[str, "Trade direction: 'buy' or 'sell'"],
+        direction: Annotated[str, "Trade direction: 'buy' or 'sell' (case-insensitive)"],
         quantity: Annotated[float, "Number of shares/units to trade"],
         tp_price: Annotated[Optional[float], "Optional take profit price"] = None,
         sl_price: Annotated[Optional[float], "Optional stop loss price"] = None,
@@ -1484,17 +1484,40 @@ class SmartRiskManagerToolkit:
         
         Args:
             symbol: Instrument symbol
-            direction: "BUY" or "SELL"
+            direction: "BUY" or "SELL" (case-insensitive)
             quantity: Position size
             tp_price: Take profit price (optional)
             sl_price: Stop loss price (optional)
             reason: Explanation for opening position
             
         Returns:
-            Result dict with success, message, transaction_id, order_id
+            Result dict with success, message, transaction_id, order_id, symbol, quantity, direction
         """
         try:
+            # Normalize direction to uppercase for case-insensitive handling
+            direction = direction.upper()
+            
             logger.info(f"Opening new {direction} position for {symbol}, quantity={quantity}. Reason: {reason}")
+            
+            # Check for existing open transaction on this symbol
+            with get_db() as session:
+                existing_transaction = session.exec(
+                    select(Transaction)
+                    .where(Transaction.expert_id == self.expert_instance_id)
+                    .where(Transaction.symbol == symbol)
+                    .where(Transaction.status == TransactionStatus.OPENED)
+                ).first()
+                
+                if existing_transaction:
+                    return {
+                        "success": False,
+                        "message": f"Cannot open new position: An open transaction already exists for {symbol} (transaction_id={existing_transaction.id}). Use adjust_quantity to modify the existing position instead.",
+                        "transaction_id": existing_transaction.id,
+                        "order_id": None,
+                        "symbol": symbol,
+                        "quantity": quantity,
+                        "direction": direction
+                    }
             
             # Validate direction
             try:
@@ -1504,7 +1527,10 @@ class SmartRiskManagerToolkit:
                     "success": False,
                     "message": f"Invalid direction: {direction}. Must be 'BUY' or 'SELL'",
                     "transaction_id": None,
-                    "order_id": None
+                    "order_id": None,
+                    "symbol": symbol,
+                    "quantity": quantity,
+                    "direction": direction
                 }
             
             # Check if symbol is enabled in expert settings
@@ -1514,24 +1540,33 @@ class SmartRiskManagerToolkit:
                     "success": False,
                     "message": f"Symbol {symbol} is not enabled in expert settings",
                     "transaction_id": None,
-                    "order_id": None
+                    "order_id": None,
+                    "symbol": symbol,
+                    "quantity": quantity,
+                    "direction": direction
                 }
             
             # Check enable_buy/enable_sell settings
             settings = self.expert.settings
-            if direction == "BUY" and not settings.get("enable_buy", True):
+            if order_direction == OrderDirection.BUY and not settings.get("enable_buy", True):
                 return {
                     "success": False,
                     "message": "Buy orders are disabled in expert settings",
                     "transaction_id": None,
-                    "order_id": None
+                    "order_id": None,
+                    "symbol": symbol,
+                    "quantity": quantity,
+                    "direction": direction
                 }
-            if direction == "SELL" and not settings.get("enable_sell", True):
+            if order_direction == OrderDirection.SELL and not settings.get("enable_sell", True):
                 return {
                     "success": False,
                     "message": "Sell orders are disabled in expert settings",
                     "transaction_id": None,
-                    "order_id": None
+                    "order_id": None,
+                    "symbol": symbol,
+                    "quantity": quantity,
+                    "direction": direction
                 }
             
             # Check account balance
@@ -1545,7 +1580,10 @@ class SmartRiskManagerToolkit:
                     "success": False,
                     "message": f"Could not get current price for {symbol}",
                     "transaction_id": None,
-                    "order_id": None
+                    "order_id": None,
+                    "symbol": symbol,
+                    "quantity": quantity,
+                    "direction": direction
                 }
             
             position_value = current_price * quantity
@@ -1555,7 +1593,10 @@ class SmartRiskManagerToolkit:
                     "success": False,
                     "message": f"Insufficient balance: position value {position_value:.2f} > available {available_balance:.2f}",
                     "transaction_id": None,
-                    "order_id": None
+                    "order_id": None,
+                    "symbol": symbol,
+                    "quantity": quantity,
+                    "direction": direction
                 }
             
             # Check position size limits
@@ -1568,7 +1609,10 @@ class SmartRiskManagerToolkit:
                     "success": False,
                     "message": f"Position size {position_value:.2f} exceeds max allowed {max_position_value:.2f} ({max_position_pct}% of equity)",
                     "transaction_id": None,
-                    "order_id": None
+                    "order_id": None,
+                    "symbol": symbol,
+                    "quantity": quantity,
+                    "direction": direction
                 }
             
             # Create and submit market order (transaction will be auto-created)
@@ -1586,9 +1630,12 @@ class SmartRiskManagerToolkit:
             if not submitted_order or not submitted_order.id:
                 return {
                     "success": False,
-                    "message": f"Failed to submit entry order",
+                    "message": f"Failed to submit entry order for {symbol}",
                     "transaction_id": None,
-                    "order_id": None
+                    "order_id": None,
+                    "symbol": symbol,
+                    "quantity": quantity,
+                    "direction": direction
                 }
             
             transaction_id = submitted_order.transaction_id
@@ -1597,11 +1644,14 @@ class SmartRiskManagerToolkit:
             logger.info(f"Successfully opened position: transaction_id={transaction_id}, order_id={order_id}")
             
             # Submit TP/SL orders if provided and we have a transaction
+            tp_created = False
+            sl_created = False
+            
             if transaction_id:
                 # Take profit order (opposite direction limit order)
                 if tp_price:
-                    tp_side = OrderDirection.SELL if direction == "BUY" else OrderDirection.BUY
-                    tp_type = OrderType.SELL_LIMIT if direction == "BUY" else OrderType.BUY_LIMIT
+                    tp_side = OrderDirection.SELL if order_direction == OrderDirection.BUY else OrderDirection.BUY
+                    tp_type = OrderType.SELL_LIMIT if order_direction == OrderDirection.BUY else OrderType.BUY_LIMIT
                     
                     try:
                         tp_order = self._create_trading_order(
@@ -1617,14 +1667,15 @@ class SmartRiskManagerToolkit:
                         )
                         submitted_tp = self.account.submit_order(tp_order)
                         if submitted_tp:
+                            tp_created = True
                             logger.info(f"Created take profit order at {tp_price}")
                     except Exception as e:
                         logger.error(f"Failed to create TP order: {e}")
                 
                 # Stop loss order (opposite direction stop order)
                 if sl_price:
-                    sl_side = OrderDirection.SELL if direction == "BUY" else OrderDirection.BUY
-                    sl_type = OrderType.SELL_STOP if direction == "BUY" else OrderType.BUY_STOP
+                    sl_side = OrderDirection.SELL if order_direction == OrderDirection.BUY else OrderDirection.BUY
+                    sl_type = OrderType.SELL_STOP if order_direction == OrderDirection.BUY else OrderType.BUY_STOP
                     
                     try:
                         sl_order = self._create_trading_order(
@@ -1640,24 +1691,43 @@ class SmartRiskManagerToolkit:
                         )
                         submitted_sl = self.account.submit_order(sl_order)
                         if submitted_sl:
+                            sl_created = True
                             logger.info(f"Created stop loss order at {sl_price}")
                     except Exception as e:
                         logger.error(f"Failed to create SL order: {e}")
             
+            # Build detailed success message
+            tp_sl_info = []
+            if tp_created:
+                tp_sl_info.append(f"TP@{tp_price:.2f}")
+            if sl_created:
+                tp_sl_info.append(f"SL@{sl_price:.2f}")
+            
+            tp_sl_text = f" with {', '.join(tp_sl_info)}" if tp_sl_info else ""
+            
             return {
                 "success": True,
-                "message": f"Successfully opened {direction} position for {symbol}",
+                "message": f"Opened {direction} position: {quantity} shares of {symbol} @ ${current_price:.2f}{tp_sl_text} (transaction_id={transaction_id}, order_id={order_id})",
                 "transaction_id": transaction_id,
-                "order_id": order_id
+                "order_id": order_id,
+                "symbol": symbol,
+                "quantity": quantity,
+                "direction": direction,
+                "entry_price": current_price,
+                "tp_price": tp_price if tp_created else None,
+                "sl_price": sl_price if sl_created else None
             }
             
         except Exception as e:
             logger.error(f"Error opening new position for {symbol}: {e}", exc_info=True)
             return {
                 "success": False,
-                "message": f"Error: {str(e)}",
+                "message": f"Error opening position for {symbol}: {str(e)}",
                 "transaction_id": None,
-                "order_id": None
+                "order_id": None,
+                "symbol": symbol,
+                "quantity": quantity,
+                "direction": direction
             }
 
     def calculate_position_metrics(
@@ -1665,7 +1735,7 @@ class SmartRiskManagerToolkit:
         entry_price: Annotated[float, "Entry price of the position"],
         current_price: Annotated[float, "Current market price"],
         quantity: Annotated[float, "Position size (number of shares/units)"],
-        direction: Annotated[str, "Position direction: 'buy' or 'sell'"]
+        direction: Annotated[str, "Position direction: 'buy' or 'sell' (case-insensitive)"]
     ) -> Dict[str, float]:
         """
         Calculate position metrics without modifying anything.
@@ -1674,14 +1744,17 @@ class SmartRiskManagerToolkit:
             entry_price: Entry price
             current_price: Current market price
             quantity: Position size
-            direction: "BUY" or "SELL"
+            direction: "BUY" or "SELL" (case-insensitive)
             
         Returns:
             Dict with unrealized_pnl, unrealized_pnl_pct, position_value
         """
         try:
+            # Normalize direction to uppercase for case-insensitive handling
+            direction = direction.upper()
+            
             # Calculate P&L
-            if direction.upper() == "BUY":
+            if direction == "BUY":
                 unrealized_pnl = (current_price - entry_price) * quantity
             else:  # SELL
                 unrealized_pnl = (entry_price - current_price) * quantity
