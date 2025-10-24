@@ -1,6 +1,6 @@
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, LimitOrderRequest, StopOrderRequest, ReplaceOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
+from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, LimitOrderRequest, StopOrderRequest, StopLimitOrderRequest, ReplaceOrderRequest, TakeProfitRequest, StopLossRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderClass
 from alpaca.common.exceptions import APIError
 from typing import Any, Dict, Optional
 from datetime import datetime, timezone
@@ -314,18 +314,20 @@ class AlpacaAccount(AccountInterface):
             return []
 
     @alpaca_api_retry
-    def _submit_order_impl(self, trading_order: TradingOrder) -> TradingOrder:
+    def _submit_order_impl(self, trading_order: TradingOrder, tp_price: Optional[float] = None, sl_price: Optional[float] = None) -> TradingOrder:
         """
         Submit a new order to Alpaca.
         
         Logic:
         1. If order.id is None, create new database record with status PENDING
-        2. Submit order to broker
+        2. Submit order to broker (with bracket orders if tp_price and sl_price provided)
         3. Update database record with broker response (broker_order_id, status)
         4. If error occurs, mark order as ERROR in database
         
         Args:
             trading_order: A TradingOrder object containing all order details
+            tp_price: Optional take profit price for bracket orders
+            sl_price: Optional stop loss price for bracket orders
             
         Returns:
             TradingOrder: The database order record (updated with broker info), or None if failed
@@ -387,6 +389,10 @@ class AlpacaAccount(AccountInterface):
             # Import OrderType enum from core.types to compare values
             from ...core.types import OrderType as CoreOrderType
             
+            # Note: We do NOT create bracket orders. TP/SL will be handled separately
+            # as STOP_LIMIT orders after the entry order fills.
+            # The parent AccountInterface.submit_order() will create pending_trigger orders.
+            
             # Create the appropriate order request based on order type
             if order_type_value == CoreOrderType.MARKET.value.lower():
                 order_request = MarketOrderRequest(
@@ -426,6 +432,26 @@ class AlpacaAccount(AccountInterface):
                     side=side,
                     time_in_force=time_in_force,
                     stop_price=rounded_stop_price,
+                    client_order_id=trading_order.comment
+                )
+            elif order_type_value in [CoreOrderType.BUY_STOP_LIMIT.value.lower(), 
+                                      CoreOrderType.SELL_STOP_LIMIT.value.lower()]:
+                if not trading_order.stop_price:
+                    raise ValueError("Stop price is required for stop-limit orders")
+                if not trading_order.limit_price:
+                    raise ValueError("Limit price is required for stop-limit orders")
+                
+                # Round prices using Alpaca pricing rules
+                rounded_stop_price = self._round_price(trading_order.stop_price, trading_order.symbol)
+                rounded_limit_price = self._round_price(trading_order.limit_price, trading_order.symbol)
+                    
+                order_request = StopLimitOrderRequest(
+                    symbol=trading_order.symbol,
+                    qty=trading_order.quantity,
+                    side=side,
+                    time_in_force=time_in_force,
+                    stop_price=rounded_stop_price,
+                    limit_price=rounded_limit_price,
                     client_order_id=trading_order.comment
                 )
             else:
@@ -880,10 +906,41 @@ class AlpacaAccount(AccountInterface):
                         updated_count += 1
                         logger.debug(f"Updated database order {db_order.id} with changes from Alpaca order {alpaca_order.broker_order_id}")
             
+            # Step 4: Mark database orders with broker_order_ids that don't exist in Alpaca as CANCELED
+            # This catches orders that were canceled in Alpaca but status wasn't updated in database
+            canceled_count = 0
+            alpaca_broker_ids = {order.broker_order_id for order in alpaca_orders if order.broker_order_id}
+            
+            with Session(get_db().bind) as session:
+                # Get all database orders for this account with broker_order_id and non-terminal status
+                db_active_orders = session.exec(
+                    select(TradingOrder).where(
+                        TradingOrder.account_id == self.id,
+                        TradingOrder.broker_order_id.is_not(None),
+                        TradingOrder.status.not_in([
+                            OrderStatus.FILLED, OrderStatus.CANCELED, 
+                            OrderStatus.EXPIRED, OrderStatus.REPLACED, OrderStatus.REJECTED
+                        ])
+                    )
+                ).all()
+                
+                for db_order in db_active_orders:
+                    # If this broker_order_id doesn't exist in Alpaca anymore, mark as CANCELED
+                    if db_order.broker_order_id not in alpaca_broker_ids:
+                        logger.warning(
+                            f"Order {db_order.id} (broker_order_id={db_order.broker_order_id}) "
+                            f"not found in Alpaca, marking as CANCELED"
+                        )
+                        fresh_order = get_instance(TradingOrder, db_order.id)
+                        if fresh_order:
+                            fresh_order.status = OrderStatus.CANCELED
+                            update_instance(fresh_order)
+                            canceled_count += 1
+            
             if heuristic_mapping and mapped_count > 0:
-                logger.info(f"Successfully refreshed orders from Alpaca: {updated_count} updated, {mapped_count} mapped via comment heuristic")
+                logger.info(f"Successfully refreshed orders from Alpaca: {updated_count} updated, {mapped_count} mapped via comment heuristic, {canceled_count} marked as canceled")
             else:
-                logger.info(f"Successfully refreshed orders from Alpaca: {updated_count} database records updated")
+                logger.info(f"Successfully refreshed orders from Alpaca: {updated_count} updated, {canceled_count} marked as canceled")
             return True
             
         except Exception as e:
@@ -919,6 +976,233 @@ class AlpacaAccount(AccountInterface):
         """
         # No broker-specific operations needed - base class handles all SL logic
         pass
+
+    def _set_order_tp_sl_impl(self, trading_order: TradingOrder, tp_price: float, sl_price: float) -> None:
+        """
+        Set both TP and SL for an order using STOP_LIMIT orders.
+        
+        After the entry order is filled, we can submit STOP_LIMIT orders for both TP and SL.
+        If existing TP/SL orders exist, we replace them with new STOP_LIMIT orders.
+        
+        STOP_LIMIT orders have:
+        - stop_price: The trigger price
+        - limit_price: The execution price (set to same as stop_price for simplicity)
+        
+        Args:
+            trading_order: The entry order (already submitted/filled)
+            tp_price: Take profit price
+            sl_price: Stop loss price
+        """
+        try:
+            from ...core.db import get_db, add_instance, update_instance
+            from sqlmodel import Session, select
+            from ...core.types import OrderType as CoreOrderType, OrderDirection
+            from alpaca.trading.requests import StopLimitOrderRequest, ReplaceOrderRequest
+            from alpaca.trading.enums import OrderSide, TimeInForce
+            
+            logger.info(
+                f"Setting combined TP/SL for order {trading_order.id}: "
+                f"TP=${tp_price:.2f}, SL=${sl_price:.2f}"
+            )
+            
+            # Find existing TP/SL orders for this transaction
+            with Session(get_db().bind) as session:
+                existing_orders = session.exec(
+                    select(TradingOrder).where(
+                        TradingOrder.transaction_id == trading_order.transaction_id,
+                        TradingOrder.id != trading_order.id,  # Exclude entry order
+                        TradingOrder.status.not_in([OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.REPLACED])
+                    )
+                ).all()
+                
+                existing_tp = None
+                existing_sl = None
+                
+                for order in existing_orders:
+                    # Check if it's a TP order (opposite side of entry, higher price for longs)
+                    if order.side != trading_order.side:
+                        if order.limit_price and order.limit_price > trading_order.open_price:
+                            existing_tp = order
+                        elif order.stop_price and order.stop_price < trading_order.open_price:
+                            existing_sl = order
+                
+                # Handle TP: Replace existing or create new STOP_LIMIT order
+                if existing_tp and existing_tp.broker_order_id:
+                    logger.info(f"Replacing existing TP order {existing_tp.id} with STOP_LIMIT at ${tp_price:.2f}")
+                    
+                    replace_request = ReplaceOrderRequest(
+                        qty=existing_tp.quantity,
+                        limit_price=tp_price,
+                        stop_price=tp_price  # STOP_LIMIT: trigger and execute at same price
+                    )
+                    
+                    try:
+                        replaced_order = self.client.replace_order_by_id(
+                            order_id=existing_tp.broker_order_id,
+                            replace_order_data=replace_request
+                        )
+                        
+                        # Create new database record
+                        new_tp = TradingOrder(
+                            account_id=existing_tp.account_id,
+                            symbol=existing_tp.symbol,
+                            quantity=existing_tp.quantity,
+                            side=existing_tp.side,
+                            order_type=CoreOrderType.SELL_STOP_LIMIT if existing_tp.side == OrderDirection.SELL else CoreOrderType.BUY_STOP_LIMIT,
+                            limit_price=tp_price,
+                            stop_price=tp_price,
+                            transaction_id=existing_tp.transaction_id,
+                            broker_order_id=replaced_order.id,
+                            status=OrderStatus.PENDING_NEW,
+                            comment=f"TP STOP_LIMIT (replaced {existing_tp.id})"
+                        )
+                        new_tp_id = add_instance(new_tp)
+                        
+                        # Mark old order as REPLACED
+                        existing_tp.status = OrderStatus.REPLACED
+                        update_instance(existing_tp)
+                        
+                        logger.info(f"Successfully replaced TP: old={existing_tp.id}, new={new_tp_id}, broker_id={replaced_order.id}")
+                        
+                    except Exception as e:
+                        logger.warning(f"Replace failed, canceling and will create new: {e}")
+                        try:
+                            self.cancel_order(existing_tp.broker_order_id)
+                            existing_tp = None  # Will trigger creation below
+                        except Exception as cancel_error:
+                            logger.error(f"Failed to cancel existing TP order: {cancel_error}")
+                
+                # If no existing TP or replace failed, create new STOP_LIMIT order
+                if not existing_tp or not existing_tp.broker_order_id:
+                    logger.info(f"Creating new TP STOP_LIMIT order at ${tp_price:.2f}")
+                    
+                    # Determine side (opposite of entry)
+                    tp_side = OrderSide.SELL if trading_order.side == OrderDirection.BUY else OrderSide.BUY
+                    
+                    stop_limit_request = StopLimitOrderRequest(
+                        symbol=trading_order.symbol,
+                        qty=trading_order.quantity,
+                        side=tp_side,
+                        time_in_force=TimeInForce.GTC,
+                        stop_price=tp_price,
+                        limit_price=tp_price  # Execute at trigger price
+                    )
+                    
+                    try:
+                        alpaca_order = self.client.submit_order(stop_limit_request)
+                        
+                        # Create database record
+                        tp_order = TradingOrder(
+                            account_id=trading_order.account_id,
+                            symbol=trading_order.symbol,
+                            quantity=trading_order.quantity,
+                            side=OrderDirection.SELL if tp_side == OrderSide.SELL else OrderDirection.BUY,
+                            order_type=CoreOrderType.SELL_STOP_LIMIT if tp_side == OrderSide.SELL else CoreOrderType.BUY_STOP_LIMIT,
+                            limit_price=tp_price,
+                            stop_price=tp_price,
+                            transaction_id=trading_order.transaction_id,
+                            broker_order_id=str(alpaca_order.id),  # Convert UUID to string
+                            status=OrderStatus.PENDING_NEW,
+                            comment=f"TP STOP_LIMIT for order {trading_order.id}"
+                        )
+                        tp_order_id = add_instance(tp_order)
+                        logger.info(f"Created TP order {tp_order_id} (broker_id={alpaca_order.id})")
+                        
+                    except Exception as e:
+                        logger.error(f"Failed to create TP STOP_LIMIT order: {e}")
+                
+                # Handle SL: Replace existing or create new STOP_LIMIT order
+                if existing_sl and existing_sl.broker_order_id:
+                    logger.info(f"Replacing existing SL order {existing_sl.id} with STOP_LIMIT at ${sl_price:.2f}")
+                    
+                    replace_request = ReplaceOrderRequest(
+                        qty=existing_sl.quantity,
+                        limit_price=sl_price,
+                        stop_price=sl_price
+                    )
+                    
+                    try:
+                        replaced_order = self.client.replace_order_by_id(
+                            order_id=existing_sl.broker_order_id,
+                            replace_order_data=replace_request
+                        )
+                        
+                        # Create new database record
+                        new_sl = TradingOrder(
+                            account_id=existing_sl.account_id,
+                            symbol=existing_sl.symbol,
+                            quantity=existing_sl.quantity,
+                            side=existing_sl.side,
+                            order_type=CoreOrderType.SELL_STOP_LIMIT if existing_sl.side == OrderDirection.SELL else CoreOrderType.BUY_STOP_LIMIT,
+                            limit_price=sl_price,
+                            stop_price=sl_price,
+                            transaction_id=existing_sl.transaction_id,
+                            broker_order_id=replaced_order.id,
+                            status=OrderStatus.PENDING_NEW,
+                            comment=f"SL STOP_LIMIT (replaced {existing_sl.id})"
+                        )
+                        new_sl_id = add_instance(new_sl)
+                        
+                        # Mark old order as REPLACED
+                        existing_sl.status = OrderStatus.REPLACED
+                        update_instance(existing_sl)
+                        
+                        logger.info(f"Successfully replaced SL: old={existing_sl.id}, new={new_sl_id}, broker_id={replaced_order.id}")
+                        
+                    except Exception as e:
+                        logger.warning(f"Replace failed, canceling and will create new: {e}")
+                        try:
+                            self.cancel_order(existing_sl.broker_order_id)
+                            existing_sl = None
+                        except Exception as cancel_error:
+                            logger.error(f"Failed to cancel existing SL order: {cancel_error}")
+                
+                # If no existing SL or replace failed, create new STOP_LIMIT order
+                if not existing_sl or not existing_sl.broker_order_id:
+                    logger.info(f"Creating new SL STOP_LIMIT order at ${sl_price:.2f}")
+                    
+                    sl_side = OrderSide.SELL if trading_order.side == OrderDirection.BUY else OrderSide.BUY
+                    
+                    stop_limit_request = StopLimitOrderRequest(
+                        symbol=trading_order.symbol,
+                        qty=trading_order.quantity,
+                        side=sl_side,
+                        time_in_force=TimeInForce.GTC,
+                        stop_price=sl_price,
+                        limit_price=sl_price
+                    )
+                    
+                    try:
+                        alpaca_order = self.client.submit_order(stop_limit_request)
+                        
+                        # Create database record
+                        sl_order = TradingOrder(
+                            account_id=trading_order.account_id,
+                            symbol=trading_order.symbol,
+                            quantity=trading_order.quantity,
+                            side=OrderDirection.SELL if sl_side == OrderSide.SELL else OrderDirection.BUY,
+                            order_type=CoreOrderType.SELL_STOP_LIMIT if sl_side == OrderSide.SELL else CoreOrderType.BUY_STOP_LIMIT,
+                            limit_price=sl_price,
+                            stop_price=sl_price,
+                            transaction_id=trading_order.transaction_id,
+                            broker_order_id=str(alpaca_order.id),  # Convert UUID to string
+                            status=OrderStatus.PENDING_NEW,
+                            comment=f"SL STOP_LIMIT for order {trading_order.id}"
+                        )
+                        sl_order_id = add_instance(sl_order)
+                        logger.info(f"Created SL order {sl_order_id} (broker_id={alpaca_order.id})")
+                        
+                    except Exception as e:
+                        logger.error(f"Failed to create SL STOP_LIMIT order: {e}")
+            
+            logger.info(f"Successfully set TP/SL using STOP_LIMIT orders for transaction {trading_order.transaction_id}")
+                
+        except Exception as e:
+            logger.error(
+                f"Error setting TP/SL for transaction {trading_order.transaction_id}: {e}",
+                exc_info=True
+            )
+            raise
 
     def _update_broker_tp_order(self, tp_order: TradingOrder, new_tp_price: float) -> None:
         """

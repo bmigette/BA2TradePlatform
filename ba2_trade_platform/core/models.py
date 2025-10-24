@@ -516,7 +516,7 @@ class TradeActionResult(SQLModel, table=True):
 class SmartRiskManagerJob(SQLModel, table=True):
     """
     Tracks Smart Risk Manager execution sessions.
-    Links to MarketAnalysis records that were analyzed during the session.
+    All trading actions are stored in graph_state under 'actions_log' key.
     """
     __tablename__ = "smartriskmanagerjob"
     
@@ -533,7 +533,7 @@ class SmartRiskManagerJob(SQLModel, table=True):
     user_instructions: str = Field(description="Snapshot of smart_risk_manager_user_instructions at execution time")
     
     # State Preservation
-    graph_state: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict, description="Complete LangGraph state as JSON")
+    graph_state: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict, description="Complete LangGraph state as JSON (includes actions_log, research_findings, final_summary)")
     
     # Execution Metrics
     duration_seconds: float = Field(default=0.0)
@@ -550,26 +550,3 @@ class SmartRiskManagerJob(SQLModel, table=True):
     # Status & Error Handling
     status: str = Field(default="RUNNING", description="RUNNING, COMPLETED, FAILED, INTERRUPTED, TIMEOUT")
     error_message: Optional[str] = Field(default=None)
-    
-    # Relationships
-    market_analyses: List["SmartRiskManagerJobAnalysis"] = Relationship(back_populates="smart_risk_job")
-
-
-class SmartRiskManagerJobAnalysis(SQLModel, table=True):
-    """
-    Junction table linking SmartRiskManagerJob to MarketAnalysis records.
-    Tracks which market analyses were consulted during the smart risk manager session.
-    """
-    __tablename__ = "smartriskmanagerjobanalysis"
-    
-    # Composite Primary Key
-    id: Optional[int] = Field(default=None, primary_key=True)
-    smart_risk_job_id: int = Field(foreign_key="smartriskmanagerjob.id", index=True, ondelete="CASCADE")
-    market_analysis_id: int = Field(foreign_key="marketanalysis.id", index=True, ondelete="CASCADE")
-    
-    # Metadata
-    consulted_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc))
-    outputs_accessed: Optional[List[str]] = Field(sa_column=Column(JSON), default=None, description="JSON list of output keys accessed")
-    
-    # Relationships
-    smart_risk_job: "SmartRiskManagerJob" = Relationship(back_populates="market_analyses")

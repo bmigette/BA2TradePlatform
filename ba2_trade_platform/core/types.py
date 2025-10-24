@@ -215,6 +215,8 @@ class OrderType(str, Enum):
     SELL_LIMIT = "sell_limit"
     BUY_STOP = "buy_stop"
     SELL_STOP = "sell_stop"
+    BUY_STOP_LIMIT = "buy_stop_limit"
+    SELL_STOP_LIMIT = "sell_stop_limit"
     TRAILING_STOP = "trailing_stop"
 
 class OrderDirection(str, Enum):
@@ -238,6 +240,7 @@ class TransactionStatus(str, Enum):
     OPENED = "OPENED"
     CLOSING = "CLOSING"
     CLOSED = "CLOSED"
+    FAILED = "FAILED"  # Transaction creation succeeded but order submission failed
 
 class RiskLevel(str, Enum):
     LOW = "LOW"

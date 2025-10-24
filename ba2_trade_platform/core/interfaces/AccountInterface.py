@@ -113,13 +113,15 @@ class AccountInterface(ExtendableSettingsInterface):
         pass
 
     @abstractmethod
-    def _submit_order_impl(self, trading_order) -> Any:
+    def _submit_order_impl(self, trading_order, tp_price: Optional[float] = None, sl_price: Optional[float] = None) -> Any:
         """
         Internal implementation of order submission. This method should be implemented by child classes.
         The public submit_order method will call this after validation.
 
         Args:
             trading_order: A validated TradingOrder object containing all order details.
+            tp_price: Optional take profit price for bracket orders (broker-specific support).
+            sl_price: Optional stop loss price for bracket orders (broker-specific support).
 
         Returns:
             Any: The created order object if successful. Returns None or raises an exception if failed.
@@ -193,7 +195,7 @@ class AccountInterface(ExtendableSettingsInterface):
         
         return full_comment
 
-    def submit_order(self, trading_order: TradingOrder) -> Any:
+    def submit_order(self, trading_order: TradingOrder, tp_price: Optional[float] = None, sl_price: Optional[float] = None) -> Any:
         """
         Submit a new order to the account with validation and transaction handling.
 
@@ -202,6 +204,8 @@ class AccountInterface(ExtendableSettingsInterface):
 
         Args:
             trading_order: A TradingOrder object containing all order details.
+            tp_price: Optional take profit price. If provided, TP order will be set after successful submission.
+            sl_price: Optional stop loss price. If provided, SL order will be set after successful submission.
 
         Returns:
             Any: The created order object if successful. Returns None or raises an exception if failed.
@@ -245,8 +249,34 @@ class AccountInterface(ExtendableSettingsInterface):
         logger.info(f"Order validation passed for {symbol} - {side.value} {quantity} @ {order_type.value}")
         
         # Call the child class implementation (this will update the order with broker_order_id)
+        # Pass tp_price and sl_price for brokers that support bracket orders
         # The trading_order object is now detached but all attributes are accessible
-        result = self._submit_order_impl(trading_order)
+        result = self._submit_order_impl(trading_order, tp_price=tp_price, sl_price=sl_price)
+        
+        # Set TP and/or SL if provided and order was successfully submitted
+        # Note: If broker supports bracket orders and both tp_price and sl_price were provided,
+        # the broker already created the TP/SL orders as part of the entry order.
+        # Check if this was a bracket order before creating fallback orders.
+        if result:
+            # Check if broker created bracket orders (indicated by tp_price and sl_price both provided)
+            # For Alpaca, when bracket orders are used, the leg orders are returned in the response
+            # and we should not create fallback orders
+            created_bracket_order = (tp_price and sl_price)
+            
+            if created_bracket_order:
+                logger.info(f"Bracket order created with TP=${tp_price:.2f} and SL=${sl_price:.2f} - skipping fallback orders")
+            elif tp_price and sl_price:
+                # Both TP and SL provided but broker doesn't support bracket orders
+                logger.info(f"Setting TP=${tp_price:.2f} and SL=${sl_price:.2f} for order {result.id}")
+                self.set_order_tp_sl(result, tp_price, sl_price)
+            elif tp_price:
+                # Only TP provided
+                logger.info(f"Setting TP=${tp_price:.2f} for order {result.id}")
+                self.set_order_tp(result, tp_price)
+            elif sl_price:
+                # Only SL provided
+                logger.info(f"Setting SL=${sl_price:.2f} for order {result.id}")
+                self.set_order_sl(result, sl_price)
         
         return result
     
@@ -1378,6 +1408,139 @@ class AccountInterface(ExtendableSettingsInterface):
             Any: Any broker-specific result (optional). Base class will not use this value.
         """
         pass
+
+    @abstractmethod
+    def _set_order_tp_sl_impl(self, trading_order: TradingOrder, tp_price: float, sl_price: float) -> Any:
+        """
+        Broker-specific implementation hook for setting both TP and SL simultaneously.
+        
+        This method is called AFTER the base class has:
+        - Enforced minimum TP/SL percent
+        - Updated the transaction's take_profit and stop_loss values
+        
+        For brokers that support STOP_LIMIT orders (e.g., Alpaca), override this method
+        to submit a single STOP_LIMIT order that includes both stop price (SL) and limit price (TP).
+        
+        For brokers that don't support combined TP/SL orders, this method can be a no-op (just pass),
+        and the base class will fall back to creating separate TP and SL orders.
+        
+        Args:
+            trading_order: The original TradingOrder object (for reference/context)
+            tp_price: The validated and enforced TP price
+            sl_price: The validated and enforced SL price
+            
+        Returns:
+            Any: Any broker-specific result (optional). Base class will not use this value.
+        """
+        pass
+
+    def set_order_tp_sl(self, trading_order: TradingOrder, tp_price: float, sl_price: float) -> tuple[TradingOrder, TradingOrder]:
+        """
+        Set both take profit and stop loss for an existing order simultaneously.
+        
+        This method:
+        1. Enforces minimum TP and SL percent to protect profitability
+        2. Updates the linked transaction's take_profit and stop_loss values
+        3. Calls broker-specific implementation (if supported - e.g., STOP_LIMIT orders)
+        4. Falls back to separate TP/SL orders if broker doesn't support combined orders
+        
+        Args:
+            trading_order: The original TradingOrder object
+            tp_price: The take profit price (may be adjusted if below minimum)
+            sl_price: The stop loss price (may be adjusted if above minimum)
+            
+        Returns:
+            tuple[TradingOrder, TradingOrder]: A tuple of (tp_order, sl_order) representing the created/updated orders
+        """
+        try:
+            from sqlmodel import Session
+            from ..db import get_db
+            
+            # Validate inputs
+            if not trading_order:
+                raise ValueError("trading_order cannot be None")
+            if not isinstance(tp_price, (int, float)) or tp_price <= 0:
+                raise ValueError("tp_price must be a positive number")
+            if not isinstance(sl_price, (int, float)) or sl_price <= 0:
+                raise ValueError("sl_price must be a positive number")
+            
+            # Get the linked transaction
+            if not trading_order.transaction_id:
+                raise ValueError("Order must have a linked transaction to set take profit and stop loss")
+            
+            transaction = get_instance(Transaction, trading_order.transaction_id)
+            if not transaction:
+                raise ValueError(f"Transaction {trading_order.transaction_id} not found")
+            
+            # Enforce minimum TP percent based on open price
+            if trading_order.open_price:
+                from ...config import get_min_tp_sl_percent
+                min_tp_sl_percent = get_min_tp_sl_percent()
+                
+                open_price = float(trading_order.open_price)
+                is_long = (trading_order.side.upper() == "BUY")
+                
+                original_tp = tp_price
+                original_sl = sl_price
+                
+                if is_long:
+                    # For LONG: TP should be above open, SL should be below open
+                    tp_percent = ((tp_price - open_price) / open_price) * 100
+                    sl_percent = ((open_price - sl_price) / open_price) * 100
+                    
+                    if tp_percent < min_tp_sl_percent:
+                        tp_price = open_price * (1 + min_tp_sl_percent / 100)
+                        logger.warning(
+                            f"[Account {self.id}] TP enforcement (LONG): Profit {tp_percent:.2f}% below minimum {min_tp_sl_percent}%. "
+                            f"Adjusting TP from ${original_tp:.2f} to ${tp_price:.2f}"
+                        )
+                    
+                    if sl_percent < min_tp_sl_percent:
+                        sl_price = open_price * (1 - min_tp_sl_percent / 100)
+                        logger.warning(
+                            f"[Account {self.id}] SL enforcement (LONG): Protection {sl_percent:.2f}% below minimum {min_tp_sl_percent}%. "
+                            f"Adjusting SL from ${original_sl:.2f} to ${sl_price:.2f}"
+                        )
+                else:
+                    # For SHORT: TP should be below open, SL should be above open
+                    tp_percent = ((open_price - tp_price) / open_price) * 100
+                    sl_percent = ((sl_price - open_price) / open_price) * 100
+                    
+                    if tp_percent < min_tp_sl_percent:
+                        tp_price = open_price * (1 - min_tp_sl_percent / 100)
+                        logger.warning(
+                            f"[Account {self.id}] TP enforcement (SHORT): Profit {tp_percent:.2f}% below minimum {min_tp_sl_percent}%. "
+                            f"Adjusting TP from ${original_tp:.2f} to ${tp_price:.2f}"
+                        )
+                    
+                    if sl_percent < min_tp_sl_percent:
+                        sl_price = open_price * (1 + min_tp_sl_percent / 100)
+                        logger.warning(
+                            f"[Account {self.id}] SL enforcement (SHORT): Protection {sl_percent:.2f}% below minimum {min_tp_sl_percent}%. "
+                            f"Adjusting SL from ${original_sl:.2f} to ${sl_price:.2f}"
+                        )
+            
+            # Update transaction's take_profit and stop_loss values
+            transaction.take_profit = tp_price
+            transaction.stop_loss = sl_price
+            update_instance(transaction)
+            
+            logger.info(f"Updated transaction {transaction.id} with TP=${tp_price:.2f} and SL=${sl_price:.2f}")
+            
+            # Call broker-specific implementation (e.g., STOP_LIMIT orders for Alpaca)
+            # This may submit a combined TP/SL order to the broker
+            self._set_order_tp_sl_impl(trading_order, tp_price, sl_price)
+            
+            # For now, fall back to creating separate TP and SL orders in the database
+            # Broker-specific implementations can override this behavior
+            tp_order = self.set_order_tp(trading_order, tp_price)
+            sl_order = self.set_order_sl(trading_order, sl_price)
+            
+            return (tp_order, sl_order)
+            
+        except Exception as e:
+            logger.error(f"Error setting TP/SL for order {trading_order.id}: {e}", exc_info=True)
+            raise
 
     @abstractmethod
     def refresh_positions(self) -> bool:

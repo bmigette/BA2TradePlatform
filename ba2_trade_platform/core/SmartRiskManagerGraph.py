@@ -22,7 +22,7 @@ import langchain
 
 from ..logger import logger
 from .. import config as config_module
-from .models import SmartRiskManagerJob, SmartRiskManagerJobAnalysis, MarketAnalysis
+from .models import SmartRiskManagerJob, MarketAnalysis
 from .db import get_db, add_instance, update_instance, get_instance
 from .models import AppSetting
 from .SmartRiskManagerToolkit import SmartRiskManagerToolkit
@@ -354,6 +354,14 @@ You have access to these trading tools:
 - **update_take_profit(transaction_id, new_tp_price, reason)** - Update take profit {update_sl_tp_note}
 - **open_buy_position(symbol, quantity, tp_price, sl_price, reason)** - Open new LONG (BUY) position {open_position_note}
 - **open_sell_position(symbol, quantity, tp_price, sl_price, reason)** - Open new SHORT (SELL) position {open_position_note}
+
+## TP/SL PRICE GUIDELINES
+When setting Take Profit (TP) or Stop Loss (SL) prices:
+- **Minimum distance:** TP and SL must be at least {min_tp_sl_pct}% away from the entry/current price
+- **BUY positions:** TP must be ABOVE entry price, SL must be BELOW entry price
+- **SELL positions:** TP must be BELOW entry price, SL must be ABOVE entry price
+- **Optional parameters:** TP and SL are optional. If prices don't meet requirements, the position will still open but without that order
+- **Manual adjustment:** You can always adjust TP/SL later using update_take_profit() or update_stop_loss() tools
 
 ## GUIDELINES FOR ACTIONS
 {user_instructions}
@@ -1281,10 +1289,14 @@ Focus on:
                     job = session.get(SmartRiskManagerJob, job_id)
                     if job:
                         # Store research findings in graph_state for later retrieval
+                        # CRITICAL: Create new dict to ensure SQLAlchemy detects the change
                         current_state = job.graph_state or {}
-                        current_state["research_findings"] = final_summary
-                        current_state["recommended_actions_count"] = len(recommended_actions_list)
-                        job.graph_state = current_state
+                        new_state = {
+                            **current_state,
+                            "research_findings": final_summary,
+                            "recommended_actions_count": len(recommended_actions_list)
+                        }
+                        job.graph_state = new_state
                         session.add(job)
                         session.commit()
                         logger.debug(f"Stored research findings in job {job_id}")
@@ -1562,6 +1574,10 @@ Open Positions:
             # No automation enabled
             trading_focus_guidance = "**Your Focus:** Automated trading is DISABLED. You can only provide analysis and recommendations, but cannot execute any trades."
         
+        # Get minimum TP/SL percentage from configuration
+        from ba2_trade_platform.config import get_min_tp_sl_percent
+        min_tp_sl_pct = get_min_tp_sl_percent()
+        
         action_prompt = ACTION_PROMPT.format(
             portfolio_summary=portfolio_summary,
             agent_scratchpad=state["agent_scratchpad"],
@@ -1575,7 +1591,8 @@ Open Positions:
             update_sl_tp_note=update_sl_tp_note,
             open_position_note=open_position_note,
             enabled_instruments=enabled_instruments,
-            max_position_pct=max_position_pct
+            max_position_pct=max_position_pct,
+            min_tp_sl_pct=min_tp_sl_pct
         )
         
         actions_log = state["actions_log"].copy()
@@ -1962,17 +1979,21 @@ def finalize(state: SmartRiskManagerState) -> Dict[str, Any]:
                 job.iteration_count = state["iteration_count"]
                 
                 # Store complete state including research findings and final summary
+                # CRITICAL: Create new dict to ensure SQLAlchemy detects the change
                 current_state = job.graph_state or {}
-                current_state["open_positions"] = state["open_positions"]
-                current_state["actions_log"] = state["actions_log"]
-                current_state["final_scratchpad"] = state["agent_scratchpad"]
-                current_state["final_summary"] = response.content  # Store final summary separately
-                # research_findings already stored by research_node
+                new_state = {
+                    **current_state,  # Preserve research_findings from research_node
+                    "open_positions": state["open_positions"],
+                    "actions_log": state["actions_log"],
+                    "final_scratchpad": state["agent_scratchpad"],
+                    "final_summary": response.content
+                }
                 
-                job.graph_state = current_state
+                # Reassign entire field to trigger SQLAlchemy change detection
+                job.graph_state = new_state
                 session.add(job)
                 session.commit()
-                logger.info(f"Updated SmartRiskManagerJob {job_id} to COMPLETED")
+                logger.info(f"Updated SmartRiskManagerJob {job_id} to COMPLETED with {len(state['actions_log'])} actions")
         
         logger.info("Smart Risk Manager session finalized")
         

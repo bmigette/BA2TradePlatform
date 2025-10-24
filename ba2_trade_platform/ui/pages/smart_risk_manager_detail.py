@@ -317,14 +317,13 @@ def content(job_id: int) -> None:
                 ui.separator()
                 ui.label(job.error_message).classes('text-sm whitespace-pre-wrap mt-2 text-negative')
         
-        # Consulted analyses section
-        # Note: This requires SmartRiskManagerJobAnalysis junction table to be populated
-        # For now, show placeholder
+        # Consulted analyses section - Future enhancement
+        # Market analyses consulted are tracked in graph_state under 'recent_analyses'
+        # and can be cross-referenced with the detailed_outputs_cache
         with ui.card().classes('w-full mb-4'):
             ui.label('Consulted Market Analyses').classes('text-h6 mb-2')
             ui.separator()
-            ui.label('Analysis linkage feature coming soon...').classes('text-sm text-grey-6 mt-2 italic')
-            # TODO: Query SmartRiskManagerJobAnalysis table and display linked analyses
+            ui.label('Market analyses consulted during this session are tracked in the graph state.').classes('text-sm text-grey-6 mt-2 italic')
     
     except Exception as e:
         logger.error(f"Error loading Smart Risk Manager job detail for job_id {job_id}: {e}", exc_info=True)

@@ -445,6 +445,11 @@ class Toolkit:
         """
         from ...utils.web_content_extractor import extract_urls_parallel
         
+        # Defensive check: ensure urls is a list, not a string
+        if isinstance(urls, str):
+            logger.warning(f"extract_web_content received a string instead of list, wrapping: {urls[:100]}")
+            urls = [urls]
+        
         if not urls:
             logger.warning("extract_web_content called with empty URL list")
             return "**No URLs Provided**\n\nPlease provide at least one URL to extract content from."

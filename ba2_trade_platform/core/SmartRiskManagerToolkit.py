@@ -12,10 +12,10 @@ from sqlmodel import Session, select
 from ..logger import logger
 from .models import (
     Transaction, TradingOrder, MarketAnalysis, ExpertInstance,
-    SmartRiskManagerJob, SmartRiskManagerJobAnalysis
+    SmartRiskManagerJob
 )
-from .types import TransactionStatus, OrderStatus, OrderType, OrderDirection, MarketAnalysisStatus
-from .db import get_db, get_instance
+from .types import TransactionStatus, OrderStatus, OrderType, OrderDirection, MarketAnalysisStatus, OrderOpenType
+from .db import get_db, get_instance, add_instance
 from .utils import get_expert_instance_from_id, get_account_instance_from_id
 
 
@@ -57,7 +57,8 @@ class SmartRiskManagerToolkit:
         depends_on_order: Optional[int] = None,
         depends_order_status_trigger: Optional[OrderStatus] = None,
         good_for: Optional[str] = None,
-        comment: Optional[str] = None
+        comment: Optional[str] = None,
+        open_type: OrderOpenType = OrderOpenType.AUTOMATIC
     ) -> TradingOrder:
         """
         Create a TradingOrder object with proper field validation.
@@ -76,6 +77,7 @@ class SmartRiskManagerToolkit:
             depends_order_status_trigger: Status trigger for dependent order
             good_for: Time-in-force (e.g., 'gtc', 'day')
             comment: Optional order comment
+            open_type: Order open type (AUTOMATIC for Smart Risk Manager)
             
         Returns:
             TradingOrder: Configured order ready for submission
@@ -111,10 +113,11 @@ class SmartRiskManagerToolkit:
             depends_order_status_trigger=depends_order_status_trigger,
             good_for=good_for,
             comment=comment,
-            status=OrderStatus.PENDING  # Will be updated by broker
+            status=OrderStatus.PENDING,  # Will be updated by broker
+            open_type=open_type
         )
         
-        logger.debug(f"Created TradingOrder: {symbol} {side.value} {quantity} @ {order_type.value}")
+        logger.debug(f"Created TradingOrder: {symbol} {side.value} {quantity} @ {order_type.value} (open_type={open_type.value})")
         return order
     
     # ==================== Portfolio & Account Tools ====================
@@ -1541,6 +1544,19 @@ class SmartRiskManagerToolkit:
         """
         try:
             direction = order_direction.value
+            
+            # Validate quantity is greater than 0
+            if quantity <= 0:
+                return {
+                    "success": False,
+                    "message": f"Invalid quantity: {quantity}. Quantity must be greater than 0",
+                    "transaction_id": None,
+                    "order_id": None,
+                    "symbol": symbol,
+                    "quantity": quantity,
+                    "direction": direction
+                }
+            
             logger.info(f"Opening new {direction} position for {symbol}, quantity={quantity}. Reason: {reason}")
             
             # Check for existing open transaction on this symbol
@@ -1646,99 +1662,175 @@ class SmartRiskManagerToolkit:
                     "direction": direction
                 }
             
-            # Create and submit market order (transaction will be auto-created)
+            # Create transaction BEFORE submitting orders
+            transaction = Transaction(
+                symbol=symbol,
+                quantity=quantity if order_direction == OrderDirection.BUY else -quantity,
+                open_price=current_price,  # Estimated open price
+                status=TransactionStatus.WAITING,
+                created_at=datetime.now(timezone.utc),
+                expert_id=self.expert_instance_id  # Link to Smart Risk Manager expert
+            )
+            
+            transaction_id = add_instance(transaction)
+            logger.info(f"Created transaction {transaction_id} for {symbol} {direction} position (expert_id={self.expert_instance_id})")
+            
+            # Create and submit market order linked to transaction
             entry_order = self._create_trading_order(
                 symbol=symbol,
                 quantity=quantity,
                 side=order_direction,
                 order_type=OrderType.MARKET,
+                transaction_id=transaction_id,
                 comment=f"New position: {reason}"
             )
             
-            # Submit order - this will auto-create transaction for market orders
-            submitted_order = self.account.submit_order(entry_order)
-            
-            if not submitted_order or not submitted_order.id:
+            # Submit order
+            try:
+                submitted_order = self.account.submit_order(entry_order)
+                
+                if not submitted_order or not submitted_order.id:
+                    # Mark transaction as FAILED if order submission failed
+                    with get_db() as session:
+                        trans = session.get(Transaction, transaction_id)
+                        if trans:
+                            trans.status = TransactionStatus.FAILED
+                            session.add(trans)
+                            session.commit()
+                    
+                    return {
+                        "success": False,
+                        "message": f"Failed to submit entry order for {symbol}",
+                        "transaction_id": transaction_id,
+                        "order_id": None,
+                        "symbol": symbol,
+                        "quantity": quantity,
+                        "direction": direction
+                    }
+                
+                order_id = submitted_order.id
+                logger.info(f"Successfully opened position: transaction_id={transaction_id}, order_id={order_id}")
+                
+            except Exception as e:
+                # Mark transaction as FAILED if order submission raised exception
+                with get_db() as session:
+                    trans = session.get(Transaction, transaction_id)
+                    if trans:
+                        trans.status = TransactionStatus.FAILED
+                        session.add(trans)
+                        session.commit()
+                
+                logger.error(f"Error submitting entry order for {symbol}: {e}", exc_info=True)
                 return {
                     "success": False,
-                    "message": f"Failed to submit entry order for {symbol}",
-                    "transaction_id": None,
+                    "message": f"Error submitting entry order for {symbol}: {str(e)}",
+                    "transaction_id": transaction_id,
                     "order_id": None,
                     "symbol": symbol,
                     "quantity": quantity,
                     "direction": direction
                 }
             
-            transaction_id = submitted_order.transaction_id
-            order_id = submitted_order.id
-            
-            logger.info(f"Successfully opened position: transaction_id={transaction_id}, order_id={order_id}")
-            
             # Submit TP/SL orders if provided and we have a transaction
             tp_created = False
             sl_created = False
+            tp_warning = None
+            sl_warning = None
             
             if transaction_id:
-                # Take profit order (opposite direction limit order)
+                # Validate and create take profit order (opposite direction limit order)
                 if tp_price:
-                    tp_side = OrderDirection.SELL if order_direction == OrderDirection.BUY else OrderDirection.BUY
-                    tp_type = OrderType.SELL_LIMIT if order_direction == OrderDirection.BUY else OrderType.BUY_LIMIT
+                    # Check if TP price makes sense for the direction
+                    tp_valid = True
+                    if order_direction == OrderDirection.BUY and tp_price <= current_price:
+                        tp_valid = False
+                        tp_warning = f"TP price {tp_price:.2f} is not above current price {current_price:.2f} for BUY order"
+                    elif order_direction == OrderDirection.SELL and tp_price >= current_price:
+                        tp_valid = False
+                        tp_warning = f"TP price {tp_price:.2f} is not below current price {current_price:.2f} for SELL order"
                     
-                    try:
-                        tp_order = self._create_trading_order(
-                            symbol=symbol,
-                            quantity=quantity,
-                            side=tp_side,
-                            order_type=tp_type,
-                            transaction_id=transaction_id,
-                            limit_price=tp_price,
-                            depends_on_order=order_id,
-                            depends_order_status_trigger=OrderStatus.FILLED,
-                            comment=f"TP for transaction {transaction_id}"
-                        )
-                        submitted_tp = self.account.submit_order(tp_order)
-                        if submitted_tp:
-                            tp_created = True
-                            logger.info(f"Created take profit order at {tp_price}")
-                    except Exception as e:
-                        logger.error(f"Failed to create TP order: {e}")
+                    if tp_valid:
+                        tp_side = OrderDirection.SELL if order_direction == OrderDirection.BUY else OrderDirection.BUY
+                        tp_type = OrderType.SELL_LIMIT if order_direction == OrderDirection.BUY else OrderType.BUY_LIMIT
+                        
+                        try:
+                            tp_order = self._create_trading_order(
+                                symbol=symbol,
+                                quantity=quantity,
+                                side=tp_side,
+                                order_type=tp_type,
+                                transaction_id=transaction_id,
+                                limit_price=tp_price,
+                                depends_on_order=order_id,
+                                depends_order_status_trigger=OrderStatus.FILLED,
+                                comment=f"TP for transaction {transaction_id}"
+                            )
+                            submitted_tp = self.account.submit_order(tp_order)
+                            if submitted_tp:
+                                tp_created = True
+                                logger.info(f"Created take profit order at {tp_price}")
+                        except Exception as e:
+                            tp_warning = f"Failed to create TP order: {e}"
+                            logger.error(tp_warning)
                 
-                # Stop loss order (opposite direction stop order)
+                # Validate and create stop loss order (opposite direction stop order)
                 if sl_price:
-                    sl_side = OrderDirection.SELL if order_direction == OrderDirection.BUY else OrderDirection.BUY
-                    sl_type = OrderType.SELL_STOP if order_direction == OrderDirection.BUY else OrderType.BUY_STOP
+                    # Check if SL price makes sense for the direction
+                    sl_valid = True
+                    if order_direction == OrderDirection.BUY and sl_price >= current_price:
+                        sl_valid = False
+                        sl_warning = f"SL price {sl_price:.2f} is not below current price {current_price:.2f} for BUY order"
+                    elif order_direction == OrderDirection.SELL and sl_price <= current_price:
+                        sl_valid = False
+                        sl_warning = f"SL price {sl_price:.2f} is not above current price {current_price:.2f} for SELL order"
                     
-                    try:
-                        sl_order = self._create_trading_order(
-                            symbol=symbol,
-                            quantity=quantity,
-                            side=sl_side,
-                            order_type=sl_type,
-                            transaction_id=transaction_id,
-                            stop_price=sl_price,
-                            depends_on_order=order_id,
-                            depends_order_status_trigger=OrderStatus.FILLED,
-                            comment=f"SL for transaction {transaction_id}"
-                        )
-                        submitted_sl = self.account.submit_order(sl_order)
-                        if submitted_sl:
-                            sl_created = True
-                            logger.info(f"Created stop loss order at {sl_price}")
-                    except Exception as e:
-                        logger.error(f"Failed to create SL order: {e}")
+                    if sl_valid:
+                        sl_side = OrderDirection.SELL if order_direction == OrderDirection.BUY else OrderDirection.BUY
+                        sl_type = OrderType.SELL_STOP if order_direction == OrderDirection.BUY else OrderType.BUY_STOP
+                        
+                        try:
+                            sl_order = self._create_trading_order(
+                                symbol=symbol,
+                                quantity=quantity,
+                                side=sl_side,
+                                order_type=sl_type,
+                                transaction_id=transaction_id,
+                                stop_price=sl_price,
+                                depends_on_order=order_id,
+                                depends_order_status_trigger=OrderStatus.FILLED,
+                                comment=f"SL for transaction {transaction_id}"
+                            )
+                            submitted_sl = self.account.submit_order(sl_order)
+                            if submitted_sl:
+                                sl_created = True
+                                logger.info(f"Created stop loss order at {sl_price}")
+                        except Exception as e:
+                            sl_warning = f"Failed to create SL order: {e}"
+                            logger.error(sl_warning)
             
             # Build detailed success message
             tp_sl_info = []
+            warnings = []
             if tp_created:
                 tp_sl_info.append(f"TP@{tp_price:.2f}")
+            elif tp_price and tp_warning:
+                warnings.append(f"TP not created: {tp_warning}")
+            
             if sl_created:
                 tp_sl_info.append(f"SL@{sl_price:.2f}")
+            elif sl_price and sl_warning:
+                warnings.append(f"SL not created: {sl_warning}")
             
             tp_sl_text = f" with {', '.join(tp_sl_info)}" if tp_sl_info else ""
+            warning_text = f" Warnings: {'; '.join(warnings)}" if warnings else ""
+            
+            message = f"Opened {direction} position: {quantity} shares of {symbol} @ ${current_price:.2f}{tp_sl_text} (transaction_id={transaction_id}, order_id={order_id}){warning_text}"
+            if warnings:
+                message += " - You can manually adjust TP/SL using update_take_profit() or update_stop_loss() tools."
             
             return {
                 "success": True,
-                "message": f"Opened {direction} position: {quantity} shares of {symbol} @ ${current_price:.2f}{tp_sl_text} (transaction_id={transaction_id}, order_id={order_id})",
+                "message": message,
                 "transaction_id": transaction_id,
                 "order_id": order_id,
                 "symbol": symbol,
@@ -1746,7 +1838,8 @@ class SmartRiskManagerToolkit:
                 "direction": direction,
                 "entry_price": current_price,
                 "tp_price": tp_price if tp_created else None,
-                "sl_price": sl_price if sl_created else None
+                "sl_price": sl_price if sl_created else None,
+                "warnings": warnings if warnings else None
             }
             
         except Exception as e:

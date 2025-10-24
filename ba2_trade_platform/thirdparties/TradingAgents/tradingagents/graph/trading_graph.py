@@ -355,7 +355,9 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             url: str
         ) -> str:
             """Extract full content from a web page URL for detailed article reading."""
-            return self.toolkit.extract_web_content(url)
+            # Ensure url is wrapped in a list if passed as string
+            urls = [url] if isinstance(url, str) else url
+            return self.toolkit.extract_web_content(urls)
         
         @tool
         def get_social_media_sentiment(
