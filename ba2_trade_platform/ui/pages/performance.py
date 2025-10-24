@@ -61,22 +61,26 @@ class PerformanceTab:
         if not transactions:
             return {}
         
-        # Group by expert
+        # Group by expert instance ID
         expert_transactions = defaultdict(list)
         for txn in transactions:
             expert_transactions[txn.expert_id].append(txn)
         
-        # Calculate metrics per expert
+        # Calculate metrics per expert instance
         expert_metrics = {}
         for expert_id, txns in expert_transactions.items():
-            # Get expert name (use user_description if available, otherwise class name)
+            # Get expert instance display name (use alias if available, otherwise class-id format)
             session = get_db()
             try:
                 expert = session.get(ExpertInstance, expert_id)
                 if expert:
-                    expert_name = expert.user_description if expert.user_description else expert.expert
+                    # Use alias if available, otherwise "ClassName-ID"
+                    if expert.alias:
+                        expert_name = expert.alias
+                    else:
+                        expert_name = f"{expert.expert}-{expert.id}"
                 else:
-                    expert_name = f"Expert {expert_id}"
+                    expert_name = f"Expert-{expert_id}"
             finally:
                 session.close()
             
@@ -131,7 +135,7 @@ class PerformanceTab:
         return expert_metrics
     
     def _calculate_monthly_metrics(self, transactions: List[Transaction]) -> Dict[str, Dict[str, float]]:
-        """Calculate monthly metrics per expert."""
+        """Calculate monthly metrics per expert instance."""
         monthly_data = defaultdict(lambda: defaultdict(lambda: {'pnl': 0, 'count': 0}))
         
         for txn in transactions:
@@ -143,9 +147,13 @@ class PerformanceTab:
                 try:
                     expert = session.get(ExpertInstance, txn.expert_id)
                     if expert:
-                        expert_name = expert.user_description if expert.user_description else expert.expert
+                        # Use alias if available, otherwise "ClassName-ID"
+                        if expert.alias:
+                            expert_name = expert.alias
+                        else:
+                            expert_name = f"{expert.expert}-{expert.id}"
                     else:
-                        expert_name = f"Expert {txn.expert_id}"
+                        expert_name = f"Expert-{txn.expert_id}"
                 finally:
                     session.close()
                 
@@ -206,7 +214,7 @@ class PerformanceTab:
         dashboard.render()
     
     def _render_expert_comparison_charts(self, expert_metrics: Dict[str, Any]):
-        """Render charts comparing experts."""
+        """Render charts comparing expert instances."""
         if not expert_metrics:
             return
         
@@ -215,21 +223,21 @@ class PerformanceTab:
             duration_data = {name: metrics['avg_duration_hours'] 
                            for name, metrics in expert_metrics.items()}
             chart1 = PerformanceBarChart(
-                title="Average Transaction Duration by Expert",
+                title="Average Transaction Duration by Expert Instance",
                 data=duration_data,
-                xlabel="Expert",
+                xlabel="Expert Instance",
                 ylabel="Hours",
                 height=350
             )
             chart1.render()
             
-            # Chart 2: Total P&L by expert
+            # Chart 2: Total P&L by expert instance
             pnl_data = {name: metrics['total_pnl'] 
                        for name, metrics in expert_metrics.items()}
             chart2 = PerformanceBarChart(
-                title="Total P&L by Expert",
+                title="Total P&L by Expert Instance",
                 data=pnl_data,
-                xlabel="Expert",
+                xlabel="Expert Instance",
                 ylabel="Profit/Loss ($)",
                 height=350
             )
@@ -242,7 +250,7 @@ class PerformanceTab:
                 win_loss_data[f'{name} - Losses'] = metrics['losses']
             
             chart3 = PieChartComponent(
-                title="Win/Loss Distribution by Expert",
+                title="Win/Loss Distribution by Expert Instance",
                 data=win_loss_data,
                 donut=True,
                 height=350
@@ -253,16 +261,16 @@ class PerformanceTab:
             avg_pnl_data = {name: metrics['avg_pnl'] 
                           for name, metrics in expert_metrics.items()}
             chart4 = PerformanceBarChart(
-                title="Average P&L per Transaction",
+                title="Average P&L per Transaction by Expert Instance",
                 data=avg_pnl_data,
-                xlabel="Expert",
+                xlabel="Expert Instance",
                 ylabel="Average P&L ($)",
                 height=350
             )
             chart4.render()
     
     def _render_monthly_trends(self, transactions: List[TradingOrder]):
-        """Render monthly trend charts."""
+        """Render monthly trend charts by expert instance."""
         if not transactions:
             return
         
@@ -299,7 +307,7 @@ class PerformanceTab:
         with ui.grid(columns=2).classes('w-full gap-4'):
             # Monthly profit chart
             chart1 = TimeSeriesChart(
-                title="Monthly P&L by Expert",
+                title="Monthly P&L by Expert Instance",
                 series_data=profit_series,
                 ylabel="P&L ($)",
                 height=400
@@ -308,7 +316,7 @@ class PerformanceTab:
             
             # Monthly transaction count chart
             chart2 = TimeSeriesChart(
-                title="Monthly Transaction Count by Expert",
+                title="Monthly Transaction Count by Expert Instance",
                 series_data=transaction_series,
                 ylabel="Transactions",
                 height=400
@@ -324,7 +332,7 @@ class PerformanceTab:
         
         # Prepare table data
         columns = [
-            'Expert', 'Transactions', 'Avg Duration (hrs)', 'Total P&L', 
+            'Expert Instance', 'Transactions', 'Avg Duration (hrs)', 'Total P&L', 
             'Avg P&L', 'Win Rate', 'Profit Factor', 'Largest Win', 
             'Largest Loss', 'Sharpe Ratio'
         ]
@@ -332,7 +340,7 @@ class PerformanceTab:
         rows = []
         for expert_name, metrics in expert_metrics.items():
             rows.append({
-                'Expert': expert_name,
+                'Expert Instance': expert_name,
                 'Transactions': metrics['total_transactions'],
                 'Avg Duration (hrs)': f"{metrics['avg_duration_hours']:.1f}",
                 'Total P&L': f"${metrics['total_pnl']:,.2f}",
@@ -379,12 +387,15 @@ class PerformanceTab:
                     ).all()
                     
                     if experts:
-                        ui.label("Experts:").classes('self-center ml-8')
-                        # Use user_description (shortname) if available, otherwise use expert class name
-                        expert_options = {
-                            expert.id: expert.user_description if expert.user_description else expert.expert 
-                            for expert in experts
-                        }
+                        ui.label("Expert Instances:").classes('self-center ml-8')
+                        # Use alias if available, otherwise use "ClassName-ID" format
+                        expert_options = {}
+                        for expert in experts:
+                            if expert.alias:
+                                display_name = expert.alias
+                            else:
+                                display_name = f"{expert.expert}-{expert.id}"
+                            expert_options[expert.id] = display_name
                         
                         def update_expert_filter(selected):
                             self.selected_experts = selected
@@ -393,7 +404,7 @@ class PerformanceTab:
                         ui.select(
                             options=expert_options,
                             multiple=True,
-                            label="Filter by expert (empty = all)"
+                            label="Filter by expert instance (empty = all)"
                         ).bind_value_to(self, 'selected_experts').on_value_change(
                             lambda e: update_expert_filter(e.value)
                         )

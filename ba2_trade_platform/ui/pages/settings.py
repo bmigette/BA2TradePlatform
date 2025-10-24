@@ -3196,71 +3196,66 @@ class ExpertSettingsTab:
             ui.notify('Expert instance not found', type='error')
     
     def _duplicate_expert(self, source_expert: ExpertInstance):
-        """Duplicate an expert instance with all its settings."""
+        """Duplicate an expert instance with all its settings by copying database records."""
         try:
             logger.info(f'Duplicating expert instance {source_expert.id} ({source_expert.expert})')
             
-            # Create new expert instance with copied fields
-            new_expert = ExpertInstance(
-                expert=source_expert.expert,
-                alias=f"{source_expert.alias or source_expert.expert} (Copy)" if source_expert.alias else f"{source_expert.expert} (Copy)",
-                enabled=False,  # Start disabled for safety
-                account_id=source_expert.account_id,
-                enter_market_ruleset_id=source_expert.enter_market_ruleset_id,
-                open_positions_ruleset_id=source_expert.open_positions_ruleset_id,
-                user_description=source_expert.user_description,
-                virtual_equity_pct=source_expert.virtual_equity_pct
-            )
-            
-            # Save the new expert to get an ID
-            new_expert_id = add_instance(new_expert)
-            
-            # Copy all settings from source expert
             from ...core.models import ExpertSetting
             from sqlmodel import select
-            import json
+            import copy
             
             with get_db() as session:
-                # Delete any existing settings for the new expert (in case of previous failed attempt)
-                existing_settings = session.exec(
+                # Get the source expert from session to ensure we have all data
+                source = session.get(ExpertInstance, source_expert.id)
+                if not source:
+                    raise ValueError(f"Source expert {source_expert.id} not found")
+                
+                # Create new expert instance by copying all fields from source
+                new_expert = ExpertInstance(
+                    expert=source.expert,
+                    alias=f"{source.alias or source.expert} (Copy)" if source.alias else f"{source.expert} (Copy)",
+                    enabled=False,  # Start disabled for safety
+                    account_id=source.account_id,
+                    enter_market_ruleset_id=source.enter_market_ruleset_id,
+                    open_positions_ruleset_id=source.open_positions_ruleset_id,
+                    user_description=source.user_description,
+                    virtual_equity_pct=source.virtual_equity_pct
+                )
+                
+                # Add and flush to get the new ID
+                session.add(new_expert)
+                session.flush()
+                new_expert_id = new_expert.id
+                
+                # Clean up any orphaned settings from previous failed duplication attempts
+                orphaned_settings = session.exec(
                     select(ExpertSetting).where(ExpertSetting.instance_id == new_expert_id)
                 ).all()
-                for existing in existing_settings:
-                    session.delete(existing)
-                session.commit()
+                if orphaned_settings:
+                    logger.warning(f'Found {len(orphaned_settings)} orphaned settings for new expert {new_expert_id}, cleaning up')
+                    for orphaned in orphaned_settings:
+                        session.delete(orphaned)
+                    session.flush()
                 
                 # Get all settings from source expert
                 source_settings = session.exec(
-                    select(ExpertSetting).where(ExpertSetting.instance_id == source_expert.id)
+                    select(ExpertSetting).where(ExpertSetting.instance_id == source.id)
                 ).all()
                 
-                # Create duplicate settings for new expert
+                # Copy all settings - use deepcopy for value_json to handle nested structures
                 for setting in source_settings:
-                    # Handle value_json - it might be a dict, string, or None
-                    if setting.value_json:
-                        if isinstance(setting.value_json, str):
-                            # Parse JSON string and make a copy
-                            value_json_copy = json.loads(setting.value_json)
-                        elif isinstance(setting.value_json, dict):
-                            # Make a copy of the dict
-                            value_json_copy = setting.value_json.copy()
-                        else:
-                            value_json_copy = {}
-                    else:
-                        value_json_copy = {}
-                    
                     new_setting = ExpertSetting(
                         instance_id=new_expert_id,
                         key=setting.key,
                         value_str=setting.value_str,
-                        value_json=value_json_copy,
+                        value_json=copy.deepcopy(setting.value_json) if setting.value_json else None,
                         value_float=setting.value_float
                     )
                     session.add(new_setting)
                 
                 session.commit()
                 
-                logger.info(f'Successfully duplicated expert {source_expert.id} to new expert {new_expert_id} with {len(source_settings)} settings')
+                logger.info(f'Successfully duplicated expert {source.id} to new expert {new_expert_id} with {len(source_settings)} settings')
                 ui.notify(f'Expert duplicated successfully! New expert ID: {new_expert_id} ({len(source_settings)} settings copied)', type='positive')
             
             # Refresh the experts table
