@@ -406,9 +406,17 @@ When setting Take Profit (TP) or Stop Loss (SL) prices:
 ## YOUR TASK
 Based on the research findings and rationale above, execute the appropriate trading actions.
 
+**CRITICAL:** You must INVOKE THE TOOLS DIRECTLY using tool calls, NOT write Python code or examples.
+- ✅ CORRECT: Use your tool-calling capability to execute open_buy_position(), close_position(), etc.
+- ❌ WRONG: Do NOT write Python code blocks or markdown showing what to do
+- ❌ WRONG: Do NOT describe actions in text - EXECUTE them using tool calls
+
 DO NOT second-guess the decision to act - you are here because action is warranted.
 DO NOT defer or wait for better conditions - implement the risk management actions now.
-DO use the available tools to execute the trades that address the identified risks and opportunities.
+DO NOT write explanatory code - USE THE TOOLS DIRECTLY to execute trades.
+
+**Remember:** When you want to open a position, you must CALL THE TOOL open_buy_position() or open_sell_position() directly.
+The system will capture your tool calls and execute them. Text descriptions or code examples will NOT be executed.
 
 For EACH action, provide clear reasoning that references your research findings.
 """
