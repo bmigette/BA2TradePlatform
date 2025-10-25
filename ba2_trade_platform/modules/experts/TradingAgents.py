@@ -183,6 +183,10 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                     "NagaAI/deepseek-chat-v3.1:free",
                     "NagaAI/deepseek-reasoner-0528",
                     "NagaAI/deepseek-reasoner-0528:free",
+                    # Qwen (latest reasoning models)
+                    "NagaAI/qwen3-max",
+                    "NagaAI/qwen3-next-80b-a3b-instruct",
+                    "NagaAI/qwen3-next-80b-a3b-thinking",
                 ],
                 "allow_custom": True,  # Allow users to enter custom model names not in the list
                 "tooltip": "The AI model used for in-depth analysis requiring complex reasoning, such as fundamental analysis and debate arbitration. Format: Provider/ModelName. OpenAI models provide proven performance. Naga AI provides access to multiple frontier models including GPT-5, GPT-4, O1/O3, Grok-4, Gemini 2.5, and DeepSeek v3 with free tier available. You can also enter custom model names."
@@ -226,6 +230,10 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                     "NagaAI/deepseek-chat-v3.1:free",
                     "NagaAI/deepseek-v3.2-exp",
                     "NagaAI/deepseek-v3.2-exp:free",
+                    # Qwen (latest reasoning models)
+                    "NagaAI/qwen3-max",
+                    "NagaAI/qwen3-next-80b-a3b-instruct",
+                    "NagaAI/qwen3-next-80b-a3b-thinking",
                 ],
                 "allow_custom": True,  # Allow users to enter custom model names not in the list
                 "help": "For more information, see [OpenAI Models](https://platform.openai.com/docs/models) and [Naga AI Models](https://naga.ac/models)",

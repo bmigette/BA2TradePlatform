@@ -119,6 +119,10 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         "NagaAI/grok-4-0709",
                         "NagaAI/grok-4-fast-non-reasoning",
                         "NagaAI/grok-4-fast-reasoning",
+                        # NagaAI Qwen (latest reasoning models)
+                        "NagaAI/qwen3-max",
+                        "NagaAI/qwen3-next-80b-a3b-instruct",
+                        "NagaAI/qwen3-next-80b-a3b-thinking",
                     ],
                     "allow_custom": True,
                     "help": "For more information, see [OpenAI Docs](https://platform.openai.com/docs/models) and [Naga AI Web Search](https://docs.naga.ac/features/web-search)",
@@ -141,6 +145,10 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         "NagaAI/grok-4-0709",
                         "NagaAI/grok-4-fast-non-reasoning",
                         "NagaAI/grok-4-fast-reasoning",
+                        # NagaAI Qwen (latest reasoning models)
+                        "NagaAI/qwen3-max",
+                        "NagaAI/qwen3-next-80b-a3b-instruct",
+                        "NagaAI/qwen3-next-80b-a3b-thinking",
                     ],
                     "allow_custom": True,
                     "help": "For more information, see [OpenAI Docs](https://platform.openai.com/docs/models) and [Naga AI Web Search](https://docs.naga.ac/features/web-search)",

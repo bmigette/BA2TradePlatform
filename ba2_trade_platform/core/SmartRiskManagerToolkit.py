@@ -1731,82 +1731,62 @@ class SmartRiskManagerToolkit:
                     "direction": direction
                 }
             
-            # Submit TP/SL orders if provided and we have a transaction
+            # Use AccountInterface's built-in TP/SL methods (handles broker-specific logic, pending orders, etc.)
             tp_created = False
             sl_created = False
             tp_warning = None
             sl_warning = None
             
-            if transaction_id:
-                # Validate and create take profit order (opposite direction limit order)
+            if transaction_id and submitted_order:
+                # Validate TP/SL prices before attempting to set them
+                tp_valid = True
+                sl_valid = True
+                
                 if tp_price:
-                    # Check if TP price makes sense for the direction
-                    tp_valid = True
                     if order_direction == OrderDirection.BUY and tp_price <= current_price:
                         tp_valid = False
                         tp_warning = f"TP price {tp_price:.2f} is not above current price {current_price:.2f} for BUY order"
                     elif order_direction == OrderDirection.SELL and tp_price >= current_price:
                         tp_valid = False
                         tp_warning = f"TP price {tp_price:.2f} is not below current price {current_price:.2f} for SELL order"
-                    
-                    if tp_valid:
-                        tp_side = OrderDirection.SELL if order_direction == OrderDirection.BUY else OrderDirection.BUY
-                        tp_type = OrderType.SELL_LIMIT if order_direction == OrderDirection.BUY else OrderType.BUY_LIMIT
-                        
-                        try:
-                            tp_order = self._create_trading_order(
-                                symbol=symbol,
-                                quantity=quantity,
-                                side=tp_side,
-                                order_type=tp_type,
-                                transaction_id=transaction_id,
-                                limit_price=tp_price,
-                                depends_on_order=order_id,
-                                depends_order_status_trigger=OrderStatus.FILLED,
-                                comment=f"TP for transaction {transaction_id}"
-                            )
-                            submitted_tp = self.account.submit_order(tp_order)
-                            if submitted_tp:
-                                tp_created = True
-                                logger.info(f"Created take profit order at {tp_price}")
-                        except Exception as e:
-                            tp_warning = f"Failed to create TP order: {e}"
-                            logger.error(tp_warning)
                 
-                # Validate and create stop loss order (opposite direction stop order)
                 if sl_price:
-                    # Check if SL price makes sense for the direction
-                    sl_valid = True
                     if order_direction == OrderDirection.BUY and sl_price >= current_price:
                         sl_valid = False
                         sl_warning = f"SL price {sl_price:.2f} is not below current price {current_price:.2f} for BUY order"
                     elif order_direction == OrderDirection.SELL and sl_price <= current_price:
                         sl_valid = False
                         sl_warning = f"SL price {sl_price:.2f} is not above current price {current_price:.2f} for SELL order"
-                    
-                    if sl_valid:
-                        sl_side = OrderDirection.SELL if order_direction == OrderDirection.BUY else OrderDirection.BUY
-                        sl_type = OrderType.SELL_STOP if order_direction == OrderDirection.BUY else OrderType.BUY_STOP
-                        
-                        try:
-                            sl_order = self._create_trading_order(
-                                symbol=symbol,
-                                quantity=quantity,
-                                side=sl_side,
-                                order_type=sl_type,
-                                transaction_id=transaction_id,
-                                stop_price=sl_price,
-                                depends_on_order=order_id,
-                                depends_order_status_trigger=OrderStatus.FILLED,
-                                comment=f"SL for transaction {transaction_id}"
-                            )
-                            submitted_sl = self.account.submit_order(sl_order)
-                            if submitted_sl:
-                                sl_created = True
-                                logger.info(f"Created stop loss order at {sl_price}")
-                        except Exception as e:
-                            sl_warning = f"Failed to create SL order: {e}"
-                            logger.error(sl_warning)
+                
+                # Use AccountInterface methods to set TP/SL (handles pending orders and broker-specific logic)
+                try:
+                    if tp_price and tp_valid and sl_price and sl_valid:
+                        # Set both TP and SL together (more efficient)
+                        logger.info(f"Setting TP@{tp_price:.2f} and SL@{sl_price:.2f} using account.set_order_tp_sl()")
+                        tp_order, sl_order = self.account.set_order_tp_sl(submitted_order, tp_price, sl_price)
+                        if tp_order:
+                            tp_created = True
+                        if sl_order:
+                            sl_created = True
+                    elif tp_price and tp_valid:
+                        # Set TP only
+                        logger.info(f"Setting TP@{tp_price:.2f} using account.set_order_tp()")
+                        tp_order = self.account.set_order_tp(submitted_order, tp_price)
+                        if tp_order:
+                            tp_created = True
+                    elif sl_price and sl_valid:
+                        # Set SL only
+                        logger.info(f"Setting SL@{sl_price:.2f} using account.set_order_sl()")
+                        sl_order = self.account.set_order_sl(submitted_order, sl_price)
+                        if sl_order:
+                            sl_created = True
+                except Exception as e:
+                    error_msg = f"Failed to set TP/SL: {str(e)}"
+                    logger.error(error_msg, exc_info=True)
+                    if tp_price and not tp_warning:
+                        tp_warning = error_msg
+                    if sl_price and not sl_warning:
+                        sl_warning = error_msg
             
             # Build detailed success message
             tp_sl_info = []

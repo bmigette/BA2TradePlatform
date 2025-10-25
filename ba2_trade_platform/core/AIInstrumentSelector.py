@@ -198,14 +198,14 @@ class AIInstrumentSelector:
         Returns:
             str: Default prompt for financial instrument selection
         """
-        return """You are a financial advisor specializing in stock analysis. Give me a list of 20 stock symbols that have medium risk and high profit potential.
+        return """You are a financial advisor specializing in stock analysis. Give me a list of 30 stock symbols that have medium/high risk and high profit potential.
 
 REQUIREMENTS:
-- Focus on well-established companies with good liquidity
 - Consider recent market trends and developments  
 - Include a mix of different sectors for diversification
-- Prioritize stocks with medium risk profiles (avoid penny stocks and highly volatile assets)
+- Prioritize stocks with medium to high risk profiles (avoid penny stocks)
 - Look for companies with strong fundamentals and growth potential
+- Search the web to get latest updates
 
 CRITICAL: You MUST respond with ONLY a valid JSON array of stock symbols. Do not include any explanations, commentary, or additional text.
 

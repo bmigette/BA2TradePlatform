@@ -263,6 +263,11 @@ You will be guided through each step of the process. Let's begin.
 
 PORTFOLIO_ANALYSIS_PROMPT = """Analyze the current portfolio status and identify key risks and opportunities.
 
+## CRITICAL: YOU HAVE FULL AUTONOMY
+You are an autonomous risk management system. Do NOT ask for approval or permission.
+You will analyze, then the system will automatically proceed to research and action phases.
+Simply provide your assessment - no approval required.
+
 ## CURRENT PORTFOLIO STATUS
 {portfolio_status}
 
@@ -274,12 +279,16 @@ Review the portfolio and create an initial assessment covering:
 4. Any risk concentrations (too much exposure to one symbol)
 5. Initial thoughts on what actions may be needed
 
-Be concise but thorough. This assessment will guide your next steps.
+Be concise but thorough. This assessment will guide the next research phase which will happen automatically.
 """
 
 # DECISION_LOOP_PROMPT removed - no longer using decision loop node
 
 RESEARCH_PROMPT = """You are a research specialist for portfolio risk management.
+
+## CRITICAL: YOU HAVE FULL AUTONOMY
+You can call ANY tool MULTIPLE TIMES without asking for approval or permission.
+Your job is to research thoroughly, then RECOMMEND SPECIFIC ACTIONS.
 
 ## YOUR MISSION
 Investigate market analyses to gather detailed information that will help make risk management decisions.
@@ -288,15 +297,43 @@ When you have gathered enough information, you MUST recommend specific trading a
 ## PORTFOLIO CONTEXT
 {agent_scratchpad}
 
-## AVAILABLE ANALYSES
-{recent_analyses_summary}
+## YOUR AVAILABLE TOOLS
+You have full access to these research tools - use them freely and repeatedly:
+- **get_analysis_outputs_tool()** - See what data is available for an analysis
+- **get_analysis_output_detail_tool()** - Get detailed content from an analysis
+- **get_analysis_outputs_batch_tool()** - Efficiently fetch multiple outputs at once (RECOMMENDED for speed)
+- **get_historical_analyses_tool()** - Look up past analyses for a symbol
+- **get_current_price_tool()** - Get real-time price for any symbol
 
-## YOUR TASK
-Use the available tools to investigate analyses that are most relevant to the portfolio's risk management needs.
-You can call tools multiple times to gather information iteratively.
+## MANDATORY ACTION REPORTING TOOLS
+**CRITICAL - YOU MUST USE THESE:**
+- **recommend_actions_tool()** - **REQUIRED**: Log EVERY action you recommend (open, close, adjust positions)
+- **finish_research_tool()** - **REQUIRED**: Call this last with your summary after calling recommend_actions_tool()
 
-**CRITICAL: After gathering information, you MUST call recommend_actions_tool() with specific actions to take.**
-Even if you decide no actions are needed, call recommend_actions_tool([]) with an empty list.
+## YOUR WORKFLOW
+1. Research analyses using the tools above (call them as many times as needed)
+2. **FOR EACH trading action you want to recommend, call recommend_actions_tool() with that specific action**
+3. After logging ALL actions via recommend_actions_tool(), call finish_research_tool() with your summary
+
+## CRITICAL: STRUCTURED ACTION REPORTING
+**DO NOT just write action recommendations in text.** You MUST call recommend_actions_tool() for each action.
+
+Example of CORRECT workflow:
+```
+1. Research: call get_analysis_outputs_batch_tool() to fetch data
+2. Research: call get_current_price_tool() for relevant symbols  
+3. Decide: Based on findings, identify specific trades
+4. Report actions: recommend_actions_tool([
+     {{"action_type": "open_buy_position", "parameters": {{"symbol": "UBER", "quantity": 10, ...}}, "reason": "...", "confidence": 75}},
+     {{"action_type": "close_position", "parameters": {{"transaction_id": 123}}, "reason": "...", "confidence": 80}}
+   ])
+5. Summarize: finish_research_tool("Found 2 high-confidence trades...")
+```
+
+Example of WRONG workflow (DO NOT DO THIS):
+```
+❌ finish_research_tool("I recommend buying UBER and closing position 123")  # NO! Actions not logged!
+```
 
 **IMMEDIATE ACTION PRIORITY:**
 When you identify positions or opportunities that meet the user's risk criteria, you should recommend IMMEDIATE actions rather than waiting or deferring.
@@ -320,7 +357,7 @@ Focus on:
 
 {expert_instructions}
 
-When you have enough information, call recommend_actions_tool() followed by finish_research_tool()."""
+**REMEMBER**: Call recommend_actions_tool() for EVERY action, then finish_research_tool() at the end."""
 
 ACTION_PROMPT = """You are ready to execute risk management actions.
 
@@ -907,19 +944,37 @@ def check_recent_analyses(state: SmartRiskManagerState) -> Dict[str, Any]:
                 by_symbol[sym] = []
             by_symbol[sym].append(analysis)
         
-        # Show summary grouped by symbol (limit to 20 symbols)
-        for idx, (sym, analyses) in enumerate(list(by_symbol.items())[:20]):
-            # Get current price for this symbol
-            price_info = ""
+        # Batch fetch prices for all symbols using bulk API call (reduces API calls dramatically)
+        all_symbols = list(by_symbol.keys())
+        
+        if all_symbols:
+            logger.info(f"Batch fetching bid/ask prices for {len(all_symbols)} symbols using bulk API")
             try:
-                bid_price = toolkit.account.get_instrument_current_price(sym, price_type='bid')
-                ask_price = toolkit.account.get_instrument_current_price(sym, price_type='ask')
-                if bid_price and ask_price:
-                    price_info = f" (current price: bid: {bid_price:.2f} / ask: {ask_price:.2f})"
-                elif bid_price:
-                    price_info = f" (current price: {bid_price:.2f})"
-            except Exception as price_err:
-                logger.debug(f"Could not fetch current price for {sym}: {price_err}")
+                # Fetch ALL bid prices in a single API call
+                bid_prices = toolkit.account.get_instrument_current_price(all_symbols, price_type='bid')
+                # Fetch ALL ask prices in a single API call
+                ask_prices = toolkit.account.get_instrument_current_price(all_symbols, price_type='ask')
+                
+                logger.info(f"Successfully bulk-fetched prices for {len(all_symbols)} symbols (2 API calls total)")
+            except Exception as batch_err:
+                logger.warning(f"Error in bulk price fetching: {batch_err}")
+                bid_prices = {}
+                ask_prices = {}
+        else:
+            bid_prices = {}
+            ask_prices = {}
+        
+        # Show summary grouped by symbol (all symbols, no truncation)
+        for idx, (sym, analyses) in enumerate(by_symbol.items()):
+            # Get price from bulk-fetched cache
+            price_info = ""
+            bid_price = bid_prices.get(sym)
+            ask_price = ask_prices.get(sym)
+            
+            if bid_price and ask_price:
+                price_info = f" (current price: bid: {bid_price:.2f} / ask: {ask_price:.2f})"
+            elif bid_price:
+                price_info = f" (current price: {bid_price:.2f})"
             
             analyses_summary += f"- {sym}{price_info}: {len(analyses)} analysis(es)\n"
             for analysis in analyses[:2]:  # Show up to 2 analyses per symbol
@@ -939,9 +994,6 @@ def check_recent_analyses(state: SmartRiskManagerState) -> Dict[str, Any]:
                 else:
                     # Fallback to simple format
                     analyses_summary += f"  [{analysis['analysis_id']}] {analysis['expert_name']} @ {analysis['timestamp']}\n"
-        
-        if len(by_symbol) > 20:
-            analyses_summary += f"... and {len(by_symbol) - 20} more symbols\n"
         
         scratchpad = state["agent_scratchpad"] + analyses_summary
         
@@ -1141,12 +1193,6 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
         llm = create_llm(risk_manager_model, 0.2, backend_url, api_key)
         llm_with_tools = llm.bind_tools(research_tools)
         
-        # Build initial research prompt with context
-        recent_analyses_summary = "\n".join(
-            f"[{a['analysis_id']}] {a['symbol']} - {a['expert_name']} @ {a['timestamp']}"
-            for a in state["recent_analyses"][:20]
-        )
-        
         # Get expert-specific instructions if available
         expert_instructions = ""
         try:
@@ -1160,19 +1206,55 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
         
         research_system_prompt = f"""You are a research specialist for portfolio risk management.
 
+## CRITICAL: YOU HAVE FULL AUTONOMY
+You can call ANY tool MULTIPLE TIMES without asking for approval or permission.
+Your job is to research thoroughly, then RECOMMEND SPECIFIC ACTIONS using the tools provided.
+
 ## YOUR MISSION
 Investigate market analyses to gather detailed information that will help make risk management decisions.
 
 ## PORTFOLIO CONTEXT
 {state.get('agent_scratchpad', 'No prior context')}
 
-## AVAILABLE ANALYSES
-{recent_analyses_summary}
+## YOUR AVAILABLE TOOLS
+You have full access to these research tools - use them freely and repeatedly:
+- **get_analysis_outputs_tool()** - See what data is available for an analysis
+- **get_analysis_output_detail_tool()** - Get detailed content from an analysis
+- **get_analysis_outputs_batch_tool()** - Efficiently fetch multiple outputs at once (RECOMMENDED for speed)
+- **get_historical_analyses_tool()** - Look up past analyses for a symbol
+- **get_current_price_tool()** - Get real-time price for any symbol
 
-## YOUR TASK
-Use the available tools to investigate analyses that are most relevant to the portfolio's risk management needs.
-You can call tools multiple times to gather information iteratively. When you have gathered enough information,
-call finish_research_tool() with a concise summary of your key findings.
+## MANDATORY ACTION REPORTING TOOLS
+**CRITICAL - YOU MUST USE THESE:**
+- **recommend_actions_tool()** - **REQUIRED**: Log EVERY trading action you recommend
+- **finish_research_tool()** - **REQUIRED**: Call this last with your summary
+
+## YOUR WORKFLOW
+1. Research analyses using the tools above (call them as many times as needed)
+2. **FOR EACH trading action you recommend, call recommend_actions_tool() with structured action data**
+3. After logging ALL actions, call finish_research_tool() with your summary
+
+## CRITICAL: STRUCTURED ACTION REPORTING
+**DO NOT just write recommendations in your summary text.**
+You MUST call recommend_actions_tool() with structured action data for EACH trade.
+
+Example:
+```
+recommend_actions_tool([
+    {{
+        "action_type": "open_buy_position",
+        "parameters": {{"symbol": "UBER", "quantity": 10, "sl_price": 90.0, "tp_price": 100.0}},
+        "reason": "Analysis #1847 shows 75% confidence BUY with 12% expected profit",
+        "confidence": 75
+    }},
+    {{
+        "action_type": "close_position",
+        "parameters": {{"transaction_id": 123}},
+        "reason": "Position showing 15% loss, exceeds risk threshold",
+        "confidence": 85
+    }}
+])
+```
 
 Focus on:
 - Positions currently held in the portfolio
@@ -1180,7 +1262,12 @@ Focus on:
 - Recent analyses with significant profit expectations
 - Risk factors and stop loss recommendations
 
-{expert_instructions}"""
+{expert_instructions}
+
+**REMEMBER**: 
+1. Use research tools as many times as needed (no approval required)
+2. Call recommend_actions_tool() for EVERY action with structured data
+3. Call finish_research_tool() at the end with a summary"""
 
         # Initialize research conversation
         research_messages = [
