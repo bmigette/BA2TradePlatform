@@ -29,13 +29,16 @@ class OpenAICompanyOverviewProvider(CompanyFundamentalsOverviewInterface):
         
         Args:
             model: OpenAI model to use (e.g., 'gpt-4', 'gpt-4o-mini').
-                   If not provided, uses OPENAI_QUICK_THINK_LLM from app settings (default: 'gpt-4')
+                   REQUIRED - must be provided by caller.
         """
         super().__init__()
         
+        if not model:
+            raise ValueError("model parameter is required for OpenAICompanyOverviewProvider - no default fallback allowed")
+        
         # Get OpenAI configuration
         self.backend_url = config.OPENAI_BACKEND_URL
-        self.model = model or config.OPENAI_MODEL
+        self.model = model
         self.default_lookback_days = 90
         
         # Get API key from database settings

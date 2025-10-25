@@ -25,10 +25,13 @@ class AIInstrumentSelector:
         
         Args:
             model_string: Model to use in format "Provider/ModelName" (e.g., "NagaAI/gpt-5-2025-08-07" or "OpenAI/gpt-5")
-                         If None, uses config.OPENAI_MODEL
+                         REQUIRED - no default fallback
         """
+        if not model_string:
+            raise ValueError("model_string is required for AIInstrumentSelector - no default fallback allowed")
+        
         self.client = None
-        self.model_string = model_string or config.OPENAI_MODEL
+        self.model_string = model_string
         self.provider = None  # "openai" or "nagaai"
         self.model = None     # Model name without provider prefix
         self.api_type = None  # "responses" (OpenAI) or "chat" (NagaAI)
@@ -412,7 +415,7 @@ def get_ai_instrument_selector(model_string: Optional[str] = None) -> AIInstrume
     
     Args:
         model_string: Model to use in format "Provider/ModelName" (e.g., "NagaAI/gpt-5-2025-08-07")
-                     If None, uses config.OPENAI_MODEL
+                     REQUIRED - no default fallback allowed
     
     Returns:
         AIInstrumentSelector: Configured AI instrument selector instance

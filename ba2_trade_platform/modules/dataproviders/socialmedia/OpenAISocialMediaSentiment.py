@@ -30,13 +30,16 @@ class OpenAISocialMediaSentiment(SocialMediaDataProviderInterface):
         
         Args:
             model: OpenAI model to use (e.g., 'gpt-4', 'gpt-4o-mini').
-                   If not provided, uses the model from settings
+                   REQUIRED - must be provided by caller.
         """
         super().__init__()
         
+        if not model:
+            raise ValueError("model parameter is required for OpenAISocialMediaSentiment - no default fallback allowed")
+        
         # Get OpenAI configuration
         self.backend_url = config.OPENAI_BACKEND_URL
-        self.model = model or config.OPENAI_MODEL
+        self.model = model
         
         # Get API key from database settings
         api_key = config.get_app_setting('openai_api_key')

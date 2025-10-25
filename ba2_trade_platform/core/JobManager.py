@@ -754,20 +754,25 @@ class JobManager:
             # Get AI prompt from expert settings
             ai_prompt = expert.settings.get('ai_instrument_prompt')
             if not ai_prompt:
-                logger.warning(f"No AI prompt found for expert {expert_instance_id} - using default")
-                ai_prompt = None
+                logger.error(f"No AI prompt configured for expert {expert_instance_id} - cannot perform dynamic selection")
+                return
             
-            # Get model configuration from expert settings
+            # Get model configuration from expert settings (REQUIRED - no fallback)
             model_string = expert.settings.get('dynamic_instrument_selection_model')
             if not model_string:
-                logger.warning(f"No dynamic_instrument_selection_model setting found for expert {expert_instance_id} - using default")
-                model_string = None  # Will use config.OPENAI_MODEL
+                logger.error(f"No dynamic_instrument_selection_model setting configured for expert {expert_instance_id} - cannot perform dynamic selection")
+                return
             
-            logger.debug(f"Using model for dynamic selection: {model_string or 'default'}")
+            logger.info(f"Using model for dynamic selection: {model_string}")
             
             # Use AI to select instruments with configured model
             from .AIInstrumentSelector import AIInstrumentSelector
-            ai_selector = AIInstrumentSelector(model_string=model_string)
+            try:
+                ai_selector = AIInstrumentSelector(model_string=model_string)
+            except ValueError as e:
+                logger.error(f"Failed to initialize AIInstrumentSelector for expert {expert_instance_id}: {e}")
+                return
+            
             selected_instruments = ai_selector.select_instruments(ai_prompt)
             
             if not selected_instruments:

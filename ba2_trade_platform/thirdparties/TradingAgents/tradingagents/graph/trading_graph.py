@@ -112,6 +112,17 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         else:
             raise ValueError(f"Unsupported LLM provider: {self.config['llm_provider']}")
         
+        # Log model configuration
+        logger.info("=" * 80)
+        logger.info("TradingAgents Model Configuration:")
+        logger.info(f"  Provider: {self.config['llm_provider']}")
+        logger.info(f"  Backend URL: {self.config.get('backend_url', 'N/A')}")
+        logger.info(f"  Deep Think Model: {self.config['deep_think_llm']}")
+        logger.info(f"  Quick Think Model: {self.config['quick_think_llm']}")
+        logger.info(f"  WebSearch Model: {self.provider_args.get('websearch_model', 'N/A')}")
+        logger.info(f"  Embedding Model: {self.config.get('embedding_model', 'N/A')}")
+        logger.info("=" * 80)
+        
         # Initialize new toolkit with provider_map
         if not self.provider_map:
             raise ValueError("provider_map is required for TradingAgentsGraph initialization")

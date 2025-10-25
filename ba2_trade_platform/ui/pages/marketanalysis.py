@@ -279,12 +279,16 @@ class JobMonitoringTab:
                 
                 rows = []
                 for job in jobs:
-                    # Get expert name
+                    # Get expert name (alias with fallback to classname + ID)
                     expert_name = "Unknown"
                     try:
                         expert_instance = session.get(ExpertInstance, job.expert_instance_id)
                         if expert_instance:
-                            expert_name = expert_instance.expert
+                            # Use alias if available, otherwise fallback to "classname (ID: expert_id)"
+                            if expert_instance.alias:
+                                expert_name = expert_instance.alias
+                            else:
+                                expert_name = f"{expert_instance.expert} (ID: {expert_instance.id})"
                     except Exception:
                         pass
                     

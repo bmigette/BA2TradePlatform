@@ -39,12 +39,15 @@ class AISocialMediaSentiment(SocialMediaDataProviderInterface):
         Args:
             model: AI model to use in format "Provider/ModelName"
                    (e.g., "OpenAI/gpt-4o", "NagaAI/grok-4-fast-reasoning").
-                   If not provided, uses OpenAI models from config.
+                   REQUIRED - must be provided by caller.
         """
         super().__init__()
         
+        if not model:
+            raise ValueError("model parameter is required for AISocialMediaSentiment - no default fallback allowed")
+        
         # Parse model string to determine provider and API type
-        self.model_string = model or f"OpenAI/{config.OPENAI_MODEL}"
+        self.model_string = model
         self._parse_model_config()
         
         # Initialize appropriate client

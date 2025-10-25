@@ -284,7 +284,7 @@ class LoggingToolNode:
             """Wrapper that stores JSON and returns text for agent."""
             # Log tool call with model information if available
             if model_info:
-                logger.info(f"[TOOL_CALL] Executing {tool_name} with args: {kwargs} | Model: {model_info}")
+                logger.info(f"[TOOL_CALL] Executing {tool_name} with args: {kwargs} | WebSearchModel: {model_info}")
             else:
                 logger.info(f"[TOOL_CALL] Executing {tool_name} with args: {kwargs}")
             
