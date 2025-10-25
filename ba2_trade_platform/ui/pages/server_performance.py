@@ -17,6 +17,74 @@ except ImportError:
     logger.error("plotly not installed")
     go = None
 
+# Geolocation support
+import requests
+IP_GEOLOCATION_CACHE = {}
+CACHE_TTL = 3600  # 1 hour
+GEOLOCATION_THREADS = {}  # Track ongoing geolocation requests
+
+def get_country_from_ip_async(ip_address):
+    """Get country from IP in background thread"""
+    if ip_address in IP_GEOLOCATION_CACHE:
+        cached_data, timestamp = IP_GEOLOCATION_CACHE[ip_address]
+        if time.time() - timestamp < CACHE_TTL:
+            return
+    
+    # Don't make duplicate requests
+    if ip_address in GEOLOCATION_THREADS:
+        return
+    
+    def fetch_country():
+        try:
+            # Skip localhost and private IPs
+            if ip_address in ['127.0.0.1', 'localhost', '::1']:
+                IP_GEOLOCATION_CACHE[ip_address] = ({'country': 'Localhost', 'country_code': 'XX'}, time.time())
+                return
+            
+            # Skip private IPs (RFC 1918)
+            try:
+                import ipaddress
+                ip_obj = ipaddress.ip_address(ip_address)
+                if ip_obj.is_private or ip_obj.is_loopback:
+                    IP_GEOLOCATION_CACHE[ip_address] = ({'country': 'Private Network', 'country_code': 'XX'}, time.time())
+                    return
+            except:
+                pass
+            
+            # Use ip-api.com free service with timeout
+            response = requests.get(f'http://ip-api.com/json/{ip_address}', timeout=3)
+            if response.status_code == 200:
+                data = response.json()
+                country = data.get('country', 'Unknown')
+                country_code = data.get('countryCode', '')
+                IP_GEOLOCATION_CACHE[ip_address] = ({'country': country, 'country_code': country_code}, time.time())
+                logger.debug(f"Geolocation lookup: {ip_address} -> {country}")
+        except Exception as e:
+            logger.debug(f"Failed to get country for IP {ip_address}: {e}")
+            IP_GEOLOCATION_CACHE[ip_address] = ({'country': 'Unknown', 'country_code': 'XX'}, time.time())
+        finally:
+            GEOLOCATION_THREADS.pop(ip_address, None)
+    
+    thread = threading.Thread(target=fetch_country, daemon=True)
+    GEOLOCATION_THREADS[ip_address] = thread
+    thread.start()
+
+def get_country_from_ip(ip_address):
+    """Get country from cache, start async lookup if not cached"""
+    if ip_address in IP_GEOLOCATION_CACHE:
+        cached_data, timestamp = IP_GEOLOCATION_CACHE[ip_address]
+        if time.time() - timestamp < CACHE_TTL:
+            return cached_data.get('country', 'Unknown')
+    
+    # Return Unknown immediately, will update in background
+    get_country_from_ip_async(ip_address)
+    return 'Unknown'
+
+# Pre-populate cache with common IPs
+IP_GEOLOCATION_CACHE['127.0.0.1'] = ({'country': 'Localhost', 'country_code': 'XX'}, time.time())
+IP_GEOLOCATION_CACHE['localhost'] = ({'country': 'Localhost', 'country_code': 'XX'}, time.time())
+IP_GEOLOCATION_CACHE['::1'] = ({'country': 'Localhost', 'country_code': 'XX'}, time.time())
+
 # Track active HTTP clients
 active_clients = {}  # {ip: timestamp}
 clients_lock = threading.Lock()
@@ -142,16 +210,17 @@ def get_active_connections_details():
     with clients_lock:
         # Clean up old entries (older than 2 minutes)
         current_time = time.time()
-        valid_clients = {ip: ts for ip, ts in active_clients.items() 
-                        if current_time - ts < 120}
+        valid_clients = {ip: data for ip, data in active_clients.items() 
+                        if current_time - data.get('timestamp', current_time) < 120}
         active_clients.clear()
         active_clients.update(valid_clients)
         
         return [{
             'remote_ip': ip,
-            'last_seen': datetime.fromtimestamp(ts).strftime('%H:%M:%S'),
+            'country': data.get('country', 'Unknown'),
+            'last_seen': datetime.fromtimestamp(data.get('timestamp', time.time())).strftime('%H:%M:%S'),
             'status': 'ACTIVE'
-        } for ip, ts in sorted(active_clients.items())]
+        } for ip, data in sorted(active_clients.items())]
 
 def get_active_users_count():
     """Get count of active websocket connections to the website"""
@@ -335,6 +404,11 @@ def content() -> None:
             with ui.tab('🔗 Active Clients (Last 1 Hour)'):
                 conn_plot_container = ui.row().classes('w-full')
                 conn_plot = None
+            
+            # World Map Tab - Client Geographic Distribution
+            with ui.tab('🌍 Clients by Country'):
+                geo_plot_container = ui.row().classes('w-full')
+                geo_plot = None
         
         # System Information
         ui.separator().classes('w-full my-8 bg-gray-700')
@@ -345,7 +419,7 @@ def content() -> None:
         
         # Auto-refresh metrics every 2 seconds
         def update_metrics():
-            nonlocal cpu_plot, mem_plot, net_plot, conn_plot
+            nonlocal cpu_plot, mem_plot, net_plot, conn_plot, geo_plot
             
             try:
                 metrics = _metrics_collector.get_current_metrics()
@@ -516,9 +590,116 @@ def content() -> None:
                         if conn_plot:
                             conn_plot_container.remove(conn_plot)
                         conn_plot = ui.plotly(fig_conn).classes('w-full')
+                        
+                        # Geolocation Chart - World Map with Active Clients
+                        connections = get_active_connections_details()
+                        country_counts = {}
+                        
+                        # Map of country names to ISO 3166 country codes
+                        COUNTRY_COORDS = {
+                            'United States': 'USA',
+                            'Canada': 'CAN',
+                            'Mexico': 'MEX',
+                            'United Kingdom': 'GBR',
+                            'Germany': 'DEU',
+                            'France': 'FRA',
+                            'Spain': 'ESP',
+                            'Italy': 'ITA',
+                            'China': 'CHN',
+                            'Japan': 'JPN',
+                            'India': 'IND',
+                            'Brazil': 'BRA',
+                            'Australia': 'AUS',
+                            'Russia': 'RUS',
+                            'Netherlands': 'NLD',
+                            'The Netherlands': 'NLD',
+                            'Switzerland': 'CHE',
+                            'Sweden': 'SWE',
+                            'Norway': 'NOR',
+                            'Singapore': 'SGP',
+                            'South Korea': 'KOR',
+                            'Israel': 'ISR',
+                            'Hungary': 'HUN',
+                            'Saudi Arabia': 'SAU',
+                            'Unknown': 'Unknown',
+                            'Localhost': 'USA',
+                            'Private Network': 'USA'
+                        }
+                        
+                        for conn in connections:
+                            country = conn.get('country', 'Unknown')
+                            country_counts[country] = country_counts.get(country, 0) + 1
+                        
+                        logger.debug(f"Geolocation map update - Total connections: {len(connections)}, Countries: {country_counts}")
+                        
+                        if country_counts:
+                            countries = list(country_counts.keys())
+                            counts = list(country_counts.values())
+                            iso_codes = []
+                            
+                            # Convert country names to ISO codes
+                            for c in countries:
+                                iso = COUNTRY_COORDS.get(c, c)
+                                # Only include entries with valid ISO codes (not 'Unknown')
+                                if iso != 'Unknown':
+                                    iso_codes.append(iso)
+                                else:
+                                    iso_codes.append(None)
+                            
+                            # Filter to only valid countries
+                            valid_entries = [(iso, count, country) for iso, count, country in zip(iso_codes, counts, countries) if iso]
+                            
+                            if valid_entries:
+                                valid_iso, valid_counts, valid_countries = zip(*valid_entries)
+                                
+                                # Create choropleth map
+                                fig_geo = go.Figure(data=go.Choropleth(
+                                    locations=valid_iso,
+                                    z=valid_counts,
+                                    text=valid_countries,
+                                    colorscale='Viridis',
+                                    autocolorscale=False,
+                                    reversescale=False,
+                                    marker_line_color='darkgray',
+                                    marker_line_width=0.5,
+                                    colorbar=dict(
+                                        title="Active Clients",
+                                        thickness=15,
+                                        len=0.7,
+                                        bgcolor='rgba(31, 41, 55, 0.8)',
+                                        tickcolor='#d1d5db'
+                                    ),
+                                    hovertemplate='<b>%{text}</b><br>Clients: %{z}<extra></extra>'
+                                ))
+                                
+                                # Add note if there are Unknown entries
+                                unknown_count = country_counts.get('Unknown', 0)
+                                title_text = 'Active Clients Around the World'
+                                if unknown_count > 0:
+                                    title_text += f' ({unknown_count} clients location unknown)'
+                                
+                                fig_geo.update_layout(
+                                    title=title_text,
+                                    geo=dict(
+                                        showland=True,
+                                        landcolor='rgb(50, 60, 70)',
+                                        showcountries=True,
+                                        countrycolor='rgb(70, 80, 90)',
+                                        projection_type='natural earth',
+                                        bgcolor='rgba(17, 24, 39, 0.9)'
+                                    ),
+                                    height=500,
+                                    margin=dict(l=0, r=0, t=50, b=0),
+                                    template='plotly_dark',
+                                    paper_bgcolor='rgba(17, 24, 39, 1)',
+                                    font=dict(color='#d1d5db')
+                                )
+                                if geo_plot:
+                                    geo_plot_container.clear()
+                                geo_plot = ui.plotly(fig_geo).classes('w-full')
             
             except Exception as e:
-                logger.error(f"Error updating metrics display: {e}")
+                logger.error(f"Error updating metrics display: {e}", exc_info=True)
         
         # Auto-refresh every 30 seconds
         ui.timer(30.0, update_metrics)

@@ -16,7 +16,7 @@ def sidemenu() -> None:
                 ui.item_label('Market Analysis')
         with ui.item(on_click=lambda: ui.navigate.to('/serverperf')):
             with ui.item_section():
-                ui.icon('computer')
+                ui.icon('storage')
             with ui.item_section():
                 ui.item_label('Server Performance')
         with ui.item(on_click=lambda: ui.navigate.to('/settings')).classes('w-full'):
