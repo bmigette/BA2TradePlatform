@@ -1,0 +1,23 @@
+[Unit]
+Description=BA2 Trade Platform - Algorithmic Trading System
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=tony
+WorkingDirectory=/home/tony/BA2TradePlatform
+Environment="PATH=/home/tony/BA2TradePlatform/venv/bin"
+ExecStart=/home/tony/BA2TradePlatform/venv/bin/python main.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ba2-trade-platform
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

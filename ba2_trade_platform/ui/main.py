@@ -1,9 +1,34 @@
 import logging
 from nicegui import ui, Client, app
-from .pages import overview, settings, marketanalysis, market_analysis_detail, rulesettest, marketanalysishistory, smart_risk_manager_detail
+from .pages import overview, settings, marketanalysis, market_analysis_detail, rulesettest, marketanalysishistory, smart_risk_manager_detail, server_performance
 from .layout import layout_render
 from pathlib import Path
 from ..logger import logger
+
+# Middleware to track active client IPs from reverse proxy headers
+@app.middleware('http')
+async def track_client_ip(request, call_next):
+    """Track active client IPs from X-Forwarded-For header (set by Duo DNG)"""
+    try:
+        from .pages.server_performance import active_clients, clients_lock
+        import time
+        
+        # Get real client IP from X-Forwarded-For header (set by Duo DNG reverse proxy)
+        x_forwarded_for = request.headers.get('X-Forwarded-For')
+        if x_forwarded_for:
+            # X-Forwarded-For can contain multiple IPs, first is the client
+            client_ip = x_forwarded_for.split(',')[0].strip()
+        else:
+            # Fallback to direct connection
+            client_ip = request.client.host if request.client else 'unknown'
+        
+        # Track this client
+        with clients_lock:
+            active_clients[client_ip] = time.time()
+    except Exception as e:
+        logger.debug(f"Error tracking client IP: {e}")
+    
+    return await call_next(request)
 
 # Configure NiceGUI JavaScript timeout globally
 # This affects all JavaScript requests throughout the application
@@ -103,6 +128,12 @@ def smart_risk_manager_detail_page(job_id: int) -> None:
     logger.debug(f"[ROUTE] /smartriskmanagerdetail/{job_id} - Loading Smart Risk Manager detail page")
     with layout_render(f'Smart Risk Manager Job #{job_id}'):
         smart_risk_manager_detail.content(job_id)
+
+@ui.page('/serverperf')
+def server_perf_page() -> None:
+    logger.debug("[ROUTE] /serverperf - Loading server performance page")
+    with layout_render('Server Performance'):
+        server_performance.content()
 
 STATICPATH = Path(__file__).parent / 'static'
 FAVICO = (STATICPATH / 'favicon.ico')
