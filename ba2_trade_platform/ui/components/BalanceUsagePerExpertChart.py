@@ -80,6 +80,37 @@ class BalanceUsagePerExpertChart:
             #         for t in transactions_any_status:
             #             logger.info(f"  - Transaction {t.id}: {t.symbol}, status={t.status}, expert_id={t.expert_id}")
             
+            # PROACTIVE PRICE CACHING: Prefetch all unique symbols in bulk to populate cache
+            # This reduces API calls from N (one per symbol) to 2 (one bid batch, one ask batch)
+            if transactions:
+                unique_symbols = list(set(t.symbol for t in transactions))
+                logger.debug(f"Proactively prefetching prices for {len(unique_symbols)} symbols: {unique_symbols}")
+                
+                # Get account interface for bulk price fetching
+                # Use the first transaction's account (assumes all use same account)
+                try:
+                    from ...core.utils import get_account_instance_from_id
+                    first_order = session.exec(
+                        select(TradingOrder)
+                        .where(TradingOrder.transaction_id == transactions[0].id)
+                        .limit(1)
+                    ).first()
+                    
+                    if first_order and first_order.account_id:
+                        account_interface = get_account_instance_from_id(first_order.account_id, session=session)
+                        
+                        # Prefetch bid prices (for SELL side positions)
+                        logger.debug(f"Prefetching bid prices for {len(unique_symbols)} symbols")
+                        account_interface.get_instrument_current_price(unique_symbols, price_type='bid')
+                        
+                        # Prefetch ask prices (for BUY side positions)
+                        logger.debug(f"Prefetching ask prices for {len(unique_symbols)} symbols")
+                        account_interface.get_instrument_current_price(unique_symbols, price_type='ask')
+                        
+                        logger.debug(f"Proactive price cache populated for {len(unique_symbols)} symbols")
+                except Exception as e:
+                    logger.warning(f"Failed to proactively prefetch prices: {e}")
+            
             # Calculate balance usage for each transaction and group by expert
             for transaction in transactions:
                 try:

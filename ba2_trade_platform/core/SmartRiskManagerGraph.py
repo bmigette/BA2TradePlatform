@@ -929,7 +929,33 @@ def check_recent_analyses(state: SmartRiskManagerState) -> Dict[str, Any]:
         # Create toolkit
         toolkit = SmartRiskManagerToolkit(expert_instance_id, account_id)
         
+        # PRE-CACHE: Get symbols with recent analyses and bulk-fetch prices BEFORE calling get_recent_analyses
+        # This prevents individual price API calls during get_analysis_summary() execution
+        from ..core.db import get_db
+        from sqlmodel import Session, select
+        from ..core.models import MarketAnalysis
+        from datetime import datetime, timedelta, timezone
+        
+        with get_db() as session:
+            cutoff_time = datetime.now(timezone.utc) - timedelta(hours=72)
+            symbols_query = select(MarketAnalysis.symbol).where(
+                MarketAnalysis.expert_instance_id == expert_instance_id,
+                MarketAnalysis.created_at >= cutoff_time
+            ).distinct()
+            symbols_to_precache = list(session.exec(symbols_query).all())
+        
+        if symbols_to_precache:
+            logger.info(f"Pre-caching prices for {len(symbols_to_precache)} symbols before fetching analyses")
+            try:
+                # Bulk fetch ALL bid and ask prices in 2 API calls (populates cache)
+                toolkit.account.get_instrument_current_price(symbols_to_precache, price_type='bid')
+                toolkit.account.get_instrument_current_price(symbols_to_precache, price_type='ask')
+                logger.info(f"✅ Successfully pre-cached prices for {len(symbols_to_precache)} symbols (2 API calls)")
+            except Exception as precache_err:
+                logger.warning(f"Price pre-caching failed: {precache_err}")
+        
         # Fetch ALL recent analyses (no symbol filter)
+        # Now get_analysis_summary() will use cached prices instead of making individual API calls
         all_analyses = toolkit.get_recent_analyses(max_age_hours=72)
         
         # Build summary for scratchpad

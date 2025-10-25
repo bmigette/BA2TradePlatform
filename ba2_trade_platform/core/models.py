@@ -430,6 +430,50 @@ class TradingOrder(SQLModel, table=True):
     
     def __str__(self) -> str:
         return self.as_string()
+    
+    def get_expert_id(self, session=None) -> int | None:
+        """
+        Get the expert instance ID for this order, checking both linkage paths.
+        
+        Orders can be linked to experts via two paths:
+        1. Transaction path: TradingOrder -> Transaction -> ExpertInstance (Smart Risk Manager)
+        2. Recommendation path: TradingOrder -> ExpertRecommendation -> ExpertInstance (traditional experts)
+        
+        Args:
+            session: Optional database session. If not provided, creates a new one.
+        
+        Returns:
+            int | None: Expert instance ID if found, None otherwise
+        """
+        # Import here to avoid circular dependency
+        from .db import get_db
+        
+        # Use provided session or create new one
+        close_session = False
+        if session is None:
+            session = get_db()
+            close_session = True
+        
+        try:
+            # Path 1: Check transaction-based linkage (Smart Risk Manager)
+            if self.transaction_id:
+                transaction = session.get(Transaction, self.transaction_id)
+                if transaction and transaction.expert_id:
+                    return transaction.expert_id
+            
+            # Path 2: Check recommendation-based linkage (traditional experts)
+            if self.expert_recommendation_id:
+                from sqlmodel import select
+                recommendation = session.get(ExpertRecommendation, self.expert_recommendation_id)
+                if recommendation and recommendation.instance_id:
+                    return recommendation.instance_id
+            
+            # No expert found via either path
+            return None
+            
+        finally:
+            if close_session:
+                session.close()
 
 
 

@@ -1800,10 +1800,8 @@ class AccountOverviewTab:
             # Query orders from database with joins to get expert information
             # Exclude PENDING and WAITING_TRIGGER orders (they have their own section)
             statement = (
-                select(TradingOrder, AccountDefinition, ExpertRecommendation, ExpertInstance)
+                select(TradingOrder, AccountDefinition)
                 .join(AccountDefinition, TradingOrder.account_id == AccountDefinition.id)
-                .outerjoin(ExpertRecommendation, TradingOrder.expert_recommendation_id == ExpertRecommendation.id)
-                .outerjoin(ExpertInstance, ExpertRecommendation.instance_id == ExpertInstance.id)
                 .where(TradingOrder.created_at >= cutoff_date)
                 .where(TradingOrder.status.not_in([OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER]))
                 .order_by(TradingOrder.created_at.desc())
@@ -1811,15 +1809,20 @@ class AccountOverviewTab:
             
             results = session.exec(statement).all()
             
-            for order, account, recommendation, expert_instance in results:
-                # Get expert name with ID if available
+            for order, account in results:
+                # Use the new helper method to get expert ID
+                expert_id = order.get_expert_id(session)
                 expert_name = ""
-                if expert_instance:
-                    # Format: Alias-ID or ExpertType-ID (e.g., "TradingAgents-1")
-                    base_name = expert_instance.alias or expert_instance.expert
-                    expert_name = f"{base_name}-{expert_instance.id}"
-                elif not recommendation:
-                    expert_name = "Manual"  # No recommendation means manual order
+                
+                if expert_id:
+                    expert_instance = session.get(ExpertInstance, expert_id)
+                    if expert_instance:
+                        base_name = expert_instance.alias or expert_instance.expert
+                        expert_name = f"{base_name}-{expert_instance.id}"
+                
+                # Only mark as "Manual" if no expert found via either path
+                if not expert_name:
+                    expert_name = "Manual"
                 
                 # Format the order data
                 order_dict = {
@@ -1901,10 +1904,8 @@ class AccountOverviewTab:
             # Get orders with PENDING, WAITING_TRIGGER, or ERROR status with expert information
             pending_statuses = [OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER, OrderStatus.ERROR]
             statement = (
-                select(TradingOrder, AccountDefinition, ExpertRecommendation, ExpertInstance)
+                select(TradingOrder, AccountDefinition)
                 .join(AccountDefinition, TradingOrder.account_id == AccountDefinition.id)
-                .outerjoin(ExpertRecommendation, TradingOrder.expert_recommendation_id == ExpertRecommendation.id)
-                .outerjoin(ExpertInstance, ExpertRecommendation.instance_id == ExpertInstance.id)
                 .where(TradingOrder.status.in_(pending_statuses))
                 .order_by(TradingOrder.created_at.desc())
             )
@@ -1916,15 +1917,20 @@ class AccountOverviewTab:
             
             # Prepare data for table
             rows = []
-            for order, account, recommendation, expert_instance in results:
-                # Get expert name with ID if available
+            for order, account in results:
+                # Use the new helper method to get expert ID
+                expert_id = order.get_expert_id(session)
                 expert_name = ""
-                if expert_instance:
-                    # Format: Alias-ID or ExpertType-ID (e.g., "TradingAgents-1")
-                    base_name = expert_instance.alias or expert_instance.expert
-                    expert_name = f"{base_name}-{expert_instance.id}"
-                elif not recommendation:
-                    expert_name = "Manual"  # No recommendation means manual order
+                
+                if expert_id:
+                    expert_instance = session.get(ExpertInstance, expert_id)
+                    if expert_instance:
+                        base_name = expert_instance.alias or expert_instance.expert
+                        expert_name = f"{base_name}-{expert_instance.id}"
+                
+                # Only mark as "Manual" if no expert found via either path
+                if not expert_name:
+                    expert_name = "Manual"
                 
                 # Format dates
                 created_at_str = order.created_at.strftime('%Y-%m-%d %H:%M:%S') if order.created_at else ''

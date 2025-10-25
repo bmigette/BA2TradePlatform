@@ -366,6 +366,26 @@ class SmartRiskManagerToolkit:
                 results.sort(key=lambda x: x["timestamp"], reverse=True)
                 
                 logger.debug(f"Found {len(results)} completed recent analyses")
+                
+                # PROACTIVE PRICE CACHING: Prefetch prices for all symbols in bulk
+                # This populates the cache before agent starts analyzing, reducing individual API calls
+                if results:
+                    unique_symbols = list(set(r["symbol"] for r in results))
+                    logger.debug(f"Proactively prefetching prices for {len(unique_symbols)} symbols from recent analyses")
+                    
+                    try:
+                        # Prefetch bid prices (used by get_current_price which defaults to 'bid')
+                        logger.debug(f"Prefetching bid prices for {len(unique_symbols)} symbols in bulk")
+                        self.account.get_instrument_current_price(unique_symbols, price_type='bid')
+                        
+                        # Also prefetch ask prices (may be needed for position analysis)
+                        logger.debug(f"Prefetching ask prices for {len(unique_symbols)} symbols in bulk")
+                        self.account.get_instrument_current_price(unique_symbols, price_type='ask')
+                        
+                        logger.debug(f"Proactive price cache populated for {len(unique_symbols)} symbols from recent analyses")
+                    except Exception as e:
+                        logger.warning(f"Failed to proactively prefetch prices for analyses: {e}")
+                
                 return results
                 
         except Exception as e:

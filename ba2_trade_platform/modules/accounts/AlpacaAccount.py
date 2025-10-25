@@ -1403,3 +1403,233 @@ class AlpacaAccount(AccountInterface):
                 exc_info=True
             )
             raise
+    
+    def _replace_tp_order(self, existing_tp: TradingOrder, new_tp_price: float) -> TradingOrder:
+        """
+        Replace an existing TP order at Alpaca with a new price using replace_order API.
+        
+        Args:
+            existing_tp: The existing TP order to replace
+            new_tp_price: The new take profit price
+            
+        Returns:
+            TradingOrder: The new TP order (old one marked as REPLACED)
+        """
+        try:
+            from alpaca.trading.requests import ReplaceOrderRequest
+            from ...core.db import add_instance, update_instance, get_db
+            from sqlmodel import Session
+            from ...core.types import OrderType as CoreOrderType
+            
+            logger.info(f"Replacing TP order {existing_tp.id} (broker_id={existing_tp.broker_order_id}) with new price ${new_tp_price:.2f}")
+            
+            # Build replace request - use STOP_LIMIT for both TP and SL
+            replace_request = ReplaceOrderRequest(
+                qty=existing_tp.quantity,
+                limit_price=new_tp_price,
+                stop_price=new_tp_price  # STOP_LIMIT: trigger and execute at same price
+            )
+            
+            # Send replace request to Alpaca
+            replaced_order = self.client.replace_order_by_id(
+                order_id=existing_tp.broker_order_id,
+                replace_order_data=replace_request
+            )
+            
+            # Create new database record for the replacement order
+            with Session(get_db().bind) as session:
+                new_tp = TradingOrder(
+                    account_id=existing_tp.account_id,
+                    symbol=existing_tp.symbol,
+                    quantity=existing_tp.quantity,
+                    side=existing_tp.side,
+                    order_type=CoreOrderType.SELL_STOP_LIMIT if existing_tp.side == OrderDirection.SELL else CoreOrderType.BUY_STOP_LIMIT,
+                    limit_price=new_tp_price,
+                    stop_price=new_tp_price,
+                    transaction_id=existing_tp.transaction_id,
+                    broker_order_id=str(replaced_order.id),
+                    status=OrderStatus.PENDING_NEW,
+                    depends_on_order=existing_tp.depends_on_order,
+                    depends_order_status_trigger=existing_tp.depends_order_status_trigger,
+                    expert_recommendation_id=existing_tp.expert_recommendation_id,
+                    open_type=OrderOpenType.AUTOMATIC,
+                    comment=f"TP STOP_LIMIT (replaced {existing_tp.id})",
+                    created_at=datetime.now(timezone.utc)
+                )
+                session.add(new_tp)
+                session.commit()
+                session.refresh(new_tp)
+                new_tp_id = new_tp.id
+            
+            # Mark old order as REPLACED
+            existing_tp.status = OrderStatus.REPLACED
+            update_instance(existing_tp)
+            
+            logger.info(f"Successfully replaced TP: old={existing_tp.id}, new={new_tp_id}, broker_id={replaced_order.id}")
+            
+            # Refresh to sync broker state
+            self.refresh_orders()
+            
+            # Return the new order
+            return get_instance(TradingOrder, new_tp_id)
+            
+        except Exception as e:
+            logger.error(f"Error replacing TP order {existing_tp.id}: {e}", exc_info=True)
+            raise
+    
+    def _replace_sl_order(self, existing_sl: TradingOrder, new_sl_price: float) -> TradingOrder:
+        """
+        Replace an existing SL order at Alpaca with a new price using replace_order API.
+        
+        Args:
+            existing_sl: The existing SL order to replace
+            new_sl_price: The new stop loss price
+            
+        Returns:
+            TradingOrder: The new SL order (old one marked as REPLACED)
+        """
+        try:
+            from alpaca.trading.requests import ReplaceOrderRequest
+            from ...core.db import add_instance, update_instance, get_db
+            from sqlmodel import Session
+            from ...core.types import OrderType as CoreOrderType
+            
+            logger.info(f"Replacing SL order {existing_sl.id} (broker_id={existing_sl.broker_order_id}) with new price ${new_sl_price:.2f}")
+            
+            # Build replace request - use STOP_LIMIT for both TP and SL
+            replace_request = ReplaceOrderRequest(
+                qty=existing_sl.quantity,
+                limit_price=new_sl_price,
+                stop_price=new_sl_price  # STOP_LIMIT: trigger and execute at same price
+            )
+            
+            # Send replace request to Alpaca
+            replaced_order = self.client.replace_order_by_id(
+                order_id=existing_sl.broker_order_id,
+                replace_order_data=replace_request
+            )
+            
+            # Create new database record for the replacement order
+            with Session(get_db().bind) as session:
+                new_sl = TradingOrder(
+                    account_id=existing_sl.account_id,
+                    symbol=existing_sl.symbol,
+                    quantity=existing_sl.quantity,
+                    side=existing_sl.side,
+                    order_type=CoreOrderType.SELL_STOP_LIMIT if existing_sl.side == OrderDirection.SELL else CoreOrderType.BUY_STOP_LIMIT,
+                    limit_price=new_sl_price,
+                    stop_price=new_sl_price,
+                    transaction_id=existing_sl.transaction_id,
+                    broker_order_id=str(replaced_order.id),
+                    status=OrderStatus.PENDING_NEW,
+                    depends_on_order=existing_sl.depends_on_order,
+                    depends_order_status_trigger=existing_sl.depends_order_status_trigger,
+                    expert_recommendation_id=existing_sl.expert_recommendation_id,
+                    open_type=OrderOpenType.AUTOMATIC,
+                    comment=f"SL STOP_LIMIT (replaced {existing_sl.id})",
+                    created_at=datetime.now(timezone.utc)
+                )
+                session.add(new_sl)
+                session.commit()
+                session.refresh(new_sl)
+                new_sl_id = new_sl.id
+            
+            # Mark old order as REPLACED
+            existing_sl.status = OrderStatus.REPLACED
+            update_instance(existing_sl)
+            
+            logger.info(f"Successfully replaced SL: old={existing_sl.id}, new={new_sl_id}, broker_id={replaced_order.id}")
+            
+            # Refresh to sync broker state
+            self.refresh_orders()
+            
+            # Return the new order
+            return get_instance(TradingOrder, new_sl_id)
+            
+        except Exception as e:
+            logger.error(f"Error replacing SL order {existing_sl.id}: {e}", exc_info=True)
+            raise
+    
+    def _replace_order_with_stop_limit(self, existing_order: TradingOrder, tp_price: float, sl_price: float) -> TradingOrder:
+        """
+        Replace an existing TP or SL order with a STOP_LIMIT order containing both TP and SL.
+        
+        This is the critical method for Alpaca's constraint - they only allow ONE opposite-direction order.
+        When setting both TP and SL together, or adding TP to existing SL (or vice versa),
+        we replace the single existing order with a STOP_LIMIT that has both prices.
+        
+        Args:
+            existing_order: The existing TP or SL order to replace
+            tp_price: The take profit (limit) price
+            sl_price: The stop loss (trigger) price
+            
+        Returns:
+            TradingOrder: The new STOP_LIMIT order with both TP and SL (old one marked as REPLACED)
+        """
+        try:
+            from alpaca.trading.requests import ReplaceOrderRequest
+            from ...core.db import add_instance, update_instance, get_db, get_instance
+            from sqlmodel import Session
+            from ...core.types import OrderType as CoreOrderType
+            
+            logger.info(f"Replacing order {existing_order.id} (broker_id={existing_order.broker_order_id}) with STOP_LIMIT (TP=${tp_price:.2f}, SL=${sl_price:.2f})")
+            
+            # Build replace request - STOP_LIMIT with both prices
+            replace_request = ReplaceOrderRequest(
+                qty=existing_order.quantity,
+                limit_price=tp_price,  # Take profit execution price
+                stop_price=sl_price    # Stop loss trigger price
+            )
+            
+            # Send replace request to Alpaca
+            replaced_order = self.client.replace_order_by_id(
+                order_id=existing_order.broker_order_id,
+                replace_order_data=replace_request
+            )
+            
+            # Determine correct order type based on side
+            if existing_order.side == OrderDirection.SELL:
+                order_type = CoreOrderType.SELL_STOP_LIMIT
+            else:
+                order_type = CoreOrderType.BUY_STOP_LIMIT
+            
+            # Create new database record for the replacement order
+            with Session(get_db().bind) as session:
+                new_order = TradingOrder(
+                    account_id=existing_order.account_id,
+                    symbol=existing_order.symbol,
+                    quantity=existing_order.quantity,
+                    side=existing_order.side,
+                    order_type=order_type,
+                    limit_price=tp_price,
+                    stop_price=sl_price,
+                    transaction_id=existing_order.transaction_id,
+                    broker_order_id=str(replaced_order.id),
+                    status=OrderStatus.PENDING_NEW,
+                    depends_on_order=existing_order.depends_on_order,
+                    depends_order_status_trigger=existing_order.depends_order_status_trigger,
+                    expert_recommendation_id=existing_order.expert_recommendation_id,
+                    open_type=OrderOpenType.AUTOMATIC,
+                    comment=f"TP/SL STOP_LIMIT (replaced {existing_order.id})",
+                    created_at=datetime.now(timezone.utc)
+                )
+                session.add(new_order)
+                session.commit()
+                session.refresh(new_order)
+                new_order_id = new_order.id
+            
+            # Mark old order as REPLACED
+            existing_order.status = OrderStatus.REPLACED
+            update_instance(existing_order)
+            
+            logger.info(f"Successfully replaced with STOP_LIMIT: old={existing_order.id}, new={new_order_id}, broker_id={replaced_order.id}")
+            
+            # Refresh to sync broker state
+            self.refresh_orders()
+            
+            # Return the new order
+            return get_instance(TradingOrder, new_order_id)
+            
+        except Exception as e:
+            logger.error(f"Error replacing order {existing_order.id} with STOP_LIMIT: {e}", exc_info=True)
+            raise

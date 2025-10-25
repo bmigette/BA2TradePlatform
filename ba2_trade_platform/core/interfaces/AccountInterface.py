@@ -1093,12 +1093,9 @@ class AccountInterface(ExtendableSettingsInterface):
                             'tp_reference_price': round(trading_order.open_price, 2)
                         }
                     
-                    # Check if parent order has broker_order_id and is not in terminal status
-                    # This means the order is active at the broker and we can submit TP immediately
-                    should_submit_immediately = (
-                        trading_order.broker_order_id is not None and 
-                        trading_order.status not in OrderStatus.get_terminal_statuses()
-                    )
+                    # Only submit TP immediately if parent order is already FILLED
+                    # If parent is still PENDING/ACCEPTED, use WAITING_TRIGGER to avoid wash trade errors
+                    should_submit_immediately = trading_order.status == OrderStatus.FILLED
                     
                     tp_order = TradingOrder(
                         account_id=self.id,
@@ -1259,11 +1256,11 @@ class AccountInterface(ExtendableSettingsInterface):
                         existing_sl_order.data['sl_percent_target'] = round(sl_percent, 2)
                         existing_sl_order.data['sl_reference_price'] = round(trading_order.open_price, 2)
                     
-                    # Check if parent order is now active and SL order is still WAITING_TRIGGER
+                    # Check if parent order is now FILLED and SL order is still WAITING_TRIGGER
                     # If so, update quantity and status to PENDING, then submit immediately
+                    # Only submit if parent is FILLED to avoid wash trade errors
                     should_submit_immediately = (
-                        trading_order.broker_order_id is not None and 
-                        trading_order.status not in OrderStatus.get_terminal_statuses() and
+                        trading_order.status == OrderStatus.FILLED and
                         existing_sl_order.status == OrderStatus.WAITING_TRIGGER
                     )
                     
@@ -1334,12 +1331,9 @@ class AccountInterface(ExtendableSettingsInterface):
                             'sl_reference_price': round(trading_order.open_price, 2)
                         }
                     
-                    # Check if parent order has broker_order_id and is not in terminal status
-                    # This means the order is active at the broker and we can submit SL immediately
-                    should_submit_immediately = (
-                        trading_order.broker_order_id is not None and 
-                        trading_order.status not in OrderStatus.get_terminal_statuses()
-                    )
+                    # Only submit SL immediately if parent order is already FILLED
+                    # If parent is still PENDING/ACCEPTED, use WAITING_TRIGGER to avoid wash trade errors
+                    should_submit_immediately = trading_order.status == OrderStatus.FILLED
                     
                     sl_order = TradingOrder(
                         account_id=self.id,
@@ -1441,8 +1435,10 @@ class AccountInterface(ExtendableSettingsInterface):
         This method:
         1. Enforces minimum TP and SL percent to protect profitability
         2. Updates the linked transaction's take_profit and stop_loss values
-        3. Calls broker-specific implementation (if supported - e.g., STOP_LIMIT orders)
-        4. Falls back to separate TP/SL orders if broker doesn't support combined orders
+        3. Finds and updates/replaces existing TP/SL orders:
+           - For broker-submitted orders: Uses replace_order API
+           - For WAITING_TRIGGER orders: Updates database directly
+        4. Creates new combined STOP_LIMIT order if none exist
         
         Args:
             trading_order: The original TradingOrder object
@@ -1453,7 +1449,7 @@ class AccountInterface(ExtendableSettingsInterface):
             tuple[TradingOrder, TradingOrder]: A tuple of (tp_order, sl_order) representing the created/updated orders
         """
         try:
-            from sqlmodel import Session
+            from sqlmodel import Session, select
             from ..db import get_db
             
             # Validate inputs
@@ -1527,20 +1523,208 @@ class AccountInterface(ExtendableSettingsInterface):
             
             logger.info(f"Updated transaction {transaction.id} with TP=${tp_price:.2f} and SL=${sl_price:.2f}")
             
-            # Call broker-specific implementation (e.g., STOP_LIMIT orders for Alpaca)
-            # This may submit a combined TP/SL order to the broker
-            self._set_order_tp_sl_impl(trading_order, tp_price, sl_price)
-            
-            # For now, fall back to creating separate TP and SL orders in the database
-            # Broker-specific implementations can override this behavior
-            tp_order = self.set_order_tp(trading_order, tp_price)
-            sl_order = self.set_order_sl(trading_order, sl_price)
+            # Find existing TP/SL orders for this transaction
+            with Session(get_db().bind) as session:
+                existing_orders = session.exec(
+                    select(TradingOrder).where(
+                        TradingOrder.transaction_id == trading_order.transaction_id,
+                        TradingOrder.id != trading_order.id,  # Exclude entry order
+                        TradingOrder.status.not_in(OrderStatus.get_terminal_statuses())
+                    )
+                ).all()
+                
+                existing_tp_sl = None  # Could be TP, SL, or STOP_LIMIT order
+                
+                # Identify existing TP/SL order (only one can exist due to Alpaca constraint)
+                for order in existing_orders:
+                    # Any order on opposite side of entry is our TP/SL order
+                    if order.side != trading_order.side:
+                        existing_tp_sl = order
+                        break
+                
+                # Determine what order type we need for TP+SL combination
+                if trading_order.side == OrderDirection.BUY:
+                    target_order_type = OrderType.SELL_STOP_LIMIT
+                    target_side = OrderDirection.SELL
+                else:
+                    target_order_type = OrderType.BUY_STOP_LIMIT
+                    target_side = OrderDirection.BUY
+                
+                # Handle existing order or create new one
+                if existing_tp_sl:
+                    # We have an existing order - need to update it to STOP_LIMIT with both prices
+                    if existing_tp_sl.broker_order_id and existing_tp_sl.status not in [OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER]:
+                        # Order already at broker - use replace API
+                        logger.info(f"Replacing existing order {existing_tp_sl.id} at broker with STOP_LIMIT (TP=${tp_price}, SL=${sl_price})")
+                        
+                        # Use broker-specific replace that handles STOP_LIMIT creation
+                        result_order = self._replace_order_with_stop_limit(
+                            existing_order=existing_tp_sl,
+                            tp_price=tp_price,
+                            sl_price=sl_price
+                        )
+                        
+                        # Return same order for both TP and SL (it's a combined order)
+                        return (result_order, result_order)
+                        
+                    elif existing_tp_sl.status == OrderStatus.WAITING_TRIGGER:
+                        # Order is WAITING_TRIGGER - update in database directly
+                        logger.info(f"Updating WAITING_TRIGGER order {existing_tp_sl.id} to STOP_LIMIT (TP=${tp_price}, SL=${sl_price})")
+                        
+                        existing_tp_sl.order_type = target_order_type
+                        existing_tp_sl.stop_price = sl_price
+                        existing_tp_sl.limit_price = tp_price
+                        
+                        session.add(existing_tp_sl)
+                        session.commit()
+                        session.refresh(existing_tp_sl)
+                        
+                        # Return same order for both TP and SL
+                        return (existing_tp_sl, existing_tp_sl)
+                    else:
+                        logger.warning(f"Order {existing_tp_sl.id} in unexpected state {existing_tp_sl.status}, will create new")
+                
+                # No existing order or update failed - create new STOP_LIMIT order
+                logger.info(f"Creating new STOP_LIMIT order for transaction {trading_order.transaction_id} (TP=${tp_price}, SL=${sl_price})")
+                
+                # Only submit immediately if parent order is FILLED
+                should_submit_immediately = trading_order.status == OrderStatus.FILLED
+                
+                stop_limit_order = TradingOrder(
+                    account_id=self.id,
+                    symbol=trading_order.symbol,
+                    quantity=trading_order.quantity if should_submit_immediately else 0,
+                    side=target_side,
+                    order_type=target_order_type,
+                    stop_price=sl_price,  # Trigger price (stop loss)
+                    limit_price=tp_price,  # Execution price (take profit)
+                    transaction_id=trading_order.transaction_id,
+                    status=OrderStatus.PENDING if should_submit_immediately else OrderStatus.WAITING_TRIGGER,
+                    depends_on_order=trading_order.id,
+                    depends_order_status_trigger=OrderStatus.FILLED,
+                    expert_recommendation_id=trading_order.expert_recommendation_id,
+                    open_type=OrderOpenType.AUTOMATIC,
+                    comment=f"TP/SL for order {trading_order.id}",
+                    created_at=datetime.now(timezone.utc)
+                )
+                
+                session.add(stop_limit_order)
+                session.commit()
+                session.refresh(stop_limit_order)
+                
+                if should_submit_immediately:
+                    logger.info(f"Parent order {trading_order.id} is FILLED, submitting STOP_LIMIT order {stop_limit_order.id} to broker")
+                    session.close()
+                    try:
+                        self.submit_order(stop_limit_order)
+                        logger.info(f"Successfully submitted STOP_LIMIT order {stop_limit_order.id} to broker")
+                    except Exception as submit_error:
+                        logger.error(f"Error submitting STOP_LIMIT order {stop_limit_order.id}: {submit_error}", exc_info=True)
+                        raise
+                else:
+                    logger.info(f"Created WAITING_TRIGGER STOP_LIMIT order {stop_limit_order.id} (will submit when order {trading_order.id} is FILLED)")
+                
+                # Return same order for both TP and SL (it's a combined order)
+                return (stop_limit_order, stop_limit_order)
             
             return (tp_order, sl_order)
             
         except Exception as e:
             logger.error(f"Error setting TP/SL for order {trading_order.id}: {e}", exc_info=True)
             raise
+    
+    def _replace_tp_order(self, existing_tp: TradingOrder, new_tp_price: float) -> TradingOrder:
+        """
+        Replace an existing TP order at the broker with a new price.
+        Default implementation - can be overridden by broker-specific logic.
+        
+        Args:
+            existing_tp: The existing TP order to replace
+            new_tp_price: The new take profit price
+            
+        Returns:
+            TradingOrder: The updated or new TP order
+        """
+        logger.warning(f"Broker {self.__class__.__name__} does not implement _replace_tp_order, using set_order_tp instead")
+        return self.set_order_tp(existing_tp, new_tp_price)
+    
+    def _replace_sl_order(self, existing_sl: TradingOrder, new_sl_price: float) -> TradingOrder:
+        """
+        Replace an existing SL order at the broker with a new price.
+        Default implementation - can be overridden by broker-specific logic.
+        
+        Args:
+            existing_sl: The existing SL order to replace
+            new_sl_price: The new stop loss price
+            
+        Returns:
+            TradingOrder: The updated or new SL order
+        """
+        logger.warning(f"Broker {self.__class__.__name__} does not implement _replace_sl_order, using set_order_sl instead")
+        return self.set_order_sl(existing_sl, new_sl_price)
+    
+    def _replace_order_with_stop_limit(self, existing_order: TradingOrder, tp_price: float, sl_price: float) -> TradingOrder:
+        """
+        Replace an existing TP or SL order with a STOP_LIMIT order containing both TP and SL.
+        
+        This is the critical method for Alpaca's constraint of allowing only one opposite-direction order.
+        When setting both TP and SL together, or when adding TP to existing SL (or vice versa),
+        we need to replace the single existing order with a STOP_LIMIT that has both prices.
+        
+        Args:
+            existing_order: The existing TP or SL order to replace
+            tp_price: The take profit (limit) price
+            sl_price: The stop loss (trigger) price
+            
+        Returns:
+            The new STOP_LIMIT order with both TP and SL
+        """
+        logger.warning(f"Broker {self.__class__.__name__} does not implement _replace_order_with_stop_limit, using cancel and recreate")
+        
+        # Fallback: cancel old order and create new one
+        try:
+            if existing_order.broker_order_id:
+                self.cancel_order(existing_order.broker_order_id)
+        except Exception as e:
+            logger.error(f"Error canceling old order {existing_order.id}: {e}")
+        
+        # Create new STOP_LIMIT order
+        from ba2_trade_platform.core.db import get_instance
+        transaction = get_instance(Transaction, existing_order.transaction_id)
+        entry_order = get_instance(TradingOrder, transaction.entry_order_id)
+        
+        # Determine correct side and type
+        if entry_order.side == OrderDirection.BUY:
+            order_type = OrderType.SELL_STOP_LIMIT
+            side = OrderDirection.SELL
+        else:
+            order_type = OrderType.BUY_STOP_LIMIT
+            side = OrderDirection.BUY
+        
+        # Create new order
+        stop_limit_order = TradingOrder(
+            account_id=self.id,
+            symbol=entry_order.symbol,
+            quantity=entry_order.quantity,
+            side=side,
+            order_type=order_type,
+            stop_price=sl_price,
+            limit_price=tp_price,
+            transaction_id=transaction.id,
+            status=OrderStatus.PENDING,
+            depends_on_order=entry_order.id,
+            depends_order_status_trigger=OrderStatus.FILLED,
+            expert_recommendation_id=entry_order.expert_recommendation_id,
+            open_type=OrderOpenType.AUTOMATIC,
+            comment=f"TP/SL replacement for order {entry_order.id}",
+            created_at=datetime.now(timezone.utc)
+        )
+        
+        add_instance(stop_limit_order)
+        self.submit_order(stop_limit_order)
+        
+        return stop_limit_order
+
 
     @abstractmethod
     def refresh_positions(self) -> bool:

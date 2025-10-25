@@ -1387,62 +1387,40 @@ class ExpertSettingsTab:
                         ui.label('AI Model Settings:').classes('text-subtitle2 mb-2')
                         ui.label('Configure AI models used by this expert for various tasks:').classes('text-body2 mb-2')
                         
+                        # Get model options from builtin settings definitions
+                        from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
+                        MarketExpertInterface._ensure_builtin_settings()
+                        
+                        risk_manager_model_def = MarketExpertInterface._builtin_settings.get('risk_manager_model', {})
+                        risk_manager_model_options = risk_manager_model_def.get('valid_values', ['NagaAI/gpt-5-2025-08-07'])
+                        risk_manager_model_default = risk_manager_model_def.get('default', 'NagaAI/gpt-5-2025-08-07')
+                        risk_manager_model_help = risk_manager_model_def.get('description', 'AI model used for risk management analysis and decision-making')
+                        
+                        dynamic_model_def = MarketExpertInterface._builtin_settings.get('dynamic_instrument_selection_model', {})
+                        dynamic_model_options = dynamic_model_def.get('valid_values', ['NagaAI/gpt-5-2025-08-07'])
+                        dynamic_model_default = dynamic_model_def.get('default', 'NagaAI/gpt-5-2025-08-07')
+                        dynamic_model_help = dynamic_model_def.get('description', 'AI model used for dynamically selecting trading instruments based on market conditions')
+                        
                         with ui.column().classes('w-full gap-2'):
                             # Risk Manager Model
                             ui.label('Risk Manager Model:').classes('text-sm font-medium')
                             self.risk_manager_model_select = ui.select(
-                                options=[
-                                    'NagaAI/gpt-5-2025-08-07',
-                                    'NagaAI/gpt-5-mini-2025-08-07',
-                                    'NagaAI/claude-opus-4-20250514',
-                                    'NagaAI/claude-sonnet-4-20250514',
-                                    'NagaAI/o1-2024-12-17',
-                                    'NagaAI/o1-mini-2024-09-12',
-                                    'NagaAI/o3-mini-2025-01-31',
-                                    'NagaAI/grok-4-0709',
-                                    'NagaAI/grok-4-fast-reasoning',
-                                    'NagaAI/grok-4-fast-non-reasoning',
-                                    'NagaAI/deepseek-reasoner-0528',
-                                    'NagaAI/deepseek-v3.2-exp',
-                                    'OpenAI/gpt-4o',
-                                    'OpenAI/gpt-4o-mini',
-                                    'OpenAI/o1',
-                                    'OpenAI/o1-mini',
-                                    'OpenAI/o3-mini'
-                                ],
+                                options=risk_manager_model_options,
                                 label='Model for risk analysis',
-                                value='NagaAI/gpt-5-2025-08-07',
+                                value=risk_manager_model_default,
                                 with_input=True
                             ).classes('w-full')
-                            ui.label('AI model used for risk management analysis and decision-making').classes('text-body2 text-grey-7 ml-2')
+                            ui.label(risk_manager_model_help).classes('text-body2 text-grey-7 ml-2')
                             
                             # Dynamic Instrument Selection Model
                             ui.label('Dynamic Instrument Selection Model:').classes('text-sm font-medium mt-2')
                             self.dynamic_instrument_selection_model_select = ui.select(
-                                options=[
-                                    'NagaAI/gpt-5-2025-08-07',
-                                    'NagaAI/gpt-5-mini-2025-08-07',
-                                    'NagaAI/claude-opus-4-20250514',
-                                    'NagaAI/claude-sonnet-4-20250514',
-                                    'NagaAI/o1-2024-12-17',
-                                    'NagaAI/o1-mini-2024-09-12',
-                                    'NagaAI/o3-mini-2025-01-31',
-                                    'NagaAI/grok-4-0709',
-                                    'NagaAI/grok-4-fast-reasoning',
-                                    'NagaAI/grok-4-fast-non-reasoning',
-                                    'NagaAI/deepseek-reasoner-0528',
-                                    'NagaAI/deepseek-v3.2-exp',
-                                    'OpenAI/gpt-4o',
-                                    'OpenAI/gpt-4o-mini',
-                                    'OpenAI/o1',
-                                    'OpenAI/o1-mini',
-                                    'OpenAI/o3-mini'
-                                ],
+                                options=dynamic_model_options,
                                 label='Model for dynamic instrument selection',
-                                value='NagaAI/gpt-5-2025-08-07',
+                                value=dynamic_model_default,
                                 with_input=True
                             ).classes('w-full')
-                            ui.label('AI model used for dynamically selecting trading instruments based on market conditions').classes('text-body2 text-grey-7 ml-2')
+                            ui.label(dynamic_model_help).classes('text-body2 text-grey-7 ml-2')
                         
                         ui.separator().classes('my-4')
                         
