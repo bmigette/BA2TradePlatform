@@ -881,15 +881,21 @@ class WorkerQueue:
             from .db import get_instance, add_instance, update_instance
             from .models import ExpertInstance, SmartRiskManagerJob
             from .SmartRiskManagerGraph import run_smart_risk_manager
+            from ..core.interfaces import get_expert_instance_from_id
             
             # Get the expert instance to retrieve settings
             expert_instance = get_instance(ExpertInstance, task.expert_instance_id)
             if not expert_instance:
                 raise ValueError(f"Expert instance {task.expert_instance_id} not found")
             
+            # Get the full expert interface to access settings properly
+            expert_interface = get_expert_instance_from_id(task.expert_instance_id)
+            if not expert_interface:
+                raise ValueError(f"Expert interface for instance {task.expert_instance_id} could not be loaded")
+            
             # Get model and user instructions from settings
-            settings = expert_instance.settings or {}
-            model_used = settings.get("llm_model", "")
+            settings = expert_interface.settings
+            model_used = settings.get("risk_manager_model", "")
             user_instructions = settings.get("user_instructions", "")
             
             # Create SmartRiskManagerJob record with RUNNING status

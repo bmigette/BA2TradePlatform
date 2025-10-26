@@ -262,7 +262,7 @@ class LoggingToolNode:
         self.tool_node = ToolNode(wrapped_tools)
     
     def _format_message_header(self, content: str) -> str:
-        """Format AI message with model information header."""
+        """Format ssage with model information header."""
         if not self.model_info:
             return content
         return f"""================================== AI Message ({self.model_info}) ==================================

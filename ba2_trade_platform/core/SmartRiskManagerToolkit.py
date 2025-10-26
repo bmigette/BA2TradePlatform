@@ -151,9 +151,18 @@ class SmartRiskManagerToolkit:
                     .where(Transaction.status == TransactionStatus.OPENED)
                 ).all()
                 
+                # Get pending transactions (WAITING status)
+                pending_transactions = session.exec(
+                    select(Transaction)
+                    .where(Transaction.expert_id == self.expert_instance_id)
+                    .where(Transaction.status == TransactionStatus.WAITING)
+                ).all()
+                
                 open_positions = []
+                pending_positions = []
                 total_unrealized_pnl = 0.0
                 total_position_value = 0.0
+                total_pending_value = 0.0
                 largest_position_value = 0.0
                 
                 for trans in transactions:
@@ -240,24 +249,77 @@ class SmartRiskManagerToolkit:
                     total_position_value += position_value
                     largest_position_value = max(largest_position_value, position_value)
                 
+                # Process pending transactions (WAITING status)
+                for trans in pending_transactions:
+                    # Get pending quantity from unfilled orders
+                    pending_qty = trans.get_pending_open_qty()
+                    
+                    if pending_qty == 0:
+                        continue
+                    
+                    # Infer direction from pending orders
+                    direction = None
+                    estimated_price = None
+                    if trans.trading_orders:
+                        for order in trans.trading_orders:
+                            if order.status in OrderStatus.get_unfilled_statuses() and order.depends_on_order is None:
+                                direction = order.side
+                                # Use limit price if available, otherwise use current market price as estimate
+                                if order.limit_price:
+                                    estimated_price = order.limit_price
+                                break
+                    
+                    if not direction:
+                        continue
+                    
+                    # Get current price for estimation
+                    try:
+                        current_price = self.account.get_instrument_current_price(trans.symbol)
+                        if not estimated_price:
+                            estimated_price = current_price
+                    except Exception as e:
+                        logger.error(f"Failed to get current price for pending transaction {trans.symbol}: {e}")
+                        if not estimated_price:
+                            continue
+                    
+                    # Calculate estimated value of pending position
+                    pending_value = abs(pending_qty) * estimated_price
+                    
+                    pending_data = {
+                        "transaction_id": trans.id,
+                        "symbol": trans.symbol,
+                        "direction": direction.value,
+                        "pending_quantity": abs(pending_qty),
+                        "estimated_price": round(estimated_price, 2),
+                        "estimated_value": round(pending_value, 2)
+                    }
+                    
+                    pending_positions.append(pending_data)
+                    total_pending_value += pending_value
+                
                 # Calculate risk metrics using virtual_balance from expert
                 balance_pct_available = (available_balance / virtual_balance * 100) if virtual_balance > 0 else 0.0
                 largest_position_pct = (largest_position_value / virtual_balance * 100) if virtual_balance > 0 else 0.0
+                pending_value_pct = (total_pending_value / virtual_balance * 100) if virtual_balance > 0 else 0.0
                 
                 result = {
                     "account_virtual_equity": round(virtual_balance, 2),
                     "account_available_balance": round(available_balance, 2),
                     "account_balance_pct_available": round(balance_pct_available, 2),
+                    "pending_transactions_value": round(total_pending_value, 2),
+                    "pending_transactions_pct": round(pending_value_pct, 2),
                     "open_positions": open_positions,
+                    "pending_positions": pending_positions,
                     "total_unrealized_pnl": round(total_unrealized_pnl, 2),
                     "total_position_value": round(total_position_value, 2),
                     "risk_metrics": {
                         "largest_position_pct": round(largest_position_pct, 2),
-                        "num_positions": len(open_positions)
+                        "num_positions": len(open_positions),
+                        "num_pending": len(pending_positions)
                     }
                 }
                 
-                logger.debug(f"Portfolio status: {len(open_positions)} positions, virtual_balance=${virtual_balance:,.2f}, available_balance=${available_balance:,.2f}, unrealized_pnl={total_unrealized_pnl}")
+                logger.debug(f"Portfolio status: {len(open_positions)} open positions, {len(pending_positions)} pending, virtual_balance=${virtual_balance:,.2f}, available_balance=${available_balance:,.2f}, pending_value=${total_pending_value:,.2f}, unrealized_pnl={total_unrealized_pnl}")
                 return result
                 
         except Exception as e:
@@ -459,13 +521,46 @@ class SmartRiskManagerToolkit:
                 if not expert_inst:
                     raise ValueError(f"Expert instance {analysis.expert_instance_id} not found")
                 
-                # Call get_output_detail
-                if hasattr(expert_inst, 'get_output_detail'):
-                    detail = expert_inst.get_output_detail(analysis_id, output_key)
-                    logger.debug(f"Retrieved output detail (length: {len(detail)} chars)")
-                    return detail
+                # Check if expert implements get_output_detail
+                has_method = hasattr(expert_inst, 'get_output_detail')
+                is_callable = callable(getattr(expert_inst, 'get_output_detail', None))
+                
+                logger.debug(f"Expert type: {type(expert_inst).__name__}, has_method: {has_method}, is_callable: {is_callable}")
+                
+                # Try to call get_output_detail if expert implements it
+                if has_method and is_callable:
+                    try:
+                        detail = expert_inst.get_output_detail(analysis_id, output_key)
+                        logger.debug(f"Retrieved output detail from expert.get_output_detail() (length: {len(detail)} chars)")
+                        return detail
+                    except KeyError as ke:
+                        # Expert method raised KeyError - output not found
+                        logger.warning(f"Expert.get_output_detail() raised KeyError: {ke}")
+                        return f"Output '{output_key}' not available for analysis {analysis_id}: {str(ke)}"
+                    except Exception as e:
+                        # Other error from expert method - log and fallback
+                        logger.error(f"Expert.get_output_detail() failed: {e}", exc_info=True)
+                        # Fall through to fallback
+                
+                # Fallback: Query AnalysisOutput table directly
+                logger.debug(f"Using fallback - querying AnalysisOutput table directly")
+                
+                from sqlmodel import select
+                from .models import AnalysisOutput
+                
+                # Try to find the output by name matching the output_key
+                output = session.exec(
+                    select(AnalysisOutput)
+                    .where(AnalysisOutput.market_analysis_id == analysis_id)
+                    .where(AnalysisOutput.name == output_key)
+                ).first()
+                
+                if output and output.text:
+                    logger.debug(f"Retrieved output detail from AnalysisOutput table (length: {len(output.text)} chars)")
+                    return output.text
                 else:
-                    raise ValueError("Expert does not implement get_output_detail()")
+                    # Return a helpful message instead of raising an error
+                    return f"Output '{output_key}' not available for analysis {analysis_id}"
                     
         except Exception as e:
             logger.error(f"Error getting analysis output detail: {e}", exc_info=True)
@@ -540,8 +635,10 @@ class SmartRiskManagerToolkit:
                         # Use get_analysis_output_detail to fetch the content
                         result = self.get_analysis_output_detail(analysis_id, output_key)
                         
-                        # Check if the result indicates an error
-                        if result.startswith("Error:") or result.startswith("Analysis") and "not found" in result:
+                        # Check if the result indicates an error or missing output
+                        if (result.startswith("Error:") or 
+                            result.startswith("Output") and "not available" in result or
+                            result.startswith("Analysis") and "not found" in result):
                             skipped_items.append({
                                 "analysis_id": analysis_id,
                                 "output_key": output_key,
@@ -920,7 +1017,7 @@ class SmartRiskManagerToolkit:
                         "transaction_id": transaction_id
                     }
                 
-                if transaction.status != TransactionStatus.OPEN:
+                if transaction.status != TransactionStatus.OPENED:
                     return {
                         "success": False,
                         "message": f"Transaction {transaction_id} is not open (status: {transaction.status})",
@@ -1589,11 +1686,25 @@ class SmartRiskManagerToolkit:
                 ).first()
                 
                 if existing_transaction:
-                    return {
-                        "success": False,
-                        "message": f"Cannot open new position: An open transaction already exists for {symbol} (transaction_id={existing_transaction.id}). Use adjust_quantity to modify the existing position instead.",
-                        "transaction_id": existing_transaction.id,
-                        "order_id": None,
+                    # Check if it's the same direction
+                    existing_direction = OrderDirection.BUY if existing_transaction.quantity > 0 else OrderDirection.SELL
+                    if existing_direction == order_direction:
+                        return {
+                            "success": False,
+                            "message": f"Cannot open new position: An open {existing_direction.value} position already exists for {symbol} (transaction_id={existing_transaction.id}). Use adjust_quantity to modify the existing position instead.",
+                            "transaction_id": existing_transaction.id,
+                            "order_id": None,
+                            "symbol": symbol,
+                            "quantity": quantity,
+                            "direction": direction
+                        }
+                    else:
+                        # Opposite direction - reject
+                        return {
+                            "success": False,
+                            "message": f"Cannot open {direction} position: An open {existing_direction.value} position already exists for {symbol} (transaction_id={existing_transaction.id}). Cannot have both BUY and SELL positions on the same symbol. Close the existing position first if you want to reverse direction.",
+                            "transaction_id": existing_transaction.id,
+                            "order_id": None,
                         "symbol": symbol,
                         "quantity": quantity,
                         "direction": direction
@@ -1639,7 +1750,11 @@ class SmartRiskManagerToolkit:
             # Check account balance
             account_info = self.account.get_account_info()
             available_balance = float(account_info.cash) if account_info else 0.0
-            virtual_equity = float(account_info.equity) if account_info else 0.0
+            
+            # Get expert's virtual equity (percentage of total account equity)
+            account_equity = float(account_info.equity) if account_info else 0.0
+            virtual_equity_pct = self.expert.instance.virtual_equity_pct
+            virtual_equity = account_equity * (virtual_equity_pct / 100.0)
             
             current_price = self.account.get_instrument_current_price(symbol)
             if current_price is None:
@@ -1666,21 +1781,41 @@ class SmartRiskManagerToolkit:
                     "direction": direction
                 }
             
-            # Check position size limits
+            # Check position size limits and adjust if necessary
             settings = self.expert.settings
             max_position_pct = settings.get("max_virtual_equity_per_instrument_percent", 100.0)
             max_position_value = virtual_equity * (max_position_pct / 100.0)
             
+            original_quantity = quantity
+            quantity_was_adjusted = False
+            
             if position_value > max_position_value:
-                return {
-                    "success": False,
-                    "message": f"Position size {position_value:.2f} exceeds max allowed {max_position_value:.2f} ({max_position_pct}% of equity)",
-                    "transaction_id": None,
-                    "order_id": None,
-                    "symbol": symbol,
-                    "quantity": quantity,
-                    "direction": direction
-                }
+                # Calculate maximum allowed quantity
+                max_allowed_quantity = max_position_value / current_price
+                
+                # Enforce minimum quantity of 1 if stock price is less than 50% of virtual equity
+                if current_price < (virtual_equity * 0.5) and max_allowed_quantity < 1:
+                    max_allowed_quantity = 1
+                    logger.warning(f"Position size would be less than 1 share, but stock price ${current_price:.2f} is less than 50% of equity ${virtual_equity:.2f}. Setting minimum quantity to 1.")
+                
+                # Round down to avoid exceeding limit
+                adjusted_quantity = int(max_allowed_quantity)
+                
+                if adjusted_quantity < 1:
+                    return {
+                        "success": False,
+                        "message": f"Position size {position_value:.2f} exceeds max allowed {max_position_value:.2f} ({max_position_pct}% of equity). Cannot reduce to minimum 1 share without exceeding limit (stock price ${current_price:.2f} too high).",
+                        "transaction_id": None,
+                        "order_id": None,
+                        "symbol": symbol,
+                        "quantity": quantity,
+                        "direction": direction
+                    }
+                
+                quantity = adjusted_quantity
+                position_value = current_price * quantity
+                quantity_was_adjusted = True
+                logger.info(f"Automatically adjusted quantity from {original_quantity} to {quantity} to respect max position size limit ({max_position_pct}% of equity = ${max_position_value:.2f})")
             
             # Create transaction BEFORE submitting orders
             transaction = Transaction(
@@ -1824,7 +1959,12 @@ class SmartRiskManagerToolkit:
             tp_sl_text = f" with {', '.join(tp_sl_info)}" if tp_sl_info else ""
             warning_text = f" Warnings: {'; '.join(warnings)}" if warnings else ""
             
-            message = f"Opened {direction} position: {quantity} shares of {symbol} @ ${current_price:.2f}{tp_sl_text} (transaction_id={transaction_id}, order_id={order_id}){warning_text}"
+            # Add quantity adjustment notice if quantity was changed
+            quantity_adjustment_text = ""
+            if quantity_was_adjusted:
+                quantity_adjustment_text = f" NOTE: Quantity automatically reduced from {original_quantity} to {quantity} to comply with max position size limit ({max_position_pct}% of equity = ${max_position_value:.2f})."
+            
+            message = f"Opened {direction} position: {quantity} shares of {symbol} @ ${current_price:.2f}{tp_sl_text} (transaction_id={transaction_id}, order_id={order_id}){warning_text}{quantity_adjustment_text}"
             if warnings:
                 message += " - You can manually adjust TP/SL using update_take_profit() or update_stop_loss() tools."
             
@@ -1905,22 +2045,25 @@ class SmartRiskManagerToolkit:
         Get all tools as a list for LangChain agent.
         
         Returns:
-            List of LangChain tool objects (all 13 tools)
+            List of LangChain tool objects (all 15 tools)
         """
         return [
-            # Portfolio & Analysis Tools (6)
+            # Portfolio & Analysis Tools (8)
             self.get_portfolio_status,
             self.get_recent_analyses,
             self.get_analysis_outputs,
             self.get_analysis_output_detail,
             self.get_analysis_outputs_batch,
             self.get_historical_analyses,
+            self.get_analysis_at_open_time,
+            self.get_last_risk_manager_summary,
             # Trading Action Tools (7)
             self.close_position,
             self.adjust_quantity,
             self.update_stop_loss,
             self.update_take_profit,
-            self.open_new_position,
+            self.open_buy_position,
+            self.open_sell_position,
             self.get_current_price,
             self.calculate_position_metrics
         ]

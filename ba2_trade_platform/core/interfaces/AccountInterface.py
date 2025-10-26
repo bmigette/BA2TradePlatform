@@ -1,5 +1,5 @@
 from abc import abstractmethod
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 from unittest import result
 from datetime import datetime, timezone
 from threading import Lock
@@ -584,11 +584,133 @@ class AccountInterface(ExtendableSettingsInterface):
                 errors.append("good_for must be a string")
             elif trading_order.good_for.lower() not in ['gtc', 'day', 'ioc', 'fok']:
                 errors.append("good_for must be one of: 'gtc', 'day', 'ioc', 'fok'")
+        
+        # Validate position size limits for market orders with expert_id
+        # This provides defense-in-depth validation at the account interface level
+        if (hasattr(trading_order, 'order_type') and 
+            trading_order.order_type == OrderType.MARKET and
+            hasattr(trading_order, 'transaction_id') and trading_order.transaction_id):
+            
+            position_size_errors = self._validate_position_size_limits(trading_order)
+            if position_size_errors:
+                errors.extend(position_size_errors)
                 
         return {
             'is_valid': len(errors) == 0,
             'errors': errors
         }
+
+    def _validate_position_size_limits(self, trading_order: TradingOrder) -> List[str]:
+        """
+        Validate that the order respects expert position size limits (defense-in-depth).
+        
+        This provides a safety check at the account interface level to prevent any code path
+        from bypassing position size limits set in expert settings.
+        
+        Args:
+            trading_order: The TradingOrder object to validate
+            
+        Returns:
+            List[str]: List of validation error messages (empty if valid)
+        """
+        errors = []
+        
+        try:
+            # Get the transaction to find the expert_id
+            from ..db import get_instance
+            from ..models import Transaction, ExpertInstance, ExpertSetting
+            
+            transaction = get_instance(Transaction, trading_order.transaction_id)
+            if not transaction or not transaction.expert_id:
+                # No expert associated - skip expert-specific validation
+                return errors
+            
+            # Get the expert instance
+            expert_instance = get_instance(ExpertInstance, transaction.expert_id)
+            if not expert_instance:
+                logger.warning(f"Expert instance {transaction.expert_id} not found for transaction {transaction.id}")
+                return errors
+            
+            # Get expert settings
+            # Load expert class to access settings
+            expert_module_name = f"ba2_trade_platform.modules.experts.{expert_instance.expert}"
+            try:
+                import importlib
+                expert_module = importlib.import_module(expert_module_name)
+                expert_class = getattr(expert_module, expert_instance.expert)
+                
+                # Get settings using the ExtendableSettingsInterface pattern
+                # Note: We can't use self.get_settings() because self is the AccountInterface
+                # We need to instantiate a temporary helper to access expert settings
+                from ..models import ExpertSetting
+                from sqlmodel import Session, select
+                from ..db import get_db
+                
+                # Manually load expert settings from database
+                with get_db() as session:
+                    expert_settings_rows = session.exec(
+                        select(ExpertSetting).where(ExpertSetting.instance_id == expert_instance.id)
+                    ).all()
+                    
+                    # Build settings dict
+                    settings = {}
+                    for setting_row in expert_settings_rows:
+                        if setting_row.value_float is not None:
+                            settings[setting_row.key] = setting_row.value_float
+                        elif setting_row.value_str is not None:
+                            settings[setting_row.key] = setting_row.value_str
+                        elif setting_row.value_json:
+                            settings[setting_row.key] = setting_row.value_json
+                
+            except (ImportError, AttributeError) as e:
+                logger.warning(f"Could not load expert {expert_instance.expert} for position size validation: {e}")
+                return errors
+            
+            # Get position size limit setting
+            max_position_pct = settings.get("max_virtual_equity_per_instrument_percent")
+            if max_position_pct is None:
+                # Setting not defined - skip validation
+                return errors
+            
+            # Calculate expert's virtual equity
+            account_info = self.get_account_info()
+            if not account_info:
+                logger.warning("Could not get account info for position size validation")
+                return errors
+            
+            account_equity = float(account_info.equity)
+            virtual_equity_pct = expert_instance.virtual_equity_pct
+            virtual_equity = account_equity * (virtual_equity_pct / 100.0)
+            
+            # Calculate max position value
+            max_position_value = virtual_equity * (max_position_pct / 100.0)
+            
+            # Calculate order position value
+            current_price = self.get_instrument_current_price(trading_order.symbol)
+            if current_price is None:
+                logger.warning(f"Could not get current price for {trading_order.symbol} in position size validation")
+                return errors
+            
+            position_value = current_price * trading_order.quantity
+            
+            # Check if position exceeds limit
+            if position_value > max_position_value:
+                errors.append(
+                    f"Position size ${position_value:.2f} exceeds expert's max allowed ${max_position_value:.2f} "
+                    f"({max_position_pct:.1f}% of virtual equity ${virtual_equity:.2f}). "
+                    f"Reduce quantity to {int(max_position_value / current_price)} or less."
+                )
+                logger.error(
+                    f"POSITION SIZE LIMIT EXCEEDED: Order for {trading_order.quantity} shares of {trading_order.symbol} "
+                    f"(${position_value:.2f}) exceeds expert {expert_instance.id} limit of ${max_position_value:.2f}"
+                )
+                
+        except Exception as e:
+            # Don't fail the entire validation if position size check has an error
+            # Just log it and continue
+            logger.warning(f"Error during position size validation: {e}")
+        
+        return errors
 
     @abstractmethod
     def cancel_order(self, order_id: str) -> Any:

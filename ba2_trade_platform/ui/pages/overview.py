@@ -3601,6 +3601,7 @@ class TransactionsTab:
         columns = [
             {'name': 'select', 'label': '', 'field': 'select', 'align': 'left', 'sortable': False},  # Selection checkbox column
             {'name': 'expand', 'label': '', 'field': 'expand', 'align': 'left'},  # Expand column
+            {'name': 'id', 'label': 'ID', 'field': 'id', 'align': 'center', 'sortable': True},
             {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left', 'sortable': True},
             {'name': 'expert', 'label': 'Expert', 'field': 'expert', 'align': 'left', 'sortable': True},
             {'name': 'quantity', 'label': 'Qty', 'field': 'quantity', 'align': 'right', 'sortable': True},

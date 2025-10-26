@@ -1,0 +1,36 @@
+2025-10-26 20:47:14,396 - ba2_trade_platform - db - DEBUG - Database file path: C:\Users\basti\Documents\ba2_trade_platform\db.sqlite
+2025-10-26 20:47:21,517 - ba2_trade_platform - ExpertInstanceCache - DEBUG - Creating new expert instance for expert 1
+2025-10-26 20:47:21,518 - ba2_trade_platform - AccountInstanceCache - DEBUG - Creating new account instance for account 1
+2025-10-26 20:47:21,518 - ba2_trade_platform - ExtendableSettingsInterface - DEBUG - Loading settings from database for AlpacaAccount id=1
+2025-10-26 20:47:21,518 - ba2_trade_platform - AlpacaAccount - INFO - Alpaca TradingClient initialized for account 1.
+2025-10-26 20:47:21,518 - ba2_trade_platform - SmartRiskManagerToolkit - DEBUG - Fetching batch outputs: 5 analyses x 1 keys, max_chars=400,000
+2025-10-26 20:47:21,518 - ba2_trade_platform - SmartRiskManagerToolkit - DEBUG - Getting output detail for analysis 101, output_key=final_trade_decision
+2025-10-26 20:47:21,518 - ba2_trade_platform - ExpertInstanceCache - DEBUG - Creating new expert instance for expert 5
+2025-10-26 20:47:21,518 - ba2_trade_platform - SmartRiskManagerToolkit - DEBUG - Expert type: FinnHubRating, has_method: False, is_callable: False
+2025-10-26 20:47:21,518 - ba2_trade_platform - SmartRiskManagerToolkit - DEBUG - Using fallback - querying AnalysisOutput table directly
+2025-10-26 20:47:21,564 - ba2_trade_platform - SmartRiskManagerToolkit - DEBUG - Getting output detail for analysis 102, output_key=final_trade_decision
+2025-10-26 20:47:21,564 - ba2_trade_platform - SmartRiskManagerToolkit - DEBUG - Expert type: FinnHubRating, has_method: False, is_callable: False
+2025-10-26 20:47:21,564 - ba2_trade_platform - SmartRiskManagerToolkit - DEBUG - Using fallback - querying AnalysisOutput table directly
+2025-10-26 20:47:21,596 - ba2_trade_platform - SmartRiskManagerToolkit - DEBUG - Getting output detail for analysis 103, output_key=final_trade_decision
+2025-10-26 20:47:21,596 - ba2_trade_platform - SmartRiskManagerToolkit - DEBUG - Expert type: FinnHubRating, has_method: False, is_callable: False
+2025-10-26 20:47:21,596 - ba2_trade_platform - SmartRiskManagerToolkit - DEBUG - Using fallback - querying AnalysisOutput table directly
+2025-10-26 20:47:21,638 - ba2_trade_platform - SmartRiskManagerToolkit - DEBUG - Getting output detail for analysis 104, output_key=final_trade_decision
+2025-10-26 20:47:21,640 - ba2_trade_platform - SmartRiskManagerToolkit - DEBUG - Expert type: FinnHubRating, has_method: False, is_callable: False
+2025-10-26 20:47:21,640 - ba2_trade_platform - SmartRiskManagerToolkit - DEBUG - Using fallback - querying AnalysisOutput table directly
+2025-10-26 20:47:21,672 - ba2_trade_platform - SmartRiskManagerToolkit - DEBUG - Getting output detail for analysis 105, output_key=final_trade_decision
+2025-10-26 20:47:21,674 - ba2_trade_platform - SmartRiskManagerToolkit - DEBUG - Expert type: FinnHubRating, has_method: False, is_callable: False
+2025-10-26 20:47:21,674 - ba2_trade_platform - SmartRiskManagerToolkit - DEBUG - Using fallback - querying AnalysisOutput table directly
+2025-10-26 20:47:21,706 - ba2_trade_platform - SmartRiskManagerToolkit - INFO - Batch fetch complete: 0 outputs (0 chars, ~0 tokens), 5 skipped, truncated=False
+Traceback (most recent call last):
+  File "C:\Users\basti\Documents\BA2TradePlatform\test_files\final_verification.py", line 39, in <module>
+================================================================================
+FINAL VERIFICATION TEST
+================================================================================
+
+TEST 1: Fetching final_trade_decision from analyses WITHOUT output (IDs 101-105)
+--------------------------------------------------------------------------------
+    print(f"\u2705 Items included: {result1['items_included']} (expected: 0)")
+  File "C:\Users\basti\AppData\Local\Programs\Python\Python311\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2705' in position 0: character maps to <undefined>

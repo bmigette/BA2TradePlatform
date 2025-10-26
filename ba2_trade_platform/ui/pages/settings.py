@@ -1145,6 +1145,9 @@ class ExpertSettingsTab:
         """Show the add/edit expert dialog."""
         logger.debug(f'Showing expert dialog for instance: {expert_instance.id if expert_instance else "new instance"}')
         
+        # Store expert_instance for use in other methods
+        self.current_expert_instance = expert_instance
+        
         # Initialize import attributes
         self._imported_expert_settings = None
         self._imported_symbol_settings = None
@@ -2212,9 +2215,22 @@ class ExpertSettingsTab:
                 with ui.column().classes('w-full mt-4'):
                     ui.label('AI Selection Prompt:').classes('text-sm font-medium mb-2')
                     
-                    # Get default prompt from AIInstrumentSelector
+                    # Get default prompt from AIInstrumentSelector (use fallback model for getting default prompt only)
                     from ...core.AIInstrumentSelector import AIInstrumentSelector
-                    ai_selector = AIInstrumentSelector()
+                    # Get model from settings or use default
+                    model_for_prompt = None
+                    if expert_instance:
+                        # Get expert interface (not database model) to access settings
+                        expert = get_expert_instance_from_id(expert_instance.id)
+                        if expert:
+                            model_for_prompt = expert.settings.get('dynamic_instrument_selection_model')
+                    if not model_for_prompt:
+                        # Use default from MarketExpertInterface
+                        from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
+                        MarketExpertInterface._ensure_builtin_settings()
+                        model_for_prompt = MarketExpertInterface._builtin_settings.get('dynamic_instrument_selection_model', {}).get('default', 'NagaAI/gpt-5-2025-08-07')
+                    
+                    ai_selector = AIInstrumentSelector(model_string=model_for_prompt)
                     default_prompt = ai_selector.get_default_prompt()
                     
                     self.ai_prompt_textarea = ui.textarea(
@@ -2261,8 +2277,21 @@ class ExpertSettingsTab:
             if hasattr(self, 'dynamic_instrument_selection_model_select'):
                 model_string = self.dynamic_instrument_selection_model_select.value
             
-            # Initialize with the selected model (or default if not set)
-            ai_selector = AIInstrumentSelector(model_string=model_string) if model_string else AIInstrumentSelector()
+            # If no model selected, get from settings or use default
+            if not model_string:
+                if hasattr(self, 'current_expert_instance') and self.current_expert_instance:
+                    # Get expert interface (not database model) to access settings
+                    expert = get_expert_instance_from_id(self.current_expert_instance.id)
+                    if expert:
+                        model_string = expert.settings.get('dynamic_instrument_selection_model')
+                if not model_string:
+                    # Use default from MarketExpertInterface
+                    from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
+                    MarketExpertInterface._ensure_builtin_settings()
+                    model_string = MarketExpertInterface._builtin_settings.get('dynamic_instrument_selection_model', {}).get('default', 'NagaAI/gpt-5-2025-08-07')
+            
+            # Initialize with the selected model (model_string is now guaranteed to exist)
+            ai_selector = AIInstrumentSelector(model_string=model_string)
             
             # Run AI selection in executor to avoid blocking the UI
             try:

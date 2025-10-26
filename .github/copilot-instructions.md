@@ -295,3 +295,14 @@ See `docs/SMART_RISK_MANAGER_FUNCTION_SPLIT.md` for complete case study.
 - Basic testing utilities: `test.py`
 - Run tests with: `.venv\Scripts\python.exe test_files/test_name.py` (Windows) or `.venv/bin/python test_files/test_name.py` (Unix)
 
+## Documentation Policy
+
+**CRITICAL RULE**: Do NOT automatically create documentation files for completed tasks unless explicitly requested by the user.
+
+- ❌ **NEVER DO THIS**: Automatically create `.md` files in `docs/` to summarize work
+- ❌ **NEVER DO THIS**: Generate summary documents after completing fixes or features
+- ✅ **ALWAYS DO THIS**: Only create documentation when user explicitly asks for it
+- ✅ **ALWAYS DO THIS**: Provide verbal summaries in chat responses instead
+
+**Rationale**: Automatic documentation generation clutters the repository and the user prefers to control when documentation is needed. Keep the focus on implementing solutions, not documenting them unless requested.
+
