@@ -2559,8 +2559,11 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             
             # After processing all tool calls, add reminder if research is not complete
             if not research_complete:
+                # Build iteration counter and actions summary
+                iteration_info = f"\n\n{'='*70}\n**ITERATION {iteration_count} of {state['max_iterations']} COMPLETE**\n{'='*70}\n"
+                
                 # Build summary of actions recommended so far
-                actions_summary = f"\n\n**ACTIONS RECOMMENDED SO FAR**: {len(recommended_actions_list)} total\n"
+                actions_summary = f"\n**ACTIONS RECOMMENDED SO FAR**: {len(recommended_actions_list)} total\n"
                 if recommended_actions_list:
                     for idx, action in enumerate(recommended_actions_list, 1):
                         action_type = action.get("action_type", "unknown")
@@ -2577,6 +2580,7 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
                 
                 # Add a reminder message to the conversation to prompt completion
                 reminder_msg = (
+                    iteration_info +
                     actions_summary +
                     "\n**REMINDER**: When you have gathered sufficient information and made your recommendations, "
                     "you MUST call the finish_research_tool to complete your research and proceed to action execution. "
