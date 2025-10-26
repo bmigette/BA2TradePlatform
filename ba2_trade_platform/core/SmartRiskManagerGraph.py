@@ -3342,7 +3342,7 @@ class SmartRiskManagerGraph:
                         "detailed_outputs_cache": detailed_cache,
                         "agent_scratchpad": state["agent_scratchpad"],
                         "research_complete": False,
-                        "recommended_actions": [],
+                        "recommended_actions": self.recommended_actions_list,  # Pass any actions collected so far
                         "iteration_count": iteration_count
                     }
                 else:
@@ -3473,7 +3473,7 @@ class SmartRiskManagerGraph:
                 "detailed_outputs_cache": detailed_cache,
                 "agent_scratchpad": updated_scratchpad,
                 "research_complete": research_complete,
-                "recommended_actions": self.recommended_actions_list if research_complete else [],
+                "recommended_actions": self.recommended_actions_list,  # Always pass actions (even if research incomplete)
                 "iteration_count": iteration_count
             }
         except Exception as e:
