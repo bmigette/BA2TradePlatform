@@ -1519,6 +1519,11 @@ class ScheduledJobsTab:
             ui.label('Scheduled Analysis Jobs').classes('text-lg font-bold')
             ui.label('View all scheduled analysis jobs for the current week').classes('text-sm text-gray-600 mb-4')
             
+            # Weekly calendar view
+            self._create_weekly_calendar()
+            
+            ui.separator().classes('my-4')
+            
             # Filters and controls
             with ui.row().classes('w-full justify-between items-center mb-4'):
                 with ui.row().classes('gap-4'):
@@ -1575,6 +1580,209 @@ class ScheduledJobsTab:
         
         # Start auto-refresh
         self.start_auto_refresh()
+
+    def _create_weekly_calendar(self):
+        """Create a condensed weekly timeline view showing scheduled jobs by expert."""
+        from datetime import datetime, timedelta
+        import json
+        from ...core.types import AnalysisUseCase
+        
+        # Get current week (Monday to Sunday)
+        today = datetime.now()
+        start_of_week = today - timedelta(days=today.weekday())  # Monday
+        
+        # Days of the week
+        weekdays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+        
+        # Get all enabled expert instances
+        expert_instances = get_all_instances(ExpertInstance)
+        enabled_experts = [ei for ei in expert_instances if ei.enabled]
+        
+        # Generate colors for experts (use hashing for consistent colors)
+        def get_expert_color(expert_id):
+            """Generate consistent color for expert based on ID."""
+            colors = [
+                '#3b82f6',  # blue
+                '#ef4444',  # red
+                '#10b981',  # green
+                '#f59e0b',  # amber
+                '#8b5cf6',  # purple
+                '#ec4899',  # pink
+                '#06b6d4',  # cyan
+                '#f97316',  # orange
+            ]
+            return colors[expert_id % len(colors)]
+        
+        def time_to_position(time_str):
+            """Convert time string (HH:MM) to percentage position (0-100)."""
+            try:
+                hour, minute = map(int, time_str.split(':'))
+                total_minutes = hour * 60 + minute
+                return (total_minutes / (24 * 60)) * 100
+            except:
+                return 0
+        
+        # Collect schedule data per expert and day
+        expert_schedules = {}  # {expert_id: {day_index: {enter_market: [times], open_positions: [times]}}}
+        
+        for expert_instance in enabled_experts:
+            try:
+                from ...core.utils import get_expert_instance_from_id
+                expert = get_expert_instance_from_id(expert_instance.id)
+                if not expert:
+                    continue
+                
+                expert_schedules[expert_instance.id] = {
+                    'name': expert_instance.alias or expert_instance.expert,
+                    'color': get_expert_color(expert_instance.id),
+                    'days': {}
+                }
+                
+                # Process both schedule types
+                for schedule_key, schedule_type in [
+                    ('execution_schedule_enter_market', 'enter_market'),
+                    ('execution_schedule_open_positions', 'open_positions')
+                ]:
+                    schedule_setting = expert.settings.get(schedule_key)
+                    if not schedule_setting:
+                        continue
+                    
+                    # Parse schedule
+                    if isinstance(schedule_setting, str):
+                        schedule_config = json.loads(schedule_setting)
+                    else:
+                        schedule_config = schedule_setting
+                    
+                    if not isinstance(schedule_config, dict):
+                        continue
+                    
+                    days = schedule_config.get('days', {})
+                    times = schedule_config.get('times', [])
+                    
+                    if not any(days.values()) or not times:
+                        continue
+                    
+                    # Map days to indices
+                    day_map = {
+                        'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
+                        'friday': 4, 'saturday': 5, 'sunday': 6
+                    }
+                    
+                    for day_name, enabled in days.items():
+                        if enabled and day_name in day_map:
+                            day_idx = day_map[day_name]
+                            if day_idx not in expert_schedules[expert_instance.id]['days']:
+                                expert_schedules[expert_instance.id]['days'][day_idx] = {
+                                    'enter_market': [],
+                                    'open_positions': []
+                                }
+                            expert_schedules[expert_instance.id]['days'][day_idx][schedule_type] = times
+                
+            except Exception as e:
+                logger.error(f"Error processing schedule for calendar view: {e}", exc_info=True)
+        
+        # Collect all unique time slots across all schedules
+        all_times = set()
+        for expert_data in expert_schedules.values():
+            for day_schedule in expert_data['days'].values():
+                all_times.update(day_schedule.get('enter_market', []))
+                all_times.update(day_schedule.get('open_positions', []))
+        
+        # Sort time slots
+        sorted_times = sorted(list(all_times))
+        
+        # Create grid layout with days as columns and times as rows
+        with ui.card().classes('w-full mb-4 p-3'):
+            ui.label('Weekly Schedule Overview').classes('text-md font-bold mb-3')
+            
+            # Create table structure
+            with ui.element('div').classes('overflow-x-auto'):
+                with ui.element('table').classes('w-full border-collapse'):
+                    # Header row with days
+                    with ui.element('thead'):
+                        with ui.element('tr'):
+                            # Time column header
+                            with ui.element('th').classes('border border-gray-300 bg-gray-100 p-2 text-left font-bold text-sm sticky left-0 z-10'):
+                                ui.label('Time').classes('text-sm')
+                            
+                            # Day column headers
+                            for day_idx, day_name in enumerate(weekdays):
+                                date = start_of_week + timedelta(days=day_idx)
+                                is_today = date.date() == today.date()
+                                header_class = 'border border-gray-300 bg-gray-100 p-2 text-center font-bold text-sm'
+                                if is_today:
+                                    header_class += ' bg-blue-100'
+                                
+                                with ui.element('th').classes(header_class):
+                                    ui.label(day_name).classes(f'{"text-blue-600" if is_today else ""}')
+                                    ui.label(date.strftime('%m/%d')).classes('text-xs text-gray-500 block')
+                    
+                    # Body rows with time slots
+                    with ui.element('tbody'):
+                        for time_str in sorted_times:
+                            with ui.element('tr'):
+                                # Time label
+                                with ui.element('td').classes('border border-gray-300 bg-gray-50 p-2 text-sm font-medium sticky left-0 z-10'):
+                                    ui.label(time_str)
+                                
+                                # Day cells
+                                for day_idx in range(7):
+                                    date = start_of_week + timedelta(days=day_idx)
+                                    is_today = date.date() == today.date()
+                                    cell_class = 'border border-gray-300 p-2 text-center'
+                                    if is_today:
+                                        cell_class += ' bg-blue-50'
+                                    
+                                    with ui.element('td').classes(cell_class):
+                                        # Collect experts scheduled at this time on this day
+                                        cell_experts = []
+                                        for expert_id, expert_data in expert_schedules.items():
+                                            if day_idx in expert_data['days']:
+                                                day_schedule = expert_data['days'][day_idx]
+                                                schedule_types = []
+                                                
+                                                if time_str in day_schedule.get('enter_market', []):
+                                                    schedule_types.append('EM')
+                                                if time_str in day_schedule.get('open_positions', []):
+                                                    schedule_types.append('OP')
+                                                
+                                                if schedule_types:
+                                                    cell_experts.append({
+                                                        'name': expert_data['name'],
+                                                        'color': expert_data['color'],
+                                                        'types': schedule_types
+                                                    })
+                                        
+                                        # Display expert badges
+                                        if cell_experts:
+                                            with ui.row().classes('gap-1 flex-wrap justify-center'):
+                                                for expert in cell_experts:
+                                                    types_str = '/'.join(expert['types'])
+                                                    badge_html = f'''
+                                                    <div style="display: inline-block; padding: 2px 6px; border-radius: 4px; 
+                                                                background-color: {expert['color']}; color: white; 
+                                                                font-size: 10px; font-weight: bold; white-space: nowrap;"
+                                                         title="{expert['name']} - {types_str}">
+                                                        {types_str}
+                                                    </div>
+                                                    '''
+                                                    ui.html(badge_html, sanitize=False)
+            
+            # Legend
+            with ui.row().classes('w-full mt-3 gap-4 flex-wrap'):
+                ui.label('Legend:').classes('text-xs font-bold text-gray-600')
+                with ui.row().classes('gap-1 items-center'):
+                    ui.label('EM = Enter Market').classes('text-xs text-gray-600')
+                with ui.row().classes('gap-1 items-center'):
+                    ui.label('OP = Open Positions').classes('text-xs text-gray-600')
+                
+                # Expert color legend
+                ui.label('|').classes('text-xs text-gray-400 mx-1')
+                ui.label('Experts:').classes('text-xs font-bold text-gray-600')
+                for expert_id, expert_data in expert_schedules.items():
+                    with ui.row().classes('gap-1 items-center'):
+                        ui.html(f'<div style="width: 12px; height: 12px; border-radius: 50%; background-color: {expert_data["color"]};"></div>', sanitize=False)
+                        ui.label(expert_data['name']).classes('text-xs text-gray-600')
 
     def _get_expert_filter_options(self) -> dict:
         """Get expert instance filter options."""

@@ -522,15 +522,21 @@ You have full access to these research tools - use them freely and repeatedly:
 
 **Action Recommendation Tools (MANDATORY - use these to recommend specific actions):**
 
+**IMPORTANT: Transaction IDs**
+- Each open position in the portfolio summary is shown as "Transaction #XXX: SYMBOL"
+- Use the transaction ID number when referencing positions in action recommendations
+- Example: "Transaction #248: CRWD" means the transaction_id is 248
+- You can only modify transactions that belong to your expert - attempting to modify another expert's transaction will fail
+
 - **recommend_close_position(transaction_id: int, reason: str, confidence: int)** - Recommend closing an existing position
-  * transaction_id: ID of the open transaction/position to close
+  * transaction_id: ID of the open transaction/position to close (from portfolio summary)
   * reason: Clear explanation referencing your research findings (e.g., 'Analysis #456 shows bearish reversal')
   * confidence: Your confidence level (1-100) in this recommendation
   * Use when: Stop loss hit, take profit reached, changed market conditions, portfolio rebalancing
   * Returns: Confirmation with total action count
 
 - **recommend_adjust_quantity(transaction_id: int, new_quantity: int, reason: str, confidence: int)** - Recommend changing position size
-  * transaction_id: ID of the position to adjust
+  * transaction_id: ID of the position to adjust (from portfolio summary)
   * new_quantity: New absolute quantity for the position (MUST be whole number like 10, not 10.5)
   * reason: Clear explanation for the quantity adjustment
   * confidence: Your confidence level (1-100)
@@ -1204,7 +1210,7 @@ def initialize_context(state: SmartRiskManagerState) -> Dict[str, Any]:
         
         # Get portfolio status
         portfolio_status = toolkit.get_portfolio_status()
-        open_positions = portfolio_status.get("positions", [])
+        open_positions = portfolio_status.get("open_positions", [])
         
         # Create or update SmartRiskManagerJob record
         job_id = state.get("job_id", 0)
@@ -1370,7 +1376,7 @@ Total Open Positions: {len(state['open_positions'])}
 Open Positions:
 """
         for pos in state["open_positions"]:
-            portfolio_summary += f"\n- Transaction {pos['transaction_id']}: {pos['symbol']}: {pos['quantity']} shares @ ${pos['current_price']:.2f}"
+            portfolio_summary += f"\n- Transaction #{pos['transaction_id']}: {pos['symbol']}: {pos['quantity']} shares @ ${pos['current_price']:.2f}"
             portfolio_summary += f" | P&L: {pos['unrealized_pnl_pct']:.2f}% (${pos['unrealized_pnl']:.2f})"
             
             # Show SL/TP status explicitly
@@ -2841,19 +2847,20 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
                         # Build summary based on action type
                         if action_type in ["open_buy_position", "open_sell_position"]:
                             direction = result.get('direction', 'BUY' if action_type == "open_buy_position" else 'SELL')
-                            summary = f"{result.get('symbol')} {direction} {result.get('quantity')} @ ${result.get('entry_price', 0):.2f}"
+                            transaction_id = result.get('transaction_id')
+                            summary = f"Transaction #{transaction_id}: {result.get('symbol')} {direction} {result.get('quantity')} @ ${result.get('entry_price', 0):.2f}"
                             if result.get('tp_price'):
                                 summary += f" TP@${result.get('tp_price'):.2f}"
                             if result.get('sl_price'):
                                 summary += f" SL@${result.get('sl_price'):.2f}"
                         elif action_type == "close_position":
-                            summary = f"Closed transaction {result.get('transaction_id')}"
+                            summary = f"Closed transaction #{result.get('transaction_id')}"
                         elif action_type == "adjust_quantity":
-                            summary = f"Adjusted {parameters.get('transaction_id')} from {result.get('old_quantity')} to {result.get('new_quantity')}"
+                            summary = f"Adjusted transaction #{parameters.get('transaction_id')} from {result.get('old_quantity')} to {result.get('new_quantity')}"
                         elif action_type == "update_stop_loss":
-                            summary = f"Updated SL from ${result.get('old_sl_price', 0):.2f} to ${result.get('new_sl_price', 0):.2f}"
+                            summary = f"Updated SL for transaction #{parameters.get('transaction_id')} from ${result.get('old_sl_price', 0):.2f} to ${result.get('new_sl_price', 0):.2f}"
                         elif action_type == "update_take_profit":
-                            summary = f"Updated TP from ${result.get('old_tp_price', 0):.2f} to ${result.get('new_tp_price', 0):.2f}"
+                            summary = f"Updated TP for transaction #{parameters.get('transaction_id')} from ${result.get('old_tp_price', 0):.2f} to ${result.get('new_tp_price', 0):.2f}"
                         else:
                             summary = result.get('message', 'Completed')
                     else:
@@ -2921,7 +2928,7 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
         
         # Refresh portfolio status after actions
         portfolio_status = toolkit.get_portfolio_status()
-        open_positions = portfolio_status.get("positions", [])
+        open_positions = portfolio_status.get("open_positions", [])
 
         logger.info(f"Action execution complete. {len(actions_log) - len(state['actions_log'])} new actions recorded")
 

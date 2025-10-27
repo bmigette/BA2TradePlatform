@@ -744,9 +744,13 @@ class WorkerQueue:
                     market_analysis = MarketAnalysis(
                         symbol=task.symbol,
                         expert_instance_id=task.expert_instance_id,
-                        status=MarketAnalysisStatus.CANCELLED,
+                        status=MarketAnalysisStatus.SKIPPED,
                         subtype=AnalysisUseCase(task.subtype),
-                        state={"reason": "insufficient_balance", "message": "Skipped due to insufficient available balance"}
+                        state={
+                            "skipped": True,
+                            "skip_reason": "Insufficient available balance below threshold",
+                            "skip_type": "insufficient_balance"
+                        }
                     )
                     market_analysis_id = add_instance(market_analysis)
                     task.market_analysis_id = market_analysis_id
@@ -772,7 +776,7 @@ class WorkerQueue:
                     market_analysis = MarketAnalysis(
                         symbol=task.symbol,
                         expert_instance_id=task.expert_instance_id,
-                        status=MarketAnalysisStatus.FAILED,  # Changed from CANCELLED to FAILED for visibility
+                        status=MarketAnalysisStatus.SKIPPED,
                         subtype=AnalysisUseCase(task.subtype),
                         state={
                             "skipped": True,

@@ -311,6 +311,7 @@ class MarketAnalysisStatus(str, Enum):
     FAILED = "failed"
     RUNNING = "running"
     CANCELLED = "cancelled"
+    SKIPPED = "skipped"
 class ReferenceValue(str, Enum):
     ORDER_OPEN_PRICE = "order_open_price"
     CURRENT_PRICE = "current_price"

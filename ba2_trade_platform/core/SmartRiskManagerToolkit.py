@@ -45,6 +45,35 @@ class SmartRiskManagerToolkit:
     
     # ==================== Helper Methods ====================
     
+    def _validate_transaction_ownership(self, transaction_id: int) -> Transaction:
+        """
+        Validate that a transaction belongs to this expert instance.
+        
+        CRITICAL SECURITY CHECK: Prevents one expert from modifying another expert's transactions.
+        
+        Args:
+            transaction_id: Transaction ID to validate
+            
+        Returns:
+            Transaction object if valid
+            
+        Raises:
+            ValueError: If transaction doesn't exist or doesn't belong to this expert
+        """
+        with get_db() as session:
+            transaction = session.get(Transaction, transaction_id)
+            
+            if not transaction:
+                raise ValueError(f"Transaction #{transaction_id} not found")
+            
+            if transaction.expert_id != self.expert_instance_id:
+                raise ValueError(
+                    f"Transaction #{transaction_id} belongs to expert {transaction.expert_id}, "
+                    f"not expert {self.expert_instance_id}. Cannot modify transactions from other experts."
+                )
+            
+            return transaction
+    
     def _create_trading_order(
         self,
         symbol: str,
@@ -145,11 +174,23 @@ class SmartRiskManagerToolkit:
             
             # Get open transactions (transactions are per expert, not per account)
             with get_db() as session:
+                # First, let's check all transactions for this expert regardless of status
+                all_expert_transactions = session.exec(
+                    select(Transaction)
+                    .where(Transaction.expert_id == self.expert_instance_id)
+                ).all()
+                
+                logger.info(f"Expert {self.expert_instance_id} has {len(all_expert_transactions)} total transactions")
+                for t in all_expert_transactions:
+                    logger.debug(f"  Transaction {t.id}: {t.symbol} status={t.status} expert_id={t.expert_id}")
+                
                 transactions = session.exec(
                     select(Transaction)
                     .where(Transaction.expert_id == self.expert_instance_id)
                     .where(Transaction.status == TransactionStatus.OPENED)
                 ).all()
+                
+                logger.info(f"Expert {self.expert_instance_id} has {len(transactions)} OPENED transactions")
                 
                 # Get pending transactions (WAITING status)
                 pending_transactions = session.exec(
@@ -175,6 +216,7 @@ class SmartRiskManagerToolkit:
                     
                     # Get actual quantity from filled orders
                     quantity = trans.get_current_open_qty()
+                    logger.debug(f"  Transaction {trans.id} ({trans.symbol}): quantity={quantity}")
                     
                     # Infer direction from first order
                     direction = None
@@ -183,7 +225,7 @@ class SmartRiskManagerToolkit:
                         direction = first_order.side
                     
                     if not direction or not trans.open_price or quantity == 0:
-                        logger.warning(f"Skipping transaction {trans.id} - missing direction or price or zero quantity")
+                        logger.warning(f"Skipping transaction {trans.id} ({trans.symbol}) - direction={direction}, open_price={trans.open_price}, quantity={quantity}")
                         continue
                     
                     # Calculate P&L
@@ -1007,20 +1049,26 @@ class SmartRiskManagerToolkit:
         try:
             logger.info(f"Closing position {transaction_id}. Reason: {reason}")
             
+            # SECURITY CHECK: Validate transaction belongs to this expert
+            try:
+                transaction = self._validate_transaction_ownership(transaction_id)
+            except ValueError as e:
+                logger.error(f"Transaction ownership validation failed: {e}")
+                return {
+                    "success": False,
+                    "message": str(e),
+                    "order_id": None,
+                    "transaction_id": transaction_id
+                }
+            
             with get_db() as session:
+                # Refresh transaction in this session
                 transaction = session.get(Transaction, transaction_id)
-                if not transaction:
-                    return {
-                        "success": False,
-                        "message": f"Transaction {transaction_id} not found",
-                        "order_id": None,
-                        "transaction_id": transaction_id
-                    }
                 
                 if transaction.status != TransactionStatus.OPENED:
                     return {
                         "success": False,
-                        "message": f"Transaction {transaction_id} is not open (status: {transaction.status})",
+                        "message": f"Transaction #{transaction_id} is not open (status: {transaction.status})",
                         "order_id": None,
                         "transaction_id": transaction_id
                     }

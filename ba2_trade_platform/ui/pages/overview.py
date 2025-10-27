@@ -516,19 +516,21 @@ class OverviewTab:
                 self._render_order_statistics_widget()
                 with ui.column().classes(''):
                     self._render_order_recommendations_widget()
-                
-                # Row 2: Floating P/L widgets
+            
+            # Row 2: Profit Per Expert and Balance Usage Per Expert (double width each)
+            with ui.grid(columns=2).classes('w-full gap-4'):
+                ProfitPerExpertChart()
+                BalanceUsagePerExpertChart()
+            
+            with ui.grid(columns=4).classes('w-full gap-4'):
+                # Row 3: Floating P/L widgets
                 FloatingPLPerExpertWidget()
                 FloatingPLPerAccountWidget()
                 
-                # Row 3: Profit Per Expert and Balance Usage Per Expert
-                ProfitPerExpertChart()
-                BalanceUsagePerExpertChart()
-                
-                # Row 3: Position Distribution by Label
+                # Row 4: Position Distribution by Label
                 self._render_position_distribution_widget(grouping_field='labels')
                 
-                # Row 3: Position Distribution by Category (can span or be paired with other widgets)
+                # Row 4: Position Distribution by Category (can span or be paired with other widgets)
                 self._render_position_distribution_widget(grouping_field='categories')
     
     def _render_position_distribution_widget(self, grouping_field='labels'):
