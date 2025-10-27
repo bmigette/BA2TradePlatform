@@ -142,7 +142,7 @@ class TradeRiskManagement:
             self.logger.debug(f"Existing allocations for expert {expert_instance_id}: {existing_allocations}")
             
             # Step 8: Calculate quantities for prioritized orders
-            updated_orders = self._calculate_order_quantities(
+            orders_to_update, orders_to_delete = self._calculate_order_quantities(
                 prioritized_orders,
                 total_virtual_balance,
                 max_equity_per_instrument,
@@ -152,10 +152,16 @@ class TradeRiskManagement:
             )
             
             # Step 9: Update orders in database
-            self._update_orders_in_database(updated_orders)
+            self._update_orders_in_database(orders_to_update)
+            
+            # Step 10: Delete orders with quantity=0 if automated trade opening is enabled
+            if allow_automated_trade_opening and orders_to_delete:
+                self._delete_unfunded_orders(orders_to_delete)
+            
+            updated_orders = orders_to_update  # For return value compatibility
             
             self.logger.info(f"Risk management completed for expert {expert_instance_id}: "
-                           f"updated {len(updated_orders)} orders")
+                           f"updated {len(updated_orders)} orders, deleted {len(orders_to_delete) if orders_to_delete else 0} unfunded orders")
             
         except Exception as e:
             self.logger.error(f"Error in risk management for expert {expert_instance_id}: {e}", exc_info=True)
@@ -484,7 +490,14 @@ class TradeRiskManagement:
         self.logger.info(f"Risk management allocation complete: ${total_allocated:.2f} allocated, "
                         f"${remaining_balance:.2f} remaining")
         
-        return updated_orders
+        # Separate orders into those to update (qty > 0) and those to delete (qty = 0)
+        orders_to_update = [o for o in updated_orders if o.quantity > 0]
+        orders_to_delete = [o for o in updated_orders if o.quantity == 0]
+        
+        if orders_to_delete:
+            self.logger.info(f"Found {len(orders_to_delete)} orders with quantity=0 that will be deleted")
+        
+        return orders_to_update, orders_to_delete
     
     def _update_orders_in_database(self, orders: List[TradingOrder]) -> None:
         """Update orders in the database with calculated quantities."""
@@ -503,6 +516,68 @@ class TradeRiskManagement:
             
         except Exception as e:
             self.logger.error(f"Error updating orders in database: {e}", exc_info=True)
+    
+    def _delete_unfunded_orders(self, orders: List[TradingOrder]) -> None:
+        """
+        Delete orders with quantity=0 (insufficient funds) and their linked orders/transactions.
+        
+        This is called when automated trade opening is enabled and risk management
+        determines some orders cannot be funded.
+        
+        Args:
+            orders: List of TradingOrder objects with quantity=0 to delete
+        """
+        try:
+            from .db import delete_instance
+            
+            deleted_order_count = 0
+            deleted_linked_order_count = 0
+            deleted_transaction_count = 0
+            
+            with get_db() as session:
+                for order in orders:
+                    try:
+                        # Log the deletion
+                        self.logger.info(f"Deleting unfunded order {order.id} ({order.symbol}, {order.side}) - insufficient funds")
+                        
+                        # Find and delete any linked orders (waiting_trigger)
+                        if order.id:
+                            linked_orders_statement = select(TradingOrder).where(
+                                TradingOrder.waiting_trigger_order_id == order.id
+                            )
+                            linked_orders = session.exec(linked_orders_statement).all()
+                            
+                            for linked_order in linked_orders:
+                                self.logger.debug(f"  Deleting linked order {linked_order.id} (waiting on trigger order {order.id})")
+                                delete_instance(linked_order, session)
+                                deleted_linked_order_count += 1
+                        
+                        # Find and delete any transaction linked to this order
+                        if order.transaction_id:
+                            transaction = session.get(Transaction, order.transaction_id)
+                            if transaction:
+                                self.logger.debug(f"  Deleting transaction {transaction.id} linked to order {order.id}")
+                                delete_instance(transaction, session)
+                                deleted_transaction_count += 1
+                        
+                        # Delete the main order
+                        delete_instance(order, session)
+                        deleted_order_count += 1
+                        
+                    except Exception as e:
+                        self.logger.error(f"Error deleting unfunded order {order.id}: {e}", exc_info=True)
+                        # Continue with other orders even if one fails
+                        continue
+                
+                # Commit all deletions
+                session.commit()
+            
+            self.logger.info(f"Deleted {deleted_order_count} unfunded orders, "
+                           f"{deleted_linked_order_count} linked orders, "
+                           f"{deleted_transaction_count} transactions")
+            
+        except Exception as e:
+            self.logger.error(f"Error deleting unfunded orders: {e}", exc_info=True)
 
 
 # Global risk management instance

@@ -1,7 +1,7 @@
 import logging
 import pandas as pd
 from nicegui import ui
-from typing import Optional
+from typing import Optional, List
 from sqlmodel import select
 
 
@@ -38,7 +38,8 @@ class InstrumentSettingsTab:
             ui.label('Instrument Management')
             with ui.row():
                 filter_input = ui.input(label='Filter') #, on_change=self.on_filter_change)
-                ui.button('Fetch Info', on_click=self.fetch_info)
+                self.fetch_info_btn = ui.button('Fetch Info', on_click=self.fetch_info)
+                self.fetch_missing_btn = ui.button('Fetch Missing', on_click=self.fetch_missing_info).props('color=orange')
                 ui.button('Import', on_click=self.import_instruments)
                 ui.button('Add Instrument', on_click=lambda: self.add_instrument_dialog())
             self.table = ui.table(
@@ -55,6 +56,7 @@ class InstrumentSettingsTab:
                 rows=self._get_all_instruments(),
                 row_key='id',
                 selection='multiple',
+                pagination={'rowsPerPage': 50, 'sortBy': 'name'}
             ).classes('w-full')
             self.table.add_slot('body-cell-actions', """
                 <q-td :props="props">
@@ -109,6 +111,10 @@ class InstrumentSettingsTab:
 
     async def fetch_info(self):
         logger.debug('Fetching info for all instruments (batch mode)')
+        
+        # Set loading state
+        self.fetch_info_btn.props('loading')
+        
         session = get_db()
         statement = select(Instrument)
         results = session.exec(statement)
@@ -118,6 +124,7 @@ class InstrumentSettingsTab:
         if not instruments:
             logger.info('No instruments found to fetch info for.')
             ui.notify('No instruments found.', type='warning')
+            self.fetch_info_btn.props(remove='loading')
             return
 
         symbol_to_instrument = {inst.name: inst for inst in instruments}
@@ -177,11 +184,109 @@ class InstrumentSettingsTab:
         except Exception as e:
             logger.error(f"Error fetching batch info: {e}", exc_info=True)
             ui.notify(f'Error fetching batch info: {e}', type='negative')
+            self.fetch_info_btn.props(remove='loading')
             return
 
         logger.info(f'Fetched info for {updated} instruments. Errors: {errors}')
         ui.notify(f'Fetched info for {updated} instruments. Errors: {errors}', type='positive' if errors == 0 else 'warning')
         self._update_table_rows()
+        self.fetch_info_btn.props(remove='loading')
+
+    async def fetch_missing_info(self):
+        """Fetch info only for instruments missing company_name or categories"""
+        logger.debug('Fetching info for instruments with missing data')
+        
+        # Set loading state
+        self.fetch_missing_btn.props('loading')
+        
+        session = get_db()
+        statement = select(Instrument)
+        results = session.exec(statement)
+        all_instruments = results.all()
+        session.close()
+
+        if not all_instruments:
+            logger.info('No instruments found.')
+            ui.notify('No instruments found.', type='warning')
+            self.fetch_missing_btn.props(remove='loading')
+            return
+
+        # Filter to only instruments missing data
+        missing_instruments = [
+            inst for inst in all_instruments 
+            if not inst.company_name or not inst.categories or len(inst.categories) == 0
+        ]
+
+        if not missing_instruments:
+            logger.info('No instruments with missing data found.')
+            ui.notify('All instruments already have company name and categories.', type='info')
+            self.fetch_missing_btn.props(remove='loading')
+            return
+
+        symbol_to_instrument = {inst.name: inst for inst in missing_instruments}
+        symbols = list(symbol_to_instrument.keys())
+        updated = 0
+        errors = 0
+
+        logger.info(f'Fetching info for {len(symbols)} instruments with missing data')
+
+        try:
+            ticker = Ticker(symbols)
+            profiles = ticker.asset_profile
+            prices = ticker.price
+
+            for symbol, instrument in symbol_to_instrument.items():
+                local_session = get_db()
+                db_instrument = local_session.get(Instrument, instrument.id)
+                updated_flag = False
+                try:
+                    profile_data = profiles.get(symbol.upper())
+                    if profile_data:
+                        sector = profile_data.get("sector")
+                        if sector and (not db_instrument.categories or len(db_instrument.categories) == 0):
+                            if self._add_to_list_field(db_instrument, 'categories', sector, local_session):
+                                logger.debug(f'Added sector {sector} to instrument {symbol}')
+                                local_session.commit()
+                                updated_flag = True
+                    else:
+                        self._add_to_list_field(db_instrument, 'labels', 'not_found', local_session)
+                        logger.warning(f'Instrument {symbol} not found in asset profile')
+                        local_session.commit()
+
+                    price_info = prices.get(symbol.upper())
+                    longname = price_info.get("longName") if price_info else None
+                    if longname and not db_instrument.company_name:
+                        db_instrument.company_name = longname
+                        local_session.add(db_instrument)
+                        local_session.commit()
+                        logger.debug(f'Updated company_name for {symbol}: {longname}')
+                        updated_flag = True
+
+                    if updated_flag:
+                        if db_instrument.labels and 'not_found' in db_instrument.labels:
+                            labels = list(db_instrument.labels)
+                            labels.remove('not_found')
+                            db_instrument.labels = labels
+                            local_session.add(db_instrument)
+                            local_session.commit()
+                        updated += 1
+                except Exception as e:
+                    self._add_to_list_field(db_instrument, 'labels', 'not_found', local_session)
+                    logger.error(f"Error fetching info for {symbol}: {e}", exc_info=True)
+                    local_session.commit()
+                    errors += 1
+                finally:
+                    local_session.close()
+        except Exception as e:
+            logger.error(f"Error fetching batch info: {e}", exc_info=True)
+            ui.notify(f'Error fetching batch info: {e}', type='negative')
+            self.fetch_missing_btn.props(remove='loading')
+            return
+
+        logger.info(f'Fetched missing info for {updated}/{len(symbols)} instruments. Errors: {errors}')
+        ui.notify(f'Fetched missing info for {updated}/{len(symbols)} instruments. Errors: {errors}', type='positive' if errors == 0 else 'warning')
+        self._update_table_rows()
+        self.fetch_missing_btn.props(remove='loading')
 
     def import_instruments(self):
         logger.debug('Opening import instruments dialog')
@@ -206,8 +311,8 @@ class InstrumentSettingsTab:
                 def handle_upload(e: UploadEventArguments):
                     try:
                         # Read content from the uploaded file
-                        e.content.seek(0)  # Ensure we're at the beginning of the file
-                        content = e.content.read().decode('utf-8')
+                        e.file.content.seek(0)  # Ensure we're at the beginning of the file
+                        content = e.file.content.read().decode('utf-8')
                         names = [line.strip() for line in content.splitlines() if line.strip()]
                         
                         # Parse labels
@@ -2592,8 +2697,8 @@ class ExpertSettingsTab:
                 """Handle JSON file upload for settings import."""
                 try:
                     # Read the uploaded file
-                    e.content.seek(0)  # Ensure we're at the beginning of the file
-                    import_json = e.content.read().decode('utf-8')
+                    e.file.content.seek(0)  # Ensure we're at the beginning of the file
+                    import_json = e.file.content.read().decode('utf-8')
                     if not import_json.strip():
                         ui.notify('Uploaded file is empty', type='warning')
                         return
@@ -4446,6 +4551,407 @@ class TradeSettingsTab:
         self.reorder_dialog.open()
 
 
+class BatchCleanupTab:
+    """Tab for batch cleanup operations across multiple experts."""
+    
+    def __init__(self):
+        """Initialize batch cleanup tab UI."""
+        self.expert_checkboxes = {}
+        self.cleanup_days_input = None
+        self.cleanup_status_checkboxes = {}
+        self.cleanup_stats_container = None
+        self.cleanup_preview_container = None
+        self.cleanup_execute_button = None
+        self.render()
+    
+    def render(self):
+        """Render the batch cleanup tab UI."""
+        logger.debug('Rendering BatchCleanupTab UI')
+        
+        with ui.card().classes('w-full'):
+            ui.label('Batch Database Cleanup').classes('text-h6 mb-2')
+            ui.label('Clean up old market analysis records across multiple experts at once.').classes('text-body2 mb-4')
+            ui.label('⚠️ Analyses with open transactions will never be deleted.').classes('text-caption text-orange mb-4')
+            
+            # Expert selection
+            with ui.card().classes('w-full mb-4'):
+                ui.label('Select Experts to Clean').classes('text-subtitle2 mb-2')
+                ui.label('Choose which experts to clean up. Each selected expert will have its old analyses removed.').classes('text-body2 mb-4')
+                
+                with ui.row().classes('w-full gap-2 mb-2'):
+                    ui.button('Select All', on_click=self._select_all_experts, icon='select_all').props('outlined dense')
+                    ui.button('Deselect All', on_click=self._deselect_all_experts, icon='deselect').props('outlined dense')
+                
+                # Get all expert instances
+                with get_db() as session:
+                    expert_instances = session.exec(select(ExpertInstance)).all()
+                
+                if not expert_instances:
+                    ui.label('No experts found in the system.').classes('text-grey')
+                else:
+                    with ui.column().classes('w-full'):
+                        for expert in expert_instances:
+                            # Get display name
+                            if expert.alias:
+                                display_name = f"{expert.alias} (ID: {expert.id})"
+                            else:
+                                display_name = f"{expert.expert} (ID: {expert.id})"
+                            
+                            # Create checkbox
+                            self.expert_checkboxes[expert.id] = ui.checkbox(
+                                display_name,
+                                value=False
+                            ).classes('mb-2')
+            
+            # Statistics section
+            with ui.card().classes('w-full mb-4'):
+                ui.label('Database Statistics').classes('text-subtitle2 mb-2')
+                self.cleanup_stats_container = ui.column().classes('w-full')
+                with self.cleanup_stats_container:
+                    ui.label('Select experts and click "Refresh Statistics" to see current data.').classes('text-body2 text-grey')
+                
+                ui.button(
+                    'Refresh Statistics',
+                    icon='refresh',
+                    on_click=self._refresh_batch_statistics
+                ).props('outlined').classes('mt-2')
+            
+            # Cleanup configuration
+            with ui.card().classes('w-full mb-4'):
+                ui.label('Cleanup Configuration').classes('text-subtitle2 mb-2')
+                
+                # Days to keep
+                ui.label('Analyses older than this many days will be cleaned up:').classes('text-body2 mb-2')
+                self.cleanup_days_input = ui.number(
+                    label='Days to Keep',
+                    value=30,
+                    min=1,
+                    max=365,
+                    step=1,
+                    format='%.0f'
+                ).classes('w-full mb-4').props('outlined')
+                
+                # Status filter
+                ui.label('Select which analysis statuses to clean up:').classes('text-body2 mb-2')
+                with ui.column().classes('w-full mb-4'):
+                    self.cleanup_status_checkboxes = {}
+                    for status in MarketAnalysisStatus:
+                        # Default: clean up COMPLETED and FAILED, but not PENDING, RUNNING, or CANCELLED
+                        default_checked = status in [MarketAnalysisStatus.COMPLETED, MarketAnalysisStatus.FAILED]
+                        self.cleanup_status_checkboxes[status] = ui.checkbox(
+                            status.value.upper(),
+                            value=default_checked
+                        ).classes('mb-2')
+            
+            # Preview results container
+            with ui.card().classes('w-full mb-4'):
+                ui.label('Preview').classes('text-subtitle2 mb-2')
+                self.cleanup_preview_container = ui.column().classes('w-full')
+                with self.cleanup_preview_container:
+                    ui.label('Click "Preview Cleanup" to see what will be deleted.').classes('text-body2 text-grey')
+            
+            # Action buttons
+            with ui.row().classes('w-full gap-2 justify-end'):
+                ui.button(
+                    'Preview Cleanup',
+                    icon='visibility',
+                    on_click=self._preview_batch_cleanup
+                ).props('outlined')
+                
+                self.cleanup_execute_button = ui.button(
+                    'Execute Cleanup',
+                    icon='delete_sweep',
+                    on_click=self._execute_batch_cleanup
+                ).props('color=orange')
+                self.cleanup_execute_button.set_enabled(False)  # Disabled until preview is run
+    
+    def _select_all_experts(self):
+        """Select all expert checkboxes."""
+        for checkbox in self.expert_checkboxes.values():
+            checkbox.value = True
+    
+    def _deselect_all_experts(self):
+        """Deselect all expert checkboxes."""
+        for checkbox in self.expert_checkboxes.values():
+            checkbox.value = False
+    
+    def _get_selected_expert_ids(self) -> List[int]:
+        """Get list of selected expert IDs."""
+        return [
+            expert_id for expert_id, checkbox in self.expert_checkboxes.items()
+            if checkbox.value
+        ]
+    
+    def _refresh_batch_statistics(self):
+        """Refresh statistics for selected experts."""
+        self.cleanup_stats_container.clear()
+        
+        selected_expert_ids = self._get_selected_expert_ids()
+        
+        if not selected_expert_ids:
+            with self.cleanup_stats_container:
+                ui.label('⚠️ Please select at least one expert.').classes('text-orange')
+            return
+        
+        try:
+            # Aggregate statistics across all selected experts
+            total_analyses = 0
+            total_outputs = 0
+            total_recommendations = 0
+            combined_by_status = {}
+            combined_by_age = {
+                '7_days': 0,
+                '30_days': 0,
+                '90_days': 0,
+                '180_days': 0,
+                'older': 0
+            }
+            
+            for expert_id in selected_expert_ids:
+                stats = get_cleanup_statistics(expert_id)
+                total_analyses += stats['total_analyses']
+                total_outputs += stats['total_outputs']
+                total_recommendations += stats['total_recommendations']
+                
+                # Combine status counts
+                for status, count in stats['analyses_by_status'].items():
+                    combined_by_status[status] = combined_by_status.get(status, 0) + count
+                
+                # Combine age counts
+                for age_key, count in stats['analyses_by_age'].items():
+                    combined_by_age[age_key] += count
+            
+            with self.cleanup_stats_container:
+                ui.label(f'Statistics for {len(selected_expert_ids)} selected expert(s)').classes('text-body2 mb-2')
+                
+                with ui.grid(columns=2).classes('w-full gap-4 mb-4'):
+                    # Total analyses
+                    with ui.card().classes('p-4'):
+                        ui.label('Total Analyses').classes('text-caption text-grey')
+                        ui.label(str(total_analyses)).classes('text-h6')
+                    
+                    # Total outputs
+                    with ui.card().classes('p-4'):
+                        ui.label('Total Outputs').classes('text-caption text-grey')
+                        ui.label(str(total_outputs)).classes('text-h6')
+                
+                # By status
+                if combined_by_status:
+                    ui.label('Analyses by Status:').classes('text-body2 mt-4 mb-2')
+                    with ui.grid(columns=3).classes('w-full gap-2'):
+                        for status, count in sorted(combined_by_status.items()):
+                            with ui.card().classes('p-2'):
+                                ui.label(status.upper()).classes('text-caption text-grey')
+                                ui.label(str(count)).classes('text-subtitle2')
+                
+                # By age
+                ui.label('Analyses by Age:').classes('text-body2 mt-4 mb-2')
+                with ui.grid(columns=5).classes('w-full gap-2'):
+                    age_labels = {
+                        '7_days': '< 7 days',
+                        '30_days': '7-30 days',
+                        '90_days': '30-90 days',
+                        '180_days': '90-180 days',
+                        'older': '> 180 days'
+                    }
+                    for age_key, label in age_labels.items():
+                        count = combined_by_age.get(age_key, 0)
+                        with ui.card().classes('p-2'):
+                            ui.label(label).classes('text-caption text-grey')
+                            ui.label(str(count)).classes('text-subtitle2')
+        
+        except Exception as e:
+            logger.error(f'Error refreshing batch statistics: {e}')
+            with self.cleanup_stats_container:
+                ui.label(f'Error loading statistics: {str(e)}').classes('text-negative')
+    
+    def _preview_batch_cleanup(self):
+        """Preview cleanup for selected experts."""
+        self.cleanup_preview_container.clear()
+        
+        selected_expert_ids = self._get_selected_expert_ids()
+        
+        if not selected_expert_ids:
+            with self.cleanup_preview_container:
+                ui.label('⚠️ Please select at least one expert.').classes('text-orange')
+            self.cleanup_execute_button.set_enabled(False)
+            return
+        
+        try:
+            # Get selected statuses
+            selected_statuses = [
+                status for status, checkbox in self.cleanup_status_checkboxes.items()
+                if checkbox.value
+            ]
+            
+            if not selected_statuses:
+                with self.cleanup_preview_container:
+                    ui.label('⚠️ Please select at least one status to clean up.').classes('text-orange')
+                self.cleanup_execute_button.set_enabled(False)
+                return
+            
+            # Get days to keep
+            days_to_keep = int(self.cleanup_days_input.value)
+            
+            # Aggregate preview across all selected experts
+            total_deletable = 0
+            total_protected = 0
+            total_outputs_deleted = 0
+            total_recommendations_deleted = 0
+            combined_preview_items = []
+            
+            for expert_id in selected_expert_ids:
+                preview = preview_cleanup(
+                    days_to_keep=days_to_keep,
+                    statuses=selected_statuses,
+                    expert_instance_id=expert_id
+                )
+                
+                total_deletable += preview['deletable_analyses']
+                total_protected += preview['protected_analyses']
+                total_outputs_deleted += preview['estimated_outputs_deleted']
+                total_recommendations_deleted += preview['estimated_recommendations_deleted']
+                
+                # Add expert ID to preview items
+                for item in preview['preview_items']:
+                    item['expert_id'] = expert_id
+                    combined_preview_items.append(item)
+            
+            with self.cleanup_preview_container:
+                # Summary
+                with ui.card().classes('w-full p-4 mb-4').style('border: 2px solid orange'):
+                    ui.label('Batch Cleanup Summary').classes('text-subtitle2 mb-2')
+                    ui.label(f'Across {len(selected_expert_ids)} selected expert(s)').classes('text-body2 mb-2')
+                    
+                    if total_deletable == 0:
+                        ui.label('✅ No analyses to clean up with current settings.').classes('text-positive')
+                        self.cleanup_execute_button.set_enabled(False)
+                        return
+                    
+                    with ui.grid(columns=2).classes('w-full gap-4'):
+                        with ui.column():
+                            ui.label(f"Will delete: {total_deletable} analyses").classes('text-body1 font-bold text-orange')
+                            ui.label(f"Protected: {total_protected} analyses (have open transactions)").classes('text-body2')
+                        
+                        with ui.column():
+                            ui.label(f"Outputs to delete: {total_outputs_deleted}").classes('text-body2')
+                            ui.label(f"Recommendations to delete: {total_recommendations_deleted}").classes('text-body2')
+                
+                # Details table (limit to 100 items for performance)
+                if combined_preview_items:
+                    ui.label(f'Sample of analyses to be deleted (up to 100 of {total_deletable}):').classes('text-body2 mt-4 mb-2')
+                    
+                    columns = [
+                        {'name': 'expert_id', 'label': 'Expert ID', 'field': 'expert_id', 'align': 'left', 'sortable': True},
+                        {'name': 'id', 'label': 'Analysis ID', 'field': 'id', 'align': 'left', 'sortable': True},
+                        {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left', 'sortable': True},
+                        {'name': 'status', 'label': 'Status', 'field': 'status', 'align': 'left', 'sortable': True},
+                        {'name': 'created_at', 'label': 'Created', 'field': 'created_at', 'align': 'left', 'sortable': True},
+                        {'name': 'outputs_count', 'label': 'Outputs', 'field': 'outputs_count', 'align': 'right', 'sortable': True},
+                        {'name': 'recommendations_count', 'label': 'Recs', 'field': 'recommendations_count', 'align': 'right', 'sortable': True}
+                    ]
+                    
+                    ui.table(
+                        columns=columns,
+                        rows=combined_preview_items[:100],
+                        row_key='id'
+                    ).classes('w-full')
+                
+                # Enable execute button
+                self.cleanup_execute_button.set_enabled(True)
+        
+        except Exception as e:
+            logger.error(f'Error previewing batch cleanup: {e}')
+            with self.cleanup_preview_container:
+                ui.label(f'❌ Error: {str(e)}').classes('text-negative')
+            self.cleanup_execute_button.set_enabled(False)
+    
+    def _execute_batch_cleanup(self):
+        """Execute batch cleanup with confirmation."""
+        # Create confirmation dialog
+        with ui.dialog() as dialog, ui.card():
+            ui.label('⚠️ Confirm Batch Cleanup').classes('text-h6 mb-4')
+            
+            selected_count = len(self._get_selected_expert_ids())
+            ui.label(f'This will permanently delete the previewed analyses from {selected_count} expert(s).').classes('text-body1 mb-4')
+            ui.label('Are you sure you want to continue?').classes('text-body2 mb-4')
+            
+            with ui.row().classes('w-full justify-end gap-2'):
+                ui.button('Cancel', on_click=dialog.close).props('flat')
+                ui.button('Delete', on_click=lambda: self._perform_batch_cleanup(dialog)).props('color=negative')
+        
+        dialog.open()
+    
+    def _perform_batch_cleanup(self, dialog):
+        """Perform the actual batch cleanup operation."""
+        dialog.close()
+        
+        selected_expert_ids = self._get_selected_expert_ids()
+        
+        try:
+            # Get selected statuses
+            selected_statuses = [
+                status for status, checkbox in self.cleanup_status_checkboxes.items()
+                if checkbox.value
+            ]
+            
+            # Get days to keep
+            days_to_keep = int(self.cleanup_days_input.value)
+            
+            # Execute cleanup for each expert
+            total_analyses_deleted = 0
+            total_analyses_protected = 0
+            total_outputs_deleted = 0
+            total_recommendations_deleted = 0
+            all_errors = []
+            
+            for expert_id in selected_expert_ids:
+                cleanup_result = execute_cleanup(
+                    days_to_keep=days_to_keep,
+                    statuses=selected_statuses,
+                    expert_instance_id=expert_id
+                )
+                
+                if cleanup_result['success']:
+                    total_analyses_deleted += cleanup_result['analyses_deleted']
+                    total_analyses_protected += cleanup_result['analyses_protected']
+                    total_outputs_deleted += cleanup_result['outputs_deleted']
+                    total_recommendations_deleted += cleanup_result['recommendations_deleted']
+                    
+                    if cleanup_result['errors']:
+                        all_errors.extend(cleanup_result['errors'])
+                else:
+                    all_errors.extend(cleanup_result['errors'])
+            
+            # Show summary notification
+            message = f"✅ Batch cleanup completed across {len(selected_expert_ids)} expert(s)!\n"
+            message += f"Deleted: {total_analyses_deleted} analyses\n"
+            message += f"Protected: {total_analyses_protected} analyses with open transactions\n"
+            message += f"Outputs deleted: {total_outputs_deleted}\n"
+            message += f"Recommendations deleted: {total_recommendations_deleted}"
+            
+            if all_errors:
+                message += f"\n⚠️ {len(all_errors)} errors occurred"
+            
+            ui.notify(message, type='positive', multi_line=True, timeout=5000)
+            
+            # Clear preview
+            self.cleanup_preview_container.clear()
+            with self.cleanup_preview_container:
+                ui.label('Click "Preview Cleanup" to see what will be deleted.').classes('text-body2 text-grey')
+            
+            # Disable execute button
+            self.cleanup_execute_button.set_enabled(False)
+            
+            # Optionally refresh statistics
+            if selected_expert_ids:
+                self._refresh_batch_statistics()
+                
+        except Exception as e:
+            logger.error(f'Error executing batch cleanup: {e}')
+            ui.notify(f'❌ Batch cleanup failed: {str(e)}', type='negative')
+
+
 def content() -> None:
     logger.debug('Initializing settings page')
     
@@ -4455,7 +4961,8 @@ def content() -> None:
         ('account', 'Account Settings'),
         ('expert', 'Expert Settings'),
         ('trade', 'Trade Settings'),
-        ('instruments', 'Instruments')
+        ('instruments', 'Instruments'),
+        ('cleanup', 'Cleanup')
     ]
     
     with ui.tabs() as tabs:
@@ -4476,6 +4983,8 @@ def content() -> None:
             TradeSettingsTab()
         with ui.tab_panel(tab_objects['instruments']):
             InstrumentSettingsTab()
+        with ui.tab_panel(tab_objects['cleanup']):
+            BatchCleanupTab()
     
     # Setup HTML5 history navigation for tabs (NiceGUI 3.0 compatible)
     async def setup_tab_navigation():
@@ -4493,7 +5002,8 @@ def content() -> None:
                     'Account Settings': 'account',
                     'Expert Settings': 'expert',
                     'Trade Settings': 'trade',
-                    'Instruments': 'instruments'
+                    'Instruments': 'instruments',
+                    'Cleanup': 'cleanup'
                 };
                 
                 // Get tab name from tab element

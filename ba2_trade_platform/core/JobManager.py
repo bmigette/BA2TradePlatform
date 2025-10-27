@@ -245,6 +245,27 @@ class JobManager:
         if not expert_instance.enabled:
             raise ValueError(f"Expert instance {expert_instance_id} is disabled")
         
+        # Auto-add instrument if it doesn't exist in database
+        from .models import Instrument
+        from .db import get_db
+        from sqlmodel import Session, select
+        
+        with get_db() as session:
+            statement = select(Instrument).where(Instrument.name == symbol)
+            existing_instrument = session.exec(statement).first()
+            
+            if not existing_instrument:
+                # Create new instrument with auto_added label
+                new_instrument = Instrument(
+                    name=symbol,
+                    instrument_type='stock',  # Default to stock
+                    categories=[],
+                    labels=['auto_added']
+                )
+                session.add(new_instrument)
+                session.commit()
+                logger.info(f"Auto-added instrument '{symbol}' to database with label 'auto_added'")
+        
         # Validate subtype
         try:
             analysis_use_case = AnalysisUseCase(subtype)

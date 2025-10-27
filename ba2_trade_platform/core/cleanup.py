@@ -12,7 +12,7 @@ from ba2_trade_platform.core.models import (
     MarketAnalysis, 
     AnalysisOutput, 
     ExpertRecommendation,
-    TradeActionResult,
+    TradingOrder,
     Transaction
 )
 from ba2_trade_platform.core.types import MarketAnalysisStatus, TransactionStatus
@@ -243,7 +243,7 @@ def _has_open_transaction(session: Session, market_analysis_id: int) -> bool:
     """
     Check if a MarketAnalysis has any linked open transactions.
     
-    A transaction is linked to an analysis via ExpertRecommendation -> TradeActionResult -> Transaction.
+    A transaction is linked to an analysis via ExpertRecommendation -> TradingOrder -> Transaction.
     
     Args:
         session: Database session
@@ -261,17 +261,17 @@ def _has_open_transaction(session: Session, market_analysis_id: int) -> bool:
     
     # Check each recommendation for linked open transactions
     for recommendation in recommendations:
-        # Get trade action results for this recommendation
-        trade_results = session.exec(
-            select(TradeActionResult).where(
-                TradeActionResult.expert_recommendation_id == recommendation.id
+        # Get trading orders for this recommendation
+        orders = session.exec(
+            select(TradingOrder).where(
+                TradingOrder.expert_recommendation_id == recommendation.id
             )
         ).all()
         
-        # Check if any of these results have open transactions
-        for result in trade_results:
-            if result.transaction_id:
-                transaction = session.get(Transaction, result.transaction_id)
+        # Check if any of these orders have open transactions
+        for order in orders:
+            if order.transaction_id:
+                transaction = session.get(Transaction, order.transaction_id)
                 if transaction and transaction.status == TransactionStatus.OPENED:
                     return True
     

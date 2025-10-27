@@ -529,9 +529,9 @@ You have full access to these research tools - use them freely and repeatedly:
   * Use when: Stop loss hit, take profit reached, changed market conditions, portfolio rebalancing
   * Returns: Confirmation with total action count
 
-- **recommend_adjust_quantity(transaction_id: int, new_quantity: float, reason: str, confidence: int)** - Recommend changing position size
+- **recommend_adjust_quantity(transaction_id: int, new_quantity: int, reason: str, confidence: int)** - Recommend changing position size
   * transaction_id: ID of the position to adjust
-  * new_quantity: New absolute quantity for the position
+  * new_quantity: New absolute quantity for the position (MUST be whole number like 10, not 10.5)
   * reason: Clear explanation for the quantity adjustment
   * confidence: Your confidence level (1-100)
   * Use when: Scaling position up/down based on research
@@ -553,9 +553,9 @@ You have full access to these research tools - use them freely and repeatedly:
   * Use when: Adjusting profit targets based on research
   * Returns: Confirmation with total action count
 
-- **recommend_open_buy_position(symbol: str, quantity: float, reason: str, confidence: int, tp_price: float = None, sl_price: float = None)** - Recommend opening a new BUY (long) position
+- **recommend_open_buy_position(symbol: str, quantity: int, reason: str, confidence: int, tp_price: float = None, sl_price: float = None)** - Recommend opening a new BUY (long) position
   * symbol: Instrument symbol to buy (e.g., 'AAPL', 'MSFT')
-  * quantity: Number of shares/units to buy
+  * quantity: Number of shares/units to buy (MUST be a whole number, e.g., 10, not 10.5)
   * reason: Clear explanation for opening this position based on research
   * confidence: Your confidence level (1-100)
   * tp_price: Optional take profit price level
@@ -563,9 +563,9 @@ You have full access to these research tools - use them freely and repeatedly:
   * Use when: Strong buying opportunity identified
   * Returns: Confirmation with total action count
 
-- **recommend_open_sell_position(symbol: str, quantity: float, reason: str, confidence: int, tp_price: float = None, sl_price: float = None)** - Recommend opening a new SELL (short) position
+- **recommend_open_sell_position(symbol: str, quantity: int, reason: str, confidence: int, tp_price: float = None, sl_price: float = None)** - Recommend opening a new SELL (short) position
   * symbol: Instrument symbol to sell short (e.g., 'AAPL', 'MSFT')
-  * quantity: Number of shares/units to sell short
+  * quantity: Number of shares/units to sell short (MUST be a whole number, e.g., 10, not 10.5)
   * reason: Clear explanation for opening this short position based on research
   * confidence: Your confidence level (1-100)
   * tp_price: Optional take profit price level
@@ -1924,7 +1924,7 @@ def create_research_tools(toolkit: SmartRiskManagerToolkit, recommended_actions_
     @smart_risk_manager_tool
     def recommend_adjust_quantity(
         transaction_id: Annotated[int, "ID of the position to adjust"],
-        new_quantity: Annotated[float, "New quantity for the position"],
+        new_quantity: Annotated[int, "New quantity for the position - MUST be whole number (e.g., 10, not 10.5)"],
         reason: Annotated[str, "Clear explanation for the quantity adjustment"],
         confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"]
     ) -> str:
@@ -1932,7 +1932,9 @@ def create_research_tools(toolkit: SmartRiskManagerToolkit, recommended_actions_
         
         Use this when research suggests scaling position size up or down.
         
-        IMPORTANT: confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
+        IMPORTANT: 
+        - new_quantity must be a whole number (integer) like 10, not 10.5
+        - confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
         
         Returns:
             Confirmation message
@@ -2002,7 +2004,7 @@ def create_research_tools(toolkit: SmartRiskManagerToolkit, recommended_actions_
     @smart_risk_manager_tool
     def recommend_open_buy_position(
         symbol: Annotated[str, "Instrument symbol to buy (e.g., 'AAPL', 'MSFT')"],
-        quantity: Annotated[float, "Number of shares/units to buy"],
+        quantity: Annotated[int, "Number of shares/units to buy (MUST be a whole number, e.g., 10, not 10.5)"],
         reason: Annotated[str, "Clear explanation for opening this position based on research"],
         confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"],
         tp_price: Annotated[Optional[float], "Take profit price level (optional)"] = None,
@@ -2012,7 +2014,9 @@ def create_research_tools(toolkit: SmartRiskManagerToolkit, recommended_actions_
         
         Use this when research indicates a strong buying opportunity.
         
-        IMPORTANT: confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
+        IMPORTANT: 
+        - quantity must be a whole number (integer) like 10, not 10.5
+        - confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85)
         
         Returns:
             Confirmation message
@@ -2035,12 +2039,23 @@ def create_research_tools(toolkit: SmartRiskManagerToolkit, recommended_actions_
     @smart_risk_manager_tool
     def recommend_open_sell_position(
         symbol: Annotated[str, "Instrument symbol to sell short (e.g., 'AAPL', 'MSFT')"],
-        quantity: Annotated[float, "Number of shares/units to sell short"],
+        quantity: Annotated[int, "Number of shares/units to sell short (MUST be a whole number, e.g., 10, not 10.5)"],
         reason: Annotated[str, "Clear explanation for opening this short position based on research"],
         confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"],
         tp_price: Annotated[Optional[float], "Take profit price level (optional)"] = None,
         sl_price: Annotated[Optional[float], "Stop loss price level (optional)"] = None
     ) -> str:
+        """Recommend opening a new SELL (short) position based on research.
+        
+        Use this when research indicates a strong short-selling opportunity.
+        
+        IMPORTANT: 
+        - quantity must be a whole number (integer) like 10, not 10.5
+        - confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85)
+        
+        Returns:
+            Confirmation message
+        """
         """Recommend opening a new SELL (short) position based on research.
         
         Use this when research indicates a strong short-selling opportunity.
@@ -2298,7 +2313,7 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
         @smart_risk_manager_tool
         def recommend_adjust_quantity(
             transaction_id: Annotated[int, "ID of the position to adjust"],
-            new_quantity: Annotated[float, "New quantity for the position"],
+            new_quantity: Annotated[int, "New quantity for the position - MUST be whole number (e.g., 10, not 10.5)"],
             reason: Annotated[str, "Clear explanation for the quantity adjustment"],
             confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"]
         ) -> str:
@@ -2306,7 +2321,9 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             
             Use this when research suggests scaling position size up or down.
             
-            IMPORTANT: confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
+            IMPORTANT: 
+            - new_quantity must be a whole number (integer) like 10, not 10.5
+            - confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
             
             Returns:
                 Confirmation message
@@ -2770,6 +2787,12 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
                     elif action_type == "adjust_quantity":
                         transaction_id = parameters["transaction_id"]
                         new_quantity = parameters["new_quantity"]
+                        
+                        # CRITICAL: Ensure new_quantity is a whole number (Alpaca requires integers for GTC orders)
+                        if not isinstance(new_quantity, int) and new_quantity != int(new_quantity):
+                            logger.warning(f"⚠️ Fractional quantity detected for transaction {transaction_id}: {new_quantity} - rounding to {int(new_quantity)}")
+                        new_quantity = int(new_quantity)
+                        
                         result = toolkit.adjust_quantity(transaction_id, new_quantity, reason)
                         
                     elif action_type == "update_stop_loss":
@@ -2787,6 +2810,12 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
                         quantity = parameters["quantity"]
                         tp_price = parameters.get("tp_price")
                         sl_price = parameters.get("sl_price")
+                        
+                        # CRITICAL: Ensure quantity is a whole number (Alpaca requires integers for GTC orders)
+                        if not isinstance(quantity, int) and quantity != int(quantity):
+                            logger.warning(f"⚠️ Fractional quantity detected for {symbol}: {quantity} - rounding to {int(quantity)}")
+                        quantity = int(quantity)
+                        
                         result = toolkit.open_buy_position(symbol, quantity, tp_price, sl_price, reason)
                     
                     elif action_type == "open_sell_position":
@@ -2794,6 +2823,12 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
                         quantity = parameters["quantity"]
                         tp_price = parameters.get("tp_price")
                         sl_price = parameters.get("sl_price")
+                        
+                        # CRITICAL: Ensure quantity is a whole number (Alpaca requires integers for GTC orders)
+                        if not isinstance(quantity, int) and quantity != int(quantity):
+                            logger.warning(f"⚠️ Fractional quantity detected for {symbol}: {quantity} - rounding to {int(quantity)}")
+                        quantity = int(quantity)
+                        
                         result = toolkit.open_sell_position(symbol, quantity, tp_price, sl_price, reason)
                     
                     else:
@@ -3160,13 +3195,15 @@ class SmartRiskManagerGraph:
         @smart_risk_manager_tool
         def recommend_adjust_quantity(
             transaction_id: Annotated[int, "ID of the position to adjust"],
-            new_quantity: Annotated[float, "New quantity for the position"],
+            new_quantity: Annotated[int, "New quantity for the position - MUST be whole number (e.g., 10, not 10.5)"],
             reason: Annotated[str, "Clear explanation for adjustment"],
             confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"]
         ) -> str:
             """Recommend adjusting position quantity.
             
-            IMPORTANT: confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
+            IMPORTANT: 
+            - new_quantity must be a whole number (integer) like 10, not 10.5
+            - confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
             """
             action = {
                 "action_type": "adjust_quantity",
@@ -3223,7 +3260,7 @@ class SmartRiskManagerGraph:
         @smart_risk_manager_tool
         def recommend_open_buy_position(
             symbol: Annotated[str, "Instrument symbol to buy"],
-            quantity: Annotated[float, "Number of shares/units"],
+            quantity: Annotated[int, "Number of shares/units (MUST be a whole number, e.g., 10, not 10.5)"],
             reason: Annotated[str, "Clear explanation based on research"],
             confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"],
             tp_price: Annotated[Optional[float], "Take profit price (optional)"] = None,
@@ -3231,7 +3268,9 @@ class SmartRiskManagerGraph:
         ) -> str:
             """Recommend opening a new BUY (long) position.
             
-            IMPORTANT: confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
+            IMPORTANT: 
+            - quantity must be a whole number (integer) like 10, not 10.5
+            - confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85)
             """
             action = {
                 "action_type": "open_buy_position",
@@ -3251,7 +3290,7 @@ class SmartRiskManagerGraph:
         @smart_risk_manager_tool
         def recommend_open_sell_position(
             symbol: Annotated[str, "Instrument symbol to sell short"],
-            quantity: Annotated[float, "Number of shares/units"],
+            quantity: Annotated[int, "Number of shares/units (MUST be a whole number, e.g., 10, not 10.5)"],
             reason: Annotated[str, "Clear explanation based on research"],
             confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"],
             tp_price: Annotated[Optional[float], "Take profit price (optional)"] = None,
@@ -3259,7 +3298,9 @@ class SmartRiskManagerGraph:
         ) -> str:
             """Recommend opening a new SELL (short) position.
             
-            IMPORTANT: confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
+            IMPORTANT: 
+            - quantity must be a whole number (integer) like 10, not 10.5
+            - confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85)
             """
             action = {
                 "action_type": "open_sell_position",

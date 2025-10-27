@@ -1556,6 +1556,45 @@ class TradeManager:
                         # Check if evaluation produced any actions
                         if not action_summaries:
                             self.logger.debug(f"Recommendation {recommendation.id} for {recommendation.symbol} - no actions to execute (conditions not met)")
+                            
+                            # Store evaluation details even when no actions are created
+                            # This is crucial for analysis, debugging, and understanding why rules didn't trigger
+                            evaluation_details = evaluator.get_evaluation_details()
+                            if evaluation_details:
+                                from ..core.models import TradeActionResult
+                                from ..core.db import add_instance
+                                
+                                evaluation_result = TradeActionResult(
+                                    action_type='evaluation_only',
+                                    success=True,  # Evaluation succeeded, just no actions needed
+                                    message=f'Rule evaluation completed for {recommendation.symbol} (OPEN_POSITIONS) - no actions triggered (conditions not met)',
+                                    data={'evaluation_details': evaluation_details},
+                                    expert_recommendation_id=recommendation.id
+                                )
+                                add_instance(evaluation_result)
+                                self.logger.debug(f"Stored evaluation details for recommendation {recommendation.id} (OPEN_POSITIONS, no actions)")
+                            
+                        # Check for evaluation errors
+                        elif any('error' in summary for summary in action_summaries):
+                            errors = [s.get('error') for s in action_summaries if 'error' in s]
+                            self.logger.warning(f"Recommendation {recommendation.id} evaluation had errors: {errors}")
+                            
+                            # Store evaluation details even when errors occurred
+                            evaluation_details = evaluator.get_evaluation_details()
+                            if evaluation_details:
+                                from ..core.models import TradeActionResult
+                                from ..core.db import add_instance
+                                
+                                evaluation_result = TradeActionResult(
+                                    action_type='evaluation_error',
+                                    success=False,
+                                    message=f'Rule evaluation encountered errors for {recommendation.symbol} (OPEN_POSITIONS): {"; ".join(errors)}',
+                                    data={'evaluation_details': evaluation_details, 'errors': errors},
+                                    expert_recommendation_id=recommendation.id
+                                )
+                                add_instance(evaluation_result)
+                                self.logger.debug(f"Stored evaluation details for recommendation {recommendation.id} (OPEN_POSITIONS, errors)")
+                            
                         else:
                             self.logger.info(f"Recommendation {recommendation.id} for {recommendation.symbol} passed ruleset - {len(action_summaries)} action(s) to execute")
                             

@@ -5,7 +5,7 @@ import math
 
 from ...core.WorkerQueue import get_worker_queue
 from ...core.db import get_all_instances, get_instance, get_db
-from ...core.models import MarketAnalysis, ExpertInstance, AnalysisOutput
+from ...core.models import MarketAnalysis, ExpertInstance, AnalysisOutput, ExpertRecommendation
 from ...core.types import MarketAnalysisStatus, WorkerTaskStatus, OrderDirection, OrderRecommendation, OrderOpenType
 from ...core.models import TradingOrder
 from ...core.types import OrderStatus
@@ -1039,7 +1039,15 @@ class ManualAnalysisTab:
                 with ui.column().classes('flex-1'):
                     # Expert instance selection
                     expert_instances = get_all_instances(ExpertInstance)
-                    expert_options = {f"{exp.id}": f"{exp.expert} (ID: {exp.id})" for exp in expert_instances if exp.enabled}
+                    # Use alias if available, otherwise fall back to expert class + ID
+                    expert_options = {}
+                    for exp in expert_instances:
+                        if exp.enabled:
+                            if exp.alias:
+                                display_name = f"{exp.alias} (ID: {exp.id})"
+                            else:
+                                display_name = f"{exp.expert} (ID: {exp.id})"
+                            expert_options[f"{exp.id}"] = display_name
                     
                     self.expert_select = ui.select(
                         options=expert_options,
@@ -1148,8 +1156,15 @@ class ManualAnalysisTab:
                     ui.label('AI Selection Prompt:').classes('text-sm font-medium mb-2')
                     
                     # Get default prompt from AIInstrumentSelector
+                    # Get model from expert settings - use dynamic_instrument_selection_model setting
+                    model_string = expert.settings.get('dynamic_instrument_selection_model')
+                    if not model_string:
+                        logger.error(f"Expert {expert.id} has no dynamic_instrument_selection_model setting - cannot perform AI instrument selection")
+                        ui.notify("Expert is not configured for AI instrument selection (missing model setting)", type='negative')
+                        return
+                    
                     from ...core.AIInstrumentSelector import AIInstrumentSelector
-                    ai_selector = AIInstrumentSelector()
+                    ai_selector = AIInstrumentSelector(model_string=model_string)
                     default_prompt = ai_selector.get_default_prompt()
                     
                     self.ai_prompt_textarea = ui.textarea(
@@ -1159,7 +1174,7 @@ class ManualAnalysisTab:
                     
                     with ui.row().classes('w-full justify-between mt-2'):
                         ui.button('Reset to Default', on_click=lambda: self.ai_prompt_textarea.set_value(default_prompt), icon='refresh').classes('bg-gray-500')
-                        ui.button('Generate AI Selection', on_click=self._generate_ai_selection, icon='auto_awesome').classes('bg-green-600')
+                        self.ai_generate_button = ui.button('Generate AI Selection', on_click=self._generate_ai_selection, icon='auto_awesome').classes('bg-green-600')
                     
                     # Container for AI-selected instruments (will be populated after AI selection)
                     self.ai_results_container = ui.column().classes('w-full mt-4')
@@ -1182,7 +1197,7 @@ class ManualAnalysisTab:
         )
         self.instrument_selector.render()
     
-    def _generate_ai_selection(self):
+    async def _generate_ai_selection(self):
         """Generate AI instrument selection based on user prompt."""
         try:
             prompt = self.ai_prompt_textarea.value.strip()
@@ -1190,19 +1205,43 @@ class ManualAnalysisTab:
                 ui.notify("Please enter a prompt for AI selection", type='negative')
                 return
             
-            # Show loading indicator
+            # Get the expert instance to access its model setting
+            from ...core.utils import get_expert_instance_from_id
+            expert = get_expert_instance_from_id(int(self.expert_instance_id))
+            
+            if not expert:
+                ui.notify("Expert instance not found", type='negative')
+                return
+            
+            # Get model from expert settings - use dynamic_instrument_selection_model setting
+            model_string = expert.settings.get('dynamic_instrument_selection_model')
+            if not model_string:
+                logger.error(f"Expert {expert.id} has no dynamic_instrument_selection_model setting - cannot perform AI instrument selection")
+                ui.notify("Expert is not configured for AI instrument selection (missing model setting)", type='negative')
+                return
+            
+            # Disable button and show spinner
+            self.ai_generate_button.props('loading')
+            self.ai_generate_button.set_enabled(False)
+            
+            # Show loading indicator in results container
             with self.ai_results_container:
                 self.ai_results_container.clear()
                 with ui.row().classes('items-center'):
                     ui.spinner('dots', size='sm').classes('mr-2')
                     ui.label('AI is selecting instruments...').classes('text-gray-600')
             
-            # Perform AI selection in background
+            # Perform AI selection in background thread
             from ...core.AIInstrumentSelector import AIInstrumentSelector
-            ai_selector = AIInstrumentSelector()
+            import asyncio
+            from concurrent.futures import ThreadPoolExecutor
             
-            # Run AI selection
-            selected_symbols = ai_selector.select_instruments(prompt)
+            ai_selector = AIInstrumentSelector(model_string=model_string)
+            
+            # Run AI selection in thread pool to avoid blocking UI
+            loop = asyncio.get_event_loop()
+            with ThreadPoolExecutor() as executor:
+                selected_symbols = await loop.run_in_executor(executor, ai_selector.select_instruments, prompt)
             
             # Auto-add instruments to database if they don't exist
             if selected_symbols:
@@ -1233,7 +1272,7 @@ class ManualAnalysisTab:
                                 for symbol in selected_symbols:
                                     ui.badge(symbol).classes('bg-blue-100 text-blue-800 px-2 py-1')
                             
-                            # Create instrument list for the selector
+                            # Create instrument list for the selector (all preselected as enabled)
                             instrument_list = [{'name': symbol, 'enabled': True} for symbol in selected_symbols]
                             
                             # Create traditional instrument selector with AI-selected instruments
@@ -1263,6 +1302,10 @@ class ManualAnalysisTab:
                         ui.icon('error').classes('text-red-600 mr-2')
                         ui.label(f'Error: {str(e)}').classes('text-red-600')
             ui.notify(f"Error during AI selection: {str(e)}", type='negative')
+        finally:
+            # Re-enable button and remove spinner
+            self.ai_generate_button.props(remove='loading')
+            self.ai_generate_button.set_enabled(True)
     
     def on_analysis_type_change(self):
         """Handle analysis type selection change."""
@@ -1325,8 +1368,65 @@ class ManualAnalysisTab:
                     logger.error(f"Error getting expert instrument recommendations: {e}", exc_info=True)
                     ui.notify(f"Error getting expert recommendations: {str(e)}", type='negative')
                     return
+            elif instrument_selection_method == 'dynamic':
+                # AI-powered dynamic selection
+                if self.instrument_selector:
+                    # User already generated AI selection - use selected instruments
+                    selected_instruments = self.instrument_selector.get_selected_instruments()
+                    
+                    if not selected_instruments:
+                        ui.notify("Please select at least one instrument from AI-generated list", type='negative')
+                        return
+                else:
+                    # User didn't click "Generate AI Selection" - automatically fetch all dynamic instruments
+                    try:
+                        # Get model from expert settings
+                        model_string = expert.settings.get('dynamic_instrument_selection_model')
+                        if not model_string:
+                            logger.error(f"Expert {expert.id} has no dynamic_instrument_selection_model setting")
+                            ui.notify("Expert is not configured for AI instrument selection (missing model setting)", type='negative')
+                            return
+                        
+                        # Get prompt from textarea
+                        prompt = self.ai_prompt_textarea.value.strip()
+                        if not prompt:
+                            ui.notify("Please enter a prompt for AI selection or click 'Generate AI Selection' first", type='negative')
+                            return
+                        
+                        # Show notification that we're generating selection
+                        ui.notify("Generating AI instrument selection automatically...", type='info')
+                        
+                        # Perform AI selection
+                        from ...core.AIInstrumentSelector import AIInstrumentSelector
+                        ai_selector = AIInstrumentSelector(model_string=model_string)
+                        selected_symbols = ai_selector.select_instruments(prompt)
+                        
+                        if not selected_symbols:
+                            ui.notify("AI instrument selection returned no results", type='negative')
+                            return
+                        
+                        # Auto-add instruments to database if they don't exist
+                        try:
+                            from ...core.InstrumentAutoAdder import get_instrument_auto_adder
+                            auto_adder = get_instrument_auto_adder()
+                            auto_adder.queue_instruments_for_addition(
+                                symbols=selected_symbols,
+                                expert_shortname='ai_selector',
+                                source='ai'
+                            )
+                        except Exception as e:
+                            logger.warning(f"Could not queue AI-selected instruments for auto-addition: {e}")
+                        
+                        # Convert to expected format (all instruments selected)
+                        selected_instruments = [{'name': symbol} for symbol in selected_symbols]
+                        logger.info(f"AI automatically selected {len(selected_instruments)} instruments: {selected_symbols}")
+                        
+                    except Exception as e:
+                        logger.error(f"Error during automatic AI instrument selection: {e}", exc_info=True)
+                        ui.notify(f"Error during AI selection: {str(e)}", type='negative')
+                        return
             else:
-                # Static or dynamic (manual selection required)
+                # Static (manual selection required)
                 if not self.instrument_selector:
                     ui.notify("No instruments available for selection", type='negative')
                     return
@@ -2118,6 +2218,19 @@ class OrderRecommendationsTab:
                         TradingOrder.symbol == symbol,
                         TradingOrder.transaction_id.is_not(None)
                     )
+                    
+                    # Apply expert filter to orders count if not 'all'
+                    if self.expert_filter and self.expert_filter != 'all':
+                        try:
+                            expert_id = int(self.expert_filter)
+                            # Join with ExpertRecommendation to filter by expert
+                            orders_statement = orders_statement.join(
+                                ExpertRecommendation,
+                                TradingOrder.expert_recommendation_id == ExpertRecommendation.id
+                            ).where(ExpertRecommendation.instance_id == expert_id)
+                        except (ValueError, IndexError):
+                            pass  # If parsing fails, don't filter orders
+                    
                     orders_count = session.exec(orders_statement).first() or 0
                     
                     # Apply order status filter
@@ -2640,17 +2753,16 @@ class OrderRecommendationsTab:
             
             experts = get_all_instances(ExpertInstance)
             enabled_experts = [e for e in experts if e.enabled]
-            
-            # Always start with 'All Experts' option
-            options = ['all']
-            
-            # Create options: alias-ID or expertType-ID format
+
+            # Build mapping for select: key -> label
+            options = {'all': 'All Experts'}
+
+            # Create options: key is expert id string, value is display name
             for expert in enabled_experts:
-                # Use alias if available, otherwise expert type
                 base_name = expert.alias or expert.expert
-                display_name = f"{base_name}-{expert.id}"
-                options.append(display_name)
-            
+                display_name = f"{base_name} (ID: {expert.id})"
+                options[str(expert.id)] = display_name
+
             return options
             
         except Exception as e:

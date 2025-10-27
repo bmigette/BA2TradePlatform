@@ -230,6 +230,8 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                     "NagaAI/deepseek-chat-v3.1:free",
                     "NagaAI/deepseek-v3.2-exp",
                     "NagaAI/deepseek-v3.2-exp:free",
+                    "NagaAI/deepseek-reasoner-0528",
+                    "NagaAI/deepseek-reasoner-0528:free",
                     # Qwen (latest reasoning models)
                     "NagaAI/qwen3-max",
                     "NagaAI/qwen3-next-80b-a3b-instruct",
@@ -614,25 +616,55 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
         expert_recommendation = final_state.get('expert_recommendation', {})
         
         if expert_recommendation:
-            # Get price_at_date from recommendation, fallback to fetching current price
-            price_at_date = expert_recommendation.get('price_at_date', 0.0)
+            # Get price_at_date from recommendation
+            graph_price = expert_recommendation.get('price_at_date', 0.0)
             
-            # If price is 0 or missing, fetch current market price from account
-            if price_at_date <= 0:
-                try:
-                    from ...core.utils import get_account_instance_from_id
-                    account = get_account_instance_from_id(self.instance.account_id)
-                    if account:
-                        current_price = account.get_instrument_current_price(symbol)
-                        if current_price and current_price > 0:
-                            price_at_date = current_price
-                            self.logger.info(f"Fetched current market price for {symbol}: ${price_at_date:.2f} (price_at_date was missing from analysis)")
-                        else:
-                            self.logger.warning(f"Could not fetch current price for {symbol}, price_at_date will be 0")
+            # Always fetch account price for validation and logging
+            account_price = None
+            try:
+                from ...core.utils import get_account_instance_from_id
+                account = get_account_instance_from_id(self.instance.account_id)
+                if account:
+                    account_price = account.get_instrument_current_price(symbol)
+                    if account_price and account_price > 0:
+                        self.logger.debug(f"Account price for {symbol}: ${account_price:.2f}")
                     else:
-                        self.logger.error(f"Could not get account instance for account_id {self.instance.account_id}")
-                except Exception as e:
-                    self.logger.error(f"Error fetching current price for {symbol}: {e}")
+                        self.logger.warning(f"Account returned invalid price for {symbol}: {account_price}")
+                else:
+                    self.logger.error(f"Could not get account instance for account_id {self.instance.account_id}")
+            except Exception as e:
+                self.logger.error(f"Error fetching account price for {symbol}: {e}", exc_info=True)
+            
+            # Determine which price to use and log decision
+            if graph_price > 0:
+                # Graph provided a price - validate against account price if available
+                if account_price and account_price > 0:
+                    price_diff_pct = abs(graph_price - account_price) / account_price * 100
+                    
+                    if price_diff_pct > 10:  # More than 10% difference
+                        self.logger.warning(
+                            f"⚠️ PRICE DISCREPANCY for {symbol}: "
+                            f"Graph=${graph_price:.2f} vs Account=${account_price:.2f} "
+                            f"(diff: {price_diff_pct:.1f}%). Using graph price. "
+                            f"Data providers: {self.settings.get('vendor_stock_data', 'unknown')}"
+                        )
+                    else:
+                        self.logger.info(f"Price validation OK for {symbol}: Graph=${graph_price:.2f}, Account=${account_price:.2f} (diff: {price_diff_pct:.1f}%)")
+                else:
+                    self.logger.info(f"Using graph price for {symbol}: ${graph_price:.2f} (account price unavailable for validation)")
+                
+                price_at_date = graph_price
+                price_source = "graph"
+            else:
+                # Graph price missing or zero - use account price
+                if account_price and account_price > 0:
+                    price_at_date = account_price
+                    price_source = "account_fallback"
+                    self.logger.info(f"Using account fallback price for {symbol}: ${price_at_date:.2f} (graph price was missing/zero)")
+                else:
+                    price_at_date = 0.0
+                    price_source = "none"
+                    self.logger.error(f"No valid price available for {symbol} - both graph and account failed!")
             
             return {
                 'signal': expert_recommendation.get('recommended_action', OrderRecommendation.ERROR),
@@ -644,8 +676,11 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                 'time_horizon': expert_recommendation.get('time_horizon', TimeHorizon.SHORT_TERM)
             }
         else:
-            # Fallback to processed signal - also fetch current price from account
+            # Fallback to processed signal - fetch current price from account
+            self.logger.warning(f"No expert_recommendation in graph output for {symbol} - using fallback path")
             price_at_date = 0.0
+            price_source = "none"
+            
             try:
                 from ...core.utils import get_account_instance_from_id
                 account = get_account_instance_from_id(self.instance.account_id)
@@ -653,13 +688,14 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                     current_price = account.get_instrument_current_price(symbol)
                     if current_price and current_price > 0:
                         price_at_date = current_price
-                        self.logger.info(f"Fetched current market price for {symbol}: ${price_at_date:.2f} (fallback path)")
+                        price_source = "account_fallback"
+                        self.logger.info(f"Using account price for {symbol}: ${price_at_date:.2f} (fallback path - no graph recommendation)")
                     else:
-                        self.logger.warning(f"Could not fetch current price for {symbol} in fallback path")
+                        self.logger.error(f"Account returned invalid price for {symbol} in fallback path: {current_price}")
                 else:
                     self.logger.error(f"Could not get account instance for account_id {self.instance.account_id} in fallback path")
             except Exception as e:
-                self.logger.error(f"Error fetching current price for {symbol} in fallback path: {e}")
+                self.logger.error(f"Error fetching account price for {symbol} in fallback path: {e}", exc_info=True)
             
             return {
                 'signal': processed_signal if processed_signal in ['BUY', 'SELL', 'HOLD'] else OrderRecommendation.ERROR,
