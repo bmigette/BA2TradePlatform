@@ -1896,7 +1896,7 @@ def create_research_tools(toolkit: SmartRiskManagerToolkit, recommended_actions_
     def recommend_close_position(
         transaction_id: Annotated[int, "ID of the open transaction/position to close"],
         reason: Annotated[str, "Clear explanation referencing your research findings (e.g., 'Analysis #456 shows bearish reversal')"],
-        confidence: Annotated[int, "Your confidence level in this recommendation (1-100)"]
+        confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"]
     ) -> str:
         """Recommend closing an existing position based on your research.
         
@@ -1905,6 +1905,8 @@ def create_research_tools(toolkit: SmartRiskManagerToolkit, recommended_actions_
         - Take profit target reached
         - Changed market conditions making the position risky
         - Portfolio rebalancing needs
+        
+        IMPORTANT: confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
         
         Returns:
             Confirmation message
@@ -1924,11 +1926,13 @@ def create_research_tools(toolkit: SmartRiskManagerToolkit, recommended_actions_
         transaction_id: Annotated[int, "ID of the position to adjust"],
         new_quantity: Annotated[float, "New quantity for the position"],
         reason: Annotated[str, "Clear explanation for the quantity adjustment"],
-        confidence: Annotated[int, "Your confidence level (1-100)"]
+        confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"]
     ) -> str:
         """Recommend adjusting the quantity/size of an existing position.
         
         Use this when research suggests scaling position size up or down.
+        
+        IMPORTANT: confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
         
         Returns:
             Confirmation message
@@ -1948,11 +1952,13 @@ def create_research_tools(toolkit: SmartRiskManagerToolkit, recommended_actions_
         transaction_id: Annotated[int, "ID of the position to update stop loss for"],
         new_sl_price: Annotated[float, "New stop loss price level"],
         reason: Annotated[str, "Clear explanation for the stop loss adjustment"],
-        confidence: Annotated[int, "Your confidence level (1-100)"]
+        confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"]
     ) -> str:
         """Recommend updating the stop loss price for an existing position.
         
         Use this when research suggests tightening or loosening stop loss levels.
+        
+        IMPORTANT: confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
         
         Returns:
             Confirmation message
@@ -1972,11 +1978,13 @@ def create_research_tools(toolkit: SmartRiskManagerToolkit, recommended_actions_
         transaction_id: Annotated[int, "ID of the position to update take profit for"],
         new_tp_price: Annotated[float, "New take profit price level"],
         reason: Annotated[str, "Clear explanation for the take profit adjustment"],
-        confidence: Annotated[int, "Your confidence level (1-100)"]
+        confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"]
     ) -> str:
         """Recommend updating the take profit price for an existing position.
         
         Use this when research suggests adjusting profit target levels.
+        
+        IMPORTANT: confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
         
         Returns:
             Confirmation message
@@ -1996,13 +2004,15 @@ def create_research_tools(toolkit: SmartRiskManagerToolkit, recommended_actions_
         symbol: Annotated[str, "Instrument symbol to buy (e.g., 'AAPL', 'MSFT')"],
         quantity: Annotated[float, "Number of shares/units to buy"],
         reason: Annotated[str, "Clear explanation for opening this position based on research"],
-        confidence: Annotated[int, "Your confidence level (1-100)"],
+        confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"],
         tp_price: Annotated[Optional[float], "Take profit price level (optional)"] = None,
         sl_price: Annotated[Optional[float], "Stop loss price level (optional)"] = None
     ) -> str:
         """Recommend opening a new BUY (long) position based on research.
         
         Use this when research indicates a strong buying opportunity.
+        
+        IMPORTANT: confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
         
         Returns:
             Confirmation message
@@ -2027,13 +2037,15 @@ def create_research_tools(toolkit: SmartRiskManagerToolkit, recommended_actions_
         symbol: Annotated[str, "Instrument symbol to sell short (e.g., 'AAPL', 'MSFT')"],
         quantity: Annotated[float, "Number of shares/units to sell short"],
         reason: Annotated[str, "Clear explanation for opening this short position based on research"],
-        confidence: Annotated[int, "Your confidence level (1-100)"],
+        confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"],
         tp_price: Annotated[Optional[float], "Take profit price level (optional)"] = None,
         sl_price: Annotated[Optional[float], "Stop loss price level (optional)"] = None
     ) -> str:
         """Recommend opening a new SELL (short) position based on research.
         
         Use this when research indicates a strong short-selling opportunity.
+        
+        IMPORTANT: confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
         
         Returns:
             Confirmation message
@@ -2071,19 +2083,20 @@ def create_research_tools(toolkit: SmartRiskManagerToolkit, recommended_actions_
 
 def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
     """
-    Research mode - autonomous agent that iteratively gathers analysis details.
+    Research mode - autonomous agent with INTERNAL iteration loop.
     
-    The research agent has its own conversation context and can call tools multiple times
-    to gather information iteratively. It continues until it has enough data, then returns
-    recommended actions directly to action_node for execution.
+    Uses an internal loop instead of graph-based iteration for better performance
+    and simpler LLM session management. The LLM session persists naturally across
+    all iterations within this single function call.
     
     Steps:
     1. Create isolated conversation context for research
     2. Give research agent access to all research tools
-    3. Let agent iteratively call tools to gather data (up to 15 iterations)
-    4. Return concise summary and recommended actions to action_node
+    3. INTERNAL LOOP: Iteratively call tools to gather data (up to max_iterations)
+    4. If no actions recommended, ask LLM why
+    5. Return summary and recommended actions to action_node
     """
-    logger.info("Entering research mode - autonomous research agent starting...")
+    logger.info("Entering research mode - autonomous research agent with internal loop...")
     
     try:
         expert_instance_id = state["expert_instance_id"]
@@ -2093,6 +2106,7 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
         api_key = state["api_key"]
         expert_settings = state["expert_settings"]
         portfolio_status = state["portfolio_status"]
+        max_iterations = state["max_iterations"]
         
         # Calculate position size limits
         max_position_pct = expert_settings.get("max_virtual_equity_per_instrument_percent", 100.0)
@@ -2101,6 +2115,9 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
         
         # Create toolkit
         toolkit = SmartRiskManagerToolkit(expert_instance_id, account_id)
+        
+        # Track recommended actions in closure scope (persists across loop iterations)
+        recommended_actions_list = []
         
         # Create research-specific tools
         @tool
@@ -2248,15 +2265,12 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             """
             return f"Research complete. Summary recorded: {summary[:100]}..."
         
-        # Track recommended actions in closure scope
-        recommended_actions_list = []
-        
         @tool
         @smart_risk_manager_tool
         def recommend_close_position(
             transaction_id: Annotated[int, "ID of the open transaction/position to close"],
             reason: Annotated[str, "Clear explanation referencing your research findings (e.g., 'Analysis #456 shows bearish reversal')"],
-            confidence: Annotated[int, "Your confidence level in this recommendation (1-100)"]
+            confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"]
         ) -> str:
             """Recommend closing an existing position based on your research.
             
@@ -2265,6 +2279,8 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             - Take profit target reached
             - Changed market conditions making the position risky
             - Portfolio rebalancing needs
+            
+            IMPORTANT: confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
             
             Returns:
                 Confirmation message
@@ -2284,11 +2300,13 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             transaction_id: Annotated[int, "ID of the position to adjust"],
             new_quantity: Annotated[float, "New quantity for the position"],
             reason: Annotated[str, "Clear explanation for the quantity adjustment"],
-            confidence: Annotated[int, "Your confidence level (1-100)"]
+            confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"]
         ) -> str:
             """Recommend adjusting the quantity/size of an existing position.
             
             Use this when research suggests scaling position size up or down.
+            
+            IMPORTANT: confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
             
             Returns:
                 Confirmation message
@@ -2308,11 +2326,13 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             transaction_id: Annotated[int, "ID of the position to update stop loss for"],
             new_sl_price: Annotated[float, "New stop loss price level"],
             reason: Annotated[str, "Clear explanation for the stop loss adjustment"],
-            confidence: Annotated[int, "Your confidence level (1-100)"]
+            confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"]
         ) -> str:
             """Recommend updating the stop loss price for an existing position.
             
             Use this when research suggests tightening or loosening stop loss levels.
+            
+            IMPORTANT: confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
             
             Returns:
                 Confirmation message
@@ -2332,11 +2352,13 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             transaction_id: Annotated[int, "ID of the position to update take profit for"],
             new_tp_price: Annotated[float, "New take profit price level"],
             reason: Annotated[str, "Clear explanation for the take profit adjustment"],
-            confidence: Annotated[int, "Your confidence level (1-100)"]
+            confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"]
         ) -> str:
             """Recommend updating the take profit price for an existing position.
             
             Use this when research suggests adjusting profit target levels.
+            
+            IMPORTANT: confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
             
             Returns:
                 Confirmation message
@@ -2356,13 +2378,15 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             symbol: Annotated[str, "Instrument symbol to buy (e.g., 'AAPL', 'MSFT')"],
             quantity: Annotated[float, "Number of shares/units to buy"],
             reason: Annotated[str, "Clear explanation for opening this position based on research"],
-            confidence: Annotated[int, "Your confidence level (1-100)"],
+            confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"],
             tp_price: Annotated[Optional[float], "Take profit price level (optional)"] = None,
             sl_price: Annotated[Optional[float], "Stop loss price level (optional)"] = None
         ) -> str:
             """Recommend opening a new BUY (long) position based on research.
             
             Use this when research indicates a strong buying opportunity.
+            
+            IMPORTANT: confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
             
             Returns:
                 Confirmation message
@@ -2387,13 +2411,15 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             symbol: Annotated[str, "Instrument symbol to sell short (e.g., 'AAPL', 'MSFT')"],
             quantity: Annotated[float, "Number of shares/units to sell short"],
             reason: Annotated[str, "Clear explanation for opening this short position based on research"],
-            confidence: Annotated[int, "Your confidence level (1-100)"],
+            confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"],
             tp_price: Annotated[Optional[float], "Take profit price level (optional)"] = None,
             sl_price: Annotated[Optional[float], "Stop loss price level (optional)"] = None
         ) -> str:
             """Recommend opening a new SELL (short) position based on research.
             
             Use this when research indicates a strong short-selling opportunity.
+            
+            IMPORTANT: confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
             
             Returns:
                 Confirmation message
@@ -2428,52 +2454,38 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             finish_research_tool
         ]
         
-        # Get or initialize research conversation from state
-        # This persists across graph loop iterations
-        research_messages = state.get("research_messages", [])
+        # Get expert-specific instructions if available
+        expert_instructions = ""
+        try:
+            expert_inst = get_expert_instance_from_id(expert_instance_id)
+            if expert_inst and hasattr(expert_inst, 'get_expert_specific_instructions'):
+                expert_instructions = expert_inst.get_expert_specific_instructions("research_node")
+                if expert_instructions:
+                    logger.info(f"Added expert-specific instructions for research_node ({len(expert_instructions)} chars)")
+        except Exception as e:
+            logger.warning(f"Could not get expert-specific instructions: {e}")
         
-        # Check if this is the first iteration - if so, initialize LLM and conversation
-        if not research_messages:
-            # FIRST ITERATION ONLY: Create LLM with tools and initialize conversation
-            
-            # Get expert-specific instructions if available
-            expert_instructions = ""
-            try:
-                expert_inst = get_expert_instance_from_id(expert_instance_id)
-                if expert_inst and hasattr(expert_inst, 'get_expert_specific_instructions'):
-                    expert_instructions = expert_inst.get_expert_specific_instructions("research_node")
-                    if expert_instructions:
-                        logger.info(f"Added expert-specific instructions for research_node ({len(expert_instructions)} chars)")
-            except Exception as e:
-                logger.warning(f"Could not get expert-specific instructions: {e}")
-            
-            # Format expert instructions with newline only if present
-            formatted_expert_instructions = f"\n\n{expert_instructions}" if expert_instructions else ""
-            
-            # Use global RESEARCH_PROMPT with dynamic context
-            agent_scratchpad_content = state.get('agent_scratchpad', 'No prior context')
-            logger.debug(f"Formatting RESEARCH_PROMPT with agent_scratchpad length: {len(agent_scratchpad_content)} chars")
-            logger.debug(f"Agent scratchpad preview: {agent_scratchpad_content[:500]}...")
-            
-            research_system_prompt = RESEARCH_PROMPT.format(
-                agent_scratchpad=agent_scratchpad_content,
-                expert_instructions=formatted_expert_instructions,
-                max_position_pct=max_position_pct,
-                max_position_equity=max_position_equity
-            )
-            
-            logger.debug(f"Formatted research_system_prompt length: {len(research_system_prompt)} chars")
-            placeholder_check = "{agent_scratchpad}" in research_system_prompt
-            logger.debug(f"Checking if placeholder was replaced: {{agent_scratchpad}} still in prompt = {placeholder_check}")
+        # Format expert instructions with newline only if present
+        formatted_expert_instructions = f"\n\n{expert_instructions}" if expert_instructions else ""
+        
+        # Use global RESEARCH_PROMPT with dynamic context
+        agent_scratchpad_content = state.get('agent_scratchpad', 'No prior context')
+        
+        research_system_prompt = RESEARCH_PROMPT.format(
+            agent_scratchpad=agent_scratchpad_content,
+            expert_instructions=formatted_expert_instructions,
+            max_position_pct=max_position_pct,
+            max_position_equity=max_position_equity
+        )
 
-            # Initialize conversation with system prompt
-            research_messages = [
-                SystemMessage(content=research_system_prompt),
-                HumanMessage(content="Begin your research. Investigate the most relevant analyses and gather detailed information.")
-            ]
-            logger.info(f"Research agent initialized with {len(research_tools)} available tools: {[t.name for t in research_tools]}")
+        # Initialize conversation with system prompt
+        research_messages = [
+            SystemMessage(content=research_system_prompt),
+            HumanMessage(content="Begin your research. Investigate the most relevant analyses and gather detailed information.")
+        ]
+        logger.info(f"Research agent initialized with {len(research_tools)} available tools")
         
-        # Create LLM with tools (reused across iterations)
+        # Create LLM with tools ONCE (reused across all loop iterations)
         llm = create_llm(risk_manager_model, 0.2, backend_url, api_key)
         llm_with_tools = llm.bind_tools(research_tools)
         
@@ -2481,26 +2493,32 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
         research_complete = False
         final_summary = ""
         
-        # Update iteration count
-        iteration_count = state["iteration_count"] + 1
-        
-        # =================== ITERATION LOGGING ===================
-        logger.info("=" * 70)
-        logger.info(f"RESEARCH ITERATION {iteration_count}/{state['max_iterations']}")
-        logger.info("=" * 70)
-        
-        # Get LLM response with tool calls
-        response = llm_with_tools.invoke(research_messages)
-        research_messages.append(response)
-        
-        logger.info(f"Research iteration: LLM returned {len(response.tool_calls) if response.tool_calls else 0} tool calls")
-        
-        # Check if research is complete
-        if not response.tool_calls:
-            logger.info("Research agent finished without tool calls")
-            final_summary = response.content
-            research_complete = True
-        else:
+        # =================== INTERNAL ITERATION LOOP ===================
+        for iteration in range(1, max_iterations + 1):
+            logger.info("=" * 70)
+            logger.info(f"RESEARCH ITERATION {iteration}/{max_iterations}")
+            logger.info("=" * 70)
+            
+            # Get LLM response with tool calls
+            try:
+                response = llm_with_tools.invoke(research_messages)
+            except Exception as e:
+                logger.error(f"LLM invocation error on iteration {iteration}: {e}", exc_info=True)
+                # Try to continue with error message
+                research_messages.append(HumanMessage(content=f"Error occurred: {str(e)}. Please continue with available information."))
+                continue
+            
+            research_messages.append(response)
+            
+            logger.info(f"Research iteration {iteration}: LLM returned {len(response.tool_calls) if response.tool_calls else 0} tool calls")
+            
+            # Check if research is complete
+            if not response.tool_calls:
+                logger.info("Research agent finished without tool calls")
+                final_summary = response.content
+                research_complete = True
+                break
+            
             # Execute tool calls
             for tool_call in response.tool_calls:
                 tool_name = tool_call.get("name")
@@ -2557,10 +2575,14 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
                         tool_call_id=tool_call_id
                     ))
             
-            # After processing all tool calls, add reminder if research is not complete
-            if not research_complete:
+            # If research complete after tool execution, exit loop
+            if research_complete:
+                break
+            
+            # After processing all tool calls, add reminder if not at last iteration
+            if iteration < max_iterations:
                 # Build iteration counter and actions summary
-                iteration_info = f"\n\n{'='*70}\n**ITERATION {iteration_count} of {state['max_iterations']} COMPLETE**\n{'='*70}\n"
+                iteration_info = f"\n\n{'='*70}\n**ITERATION {iteration} of {max_iterations} COMPLETE**\n{'='*70}\n"
                 
                 # Build summary of actions recommended so far
                 actions_summary = f"\n**ACTIONS RECOMMENDED SO FAR**: {len(recommended_actions_list)} total\n"
@@ -2594,49 +2616,85 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
                         tool_call_id=last_tool_msg.tool_call_id
                     )
         
-        logger.info(f"Research iteration {iteration_count} complete")
+        # =================== END OF ITERATION LOOP ===================
+        
+        logger.info(f"Research loop complete after {iteration} iterations")
         logger.info(f"Research node has {len(recommended_actions_list)} recommended actions")
         logger.info("=" * 70)
         
-        # If research is complete, update scratchpad with research summary
-        if research_complete and final_summary:
-            updated_scratchpad = state["agent_scratchpad"] + f"\n\n## Research Findings\n{final_summary}\n"
+        # If no actions were recommended, ask the LLM why
+        no_action_explanation = ""
+        if len(recommended_actions_list) == 0:
+            logger.warning("No actions recommended - asking LLM for explanation...")
             
-            # Store research findings in job record for UI display
-            job_id = state.get("job_id")
-            if job_id:
-                try:
-                    with get_db() as session:
-                        job = session.get(SmartRiskManagerJob, job_id)
-                        if job:
-                            # Store research findings in graph_state for later retrieval
-                            # CRITICAL: Create new dict to ensure SQLAlchemy detects the change
-                            current_state = job.graph_state or {}
-                            new_state = {
-                                **current_state,
-                                "research_findings": final_summary,
-                                "recommended_actions_count": len(recommended_actions_list)
-                            }
-                            job.graph_state = new_state
-                            session.add(job)
-                            session.commit()
-                            logger.debug(f"Stored research findings in job {job_id}")
-                except Exception as e:
-                    logger.warning(f"Failed to store research findings in job: {e}")
-        else:
-            # Research not complete yet - keep current scratchpad
-            updated_scratchpad = state["agent_scratchpad"]
+            try:
+                # Create a simple LLM without tools for this query
+                llm_no_tools = create_llm(risk_manager_model, 0.2, backend_url, api_key)
+                
+                explanation_prompt = HumanMessage(content="""You completed your research but did not recommend any actions.
+                
+Please explain:
+1. Why did you not recommend any trading actions?
+2. What were the key factors in your decision to take no action?
+3. What conditions would need to change for you to recommend actions?
+
+Provide a concise 2-3 paragraph explanation.""")
+                
+                research_messages.append(explanation_prompt)
+                explanation_response = llm_no_tools.invoke(research_messages)
+                no_action_explanation = explanation_response.content
+                
+                logger.info("=" * 70)
+                logger.info("LLM EXPLANATION FOR NO ACTIONS:")
+                logger.info("=" * 70)
+                logger.info(no_action_explanation)
+                logger.info("=" * 70)
+                
+            except Exception as e:
+                logger.error(f"Failed to get explanation for no actions: {e}", exc_info=True)
+                no_action_explanation = f"Failed to get explanation: {str(e)}"
         
-        # Return updated state - graph will decide whether to loop or proceed to action_node
-        # CRITICAL: Set research_complete flag so conditional edge can route correctly
+        # Update scratchpad with research summary
+        if final_summary:
+            updated_scratchpad = state["agent_scratchpad"] + f"\n\n## Research Findings\n{final_summary}\n"
+        else:
+            updated_scratchpad = state["agent_scratchpad"] + f"\n\n## Research Findings\nResearch completed after {iteration} iterations.\n"
+        
+        # Add no-action explanation to scratchpad if present
+        if no_action_explanation:
+            updated_scratchpad += f"\n\n## No Action Explanation\n{no_action_explanation}\n"
+        
+        # Store research findings in job record for UI display
+        job_id = state.get("job_id")
+        if job_id:
+            try:
+                with get_db() as session:
+                    job = session.get(SmartRiskManagerJob, job_id)
+                    if job:
+                        # Store research findings in graph_state for later retrieval
+                        # CRITICAL: Create new dict to ensure SQLAlchemy detects the change
+                        current_state = job.graph_state or {}
+                        new_state = {
+                            **current_state,
+                            "research_findings": final_summary or f"Research completed after {iteration} iterations",
+                            "recommended_actions_count": len(recommended_actions_list),
+                            "no_action_explanation": no_action_explanation if no_action_explanation else None
+                        }
+                        job.graph_state = new_state
+                        session.add(job)
+                        session.commit()
+                        logger.debug(f"Stored research findings in job {job_id}")
+            except Exception as e:
+                logger.warning(f"Failed to store research findings in job: {e}")
+        
+        # Return updated state - always proceed to action_node now (no more graph loop)
         return {
             "messages": state["messages"],  # Keep parent conversation (don't overwrite)
-            "research_messages": research_messages,  # Persist research conversation for next iteration
             "detailed_outputs_cache": detailed_cache,
             "agent_scratchpad": updated_scratchpad,
-            "research_complete": research_complete,  # Flag set by finish_research_tool
-            "recommended_actions": recommended_actions_list if research_complete else [],  # Only set when complete
-            "iteration_count": iteration_count
+            "research_complete": True,  # Always true when exiting this node
+            "recommended_actions": recommended_actions_list,  # Always pass the list (may be empty)
+            "iteration_count": state["iteration_count"] + iteration  # Update total count
         }
         
     except Exception as e:
@@ -2969,33 +3027,8 @@ def should_continue_or_finalize(state: SmartRiskManagerState) -> str:
     return "finalize"
 
 
-def should_research_node_continue(state: SmartRiskManagerState) -> str:
-    """
-    Determine if research_node should continue researching or proceed to action_node.
-    
-    This checks if the research node called finish_research_tool, which sets
-    the research_complete flag to True, indicating research is done.
-    
-    Returns:
-        "continue_research" - Loop back to research_node for more investigation
-        "action_node" - Research complete, proceed to execute actions
-    """
-    # Check iteration limit first
-    if state["iteration_count"] >= state["max_iterations"]:
-        logger.warning(f"Max iterations ({state['max_iterations']}) reached, proceeding to action node")
-        return "action_node"
-    
-    # Check if research has been explicitly marked as complete by finish_research_tool
-    research_complete = state.get("research_complete", False)
-    
-    if research_complete:
-        recommended_actions = state.get("recommended_actions", [])
-        logger.info(f"Research complete (finish_research_tool called) with {len(recommended_actions)} recommended actions, proceeding to action node")
-        return "action_node"
-    
-    # Research not complete yet, continue
-    logger.info("Research not complete, continuing research iterations")
-    return "continue_research"
+# NOTE: should_research_node_continue function removed - research_node now uses internal loop
+# and always returns research_complete=True, so no conditional routing needed
 
 
 # ==================== SMART RISK MANAGER GRAPH CLASS ====================
@@ -3108,9 +3141,12 @@ class SmartRiskManagerGraph:
         def recommend_close_position(
             transaction_id: Annotated[int, "ID of the position to close"],
             reason: Annotated[str, "Clear explanation referencing research findings"],
-            confidence: Annotated[int, "Confidence level (1-100)"]
+            confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"]
         ) -> str:
-            """Recommend closing an existing position."""
+            """Recommend closing an existing position.
+            
+            IMPORTANT: confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
+            """
             action = {
                 "action_type": "close_position",
                 "parameters": {"transaction_id": transaction_id},
@@ -3126,9 +3162,12 @@ class SmartRiskManagerGraph:
             transaction_id: Annotated[int, "ID of the position to adjust"],
             new_quantity: Annotated[float, "New quantity for the position"],
             reason: Annotated[str, "Clear explanation for adjustment"],
-            confidence: Annotated[int, "Confidence level (1-100)"]
+            confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"]
         ) -> str:
-            """Recommend adjusting position quantity."""
+            """Recommend adjusting position quantity.
+            
+            IMPORTANT: confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
+            """
             action = {
                 "action_type": "adjust_quantity",
                 "parameters": {"transaction_id": transaction_id, "new_quantity": new_quantity},
@@ -3144,9 +3183,12 @@ class SmartRiskManagerGraph:
             transaction_id: Annotated[int, "ID of the position"],
             new_sl_price: Annotated[float, "New stop loss price"],
             reason: Annotated[str, "Clear explanation for adjustment"],
-            confidence: Annotated[int, "Confidence level (1-100)"]
+            confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"]
         ) -> str:
-            """Recommend updating stop loss price."""
+            """Recommend updating stop loss price.
+            
+            IMPORTANT: confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
+            """
             action = {
                 "action_type": "update_stop_loss",
                 "parameters": {"transaction_id": transaction_id, "new_sl_price": new_sl_price},
@@ -3162,9 +3204,12 @@ class SmartRiskManagerGraph:
             transaction_id: Annotated[int, "ID of the position"],
             new_tp_price: Annotated[float, "New take profit price"],
             reason: Annotated[str, "Clear explanation for adjustment"],
-            confidence: Annotated[int, "Confidence level (1-100)"]
+            confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"]
         ) -> str:
-            """Recommend updating take profit price."""
+            """Recommend updating take profit price.
+            
+            IMPORTANT: confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
+            """
             action = {
                 "action_type": "update_take_profit",
                 "parameters": {"transaction_id": transaction_id, "new_tp_price": new_tp_price},
@@ -3180,11 +3225,14 @@ class SmartRiskManagerGraph:
             symbol: Annotated[str, "Instrument symbol to buy"],
             quantity: Annotated[float, "Number of shares/units"],
             reason: Annotated[str, "Clear explanation based on research"],
-            confidence: Annotated[int, "Confidence level (1-100)"],
+            confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"],
             tp_price: Annotated[Optional[float], "Take profit price (optional)"] = None,
             sl_price: Annotated[Optional[float], "Stop loss price (optional)"] = None
         ) -> str:
-            """Recommend opening a new BUY (long) position."""
+            """Recommend opening a new BUY (long) position.
+            
+            IMPORTANT: confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
+            """
             action = {
                 "action_type": "open_buy_position",
                 "parameters": {
@@ -3205,11 +3253,14 @@ class SmartRiskManagerGraph:
             symbol: Annotated[str, "Instrument symbol to sell short"],
             quantity: Annotated[float, "Number of shares/units"],
             reason: Annotated[str, "Clear explanation based on research"],
-            confidence: Annotated[int, "Confidence level (1-100)"],
+            confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"],
             tp_price: Annotated[Optional[float], "Take profit price (optional)"] = None,
             sl_price: Annotated[Optional[float], "Stop loss price (optional)"] = None
         ) -> str:
-            """Recommend opening a new SELL (short) position."""
+            """Recommend opening a new SELL (short) position.
+            
+            IMPORTANT: confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85).
+            """
             action = {
                 "action_type": "open_sell_position",
                 "parameters": {
@@ -3306,6 +3357,7 @@ class SmartRiskManagerGraph:
     def _research_node(self, state: SmartRiskManagerState) -> Dict[str, Any]:
         """Research node - reuses LLM and continues conversation from previous iteration."""
         logger.info("Research node executing...")
+        logger.info("Entering research mode - autonomous research agent starting...")
         
         try:
             # Get research conversation (already initialized by _initialize_research_agent)
@@ -3314,137 +3366,146 @@ class SmartRiskManagerGraph:
             detailed_cache = state["detailed_outputs_cache"].copy()
             research_complete = False
             final_summary = ""
-            iteration_count = state["iteration_count"] + 1
+            iteration_count = state["iteration_count"]
+            max_iterations = state['max_iterations']
             
-            # =================== ITERATION LOGGING ===================
-            logger.info("=" * 70)
-            logger.info(f"RESEARCH ITERATION {iteration_count}/{state['max_iterations']}")
-            logger.info("=" * 70)
-            
-            # Get LLM response (REUSING self.llm_with_tools)
-            try:
-                response = self.llm_with_tools.invoke(research_messages)
-                research_messages.append(response)
-            except Exception as llm_error:
-                # Handle LLM errors (e.g., malformed function calls from DeepSeek reasoner)
-                error_msg = str(llm_error)
-                logger.error(f"LLM invocation error: {error_msg[:500]}")
+            # =================== INTERNAL RESEARCH LOOP ===================
+            # Loop until research is complete OR max iterations reached
+            while not research_complete and iteration_count < max_iterations:
+                iteration_count += 1
                 
-                # Check if it's a function calling format error
-                if "validation error" in error_msg.lower() or "invalid function calling" in error_msg.lower():
-                    logger.warning("LLM returned malformed function call - treating as research incomplete")
-                    # Add error message to conversation to help LLM understand the issue
-                    research_messages.append(AIMessage(
-                        content=f"⚠️ Previous function call had formatting errors. Please call tools again with correct format. "
-                                f"Remember: function parameters must be valid JSON objects, not strings."
-                    ))
+                # =================== ITERATION LOGGING ===================
+                logger.info("=" * 70)
+                logger.info(f"RESEARCH ITERATION {iteration_count}/{max_iterations}")
+                logger.info("=" * 70)
+                
+                # Get LLM response (REUSING self.llm_with_tools)
+                try:
+                    response = self.llm_with_tools.invoke(research_messages)
+                    research_messages.append(response)
+                except Exception as llm_error:
+                    # Handle LLM errors (e.g., malformed function calls from DeepSeek reasoner)
+                    error_msg = str(llm_error)
+                    logger.error(f"LLM invocation error: {error_msg[:500]}")
                     
-                    # Return state to continue research (will loop back)
-                    return {
-                        "messages": state["messages"],
-                        "research_messages": research_messages,
-                        "detailed_outputs_cache": detailed_cache,
-                        "agent_scratchpad": state["agent_scratchpad"],
-                        "research_complete": False,
-                        "recommended_actions": self.recommended_actions_list,  # Pass any actions collected so far
-                        "iteration_count": iteration_count
-                    }
+                    # Check if it's a function calling format error
+                    if "validation error" in error_msg.lower() or "invalid function calling" in error_msg.lower():
+                        logger.warning("LLM returned malformed function call - treating as research incomplete")
+                        # Add error message to conversation to help LLM understand the issue
+                        research_messages.append(AIMessage(
+                            content=f"⚠️ Previous function call had formatting errors. Please call tools again with correct format. "
+                                    f"Remember: function parameters must be valid JSON objects, not strings."
+                        ))
+                        # Continue to next iteration
+                        continue
+                    else:
+                        # Other errors - re-raise
+                        raise
+                
+                logger.info(f"Research iteration: LLM returned {len(response.tool_calls) if response.tool_calls else 0} tool calls")
+                
+                # Check if research is complete
+                if not response.tool_calls:
+                    logger.info("Research agent finished without tool calls")
+                    final_summary = response.content
+                    research_complete = True
                 else:
-                    # Other errors - re-raise
-                    raise
-            
-            logger.info(f"Research iteration: LLM returned {len(response.tool_calls) if response.tool_calls else 0} tool calls")
-            
-            # Check if research is complete
-            if not response.tool_calls:
-                logger.info("Research agent finished without tool calls")
-                final_summary = response.content
-                research_complete = True
-            else:
-                # Execute tool calls
-                for tool_call in response.tool_calls:
-                    tool_name = tool_call.get("name")
-                    tool_args = tool_call.get("args", {})
-                    tool_call_id = tool_call.get("id")
-                    
-                    logger.debug(f"Research tool: {tool_name} with args {tool_args}")
-                    
-                    if tool_name == "finish_research_tool":
-                        final_summary = tool_args.get("summary", response.content)
-                        research_complete = True
-                        research_messages.append(ToolMessage(
-                            content="Research complete. Proceeding to action execution.",
-                            tool_call_id=tool_call_id
-                        ))
-                        break
-                    
-                    matching_tool = next((t for t in self.research_tools if t.name == tool_name), None)
-                    if matching_tool:
-                        try:
-                            logger.info(f"🔧 Research Tool Call: {tool_name} | Args: {json.dumps(tool_args)}")
-                            result = matching_tool.invoke(tool_args)
-                            result_preview = str(result)[:200] if not isinstance(result, dict) else f"dict with {len(result)} keys"
-                            logger.info(f"✅ Research Tool Result: {tool_name} | {result_preview}")
-                            
-                            if tool_name == "get_analysis_output_detail_tool":
-                                analysis_id = tool_args.get("analysis_id")
-                                output_key = tool_args.get("output_key")
-                                if analysis_id and output_key:
-                                    if analysis_id not in detailed_cache:
-                                        detailed_cache[analysis_id] = {}
-                                    detailed_cache[analysis_id][output_key] = result.get("content", "")
-                            
-                            result_str = json.dumps(result, indent=2) if isinstance(result, dict) else str(result)
+                    # Execute tool calls
+                    for tool_call in response.tool_calls:
+                        tool_name = tool_call.get("name")
+                        tool_args = tool_call.get("args", {})
+                        tool_call_id = tool_call.get("id")
+                        
+                        logger.debug(f"Research tool: {tool_name} with args {tool_args}")
+                        
+                        if tool_name == "finish_research_tool":
+                            final_summary = tool_args.get("summary", response.content)
+                            research_complete = True
                             research_messages.append(ToolMessage(
-                                content=result_str,
+                                content="Research complete. Proceeding to action execution.",
                                 tool_call_id=tool_call_id
                             ))
-                        except Exception as e:
-                            logger.error(f"Error executing research tool {tool_name}: {e}", exc_info=True)
+                            break
+                        
+                        matching_tool = next((t for t in self.research_tools if t.name == tool_name), None)
+                        if matching_tool:
+                            try:
+                                logger.info(f"🔧 Research Tool Call: {tool_name} | Args: {json.dumps(tool_args)}")
+                                result = matching_tool.invoke(tool_args)
+                                result_preview = str(result)[:200] if not isinstance(result, dict) else f"dict with {len(result)} keys"
+                                logger.info(f"✅ Research Tool Result: {tool_name} | {result_preview}")
+                                
+                                if tool_name == "get_analysis_output_detail_tool":
+                                    analysis_id = tool_args.get("analysis_id")
+                                    output_key = tool_args.get("output_key")
+                                    if analysis_id and output_key:
+                                        if analysis_id not in detailed_cache:
+                                            detailed_cache[analysis_id] = {}
+                                        detailed_cache[analysis_id][output_key] = result.get("content", "")
+                                
+                                result_str = json.dumps(result, indent=2) if isinstance(result, dict) else str(result)
+                                research_messages.append(ToolMessage(
+                                    content=result_str,
+                                    tool_call_id=tool_call_id
+                                ))
+                            except Exception as e:
+                                logger.error(f"Error executing research tool {tool_name}: {e}", exc_info=True)
+                                research_messages.append(ToolMessage(
+                                    content=f"Error: {str(e)}",
+                                    tool_call_id=tool_call_id
+                                ))
+                        else:
+                            logger.warning(f"Tool {tool_name} not found in research_tools")
                             research_messages.append(ToolMessage(
-                                content=f"Error: {str(e)}",
+                                content=f"Error: Tool {tool_name} not available",
                                 tool_call_id=tool_call_id
                             ))
-                    else:
-                        logger.warning(f"Tool {tool_name} not found in research_tools")
-                        research_messages.append(ToolMessage(
-                            content=f"Error: Tool {tool_name} not available",
-                            tool_call_id=tool_call_id
-                        ))
-                
-                # Add reminder if research not complete
-                if not research_complete:
-                    actions_summary = f"\n\n**ACTIONS RECOMMENDED SO FAR**: {len(self.recommended_actions_list)} total\n"
-                    if self.recommended_actions_list:
-                        for idx, action in enumerate(self.recommended_actions_list, 1):
-                            action_type = action.get("action_type", "unknown")
-                            confidence = action.get("confidence", 0)
-                            reason = action.get("reason", "No reason provided")[:100]
-                            actions_summary += f"  {idx}. {action_type} (confidence: {confidence}%) - {reason}\n"
-                        actions_summary += "\n**NEXT STEP**: Call finish_research_tool to proceed with executing these actions.\n"
-                    else:
-                        actions_summary += "  ⚠️ No actions recommended yet.\n"
-                        actions_summary += "  - If you need more information, continue researching with available tools.\n"
-                        actions_summary += "  - If you have enough information, recommend appropriate actions (open/close/adjust positions).\n"
-                        actions_summary += "  - If no actions are needed, explain why in finish_research_tool's summary.\n"
-                        actions_summary += "  - Only call finish_research_tool after recommending actions OR explaining why none are needed.\n"
                     
-                    reminder_msg = (
-                        actions_summary +
-                        "\n**REMINDER**: When you have gathered sufficient information and made your recommendations, "
-                        "you MUST call the finish_research_tool to complete your research and proceed to action execution. "
-                        "Without calling finish_research_tool, the system will continue iterating."
-                    )
-                    if research_messages and isinstance(research_messages[-1], ToolMessage):
-                        last_tool_msg = research_messages[-1]
-                        research_messages[-1] = ToolMessage(
-                            content=last_tool_msg.content + reminder_msg,
-                            tool_call_id=last_tool_msg.tool_call_id
+                    # Add reminder if research not complete
+                    if not research_complete:
+                        actions_summary = f"\n\n**ACTIONS RECOMMENDED SO FAR**: {len(self.recommended_actions_list)} total\n"
+                        if self.recommended_actions_list:
+                            for idx, action in enumerate(self.recommended_actions_list, 1):
+                                action_type = action.get("action_type", "unknown")
+                                confidence = action.get("confidence", 0)
+                                reason = action.get("reason", "No reason provided")[:100]
+                                actions_summary += f"  {idx}. {action_type} (confidence: {confidence}%) - {reason}\n"
+                            actions_summary += "\n**NEXT STEP**: Call finish_research_tool to proceed with executing these actions.\n"
+                        else:
+                            actions_summary += "  ⚠️ No actions recommended yet.\n"
+                            actions_summary += "  - If you need more information, continue researching with available tools.\n"
+                            actions_summary += "  - If you have enough information, recommend appropriate actions (open/close/adjust positions).\n"
+                            actions_summary += "  - If no actions are needed, explain why in finish_research_tool's summary.\n"
+                            actions_summary += "  - Only call finish_research_tool after recommending actions OR explaining why none are needed.\n"
+                        
+                        reminder_msg = (
+                            actions_summary +
+                            "\n**REMINDER**: When you have gathered sufficient information and made your recommendations, "
+                            "you MUST call the finish_research_tool to complete your research and proceed to action execution. "
+                            "Without calling finish_research_tool, the system will continue iterating."
                         )
+                        
+                        logger.debug(f"📝 Appending reminder message to last ToolMessage ({len(reminder_msg)} chars)")
+                        logger.debug(f"Reminder preview: {reminder_msg[:200]}...")
+                        
+                        if research_messages and isinstance(research_messages[-1], ToolMessage):
+                            last_tool_msg = research_messages[-1]
+                            research_messages[-1] = ToolMessage(
+                                content=last_tool_msg.content + reminder_msg,
+                                tool_call_id=last_tool_msg.tool_call_id
+                            )
+                            logger.debug("✅ Reminder message appended to ToolMessage - will be sent to LLM in next iteration")
+                
+                logger.info(f"Research iteration {iteration_count} complete")
+                logger.info(f"Research node has {len(self.recommended_actions_list)} recommended actions")
+                logger.info("=" * 70)
             
-            logger.info(f"Research iteration {iteration_count} complete")
-            logger.info(f"Research node has {len(self.recommended_actions_list)} recommended actions")
-            logger.info("=" * 70)
+            # =================== END OF INTERNAL RESEARCH LOOP ===================
+            # Log completion reason
+            if research_complete:
+                logger.info("✅ Research complete - finish_research_tool was called")
+            elif iteration_count >= max_iterations:
+                logger.warning(f"⚠️ Research terminated - reached max iterations ({max_iterations})")
             
             # Update scratchpad if research complete
             if research_complete and final_summary:
@@ -3487,20 +3548,8 @@ class SmartRiskManagerGraph:
                 mark_job_as_failed(job_id, f"Error in research_node: {str(e)}")
             raise
     
-    def _should_continue(self, state: SmartRiskManagerState) -> str:
-        """Determine if research should continue or proceed to action."""
-        if state["iteration_count"] >= state["max_iterations"]:
-            logger.warning(f"Max iterations ({state['max_iterations']}) reached, proceeding to action node")
-            return "action_node"
-        
-        research_complete = state.get("research_complete", False)
-        if research_complete:
-            recommended_actions = state.get("recommended_actions", [])
-            logger.info(f"Research complete with {len(recommended_actions)} recommended actions, proceeding to action node")
-            return "action_node"
-        
-        logger.info("Research not complete, continuing research iterations")
-        return "continue_research"
+    # NOTE: _should_continue method removed - research_node now uses internal loop
+    # and always returns research_complete=True, so no conditional routing needed
     
     def _build_graph(self) -> StateGraph:
         """Build and compile the LangGraph workflow."""
@@ -3522,17 +3571,10 @@ class SmartRiskManagerGraph:
         workflow.add_edge("initialize_context", "analyze_portfolio")
         workflow.add_edge("analyze_portfolio", "check_recent_analyses")
         workflow.add_edge("check_recent_analyses", "initialize_research_agent")  # Initialize before research loop
-        workflow.add_edge("initialize_research_agent", "research_node")  # Go to research loop
+        workflow.add_edge("initialize_research_agent", "research_node")  # Go to research (internal loop handles iterations)
         
-        # Research loop
-        workflow.add_conditional_edges(
-            "research_node",
-            self._should_continue,
-            {
-                "continue_research": "research_node",
-                "action_node": "action_node"
-            }
-        )
+        # Research node now handles its own internal iteration loop - always proceeds to action_node when done
+        workflow.add_edge("research_node", "action_node")
         
         workflow.add_edge("action_node", "finalize")
         workflow.add_edge("finalize", END)
@@ -3549,13 +3591,18 @@ def build_smart_risk_manager_graph(expert_instance_id: int, account_id: int) -> 
     
     Flow: 
     1. initialize → analyze_portfolio → check_recent_analyses 
-    2. research_node loops on itself until finish_research_tool is called
-    3. action_node (pure Python) executes all recommended actions in one pass
-    4. finalize
+    2. initialize_research_agent sets up the LLM and tools
+    3. research_node handles iterative research using an INTERNAL LOOP (not graph-based iteration)
+       - LLM session persists naturally in function scope across all iterations
+       - Can make up to max_iterations tool calls
+       - If no actions recommended, asks LLM for explanation
+       - Always returns research_complete=True when exiting
+    4. action_node (pure Python) executes all recommended actions in one pass
+    5. finalize
     
-    The research_node handles the iterative LLM-based investigation and decision making,
-    calling finish_research_tool when ready. The graph's conditional edges control the loop,
-    checking if recommended_actions are set (which happens when finish_research_tool is called).
+    The research_node uses an internal for loop (1 to max_iterations) instead of graph-based
+    looping. This is more efficient as it avoids state serialization overhead and maintains
+    a single LLM session throughout the research phase.
     
     Args:
         expert_instance_id: ID of the ExpertInstance
