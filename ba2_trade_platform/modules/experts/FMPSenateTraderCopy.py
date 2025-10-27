@@ -1132,124 +1132,185 @@ Recommendations Generated:"""
             max_disclose_days = self.settings.get('max_disclose_date_days', 30)
             max_exec_days = self.settings.get('max_trade_exec_days', 60)
             
-            # Fetch current trades
-            senate_trades = self._fetch_senate_trades(symbol=None)
-            house_trades = self._fetch_house_trades(symbol=None)
+            # OPEN_POSITIONS: Fetch trades only for the specific symbol being analyzed
+            # This ensures we only analyze the position we're holding
+            senate_trades = self._fetch_senate_trades(symbol=symbol)
+            house_trades = self._fetch_house_trades(symbol=symbol)
             
             if senate_trades is None and house_trades is None:
-                raise ValueError("Failed to fetch trades from FMP API (both senate and house failed)")
+                raise ValueError(f"Failed to fetch trades for {symbol} from FMP API (both senate and house failed)")
             
             # Combine trades
             all_trades = (senate_trades or []) + (house_trades or [])
-            self.logger.info(f"Fetched {len(all_trades)} total trades from senate and house")
+            self.logger.info(f"Fetched {len(all_trades)} trades for {symbol} from senate and house")
             
             # Filter trades by settings
             filtered_trades = self._filter_trades(all_trades, copy_trade_names, max_disclose_days, max_exec_days)
-            self.logger.info(f"Filtered to {len(filtered_trades)} trades within age criteria")
+            self.logger.info(f"Filtered to {len(filtered_trades)} trades for {symbol} within age criteria")
             
-            # Group trades by symbol for close recommendations
-            trades_by_symbol = {}
-            for trade in filtered_trades:
-                trade_symbol = trade.get('symbol', '').upper()
-                if trade_symbol and len(trade_symbol) > 0:
-                    if trade_symbol not in trades_by_symbol:
-                        trades_by_symbol[trade_symbol] = []
-                    trades_by_symbol[trade_symbol].append(trade)
+            # For OPEN_POSITIONS, we only care about the symbol being analyzed
+            # Filter trades to only include the specific symbol (in case API returned multiple)
+            symbol_trades = [t for t in filtered_trades if t.get('symbol', '').upper() == symbol.upper()]
             
-            copy_trades = filtered_trades  # All filtered trades are relevant for close recommendations
-            self.logger.info(f"Found copy trades for {len(trades_by_symbol)} symbols")
-            
-            # Create recommendations for each symbol
-            recommendation_ids = []
-            symbol_recommendations = {}
-            
-            for trade_symbol, symbol_trades in trades_by_symbol.items():
-                try:
-                    # Determine the effective mode based on whether orders have trader names
-                    effective_close_only_for_same_trader = close_only_for_same_trader
-                    use_fallback_mode = False
-                    
-                    if close_only_for_same_trader:
-                        # Check if we have ANY open positions (with or without trader names)
-                        # This method returns (has_any_orders, has_orders_with_trader_names)
-                        has_any_orders, has_orders_with_trader_names = self._check_open_positions_trader_status(trade_symbol)
-                        
-                        if has_any_orders and not has_orders_with_trader_names:
-                            # Mixed state: We have orders but none with trader names
-                            # Fall back to averaging logic for backward compatibility
-                            self.logger.debug(f"Found {has_any_orders} open positions for {trade_symbol} but none have trader names, "
-                                            f"falling back to averaging logic (backward compatibility)")
-                            effective_close_only_for_same_trader = False
-                            use_fallback_mode = True
-                        elif not has_any_orders:
-                            # No orders exist, can use same_trader mode with current trades
-                            self.logger.debug(f"No open positions for {trade_symbol}, using same_trader mode with current Senate/House trades")
-                            pass
-                        # else: has_orders_with_trader_names is True, continue with same_trader mode
-                    
-                    # Generate close recommendations based on effective mode
-                    if effective_close_only_for_same_trader:
-                        # NEW MODE: Check for same trader reversals
-                        recommendation_data = self._generate_close_recommendations_same_trader(
-                            symbol_trades, trade_symbol
-                        )
-                    else:
-                        # OLD MODE: Use averaging logic (or fallback mode)
-                        recommendation_data = self._generate_close_recommendations_averaging(
-                            symbol_trades, trade_symbol
-                        )
-                    
-                    if not recommendation_data:
-                        # No recommendation for this symbol in this mode
-                        mode_name = 'same_trader' if effective_close_only_for_same_trader else 'averaging'
-                        if use_fallback_mode:
-                            mode_name = 'averaging (fallback - no trader names)'
-                        self.logger.debug(f"No close recommendation for {trade_symbol} in {mode_name} mode")
-                        continue
-                    
-                    # Get current price
-                    current_price = self._get_current_price(trade_symbol)
-                    if not current_price:
-                        self.logger.warning(f"Unable to get current price for {trade_symbol}, using 0.0")
-                        current_price = 0.0
-                    
-                    # Create ExpertRecommendation record
-                    recommendation_id = self._create_expert_recommendation(
-                        recommendation_data, trade_symbol, market_analysis.id, current_price
-                    )
-                    
-                    recommendation_ids.append(recommendation_id)
-                    symbol_recommendations[trade_symbol] = {
-                        'recommendation_id': recommendation_id,
-                        'signal': recommendation_data['signal'].value,
-                        'confidence': recommendation_data['confidence'],
-                        'expected_profit_percent': recommendation_data['expected_profit_percent'],
-                        'current_price': current_price,
-                        'trade_count': len(symbol_trades),
-                        'trader_name': recommendation_data.get('trader_name', 'Unknown'),
-                        'trader_names': recommendation_data.get('trader_names', []),
-                        'num_traders': recommendation_data.get('num_traders', 1)
+            if not symbol_trades:
+                self.logger.info(f"No recent trades found for {symbol} by tracked traders - returning HOLD")
+                # No trades means no action needed - position can stay open
+                # Create HOLD recommendation
+                current_price = self._get_current_price(symbol)
+                if not current_price:
+                    self.logger.warning(f"Unable to get current price for {symbol}, using 0.0")
+                    current_price = 0.0
+                
+                hold_recommendation = ExpertRecommendation(
+                    instance_id=self.instance.id,
+                    market_analysis_id=market_analysis.id,
+                    symbol=symbol,
+                    recommended_action=OrderRecommendation.HOLD,
+                    expected_profit_percent=0.0,
+                    price_at_date=current_price,
+                    details=f"No recent trades by tracked traders for {symbol}",
+                    confidence=0.0,
+                    risk_level=RiskLevel.LOW,
+                    time_horizon=TimeHorizon.SHORT_TERM,
+                    data={}
+                )
+                recommendation_id = add_instance(hold_recommendation)
+                
+                # Store minimal state
+                market_analysis.state = {
+                    'copy_trade_multi': {
+                        'analysis_type': 'open_positions_close',
+                        'symbol': symbol,
+                        'result': 'hold',
+                        'reason': 'no_recent_trades',
+                        'trade_statistics': {
+                            'total_trades': len(all_trades),
+                            'filtered_trades': len(filtered_trades),
+                            'symbol_trades': 0
+                        }
                     }
-                    
-                    self.logger.info(f"Created close recommendation for {trade_symbol}: {recommendation_data['signal'].value}")
-                    
-                except Exception as e:
-                    self.logger.error(f"Error creating close recommendation for {trade_symbol}: {e}", exc_info=True)
-                    continue
+                }
+                market_analysis.status = MarketAnalysisStatus.COMPLETED
+                update_instance(market_analysis)
+                return
+            
+            self.logger.info(f"Found {len(symbol_trades)} trades for {symbol} by tracked traders")
+            
+            # Determine the effective mode based on whether orders have trader names
+            effective_close_only_for_same_trader = close_only_for_same_trader
+            use_fallback_mode = False
+            
+            if close_only_for_same_trader:
+                # Check if we have ANY open positions (with or without trader names)
+                # This method returns (has_any_orders, has_orders_with_trader_names)
+                has_any_orders, has_orders_with_trader_names = self._check_open_positions_trader_status(symbol)
+                
+                if has_any_orders and not has_orders_with_trader_names:
+                    # Mixed state: We have orders but none with trader names
+                    # Fall back to averaging logic for backward compatibility
+                    self.logger.debug(f"Found open positions for {symbol} but none have trader names, "
+                                    f"falling back to averaging logic (backward compatibility)")
+                    effective_close_only_for_same_trader = False
+                    use_fallback_mode = True
+                elif not has_any_orders:
+                    # No orders exist, can use same_trader mode with current trades
+                    self.logger.debug(f"No open positions for {symbol}, using same_trader mode with current Senate/House trades")
+                # else: has_orders_with_trader_names is True, continue with same_trader mode
+            
+            # Generate close recommendations based on effective mode
+            if effective_close_only_for_same_trader:
+                # NEW MODE: Check for same trader reversals
+                recommendation_data = self._generate_close_recommendations_same_trader(
+                    symbol_trades, symbol
+                )
+            else:
+                # OLD MODE: Use averaging logic (or fallback mode)
+                recommendation_data = self._generate_close_recommendations_averaging(
+                    symbol_trades, symbol
+                )
+            
+            if not recommendation_data:
+                # No recommendation in this mode - return HOLD
+                mode_name = 'same_trader' if effective_close_only_for_same_trader else 'averaging'
+                if use_fallback_mode:
+                    mode_name = 'averaging (fallback - no trader names)'
+                self.logger.info(f"No close recommendation for {symbol} in {mode_name} mode - returning HOLD")
+                
+                current_price = self._get_current_price(symbol)
+                if not current_price:
+                    self.logger.warning(f"Unable to get current price for {symbol}, using 0.0")
+                    current_price = 0.0
+                
+                hold_recommendation = ExpertRecommendation(
+                    instance_id=self.instance.id,
+                    market_analysis_id=market_analysis.id,
+                    symbol=symbol,
+                    recommended_action=OrderRecommendation.HOLD,
+                    expected_profit_percent=0.0,
+                    price_at_date=current_price,
+                    details=f"No actionable signal for {symbol} in {mode_name} mode",
+                    confidence=0.0,
+                    risk_level=RiskLevel.LOW,
+                    time_horizon=TimeHorizon.SHORT_TERM,
+                    data={}
+                )
+                recommendation_id = add_instance(hold_recommendation)
+                
+                # Store state
+                market_analysis.state = {
+                    'copy_trade_multi': {
+                        'analysis_type': 'open_positions_close',
+                        'symbol': symbol,
+                        'close_mode': mode_name,
+                        'result': 'hold',
+                        'reason': 'no_actionable_signal',
+                        'trade_statistics': {
+                            'total_trades': len(all_trades),
+                            'filtered_trades': len(filtered_trades),
+                            'symbol_trades': len(symbol_trades)
+                        }
+                    }
+                }
+                market_analysis.status = MarketAnalysisStatus.COMPLETED
+                update_instance(market_analysis)
+                return
+            
+            # Get current price
+            current_price = self._get_current_price(symbol)
+            if not current_price:
+                self.logger.warning(f"Unable to get current price for {symbol}, using 0.0")
+                current_price = 0.0
+            
+            # Create ExpertRecommendation record
+            recommendation_id = self._create_expert_recommendation(
+                recommendation_data, symbol, market_analysis.id, current_price
+            )
+            
+            self.logger.info(f"Created close recommendation for {symbol}: {recommendation_data['signal'].value}")
             
             # Store analysis state
+            mode_name = 'same_trader' if effective_close_only_for_same_trader else 'averaging'
+            if use_fallback_mode:
+                mode_name = 'averaging (fallback - no trader names)'
+            
             market_analysis.state = {
                 'copy_trade_multi': {
                     'analysis_type': 'open_positions_close',
-                    'close_mode': 'same_trader' if close_only_for_same_trader else 'averaging',
-                    'total_symbols': len(trades_by_symbol),
-                    'symbols_analyzed': sorted(trades_by_symbol.keys()),
-                    'symbol_recommendations': symbol_recommendations,
+                    'symbol': symbol,
+                    'close_mode': mode_name,
+                    'recommendation_id': recommendation_id,
+                    'signal': recommendation_data['signal'].value,
+                    'confidence': recommendation_data['confidence'],
+                    'expected_profit_percent': recommendation_data['expected_profit_percent'],
+                    'current_price': current_price,
+                    'trade_count': len(symbol_trades),
+                    'trader_name': recommendation_data.get('trader_name', 'Unknown'),
+                    'trader_names': recommendation_data.get('trader_names', []),
+                    'num_traders': recommendation_data.get('num_traders', 1),
                     'trade_statistics': {
                         'total_trades': len(all_trades),
                         'filtered_trades': len(filtered_trades),
-                        'copy_trades_found': len(copy_trades),
-                        'symbols_with_trades': len(trades_by_symbol)
+                        'symbol_trades': len(symbol_trades)
                     },
                     'settings': {
                         'copy_trade_names': copy_trade_names_setting,
@@ -1257,7 +1318,6 @@ Recommendations Generated:"""
                         'max_disclose_date_days': max_disclose_days,
                         'max_trade_exec_days': max_exec_days
                     },
-                    'expert_recommendation_ids': recommendation_ids,
                     'analysis_timestamp': datetime.now(timezone.utc).isoformat()
                 }
             }
@@ -1266,8 +1326,8 @@ Recommendations Generated:"""
             market_analysis.status = MarketAnalysisStatus.COMPLETED
             update_instance(market_analysis)
             
-            self.logger.info(f"Completed FMPSenateTraderCopy OPEN_POSITIONS analysis: "
-                           f"found {len(symbol_recommendations)} close opportunities")
+            self.logger.info(f"Completed FMPSenateTraderCopy OPEN_POSITIONS analysis for {symbol}: "
+                           f"{recommendation_data['signal'].value} recommendation created")
             
         except Exception as e:
             self.logger.error(f"FMPSenateTraderCopy OPEN_POSITIONS analysis failed: {e}", exc_info=True)

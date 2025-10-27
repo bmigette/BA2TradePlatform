@@ -102,7 +102,8 @@ class TradeManager:
                         self.logger.debug(f"Refreshed positions for {account_def.name}")
                     
                     if hasattr(account, 'refresh_orders'):
-                        account.refresh_orders()
+                        # Use fetch_all=True on startup to ensure complete synchronization
+                        account.refresh_orders(fetch_all=True)
                         self.logger.debug(f"Refreshed orders for {account_def.name}")
                     
                     if hasattr(account, 'refresh_transactions'):
@@ -1145,7 +1146,8 @@ class TradeManager:
                         if submitted_count > 0:
                             self.logger.info("Refreshing order statuses from broker after submission")
                             try:
-                                account.refresh_orders()
+                                # Use fetch_all=True to ensure we get all orders including newly submitted ones
+                                account.refresh_orders(fetch_all=True)
                                 self.logger.info("Order status refresh completed")
                             except Exception as refresh_error:
                                 self.logger.error(f"Error refreshing order statuses: {refresh_error}", exc_info=True)

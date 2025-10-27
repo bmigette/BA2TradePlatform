@@ -14,7 +14,7 @@ from ...modules.accounts import get_account_class
 from ...core.db import add_instance
 from ...logger import logger
 from ...core.utils import get_account_instance_from_id
-from sqlmodel import select, func
+from sqlmodel import select, func, distinct
 
 
 class JobMonitoringTab:
@@ -402,13 +402,16 @@ class JobMonitoringTab:
                 if self.recommendation_filter != 'all':
                     from ...core.types import OrderRecommendation
                     # Only include analyses that have recommendations with the selected action
-                    from sqlmodel import and_
-                    statement = statement.join(ExpertRecommendation).where(
+                    statement = statement.join(
+                        ExpertRecommendation,
+                        MarketAnalysis.id == ExpertRecommendation.market_analysis_id
+                    ).where(
                         ExpertRecommendation.recommended_action == OrderRecommendation[self.recommendation_filter]
                     ).distinct()
           
                 # Get total count for pagination
-                count_statement = select(func.count(MarketAnalysis.id).distinct())
+                # When using joins, need to count distinct MarketAnalysis.id to avoid duplicates
+                count_statement = select(func.count(distinct(MarketAnalysis.id)))
                 if self.status_filter != 'all':
                     count_statement = count_statement.where(MarketAnalysis.status == MarketAnalysisStatus(self.status_filter))
                 if self.expert_filter != 'all':
@@ -421,9 +424,12 @@ class JobMonitoringTab:
                         count_statement = count_statement.where(MarketAnalysis.subtype == AnalysisUseCase.OPEN_POSITIONS)
                 if self.recommendation_filter != 'all':
                     from ...core.types import OrderRecommendation
-                    count_statement = count_statement.join(ExpertRecommendation).where(
+                    count_statement = count_statement.join(
+                        ExpertRecommendation,
+                        MarketAnalysis.id == ExpertRecommendation.market_analysis_id
+                    ).where(
                         ExpertRecommendation.recommended_action == OrderRecommendation[self.recommendation_filter]
-                    ).distinct()
+                    )
  
                 total_count = session.exec(count_statement).first() or 0
                 
@@ -1272,17 +1278,21 @@ class ManualAnalysisTab:
                                 for symbol in selected_symbols:
                                     ui.badge(symbol).classes('bg-blue-100 text-blue-800 px-2 py-1')
                             
-                            # Create instrument list for the selector (all preselected as enabled)
-                            instrument_list = [{'name': symbol, 'enabled': True} for symbol in selected_symbols]
-                            
                             # Create traditional instrument selector with AI-selected instruments
                             from ..components.InstrumentSelector import InstrumentSelector
                             self.instrument_selector = InstrumentSelector(
                                 on_selection_change=self.on_instrument_selection_change,
-                                instrument_list=instrument_list,
+                                instrument_list=selected_symbols,  # Pass list of symbol strings
                                 hide_weights=True
                             )
                             self.instrument_selector.render()
+                            
+                            # Pre-select all AI-selected instruments
+                            # The InstrumentSelector needs instrument IDs, so we need to get them from the loaded instruments
+                            instrument_configs = {}
+                            for instrument in self.instrument_selector.instruments:
+                                instrument_configs[instrument.id] = {'enabled': True, 'weight': 100.0}
+                            self.instrument_selector.set_selected_instruments(instrument_configs)
                 
                 ui.notify(f"AI selected {len(selected_symbols)} instruments successfully", type='positive')
             else:

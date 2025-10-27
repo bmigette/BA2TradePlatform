@@ -57,8 +57,9 @@ class OverviewTab:
                                 account_provider_class = providers.get(account_def.provider)
                                 if account_provider_class:
                                     account = account_provider_class(account_def.id)
-                                    # Call refresh_orders with heuristic_mapping=True
-                                    if account.refresh_orders(heuristic_mapping=True):
+                                    # Call refresh_orders with heuristic_mapping=True and fetch_all=True
+                                    # fetch_all ensures pagination to get ALL orders from broker
+                                    if account.refresh_orders(heuristic_mapping=True, fetch_all=True):
                                         success_count += 1
                                         logger.info(f"Successfully synced orders for account {account_def.id} ({account_def.provider}) with heuristic mapping")
                             except Exception as e:
@@ -3178,6 +3179,12 @@ class TransactionsTab:
                         on_change=lambda: self._refresh_transactions()
                     ).classes('w-40')
                     
+                    self.broker_order_id_filter = ui.input(
+                        label='Broker Order ID',
+                        placeholder='Search by broker order ID...',
+                        on_change=lambda: self._refresh_transactions()
+                    ).classes('w-48')
+                    
                     ui.button('Refresh', icon='refresh', on_click=lambda: self._refresh_transactions()).props('outline')
                     
                     ui.button('Force Refresh Account', icon='cloud_download', on_click=self._force_refresh_account_now).props('outline')
@@ -3385,6 +3392,8 @@ class TransactionsTab:
         from ...core.types import TransactionStatus
         from sqlmodel import col
         
+        logger.debug("[TRANSACTIONS] _get_transactions_data() - START")
+        
         session = get_db()
         try:
             # Build query based on filters - join with ExpertInstance for expert info
@@ -3392,8 +3401,11 @@ class TransactionsTab:
                 ExpertInstance, Transaction.expert_id == ExpertInstance.id
             ).order_by(Transaction.created_at.desc())
             
+            logger.debug(f"[TRANSACTIONS] Initial query built")
+            
             # Apply status filter
             status_value = self.status_filter.value if hasattr(self, 'status_filter') else 'All'
+            logger.debug(f"[TRANSACTIONS] Status filter: {status_value}")
             if status_value != 'All':
                 status_map = {
                     'Open': TransactionStatus.OPENED,
@@ -3412,19 +3424,37 @@ class TransactionsTab:
             
             # Apply symbol filter
             if hasattr(self, 'symbol_filter') and self.symbol_filter.value:
+                logger.debug(f"[TRANSACTIONS] Symbol filter: {self.symbol_filter.value}")
                 statement = statement.where(Transaction.symbol.contains(self.symbol_filter.value.upper()))
             
+            # Apply broker order ID filter - requires joining with TradingOrder
+            if hasattr(self, 'broker_order_id_filter') and self.broker_order_id_filter.value and self.broker_order_id_filter.value.strip():
+                logger.debug(f"[TRANSACTIONS] Broker order ID filter: {self.broker_order_id_filter.value}")
+                from ...core.models import TradingOrder
+                # Join with TradingOrder and filter by broker_order_id
+                statement = statement.join(
+                    TradingOrder,
+                    Transaction.id == TradingOrder.transaction_id
+                ).where(
+                    TradingOrder.broker_order_id.contains(self.broker_order_id_filter.value.strip())
+                ).distinct()
+            
             # Execute query and separate transaction and expert
+            logger.debug("[TRANSACTIONS] Executing query...")
             results = list(session.exec(statement).all())
+            logger.debug(f"[TRANSACTIONS] Query returned {len(results)} results")
             transactions = []
             transaction_experts = {}
             for txn, expert in results:
                 transactions.append(txn)
                 transaction_experts[txn.id] = expert
             
+            logger.debug(f"[TRANSACTIONS] Processed {len(transactions)} transactions")
+            
             if not transactions:
-                ui.label('No transactions found.').classes('text-gray-500')
-                return
+                # Return empty list instead of creating UI here - let the caller handle it
+                logger.debug("[TRANSACTIONS] No transactions found, returning empty list")
+                return []
             
             # BATCH PRICE FETCHING: Collect all symbols from open transactions grouped by account
             # This prevents individual API calls and uses batch fetching instead
@@ -3526,10 +3556,22 @@ class TransactionsTab:
                             # Determine if this is a TP/SL order
                             order_category = 'Entry'
                             if order.depends_on_order:
-                                if 'TP' in order.comment or 'take_profit' in order.comment.lower() if order.comment else False:
+                                # Dependent orders are TP/SL orders
+                                # Determine if it's TP or SL by checking order type and comment
+                                is_stop_order = 'stop' in order_type_display.lower()
+                                is_limit_order = 'limit' in order_type_display.lower()
+                                comment_lower = (order.comment or '').lower()
+                                
+                                # Check comment first for explicit indicators
+                                if 'tp' in comment_lower or 'take_profit' in comment_lower or 'take profit' in comment_lower:
                                     order_category = 'Take Profit'
-                                elif 'SL' in order.comment or 'stop_loss' in order.comment.lower() if order.comment else False:
+                                elif 'sl' in comment_lower or 'stop_loss' in comment_lower or 'stop loss' in comment_lower:
                                     order_category = 'Stop Loss'
+                                # Fallback to order type heuristic
+                                elif is_stop_order:
+                                    order_category = 'Stop Loss'
+                                elif is_limit_order:
+                                    order_category = 'Take Profit'
                                 else:
                                     order_category = 'Dependent'
                             
@@ -3553,6 +3595,68 @@ class TransactionsTab:
                     except Exception as e:
                         logger.error(f"Error loading orders for transaction {txn.id}: {e}")
                 
+                # Check if TP/SL are defined but have no valid orders
+                # Valid means: order exists with correct type/price and is not CANCELED/REJECTED/ERROR
+                has_missing_tpsl_orders = False
+                if txn.status == TransactionStatus.OPENED:  # Only for open transactions
+                    has_tp_defined = txn.take_profit is not None and txn.take_profit > 0
+                    has_sl_defined = txn.stop_loss is not None and txn.stop_loss > 0
+                    
+                    if has_tp_defined or has_sl_defined:
+                        # Check if we have valid TP/SL orders
+                        from ...core.types import OrderStatus
+                        
+                        has_valid_tp_order = False
+                        has_valid_sl_order = False
+                        has_valid_bracket_order = False  # STOP_LIMIT order that covers both TP and SL
+                        
+                        # Invalid order statuses (terminal failed states)
+                        invalid_statuses = {'canceled', 'rejected', 'error', 'expired'}
+                        
+                        for order in txn_orders:
+                            if not order.depends_on_order:
+                                continue  # Skip entry orders
+                            
+                            # Check if order is in valid state
+                            order_status = order.status.value.lower() if hasattr(order.status, 'value') else str(order.status).lower()
+                            is_valid_order = order_status not in invalid_statuses
+                            
+                            if not is_valid_order:
+                                continue
+                            
+                            # Get order type
+                            order_type = order.order_type.value.lower() if hasattr(order.order_type, 'value') else str(order.order_type).lower()
+                            
+                            # Round prices to 1 decimal for comparison
+                            order_limit_price = round(order.limit_price, 1) if order.limit_price else None
+                            order_stop_price = round(order.stop_price, 1) if order.stop_price else None
+                            txn_tp = round(txn.take_profit, 1) if txn.take_profit else None
+                            txn_sl = round(txn.stop_loss, 1) if txn.stop_loss else None
+                            
+                            # Check for bracket order (STOP_LIMIT that covers both TP and SL)
+                            if has_tp_defined and has_sl_defined:
+                                if 'stop_limit' in order_type:
+                                    # For bracket orders, check if both TP (limit) and SL (stop) match
+                                    if order_limit_price == txn_tp and order_stop_price == txn_sl:
+                                        has_valid_bracket_order = True
+                                        has_valid_tp_order = True
+                                        has_valid_sl_order = True
+                            
+                            # Check for individual TP order (LIMIT)
+                            if has_tp_defined and not has_valid_tp_order:
+                                if 'limit' in order_type and 'stop' not in order_type:
+                                    if order_limit_price == txn_tp:
+                                        has_valid_tp_order = True
+                            
+                            # Check for individual SL order (STOP)
+                            if has_sl_defined and not has_valid_sl_order:
+                                if 'stop' in order_type and 'limit' not in order_type:
+                                    if order_stop_price == txn_sl:
+                                        has_valid_sl_order = True
+                        
+                        # Missing if TP/SL is defined but no valid order exists
+                        has_missing_tpsl_orders = (has_tp_defined and not has_valid_tp_order) or (has_sl_defined and not has_valid_sl_order)
+                
                 row = {
                     'id': txn.id,
                     '_selected': txn.id in self.selected_transactions,  # Track selection state for checkbox
@@ -3575,11 +3679,13 @@ class TransactionsTab:
                     'is_open': txn.status == TransactionStatus.OPENED,
                     'is_waiting': txn.status == TransactionStatus.WAITING,  # Track WAITING status
                     'is_closing': txn.status == TransactionStatus.CLOSING,  # Track CLOSING status
+                    'has_missing_tpsl_orders': has_missing_tpsl_orders,  # Track if TP/SL defined but no valid orders
                     'orders': orders_data,  # Add orders for expansion
                     'order_count': len(orders_data),  # Show order count
                 }
                 rows.append(row)
             
+            logger.debug(f"[TRANSACTIONS] Returning {len(rows)} rows")
             return rows
             
         except Exception as e:
@@ -3593,9 +3699,12 @@ class TransactionsTab:
         logger.debug("[RENDER] _render_transactions_table() - START")
         
         # Get transactions data
+        logger.debug("[RENDER] Calling _get_transactions_data()...")
         rows = self._get_transactions_data()
+        logger.debug(f"[RENDER] Got {len(rows) if rows else 0} rows")
         
         if not rows:
+            logger.debug("[RENDER] No rows, showing 'No transactions found' message")
             ui.label('No transactions found.').classes('text-gray-500')
             return
         
@@ -3698,6 +3807,17 @@ class TransactionsTab:
                             </span>
                         </template>
                         <template v-else-if="col.name === 'actions'">
+                            <q-btn v-if="props.row.has_missing_tpsl_orders"
+                                   icon="warning"
+                                   size="sm"
+                                   flat
+                                   round
+                                   color="warning"
+                                   @click="$parent.$emit('recreate_tpsl_orders', props.row.id)"
+                                   title="TP/SL defined but no valid orders - Click to recreate"
+                            >
+                                <q-tooltip>TP/SL defined but no valid orders - Click to recreate</q-tooltip>
+                            </q-btn>
                             <q-btn v-if="props.row.is_open" 
                                    icon="edit" 
                                    size="sm" 
@@ -3802,6 +3922,7 @@ class TransactionsTab:
         self.transactions_table.on('edit_transaction', self._show_edit_dialog)
         self.transactions_table.on('close_transaction', self._show_close_dialog)
         self.transactions_table.on('retry_close_transaction', self._show_retry_close_dialog)
+        self.transactions_table.on('recreate_tpsl_orders', self._recreate_tpsl_orders)
         self.transactions_table.on('view_recommendation', self._show_recommendation_dialog)
         logger.debug("[RENDER] _render_transactions_table() - END (success)")
     
@@ -3824,6 +3945,133 @@ class TransactionsTab:
         self._update_batch_buttons()
         # Refresh table to show updated checkbox state
         self.transactions_table.update()
+    
+    def _recreate_tpsl_orders(self, event_data):
+        """Recreate TP/SL orders for a transaction that has TP/SL defined but no valid orders."""
+        from ...core.models import Transaction, TradingOrder
+        from ...core.types import OrderStatus
+        
+        # Extract transaction_id from event_data
+        transaction_id = event_data.args if hasattr(event_data, 'args') else event_data
+        
+        try:
+            txn = get_instance(Transaction, transaction_id)
+            if not txn:
+                ui.notify('Transaction not found', type='negative')
+                return
+            
+            # Verify transaction is open
+            from ...core.types import TransactionStatus
+            if txn.status != TransactionStatus.OPENED:
+                ui.notify('Transaction is not open', type='negative')
+                return
+            
+            # Verify TP or SL is defined
+            if not ((txn.take_profit and txn.take_profit > 0) or (txn.stop_loss and txn.stop_loss > 0)):
+                ui.notify('No TP/SL defined for this transaction', type='negative')
+                return
+            
+            # Get the entry order to find account_id
+            with get_db() as session:
+                entry_order_stmt = select(TradingOrder).where(
+                    TradingOrder.transaction_id == transaction_id,
+                    TradingOrder.depends_on_order == None  # Entry order has no dependencies
+                ).limit(1)
+                entry_order = session.exec(entry_order_stmt).first()
+                
+                if not entry_order:
+                    ui.notify('Could not find entry order', type='negative')
+                    return
+                
+                account_id = entry_order.account_id
+            
+            # Cancel any existing TP/SL orders that are still active
+            with get_db() as session:
+                existing_tpsl_stmt = select(TradingOrder).where(
+                    TradingOrder.transaction_id == transaction_id,
+                    TradingOrder.depends_on_order != None  # TP/SL orders depend on entry
+                )
+                existing_tpsl_orders = list(session.exec(existing_tpsl_stmt).all())
+                
+                account_inst = get_account_instance_from_id(account_id)
+                if not account_inst:
+                    ui.notify('Could not load account instance', type='negative')
+                    return
+                
+                for order in existing_tpsl_orders:
+                    # Only cancel orders that are not already in terminal state
+                    terminal_statuses = OrderStatus.get_terminal_statuses()
+                    if order.status not in terminal_statuses:
+                        try:
+                            account_inst.cancel_order(order.id)
+                            logger.info(f"Canceled existing TP/SL order {order.id} for transaction {transaction_id}")
+                        except Exception as e:
+                            logger.warning(f"Failed to cancel order {order.id}: {e}")
+            
+            # Recreate TP/SL orders using the proper AccountInterface methods
+            orders_created = []
+            
+            # Check if both TP and SL are defined - if so, use set_order_tp_sl for bracket order
+            has_tp = txn.take_profit and txn.take_profit > 0
+            has_sl = txn.stop_loss and txn.stop_loss > 0
+            
+            if has_tp and has_sl:
+                # Both TP and SL defined - create as bracket order
+                try:
+                    tp_order, sl_order = account_inst.set_order_tp_sl(
+                        entry_order, 
+                        txn.take_profit, 
+                        txn.stop_loss
+                    )
+                    if tp_order and sl_order:
+                        orders_created.extend(['TP', 'SL'])
+                        logger.info(
+                            f"Created TP order {tp_order.id} at ${txn.take_profit:.2f} "
+                            f"and SL order {sl_order.id} at ${txn.stop_loss:.2f} "
+                            f"for transaction {transaction_id}"
+                        )
+                    elif tp_order:
+                        orders_created.append('TP')
+                        logger.info(f"Created TP order {tp_order.id} at ${txn.take_profit:.2f} for transaction {transaction_id}")
+                    elif sl_order:
+                        orders_created.append('SL')
+                        logger.info(f"Created SL order {sl_order.id} at ${txn.stop_loss:.2f} for transaction {transaction_id}")
+                except Exception as e:
+                    logger.error(f"Failed to create TP/SL bracket orders: {e}", exc_info=True)
+            else:
+                # Only one of TP or SL defined - create separately
+                if has_tp:
+                    try:
+                        tp_order = account_inst.set_order_tp(entry_order, txn.take_profit)
+                        if tp_order:
+                            orders_created.append('TP')
+                            logger.info(f"Created TP order {tp_order.id} at ${txn.take_profit:.2f} for transaction {transaction_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to create TP order: {e}", exc_info=True)
+                
+                if has_sl:
+                    try:
+                        sl_order = account_inst.set_order_sl(entry_order, txn.stop_loss)
+                        if sl_order:
+                            orders_created.append('SL')
+                            logger.info(f"Created SL order {sl_order.id} at ${txn.stop_loss:.2f} for transaction {transaction_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to create SL order: {e}", exc_info=True)
+            
+            if orders_created:
+                orders_str = ' and '.join(orders_created)
+                ui.notify(f'✓ {orders_str} order(s) recreated for {txn.symbol}', type='positive')
+                logger.info(f"Successfully recreated {orders_str} orders for transaction {transaction_id}")
+            else:
+                ui.notify('No TP/SL orders were created', type='warning')
+                logger.warning(f"No TP/SL orders were created for transaction {transaction_id}")
+            
+            # Refresh the table
+            self._refresh_transactions()
+            
+        except Exception as e:
+            logger.error(f"Error recreating TP/SL orders for transaction {transaction_id}: {e}", exc_info=True)
+            ui.notify(f'Error: {str(e)}', type='negative')
     
     def _show_edit_dialog(self, event_data):
         """Show dialog to edit TP/SL for a transaction."""

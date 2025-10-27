@@ -308,11 +308,12 @@ class InstrumentSettingsTab:
                 
                 ui.label('Select file with instrument symbols (one per line):').classes('mb-2')
                 
-                def handle_upload(e: UploadEventArguments):
+                async def handle_upload(e: UploadEventArguments):
                     try:
                         # Read content from the uploaded file
-                        e.file.content.seek(0)  # Ensure we're at the beginning of the file
-                        content = e.file.content.read().decode('utf-8')
+                        # NiceGUI 3.0+: e.file is the UploadFile object directly, read() is async
+                        content_bytes = await e.file.read()
+                        content = content_bytes.decode('utf-8')
                         names = [line.strip() for line in content.splitlines() if line.strip()]
                         
                         # Parse labels
@@ -2693,12 +2694,13 @@ class ExpertSettingsTab:
             
             ui.label('Upload a previously exported JSON settings file to restore settings:').classes('text-body2 mb-2')
             
-            def handle_import_upload(e: UploadEventArguments):
+            async def handle_import_upload(e: UploadEventArguments):
                 """Handle JSON file upload for settings import."""
                 try:
                     # Read the uploaded file
-                    e.file.content.seek(0)  # Ensure we're at the beginning of the file
-                    import_json = e.file.content.read().decode('utf-8')
+                    # NiceGUI 3.0+: e.file is the UploadFile object directly, read() is async
+                    import_json_bytes = await e.file.read()
+                    import_json = import_json_bytes.decode('utf-8')
                     if not import_json.strip():
                         ui.notify('Uploaded file is empty', type='warning')
                         return

@@ -3,7 +3,7 @@ from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, LimitO
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderClass
 from alpaca.common.exceptions import APIError
 from typing import Any, Dict, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import time
 import functools
 
@@ -287,12 +287,13 @@ class AlpacaAccount(AccountInterface):
         )
         
     @alpaca_api_retry
-    def get_orders(self, status: Optional[OrderStatus] = OrderStatus.ALL): # TODO: Add filter handling
+    def get_orders(self, status: Optional[OrderStatus] = OrderStatus.ALL, fetch_all: bool = False): # TODO: Add filter handling
         """
         Retrieve a list of orders based on the provided filter.
         
         Args:
-            filter (dict, optional): Filter criteria for orders. Defaults to {}.
+            status: Filter by order status. Defaults to ALL.
+            fetch_all: If True, fetches ALL orders using date-based pagination. If False, returns first 500 orders.
             
         Returns:
             list: A list of TradingOrder objects representing the orders.
@@ -302,13 +303,98 @@ class AlpacaAccount(AccountInterface):
             return []
             
         try:
-            filter = GetOrdersRequest(
-                status=status
-            )
-            alpaca_orders = self.client.get_orders(filter)
+            limit = 500  # Always use 500 as limit per Alpaca's maximum
+            all_orders_dict = {}  # Use dict to deduplicate by broker_order_id
+            
+            if fetch_all:
+                # Paginate through all orders using date-based pagination
+                until_date = None  # Start with no date filter (gets most recent orders)
+                page = 0
+                
+                while True:
+                    # Build filter with optional until parameter
+                    filter_params = {
+                        "status": status,
+                        "limit": limit
+                    }
+                    if until_date:
+                        filter_params["until"] = until_date
+                    
+                    filter = GetOrdersRequest(**filter_params)
+                    alpaca_orders = self.client.get_orders(filter)
+                    
+                    # If no orders returned, we've fetched everything
+                    if not alpaca_orders:
+                        logger.debug(f"No more orders to fetch at page {page + 1}")
+                        break
+                    
+                    # Add orders to dict (deduplicates by broker_order_id)
+                    new_order_count = 0
+                    oldest_order_date = None
+                    
+                    for order in alpaca_orders:
+                        if order.id:  # Alpaca's order.id is the broker_order_id
+                            if order.id not in all_orders_dict:
+                                all_orders_dict[order.id] = order
+                                new_order_count += 1
+                            
+                            # Track the oldest order date in this batch
+                            if order.created_at:
+                                if oldest_order_date is None or order.created_at < oldest_order_date:
+                                    oldest_order_date = order.created_at
+                    
+                    logger.debug(
+                        f"Fetched page {page + 1}: {len(alpaca_orders)} orders returned, "
+                        f"{new_order_count} new unique orders (total unique: {len(all_orders_dict)})"
+                    )
+                    
+                    # If we got fewer than limit, we've reached the end
+                    if len(alpaca_orders) < limit:
+                        logger.debug(f"Received fewer than {limit} orders, pagination complete")
+                        break
+                    
+                    # If no new unique orders were added, we're seeing duplicates - stop
+                    if new_order_count == 0:
+                        logger.debug(f"No new unique orders in this batch, pagination complete")
+                        break
+                    
+                    # Set until_date to oldest order's date - 1 day for next iteration
+                    # The 'until' parameter means "fetch orders created BEFORE this date"
+                    # So we go backwards in time to get older orders
+                    if oldest_order_date:
+                        # Subtract 1 day to fetch older orders in next iteration
+                        until_date = oldest_order_date - timedelta(days=1)
+                        logger.debug(f"Next pagination until date (going backwards): {until_date}")
+                    else:
+                        # No date found, can't continue pagination
+                        logger.warning("No created_at date found in orders, stopping pagination")
+                        break
+                    
+                    page += 1
+                    
+                    # Safety limit: stop after 100 pages to prevent infinite loops
+                    if page >= 100:
+                        logger.warning(f"Reached maximum pagination limit of 100 pages, stopping")
+                        break
+                
+                # Convert dict values to list
+                alpaca_orders = list(all_orders_dict.values())
+                logger.info(f"Fetched {len(alpaca_orders)} unique orders across {page + 1} page(s)")
+                
+            else:
+                # Just fetch first batch (up to 500 orders)
+                filter = GetOrdersRequest(
+                    status=status,
+                    limit=limit
+                )
+                alpaca_orders = self.client.get_orders(filter)
+                logger.debug(f"Fetched {len(alpaca_orders)} orders (single page, no pagination)")
+            
+            # Convert to TradingOrder objects
             orders = [self.alpaca_order_to_tradingorder(order) for order in alpaca_orders]
-            logger.debug(f"Listed {len(orders)} Alpaca Orders.")
+            logger.debug(f"Converted to {len(orders)} TradingOrder objects")
             return orders
+            
         except Exception as e:
             logger.error(f"Error listing Alpaca orders: {e}", exc_info=True)
             return []
@@ -605,14 +691,30 @@ class AlpacaAccount(AccountInterface):
         Cancel an existing order.
         
         Args:
-            order_id (str): The ID of the order to cancel.
+            order_id (str): Our database order ID (will be looked up to get broker_order_id).
             
         Returns:
             bool: True if cancellation was successful, False otherwise.
         """
         try:
-            self.client.cancel_order_by_id(order_id)
-            logger.info(f"Cancelled Alpaca order: {order_id}")
+            # Look up the order in our database to get the broker_order_id
+            db_order = get_instance(TradingOrder, int(order_id))
+            if not db_order:
+                logger.error(f"Order {order_id} not found in database")
+                return False
+            
+            if not db_order.broker_order_id:
+                logger.error(f"Order {order_id} has no broker_order_id")
+                return False
+            
+            # Cancel using the broker's order ID (UUID)
+            self.client.cancel_order_by_id(db_order.broker_order_id)
+            logger.info(f"Cancelled Alpaca order: database_id={order_id}, broker_order_id={db_order.broker_order_id}")
+            
+            # Update the order status in our database
+            db_order.status = OrderStatus.CANCELED
+            update_instance(db_order)
+            
             return True
         except Exception as e:
             logger.error(f"Error cancelling Alpaca order {order_id}: {e}", exc_info=True)
@@ -806,7 +908,7 @@ class AlpacaAccount(AccountInterface):
             logger.error(f"Error refreshing positions from Alpaca: {e}", exc_info=True)
             return False
 
-    def refresh_orders(self, heuristic_mapping: bool = False) -> bool:
+    def refresh_orders(self, heuristic_mapping: bool = False, fetch_all: bool = True) -> bool:
         """
         Refresh/synchronize account orders from Alpaca broker.
         This method updates database records with current order states from the broker.
@@ -815,13 +917,16 @@ class AlpacaAccount(AccountInterface):
             heuristic_mapping (bool): If True, attempt to map orders by comment field when broker_order_id is missing.
                                       Useful for recovering from errors where broker_order_id wasn't saved.
                                       Assumes comment field is unique for this account's orders.
+            fetch_all (bool): If True, fetches all orders from Alpaca using pagination. 
+                              If False, fetches only first 500 orders (faster but incomplete).
+                              Defaults to True for complete synchronization.
         
         Returns:
             bool: True if refresh was successful, False otherwise
         """
         try:
-            # Get all orders from Alpaca
-            alpaca_orders = self.get_orders(OrderStatus.ALL)
+            # Get all orders from Alpaca (with pagination if fetch_all=True)
+            alpaca_orders = self.get_orders(OrderStatus.ALL, fetch_all=fetch_all)
             
             if not alpaca_orders:
                 logger.warning("No orders returned from Alpaca during refresh")
@@ -925,8 +1030,19 @@ class AlpacaAccount(AccountInterface):
                 ).all()
                 
                 for db_order in db_active_orders:
-                    # If this broker_order_id doesn't exist in Alpaca anymore, mark as CANCELED
+                    # If this broker_order_id doesn't exist in Alpaca anymore, check if we should mark as CANCELED
                     if db_order.broker_order_id not in alpaca_broker_ids:
+                        # Safety check: Don't mark as CANCELED if order was created very recently
+                        # This prevents race conditions where order was just submitted but not yet in Alpaca's response
+                        if db_order.created_at:
+                            order_age_minutes = (datetime.now(timezone.utc) - db_order.created_at).total_seconds() / 60
+                            if order_age_minutes < 5:
+                                logger.debug(
+                                    f"Order {db_order.id} (broker_order_id={db_order.broker_order_id}) "
+                                    f"not found in Alpaca but is only {order_age_minutes:.1f} minutes old - skipping cancellation"
+                                )
+                                continue
+                        
                         logger.warning(
                             f"Order {db_order.id} (broker_order_id={db_order.broker_order_id}) "
                             f"not found in Alpaca, marking as CANCELED"
