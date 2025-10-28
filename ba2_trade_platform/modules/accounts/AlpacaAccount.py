@@ -155,6 +155,26 @@ class AlpacaAccount(AccountInterface):
         
         return rounded
     
+    @staticmethod
+    def _generate_tpsl_comment(order_type: str, account_id: int, transaction_id: int, parent_order_id: int) -> str:
+        """
+        Generate unique timestamp-based comment for TP/SL orders.
+        
+        Format: timestamp-TYPE-[ACC:XX/TR:YY/PORD:ZZZ]
+        where TYPE can be TP, SL, or TPSL
+        
+        Args:
+            order_type: "TP", "SL", or "TPSL"
+            account_id: Account ID
+            transaction_id: Transaction ID
+            parent_order_id: Parent order ID (entry order)
+            
+        Returns:
+            str: Formatted comment string
+        """
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        return f"{timestamp}-{order_type}-[ACC:{account_id}/TR:{transaction_id}/PORD:{parent_order_id}]"
+    
     def alpaca_order_to_tradingorder(self, order):
         """
         Convert an Alpaca order object to a TradingOrder object.
@@ -1257,7 +1277,7 @@ class AlpacaAccount(AccountInterface):
                     try:
                         replaced_order = self.client.replace_order_by_id(
                             order_id=existing_tp.broker_order_id,
-                            replace_order_data=replace_request
+                            order_data=replace_request
                         )
                         
                         # Create new database record
@@ -1342,7 +1362,7 @@ class AlpacaAccount(AccountInterface):
                     try:
                         replaced_order = self.client.replace_order_by_id(
                             order_id=existing_sl.broker_order_id,
-                            replace_order_data=replace_request
+                            order_data=replace_request
                         )
                         
                         # Create new database record
@@ -1665,7 +1685,7 @@ class AlpacaAccount(AccountInterface):
             # Send replace request to Alpaca
             replaced_order = self.client.replace_order_by_id(
                 order_id=existing_tp.broker_order_id,
-                replace_order_data=replace_request
+                order_data=replace_request
             )
             
             # Create new database record for the replacement order
@@ -1738,7 +1758,7 @@ class AlpacaAccount(AccountInterface):
             # Send replace request to Alpaca
             replaced_order = self.client.replace_order_by_id(
                 order_id=existing_sl.broker_order_id,
-                replace_order_data=replace_request
+                order_data=replace_request
             )
             
             # Create new database record for the replacement order
@@ -1816,7 +1836,7 @@ class AlpacaAccount(AccountInterface):
             # Send replace request to Alpaca
             replaced_order = self.client.replace_order_by_id(
                 order_id=existing_order.broker_order_id,
-                replace_order_data=replace_request
+                order_data=replace_request
             )
             
             # Determine correct order type based on side
@@ -1961,13 +1981,17 @@ class AlpacaAccount(AccountInterface):
                 ).all()
                 
                 existing_tp = None
+                existing_oco = None  # OCO orders that might contain TP
                 for order in all_orders:
                     if self._is_tp_order(order, entry_order):
                         existing_tp = order
                         break
+                    # Also check for OCO orders (they have both TP and SL)
+                    if order.order_type == CoreOrderType.OCO and order.limit_price and order.stop_price:
+                        existing_oco = order
                 
                 # 4. Determine action based on states
-                logger.debug(f"Entry order {entry_order.id} status: {entry_order.status}, existing_tp: {existing_tp.id if existing_tp else None}")
+                logger.debug(f"Entry order {entry_order.id} status: {entry_order.status}, existing_tp: {existing_tp.id if existing_tp else None}, existing_oco: {existing_oco.id if existing_oco else None}")
                 if entry_order.status in OrderStatus.get_unsent_statuses():
                     # Entry not sent to broker yet - create/update pending TP order
                     if existing_tp:
@@ -1982,9 +2006,16 @@ class AlpacaAccount(AccountInterface):
                         session.add(existing_tp)
                         session.commit()
                         logger.info(f"Updated pending TP order {existing_tp.id} to ${new_tp_price:.2f}")
+                    elif existing_oco:
+                        # Update existing OCO order with new TP price
+                        existing_oco.limit_price = new_tp_price
+                        session.add(existing_oco)
+                        session.commit()
+                        logger.info(f"Updated pending OCO order {existing_oco.id} TP to ${new_tp_price:.2f}")
                     else:
                         # Create new pending TP order
                         tp_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
+                        tp_comment = self._generate_tpsl_comment("TP", self.id, transaction.id, entry_order.id)
                         tp_order = TradingOrder(
                             account_id=self.id,
                             symbol=entry_order.symbol,
@@ -1996,7 +2027,7 @@ class AlpacaAccount(AccountInterface):
                             status=OrderStatus.PENDING,
                             depends_on_order=entry_order.id,
                             open_type=OrderOpenType.AUTOMATIC,
-                            comment="TP order (OTO)",
+                            comment=tp_comment,
                             data={"tp_percent_target": self._calculate_tp_percent(entry_order, new_tp_price)},
                             created_at=datetime.now(timezone.utc)
                         )
@@ -2008,46 +2039,38 @@ class AlpacaAccount(AccountInterface):
                 
                 elif entry_order.status in OrderStatus.get_executed_statuses():
                     # Entry filled - work with broker
-                    if not existing_tp:
-                        # No existing TP - create OCO/OTO order
-                        return self._create_broker_tp_order(session, transaction, entry_order, new_tp_price)
                     
-                    elif existing_tp.status in OrderStatus.get_unsent_statuses():
-                        # Existing TP pending - just update it
-                        existing_tp.limit_price = new_tp_price
-                        # Upgrade legacy order types to new OTO/OCO
-                        # Check if order type is not already OTO/OCO (compare values, not enums)
-                        order_type_value = existing_tp.order_type.value if hasattr(existing_tp.order_type, 'value') else str(existing_tp.order_type)
-                        logger.debug(f"TP order {existing_tp.id} has type: {order_type_value} (checking if needs upgrade)")
-                        if order_type_value not in ["oto", "oco"]:
-                            has_sl = transaction.stop_loss is not None and transaction.stop_loss > 0
-                            existing_tp.order_type = CoreOrderType.OCO if has_sl else CoreOrderType.OTO
-                            logger.info(f"Upgraded TP order {existing_tp.id} from {order_type_value} to {existing_tp.order_type.value}")
-                        else:
-                            logger.debug(f"TP order {existing_tp.id} already using OTO/OCO, no upgrade needed")
-                        session.add(existing_tp)
+                    # Cancel ALL existing TP/SL/OCO orders before creating new TP order
+                    orders_to_cancel = []
+                    if existing_tp:
+                        orders_to_cancel.append(existing_tp)
+                    if existing_oco:
+                        orders_to_cancel.append(existing_oco)
+                    # Also check for any other non-terminal TP/SL orders we might have missed
+                    for order in all_orders:
+                        if order not in orders_to_cancel and order.id not in [existing_tp.id if existing_tp else None, existing_oco.id if existing_oco else None]:
+                            # This is another TP/SL order - cancel it too
+                            orders_to_cancel.append(order)
+                    
+                    if orders_to_cancel:
+                        logger.info(f"Cancelling {len(orders_to_cancel)} existing TP/SL/OCO orders before creating new TP")
+                        for order in orders_to_cancel:
+                            if order.broker_order_id:
+                                # Order at broker - cancel via API
+                                try:
+                                    self.cancel_order(order.id)
+                                    logger.info(f"Cancelled broker order {order.id} (broker_id={order.broker_order_id})")
+                                except Exception as e:
+                                    logger.warning(f"Failed to cancel broker order {order.id}: {e}")
+                            else:
+                                # Pending order - just mark as cancelled in DB
+                                order.status = OrderStatus.CANCELED
+                                session.add(order)
+                                logger.info(f"Cancelled pending order {order.id}")
                         session.commit()
-                        logger.info(f"Updated pending TP order {existing_tp.id} to ${new_tp_price:.2f}")
-                        return True
                     
-                    else:
-                        # Existing TP at broker - check if legacy type needs migration
-                        order_type_value = existing_tp.order_type.value if hasattr(existing_tp.order_type, 'value') else str(existing_tp.order_type)
-                        if order_type_value not in ["oto", "oco"]:
-                            # Legacy order type (LIMIT, STOP_LIMIT, etc.) - cancel and create new OTO/OCO
-                            logger.info(f"Migrating legacy TP order {existing_tp.id} (type={order_type_value}) to OTO/OCO")
-                            try:
-                                # Cancel old order
-                                self.cancel_order(existing_tp.id)
-                                # Create new OTO/OCO order
-                                return self._create_broker_tp_order(session, transaction, entry_order, new_tp_price)
-                            except Exception as e:
-                                logger.error(f"Error migrating legacy TP order: {e}", exc_info=True)
-                                # If cancel fails, try fallback to PENDING_CANCEL
-                                return self._replace_broker_tp_order(session, existing_tp, new_tp_price)
-                        else:
-                            # Modern OTO/OCO order - try to replace
-                            return self._replace_broker_tp_order(session, existing_tp, new_tp_price)
+                    # Create new TP order
+                    return self._create_broker_tp_order(session, transaction, entry_order, new_tp_price)
                 
                 else:
                     logger.warning(f"Entry order {entry_order.id} in unexpected state: {entry_order.status.value}")
@@ -2074,6 +2097,12 @@ class AlpacaAccount(AccountInterface):
             
             # Create TP order
             tp_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
+            tp_comment = self._generate_tpsl_comment(
+                "TPSL" if has_sl else "TP",
+                self.id,
+                transaction.id,
+                entry_order.id
+            )
             tp_order = TradingOrder(
                 account_id=self.id,
                 symbol=entry_order.symbol,
@@ -2084,7 +2113,7 @@ class AlpacaAccount(AccountInterface):
                 transaction_id=transaction.id,
                 status=OrderStatus.PENDING,
                 open_type=OrderOpenType.AUTOMATIC,
-                comment=f"TP order ({order_type.value})",
+                comment=tp_comment,
                 data={"tp_percent_target": self._calculate_tp_percent(entry_order, tp_price)},
                 created_at=datetime.now(timezone.utc)
             )
@@ -2092,10 +2121,15 @@ class AlpacaAccount(AccountInterface):
             session.commit()
             session.refresh(tp_order)
             
-            # Submit to broker (actual OCO/OTO submission would happen here)
-            # For now, just mark as pending - actual broker submission is separate
-            logger.info(f"Created {order_type.value} TP order {tp_order.id} for transaction {transaction.id}")
-            return True
+            # Submit to broker
+            logger.info(f"Submitting {order_type.value} TP order {tp_order.id} to broker")
+            try:
+                self.submit_order(tp_order)
+                logger.info(f"Successfully submitted {order_type.value} TP order {tp_order.id} for transaction {transaction.id}")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to submit TP order to broker: {e}", exc_info=True)
+                return False
             
         except Exception as e:
             logger.error(f"Error creating broker TP order: {e}", exc_info=True)
@@ -2234,12 +2268,17 @@ class AlpacaAccount(AccountInterface):
                 ).all()
                 
                 existing_sl = None
+                existing_oco = None  # OCO orders that might contain SL
                 for order in all_orders:
                     if self._is_sl_order(order, entry_order):
                         existing_sl = order
                         break
+                    # Also check for OCO orders (they have both TP and SL)
+                    if order.order_type == CoreOrderType.OCO and order.limit_price and order.stop_price:
+                        existing_oco = order
                 
                 # 4. Determine action (same logic as TP)
+                logger.debug(f"Entry order {entry_order.id} status: {entry_order.status}, existing_sl: {existing_sl.id if existing_sl else None}, existing_oco: {existing_oco.id if existing_oco else None}")
                 if entry_order.status in OrderStatus.get_unsent_statuses():
                     if existing_sl:
                         existing_sl.stop_price = new_sl_price
@@ -2253,8 +2292,15 @@ class AlpacaAccount(AccountInterface):
                         session.add(existing_sl)
                         session.commit()
                         logger.info(f"Updated pending SL order {existing_sl.id} to ${new_sl_price:.2f}")
+                    elif existing_oco:
+                        # Update existing OCO order with new SL price
+                        existing_oco.stop_price = new_sl_price
+                        session.add(existing_oco)
+                        session.commit()
+                        logger.info(f"Updated pending OCO order {existing_oco.id} SL to ${new_sl_price:.2f}")
                     else:
                         sl_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
+                        sl_comment = self._generate_tpsl_comment("SL", self.id, transaction.id, entry_order.id)
                         sl_order = TradingOrder(
                             account_id=self.id,
                             symbol=entry_order.symbol,
@@ -2266,7 +2312,7 @@ class AlpacaAccount(AccountInterface):
                             status=OrderStatus.PENDING,
                             depends_on_order=entry_order.id,
                             open_type=OrderOpenType.AUTOMATIC,
-                            comment="SL order (OTO)",
+                            comment=sl_comment,
                             data={"sl_percent_target": self._calculate_sl_percent(entry_order, new_sl_price)},
                             created_at=datetime.now(timezone.utc)
                         )
@@ -2276,39 +2322,39 @@ class AlpacaAccount(AccountInterface):
                     return True
                 
                 elif entry_order.status in OrderStatus.get_executed_statuses():
-                    if not existing_sl:
-                        return self._create_broker_sl_order(session, transaction, entry_order, new_sl_price)
-                    elif existing_sl.status in OrderStatus.get_unsent_statuses():
-                        existing_sl.stop_price = new_sl_price
-                        # Upgrade legacy order types to new OTO/OCO
-                        # Check if order type is not already OTO/OCO (compare values, not enums)
-                        order_type_value = existing_sl.order_type.value if hasattr(existing_sl.order_type, 'value') else str(existing_sl.order_type)
-                        if order_type_value not in ["oto", "oco"]:
-                            has_tp = transaction.take_profit is not None and transaction.take_profit > 0
-                            existing_sl.order_type = CoreOrderType.OCO if has_tp else CoreOrderType.OTO
-                            logger.info(f"Upgraded SL order {existing_sl.id} from {order_type_value} to {existing_sl.order_type.value}")
-                        session.add(existing_sl)
+                    # Entry filled - work with broker
+                    
+                    # Cancel ALL existing TP/SL/OCO orders before creating new SL order
+                    orders_to_cancel = []
+                    if existing_sl:
+                        orders_to_cancel.append(existing_sl)
+                    if existing_oco:
+                        orders_to_cancel.append(existing_oco)
+                    # Also check for any other non-terminal TP/SL orders we might have missed
+                    for order in all_orders:
+                        if order not in orders_to_cancel and order.id not in [existing_sl.id if existing_sl else None, existing_oco.id if existing_oco else None]:
+                            # This is another TP/SL order - cancel it too
+                            orders_to_cancel.append(order)
+                    
+                    if orders_to_cancel:
+                        logger.info(f"Cancelling {len(orders_to_cancel)} existing TP/SL/OCO orders before creating new SL")
+                        for order in orders_to_cancel:
+                            if order.broker_order_id:
+                                # Order at broker - cancel via API
+                                try:
+                                    self.cancel_order(order.id)
+                                    logger.info(f"Cancelled broker order {order.id} (broker_id={order.broker_order_id})")
+                                except Exception as e:
+                                    logger.warning(f"Failed to cancel broker order {order.id}: {e}")
+                            else:
+                                # Pending order - just mark as cancelled in DB
+                                order.status = OrderStatus.CANCELED
+                                session.add(order)
+                                logger.info(f"Cancelled pending order {order.id}")
                         session.commit()
-                        logger.info(f"Updated pending SL order {existing_sl.id} to ${new_sl_price:.2f}")
-                        return True
-                    else:
-                        # Existing SL at broker - check if legacy type needs migration
-                        order_type_value = existing_sl.order_type.value if hasattr(existing_sl.order_type, 'value') else str(existing_sl.order_type)
-                        if order_type_value not in ["oto", "oco"]:
-                            # Legacy order type (STOP, STOP_LIMIT, etc.) - cancel and create new OTO/OCO
-                            logger.info(f"Migrating legacy SL order {existing_sl.id} (type={order_type_value}) to OTO/OCO")
-                            try:
-                                # Cancel old order
-                                self.cancel_order(existing_sl.id)
-                                # Create new OTO/OCO order
-                                return self._create_broker_sl_order(session, transaction, entry_order, new_sl_price)
-                            except Exception as e:
-                                logger.error(f"Error migrating legacy SL order: {e}", exc_info=True)
-                                # If cancel fails, try fallback to PENDING_CANCEL
-                                return self._replace_broker_sl_order(session, existing_sl, new_sl_price)
-                        else:
-                            # Modern OTO/OCO order - try to replace
-                            return self._replace_broker_sl_order(session, existing_sl, new_sl_price)
+                    
+                    # Create new SL order
+                    return self._create_broker_sl_order(session, transaction, entry_order, new_sl_price)
                 else:
                     logger.warning(f"Entry order {entry_order.id} in unexpected state: {entry_order.status.value}")
                     return False
@@ -2332,6 +2378,12 @@ class AlpacaAccount(AccountInterface):
             order_type = CoreOrderType.OCO if has_tp else CoreOrderType.OTO
             
             sl_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
+            sl_comment = self._generate_tpsl_comment(
+                "TPSL" if has_tp else "SL",
+                self.id,
+                transaction.id,
+                entry_order.id
+            )
             sl_order = TradingOrder(
                 account_id=self.id,
                 symbol=entry_order.symbol,
@@ -2342,7 +2394,7 @@ class AlpacaAccount(AccountInterface):
                 transaction_id=transaction.id,
                 status=OrderStatus.PENDING,
                 open_type=OrderOpenType.AUTOMATIC,
-                comment=f"SL order ({order_type.value})",
+                comment=sl_comment,
                 data={"sl_percent_target": self._calculate_sl_percent(entry_order, sl_price)},
                 created_at=datetime.now(timezone.utc)
             )
@@ -2350,8 +2402,15 @@ class AlpacaAccount(AccountInterface):
             session.commit()
             session.refresh(sl_order)
             
-            logger.info(f"Created {order_type.value} SL order {sl_order.id} for transaction {transaction.id}")
-            return True
+            # Submit to broker
+            logger.info(f"Submitting {order_type.value} SL order {sl_order.id} to broker")
+            try:
+                self.submit_order(sl_order)
+                logger.info(f"Successfully submitted {order_type.value} SL order {sl_order.id} for transaction {transaction.id}")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to submit SL order to broker: {e}", exc_info=True)
+                return False
             
         except Exception as e:
             logger.error(f"Error creating broker SL order: {e}", exc_info=True)
@@ -2528,6 +2587,7 @@ class AlpacaAccount(AccountInterface):
                         
                         # Create pending OCO order
                         oco_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
+                        oco_comment = self._generate_tpsl_comment("TPSL", self.id, transaction.id, entry_order.id)
                         oco_order = TradingOrder(
                             account_id=self.id,
                             symbol=entry_order.symbol,
@@ -2540,7 +2600,7 @@ class AlpacaAccount(AccountInterface):
                             status=OrderStatus.PENDING,
                             depends_on_order=entry_order.id,
                             open_type=OrderOpenType.AUTOMATIC,
-                            comment="OCO order (TP+SL)",
+                            comment=oco_comment,
                             data={
                                 "tp_percent_target": self._calculate_tp_percent(entry_order, new_tp_price),
                                 "sl_percent_target": self._calculate_sl_percent(entry_order, new_sl_price)
@@ -2555,27 +2615,34 @@ class AlpacaAccount(AccountInterface):
                 elif entry_order.status in OrderStatus.get_executed_statuses():
                     # SCENARIO 2: Entry filled - work with broker
                     
-                    # If we have existing OCO order at broker
-                    if existing_oco and existing_oco.broker_order_id:
-                        # Try to replace OCO order
-                        return self._replace_broker_oco_order(session, existing_oco, new_tp_price, new_sl_price)
+                    # Cancel ALL existing TP/SL orders (pending or at broker)
+                    orders_to_cancel = []
+                    if existing_oco:
+                        orders_to_cancel.append(existing_oco)
+                    if existing_tp:
+                        orders_to_cancel.append(existing_tp)
+                    if existing_sl:
+                        orders_to_cancel.append(existing_sl)
                     
-                    # If we have separate TP and/or SL orders, cancel them and create new OCO
-                    if existing_tp or existing_sl:
-                        logger.info(f"Cancelling separate TP/SL orders to create combined OCO")
-                        if existing_tp and existing_tp.broker_order_id:
-                            try:
-                                self.cancel_order(existing_tp.id)
-                            except Exception as e:
-                                logger.warning(f"Failed to cancel existing TP order: {e}")
-                        if existing_sl and existing_sl.broker_order_id:
-                            try:
-                                self.cancel_order(existing_sl.id)
-                            except Exception as e:
-                                logger.warning(f"Failed to cancel existing SL order: {e}")
+                    if orders_to_cancel:
+                        logger.info(f"Cancelling {len(orders_to_cancel)} existing TP/SL orders before creating new OCO")
+                        for order in orders_to_cancel:
+                            if order.broker_order_id:
+                                # Order at broker - cancel via API
+                                try:
+                                    self.cancel_order(order.id)
+                                    logger.info(f"Cancelled broker order {order.id} (broker_id={order.broker_order_id})")
+                                except Exception as e:
+                                    logger.warning(f"Failed to cancel broker order {order.id}: {e}")
+                            else:
+                                # Pending order - just mark as cancelled in DB
+                                order.status = OrderStatus.CANCELED
+                                session.add(order)
+                                logger.info(f"Cancelled pending order {order.id}")
                     
                     # Create and submit new OCO order to broker
                     oco_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
+                    oco_comment = self._generate_tpsl_comment("TPSL", self.id, transaction.id, entry_order.id)
                     oco_order = TradingOrder(
                         account_id=self.id,
                         symbol=entry_order.symbol,
@@ -2587,7 +2654,7 @@ class AlpacaAccount(AccountInterface):
                         transaction_id=transaction.id,
                         status=OrderStatus.PENDING,
                         open_type=OrderOpenType.AUTOMATIC,
-                        comment="OCO order (TP+SL)",
+                        comment=oco_comment,
                         data={
                             "tp_percent_target": self._calculate_tp_percent(entry_order, new_tp_price),
                             "sl_percent_target": self._calculate_sl_percent(entry_order, new_sl_price)
@@ -2636,7 +2703,7 @@ class AlpacaAccount(AccountInterface):
                 
                 replaced_order = self.client.replace_order_by_id(
                     order_id=existing_oco.broker_order_id,
-                    replace_order_data=replace_request
+                    order_data=replace_request
                 )
                 
                 # Update existing order record with new prices and broker ID
