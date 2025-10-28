@@ -30,56 +30,37 @@ def get_account_prices(account: AccountInterface, symbol: str) -> dict:
     """
     Get bid/ask prices for a symbol from an account.
     
+    Fetches both bid and ask prices separately to ensure accurate spread calculation.
+    
     Returns:
         dict with keys: bid, ask, mid, spread, spread_pct, error
     """
     try:
-        price = account.get_instrument_current_price(symbol)
+        # Fetch bid and ask prices separately using the price_type parameter
+        bid = account.get_instrument_current_price(symbol, price_type='bid')
+        ask = account.get_instrument_current_price(symbol, price_type='ask')
         
-        if price is None:
-            return {"error": "Price is None"}
+        if bid is None and ask is None:
+            return {"error": "Both bid and ask prices are None"}
         
-        # Check if price is a dict with bid/ask or just a single price
-        if isinstance(price, dict):
-            bid = price.get('bid')
-            ask = price.get('ask')
-            
-            if bid is not None and ask is not None:
-                mid = (bid + ask) / 2
-                spread = ask - bid
-                spread_pct = (spread / mid) * 100 if mid > 0 else 0
-                
-                return {
-                    "bid": bid,
-                    "ask": ask,
-                    "mid": mid,
-                    "spread": spread,
-                    "spread_pct": spread_pct
-                }
-            else:
-                # Dict but missing bid/ask - use 'price' key or the value itself
-                single_price = price.get('price', price.get('last', None))
-                if single_price is not None:
-                    return {
-                        "bid": single_price,
-                        "ask": single_price,
-                        "mid": single_price,
-                        "spread": 0.0,
-                        "spread_pct": 0.0,
-                        "note": "Single price (no bid/ask)"
-                    }
-                else:
-                    return {"error": f"Dict without bid/ask/price: {price}"}
-        else:
-            # Single price value
-            return {
-                "bid": price,
-                "ask": price,
-                "mid": price,
-                "spread": 0.0,
-                "spread_pct": 0.0,
-                "note": "Single price (no bid/ask)"
-            }
+        # Handle missing bid or ask
+        if bid is None:
+            bid = ask  # Fallback to ask if bid missing
+        if ask is None:
+            ask = bid  # Fallback to bid if ask missing
+        
+        # Calculate mid, spread, and spread percentage
+        mid = (bid + ask) / 2
+        spread = ask - bid
+        spread_pct = (spread / mid) * 100 if mid > 0 else 0
+        
+        return {
+            "bid": bid,
+            "ask": ask,
+            "mid": mid,
+            "spread": spread,
+            "spread_pct": spread_pct
+        }
     
     except Exception as e:
         return {"error": str(e)}
@@ -156,7 +137,26 @@ def compare_account_prices(account1_id: int = 1, account2_id: int = 2):
         console.print("[bold cyan]PRICE COMPARISON RESULTS[/bold cyan]")
         console.print("="*120 + "\n")
         
-        table = Table(title="Bid/Ask Price Comparison", show_header=True, header_style="bold magenta")
+        # Sort results by spread percentage (highest first)
+        # Use Account 1's spread for sorting (or Account 2 if Account 1 has error)
+        def get_sort_key(result):
+            p1 = result["account1"]
+            p2 = result["account2"]
+            
+            # Prioritize errors last (use -1 so they sort to bottom)
+            if "error" in p1 and "error" in p2:
+                return -999.0  # Both errors - sort to bottom
+            elif "error" in p1:
+                return p2.get("spread_pct", -999.0)  # Use account2 spread
+            elif "error" in p2:
+                return p1.get("spread_pct", -999.0)  # Use account1 spread
+            else:
+                # Use max of both accounts' spreads
+                return max(p1.get("spread_pct", 0.0), p2.get("spread_pct", 0.0))
+        
+        results.sort(key=get_sort_key, reverse=True)
+        
+        table = Table(title="Bid/Ask Price Comparison (Sorted by Spread)", show_header=True, header_style="bold magenta")
         table.add_column("Symbol", style="cyan", width=8)
         table.add_column("Account 1\nBid", justify="right", width=12)
         table.add_column("Account 1\nAsk", justify="right", width=12)

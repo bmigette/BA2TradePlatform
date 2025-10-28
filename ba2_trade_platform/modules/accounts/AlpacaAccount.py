@@ -561,66 +561,35 @@ class AlpacaAccount(AccountInterface):
                     client_order_id=trading_order.comment
                 )
             elif order_type_value == CoreOrderType.OCO.value.lower():
-                # OCO (One-Cancels-Other): Both TP and SL in single order
-                # In Alpaca, this is a LIMIT order with order_class=OCO and both take_profit/stop_loss
+                # OCO (One-Cancels-Other): Both TP and SL in one submission
+                # Per Alpaca API: OCO orders don't have limit_price on main order, only in take_profit/stop_loss legs
                 if not trading_order.limit_price:
                     raise ValueError("Limit price (take profit) is required for OCO orders")
                 if not trading_order.stop_price:
                     raise ValueError("Stop price (stop loss) is required for OCO orders")
                 
                 # Round prices using Alpaca pricing rules
-                rounded_limit_price = self._round_price(trading_order.limit_price, trading_order.symbol)
-                rounded_stop_price = self._round_price(trading_order.stop_price, trading_order.symbol)
+                rounded_tp_price = self._round_price(trading_order.limit_price, trading_order.symbol)
+                rounded_sl_stop_price = self._round_price(trading_order.stop_price, trading_order.symbol)
+                # Stop-loss limit price should be slightly worse than stop price to ensure execution
+                rounded_sl_limit_price = self._round_price(
+                    rounded_sl_stop_price * 0.995 if side == OrderSide.SELL else rounded_sl_stop_price * 1.005,
+                    trading_order.symbol
+                )
                 
-                # Determine if this is a profit target (limit > current) or loss limit (limit < current)
-                # For OCO, limit_price is the take profit, so use it as the limit order price
+                # OCO order: MarketOrderRequest (no limit_price) with take_profit and stop_loss legs
                 order_request = LimitOrderRequest(
                     symbol=trading_order.symbol,
                     qty=trading_order.quantity,
                     side=side,
                     time_in_force=time_in_force,
-                    limit_price=rounded_limit_price,
                     order_class=OrderClass.OCO,
-                    take_profit=TakeProfitRequest(limit_price=rounded_limit_price),
-                    stop_loss=StopLossRequest(stop_price=rounded_stop_price),
+                    take_profit=TakeProfitRequest(limit_price=rounded_tp_price),
+                    stop_loss=StopLossRequest(stop_price=rounded_sl_stop_price, limit_price=rounded_sl_limit_price),
                     client_order_id=trading_order.comment
                 )
-                logger.info(f"Submitting OCO order: TP=${rounded_limit_price:.4f}, SL=${rounded_stop_price:.4f}")
+                logger.info(f"Submitting OCO order: TP=${rounded_tp_price:.4f}, SL stop=${rounded_sl_stop_price:.4f} limit=${rounded_sl_limit_price:.4f}")
                 
-            elif order_type_value == CoreOrderType.OTO.value.lower():
-                # OTO (One-Triggers-Other): Only TP or only SL
-                # In Alpaca, this is a LIMIT or STOP order with order_class=OTO
-                if trading_order.limit_price and not trading_order.stop_price:
-                    # TP only - use LIMIT order with take_profit
-                    rounded_limit_price = self._round_price(trading_order.limit_price, trading_order.symbol)
-                    order_request = LimitOrderRequest(
-                        symbol=trading_order.symbol,
-                        qty=trading_order.quantity,
-                        side=side,
-                        time_in_force=time_in_force,
-                        limit_price=rounded_limit_price,
-                        order_class=OrderClass.OTO,
-                        take_profit=TakeProfitRequest(limit_price=rounded_limit_price),
-                        client_order_id=trading_order.comment
-                    )
-                    logger.info(f"Submitting OTO order (TP only): TP=${rounded_limit_price:.4f}")
-                    
-                elif trading_order.stop_price and not trading_order.limit_price:
-                    # SL only - use STOP order with stop_loss
-                    rounded_stop_price = self._round_price(trading_order.stop_price, trading_order.symbol)
-                    order_request = StopOrderRequest(
-                        symbol=trading_order.symbol,
-                        qty=trading_order.quantity,
-                        side=side,
-                        time_in_force=time_in_force,
-                        stop_price=rounded_stop_price,
-                        order_class=OrderClass.OTO,
-                        stop_loss=StopLossRequest(stop_price=rounded_stop_price),
-                        client_order_id=trading_order.comment
-                    )
-                    logger.info(f"Submitting OTO order (SL only): SL=${rounded_stop_price:.4f}")
-                else:
-                    raise ValueError("OTO orders require either limit_price (TP) or stop_price (SL), not both")
             else:
                 raise ValueError(f"Unsupported order type: {trading_order.order_type} (value: {order_type_value})")
             
@@ -916,7 +885,7 @@ class AlpacaAccount(AccountInterface):
         try:
             from alpaca.data.historical import StockHistoricalDataClient
             from alpaca.data.requests import StockLatestQuoteRequest
-            
+            from alpaca.data.enums import DataFeed
             # Create data client for market data
             data_client = StockHistoricalDataClient(
                 api_key=self.settings["api_key"],
@@ -928,7 +897,7 @@ class AlpacaAccount(AccountInterface):
             symbols_list = [symbol_or_symbols] if is_single_symbol else symbol_or_symbols
             
             # Get latest quotes - Alpaca natively supports bulk fetching
-            request = StockLatestQuoteRequest(symbol_or_symbols=symbols_list)
+            request = StockLatestQuoteRequest(symbol_or_symbols=symbols_list, feed=DataFeed.DELAYED_SIP)
             quotes = data_client.get_stock_latest_quote(request)
             
             # Process quotes and calculate prices
@@ -1175,15 +1144,96 @@ class AlpacaAccount(AccountInterface):
                             update_instance(fresh_order)
                             canceled_count += 1
             
+            # Step 5: Check for dependent orders that can now be submitted
+            triggered_count = self._check_and_submit_dependent_orders()
+            
             if heuristic_mapping and mapped_count > 0:
-                logger.info(f"Successfully refreshed orders from Alpaca: {updated_count} updated, {mapped_count} mapped via comment heuristic, {canceled_count} marked as canceled")
+                logger.info(f"Successfully refreshed orders from Alpaca: {updated_count} updated, {mapped_count} mapped via comment heuristic, {canceled_count} marked as canceled, {triggered_count} dependent orders triggered")
             else:
-                logger.info(f"Successfully refreshed orders from Alpaca: {updated_count} updated, {canceled_count} marked as canceled")
+                logger.info(f"Successfully refreshed orders from Alpaca: {updated_count} updated, {canceled_count} marked as canceled, {triggered_count} dependent orders triggered")
             return True
             
         except Exception as e:
             logger.error(f"Error refreshing orders from Alpaca: {e}", exc_info=True)
             return False
+    
+    def _check_and_submit_dependent_orders(self) -> int:
+        """
+        Check for PENDING orders with depends_on_order and submit them if dependency is met.
+        
+        This handles the workflow where:
+        1. Order A is PENDING_CANCEL waiting for cancellation
+        2. Order A transitions to CANCELED
+        3. Order B (depends_on_order=A, status=PENDING) should now be submitted
+        
+        Also handles:
+        - TP/SL orders waiting for entry order to fill
+        - Any order waiting for its parent to reach a specific status
+        
+        Returns:
+            int: Number of dependent orders submitted
+        """
+        try:
+            from sqlmodel import Session, select
+            
+            triggered_count = 0
+            
+            with Session(get_db().bind) as session:
+                # Find all PENDING orders with dependencies
+                dependent_orders = session.exec(
+                    select(TradingOrder).where(
+                        TradingOrder.account_id == self.id,
+                        TradingOrder.status == OrderStatus.PENDING,
+                        TradingOrder.depends_on_order.is_not(None)
+                    )
+                ).all()
+                
+                for order in dependent_orders:
+                    # Get the parent order
+                    parent_order = session.exec(
+                        select(TradingOrder).where(
+                            TradingOrder.id == order.depends_on_order
+                        )
+                    ).first()
+                    
+                    if not parent_order:
+                        logger.warning(f"Order {order.id} depends on non-existent order {order.depends_on_order}")
+                        continue
+                    
+                    # Check if dependency is met
+                    dependency_met = False
+                    if order.depends_order_status_trigger:
+                        # Specific status trigger (e.g., wait for FILLED)
+                        if parent_order.status == order.depends_order_status_trigger:
+                            dependency_met = True
+                            logger.info(f"Order {order.id} dependency met: parent order {parent_order.id} reached status {parent_order.status}")
+                    else:
+                        # Default: wait for any terminal status (FILLED, CANCELED, etc.)
+                        if parent_order.status in OrderStatus.get_terminal_statuses():
+                            dependency_met = True
+                            logger.info(f"Order {order.id} dependency met: parent order {parent_order.id} reached terminal status {parent_order.status}")
+                    
+                    if dependency_met:
+                        # Submit the dependent order
+                        logger.info(f"Submitting dependent order {order.id} (depends on {parent_order.id})")
+                        try:
+                            self.submit_order(order)
+                            triggered_count += 1
+                        except Exception as e:
+                            logger.error(f"Failed to submit dependent order {order.id}: {e}", exc_info=True)
+                            # Mark order as ERROR status
+                            order.status = OrderStatus.ERROR
+                            session.add(order)
+                            session.commit()
+            
+            if triggered_count > 0:
+                logger.info(f"Triggered {triggered_count} dependent orders")
+            
+            return triggered_count
+            
+        except Exception as e:
+            logger.error(f"Error checking dependent orders: {e}", exc_info=True)
+            return 0
 
     def _set_order_tp_impl(self, trading_order: TradingOrder, tp_price: float) -> None:
         """
@@ -1996,12 +2046,17 @@ class AlpacaAccount(AccountInterface):
                     # Entry not sent to broker yet - create/update pending TP order
                     if existing_tp:
                         existing_tp.limit_price = new_tp_price
-                        # Upgrade legacy order types to new OTO/OCO
+                        # Upgrade legacy order types to new SELL_LIMIT/BUY_LIMIT/OCO
                         order_type_value = existing_tp.order_type.value if hasattr(existing_tp.order_type, 'value') else str(existing_tp.order_type)
                         logger.debug(f"TP order {existing_tp.id} (entry unsent) has type: {order_type_value}")
-                        if order_type_value not in ["oto", "oco"]:
+                        if order_type_value not in ["sell_limit", "buy_limit", "oco"]:
                             has_sl = transaction.stop_loss is not None and transaction.stop_loss > 0
-                            existing_tp.order_type = CoreOrderType.OCO if has_sl else CoreOrderType.OTO
+                            if has_sl:
+                                existing_tp.order_type = CoreOrderType.OCO
+                            else:
+                                # Determine correct limit type based on side
+                                tp_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
+                                existing_tp.order_type = CoreOrderType.SELL_LIMIT if tp_side == OrderDirection.SELL else CoreOrderType.BUY_LIMIT
                             logger.info(f"Upgraded TP order {existing_tp.id} from {order_type_value} to {existing_tp.order_type.value}")
                         session.add(existing_tp)
                         session.commit()
@@ -2016,12 +2071,16 @@ class AlpacaAccount(AccountInterface):
                         # Create new pending TP order
                         tp_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
                         tp_comment = self._generate_tpsl_comment("TP", self.id, transaction.id, entry_order.id)
+                        
+                        # Use direction-specific limit type for TP-only orders
+                        order_type = CoreOrderType.SELL_LIMIT if tp_side == OrderDirection.SELL else CoreOrderType.BUY_LIMIT
+                        
                         tp_order = TradingOrder(
                             account_id=self.id,
                             symbol=entry_order.symbol,
                             quantity=entry_order.quantity,
                             side=tp_side,
-                            order_type=CoreOrderType.OTO,  # Will trigger when entry fills
+                            order_type=order_type,
                             limit_price=new_tp_price,
                             transaction_id=transaction.id,
                             status=OrderStatus.PENDING,
@@ -2033,7 +2092,7 @@ class AlpacaAccount(AccountInterface):
                         )
                         session.add(tp_order)
                         session.commit()
-                        logger.info(f"Created pending OTO TP order for transaction {transaction.id}")
+                        logger.info(f"Created pending {order_type.value} TP order for transaction {transaction.id}")
                     
                     return True
                 
@@ -2087,16 +2146,23 @@ class AlpacaAccount(AccountInterface):
         return ((tp_price - entry_order.open_price) / entry_order.open_price) * 100
     
     def _create_broker_tp_order(self, session: Session, transaction: Transaction, entry_order: TradingOrder, tp_price: float) -> bool:
-        """Create new TP order at broker using OCO/OTO"""
+        """Create new TP order at broker using OCO (both TP+SL) or simple limit order (TP only)"""
         try:
             logger.info(f"Creating TP order at broker for transaction {transaction.id}")
             
-            # Determine if we need OCO (both TP and SL) or OTO (only TP)
+            # Determine if we need OCO (both TP and SL) or simple limit order (only TP)
             has_sl = transaction.stop_loss is not None and transaction.stop_loss > 0
-            order_type = CoreOrderType.OCO if has_sl else CoreOrderType.OTO
             
             # Create TP order
             tp_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
+            
+            # Determine order type based on whether we have SL
+            if has_sl:
+                order_type = CoreOrderType.OCO
+            else:
+                # Use direction-specific limit type
+                order_type = CoreOrderType.SELL_LIMIT if tp_side == OrderDirection.SELL else CoreOrderType.BUY_LIMIT
+            
             tp_comment = self._generate_tpsl_comment(
                 "TPSL" if has_sl else "TP",
                 self.id,
@@ -2110,6 +2176,7 @@ class AlpacaAccount(AccountInterface):
                 side=tp_side,
                 order_type=order_type,
                 limit_price=tp_price,
+                stop_price=transaction.stop_loss if has_sl else None,  # Include SL if OCO
                 transaction_id=transaction.id,
                 status=OrderStatus.PENDING,
                 open_type=OrderOpenType.AUTOMATIC,
@@ -2139,19 +2206,33 @@ class AlpacaAccount(AccountInterface):
         """
         Replace existing TP order at broker.
         
-        Handles OTO ↔ OCO transitions based on current transaction state.
+        Handles SELL_LIMIT/BUY_LIMIT ↔ OCO transitions based on current transaction state.
         """
         try:
             logger.info(f"Attempting to replace TP order {existing_tp.id} at broker")
             
-            # Get transaction to check if we need OTO or OCO
+            # Get transaction to check if we need limit or OCO
             transaction = get_instance(Transaction, existing_tp.transaction_id)
             has_sl = transaction.stop_loss is not None and transaction.stop_loss > 0
-            new_order_type = CoreOrderType.OCO if has_sl else CoreOrderType.OTO
             
-            # Check if order type needs to change (OTO ↔ OCO transition)
+            # Determine correct order type
+            if has_sl:
+                new_order_type = CoreOrderType.OCO
+            else:
+                # Use direction-specific limit type
+                new_order_type = CoreOrderType.SELL_LIMIT if existing_tp.side == OrderDirection.SELL else CoreOrderType.BUY_LIMIT
+            
+            # Check if order type needs to change (SELL_LIMIT/BUY_LIMIT ↔ OCO transition)
             old_order_type = existing_tp.order_type.value if hasattr(existing_tp.order_type, 'value') else str(existing_tp.order_type)
-            if old_order_type != new_order_type.value:
+            
+            # Check if we need to change order type (between limit types and OCO, or legacy OTO)
+            type_change_needed = False
+            if has_sl and old_order_type not in ["oco"]:
+                type_change_needed = True
+            elif not has_sl and old_order_type not in ["sell_limit", "buy_limit"]:
+                type_change_needed = True
+            
+            if type_change_needed:
                 logger.info(f"Order type transition detected: {old_order_type} → {new_order_type.value}. Canceling old order and creating new one.")
                 # Can't replace when order type changes - must cancel and create new
                 existing_tp.status = OrderStatus.PENDING_CANCEL
@@ -2282,12 +2363,17 @@ class AlpacaAccount(AccountInterface):
                 if entry_order.status in OrderStatus.get_unsent_statuses():
                     if existing_sl:
                         existing_sl.stop_price = new_sl_price
-                        # Upgrade legacy order types to new OTO/OCO
-                        # Check if order type is not already OTO/OCO (compare values, not enums)
+                        # Upgrade legacy order types to new SELL_STOP/BUY_STOP/OCO
+                        # Check if order type is not already the correct type (compare values, not enums)
                         order_type_value = existing_sl.order_type.value if hasattr(existing_sl.order_type, 'value') else str(existing_sl.order_type)
-                        if order_type_value not in ["oto", "oco"]:
+                        if order_type_value not in ["sell_stop", "buy_stop", "oco"]:
                             has_tp = transaction.take_profit is not None and transaction.take_profit > 0
-                            existing_sl.order_type = CoreOrderType.OCO if has_tp else CoreOrderType.OTO
+                            if has_tp:
+                                existing_sl.order_type = CoreOrderType.OCO
+                            else:
+                                # Determine correct stop type based on side
+                                sl_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
+                                existing_sl.order_type = CoreOrderType.SELL_STOP if sl_side == OrderDirection.SELL else CoreOrderType.BUY_STOP
                             logger.info(f"Upgraded SL order {existing_sl.id} from {order_type_value} to {existing_sl.order_type.value}")
                         session.add(existing_sl)
                         session.commit()
@@ -2301,12 +2387,16 @@ class AlpacaAccount(AccountInterface):
                     else:
                         sl_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
                         sl_comment = self._generate_tpsl_comment("SL", self.id, transaction.id, entry_order.id)
+                        
+                        # Use direction-specific stop type for SL-only orders
+                        order_type = CoreOrderType.SELL_STOP if sl_side == OrderDirection.SELL else CoreOrderType.BUY_STOP
+                        
                         sl_order = TradingOrder(
                             account_id=self.id,
                             symbol=entry_order.symbol,
                             quantity=entry_order.quantity,
                             side=sl_side,
-                            order_type=CoreOrderType.OTO,
+                            order_type=order_type,
                             stop_price=new_sl_price,
                             transaction_id=transaction.id,
                             status=OrderStatus.PENDING,
@@ -2318,7 +2408,7 @@ class AlpacaAccount(AccountInterface):
                         )
                         session.add(sl_order)
                         session.commit()
-                        logger.info(f"Created pending OTO SL order for transaction {transaction.id}")
+                        logger.info(f"Created pending {order_type.value} SL order for transaction {transaction.id}")
                     return True
                 
                 elif entry_order.status in OrderStatus.get_executed_statuses():
@@ -2370,14 +2460,21 @@ class AlpacaAccount(AccountInterface):
         return ((entry_order.open_price - sl_price) / entry_order.open_price) * 100
     
     def _create_broker_sl_order(self, session: Session, transaction: Transaction, entry_order: TradingOrder, sl_price: float) -> bool:
-        """Create new SL order at broker using OCO/OTO"""
+        """Create new SL order at broker using OCO (both TP+SL) or simple stop order (SL only)"""
         try:
             logger.info(f"Creating SL order at broker for transaction {transaction.id}")
             
             has_tp = transaction.take_profit is not None and transaction.take_profit > 0
-            order_type = CoreOrderType.OCO if has_tp else CoreOrderType.OTO
             
             sl_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
+            
+            # Determine order type based on whether we have TP
+            if has_tp:
+                order_type = CoreOrderType.OCO
+            else:
+                # Use direction-specific stop type
+                order_type = CoreOrderType.SELL_STOP if sl_side == OrderDirection.SELL else CoreOrderType.BUY_STOP
+            
             sl_comment = self._generate_tpsl_comment(
                 "TPSL" if has_tp else "SL",
                 self.id,
@@ -2391,6 +2488,7 @@ class AlpacaAccount(AccountInterface):
                 side=sl_side,
                 order_type=order_type,
                 stop_price=sl_price,
+                limit_price=transaction.take_profit if has_tp else None,  # Include TP if OCO
                 transaction_id=transaction.id,
                 status=OrderStatus.PENDING,
                 open_type=OrderOpenType.AUTOMATIC,
@@ -2420,19 +2518,33 @@ class AlpacaAccount(AccountInterface):
         """
         Replace existing SL order at broker.
         
-        Handles OTO ↔ OCO transitions based on current transaction state.
+        Handles SELL_STOP/BUY_STOP ↔ OCO transitions based on current transaction state.
         """
         try:
             logger.info(f"Attempting to replace SL order {existing_sl.id} at broker")
             
-            # Get transaction to check if we need OTO or OCO
+            # Get transaction to check if we need stop or OCO
             transaction = get_instance(Transaction, existing_sl.transaction_id)
             has_tp = transaction.take_profit is not None and transaction.take_profit > 0
-            new_order_type = CoreOrderType.OCO if has_tp else CoreOrderType.OTO
             
-            # Check if order type needs to change (OTO ↔ OCO transition)
+            # Determine correct order type
+            if has_tp:
+                new_order_type = CoreOrderType.OCO
+            else:
+                # Use direction-specific stop type
+                new_order_type = CoreOrderType.SELL_STOP if existing_sl.side == OrderDirection.SELL else CoreOrderType.BUY_STOP
+            
+            # Check if order type needs to change (SELL_STOP/BUY_STOP ↔ OCO transition)
             old_order_type = existing_sl.order_type.value if hasattr(existing_sl.order_type, 'value') else str(existing_sl.order_type)
-            if old_order_type != new_order_type.value:
+            
+            # Check if we need to change order type (between stop types and OCO, or legacy OTO)
+            type_change_needed = False
+            if has_tp and old_order_type not in ["oco"]:
+                type_change_needed = True
+            elif not has_tp and old_order_type not in ["sell_stop", "buy_stop"]:
+                type_change_needed = True
+            
+            if type_change_needed:
                 logger.info(f"Order type transition detected: {old_order_type} → {new_order_type.value}. Canceling old order and creating new one.")
                 # Can't replace when order type changes - must cancel and create new
                 existing_sl.status = OrderStatus.PENDING_CANCEL
