@@ -669,11 +669,11 @@ class OverviewTab:
             try:
                 for account in accounts:
                     # Count orders by status for this account
+                    # ONLY count MARKET orders (entry orders)
                     # EXCLUDE TP/SL orders (OCO, SELL_LIMIT, BUY_LIMIT, SELL_STOP, BUY_STOP)
                     # These are exit orders that don't use buying power
-                    entry_order_types = [OrderType.MARKET, "limit"]
                     
-                    # Open orders = FILLED, NEW, OPEN, ACCEPTED (entry orders only)
+                    # Open orders = FILLED, NEW, OPEN, ACCEPTED (MARKET entry orders only)
                     open_count = session.exec(
                         select(func.count(TradingOrder.id))
                         .where(TradingOrder.account_id == account.id)
@@ -683,23 +683,23 @@ class OverviewTab:
                             OrderStatus.OPEN, 
                             OrderStatus.ACCEPTED
                         ]))
-                        .where(TradingOrder.order_type.in_(entry_order_types))
+                        .where(TradingOrder.order_type == OrderType.MARKET)
                     ).first() or 0
                     
-                    # Pending orders = PENDING, WAITING_TRIGGER (entry orders only)
+                    # Pending orders = PENDING, WAITING_TRIGGER (MARKET entry orders only)
                     pending_count = session.exec(
                         select(func.count(TradingOrder.id))
                         .where(TradingOrder.account_id == account.id)
                         .where(TradingOrder.status.in_([OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER]))
-                        .where(TradingOrder.order_type.in_(entry_order_types))
+                        .where(TradingOrder.order_type == OrderType.MARKET)
                     ).first() or 0
                     
-                    # Error orders (entry orders only)
+                    # Error orders (MARKET entry orders only)
                     error_count = session.exec(
                         select(func.count(TradingOrder.id))
                         .where(TradingOrder.account_id == account.id)
                         .where(TradingOrder.status == OrderStatus.ERROR)
-                        .where(TradingOrder.order_type.in_(entry_order_types))
+                        .where(TradingOrder.order_type == OrderType.MARKET)
                     ).first() or 0
                     
                     # Display account section

@@ -1519,8 +1519,10 @@ class ScheduledJobsTab:
             ui.label('Scheduled Analysis Jobs').classes('text-lg font-bold')
             ui.label('View all scheduled analysis jobs for the current week').classes('text-sm text-gray-600 mb-4')
             
-            # Weekly calendar view
-            self._create_weekly_calendar()
+            # Weekly calendar view (in a container for dynamic refresh)
+            self.calendar_container = ui.column().classes('w-full')
+            with self.calendar_container:
+                self._create_weekly_calendar()
             
             ui.separator().classes('my-4')
             
@@ -1587,6 +1589,10 @@ class ScheduledJobsTab:
         import json
         from ...core.types import AnalysisUseCase
         
+        # Initialize hidden experts state if not exists
+        if not hasattr(self, 'hidden_experts'):
+            self.hidden_experts = set()
+        
         # Get current week (Monday to Sunday)
         today = datetime.now()
         start_of_week = today - timedelta(days=today.weekday())  # Monday
@@ -1610,6 +1616,18 @@ class ScheduledJobsTab:
                 '#ec4899',  # pink
                 '#06b6d4',  # cyan
                 '#f97316',  # orange
+                '#14b8a6',  # teal
+                '#a855f7',  # violet
+                '#f43f5e',  # rose
+                '#84cc16',  # lime
+                '#0ea5e9',  # sky
+                '#f59e0b',  # yellow
+                '#d946ef',  # fuchsia
+                '#22c55e',  # emerald
+                '#fb923c',  # orange-400
+                '#6366f1',  # indigo
+                '#64748b',  # slate
+                '#78716c',  # stone
             ]
             return colors[expert_id % len(colors)]
         
@@ -1734,9 +1752,13 @@ class ScheduledJobsTab:
                                         cell_class += ' bg-blue-50'
                                     
                                     with ui.element('td').classes(cell_class):
-                                        # Collect experts scheduled at this time on this day
+                                        # Collect experts scheduled at this time on this day (filter hidden)
                                         cell_experts = []
                                         for expert_id, expert_data in expert_schedules.items():
+                                            # Skip hidden experts
+                                            if expert_id in self.hidden_experts:
+                                                continue
+                                                
                                             if day_idx in expert_data['days']:
                                                 day_schedule = expert_data['days'][day_idx]
                                                 schedule_types = []
@@ -1776,13 +1798,30 @@ class ScheduledJobsTab:
                 with ui.row().classes('gap-1 items-center'):
                     ui.label('OP = Open Positions').classes('text-xs text-gray-600')
                 
-                # Expert color legend
+                # Expert color legend (clickable to show/hide)
                 ui.label('|').classes('text-xs text-gray-400 mx-1')
-                ui.label('Experts:').classes('text-xs font-bold text-gray-600')
+                ui.label('Experts (click to show/hide):').classes('text-xs font-bold text-gray-600')
+                
+                def toggle_expert(expert_id):
+                    """Toggle expert visibility."""
+                    if expert_id in self.hidden_experts:
+                        self.hidden_experts.remove(expert_id)
+                    else:
+                        self.hidden_experts.add(expert_id)
+                    # Refresh the calendar view
+                    self.calendar_container.clear()
+                    with self.calendar_container:
+                        self._create_weekly_calendar()
+                
                 for expert_id, expert_data in expert_schedules.items():
-                    with ui.row().classes('gap-1 items-center'):
-                        ui.html(f'<div style="width: 12px; height: 12px; border-radius: 50%; background-color: {expert_data["color"]};"></div>', sanitize=False)
-                        ui.label(expert_data['name']).classes('text-xs text-gray-600')
+                    is_hidden = expert_id in self.hidden_experts
+                    with ui.row().classes('gap-1 items-center cursor-pointer hover:bg-gray-100 px-2 py-1 rounded').on('click', lambda e, eid=expert_id: toggle_expert(eid)):
+                        # Color dot with opacity based on visibility
+                        opacity = '0.3' if is_hidden else '1.0'
+                        ui.html(f'<div style="width: 12px; height: 12px; border-radius: 50%; background-color: {expert_data["color"]}; opacity: {opacity};"></div>', sanitize=False)
+                        # Expert name with strikethrough if hidden
+                        text_class = 'text-xs text-gray-400 line-through' if is_hidden else 'text-xs text-gray-600'
+                        ui.label(expert_data['name']).classes(text_class)
 
     def _get_expert_filter_options(self) -> dict:
         """Get expert instance filter options."""
