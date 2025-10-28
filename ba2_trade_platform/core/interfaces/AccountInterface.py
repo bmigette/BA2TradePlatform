@@ -254,29 +254,31 @@ class AccountInterface(ExtendableSettingsInterface):
         result = self._submit_order_impl(trading_order, tp_price=tp_price, sl_price=sl_price)
         
         # Set TP and/or SL if provided and order was successfully submitted
-        # Note: If broker supports bracket orders and both tp_price and sl_price were provided,
-        # the broker already created the TP/SL orders as part of the entry order.
-        # Check if this was a bracket order before creating fallback orders.
-        if result:
-            # Check if broker created bracket orders (indicated by tp_price and sl_price both provided)
-            # For Alpaca, when bracket orders are used, the leg orders are returned in the response
-            # and we should not create fallback orders
-            created_bracket_order = (tp_price and sl_price)
-            
-            if created_bracket_order:
-                logger.info(f"Bracket order created with TP=${tp_price:.2f} and SL=${sl_price:.2f} - skipping fallback orders")
-            elif tp_price and sl_price:
-                # Both TP and SL provided but broker doesn't support bracket orders
-                logger.info(f"Setting TP=${tp_price:.2f} and SL=${sl_price:.2f} for order {result.id}")
-                self.set_order_tp_sl(result, tp_price, sl_price)
-            elif tp_price:
-                # Only TP provided
-                logger.info(f"Setting TP=${tp_price:.2f} for order {result.id}")
-                self.set_order_tp(result, tp_price)
-            elif sl_price:
-                # Only SL provided
-                logger.info(f"Setting SL=${sl_price:.2f} for order {result.id}")
-                self.set_order_sl(result, sl_price)
+        # Use the new adjust methods which create OCO/OTO orders
+        if result and result.transaction_id:
+            transaction = get_instance(Transaction, result.transaction_id)
+            if transaction:
+                if tp_price and sl_price:
+                    # Both TP and SL provided - use adjust_tp_sl for OCO order
+                    logger.info(f"Setting TP=${tp_price:.2f} and SL=${sl_price:.2f} for transaction {transaction.id} (OCO order)")
+                    try:
+                        self.adjust_tp_sl(transaction, tp_price, sl_price)
+                    except NotImplementedError:
+                        logger.warning(f"Broker {self.__class__.__name__} does not implement adjust_tp_sl - TP/SL not set")
+                elif tp_price:
+                    # Only TP provided - use adjust_tp for OTO order
+                    logger.info(f"Setting TP=${tp_price:.2f} for transaction {transaction.id} (OTO order)")
+                    try:
+                        self.adjust_tp(transaction, tp_price)
+                    except NotImplementedError:
+                        logger.warning(f"Broker {self.__class__.__name__} does not implement adjust_tp - TP not set")
+                elif sl_price:
+                    # Only SL provided - use adjust_sl for OTO order
+                    logger.info(f"Setting SL=${sl_price:.2f} for transaction {transaction.id} (OTO order)")
+                    try:
+                        self.adjust_sl(transaction, sl_price)
+                    except NotImplementedError:
+                        logger.warning(f"Broker {self.__class__.__name__} does not implement adjust_sl - SL not set")
         
         return result
     
@@ -1025,6 +1027,86 @@ class AccountInterface(ExtendableSettingsInterface):
         raise NotImplementedError(
             f"Broker {self.__class__.__name__} does not support updating live SL orders. "
             f"Must implement _update_broker_sl_order() to support manual TP/SL updates."
+        )
+    
+    def adjust_tp(self, transaction: Transaction, new_tp_price: float) -> bool:
+        """
+        Adjust take profit for a transaction (generic stub - provider implements logic).
+        
+        This is a stateless operation that should work regardless of current transaction state.
+        The provider implementation determines what action to take based on:
+        - Current transaction status (WAITING, OPENED, etc.)
+        - Existing TP/SL order states (PENDING, ACCEPTED, FILLED, etc.)
+        - Broker capabilities (OCO/OTO support, order modification, etc.)
+        
+        Source of truth: transaction.take_profit is updated first, then orders are adjusted.
+        
+        Args:
+            transaction: Transaction object to adjust TP for
+            new_tp_price: New take profit price
+            
+        Returns:
+            bool: True if adjustment succeeded, False otherwise
+            
+        Raises:
+            NotImplementedError: Provider must implement this method
+        """
+        raise NotImplementedError(
+            f"Broker {self.__class__.__name__} must implement adjust_tp() for TP/SL management."
+        )
+    
+    def adjust_sl(self, transaction: Transaction, new_sl_price: float) -> bool:
+        """
+        Adjust stop loss for a transaction (generic stub - provider implements logic).
+        
+        This is a stateless operation that should work regardless of current transaction state.
+        The provider implementation determines what action to take based on:
+        - Current transaction status (WAITING, OPENED, etc.)
+        - Existing TP/SL order states (PENDING, ACCEPTED, FILLED, etc.)
+        - Broker capabilities (OCO/OTO support, order modification, etc.)
+        
+        Source of truth: transaction.stop_loss is updated first, then orders are adjusted.
+        
+        Args:
+            transaction: Transaction object to adjust SL for
+            new_sl_price: New stop loss price
+            
+        Returns:
+            bool: True if adjustment succeeded, False otherwise
+            
+        Raises:
+            NotImplementedError: Provider must implement this method
+        """
+        raise NotImplementedError(
+            f"Broker {self.__class__.__name__} must implement adjust_sl() for TP/SL management."
+        )
+    
+    def adjust_tp_sl(self, transaction: Transaction, new_tp_price: float, new_sl_price: float) -> bool:
+        """
+        Adjust both take profit and stop loss for a transaction (generic stub - provider implements logic).
+        
+        This is a stateless operation that should work regardless of current transaction state.
+        The provider implementation determines what action to take based on:
+        - Current transaction status (WAITING, OPENED, etc.)
+        - Existing TP/SL order states (PENDING, ACCEPTED, FILLED, etc.)
+        - Broker capabilities (OCO/OTO support, order modification, etc.)
+        
+        Source of truth: transaction.take_profit and transaction.stop_loss are updated first,
+        then orders are adjusted (using OCO if both defined, OTO if only one).
+        
+        Args:
+            transaction: Transaction object to adjust TP/SL for
+            new_tp_price: New take profit price
+            new_sl_price: New stop loss price
+            
+        Returns:
+            bool: True if adjustment succeeded, False otherwise
+            
+        Raises:
+            NotImplementedError: Provider must implement this method
+        """
+        raise NotImplementedError(
+            f"Broker {self.__class__.__name__} must implement adjust_tp_sl() for TP/SL management."
         )
 
     def set_order_tp(self, trading_order: TradingOrder, tp_price: float) -> TradingOrder:

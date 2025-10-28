@@ -2858,9 +2858,15 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
                         elif action_type == "adjust_quantity":
                             summary = f"Adjusted transaction #{parameters.get('transaction_id')} from {result.get('old_quantity')} to {result.get('new_quantity')}"
                         elif action_type == "update_stop_loss":
-                            summary = f"Updated SL for transaction #{parameters.get('transaction_id')} from ${result.get('old_sl_price', 0):.2f} to ${result.get('new_sl_price', 0):.2f}"
+                            old_sl = result.get('old_sl_price')
+                            new_sl = result.get('new_sl_price', 0)
+                            old_sl_str = f"${old_sl:.2f}" if old_sl is not None else "None"
+                            summary = f"Updated SL for transaction #{parameters.get('transaction_id')} from {old_sl_str} to ${new_sl:.2f}"
                         elif action_type == "update_take_profit":
-                            summary = f"Updated TP for transaction #{parameters.get('transaction_id')} from ${result.get('old_tp_price', 0):.2f} to ${result.get('new_tp_price', 0):.2f}"
+                            old_tp = result.get('old_tp_price')
+                            new_tp = result.get('new_tp_price', 0)
+                            old_tp_str = f"${old_tp:.2f}" if old_tp is not None else "None"
+                            summary = f"Updated TP for transaction #{parameters.get('transaction_id')} from {old_tp_str} to ${new_tp:.2f}"
                         else:
                             summary = result.get('message', 'Completed')
                     else:

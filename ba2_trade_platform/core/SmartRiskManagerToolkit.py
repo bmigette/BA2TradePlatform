@@ -1155,10 +1155,10 @@ class SmartRiskManagerToolkit:
                         "new_quantity": new_quantity
                     }
                 
-                if transaction.status != TransactionStatus.OPEN:
+                if transaction.status != TransactionStatus.OPENED:
                     return {
                         "success": False,
-                        "message": f"Transaction {transaction_id} is not open (status: {transaction.status})",
+                        "message": f"Transaction {transaction_id} is not OPENED (status: {transaction.status.value}). Can only adjust quantity for filled positions.",
                         "order_id": None,
                         "old_quantity": transaction.quantity,
                         "new_quantity": new_quantity
@@ -1356,29 +1356,18 @@ class SmartRiskManagerToolkit:
                         "new_sl_price": new_sl_price
                     }
                 
-                # Get transaction direction
+                # Get entry order
                 if not transaction.trading_orders:
                     return {
                         "success": False,
-                        "message": "Transaction has no orders - cannot determine direction",
+                        "message": "Transaction has no orders - cannot update SL",
                         "order_id": None,
                         "old_sl_price": None,
                         "new_sl_price": new_sl_price
                     }
                 
-                entry_direction = transaction.trading_orders[0].side
-                entry_order_id = transaction.trading_orders[0].id
-                
-                # Get existing SL order (SELL_STOP for long, BUY_STOP for short)
-                sl_order_type = OrderType.SELL_STOP if entry_direction == OrderDirection.BUY else OrderType.BUY_STOP
-                sl_order = session.exec(
-                    select(TradingOrder)
-                    .where(TradingOrder.transaction_id == transaction_id)
-                    .where(TradingOrder.order_type == sl_order_type)
-                    .where(TradingOrder.status.not_in(OrderStatus.get_terminal_statuses()))
-                ).first()
-                
-                old_sl_price = sl_order.stop_price if sl_order else None
+                entry_order = transaction.trading_orders[0]
+                old_sl_price = transaction.stop_loss
                 
                 # Validate new SL price
                 current_price = self.account.get_instrument_current_price(transaction.symbol)
@@ -1391,7 +1380,7 @@ class SmartRiskManagerToolkit:
                         "new_sl_price": new_sl_price
                     }
                 
-                if entry_direction == OrderDirection.BUY:
+                if entry_order.side == OrderDirection.BUY:
                     # For long positions, SL must be below current price
                     if new_sl_price >= current_price:
                         return {
@@ -1412,56 +1401,32 @@ class SmartRiskManagerToolkit:
                             "new_sl_price": new_sl_price
                         }
                 
-                # Cancel existing SL order if exists
-                if sl_order:
-                    try:
-                        self.account.cancel_order(sl_order.id)
-                        logger.info(f"Cancelled existing SL order {sl_order.id}")
-                    except Exception as e:
-                        logger.error(f"Failed to cancel existing SL order {sl_order.id}: {e}")
-                        # Continue anyway - try to create new order
-                
-                # Create new SL order
-                sl_direction = OrderDirection.SELL if entry_direction == OrderDirection.BUY else OrderDirection.BUY
-                
-                # Get current position quantity
-                current_qty = transaction.get_current_open_qty()
-                if current_qty <= 0:
+                # Use AccountInterface's adjust_sl method - stateless operation that determines action based on current state
+                try:
+                    success = self.account.adjust_sl(transaction, new_sl_price)
+                    
+                    if success:
+                        logger.info(f"Successfully adjusted stop loss from {old_sl_price} to {new_sl_price}")
+                        return {
+                            "success": True,
+                            "message": f"Successfully adjusted stop loss to {new_sl_price:.2f}",
+                            "order_id": None,  # adjust_sl doesn't return order ID
+                            "old_sl_price": old_sl_price,
+                            "new_sl_price": new_sl_price
+                        }
+                    else:
+                        return {
+                            "success": False,
+                            "message": f"Failed to adjust SL",
+                            "order_id": None,
+                            "old_sl_price": old_sl_price,
+                            "new_sl_price": new_sl_price
+                        }
+                except Exception as e:
+                    logger.error(f"Error calling account.adjust_sl: {e}", exc_info=True)
                     return {
                         "success": False,
-                        "message": f"Transaction has no open quantity",
-                        "order_id": None,
-                        "old_sl_price": old_sl_price,
-                        "new_sl_price": new_sl_price
-                    }
-                
-                sl_order_obj = self._create_trading_order(
-                    symbol=transaction.symbol,
-                    quantity=current_qty,
-                    side=sl_direction,
-                    order_type=sl_order_type,
-                    transaction_id=transaction_id,
-                    stop_price=new_sl_price,
-                    depends_on_order=entry_order_id,
-                    depends_order_status_trigger=OrderStatus.FILLED,
-                    comment=f"Updated SL: {reason}"
-                )
-                
-                submitted_order = self.account.submit_order(sl_order_obj)
-                
-                if submitted_order and submitted_order.id:
-                    logger.info(f"Successfully updated stop loss from {old_sl_price} to {new_sl_price}")
-                    return {
-                        "success": True,
-                        "message": f"Successfully updated stop loss to {new_sl_price:.2f}",
-                        "order_id": submitted_order.id,
-                        "old_sl_price": old_sl_price,
-                        "new_sl_price": new_sl_price
-                    }
-                else:
-                    return {
-                        "success": False,
-                        "message": f"Failed to create new SL order",
+                        "message": f"Error updating SL: {str(e)}",
                         "order_id": None,
                         "old_sl_price": old_sl_price,
                         "new_sl_price": new_sl_price
@@ -1517,29 +1482,18 @@ class SmartRiskManagerToolkit:
                         "new_tp_price": new_tp_price
                     }
                 
-                # Get transaction direction
+                # Get entry order
                 if not transaction.trading_orders:
                     return {
                         "success": False,
-                        "message": "Transaction has no orders - cannot determine direction",
+                        "message": "Transaction has no orders - cannot update TP",
                         "order_id": None,
                         "old_tp_price": None,
                         "new_tp_price": new_tp_price
                     }
                 
-                entry_direction = transaction.trading_orders[0].side
-                entry_order_id = transaction.trading_orders[0].id
-                
-                # Get existing TP order (SELL_LIMIT for long, BUY_LIMIT for short)
-                tp_order_type = OrderType.SELL_LIMIT if entry_direction == OrderDirection.BUY else OrderType.BUY_LIMIT
-                tp_order = session.exec(
-                    select(TradingOrder)
-                    .where(TradingOrder.transaction_id == transaction_id)
-                    .where(TradingOrder.order_type == tp_order_type)
-                    .where(TradingOrder.status.not_in(OrderStatus.get_terminal_statuses()))
-                ).first()
-                
-                old_tp_price = tp_order.limit_price if tp_order else None
+                entry_order = transaction.trading_orders[0]
+                old_tp_price = transaction.take_profit
                 
                 # Validate new TP price
                 current_price = self.account.get_instrument_current_price(transaction.symbol)
@@ -1552,7 +1506,7 @@ class SmartRiskManagerToolkit:
                         "new_tp_price": new_tp_price
                     }
                 
-                if entry_direction == OrderDirection.BUY:
+                if entry_order.side == OrderDirection.BUY:
                     # For long positions, TP must be above current price
                     if new_tp_price <= current_price:
                         return {
@@ -1573,56 +1527,32 @@ class SmartRiskManagerToolkit:
                             "new_tp_price": new_tp_price
                         }
                 
-                # Cancel existing TP order if exists
-                if tp_order:
-                    try:
-                        self.account.cancel_order(tp_order.id)
-                        logger.info(f"Cancelled existing TP order {tp_order.id}")
-                    except Exception as e:
-                        logger.error(f"Failed to cancel existing TP order {tp_order.id}: {e}")
-                        # Continue anyway - try to create new order
-                
-                # Create new TP order
-                tp_direction = OrderDirection.SELL if entry_direction == OrderDirection.BUY else OrderDirection.BUY
-                
-                # Get current position quantity
-                current_qty = transaction.get_current_open_qty()
-                if current_qty <= 0:
+                # Use AccountInterface's adjust_tp method - stateless operation that determines action based on current state
+                try:
+                    success = self.account.adjust_tp(transaction, new_tp_price)
+                    
+                    if success:
+                        logger.info(f"Successfully adjusted take profit from {old_tp_price} to {new_tp_price}")
+                        return {
+                            "success": True,
+                            "message": f"Successfully adjusted take profit to {new_tp_price:.2f}",
+                            "order_id": None,  # adjust_tp doesn't return order ID
+                            "old_tp_price": old_tp_price,
+                            "new_tp_price": new_tp_price
+                        }
+                    else:
+                        return {
+                            "success": False,
+                            "message": f"Failed to adjust TP",
+                            "order_id": None,
+                            "old_tp_price": old_tp_price,
+                            "new_tp_price": new_tp_price
+                        }
+                except Exception as e:
+                    logger.error(f"Error calling account.adjust_tp: {e}", exc_info=True)
                     return {
                         "success": False,
-                        "message": f"Transaction has no open quantity",
-                        "order_id": None,
-                        "old_tp_price": old_tp_price,
-                        "new_tp_price": new_tp_price
-                    }
-                
-                tp_order_obj = self._create_trading_order(
-                    symbol=transaction.symbol,
-                    quantity=current_qty,
-                    side=tp_direction,
-                    order_type=tp_order_type,
-                    transaction_id=transaction_id,
-                    limit_price=new_tp_price,
-                    depends_on_order=entry_order_id,
-                    depends_order_status_trigger=OrderStatus.FILLED,
-                    comment=f"Updated TP: {reason}"
-                )
-                
-                submitted_order = self.account.submit_order(tp_order_obj)
-                
-                if submitted_order and submitted_order.id:
-                    logger.info(f"Successfully updated take profit from {old_tp_price} to {new_tp_price}")
-                    return {
-                        "success": True,
-                        "message": f"Successfully updated take profit to {new_tp_price:.2f}",
-                        "order_id": submitted_order.id,
-                        "old_tp_price": old_tp_price,
-                        "new_tp_price": new_tp_price
-                    }
-                else:
-                    return {
-                        "success": False,
-                        "message": f"Failed to create new TP order",
+                        "message": f"Error updating TP: {str(e)}",
                         "order_id": None,
                         "old_tp_price": old_tp_price,
                         "new_tp_price": new_tp_price
@@ -1934,7 +1864,7 @@ class SmartRiskManagerToolkit:
                     "direction": direction
                 }
             
-            # Use AccountInterface's built-in TP/SL methods (handles broker-specific logic, pending orders, etc.)
+            # Use AccountInterface's built-in TP/SL adjustment methods (stateless, handles all order states)
             tp_created = False
             sl_created = False
             tp_warning = None
@@ -1961,30 +1891,33 @@ class SmartRiskManagerToolkit:
                         sl_valid = False
                         sl_warning = f"SL price {sl_price:.2f} is not above current price {current_price:.2f} for SELL order"
                 
-                # Use AccountInterface methods to set TP/SL (handles pending orders and broker-specific logic)
+                # Get fresh transaction object for adjustment methods
+                with get_db() as session:
+                    transaction = session.get(Transaction, transaction_id)
+                
+                # Use AccountInterface adjustment methods (stateless, transaction-based)
                 try:
                     if tp_price and tp_valid and sl_price and sl_valid:
-                        # Set both TP and SL together (more efficient)
-                        logger.info(f"Setting TP@{tp_price:.2f} and SL@{sl_price:.2f} using account.set_order_tp_sl()")
-                        tp_order, sl_order = self.account.set_order_tp_sl(submitted_order, tp_price, sl_price)
-                        if tp_order:
+                        # Set both TP and SL together
+                        logger.info(f"Adjusting TP to {tp_price:.2f} and SL to {sl_price:.2f} using account.adjust_tp_sl()")
+                        success = self.account.adjust_tp_sl(transaction, tp_price, sl_price)
+                        if success:
                             tp_created = True
-                        if sl_order:
                             sl_created = True
                     elif tp_price and tp_valid:
                         # Set TP only
-                        logger.info(f"Setting TP@{tp_price:.2f} using account.set_order_tp()")
-                        tp_order = self.account.set_order_tp(submitted_order, tp_price)
-                        if tp_order:
+                        logger.info(f"Adjusting TP to {tp_price:.2f} using account.adjust_tp()")
+                        success = self.account.adjust_tp(transaction, tp_price)
+                        if success:
                             tp_created = True
                     elif sl_price and sl_valid:
                         # Set SL only
-                        logger.info(f"Setting SL@{sl_price:.2f} using account.set_order_sl()")
-                        sl_order = self.account.set_order_sl(submitted_order, sl_price)
-                        if sl_order:
+                        logger.info(f"Adjusting SL to {sl_price:.2f} using account.adjust_sl()")
+                        success = self.account.adjust_sl(transaction, sl_price)
+                        if success:
                             sl_created = True
                 except Exception as e:
-                    error_msg = f"Failed to set TP/SL: {str(e)}"
+                    error_msg = f"Failed to adjust TP/SL: {str(e)}"
                     logger.error(error_msg, exc_info=True)
                     if tp_price and not tp_warning:
                         tp_warning = error_msg

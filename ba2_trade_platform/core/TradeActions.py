@@ -766,12 +766,44 @@ class AdjustTakeProfitAction(TradeAction):
                 
                 logger.info(f"TP Calculation COMPLETE for {self.instrument_name} - Final TP Price: ${self.take_profit_price:.2f}")
             
-            # Use account's set_order_tp method to adjust take profit
-            # This method either returns a TradingOrder object or raises an exception
+            # Use account's adjust_tp method to adjust take profit (creates OCO/OTO order)
+            # This method returns a bool indicating success
             try:
-                logger.debug(f"Calling set_order_tp for order {self.existing_order.id} with price ${self.take_profit_price:.2f}")
-                tp_result = self.account.set_order_tp(self.existing_order, self.take_profit_price)
-                logger.info(f"✅ Successfully set take profit for {self.instrument_name}: TP order {tp_result.id if hasattr(tp_result, 'id') else 'unknown'} created/updated")
+                # Get the transaction from the existing order
+                if not self.existing_order.transaction_id:
+                    logger.error(f"Order {self.existing_order.id} has no linked transaction")
+                    return self.create_and_save_action_result(
+                        action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
+                        success=False,
+                        message=f"Order {self.existing_order.id} has no linked transaction",
+                        data={}
+                    )
+                
+                from .models import Transaction
+                from .db import get_instance
+                transaction = get_instance(Transaction, self.existing_order.transaction_id)
+                if not transaction:
+                    logger.error(f"Transaction {self.existing_order.transaction_id} not found")
+                    return self.create_and_save_action_result(
+                        action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
+                        success=False,
+                        message=f"Transaction {self.existing_order.transaction_id} not found",
+                        data={}
+                    )
+                
+                logger.debug(f"Calling adjust_tp for transaction {transaction.id} with price ${self.take_profit_price:.2f}")
+                success = self.account.adjust_tp(transaction, self.take_profit_price)
+                
+                if success:
+                    logger.info(f"✅ Successfully adjusted take profit for {self.instrument_name}: OCO/OTO order created/updated")
+                else:
+                    logger.warning(f"Failed to adjust take profit for {self.instrument_name}")
+                    return self.create_and_save_action_result(
+                        action_type=ExpertActionType.ADJUST_TAKE_PROFIT.value,
+                        success=False,
+                        message=f"Failed to adjust take profit for {self.instrument_name}",
+                        data={"order_id": self.existing_order.id}
+                    )
                 
                 # Store TP percent target in order.data if reference is ORDER_OPEN_PRICE
                 # This allows us to enforce minimum percent during triggered TP/SL
@@ -796,8 +828,8 @@ class AdjustTakeProfitAction(TradeAction):
                     success=True,
                     message=f"Take profit adjusted for {self.instrument_name} to ${self.take_profit_price:.2f}",
                     data={
-                        "order_id": self.existing_order.id, 
-                        "tp_order_id": tp_result.id if hasattr(tp_result, 'id') else None,
+                        "order_id": self.existing_order.id,
+                        "transaction_id": transaction.id,
                         "new_tp_price": self.take_profit_price
                     }
                 )
@@ -1105,12 +1137,44 @@ class AdjustStopLossAction(TradeAction):
                         )
                         self.stop_loss_price = enforced_sl
             
-            # Use account's set_order_sl method to adjust stop loss
-            # This method either returns a TradingOrder object or raises an exception
+            # Use account's adjust_sl method to adjust stop loss (creates OCO/OTO order)
+            # This method returns a bool indicating success
             try:
-                logger.debug(f"Calling set_order_sl for order {self.existing_order.id} with price ${self.stop_loss_price:.2f}")
-                sl_result = self.account.set_order_sl(self.existing_order, self.stop_loss_price)
-                logger.info(f"✅ Successfully set stop loss for {self.instrument_name}: SL order {sl_result.id if hasattr(sl_result, 'id') else 'unknown'} created/updated")
+                # Get the transaction from the existing order
+                if not self.existing_order.transaction_id:
+                    logger.error(f"Order {self.existing_order.id} has no linked transaction")
+                    return self.create_and_save_action_result(
+                        action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
+                        success=False,
+                        message=f"Order {self.existing_order.id} has no linked transaction",
+                        data={}
+                    )
+                
+                from .models import Transaction
+                from .db import get_instance
+                transaction = get_instance(Transaction, self.existing_order.transaction_id)
+                if not transaction:
+                    logger.error(f"Transaction {self.existing_order.transaction_id} not found")
+                    return self.create_and_save_action_result(
+                        action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
+                        success=False,
+                        message=f"Transaction {self.existing_order.transaction_id} not found",
+                        data={}
+                    )
+                
+                logger.debug(f"Calling adjust_sl for transaction {transaction.id} with price ${self.stop_loss_price:.2f}")
+                success = self.account.adjust_sl(transaction, self.stop_loss_price)
+                
+                if success:
+                    logger.info(f"✅ Successfully adjusted stop loss for {self.instrument_name}: OCO/OTO order created/updated")
+                else:
+                    logger.warning(f"Failed to adjust stop loss for {self.instrument_name}")
+                    return self.create_and_save_action_result(
+                        action_type=ExpertActionType.ADJUST_STOP_LOSS.value,
+                        success=False,
+                        message=f"Failed to adjust stop loss for {self.instrument_name}",
+                        data={"order_id": self.existing_order.id}
+                    )
                 
                 # Store SL percent target in order.data if reference is ORDER_OPEN_PRICE
                 # This allows us to enforce minimum percent during triggered TP/SL
@@ -1135,8 +1199,8 @@ class AdjustStopLossAction(TradeAction):
                     success=True,
                     message=f"Stop loss adjusted for {self.instrument_name} to ${self.stop_loss_price:.2f}",
                     data={
-                        "order_id": self.existing_order.id, 
-                        "sl_order_id": sl_result.id if hasattr(sl_result, 'id') else None,
+                        "order_id": self.existing_order.id,
+                        "transaction_id": transaction.id,
                         "new_sl_price": self.stop_loss_price
                     }
                 )

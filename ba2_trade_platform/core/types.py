@@ -164,7 +164,7 @@ class OrderStatus(str, Enum):
         - PENDING_NEW: Order is pending creation
         - WAITING_TRIGGER: Order is waiting for a trigger condition
         - ACCEPTED: Order was accepted but not filled
-        - PENDING_CANCEL: Order is pending cancellation
+        - PENDING_CANCEL: Order is pending cancellation (special: waiting to be cancelled before replacement)
         - PENDING_REPLACE: Order is pending replacement
         - PENDING_REVIEW: Order is pending review
         - ACCEPTED_FOR_BIDDING: Order accepted for bidding
@@ -179,6 +179,7 @@ class OrderStatus(str, Enum):
             cls.OPEN,
             cls.PENDING_NEW,
             cls.ACCEPTED,
+            cls.PENDING_CANCEL,
             cls.PENDING_REPLACE,
             cls.PENDING_REVIEW,
             cls.ACCEPTED_FOR_BIDDING,
@@ -218,6 +219,9 @@ class OrderType(str, Enum):
     BUY_STOP_LIMIT = "buy_stop_limit"
     SELL_STOP_LIMIT = "sell_stop_limit"
     TRAILING_STOP = "trailing_stop"
+    # Triggered order types for TP/SL management
+    OCO = "oco"  # One-Cancels-Other: TP and SL both defined, if one executes the other cancels
+    OTO = "oto"  # One-Triggers-Other: Only TP or SL defined, triggers when parent order executes
 
 class OrderDirection(str, Enum):
     SELL = "SELL"

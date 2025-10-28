@@ -1959,6 +1959,7 @@ class AccountOverviewTab:
             # Define table columns
             columns = [
                 {'name': 'order_id', 'label': 'Order ID', 'field': 'order_id'},
+                {'name': 'created_at', 'label': 'Date', 'field': 'created_at'},
                 {'name': 'account', 'label': 'Account', 'field': 'account'},
                 {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol'},
                 {'name': 'side', 'label': 'Side', 'field': 'side'},
@@ -1968,9 +1969,8 @@ class AccountOverviewTab:
                 {'name': 'limit_price', 'label': 'Limit Price', 'field': 'limit_price'},
                 {'name': 'stop_price', 'label': 'Stop Price', 'field': 'stop_price'},
                 {'name': 'expert', 'label': 'Expert', 'field': 'expert'},
-                {'name': 'comment', 'label': 'Comment', 'field': 'comment'},
-                {'name': 'created_at', 'label': 'Created', 'field': 'created_at'},
                 {'name': 'waited_status', 'label': 'Waited Status', 'field': 'waited_status'},
+                {'name': 'comment', 'label': 'Comment', 'field': 'comment'},
                 {'name': 'actions', 'label': 'Actions', 'field': 'actions'}
             ]
             
@@ -4010,53 +4010,49 @@ class TransactionsTab:
                         except Exception as e:
                             logger.warning(f"Failed to cancel order {order.id}: {e}")
             
-            # Recreate TP/SL orders using the proper AccountInterface methods
+            # Recreate TP/SL orders using the new adjust methods (creates OCO/OTO orders)
             orders_created = []
             
-            # Check if both TP and SL are defined - if so, use set_order_tp_sl for bracket order
+            # Check if both TP and SL are defined - if so, use adjust_tp_sl for OCO order
             has_tp = txn.take_profit and txn.take_profit > 0
             has_sl = txn.stop_loss and txn.stop_loss > 0
             
             if has_tp and has_sl:
-                # Both TP and SL defined - create as bracket order
+                # Both TP and SL defined - create as OCO order
                 try:
-                    tp_order, sl_order = account_inst.set_order_tp_sl(
-                        entry_order, 
-                        txn.take_profit, 
-                        txn.stop_loss
-                    )
-                    if tp_order and sl_order:
+                    success = account_inst.adjust_tp_sl(txn, txn.take_profit, txn.stop_loss)
+                    if success:
                         orders_created.extend(['TP', 'SL'])
                         logger.info(
-                            f"Created TP order {tp_order.id} at ${txn.take_profit:.2f} "
-                            f"and SL order {sl_order.id} at ${txn.stop_loss:.2f} "
+                            f"Created OCO order with TP at ${txn.take_profit:.2f} "
+                            f"and SL at ${txn.stop_loss:.2f} "
                             f"for transaction {transaction_id}"
                         )
-                    elif tp_order:
-                        orders_created.append('TP')
-                        logger.info(f"Created TP order {tp_order.id} at ${txn.take_profit:.2f} for transaction {transaction_id}")
-                    elif sl_order:
-                        orders_created.append('SL')
-                        logger.info(f"Created SL order {sl_order.id} at ${txn.stop_loss:.2f} for transaction {transaction_id}")
+                    else:
+                        logger.warning(f"Failed to create OCO order for transaction {transaction_id}")
                 except Exception as e:
-                    logger.error(f"Failed to create TP/SL bracket orders: {e}", exc_info=True)
+                    logger.error(f"Failed to create TP/SL OCO order: {e}", exc_info=True)
             else:
                 # Only one of TP or SL defined - create separately
                 if has_tp:
                     try:
-                        tp_order = account_inst.set_order_tp(entry_order, txn.take_profit)
-                        if tp_order:
+                        success = account_inst.adjust_tp(txn, txn.take_profit)
+                        if success:
                             orders_created.append('TP')
-                            logger.info(f"Created TP order {tp_order.id} at ${txn.take_profit:.2f} for transaction {transaction_id}")
+                            logger.info(f"Created TP order at ${txn.take_profit:.2f} for transaction {transaction_id}")
+                        else:
+                            logger.warning(f"Failed to create TP order for transaction {transaction_id}")
                     except Exception as e:
                         logger.error(f"Failed to create TP order: {e}", exc_info=True)
                 
                 if has_sl:
                     try:
-                        sl_order = account_inst.set_order_sl(entry_order, txn.stop_loss)
-                        if sl_order:
+                        success = account_inst.adjust_sl(txn, txn.stop_loss)
+                        if success:
                             orders_created.append('SL')
-                            logger.info(f"Created SL order {sl_order.id} at ${txn.stop_loss:.2f} for transaction {transaction_id}")
+                            logger.info(f"Created SL order at ${txn.stop_loss:.2f} for transaction {transaction_id}")
+                        else:
+                            logger.warning(f"Failed to create SL order for transaction {transaction_id}")
                     except Exception as e:
                         logger.error(f"Failed to create SL order: {e}", exc_info=True)
             
@@ -4137,7 +4133,7 @@ class TransactionsTab:
                 ui.notify('No orders linked to this transaction or order account not found', type='negative')
                 return
             
-            # Get account to use set_order_tp/set_order_sl methods
+            # Get account to use adjust_tp/adjust_sl methods
             from ...modules.accounts import get_account_class
             from ...core.models import AccountDefinition
             
@@ -4153,29 +4149,45 @@ class TransactionsTab:
             
             account = account_class(acc_def.id)
             
-            # Update TP if changed
-            if tp_price and tp_price != txn.take_profit:
-                try:
-                    account.set_order_tp(order, tp_price)
-                    ui.notify(f'Take Profit updated to ${tp_price:.2f}', type='positive')
-                except Exception as e:
-                    ui.notify(f'Error updating TP: {str(e)}', type='negative')
-                    logger.error(f"Error updating TP: {e}", exc_info=True)
+            # Use adjust_tp_sl if both changed, otherwise adjust individually
+            tp_changed = tp_price and tp_price != txn.take_profit
+            sl_changed = sl_price and sl_price != txn.stop_loss
             
-            # Update SL if changed and method exists
-            if sl_price and sl_price != txn.stop_loss:
-                if hasattr(account, 'set_order_sl'):
+            if tp_changed and sl_changed:
+                # Both changed - use adjust_tp_sl for OCO order
+                try:
+                    success = account.adjust_tp_sl(txn, tp_price, sl_price)
+                    if success:
+                        ui.notify(f'TP/SL updated to ${tp_price:.2f}/${sl_price:.2f}', type='positive')
+                    else:
+                        ui.notify('Failed to update TP/SL', type='negative')
+                except Exception as e:
+                    ui.notify(f'Error updating TP/SL: {str(e)}', type='negative')
+                    logger.error(f"Error updating TP/SL: {e}", exc_info=True)
+            else:
+                # Update TP if changed
+                if tp_changed:
                     try:
-                        account.set_order_sl(order, sl_price)
-                        ui.notify(f'Stop Loss updated to ${sl_price:.2f}', type='positive')
+                        success = account.adjust_tp(txn, tp_price)
+                        if success:
+                            ui.notify(f'Take Profit updated to ${tp_price:.2f}', type='positive')
+                        else:
+                            ui.notify('Failed to update Take Profit', type='negative')
+                    except Exception as e:
+                        ui.notify(f'Error updating TP: {str(e)}', type='negative')
+                        logger.error(f"Error updating TP: {e}", exc_info=True)
+                
+                # Update SL if changed
+                if sl_changed:
+                    try:
+                        success = account.adjust_sl(txn, sl_price)
+                        if success:
+                            ui.notify(f'Stop Loss updated to ${sl_price:.2f}', type='positive')
+                        else:
+                            ui.notify('Failed to update Stop Loss', type='negative')
                     except Exception as e:
                         ui.notify(f'Error updating SL: {str(e)}', type='negative')
                         logger.error(f"Error updating SL: {e}", exc_info=True)
-                else:
-                    # Manually update transaction if method doesn't exist
-                    txn.stop_loss = sl_price
-                    update_instance(txn)
-                    ui.notify(f'Stop Loss updated to ${sl_price:.2f} (in transaction only)', type='info')
             
             dialog.close()
             self._refresh_transactions()
@@ -4777,134 +4789,20 @@ class TransactionsTab:
                         
                         logger.info(f"[Batch TP] Transaction {txn_id}: found account")
                         
-                        # Check if existing TP order exists
-                        session = get_db()
-                        existing_tp_order = None
+                        # Use adjust_tp() to handle TP adjustment properly (creates OCO/OTO orders)
+                        logger.info(f"[Batch TP] Transaction {txn_id}: calling adjust_tp with price ${new_tp_price:.2f}")
                         try:
-                            # Look for existing limit orders (SELL_LIMIT for long positions, BUY_LIMIT for short)
-                            tp_side = OrderDirection.SELL if current_open_qty > 0 else OrderDirection.BUY
-                            tp_types = [OrderType.SELL_LIMIT, OrderType.BUY_LIMIT]
-                            
-                            statement = select(TradingOrder).where(
-                                TradingOrder.transaction_id == txn_id,
-                                TradingOrder.order_type.in_(tp_types),
-                                TradingOrder.side == tp_side
-                            )
-                            results = session.exec(statement).all()
-                            logger.info(f"[Batch TP] Transaction {txn_id}: found {len(results)} existing TP orders")
-                            # Find the TP order (typically a SELL limit for long positions)
-                            for order in results:
-                                if order.limit_price and order.limit_price > txn.open_price:
-                                    existing_tp_order = order
-                                    logger.info(f"[Batch TP] Transaction {txn_id}: selected TP order {order.alpaca_order_id}")
-                                    break
-                        except Exception as e:
-                            logger.error(f"[Batch TP] Could not check for existing TP order for transaction {txn_id}: {e}", exc_info=True)
-                        finally:
-                            session.close()
-                        
-                        if existing_tp_order:
-                            # Modify existing TP order using Alpaca modify_order
-                            logger.info(f"[Batch TP] Transaction {txn_id}: modifying existing TP order {existing_tp_order.alpaca_order_id}")
-                            try:
-                                from ...core.models import TradingOrder as TO
-                                
-                                # Use the correct OrderType based on side
-                                tp_type = OrderType.SELL_LIMIT if existing_tp_order.side == OrderDirection.SELL else OrderType.BUY_LIMIT
-                                
-                                # Create modified trading order with new limit price
-                                modified_order = TO(
-                                    account_id=expert_instance.account_id,
-                                    symbol=txn.symbol,
-                                    quantity=existing_tp_order.quantity,
-                                    side=existing_tp_order.side,
-                                    order_type=tp_type,
-                                    limit_price=new_tp_price,
-                                    good_for=existing_tp_order.good_for or 'day'
-                                )
-                                
-                                # Use account's modify_order method
-                                result = account.modify_order(existing_tp_order.alpaca_order_id, modified_order)
-                                logger.info(f"[Batch TP] Transaction {txn_id}: modify_order result={result}")
-                                if result:
-                                    existing_tp_order.limit_price = new_tp_price
-                                    update_instance(existing_tp_order)
-                                    
-                                    # Also update the transaction's take_profit field
-                                    txn.take_profit = new_tp_price
-                                    update_instance(txn)
-                                    
-                                    success_count += 1
-                                    existing_tp_modified.append(txn_id)
-                                    logger.info(f"[Batch TP] Transaction {txn_id}: ✓ Successfully modified TP to ${new_tp_price:.2f} and updated transaction TP field")
-                                else:
-                                    failed.append(txn_id)
-                                    logger.error(f"[Batch TP] Transaction {txn_id}: ✗ Failed to modify TP order (modify_order returned falsy)")
-                            except Exception as e:
-                                logger.error(f"[Batch TP] Transaction {txn_id}: ✗ Error modifying TP order: {e}", exc_info=True)
-                                failed.append(txn_id)
-                        else:
-                            # No existing TP order
-                            # If position is already filled (open qty matches entry qty), submit market TP order
-                            # Otherwise, just update the TP field for later order creation
-                            
-                            open_qty = current_open_qty
-                            entry_qty = txn.quantity
-                            logger.info(f"[Batch TP] Transaction {txn_id}: no existing TP order. open_qty={open_qty}, entry_qty={entry_qty}")
-                            
-                            if open_qty > 0 and open_qty == entry_qty:
-                                # Position is filled - submit TP limit order directly to market
-                                logger.info(f"[Batch TP] Transaction {txn_id}: position filled, submitting TP limit order at ${new_tp_price:.2f}")
-                                try:
-                                    # Determine sell side based on position direction
-                                    # If we bought (went long), we sell to take profit
-                                    tp_side = OrderDirection.SELL if entry_qty > 0 else OrderDirection.BUY
-                                    
-                                    # Use the correct OrderType based on side
-                                    tp_type = OrderType.SELL_LIMIT if entry_qty > 0 else OrderType.BUY_LIMIT
-                                    
-                                    # Create and submit TP limit order
-                                    tp_order = TradingOrder(
-                                        account_id=expert_instance.account_id,
-                                        symbol=txn.symbol,
-                                        quantity=open_qty,
-                                        side=tp_side,
-                                        order_type=tp_type,
-                                        limit_price=new_tp_price,
-                                        transaction_id=txn_id,
-                                        good_for='day'
-                                    )
-                                    
-                                    # Submit to market via account
-                                    # Note: account.submit_order() handles database persistence internally
-                                    alpaca_order = account.submit_order(tp_order)
-                                    logger.info(f"[Batch TP] Transaction {txn_id}: submit_order result={alpaca_order is not None}")
-                                    if alpaca_order:
-                                        # Update the transaction's take_profit field
-                                        txn.take_profit = new_tp_price
-                                        update_instance(txn)
-                                        
-                                        success_count += 1
-                                        new_tp_created.append(txn_id)
-                                        logger.info(f"[Batch TP] Transaction {txn_id}: ✓ Successfully submitted TP limit order and updated transaction TP field")
-                                    else:
-                                        failed.append(txn_id)
-                                        logger.error(f"[Batch TP] Transaction {txn_id}: ✗ Failed to submit TP order (submit_order returned None)")
-                                except Exception as e:
-                                    logger.error(f"[Batch TP] Transaction {txn_id}: ✗ Error submitting TP order: {e}", exc_info=True)
-                                    failed.append(txn_id)
+                            success = account.adjust_tp(txn, new_tp_price)
+                            if success:
+                                success_count += 1
+                                existing_tp_modified.append(txn_id)
+                                logger.info(f"[Batch TP] Transaction {txn_id}: ✓ Successfully adjusted TP to ${new_tp_price:.2f}")
                             else:
-                                # Position not yet filled - just update the TP field for later
-                                logger.info(f"[Batch TP] Transaction {txn_id}: position not yet filled, updating TP field to ${new_tp_price:.2f}")
-                                try:
-                                    txn.take_profit = new_tp_price
-                                    update_instance(txn)
-                                    success_count += 1
-                                    new_tp_created.append(txn_id)
-                                    logger.info(f"[Batch TP] Transaction {txn_id}: ✓ Successfully updated TP field")
-                                except Exception as e:
-                                    logger.error(f"[Batch TP] Transaction {txn_id}: ✗ Error updating TP field: {e}", exc_info=True)
-                                    failed.append(txn_id)
+                                failed.append(txn_id)
+                                logger.error(f"[Batch TP] Transaction {txn_id}: ✗ Failed to adjust TP (adjust_tp returned False)")
+                        except Exception as e:
+                            logger.error(f"[Batch TP] Transaction {txn_id}: ✗ Error adjusting TP: {e}", exc_info=True)
+                            failed.append(txn_id)
                     
                     except Exception as e:
                         logger.error(f"Error processing transaction {txn_id}: {e}", exc_info=True)

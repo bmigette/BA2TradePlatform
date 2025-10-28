@@ -9,6 +9,7 @@ alembic
 reportlab
 plotly
 fmpsdk
+ib_async
 
 # TradingAgents Tools
 typing-extensions
