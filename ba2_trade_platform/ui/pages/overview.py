@@ -9,7 +9,7 @@ import json
 
 from ...core.db import get_all_instances, get_db, get_instance, update_instance
 from ...core.models import AccountDefinition, MarketAnalysis, ExpertRecommendation, ExpertInstance, AppSetting, TradingOrder, Transaction
-from ...core.types import MarketAnalysisStatus, OrderRecommendation, OrderStatus, OrderOpenType, CoreOrderType
+from ...core.types import MarketAnalysisStatus, OrderRecommendation, OrderStatus, OrderOpenType, OrderType
 from ...core.utils import get_expert_instance_from_id, get_market_analysis_id_from_order_id, get_account_instance_from_id
 from ...modules.accounts import providers
 from ...logger import logger
@@ -671,7 +671,7 @@ class OverviewTab:
                     # Count orders by status for this account
                     # EXCLUDE TP/SL orders (OCO, SELL_LIMIT, BUY_LIMIT, SELL_STOP, BUY_STOP)
                     # These are exit orders that don't use buying power
-                    entry_order_types = [CoreOrderType.MARKET, "limit"]
+                    entry_order_types = [OrderType.MARKET, "limit"]
                     
                     # Open orders = FILLED, NEW, OPEN, ACCEPTED (entry orders only)
                     open_count = session.exec(
@@ -4236,7 +4236,6 @@ class TransactionsTab:
                 else:
                     # Both deleted - cancel all TP/SL orders
                     from ...core.models import TradingOrder
-                    from ...core.types import OrderStatus, CoreOrderType
                     from sqlmodel import Session, select
                     from ...core.db import get_db
                     try:
@@ -4245,7 +4244,7 @@ class TransactionsTab:
                                 select(TradingOrder).where(
                                     TradingOrder.transaction_id == txn.id,
                                     TradingOrder.status.notin_(OrderStatus.get_terminal_statuses()),
-                                    TradingOrder.order_type.notin_([CoreOrderType.MARKET, "limit"])
+                                    TradingOrder.order_type.notin_([OrderType.MARKET, "limit"])
                                 )
                             ).all()
                             for order in orders:
@@ -4286,7 +4285,6 @@ class TransactionsTab:
                     else:
                         # No SL either - cancel all TP/SL orders
                         from ...core.models import TradingOrder
-                        from ...core.types import OrderStatus, CoreOrderType
                         from sqlmodel import Session, select
                         from ...core.db import get_db
                         try:
@@ -4295,7 +4293,7 @@ class TransactionsTab:
                                     select(TradingOrder).where(
                                         TradingOrder.transaction_id == txn.id,
                                         TradingOrder.status.notin_(OrderStatus.get_terminal_statuses()),
-                                        TradingOrder.order_type.notin_([CoreOrderType.MARKET, "limit"])
+                                        TradingOrder.order_type.notin_([OrderType.MARKET, "limit"])
                                     )
                                 ).all()
                                 for order in orders:
@@ -4336,7 +4334,6 @@ class TransactionsTab:
                     else:
                         # No TP either - cancel all TP/SL orders
                         from ...core.models import TradingOrder
-                        from ...core.types import OrderStatus, CoreOrderType
                         from sqlmodel import Session, select
                         from ...core.db import get_db
                         try:
@@ -4345,7 +4342,7 @@ class TransactionsTab:
                                     select(TradingOrder).where(
                                         TradingOrder.transaction_id == txn.id,
                                         TradingOrder.status.notin_(OrderStatus.get_terminal_statuses()),
-                                        TradingOrder.order_type.notin_([CoreOrderType.MARKET, "limit"])
+                                        TradingOrder.order_type.notin_([OrderType.MARKET, "limit"])
                                     )
                                 ).all()
                                 for order in orders:
