@@ -25,71 +25,36 @@ class BalanceUsagePerExpertChart:
     
     def calculate_expert_balance_usage(self) -> Dict[str, Dict[str, float]]:
         """
-        Calculate balance usage for each expert from transactions.
+        Calculate balance usage for each expert from MARKET orders only.
+        Only MARKET orders use buying power - TP/SL orders are exit orders and should be ignored.
         
         Returns:
             Dict mapping expert names to their balance usage breakdown:
             {
                 'expert_name': {
-                    'pending': float (total value of pending orders),
-                    'filled': float (total value of filled orders)
+                    'pending': float (total value of pending MARKET orders),
+                    'filled': float (total value of filled MARKET orders)
                 }
             }
         """
         balance_usage = {}
         
         with get_db() as session:
+            from ...core.types import TransactionStatus, OrderType
+            from ...core.utils import get_account_instance_from_id
+            
             # Get all transactions with expert_id (both OPENED and WAITING status)
-            from ...core.types import TransactionStatus
-            
-            # First, check all transactions to debug
-            # all_transactions = session.exec(select(Transaction)).all()
-            # logger.info(f"Total transactions in database: {len(all_transactions)}")
-            # 
-            # # Count by status
-            # status_counts = {}
-            # expert_counts = {'with_expert': 0, 'without_expert': 0}
-            # for t in all_transactions:
-            #     status_str = str(t.status)
-            #     status_counts[status_str] = status_counts.get(status_str, 0) + 1
-            #     if t.expert_id:
-            #         expert_counts['with_expert'] += 1
-            #     else:
-            #         expert_counts['without_expert'] += 1
-            # 
-            # logger.info(f"Transaction status breakdown: {status_counts}")
-            # logger.info(f"Expert attribution: {expert_counts}")
-            
-            # Now get the filtered transactions
             transactions = session.exec(
                 select(Transaction)
                 .where(Transaction.expert_id.isnot(None))
                 .where(Transaction.status.in_([TransactionStatus.OPENED, TransactionStatus.WAITING]))
             ).all()
             
-            # logger.info(f"Found {len(transactions)} active transactions with expert attribution (OPENED or WAITING status)")
-            
-            # if len(transactions) == 0:
-            #     # Try without status filter to see if there are ANY transactions with experts
-            #     transactions_any_status = session.exec(
-            #         select(Transaction)
-            #         .where(Transaction.expert_id.isnot(None))
-            #     ).all()
-            #     logger.info(f"Transactions with expert_id (any status): {len(transactions_any_status)}")
-            #     if transactions_any_status:
-            #         for t in transactions_any_status:
-            #             logger.info(f"  - Transaction {t.id}: {t.symbol}, status={t.status}, expert_id={t.expert_id}")
-            
-            # PROACTIVE PRICE CACHING: Prefetch all unique symbols in bulk to populate cache
-            # This reduces API calls from N (one per symbol) to 2 (one bid batch, one ask batch)
+            # Prefetch prices for all symbols in bulk
             if transactions:
                 unique_symbols = list(set(t.symbol for t in transactions))
-                logger.debug(f"Proactively prefetching prices for {len(unique_symbols)} symbols: {unique_symbols}")
                 
-                # Get account interface for bulk price fetching
-                # Use the first transaction's account (assumes all use same account)
                 try:
-                    from ...core.utils import get_account_instance_from_id
                     first_order = session.exec(
                         select(TradingOrder)
                         .where(TradingOrder.transaction_id == transactions[0].id)
@@ -99,19 +64,13 @@ class BalanceUsagePerExpertChart:
                     if first_order and first_order.account_id:
                         account_interface = get_account_instance_from_id(first_order.account_id, session=session)
                         
-                        # Prefetch bid prices (for SELL side positions)
-                        logger.debug(f"Prefetching bid prices for {len(unique_symbols)} symbols")
+                        # Prefetch bid and ask prices
                         account_interface.get_instrument_current_price(unique_symbols, price_type='bid')
-                        
-                        # Prefetch ask prices (for BUY side positions)
-                        logger.debug(f"Prefetching ask prices for {len(unique_symbols)} symbols")
                         account_interface.get_instrument_current_price(unique_symbols, price_type='ask')
-                        
-                        logger.debug(f"Proactive price cache populated for {len(unique_symbols)} symbols")
                 except Exception as e:
                     logger.warning(f"Failed to proactively prefetch prices: {e}")
             
-            # Calculate balance usage for each transaction and group by expert
+            # Calculate balance usage for each transaction by directly querying MARKET orders
             for transaction in transactions:
                 try:
                     # Get expert instance
@@ -130,12 +89,9 @@ class BalanceUsagePerExpertChart:
                             'filled': 0.0
                         }
                     
-                    # Get account interface for market price (needed for pending equity)
+                    # Get account interface for market price
                     account_interface = None
                     try:
-                        from ...core.utils import get_account_instance_from_id
-                        
-                        # Get account from first order of this transaction
                         first_order = session.exec(
                             select(TradingOrder)
                             .where(TradingOrder.transaction_id == transaction.id)
@@ -143,39 +99,55 @@ class BalanceUsagePerExpertChart:
                         ).first()
                         
                         if first_order and first_order.account_id:
-                            # Use cached account instance instead of creating new one
                             account_interface = get_account_instance_from_id(first_order.account_id, session=session)
                     except Exception as e:
                         logger.debug(f"Could not get account interface for transaction {transaction.id}: {e}")
                     
-                    # Calculate filled equity using the new method
-                    filled_equity = transaction.get_current_open_equity(account_interface)
-                    balance_usage[expert_name]['filled'] += filled_equity
+                    # Get market price for value calculation
+                    market_price = None
+                    if account_interface:
+                        try:
+                            market_price = account_interface.get_instrument_current_price(transaction.symbol)
+                        except Exception as e:
+                            logger.debug(f"Could not get market price for {transaction.symbol}: {e}")
                     
-                    # Calculate pending equity using the new method
-                    pending_equity = transaction.get_pending_open_equity(account_interface)
-                    balance_usage[expert_name]['pending'] += pending_equity
+                    if not market_price:
+                        continue
                     
-                    # logger.info(f"Transaction {transaction.id} ({transaction.symbol}): Expert {expert_name}, Filled: ${filled_equity:.2f}, Pending: ${pending_equity:.2f}")
+                    # Get all MARKET orders for this transaction
+                    market_orders = session.exec(
+                        select(TradingOrder)
+                        .where(TradingOrder.transaction_id == transaction.id)
+                        .where(TradingOrder.order_type == OrderType.MARKET)
+                    ).all()
                     
-                    # Debug: Check if there are any orders for this transaction
-                    # order_count = session.exec(
-                    #     select(TradingOrder)
-                    #     .where(TradingOrder.transaction_id == transaction.id)
-                    # ).all()
-                    # logger.debug(f"  - Transaction {transaction.id} has {len(order_count)} orders")
+                    # Calculate pending and filled equity from MARKET orders only
+                    for order in market_orders:
+                        if order.status in OrderStatus.get_unfilled_statuses():
+                            # Unfilled MARKET order - count as pending
+                            remaining_qty = order.quantity
+                            if order.filled_qty:
+                                remaining_qty -= order.filled_qty
+                            
+                            if remaining_qty > 0:
+                                equity = abs(remaining_qty) * market_price
+                                balance_usage[expert_name]['pending'] += equity
+                                
+                        elif order.status in OrderStatus.get_executed_statuses():
+                            # Executed MARKET order - count as filled/used balance
+                            filled_qty = order.filled_qty if order.filled_qty else order.quantity
+                            
+                            if filled_qty > 0:
+                                equity = abs(filled_qty) * market_price
+                                balance_usage[expert_name]['filled'] += equity
+                        # Other statuses (terminal, error, etc.) are not counted
                     
                 except Exception as e:
                     logger.error(f"Error calculating balance usage for transaction {transaction.id}: {e}")
                     continue
             
             # Remove experts with zero balance usage
-            # before_filter_count = len(balance_usage)
             balance_usage = {k: v for k, v in balance_usage.items() if v['pending'] > 0 or v['filled'] > 0}
-            # filtered_count = before_filter_count - len(balance_usage)
-            # 
-            # if filtered_count > 0:
-            #     logger.info(f"Filtered out {filtered_count} experts with zero balance usage")
             
             # Sort by total balance usage (highest to lowest)
             balance_usage = dict(sorted(
@@ -183,8 +155,6 @@ class BalanceUsagePerExpertChart:
                 key=lambda x: x[1]['pending'] + x[1]['filled'],
                 reverse=True
             ))
-            
-            # logger.info(f"Final result: {len(balance_usage)} experts with active balance usage")
         
         return balance_usage
     
