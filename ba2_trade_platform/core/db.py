@@ -665,3 +665,47 @@ def move_rule_down(ruleset_id: int, eventaction_id: int) -> bool:
         except Exception as e:
             logger.error(f"Error moving rule down: {e}", exc_info=True)
             return False
+
+def log_activity(
+    severity: 'ActivityLogSeverity',
+    activity_type: 'ActivityLogType', 
+    description: str,
+    data: dict = None,
+    source_expert_id: int = None,
+    source_account_id: int = None
+) -> int:
+    """
+    Log an activity to the ActivityLog table.
+    
+    Args:
+        severity: ActivityLogSeverity enum value
+        activity_type: ActivityLogType enum value
+        description: Human-readable description
+        data: Optional structured data (will be stored as JSON)
+        source_expert_id: Optional expert instance ID
+        source_account_id: Optional account ID
+        
+    Returns:
+        int: ID of the created activity log entry
+        
+    Example:
+        log_activity(
+            ActivityLogSeverity.SUCCESS,
+            ActivityLogType.TRANSACTION_CREATED,
+            "Opened BUY position for AAPL",
+            data={"symbol": "AAPL", "quantity": 10, "price": 150.25},
+            source_expert_id=42
+        )
+    """
+    from .models import ActivityLog
+    
+    activity = ActivityLog(
+        severity=severity,
+        type=activity_type,
+        description=description,
+        data=data or {},
+        source_expert_id=source_expert_id,
+        source_account_id=source_account_id
+    )
+    
+    return add_instance(activity)

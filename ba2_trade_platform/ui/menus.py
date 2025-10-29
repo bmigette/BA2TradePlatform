@@ -14,6 +14,11 @@ def sidemenu() -> None:
                 ui.icon('analytics')
             with ui.item_section():
                 ui.item_label('Market Analysis')
+        with ui.item(on_click=lambda: ui.navigate.to('/activitymonitor')):
+            with ui.item_section():
+                ui.icon('receipt_long')
+            with ui.item_section():
+                ui.item_label('Activity Monitor')
         with ui.item(on_click=lambda: ui.navigate.to('/settings')).classes('w-full'):
             with ui.item_section():
                 ui.icon('settings')

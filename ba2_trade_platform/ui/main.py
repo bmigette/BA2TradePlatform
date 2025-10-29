@@ -1,6 +1,6 @@
 import logging
 from nicegui import ui, Client, app
-from .pages import overview, settings, marketanalysis, market_analysis_detail, rulesettest, marketanalysishistory, smart_risk_manager_detail
+from .pages import overview, settings, marketanalysis, market_analysis_detail, rulesettest, marketanalysishistory, smart_risk_manager_detail, activity_monitor
 from .layout import layout_render
 from pathlib import Path
 from ..logger import logger
@@ -104,11 +104,40 @@ def smart_risk_manager_detail_page(job_id: int) -> None:
     with layout_render(f'Smart Risk Manager Job #{job_id}'):
         smart_risk_manager_detail.content(job_id)
 
+@ui.page('/activitymonitor')
+def activity_monitor_page() -> None:
+    logger.debug("[ROUTE] /activitymonitor - Loading activity monitor page")
+    with layout_render('Activity Monitor'):
+        activity_monitor.render()
+
 STATICPATH = Path(__file__).parent / 'static'
 FAVICO = (STATICPATH / 'favicon.ico')
 
 # Get HTTP port from config
 from ..config import HTTP_PORT
+
+# Register shutdown handler to log application stop
+def on_shutdown():
+    """Log application shutdown activity."""
+    try:
+        from ..core.db import log_activity
+        from ..core.types import ActivityLogSeverity, ActivityLogType
+        
+        log_activity(
+            severity=ActivityLogSeverity.INFO,
+            activity_type=ActivityLogType.APPLICATION_STATUS_CHANGE,
+            description="BA2 Trade Platform stopped",
+            data={
+                "status": "stopped"
+            },
+            source_expert_id=None,
+            source_account_id=None
+        )
+        logger.info("Application shutdown logged to activity monitor")
+    except Exception as e:
+        logger.warning(f"Failed to log application shutdown activity: {e}")
+
+app.on_shutdown(on_shutdown)
 
 # Configure NiceGUI with increased timeouts
 ui.run(

@@ -356,8 +356,54 @@ class AccountInterface(ExtendableSettingsInterface):
             
             logger.info(f"Created transaction {transaction_id} for order: {trading_order.symbol} {trading_order.side.value} {trading_order.quantity} (expert_id={expert_id})")
             
+            # Log activity
+            try:
+                from ..db import log_activity
+                from ..types import ActivityLogSeverity, ActivityLogType
+                
+                log_activity(
+                    severity=ActivityLogSeverity.SUCCESS,
+                    activity_type=ActivityLogType.TRANSACTION_CREATED,
+                    description=f"Created {trading_order.side.value} transaction for {trading_order.symbol} (quantity: {trading_order.quantity})",
+                    data={
+                        "transaction_id": transaction_id,
+                        "symbol": trading_order.symbol,
+                        "side": trading_order.side.value,
+                        "quantity": trading_order.quantity,
+                        "open_price": current_price,
+                        "order_id": trading_order.id
+                    },
+                    source_expert_id=expert_id,
+                    source_account_id=self.id
+                )
+            except Exception as log_error:
+                logger.warning(f"Failed to log transaction creation activity: {log_error}")
+            
         except Exception as e:
             logger.error(f"Error creating transaction for order: {e}", exc_info=True)
+            
+            # Log activity for transaction creation failure
+            try:
+                from ..db import log_activity
+                from ..types import ActivityLogSeverity, ActivityLogType
+                
+                log_activity(
+                    severity=ActivityLogSeverity.FAILURE,
+                    activity_type=ActivityLogType.TRANSACTION_CREATED,
+                    description=f"Failed to create transaction for {trading_order.symbol}: {str(e)}",
+                    data={
+                        "symbol": trading_order.symbol,
+                        "side": trading_order.side.value,
+                        "quantity": trading_order.quantity,
+                        "order_id": trading_order.id,
+                        "error": str(e)
+                    },
+                    source_expert_id=expert_id if 'expert_id' in locals() else None,
+                    source_account_id=self.id
+                )
+            except Exception as log_error:
+                logger.warning(f"Failed to log transaction creation failure activity: {log_error}")
+            
             raise ValueError(f"Failed to create transaction for order: {e}")
     
     def _ensure_tp_sl_percent_stored(self, tp_or_sl_order: TradingOrder, parent_order: TradingOrder) -> None:
@@ -1222,18 +1268,17 @@ class AccountInterface(ExtendableSettingsInterface):
                         existing_tp_order.data['tp_percent_target'] = round(tp_percent, 2)
                         existing_tp_order.data['tp_reference_price'] = round(trading_order.open_price, 2)
                     
-                    # Check if parent order is now active and TP order is still WAITING_TRIGGER
-                    # If so, update quantity and status to PENDING, then submit immediately
+                    # Check if parent order is now EXECUTED (FILLED/PARTIALLY_FILLED) and TP order is still WAITING_TRIGGER
+                    # If so, submit the TP order immediately to broker
                     should_submit_immediately = (
-                        trading_order.broker_order_id is not None and 
-                        trading_order.status not in OrderStatus.get_terminal_statuses() and
+                        trading_order.status in OrderStatus.get_executed_statuses() and
                         existing_tp_order.status == OrderStatus.WAITING_TRIGGER
                     )
                     
                     if should_submit_immediately:
-                        logger.info(f"Parent order {trading_order.id} is now active at broker, promoting TP order {existing_tp_order.id} from WAITING_TRIGGER to PENDING")
+                        logger.info(f"Parent order {trading_order.id} is now EXECUTED (status: {trading_order.status.value}), submitting TP order {existing_tp_order.id} to broker")
                         existing_tp_order.quantity = trading_order.quantity
-                        existing_tp_order.status = OrderStatus.PENDING
+                        # Don't set to PENDING - submit directly and let submit_order set the status
                     
                     session.add(existing_tp_order)
                     session.commit()
@@ -1278,6 +1323,29 @@ class AccountInterface(ExtendableSettingsInterface):
                         session = Session(get_db().bind)
                     
                     logger.info(f"Successfully updated TP order {tp_order.id} to ${tp_price}")
+                    
+                    # Log activity for TP change
+                    try:
+                        from ..db import log_activity
+                        from ..types import ActivityLogSeverity, ActivityLogType
+                        
+                        log_activity(
+                            severity=ActivityLogSeverity.SUCCESS,
+                            activity_type=ActivityLogType.TRANSACTION_TP_CHANGED,
+                            description=f"Updated TP for {transaction.symbol} transaction #{transaction_id} to ${tp_price:.2f}" + 
+                                       (f" ({tp_percent:.1f}%)" if tp_percent else ""),
+                            data={
+                                "transaction_id": transaction_id,
+                                "symbol": transaction.symbol,
+                                "new_tp": tp_price,
+                                "tp_percent": tp_percent,
+                                "order_id": existing_tp_order.id
+                            },
+                            source_expert_id=transaction.expert_id,
+                            source_account_id=self.id
+                        )
+                    except Exception as log_error:
+                        logger.warning(f"Failed to log TP change activity: {log_error}")
                 else:
                     # Create new TP order
                     if trading_order.side.upper() == "BUY":
@@ -1345,6 +1413,31 @@ class AccountInterface(ExtendableSettingsInterface):
             
         except Exception as e:
             logger.error(f"Error setting take profit for order {trading_order.id if trading_order else 'None'}: {e}", exc_info=True)
+            
+            # Log activity for TP adjustment failure
+            try:
+                from ..db import log_activity
+                from ..types import ActivityLogSeverity, ActivityLogType
+                
+                transaction_id = trading_order.transaction_id if trading_order else None
+                transaction = get_instance(Transaction, transaction_id) if transaction_id else None
+                
+                log_activity(
+                    severity=ActivityLogSeverity.FAILURE,
+                    activity_type=ActivityLogType.TRANSACTION_TP_CHANGED,
+                    description=f"Failed to set TP for {trading_order.symbol if trading_order else 'unknown'}: {str(e)}",
+                    data={
+                        "order_id": trading_order.id if trading_order else None,
+                        "symbol": trading_order.symbol if trading_order else None,
+                        "transaction_id": transaction_id,
+                        "error": str(e)
+                    },
+                    source_expert_id=transaction.expert_id if transaction else None,
+                    source_account_id=self.id
+                )
+            except Exception as log_error:
+                logger.warning(f"Failed to log TP adjustment failure activity: {log_error}")
+            
             raise
 
     def set_order_sl(self, trading_order: TradingOrder, sl_price: float) -> TradingOrder:
@@ -1460,18 +1553,17 @@ class AccountInterface(ExtendableSettingsInterface):
                         existing_sl_order.data['sl_percent_target'] = round(sl_percent, 2)
                         existing_sl_order.data['sl_reference_price'] = round(trading_order.open_price, 2)
                     
-                    # Check if parent order is now FILLED and SL order is still WAITING_TRIGGER
-                    # If so, update quantity and status to PENDING, then submit immediately
-                    # Only submit if parent is FILLED to avoid wash trade errors
+                    # Check if parent order is now EXECUTED (FILLED/PARTIALLY_FILLED) and SL order is still WAITING_TRIGGER
+                    # If so, submit the SL order immediately to broker
                     should_submit_immediately = (
-                        trading_order.status == OrderStatus.FILLED and
+                        trading_order.status in OrderStatus.get_executed_statuses() and
                         existing_sl_order.status == OrderStatus.WAITING_TRIGGER
                     )
                     
                     if should_submit_immediately:
-                        logger.info(f"Parent order {trading_order.id} is now active at broker, promoting SL order {existing_sl_order.id} from WAITING_TRIGGER to PENDING")
+                        logger.info(f"Parent order {trading_order.id} is now EXECUTED (status: {trading_order.status.value}), submitting SL order {existing_sl_order.id} to broker")
                         existing_sl_order.quantity = trading_order.quantity
-                        existing_sl_order.status = OrderStatus.PENDING
+                        # Don't set to PENDING - submit directly and let submit_order set the status
                     
                     session.add(existing_sl_order)
                     session.commit()
@@ -1516,6 +1608,29 @@ class AccountInterface(ExtendableSettingsInterface):
                         session = Session(get_db().bind)
                     
                     logger.info(f"Successfully updated SL order {sl_order.id} to ${sl_price}")
+                    
+                    # Log activity for SL change
+                    try:
+                        from ..db import log_activity
+                        from ..types import ActivityLogSeverity, ActivityLogType
+                        
+                        log_activity(
+                            severity=ActivityLogSeverity.SUCCESS,
+                            activity_type=ActivityLogType.TRANSACTION_SL_CHANGED,
+                            description=f"Updated SL for {transaction.symbol} transaction #{transaction_id} to ${sl_price:.2f}" + 
+                                       (f" ({sl_percent:.1f}%)" if sl_percent else ""),
+                            data={
+                                "transaction_id": transaction_id,
+                                "symbol": transaction.symbol,
+                                "new_sl": sl_price,
+                                "sl_percent": sl_percent,
+                                "order_id": existing_sl_order.id
+                            },
+                            source_expert_id=transaction.expert_id,
+                            source_account_id=self.id
+                        )
+                    except Exception as log_error:
+                        logger.warning(f"Failed to log SL change activity: {log_error}")
                 else:
                     # Create new SL order
                     if trading_order.side.upper() == "BUY":
@@ -1583,6 +1698,31 @@ class AccountInterface(ExtendableSettingsInterface):
             
         except Exception as e:
             logger.error(f"Error setting stop loss for order {trading_order.id if trading_order else 'None'}: {e}", exc_info=True)
+            
+            # Log activity for SL adjustment failure
+            try:
+                from ..db import log_activity
+                from ..types import ActivityLogSeverity, ActivityLogType
+                
+                transaction_id = trading_order.transaction_id if trading_order else None
+                transaction = get_instance(Transaction, transaction_id) if transaction_id else None
+                
+                log_activity(
+                    severity=ActivityLogSeverity.FAILURE,
+                    activity_type=ActivityLogType.TRANSACTION_SL_CHANGED,
+                    description=f"Failed to set SL for {trading_order.symbol if trading_order else 'unknown'}: {str(e)}",
+                    data={
+                        "order_id": trading_order.id if trading_order else None,
+                        "symbol": trading_order.symbol if trading_order else None,
+                        "transaction_id": transaction_id,
+                        "error": str(e)
+                    },
+                    source_expert_id=transaction.expert_id if transaction else None,
+                    source_account_id=self.id
+                )
+            except Exception as log_error:
+                logger.warning(f"Failed to log SL adjustment failure activity: {log_error}")
+            
             raise
 
     @abstractmethod
@@ -2412,6 +2552,40 @@ class AccountInterface(ExtendableSettingsInterface):
                     session.add(transaction)
                     logger.info(f"All orders for transaction {transaction_id} are in terminal status, marking transaction as CLOSED")
                     result['message'] += ' (transaction closed)'
+                    
+                    # Log activity for transaction close
+                    try:
+                        from ..db import log_activity
+                        from ..types import ActivityLogSeverity, ActivityLogType
+                        
+                        # Calculate P&L if available
+                        profit_loss = None
+                        if transaction.close_price and transaction.open_price:
+                            if transaction.quantity > 0:  # Long position
+                                profit_loss = (transaction.close_price - transaction.open_price) * transaction.quantity
+                            else:  # Short position
+                                profit_loss = (transaction.open_price - transaction.close_price) * abs(transaction.quantity)
+                        
+                        log_activity(
+                            severity=ActivityLogSeverity.SUCCESS,
+                            activity_type=ActivityLogType.TRANSACTION_CLOSED,
+                            description=f"Closed {transaction.symbol} transaction #{transaction_id}" + 
+                                       (f" with P&L ${profit_loss:.2f}" if profit_loss is not None else ""),
+                            data={
+                                "transaction_id": transaction_id,
+                                "symbol": transaction.symbol,
+                                "quantity": transaction.quantity,
+                                "open_price": transaction.open_price,
+                                "close_price": transaction.close_price,
+                                "profit_loss": profit_loss,
+                                "open_date": transaction.open_date.isoformat() if transaction.open_date else None,
+                                "close_date": transaction.close_date.isoformat() if transaction.close_date else None
+                            },
+                            source_expert_id=transaction.expert_id,
+                            source_account_id=self.id
+                        )
+                    except Exception as log_error:
+                        logger.warning(f"Failed to log transaction close activity: {log_error}")
                 
                 session.commit()
             
@@ -2420,4 +2594,29 @@ class AccountInterface(ExtendableSettingsInterface):
         except Exception as e:
             logger.error(f"Error closing transaction {transaction_id}: {e}", exc_info=True)
             result['message'] = f'Error: {str(e)}'
+            
+            # Log activity for transaction close failure
+            try:
+                from ..db import log_activity
+                from ..types import ActivityLogSeverity, ActivityLogType
+                
+                transaction = get_instance(Transaction, transaction_id)
+                
+                log_activity(
+                    severity=ActivityLogSeverity.FAILURE,
+                    activity_type=ActivityLogType.TRANSACTION_CLOSED,
+                    description=f"Failed to close transaction #{transaction_id}" + 
+                               (f" ({transaction.symbol})" if transaction else "") + 
+                               f": {str(e)}",
+                    data={
+                        "transaction_id": transaction_id,
+                        "symbol": transaction.symbol if transaction else None,
+                        "error": str(e)
+                    },
+                    source_expert_id=transaction.expert_id if transaction else None,
+                    source_account_id=self.id
+                )
+            except Exception as log_error:
+                logger.warning(f"Failed to log transaction close failure activity: {log_error}")
+            
             return result

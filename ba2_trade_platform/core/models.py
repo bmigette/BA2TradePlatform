@@ -2,7 +2,7 @@ from sqlmodel import Field, Session, SQLModel, Column, Relationship
 from sqlalchemy import String, Float, JSON, UniqueConstraint, Table, Integer, ForeignKey
 from sqlalchemy.orm import relationship
 from typing import Optional, Dict, Any, List
-from .types import InstrumentType, MarketAnalysisStatus, OrderType, OrderRecommendation, OrderStatus, OrderDirection, OrderOpenType, ExpertEventRuleType, AnalysisUseCase, RiskLevel, TimeHorizon, TransactionStatus
+from .types import InstrumentType, MarketAnalysisStatus, OrderType, OrderRecommendation, OrderStatus, OrderDirection, OrderOpenType, ExpertEventRuleType, AnalysisUseCase, RiskLevel, TimeHorizon, TransactionStatus, ActivityLogSeverity, ActivityLogType
 from datetime import datetime as DateTime, timezone
 
 # Association table for many-to-many relationship between Ruleset and EventAction
@@ -594,3 +594,23 @@ class SmartRiskManagerJob(SQLModel, table=True):
     # Status & Error Handling
     status: str = Field(default="RUNNING", description="RUNNING, COMPLETED, FAILED, INTERRUPTED, TIMEOUT")
     error_message: Optional[str] = Field(default=None)
+
+class ActivityLog(SQLModel, table=True):
+    """
+    Comprehensive activity log for tracking all significant system operations.
+    Records transaction lifecycle, TP/SL modifications, risk manager runs, analysis execution, etc.
+    """
+    id: int | None = Field(default=None, primary_key=True)
+    created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), description="When this activity occurred")
+    
+    # Classification
+    severity: ActivityLogSeverity = Field(description="SUCCESS, INFO, WARNING, FAILURE, DEBUG")
+    type: ActivityLogType = Field(description="Type of activity (e.g., TRANSACTION_CREATED, ANALYSIS_COMPLETED)")
+    
+    # Source context
+    source_expert_id: int | None = Field(default=None, foreign_key="expertinstance.id", nullable=True, ondelete="CASCADE", description="Expert that generated this activity (if applicable)")
+    source_account_id: int | None = Field(default=None, foreign_key="accountdefinition.id", nullable=True, ondelete="CASCADE", description="Account associated with this activity (if applicable)")
+    
+    # Content
+    description: str = Field(description="Human-readable description of the activity")
+    data: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict, description="Structured data related to the activity (transaction IDs, prices, recommendations, etc.)")

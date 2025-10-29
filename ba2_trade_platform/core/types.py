@@ -328,6 +328,31 @@ class WorkerTaskStatus(Enum):
     COMPLETED = "completed"
     FAILED = "failed"
 
+class ActivityLogSeverity(str, Enum):
+    """Severity level for activity log entries."""
+    SUCCESS = "success"
+    INFO = "info"
+    WARNING = "warning"
+    FAILURE = "failure"
+    DEBUG = "debug"
+
+class ActivityLogType(str, Enum):
+    """Type of activity being logged."""
+    APPLICATION_STATUS_CHANGE = "application_status_change"
+    TRANSACTION_CREATED = "transaction_created"
+    TRANSACTION_TP_CHANGED = "transaction_tp_changed"
+    TRANSACTION_SL_CHANGED = "transaction_sl_changed"
+    TRANSACTION_CLOSED = "transaction_closed"
+    RISK_MANAGER_RAN = "risk_manager_ran"
+    ANALYSIS_COMPLETED = "analysis_completed"
+    ANALYSIS_FAILED = "analysis_failed"
+    ORDER_SUBMITTED = "order_submitted"
+    ORDER_FILLED = "order_filled"
+    ORDER_CANCELLED = "order_cancelled"
+    ORDER_REJECTED = "order_rejected"
+    EXPERT_RECOMMENDATION = "expert_recommendation"
+    RULE_EXECUTED = "rule_executed"
+
 def get_reference_value_options():
     """Return dictionary of reference value options with user-friendly labels."""
     return {

@@ -100,6 +100,31 @@ def initialize_system():
     initialize_smart_risk_manager_queue()
     
     logger.info("BA2 Trade Platform initialization complete")
+    
+    # Log application startup activity
+    try:
+        from ba2_trade_platform.core.db import log_activity
+        from ba2_trade_platform.core.types import ActivityLogSeverity, ActivityLogType
+        import platform
+        import sys
+        
+        log_activity(
+            severity=ActivityLogSeverity.INFO,
+            activity_type=ActivityLogType.APPLICATION_STATUS_CHANGE,
+            description="BA2 Trade Platform started successfully",
+            data={
+                "status": "started",
+                "python_version": sys.version,
+                "platform": platform.platform(),
+                "database": config.DB_FILE,
+                "port": config.HTTP_PORT
+            },
+            source_expert_id=None,
+            source_account_id=None
+        )
+        logger.info("Application startup logged to activity monitor")
+    except Exception as e:
+        logger.warning(f"Failed to log application startup activity: {e}")
 
 if __name__ in {"__main__", "__mp_main__"}:
     # Parse command-line arguments FIRST, before any imports that trigger initialization
