@@ -604,7 +604,8 @@ class RulesExportImportUI:
         """Perform the actual import."""
         try:
             import_type = data.get('export_type')
-            name_suffix = f" (Imported {datetime.now().strftime('%Y-%m-%d %H:%M')})"
+            # Don't add timestamp suffix - preserve original names, only add -1, -2 for duplicates
+            name_suffix = ""
 
             if import_type == 'ruleset':
                 ruleset_id, warnings = RulesImporter.import_ruleset(data, name_suffix)
