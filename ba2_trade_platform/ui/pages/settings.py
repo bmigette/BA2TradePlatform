@@ -1659,6 +1659,13 @@ class ExpertSettingsTab:
     def _load_expert_instrument_config(self, expert_instance):
         """Load instrument configuration for an existing expert."""
         try:
+            # Check if we have imported instrument configs to use instead
+            if hasattr(self, '_imported_instrument_configs') and self._imported_instrument_configs:
+                if self.instrument_selector:
+                    self.instrument_selector.set_selected_instruments(self._imported_instrument_configs)
+                    logger.info('Loaded imported instrument configurations')
+                return
+            
             # Get the expert instance with appropriate class
             from ...core.utils import get_expert_instance_from_id
             expert = get_expert_instance_from_id(expert_instance.id)
@@ -1953,8 +1960,11 @@ class ExpertSettingsTab:
             if not expert:
                 return
             
+            # Check if we have imported settings to use instead
+            settings_source = self._imported_expert_settings if hasattr(self, '_imported_expert_settings') and self._imported_expert_settings else expert.settings
+            
             # Load execution schedule (entering market)
-            enter_market_schedule = expert.settings.get('execution_schedule_enter_market')
+            enter_market_schedule = settings_source.get('execution_schedule_enter_market')
             if enter_market_schedule:
                 if isinstance(enter_market_schedule, str):
                     import json
@@ -1968,7 +1978,7 @@ class ExpertSettingsTab:
                     self._load_enter_market_schedule_config(enter_market_schedule)
             
             # Load execution schedule (open positions)
-            open_positions_schedule = expert.settings.get('execution_schedule_open_positions')
+            open_positions_schedule = settings_source.get('execution_schedule_open_positions')
             if open_positions_schedule:
                 if isinstance(open_positions_schedule, str):
                     import json
@@ -1982,16 +1992,16 @@ class ExpertSettingsTab:
                     self._load_open_positions_schedule_config(open_positions_schedule)
             
             # Load trading permissions - convert to booleans if they're strings
-            enable_buy = expert.settings.get('enable_buy', True)  # Default to True
-            enable_sell = expert.settings.get('enable_sell', False)  # Default to False
+            enable_buy = settings_source.get('enable_buy', True)  # Default to True
+            enable_sell = settings_source.get('enable_sell', False)  # Default to False
             
             # Handle legacy automatic_trading setting by splitting it into new settings
-            legacy_automatic_trading = expert.settings.get('automatic_trading', None)
-            allow_automated_trade_opening = expert.settings.get('allow_automated_trade_opening', False)
-            allow_automated_trade_modification = expert.settings.get('allow_automated_trade_modification', False)
+            legacy_automatic_trading = settings_source.get('automatic_trading', None)
+            allow_automated_trade_opening = settings_source.get('allow_automated_trade_opening', False)
+            allow_automated_trade_modification = settings_source.get('allow_automated_trade_modification', False)
             
             # If legacy setting exists and new settings don't, migrate the legacy setting
-            if legacy_automatic_trading is not None and 'allow_automated_trade_opening' not in expert.settings and 'allow_automated_trade_modification' not in expert.settings:
+            if legacy_automatic_trading is not None and 'allow_automated_trade_opening' not in settings_source and 'allow_automated_trade_modification' not in settings_source:
                 if isinstance(legacy_automatic_trading, str):
                     legacy_value = legacy_automatic_trading.lower() == 'true'
                 else:
@@ -2019,7 +2029,7 @@ class ExpertSettingsTab:
                 self.allow_automated_trade_modification_checkbox.value = allow_automated_trade_modification
             
             # Load risk management settings
-            max_virtual_equity_per_instrument = expert.settings.get('max_virtual_equity_per_instrument_percent', 10.0)
+            max_virtual_equity_per_instrument = settings_source.get('max_virtual_equity_per_instrument_percent', 10.0)
             if isinstance(max_virtual_equity_per_instrument, str):
                 max_virtual_equity_per_instrument = float(max_virtual_equity_per_instrument)
             
@@ -2027,26 +2037,26 @@ class ExpertSettingsTab:
                 self.max_virtual_equity_per_instrument_input.value = str(max_virtual_equity_per_instrument)
             
             # Load AI model settings
-            risk_manager_model = expert.settings.get('risk_manager_model', 'NagaAI/gpt-5-2025-08-07')
+            risk_manager_model = settings_source.get('risk_manager_model', 'NagaAI/gpt-5-2025-08-07')
             if hasattr(self, 'risk_manager_model_select'):
                 self.risk_manager_model_select.value = risk_manager_model
             
-            dynamic_instrument_selection_model = expert.settings.get('dynamic_instrument_selection_model', 'NagaAI/gpt-5-2025-08-07')
+            dynamic_instrument_selection_model = settings_source.get('dynamic_instrument_selection_model', 'NagaAI/gpt-5-2025-08-07')
             if hasattr(self, 'dynamic_instrument_selection_model_select'):
                 self.dynamic_instrument_selection_model_select.value = dynamic_instrument_selection_model
             
             # Load AI instrument prompt (for dynamic instrument selection)
-            ai_instrument_prompt = expert.settings.get('ai_instrument_prompt')
+            ai_instrument_prompt = settings_source.get('ai_instrument_prompt')
             if ai_instrument_prompt and hasattr(self, 'ai_prompt_textarea'):
                 self.ai_prompt_textarea.value = ai_instrument_prompt
             
             # Load risk manager mode
-            risk_manager_mode = expert.settings.get('risk_manager_mode', 'classic')
+            risk_manager_mode = settings_source.get('risk_manager_mode', 'classic')
             if hasattr(self, 'risk_manager_mode_select'):
                 self.risk_manager_mode_select.value = risk_manager_mode
             
             # Load smart risk manager user instructions
-            smart_risk_manager_user_instructions = expert.settings.get('smart_risk_manager_user_instructions', 'Maximize short term profit with medium risk taking')
+            smart_risk_manager_user_instructions = settings_source.get('smart_risk_manager_user_instructions', 'Maximize short term profit with medium risk taking')
             if hasattr(self, 'smart_risk_manager_user_instructions_input'):
                 self.smart_risk_manager_user_instructions_input.value = smart_risk_manager_user_instructions
             
@@ -2772,12 +2782,20 @@ class ExpertSettingsTab:
                     if expert_instance and 'expert_settings' in import_data and hasattr(self, '_imported_expert_settings'):
                         self._imported_expert_settings = import_data['expert_settings']
                         
-                        # Update UI with imported schedule configurations
+                        # Update UI with imported schedule configurations (only if containers exist)
                         if 'execution_schedule_enter_market' in import_data['expert_settings']:
-                            self._load_enter_market_schedule_config(import_data['expert_settings']['execution_schedule_enter_market'])
+                            if hasattr(self, 'enter_market_times_container') and self.enter_market_times_container is not None:
+                                self._load_enter_market_schedule_config(import_data['expert_settings']['execution_schedule_enter_market'])
+                                logger.info('Loaded enter market schedule from import')
+                            else:
+                                logger.info('Deferred enter market schedule loading (containers not yet created)')
                         
                         if 'execution_schedule_open_positions' in import_data['expert_settings']:
-                            self._load_open_positions_schedule_config(import_data['expert_settings']['execution_schedule_open_positions'])
+                            if hasattr(self, 'open_positions_times_container') and self.open_positions_times_container is not None:
+                                self._load_open_positions_schedule_config(import_data['expert_settings']['execution_schedule_open_positions'])
+                                logger.info('Loaded open positions schedule from import')
+                            else:
+                                logger.info('Deferred open positions schedule loading (containers not yet created)')
                         
                         ui.notify('Expert settings ready to import (will be applied on save)', type='info')
                     
@@ -2794,7 +2812,7 @@ class ExpertSettingsTab:
                         ui.notify('Symbol settings ready to import (will be applied on save)', type='info')
                     
                     # Import instruments
-                    if 'instruments' in import_data and hasattr(self, 'instrument_selector') and self.instrument_selector:
+                    if 'instruments' in import_data:
                         instruments_data = import_data['instruments']
                         instrument_configs = {}
                         for inst_id_str, inst_config in instruments_data.items():
@@ -2802,8 +2820,14 @@ class ExpertSettingsTab:
                                 instrument_configs[int(inst_id_str)] = inst_config
                             except ValueError:
                                 logger.warning(f'Invalid instrument ID: {inst_id_str}')
-                        if self.instrument_selector:
+                        
+                        # Store for later application when selector is created
+                        self._imported_instrument_configs = instrument_configs
+                        
+                        # Apply now if selector exists
+                        if hasattr(self, 'instrument_selector') and self.instrument_selector:
                             self.instrument_selector.set_selected_instruments(instrument_configs)
+                            logger.info('Applied imported instruments to existing selector')
                     
                     ui.notify('✅ Settings imported successfully! Click Save to apply all changes.', type='positive')
                     logger.info(f'Successfully imported expert settings from file')
@@ -3246,6 +3270,11 @@ class ExpertSettingsTab:
                 logger.warning(f'Could not import symbol settings: {e}')
             # Clear imported settings after applying
             self._imported_symbol_settings = None
+        
+        # Clear imported instrument configs after saving (they'll be saved via instrument selector)
+        if hasattr(self, '_imported_instrument_configs') and self._imported_instrument_configs:
+            self._imported_instrument_configs = None
+            logger.debug('Cleared imported instrument configs')
         
         # Save general settings (schedules and trading permissions)
         if hasattr(self, 'enter_market_schedule_days') and hasattr(self, 'enter_market_execution_times'):
