@@ -3,11 +3,13 @@ Utility functions for the BA2 Trade Platform core functionality.
 """
 
 from typing import Optional, List, TYPE_CHECKING
+from datetime import datetime, timezone
 from .db import get_instance, get_db
-from .models import ExpertInstance, TradingOrder, ExpertRecommendation, MarketAnalysis
-from .types import OrderStatus
+from .models import ExpertInstance, TradingOrder, ExpertRecommendation, MarketAnalysis, Transaction
+from .types import OrderStatus, TransactionStatus, ActivityLogSeverity, ActivityLogType
 from ..modules.experts import get_expert_class
 from ..modules.accounts import get_account_class
+from ..logger import logger
 from sqlmodel import Session, select
 
 if TYPE_CHECKING:
@@ -280,3 +282,99 @@ def get_account_instance_from_id(account_id: int, session=None, use_cache: bool 
     else:
         # Create new instance without caching (for special cases)
         return account_class(account_id)
+
+
+def close_transaction_with_logging(
+    transaction: Transaction,
+    account_id: int,
+    close_reason: str,
+    session: Optional[Session] = None,
+    additional_data: Optional[dict] = None
+) -> None:
+    """
+    Close a transaction and log the activity.
+    
+    This centralized function should be used by all code paths that close transactions
+    to ensure consistent activity logging.
+    
+    Args:
+        transaction: The transaction to close
+        account_id: The account ID for activity logging
+        close_reason: Reason for closing (e.g., "tp_sl_filled", "all_orders_terminal", "position_balanced")
+        session: Optional database session (if None, transaction object should be managed externally)
+        additional_data: Optional additional data to include in activity log
+    """
+    try:
+        # Update transaction status
+        transaction.status = TransactionStatus.CLOSED
+        if not transaction.close_date:
+            transaction.close_date = datetime.now(timezone.utc)
+        
+        # Calculate P&L if available
+        profit_loss = None
+        if transaction.close_price and transaction.open_price and transaction.quantity:
+            if transaction.quantity > 0:  # Long position
+                profit_loss = (transaction.close_price - transaction.open_price) * transaction.quantity
+            else:  # Short position
+                profit_loss = (transaction.open_price - transaction.close_price) * abs(transaction.quantity)
+        
+        # Build activity description
+        description = f"Closed {transaction.symbol} transaction #{transaction.id}"
+        
+        # Add close reason to description
+        reason_descriptions = {
+            "tp_sl_filled": "(TP/SL filled)",
+            "all_orders_terminal": "(all orders terminal)",
+            "position_balanced": "(position balanced)",
+            "entry_orders_terminal_no_execution": "(entry orders canceled/rejected)",
+            "entry_orders_terminal_after_opening": "(entry orders terminal)",
+            "manual_close": "(manual close)",
+            "cleanup": "(cleanup)"
+        }
+        
+        if close_reason in reason_descriptions:
+            description += f" {reason_descriptions[close_reason]}"
+        else:
+            description += f" ({close_reason})"
+        
+        # Add P&L to description if available
+        if profit_loss is not None:
+            description += f" with P&L ${profit_loss:.2f}"
+        
+        # Build activity data
+        activity_data = {
+            "transaction_id": transaction.id,
+            "symbol": transaction.symbol,
+            "quantity": transaction.quantity,
+            "open_price": transaction.open_price,
+            "close_price": transaction.close_price,
+            "profit_loss": profit_loss,
+            "close_reason": close_reason
+        }
+        
+        # Merge additional data if provided
+        if additional_data:
+            activity_data.update(additional_data)
+        
+        # Determine severity based on close reason
+        severity = ActivityLogSeverity.SUCCESS
+        if close_reason in ["entry_orders_terminal_no_execution", "entry_orders_terminal_after_opening"]:
+            severity = ActivityLogSeverity.INFO
+        
+        # Log activity
+        from .db import log_activity
+        
+        log_activity(
+            severity=severity,
+            activity_type=ActivityLogType.TRANSACTION_CLOSED,
+            description=description,
+            data=activity_data,
+            source_account_id=account_id,
+            source_expert_id=transaction.expert_id
+        )
+        
+        logger.info(f"Closed transaction {transaction.id} ({transaction.symbol}): {close_reason}")
+        
+    except Exception as e:
+        logger.error(f"Error closing transaction {transaction.id} with logging: {e}", exc_info=True)
+

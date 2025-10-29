@@ -21,7 +21,7 @@ from ...logger import logger
 class ActivityMonitorPage:
     def __init__(self):
         self.refresh_task: Optional[asyncio.Task] = None
-        self.auto_refresh = False
+        self.auto_refresh = True  # Auto-refresh enabled by default
         self.refresh_interval = 5  # seconds
         
         # Filter state
@@ -178,7 +178,7 @@ class ActivityMonitorPage:
             with ui.card().classes("p-4"):
                 ui.label("Auto-Refresh").classes("font-bold")
                 with ui.row().classes("gap-2 items-center"):
-                    self.auto_refresh_switch = ui.switch("Enabled", value=False, on_change=lambda e: self.toggle_auto_refresh(e.value))
+                    self.auto_refresh_switch = ui.switch("Enabled", value=True, on_change=lambda e: self.toggle_auto_refresh(e.value))
                     ui.label("Interval (seconds):")
                     self.refresh_interval_input = ui.input(
                         value=str(self.refresh_interval),
@@ -268,8 +268,12 @@ class ActivityMonitorPage:
                 </q-td>
             ''')
         
-        # Initial load
+        # Initial load and start auto-refresh
         asyncio.create_task(self.refresh_activities())
+        
+        # Start auto-refresh task since it's enabled by default
+        if self.auto_refresh and (not self.refresh_task or self.refresh_task.done()):
+            self.refresh_task = asyncio.create_task(self.auto_refresh_loop())
 
 
 def render():

@@ -2237,25 +2237,30 @@ class AccountInterface(ExtendableSettingsInterface):
                     
                     # OPENED -> CLOSED: If we have a filled closing order (TP/SL)
                     if filled_closing_orders and transaction.status == TransactionStatus.OPENED:
+                        from ..utils import close_transaction_with_logging
+                        close_transaction_with_logging(
+                            transaction=transaction,
+                            account_id=self.id,
+                            close_reason="tp_sl_filled",
+                            session=session
+                        )
                         new_status = TransactionStatus.CLOSED
-                        transaction.close_date = datetime.now(timezone.utc)
-                        
-                        logger.debug(f"Transaction {transaction.id} has filled closing order, marking as CLOSED")
                         has_changes = True
                     
                     # ANY STATUS -> CLOSED: If all orders are in terminal state (canceled, rejected, error, expired, or closed)
                     elif all_orders_terminal and transaction.status != TransactionStatus.CLOSED:
+                        from ..utils import close_transaction_with_logging
+                        close_transaction_with_logging(
+                            transaction=transaction,
+                            account_id=self.id,
+                            close_reason="all_orders_terminal",
+                            session=session
+                        )
                         new_status = TransactionStatus.CLOSED
-                        if not transaction.close_date:
-                            transaction.close_date = datetime.now(timezone.utc)
-                        logger.info(f"Transaction {transaction.id} all orders in terminal state, marking as CLOSED")
                         has_changes = True
                     
                     # OPENED -> CLOSED: If filled buy and sell orders sum to match quantity (position balanced)
                     elif position_balanced and transaction.status != TransactionStatus.CLOSED and (total_filled_buy > 0 or total_filled_sell > 0):
-                        new_status = TransactionStatus.CLOSED
-                        transaction.close_date = datetime.now(timezone.utc)
-                        
                         # Update close_price from the last filled order that closed the position (always update)
                         # Find the last filled order chronologically
                         filled_orders = [o for o in orders if o.status in executed_statuses and o.open_price]
@@ -2268,14 +2273,31 @@ class AccountInterface(ExtendableSettingsInterface):
                                 has_changes = True
                                 logger.debug(f"Transaction {transaction.id} close_price updated to {last_order.open_price} from last filled order {last_order.id}")
                         
-                        logger.info(f"Transaction {transaction.id} filled buy/sell orders balanced (buy={total_filled_buy}, sell={total_filled_sell}), marking as CLOSED")
+                        from ..utils import close_transaction_with_logging
+                        close_transaction_with_logging(
+                            transaction=transaction,
+                            account_id=self.id,
+                            close_reason="position_balanced",
+                            session=session,
+                            additional_data={
+                                "total_filled_buy": total_filled_buy,
+                                "total_filled_sell": total_filled_sell
+                            }
+                        )
+                        new_status = TransactionStatus.CLOSED
                         has_changes = True
                     
                     # WAITING -> CLOSED: If all market entry orders are in terminal state without execution
                     # This handles canceled/rejected/error orders before the transaction ever opened
                     elif all_entry_orders_terminal and transaction.status == TransactionStatus.WAITING and not has_filled_entry_order:
+                        from ..utils import close_transaction_with_logging
+                        close_transaction_with_logging(
+                            transaction=transaction,
+                            account_id=self.id,
+                            close_reason="entry_orders_terminal_no_execution",
+                            session=session
+                        )
                         new_status = TransactionStatus.CLOSED
-                        logger.debug(f"Transaction {transaction.id} all market entry orders terminal without execution, marking as CLOSED")
                         has_changes = True
                     
                     # OPENED -> CLOSED: If all market entry orders are in terminal state after opening
@@ -2284,9 +2306,14 @@ class AccountInterface(ExtendableSettingsInterface):
                         # Only close if we don't have any active TP/SL orders waiting
                         active_dependent_orders = [o for o in dependent_orders if o.status not in terminal_statuses]
                         if not active_dependent_orders:
+                            from ..utils import close_transaction_with_logging
+                            close_transaction_with_logging(
+                                transaction=transaction,
+                                account_id=self.id,
+                                close_reason="entry_orders_terminal_after_opening",
+                                session=session
+                            )
                             new_status = TransactionStatus.CLOSED
-                            transaction.close_date = datetime.now(timezone.utc)
-                            logger.debug(f"Transaction {transaction.id} all market entry orders terminal after opening, marking as CLOSED")
                             has_changes = True
                     
                     # Update transaction status if changed
@@ -2546,46 +2573,19 @@ class AccountInterface(ExtendableSettingsInterface):
                 all_orders_terminal = all(order.status in terminal_statuses for order in all_orders)
                 
                 if all_orders_terminal and transaction.status != TransactionStatus.CLOSED:
-                    transaction.status = TransactionStatus.CLOSED
-                    if not transaction.close_date:
-                        transaction.close_date = datetime.now(timezone.utc)
+                    from ..utils import close_transaction_with_logging
+                    close_transaction_with_logging(
+                        transaction=transaction,
+                        account_id=self.id,
+                        close_reason="manual_close",
+                        session=session,
+                        additional_data={
+                            "open_date": transaction.open_date.isoformat() if transaction.open_date else None,
+                            "close_date": transaction.close_date.isoformat() if transaction.close_date else None
+                        }
+                    )
                     session.add(transaction)
-                    logger.info(f"All orders for transaction {transaction_id} are in terminal status, marking transaction as CLOSED")
                     result['message'] += ' (transaction closed)'
-                    
-                    # Log activity for transaction close
-                    try:
-                        from ..db import log_activity
-                        from ..types import ActivityLogSeverity, ActivityLogType
-                        
-                        # Calculate P&L if available
-                        profit_loss = None
-                        if transaction.close_price and transaction.open_price:
-                            if transaction.quantity > 0:  # Long position
-                                profit_loss = (transaction.close_price - transaction.open_price) * transaction.quantity
-                            else:  # Short position
-                                profit_loss = (transaction.open_price - transaction.close_price) * abs(transaction.quantity)
-                        
-                        log_activity(
-                            severity=ActivityLogSeverity.SUCCESS,
-                            activity_type=ActivityLogType.TRANSACTION_CLOSED,
-                            description=f"Closed {transaction.symbol} transaction #{transaction_id}" + 
-                                       (f" with P&L ${profit_loss:.2f}" if profit_loss is not None else ""),
-                            data={
-                                "transaction_id": transaction_id,
-                                "symbol": transaction.symbol,
-                                "quantity": transaction.quantity,
-                                "open_price": transaction.open_price,
-                                "close_price": transaction.close_price,
-                                "profit_loss": profit_loss,
-                                "open_date": transaction.open_date.isoformat() if transaction.open_date else None,
-                                "close_date": transaction.close_date.isoformat() if transaction.close_date else None
-                            },
-                            source_expert_id=transaction.expert_id,
-                            source_account_id=self.id
-                        )
-                    except Exception as log_error:
-                        logger.warning(f"Failed to log transaction close activity: {log_error}")
                 
                 session.commit()
             

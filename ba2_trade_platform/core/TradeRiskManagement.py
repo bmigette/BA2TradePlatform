@@ -585,10 +585,10 @@ class TradeRiskManagement:
                         # Log the deletion
                         self.logger.info(f"Deleting unfunded order {order.id} ({order.symbol}, {order.side}) - insufficient funds")
                         
-                        # Find and delete any linked orders (waiting_trigger)
+                        # Find and delete any linked orders (orders that depend on this order)
                         if order.id:
                             linked_orders_statement = select(TradingOrder).where(
-                                TradingOrder.waiting_trigger_order_id == order.id
+                                TradingOrder.depends_on_order == order.id
                             )
                             linked_orders = session.exec(linked_orders_statement).all()
                             

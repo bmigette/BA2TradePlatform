@@ -1296,13 +1296,15 @@ class TradeManager:
             with Session(get_db().bind) as session:
                 # CRITICAL: Only clean PENDING and ERROR orders - NOT WAITING_TRIGGER
                 # WAITING_TRIGGER orders are preserved unless their parent order is also being deleted
+                # ALSO: Skip orders that have depends_on_order set (dependent orders like TP/SL)
                 pending_statuses = [OrderStatus.PENDING, OrderStatus.ERROR]
                 statement = select(TradingOrder).where(
-                    TradingOrder.status.in_(pending_statuses)
+                    TradingOrder.status.in_(pending_statuses),
+                    TradingOrder.depends_on_order.is_(None)  # Only delete orders that are NOT dependent on another order
                 )
                 pending_orders = session.exec(statement).all()
                 
-                self.logger.info(f"Found {len(pending_orders)} PENDING/ERROR orders to clean")
+                self.logger.info(f"Found {len(pending_orders)} PENDING/ERROR orders to clean (excluding dependent orders)")
                 
                 # Create a set of order IDs being deleted for quick lookup
                 orders_to_delete_ids = {order.id for order in pending_orders}
@@ -1332,15 +1334,31 @@ class TradeManager:
                     orders_to_delete.append(order)
                 
                 # PHASE 1: Close transactions
+                # CRITICAL: Only close transactions that have NO other active orders
                 for txn_id in transactions_to_close:
                     try:
                         txn = session.get(Transaction, txn_id)
                         if txn:
-                            # Close the transaction
+                            # Check if this transaction has any other orders that are NOT being deleted
+                            other_orders_statement = select(TradingOrder).where(
+                                TradingOrder.transaction_id == txn_id,
+                                TradingOrder.id.not_in(orders_to_delete_ids)
+                            )
+                            other_orders = session.exec(other_orders_statement).all()
+                            
+                            if other_orders:
+                                # Transaction has other active orders - DO NOT CLOSE
+                                self.logger.info(
+                                    f"Preserving transaction {txn_id} - has {len(other_orders)} other orders: "
+                                    f"{[f'{o.id}({o.status.value})' for o in other_orders]}"
+                                )
+                                continue
+                            
+                            # No other orders - safe to close
                             txn.status = TransactionStatus.CLOSED
                             txn.close_date = datetime.now(timezone.utc)
                             session.add(txn)
-                            self.logger.info(f"Marked transaction {txn_id} as CLOSED")
+                            self.logger.info(f"Marked transaction {txn_id} as CLOSED (no remaining orders)")
                             stats['transactions_closed'] += 1
                         else:
                             error_msg = f"Transaction {txn_id} not found"
