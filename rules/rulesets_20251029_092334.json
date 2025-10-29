@@ -1,7 +1,7 @@
 {
   "export_version": "1.0",
   "export_type": "rulesets",
-  "export_timestamp": "2025-10-02T11:11:45.124336",
+  "export_timestamp": "2025-10-29T09:23:34.065524",
   "rulesets": [
     {
       "name": "Medium/Long Term Enter",
@@ -19,16 +19,19 @@
             },
             "trigger_1": {
               "event_type": "expected_profit_target_percent",
-              "operator": ">",
+              "operator": ">=",
               "value": 10.0
             },
             "trigger_2": {
               "event_type": "confidence",
-              "operator": ">",
+              "operator": ">=",
               "value": 70.0
             },
             "trigger_3": {
               "event_type": "long_term"
+            },
+            "trigger_4": {
+              "event_type": "has_no_position"
             }
           },
           "actions": {
@@ -55,16 +58,19 @@
             },
             "trigger_1": {
               "event_type": "expected_profit_target_percent",
-              "operator": ">",
+              "operator": ">=",
               "value": 10.0
             },
             "trigger_2": {
               "event_type": "confidence",
-              "operator": ">",
+              "operator": ">=",
               "value": 70.0
             },
             "trigger_3": {
               "event_type": "medium_term"
+            },
+            "trigger_4": {
+              "event_type": "has_no_position"
             }
           },
           "actions": {
@@ -219,6 +225,9 @@
               "event_type": "confidence",
               "operator": ">",
               "value": 70.0
+            },
+            "trigger_4": {
+              "event_type": "has_no_position"
             }
           },
           "actions": {
@@ -255,6 +264,9 @@
               "event_type": "confidence",
               "operator": ">",
               "value": 70.0
+            },
+            "trigger_4": {
+              "event_type": "has_no_position"
             }
           },
           "actions": {
@@ -395,6 +407,9 @@
               "event_type": "confidence",
               "operator": ">",
               "value": 70.0
+            },
+            "trigger_4": {
+              "event_type": "has_no_position"
             }
           },
           "actions": {
@@ -431,6 +446,9 @@
               "event_type": "confidence",
               "operator": ">",
               "value": 70.0
+            },
+            "trigger_4": {
+              "event_type": "has_no_position"
             }
           },
           "actions": {
@@ -448,20 +466,18 @@
           "order_index": 1
         },
         {
-          "name": "ShortTerm_Is_Positive_0ProfitTarget",
+          "name": "MedTerm_Is_Positive_0ProfitTarget",
           "type": "trading_recommendation_rule",
           "subtype": "enter_market",
           "triggers": {
             "trigger_0": {
-              "event_type": "short_term"
+              "event_type": "medium_term"
             },
             "trigger_1": {
               "event_type": "current_rating_positive"
             },
             "trigger_3": {
-              "event_type": "confidence",
-              "operator": ">",
-              "value": 70.0
+              "event_type": "has_no_position"
             }
           },
           "actions": {
@@ -470,13 +486,190 @@
             },
             "action_1": {
               "action_type": "adjust_take_profit",
-              "value": 0.0,
-              "reference_value": "expert_target_price"
+              "value": 10.0,
+              "reference_value": "current_price"
             }
           },
           "extra_parameters": {},
           "continue_processing": false,
           "order_index": 2
+        }
+      ]
+    },
+    {
+      "name": "Medium/Long Term Enter NoMinProfit",
+      "description": "Buy when market is bullish and no position exists",
+      "type": "trading_recommendation_rule",
+      "subtype": "enter_market",
+      "rules": [
+        {
+          "name": "BUY_Longterm_70pctConfidence_0pctProfit",
+          "type": "trading_recommendation_rule",
+          "subtype": "enter_market",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "bullish"
+            },
+            "trigger_2": {
+              "event_type": "confidence",
+              "operator": ">",
+              "value": 70.0
+            },
+            "trigger_3": {
+              "event_type": "long_term"
+            },
+            "trigger_4": {
+              "event_type": "has_no_position"
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "buy"
+            },
+            "action_1": {
+              "action_type": "adjust_take_profit",
+              "value": 10.0,
+              "reference_value": "current_price"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 0
+        },
+        {
+          "name": "BUY_Medterm_70pctConfidence_0pctProfit",
+          "type": "trading_recommendation_rule",
+          "subtype": "enter_market",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "bullish"
+            },
+            "trigger_2": {
+              "event_type": "confidence",
+              "operator": ">",
+              "value": 70.0
+            },
+            "trigger_3": {
+              "event_type": "medium_term"
+            },
+            "trigger_4": {
+              "event_type": "has_no_position"
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "buy"
+            },
+            "action_1": {
+              "action_type": "adjust_take_profit",
+              "value": 10.0,
+              "reference_value": "order_open_price"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 1
+        }
+      ]
+    },
+    {
+      "name": "QuickEnter",
+      "description": null,
+      "type": "trading_recommendation_rule",
+      "subtype": "enter_market",
+      "rules": [
+        {
+          "name": "QuickBuy",
+          "type": "trading_recommendation_rule",
+          "subtype": "enter_market",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "has_no_position"
+            },
+            "trigger_1": {
+              "event_type": "bullish"
+            },
+            "trigger_2": {
+              "event_type": "confidence",
+              "operator": ">=",
+              "value": 65.0
+            },
+            "trigger_3": {
+              "event_type": "current_rating_positive"
+            },
+            "trigger_4": {
+              "event_type": "expected_profit_target_percent",
+              "operator": ">=",
+              "value": 7.0
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "buy"
+            },
+            "action_1": {
+              "action_type": "adjust_take_profit",
+              "value": 5.0,
+              "reference_value": "current_price"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 0
+        }
+      ]
+    },
+    {
+      "name": "QuickExit",
+      "description": null,
+      "type": "trading_recommendation_rule",
+      "subtype": "open_positions",
+      "rules": [
+        {
+          "name": "QuickExitPositive",
+          "type": "trading_recommendation_rule",
+          "subtype": "open_positions",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "profit_loss_percent",
+              "operator": ">",
+              "value": 0.0
+            },
+            "trigger_1": {
+              "event_type": "current_rating_neutral"
+            },
+            "trigger_2": {
+              "event_type": "current_rating_negative"
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "close"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 0
+        },
+        {
+          "name": "QuickExitNegative",
+          "type": "trading_recommendation_rule",
+          "subtype": "open_positions",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "profit_loss_percent",
+              "operator": ">",
+              "value": -10.0
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "close"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 1
         }
       ]
     }

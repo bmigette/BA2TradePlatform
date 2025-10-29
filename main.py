@@ -1,22 +1,74 @@
 import os
 import warnings
-from ba2_trade_platform.core.db import init_db, get_db
-from ba2_trade_platform.core.WorkerQueue import initialize_worker_queue
-from ba2_trade_platform.core.SmartRiskManagerQueue import initialize_smart_risk_manager_queue
-from ba2_trade_platform.core.JobManager import get_job_manager
-from ba2_trade_platform.logger import logger
-from ba2_trade_platform.config import LOG_FOLDER
+import argparse
 
-# Suppress NiceGUI RuntimeWarning for unawaited coroutines in input.py
-# This is expected behavior in NiceGUI when synchronously updating input values
-warnings.filterwarnings('ignore', message='coroutine.*was never awaited', category=RuntimeWarning, module='nicegui.elements.input')
+def parse_arguments():
+    """Parse command-line arguments for configuration overrides."""
+    # Import config here to get default values, but avoid triggering db initialization
+    import ba2_trade_platform.config as config
+    
+    parser = argparse.ArgumentParser(
+        description='BA2 Trade Platform - Algorithmic Trading Platform',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    parser.add_argument(
+        '--db-file',
+        type=str,
+        default=config.DB_FILE,
+        help='Path to the SQLite database file'
+    )
+    
+    parser.add_argument(
+        '--cache-folder',
+        type=str,
+        default=config.CACHE_FOLDER,
+        help='Path to the cache folder for temporary data'
+    )
+    
+    parser.add_argument(
+        '--log-folder',
+        type=str,
+        default=config.LOG_FOLDER,
+        help='Path to the log folder'
+    )
+    
+    parser.add_argument(
+        '--port',
+        type=int,
+        default=config.HTTP_PORT,
+        help='HTTP port for the web interface'
+    )
+    
+    return parser.parse_args()
 
 def initialize_system():
     """Initialize the system components."""
+    # Import these after config has been updated from command-line args
+    from ba2_trade_platform.core.db import init_db, get_db
+    from ba2_trade_platform.core.WorkerQueue import initialize_worker_queue
+    from ba2_trade_platform.core.SmartRiskManagerQueue import initialize_smart_risk_manager_queue
+    from ba2_trade_platform.core.JobManager import get_job_manager
+    from ba2_trade_platform.logger import logger
+    import ba2_trade_platform.config as config
+    
     logger.info("Initializing BA2 Trade Platform...")
     
     # Create log folder if not exists
-    os.makedirs(LOG_FOLDER, exist_ok=True)
+    os.makedirs(config.LOG_FOLDER, exist_ok=True)
+    
+    # Create cache folder if not exists
+    os.makedirs(config.CACHE_FOLDER, exist_ok=True)
+    
+    # Create database folder if not exists
+    db_dir = os.path.dirname(config.DB_FILE)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+    
+    logger.info(f"Using database file: {config.DB_FILE}")
+    logger.info(f"Using cache folder: {config.CACHE_FOLDER}")
+    logger.info(f"Using log folder: {config.LOG_FOLDER}")
+    logger.info(f"Web interface will start on port: {config.HTTP_PORT}")
     
     # Initialize database
     init_db()
@@ -50,6 +102,20 @@ def initialize_system():
     logger.info("BA2 Trade Platform initialization complete")
 
 if __name__ in {"__main__", "__mp_main__"}:
+    # Parse command-line arguments FIRST, before any imports that trigger initialization
+    args = parse_arguments()
+    
+    # Import config module and update with command-line arguments
+    import ba2_trade_platform.config as config
+    config.DB_FILE = args.db_file
+    config.CACHE_FOLDER = args.cache_folder
+    config.LOG_FOLDER = args.log_folder
+    config.HTTP_PORT = args.port
+    
+    # Suppress NiceGUI RuntimeWarning for unawaited coroutines in input.py
+    # This is expected behavior in NiceGUI when synchronously updating input values
+    warnings.filterwarnings('ignore', message='coroutine.*was never awaited', category=RuntimeWarning, module='nicegui.elements.input')
+    
     initialize_system()
     
     # Start the UI

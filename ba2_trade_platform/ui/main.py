@@ -107,11 +107,15 @@ def smart_risk_manager_detail_page(job_id: int) -> None:
 STATICPATH = Path(__file__).parent / 'static'
 FAVICO = (STATICPATH / 'favicon.ico')
 
+# Get HTTP port from config
+from ..config import HTTP_PORT
+
 # Configure NiceGUI with increased timeouts
 ui.run(
     title="BA2 Trade Platform", 
     reload=False, 
     favicon=FAVICO,
+    port=HTTP_PORT,
     # Increase reconnect timeout (this is the supported parameter in NiceGUI 2.24.1)
     reconnect_timeout=5.0,
     # Increase binding refresh interval to reduce pressure

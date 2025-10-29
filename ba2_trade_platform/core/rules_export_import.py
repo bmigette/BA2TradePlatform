@@ -161,10 +161,29 @@ class RulesImporter:
         try:
             with get_db() as session:
                 ruleset_info = ruleset_data["ruleset"]
+                
+                # Preserve original name, but handle duplicates
+                base_name = ruleset_info['name']
+                final_name = base_name
+                
+                # Check if name already exists
+                counter = 1
+                while True:
+                    existing = session.exec(
+                        select(Ruleset).where(Ruleset.name == final_name)
+                    ).first()
+                    
+                    if not existing:
+                        break
+                    
+                    # Name exists, try with suffix
+                    final_name = f"{base_name}-{counter}"
+                    counter += 1
+                    warnings.append(f"Ruleset name '{base_name}' already exists, renamed to '{final_name}'")
 
-                # Create ruleset
+                # Create ruleset with unique name
                 ruleset = Ruleset(
-                    name=f"{ruleset_info['name']}{name_suffix}",
+                    name=final_name,
                     description=ruleset_info.get('description'),
                     type=ruleset_info.get('type'),
                     subtype=ruleset_info.get('subtype')
@@ -173,12 +192,19 @@ class RulesImporter:
                 session.add(ruleset)
                 session.flush()  # Get the ID
 
+                # Track rules already processed in this import to avoid duplicate warnings
+                processed_rule_ids = set()
+
                 # Import rules and create links
                 for rule_data in ruleset_info["rules"]:
                     rule_id, rule_warnings = RulesImporter._import_rule_to_session(
-                        session, rule_data, name_suffix
+                        session, rule_data, ""  # Don't add suffix to individual rules
                     )
-                    warnings.extend(rule_warnings)
+                    
+                    # Only add warnings for rules we haven't seen yet in this import
+                    if rule_id not in processed_rule_ids:
+                        warnings.extend(rule_warnings)
+                        processed_rule_ids.add(rule_id)
 
                     # Create link
                     link = RulesetEventActionLink(
@@ -201,7 +227,7 @@ class RulesImporter:
         try:
             with get_db() as session:
                 rule_id, warnings = RulesImporter._import_rule_to_session(
-                    session, rule_data["rule"], name_suffix
+                    session, rule_data["rule"], ""  # Don't add suffix
                 )
                 session.commit()
                 return rule_id, warnings
@@ -212,19 +238,75 @@ class RulesImporter:
 
     @staticmethod
     def import_multiple_rulesets(rulesets_data: Dict[str, Any], name_suffix: str = "") -> Tuple[List[int], List[str]]:
-        """Import multiple rulesets. Returns (ruleset_ids, warnings)."""
+        """Import multiple rulesets, reusing rules across rulesets. Returns (ruleset_ids, warnings)."""
         ruleset_ids = []
         all_warnings = []
+        processed_rule_names = {}  # Map rule names to IDs to avoid duplicates across rulesets
 
         try:
-            for ruleset_data in rulesets_data["rulesets"]:
-                ruleset_id, warnings = RulesImporter.import_ruleset(
-                    {"ruleset": ruleset_data}, name_suffix
-                )
-                ruleset_ids.append(ruleset_id)
-                all_warnings.extend(warnings)
+            with get_db() as session:
+                for ruleset_data in rulesets_data["rulesets"]:
+                    ruleset_info = ruleset_data
+                    warnings = []
+                    
+                    # Preserve original name, but handle duplicates
+                    base_name = ruleset_info['name']
+                    final_name = base_name
+                    
+                    # Check if name already exists
+                    counter = 1
+                    while True:
+                        existing = session.exec(
+                            select(Ruleset).where(Ruleset.name == final_name)
+                        ).first()
+                        
+                        if not existing:
+                            break
+                        
+                        # Name exists, try with suffix
+                        final_name = f"{base_name}-{counter}"
+                        counter += 1
+                        warnings.append(f"Ruleset name '{base_name}' already exists, renamed to '{final_name}'")
 
-            return ruleset_ids, all_warnings
+                    # Create ruleset with unique name
+                    ruleset = Ruleset(
+                        name=final_name,
+                        description=ruleset_info.get('description'),
+                        type=ruleset_info.get('type'),
+                        subtype=ruleset_info.get('subtype')
+                    )
+
+                    session.add(ruleset)
+                    session.flush()  # Get the ID
+                    ruleset_ids.append(ruleset.id)
+
+                    # Import rules and create links, reusing rules across rulesets
+                    for rule_data in ruleset_info["rules"]:
+                        rule_name = f"{rule_data['name']}{name_suffix}"
+                        
+                        # Check if we already processed this rule in current import batch
+                        if rule_name in processed_rule_names:
+                            rule_id = processed_rule_names[rule_name]
+                        else:
+                            # Import/reuse rule
+                            rule_id, rule_warnings = RulesImporter._import_rule_to_session(
+                                session, rule_data, name_suffix
+                            )
+                            processed_rule_names[rule_name] = rule_id
+                            warnings.extend(rule_warnings)
+
+                        # Create link
+                        link = RulesetEventActionLink(
+                            ruleset_id=ruleset.id,
+                            eventaction_id=rule_id,
+                            order_index=rule_data.get('order_index', 0)
+                        )
+                        session.add(link)
+                    
+                    all_warnings.extend(warnings)
+
+                session.commit()
+                return ruleset_ids, all_warnings
 
         except Exception as e:
             logger.error(f"Error importing multiple rulesets: {e}", exc_info=True)
@@ -257,17 +339,23 @@ class RulesImporter:
 
         try:
             # Check if rule with same name already exists
-            existing_rule = session.exec(
-                select(EventAction).where(EventAction.name == f"{rule_data['name']}{name_suffix}")
-            ).first()
+            rule_name = f"{rule_data['name']}{name_suffix}"
+            try:
+                existing_rule = session.exec(
+                    select(EventAction).where(EventAction.name == rule_name)
+                ).first()
+            except Exception as e:
+                # Handle corrupted data in database (e.g., invalid enum values from old tests)
+                logger.debug(f"Error checking for existing rule '{rule_name}': {e}")
+                existing_rule = None
 
             if existing_rule:
-                warnings.append(f"Rule '{rule_data['name']}{name_suffix}' already exists, skipping")
+                warnings.append(f"Rule '{rule_name}' already exists, reusing existing rule (ID: {existing_rule.id})")
                 return existing_rule.id, warnings
 
             # Create new rule
             rule = EventAction(
-                name=f"{rule_data['name']}{name_suffix}",
+                name=rule_name,
                 type=rule_data.get('type'),
                 subtype=rule_data.get('subtype'),
                 triggers=rule_data.get('triggers', {}),

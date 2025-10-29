@@ -920,7 +920,16 @@ class AccountDefinitionsTab:
                     if meta["type"] == "str":
                         inp = ui.input(label=display_label, value=value or "").classes('w-full')
                     elif meta["type"] == "bool":
-                        inp = ui.checkbox(text=display_label, value=bool(value) if value is not None else False)
+                        # Proper boolean conversion - handle string "false"/"true" and boolean values
+                        bool_value = False
+                        if value is not None:
+                            if isinstance(value, bool):
+                                bool_value = value
+                            elif isinstance(value, str):
+                                bool_value = value.lower() in ('true', '1', 'yes')
+                            else:
+                                bool_value = bool(value)
+                        inp = ui.checkbox(text=display_label, value=bool_value)
                     else:
                         inp = ui.input(label=display_label, value=value or "").classes('w-full')
                 
@@ -1247,6 +1256,26 @@ class ExpertSettingsTab:
         
         return display_list, name_to_id_map
     
+    def _get_ruleset_id_by_name(self, ruleset_name: str) -> int | None:
+        """Look up a ruleset ID by exact name match.
+        
+        Args:
+            ruleset_name: The exact name of the ruleset to find
+            
+        Returns:
+            The ruleset ID if found, None otherwise
+        """
+        if not ruleset_name:
+            return None
+        
+        from sqlmodel import select
+        session = get_db()
+        statement = select(Ruleset).where(Ruleset.name == ruleset_name)
+        ruleset = session.exec(statement).first()
+        session.close()
+        
+        return ruleset.id if ruleset else None
+    
     def show_dialog(self, expert_instance=None):
         """Show the add/edit expert dialog."""
         logger.debug(f'Showing expert dialog for instance: {expert_instance.id if expert_instance else "new instance"}')
@@ -1257,6 +1286,8 @@ class ExpertSettingsTab:
         # Initialize import attributes
         self._imported_expert_settings = None
         self._imported_symbol_settings = None
+        self._imported_enter_market_ruleset_name = None
+        self._imported_open_positions_ruleset_name = None
         
         is_edit = expert_instance is not None
         
@@ -2640,10 +2671,25 @@ class ExpertSettingsTab:
                     # Export expert settings if editing
                     if expert_instance and (export_expert.value or export_symbols.value):
                         from ...core.utils import get_expert_instance_from_id
+                        from ...core.db import get_instance
+                        from ...core.models import Ruleset
                         expert = get_expert_instance_from_id(expert_instance.id)
                         if expert:
                             if export_expert.value:
                                 export_data['expert_settings'] = dict(expert.settings) if hasattr(expert, 'settings') else {}
+                                
+                                # Export ruleset references by name instead of ID
+                                if expert_instance.enter_market_ruleset_id:
+                                    enter_ruleset = get_instance(Ruleset, expert_instance.enter_market_ruleset_id)
+                                    export_data['enter_market_ruleset_name'] = enter_ruleset.name if enter_ruleset else None
+                                else:
+                                    export_data['enter_market_ruleset_name'] = None
+                                
+                                if expert_instance.open_positions_ruleset_id:
+                                    open_ruleset = get_instance(Ruleset, expert_instance.open_positions_ruleset_id)
+                                    export_data['open_positions_ruleset_name'] = open_ruleset.name if open_ruleset else None
+                                else:
+                                    export_data['open_positions_ruleset_name'] = None
                             
                             if export_symbols.value:
                                 # Export enabled instruments/symbols
@@ -2723,6 +2769,13 @@ class ExpertSettingsTab:
                     if expert_instance and 'expert_settings' in import_data and hasattr(self, '_imported_expert_settings'):
                         self._imported_expert_settings = import_data['expert_settings']
                         ui.notify('Expert settings ready to import (will be applied on save)', type='info')
+                    
+                    # Import ruleset references by name
+                    if expert_instance:
+                        if 'enter_market_ruleset_name' in import_data:
+                            self._imported_enter_market_ruleset_name = import_data['enter_market_ruleset_name']
+                        if 'open_positions_ruleset_name' in import_data:
+                            self._imported_open_positions_ruleset_name = import_data['open_positions_ruleset_name']
                     
                     # Import symbol settings
                     if expert_instance and 'symbol_settings' in import_data and hasattr(self, '_imported_symbol_settings'):
@@ -3039,11 +3092,32 @@ class ExpertSettingsTab:
                 expert_instance.virtual_equity_pct = float(self.virtual_equity_input.value)
                 expert_instance.account_id = account_id
                 
-                # Update ruleset assignments - convert display name to ID
-                if hasattr(self, 'enter_market_ruleset_select') and hasattr(self, 'enter_market_ruleset_map'):
+                # Apply imported ruleset mappings if available
+                if hasattr(self, '_imported_enter_market_ruleset_name') and self._imported_enter_market_ruleset_name is not None:
+                    ruleset_id = self._get_ruleset_id_by_name(self._imported_enter_market_ruleset_name)
+                    if ruleset_id:
+                        expert_instance.enter_market_ruleset_id = ruleset_id
+                        logger.info(f'Mapped imported enter_market ruleset "{self._imported_enter_market_ruleset_name}" to ID {ruleset_id}')
+                    else:
+                        logger.warning(f'Could not find ruleset with name "{self._imported_enter_market_ruleset_name}" for enter_market_ruleset')
+                        expert_instance.enter_market_ruleset_id = None
+                    self._imported_enter_market_ruleset_name = None
+                elif hasattr(self, 'enter_market_ruleset_select') and hasattr(self, 'enter_market_ruleset_map'):
+                    # Use normal UI selection
                     selected_display_name = self.enter_market_ruleset_select.value
                     expert_instance.enter_market_ruleset_id = self.enter_market_ruleset_map.get(selected_display_name)
-                if hasattr(self, 'open_positions_ruleset_select') and hasattr(self, 'open_positions_ruleset_map'):
+                
+                if hasattr(self, '_imported_open_positions_ruleset_name') and self._imported_open_positions_ruleset_name is not None:
+                    ruleset_id = self._get_ruleset_id_by_name(self._imported_open_positions_ruleset_name)
+                    if ruleset_id:
+                        expert_instance.open_positions_ruleset_id = ruleset_id
+                        logger.info(f'Mapped imported open_positions ruleset "{self._imported_open_positions_ruleset_name}" to ID {ruleset_id}')
+                    else:
+                        logger.warning(f'Could not find ruleset with name "{self._imported_open_positions_ruleset_name}" for open_positions_ruleset')
+                        expert_instance.open_positions_ruleset_id = None
+                    self._imported_open_positions_ruleset_name = None
+                elif hasattr(self, 'open_positions_ruleset_select') and hasattr(self, 'open_positions_ruleset_map'):
+                    # Use normal UI selection
                     selected_display_name = self.open_positions_ruleset_select.value
                     expert_instance.open_positions_ruleset_id = self.open_positions_ruleset_map.get(selected_display_name)
                 
@@ -3055,10 +3129,27 @@ class ExpertSettingsTab:
                 # Create new instance
                 enter_market_id = None
                 open_positions_id = None
-                if hasattr(self, 'enter_market_ruleset_select') and hasattr(self, 'enter_market_ruleset_map'):
+                
+                # Check for imported ruleset mappings first
+                if hasattr(self, '_imported_enter_market_ruleset_name') and self._imported_enter_market_ruleset_name is not None:
+                    enter_market_id = self._get_ruleset_id_by_name(self._imported_enter_market_ruleset_name)
+                    if enter_market_id:
+                        logger.info(f'Mapped imported enter_market ruleset "{self._imported_enter_market_ruleset_name}" to ID {enter_market_id}')
+                    else:
+                        logger.warning(f'Could not find ruleset with name "{self._imported_enter_market_ruleset_name}" for enter_market_ruleset')
+                    self._imported_enter_market_ruleset_name = None
+                elif hasattr(self, 'enter_market_ruleset_select') and hasattr(self, 'enter_market_ruleset_map'):
                     selected_display_name = self.enter_market_ruleset_select.value
                     enter_market_id = self.enter_market_ruleset_map.get(selected_display_name)
-                if hasattr(self, 'open_positions_ruleset_select') and hasattr(self, 'open_positions_ruleset_map'):
+                
+                if hasattr(self, '_imported_open_positions_ruleset_name') and self._imported_open_positions_ruleset_name is not None:
+                    open_positions_id = self._get_ruleset_id_by_name(self._imported_open_positions_ruleset_name)
+                    if open_positions_id:
+                        logger.info(f'Mapped imported open_positions ruleset "{self._imported_open_positions_ruleset_name}" to ID {open_positions_id}')
+                    else:
+                        logger.warning(f'Could not find ruleset with name "{self._imported_open_positions_ruleset_name}" for open_positions_ruleset')
+                    self._imported_open_positions_ruleset_name = None
+                elif hasattr(self, 'open_positions_ruleset_select') and hasattr(self, 'open_positions_ruleset_map'):
                     selected_display_name = self.open_positions_ruleset_select.value
                     open_positions_id = self.open_positions_ruleset_map.get(selected_display_name)
                 

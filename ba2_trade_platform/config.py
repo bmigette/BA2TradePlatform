@@ -1,10 +1,17 @@
-
 import os
 from dotenv import load_dotenv
 from typing import Optional
 HOME = os.path.abspath(os.path.join(os.path.dirname(__file__))) 
 HOME_PARENT = os.path.abspath(os.path.join(HOME, "..")) 
+
+# Default paths - can be overridden via command-line arguments
 LOG_FOLDER = os.path.join(HOME_PARENT, 'logs')
+DB_FILE = os.path.join(os.path.expanduser("~"), "Documents", "ba2_trade_platform", "db.sqlite")
+CACHE_FOLDER = os.path.join(os.path.expanduser("~"), "Documents", "ba2_trade_platform", "cache")
+
+# Default HTTP port for the web interface
+HTTP_PORT = 8080
+
 #https://alpaca.markets/learn/connect-to-alpaca-api
 
 STDOUT_LOGGING = True
@@ -15,8 +22,6 @@ OPENAI_BACKEND_URL="https://api.openai.com/v1"  # Default OpenAI API endpoint
 
 ALPHA_VANTAGE_API_KEY=None
 
-DB_FILE = os.path.join(os.path.expanduser("~"), "Documents", "ba2_trade_platform", "db.sqlite")
-CACHE_FOLDER = os.path.join(os.path.expanduser("~"), "Documents", "ba2_trade_platform", "cache")
 # Price cache duration in seconds
 PRICE_CACHE_TIME = 60  # Default to 60 seconds
 

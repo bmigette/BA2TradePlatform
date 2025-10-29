@@ -324,6 +324,51 @@ All API keys should be configured through the **Web Interface** (Recommended):
    .venv/bin/python main.py
    ```
 
+### Command-Line Arguments
+
+The application supports command-line arguments to customize data folders and HTTP port:
+
+```bash
+python main.py [options]
+```
+
+**Available Options**:
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--db-file` | Path to the SQLite database file | `~/Documents/ba2_trade_platform/db.sqlite` |
+| `--cache-folder` | Path to the cache folder for temporary data | `~/Documents/ba2_trade_platform/cache` |
+| `--log-folder` | Path to the log folder | `./logs` |
+| `--port` | HTTP port for the web interface | `8080` |
+
+**Examples**:
+
+```bash
+# View help
+python main.py --help
+
+# Use custom database path
+python main.py --db-file /data/trading/database.sqlite
+
+# Use custom port
+python main.py --port 9090
+
+# Combine multiple options
+python main.py --db-file /data/trading.db --cache-folder /tmp/cache --log-folder /var/log/ba2 --port 3000
+
+# Development setup (separate database)
+python main.py --db-file ./dev_database.sqlite --port 8081
+
+# Production setup
+python main.py --db-file /opt/ba2/production.db --cache-folder /opt/ba2/cache --log-folder /var/log/ba2 --port 80
+```
+
+**Notes**:
+- All folder paths are created automatically if they don't exist
+- The database file's parent directory is also created automatically
+- Arguments are parsed before any system initialization occurs
+- The `--help` option shows all available options without starting the application
+
 6. **Access the web interface**:
    
    Open your browser and navigate to:
