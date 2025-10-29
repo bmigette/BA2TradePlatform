@@ -19,6 +19,11 @@ def sidemenu() -> None:
                 ui.icon('receipt_long')
             with ui.item_section():
                 ui.item_label('Activity Monitor')
+        with ui.item(on_click=lambda: ui.navigate.to('/livetrades')):
+            with ui.item_section():
+                ui.icon('trending_up')
+            with ui.item_section():
+                ui.item_label('Live Trades')
         with ui.item(on_click=lambda: ui.navigate.to('/settings')).classes('w-full'):
             with ui.item_section():
                 ui.icon('settings')

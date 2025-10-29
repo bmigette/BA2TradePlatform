@@ -1132,9 +1132,47 @@ class WorkerQueue:
                             logger.error(f"Expert instance {expert_instance_id} not found or invalid expert type")
                             return
                         
-                        # Check risk_manager_mode setting
+                        # Check risk_manager_mode setting with validation and error logging
+                        from .utils import get_risk_manager_mode
+                        from .db import log_activity
+                        from .types import ActivityLogSeverity, ActivityLogType
+                        
                         settings = expert.settings or {}
-                        risk_manager_mode = settings.get("risk_manager_mode", "classic")
+                        risk_manager_mode = get_risk_manager_mode(settings)
+                        
+                        # Validate risk_manager_mode is properly configured
+                        if not risk_manager_mode:
+                            error_msg = f"Risk manager mode not configured for expert {expert_instance_id}"
+                            logger.error(error_msg)
+                            try:
+                                log_activity(
+                                    severity=ActivityLogSeverity.FAILURE,
+                                    activity_type=ActivityLogType.RISK_MANAGER_EXECUTION,
+                                    description=error_msg,
+                                    data={"expert_id": expert_instance_id, "issue": "missing_risk_manager_mode"},
+                                    source_expert_id=expert_instance_id
+                                )
+                            except Exception as e:
+                                logger.warning(f"Failed to log activity for missing risk_manager_mode: {e}")
+                            return
+                        
+                        # Check for classic mode without rules configured
+                        if risk_manager_mode == "classic":
+                            enter_market_ruleset_id = settings.get("enter_market_ruleset_id")
+                            if not enter_market_ruleset_id:
+                                error_msg = f"Classic risk manager mode enabled but no enter_market_ruleset_id configured for expert {expert_instance_id}"
+                                logger.error(error_msg)
+                                try:
+                                    log_activity(
+                                        severity=ActivityLogSeverity.FAILURE,
+                                        activity_type=ActivityLogType.RISK_MANAGER_EXECUTION,
+                                        description=error_msg,
+                                        data={"expert_id": expert_instance_id, "issue": "missing_classic_rules"},
+                                        source_expert_id=expert_instance_id
+                                    )
+                                except Exception as e:
+                                    logger.warning(f"Failed to log activity for missing classic rules: {e}")
+                                return
                         
                         if risk_manager_mode == "smart":
                             # Use Smart Risk Manager for automated processing

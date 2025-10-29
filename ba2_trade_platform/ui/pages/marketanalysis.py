@@ -39,6 +39,7 @@ class JobMonitoringTab:
         self.expert_filter = 'all'  # Filter by expert
         self.type_filter = 'all'  # Filter by analysis type (ENTER_MARKET or OPEN_POSITIONS)
         self.recommendation_filter = 'all'  # Filter by recommendation (BUY, SELL, HOLD)
+        self.symbol_filter = ''  # Filter by symbol - filters at database level, not client-side
         self.render()
     
     def _get_worker_queue(self):
@@ -111,7 +112,7 @@ class JobMonitoringTab:
                         'Symbol Filter',
                         placeholder='e.g., AAPL, MSFT'
                     ).classes('w-40')
-                    
+                    self.symbol_input.on_value_change(self._on_symbol_filter_change)
                 
                 with ui.row().classes('gap-2'):
                     ui.button('Clear Filters', on_click=self._clear_filters, icon='clear')
@@ -121,7 +122,6 @@ class JobMonitoringTab:
             
             # Analysis jobs table
             self._create_analysis_table()
-            self.symbol_input.bind_value(self.analysis_table, "filter")
             # Pagination controls container
             self.pagination_container = ui.row().classes('w-full')
             with self.pagination_container:
@@ -398,6 +398,10 @@ class JobMonitoringTab:
                     elif self.type_filter == 'open_positions':
                         statement = statement.where(MarketAnalysis.subtype == AnalysisUseCase.OPEN_POSITIONS)
                 
+                # Apply symbol filter (case-insensitive substring match)
+                if self.symbol_filter:
+                    statement = statement.where(MarketAnalysis.symbol.ilike(f"%{self.symbol_filter}%"))
+                
                 # Apply recommendation filter (BUY, SELL, HOLD) - filter analyses that have at least one recommendation matching the filter
                 if self.recommendation_filter != 'all':
                     from ...core.types import OrderRecommendation
@@ -422,6 +426,8 @@ class JobMonitoringTab:
                         count_statement = count_statement.where(MarketAnalysis.subtype == AnalysisUseCase.ENTER_MARKET)
                     elif self.type_filter == 'open_positions':
                         count_statement = count_statement.where(MarketAnalysis.subtype == AnalysisUseCase.OPEN_POSITIONS)
+                if self.symbol_filter:
+                    count_statement = count_statement.where(MarketAnalysis.symbol.ilike(f"%{self.symbol_filter}%"))
                 if self.recommendation_filter != 'all':
                     from ...core.types import OrderRecommendation
                     count_statement = count_statement.join(
@@ -689,6 +695,12 @@ class JobMonitoringTab:
         self.recommendation_filter = event.value
         self.current_page = 1  # Reset to first page when filtering
         self.refresh_data()
+    
+    def _on_symbol_filter_change(self, event):
+        """Handle symbol filter change - queries database with filter applied."""
+        self.symbol_filter = event.value.strip().upper()  # Normalize input (uppercase for consistency)
+        self.current_page = 1  # Reset to first page when filtering
+        self.refresh_data()
 
     def _clear_filters(self):
         """Clear all filters."""
@@ -696,6 +708,7 @@ class JobMonitoringTab:
         self.expert_filter = 'all'
         self.type_filter = 'all'
         self.recommendation_filter = 'all'
+        self.symbol_filter = ''
         self.current_page = 1
         if hasattr(self, 'status_select'):
             self.status_select.value = 'all'

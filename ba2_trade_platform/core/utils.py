@@ -763,3 +763,79 @@ def get_risk_manager_mode(settings: dict, default: str = "classic") -> str:
     
     return risk_manager_mode
 
+
+def get_order_status_color(status: OrderStatus) -> str:
+    """
+    Get color for order status badge for UI display.
+    
+    Used in both TransactionsTab and other UI components to ensure consistent
+    status coloring across the application.
+    
+    Args:
+        status: OrderStatus enum value
+        
+    Returns:
+        Color string for NiceGUI badge (e.g., 'green', 'blue', 'red', etc.)
+        
+    Example:
+        >>> from ba2_trade_platform.core.types import OrderStatus
+        >>> color = get_order_status_color(OrderStatus.FILLED)
+        >>> # Returns 'green'
+    """
+    color_map = {
+        OrderStatus.FILLED: 'green',
+        OrderStatus.OPEN: 'blue',
+        OrderStatus.PENDING: 'orange',
+        OrderStatus.WAITING_TRIGGER: 'purple',
+        OrderStatus.CANCELED: 'grey',
+        OrderStatus.REJECTED: 'red',
+        OrderStatus.ERROR: 'red',
+        OrderStatus.EXPIRED: 'grey',
+        OrderStatus.PARTIALLY_FILLED: 'teal',
+        OrderStatus.CLOSED: 'grey',
+    }
+    return color_map.get(status, 'grey')
+
+
+def get_expert_options_for_ui() -> tuple[list[str], dict[str, int]]:
+    """
+    Get list of expert options and ID mapping for UI dropdowns.
+    
+    Used in transaction filtering and other UI components that need to display
+    expert selection dropdowns.
+    
+    Returns:
+        Tuple of (expert_options_list, expert_id_map)
+        - expert_options_list: List of display names like ['All', 'TradingAgents-1', 'SmartRisk-2']
+        - expert_id_map: Dict mapping display names to expert instance IDs
+        
+    Example:
+        >>> options, id_map = get_expert_options_for_ui()
+        >>> # options = ['All', 'TradingAgents-1', 'SmartRisk-2']
+        >>> # id_map = {'All': 'All', 'TradingAgents-1': 1, 'SmartRisk-2': 2}
+    """
+    from .models import ExpertInstance
+    
+    session = get_db()
+    try:
+        # Get ALL expert instances
+        expert_statement = select(ExpertInstance)
+        experts = list(session.exec(expert_statement).all())
+        
+        # Build expert options list with shortnames
+        expert_options = ['All']
+        expert_map = {'All': 'All'}
+        for expert in experts:
+            # Create shortname: use alias, user_description, or fallback to "expert_name-id"
+            shortname = expert.alias or expert.user_description or f"{expert.expert}-{expert.id}"
+            expert_options.append(shortname)
+            expert_map[shortname] = expert.id
+        
+        logger.debug(f"[GET_EXPERT_OPTIONS] Built {len(expert_options)} expert options")
+        return expert_options, expert_map
+        
+    except Exception as e:
+        logger.error(f"Error getting expert options: {e}", exc_info=True)
+        return ['All'], {'All': 'All'}
+    finally:
+        session.close()

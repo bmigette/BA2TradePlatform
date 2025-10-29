@@ -4150,8 +4150,9 @@ class TransactionsTab:
     
     def _update_tp_sl(self, transaction_id, tp_price, sl_price, dialog):
         """Update TP/SL for a transaction."""
-        from ...core.models import Transaction
-        from ...core.db import update_instance
+        from ...core.models import Transaction, TradingOrder
+        from ...core.db import update_instance, get_db
+        from sqlmodel import select, Session
         
         try:
             txn = get_instance(Transaction, transaction_id)
@@ -4242,9 +4243,6 @@ class TransactionsTab:
                         logger.error(f"Error updating SL: {e}", exc_info=True)
                 else:
                     # Both deleted - cancel all TP/SL orders
-                    from ...core.models import TradingOrder
-                    from sqlmodel import Session, select
-                    from ...core.db import get_db
                     try:
                         with Session(get_db().bind) as session:
                             orders = session.exec(
@@ -4291,9 +4289,6 @@ class TransactionsTab:
                             logger.error(f"Error removing TP: {e}", exc_info=True)
                     else:
                         # No SL either - cancel all TP/SL orders
-                        from ...core.models import TradingOrder
-                        from sqlmodel import Session, select
-                        from ...core.db import get_db
                         try:
                             with Session(get_db().bind) as session:
                                 orders = session.exec(
@@ -4340,9 +4335,6 @@ class TransactionsTab:
                             logger.error(f"Error removing SL: {e}", exc_info=True)
                     else:
                         # No TP either - cancel all TP/SL orders
-                        from ...core.models import TradingOrder
-                        from sqlmodel import Session, select
-                        from ...core.db import get_db
                         try:
                             with Session(get_db().bind) as session:
                                 orders = session.exec(
@@ -5067,7 +5059,6 @@ def content() -> None:
     tab_config = [
         ('overview', 'Overview'),
         ('account', 'Account Overview'),
-        ('transactions', 'Transactions'),
         ('performance', 'Performance')
     ]
     
@@ -5082,8 +5073,6 @@ def content() -> None:
             OverviewTab(tabs_ref=tabs)
         with ui.tab_panel(tab_objects['account']):
             AccountOverviewTab()
-        with ui.tab_panel(tab_objects['transactions']):
-            TransactionsTab()
         with ui.tab_panel(tab_objects['performance']):
             PerformanceTab()
     
@@ -5101,7 +5090,6 @@ def content() -> None:
                 const labelToName = {
                     'Overview': 'overview',
                     'Account Overview': 'account',
-                    'Transactions': 'transactions',
                     'Performance': 'performance'
                 };
                 
