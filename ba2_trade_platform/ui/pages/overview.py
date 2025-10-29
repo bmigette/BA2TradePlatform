@@ -4427,15 +4427,28 @@ class TransactionsTab:
                 return
             
             # Get account interface using centralized helper
-            from ...core.utils import get_account_instance_from_transaction
+            from ...core.utils import get_account_instance_from_transaction, close_transaction_with_logging
             
             account = get_account_instance_from_transaction(transaction_id)
             if not account:
                 if txn.status.value == 'FAILED':
                     ui.notify('Cannot process FAILED transaction - transaction was previously marked as failed', type='negative')
+                    dialog.close()
+                    return
                 else:
-                    ui.notify('Cannot find account for transaction - transaction may be orphaned (no orders found)', type='negative')
-                return
+                    # Transaction is orphaned (no orders found) - mark as closed with logging
+                    logger.warning(f"Transaction {transaction_id} has no orders - marking as closed")
+                    close_transaction_with_logging(
+                        txn,
+                        account_id=1,  # Use default account ID for orphaned transactions
+                        close_reason="orphaned_no_orders",
+                        additional_data={"note": "Transaction had no associated orders"}
+                    )
+                    update_instance(txn)
+                    ui.notify('Transaction closed (was orphaned with no orders)', type='positive')
+                    dialog.close()
+                    self._refresh_transactions()
+                    return
             
             # Capture client for background task
             from nicegui import context
@@ -4528,15 +4541,28 @@ class TransactionsTab:
                 return
             
             # Get account interface using centralized helper
-            from ...core.utils import get_account_instance_from_transaction
+            from ...core.utils import get_account_instance_from_transaction, close_transaction_with_logging
             
             account = get_account_instance_from_transaction(transaction_id)
             if not account:
                 if txn.status.value == 'FAILED':
                     ui.notify('Cannot process FAILED transaction - transaction was previously marked as failed', type='negative')
+                    dialog.close()
+                    return
                 else:
-                    ui.notify('Cannot find account for transaction - transaction may be orphaned (no orders found)', type='negative')
-                return
+                    # Transaction is orphaned (no orders found) - mark as closed with logging
+                    logger.warning(f"Transaction {transaction_id} has no orders - marking as closed")
+                    close_transaction_with_logging(
+                        txn,
+                        account_id=1,  # Use default account ID for orphaned transactions
+                        close_reason="orphaned_no_orders",
+                        additional_data={"note": "Transaction had no associated orders"}
+                    )
+                    update_instance(txn)
+                    ui.notify('Transaction closed (was orphaned with no orders)', type='positive')
+                    dialog.close()
+                    self._refresh_transactions()
+                    return
             
             # Capture client for background task
             from nicegui import context
