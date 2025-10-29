@@ -4426,31 +4426,16 @@ class TransactionsTab:
                 dialog.close()
                 return
             
-            # Get account interface
-            session = get_db()
-            orders_statement = select(TradingOrder).where(
-                TradingOrder.transaction_id == transaction_id
-            ).limit(1)
-            first_order = session.exec(orders_statement).first()
+            # Get account interface using centralized helper
+            from ...core.utils import get_account_instance_from_transaction
             
-            if not first_order or not first_order.account_id:
-                ui.notify('Cannot find account for transaction', type='negative')
+            account = get_account_instance_from_transaction(transaction_id)
+            if not account:
+                if txn.status.value == 'FAILED':
+                    ui.notify('Cannot process FAILED transaction - transaction was previously marked as failed', type='negative')
+                else:
+                    ui.notify('Cannot find account for transaction - transaction may be orphaned (no orders found)', type='negative')
                 return
-            
-            from ...modules.accounts import get_account_class
-            from ...core.models import AccountDefinition
-            
-            acc_def = get_instance(AccountDefinition, first_order.account_id)
-            if not acc_def:
-                ui.notify('Account not found', type='negative')
-                return
-            
-            account_class = get_account_class(acc_def.provider)
-            if not account_class:
-                ui.notify(f'Account provider not found', type='negative')
-                return
-            
-            account = account_class(acc_def.id)
             
             # Capture client for background task
             from nicegui import context
@@ -4542,32 +4527,16 @@ class TransactionsTab:
                 dialog.close()
                 return
             
-            # Get account from first order
-            session = get_db()
-            order_statement = select(TradingOrder).where(
-                TradingOrder.transaction_id == transaction_id
-            ).limit(1)
-            first_order = session.exec(order_statement).first()
+            # Get account interface using centralized helper
+            from ...core.utils import get_account_instance_from_transaction
             
-            if not first_order or not first_order.account_id:
-                ui.notify('Cannot find account for transaction', type='negative')
+            account = get_account_instance_from_transaction(transaction_id)
+            if not account:
+                if txn.status.value == 'FAILED':
+                    ui.notify('Cannot process FAILED transaction - transaction was previously marked as failed', type='negative')
+                else:
+                    ui.notify('Cannot find account for transaction - transaction may be orphaned (no orders found)', type='negative')
                 return
-            
-            # Get account interface
-            from ...modules.accounts import get_account_class
-            from ...core.models import AccountDefinition
-            
-            acc_def = get_instance(AccountDefinition, first_order.account_id)
-            if not acc_def:
-                ui.notify('Account not found', type='negative')
-                return
-            
-            account_class = get_account_class(acc_def.provider)
-            if not account_class:
-                ui.notify(f'Account provider not found', type='negative')
-                return
-            
-            account = account_class(acc_def.id)
             
             # Capture client for background task
             from nicegui import context

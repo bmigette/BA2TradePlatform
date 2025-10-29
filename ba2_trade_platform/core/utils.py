@@ -529,6 +529,95 @@ def log_transaction_created_activity(
         logger.warning(f"Failed to log transaction creation activity: {e}")
 
 
+def is_transaction_orphaned(transaction_id: int, session: Optional[Session] = None) -> bool:
+    """
+    Check if a transaction is orphaned (has no associated orders).
+    
+    Args:
+        transaction_id: The ID of the transaction to check
+        session: Optional database session (if None, creates a new one)
+        
+    Returns:
+        bool: True if the transaction has no orders, False otherwise
+    """
+    try:
+        # Use provided session or get database connection
+        if session is None:
+            session = get_db()
+        
+        # Check if transaction has any orders
+        orders_statement = select(TradingOrder).where(
+            TradingOrder.transaction_id == transaction_id
+        ).limit(1)
+        first_order = session.exec(orders_statement).first()
+        
+        return first_order is None
+        
+    except Exception as e:
+        logger.error(f"Error checking if transaction {transaction_id} is orphaned: {e}", exc_info=True)
+        return False
+
+
+def get_account_instance_from_transaction(transaction_id: int, session: Optional[Session] = None):
+    """
+    Get an account instance from a transaction ID by finding the first order's account.
+    
+    This centralized function should be used instead of duplicating the logic of finding
+    the account through transaction orders.
+    
+    Args:
+        transaction_id: The ID of the transaction
+        session: Optional database session (if None, creates a new one)
+        
+    Returns:
+        Optional[AccountInterface]: The account instance, or None if not found
+        
+    Note:
+        Logs specific error messages to help debug transaction/order relationship issues.
+        Use is_transaction_orphaned() to check if transaction has no orders before calling this.
+        Returns None for FAILED transactions since they shouldn't be processed.
+    """
+    from .models import AccountDefinition, Transaction
+    from .types import TransactionStatus
+    
+    try:
+        # Use provided session or get database connection
+        if session is None:
+            session = get_db()
+        
+        # First check if this is a failed transaction - don't process those
+        transaction = session.get(Transaction, transaction_id)
+        if transaction and transaction.status == TransactionStatus.FAILED:
+            logger.debug(f"Transaction {transaction_id} is FAILED - not processing for account lookup")
+            return None
+        
+        # Get first order for this transaction
+        orders_statement = select(TradingOrder).where(
+            TradingOrder.transaction_id == transaction_id
+        ).limit(1)
+        first_order = session.exec(orders_statement).first()
+        
+        if not first_order:
+            logger.error(f"No orders found for transaction {transaction_id}. This transaction may be orphaned or corrupted.")
+            return None
+        
+        if not first_order.account_id:
+            logger.error(f"Order {first_order.id} for transaction {transaction_id} has no account_id. Order may be corrupted.")
+            return None
+        
+        # Get account instance using the existing helper
+        account = get_account_instance_from_id(first_order.account_id, session=session)
+        if not account:
+            logger.error(f"Could not get account instance for account_id {first_order.account_id} from transaction {transaction_id}")
+            return None
+        
+        return account
+        
+    except Exception as e:
+        logger.error(f"Error getting account for transaction {transaction_id}: {e}", exc_info=True)
+        return None
+
+
 def log_tp_sl_adjustment_activity(
     trading_order: TradingOrder,
     account_id: int,
