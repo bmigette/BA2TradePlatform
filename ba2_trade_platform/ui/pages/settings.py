@@ -2785,10 +2785,11 @@ class ExpertSettingsTab:
             ui.label('Upload a previously exported JSON settings file to restore settings:').classes('text-body2 mb-2')
             
             async def handle_import_upload(e: UploadEventArguments):
-                """Handle JSON file upload for settings import."""
+                """Handle JSON file upload for settings import - creates a new expert from imported data."""
+                import asyncio
+                
                 try:
                     # Read the uploaded file
-                    # NiceGUI 3.0+: e.file is the UploadFile object directly, read() is async
                     import_json_bytes = await e.file.read()
                     import_json = import_json_bytes.decode('utf-8')
                     if not import_json.strip():
@@ -2796,67 +2797,126 @@ class ExpertSettingsTab:
                         return
                     
                     import_data = json.loads(import_json)
+                    logger.info(f'Importing expert settings from file')
                     
-                    # Import general settings
-                    if 'general' in import_data:
-                        general = import_data['general']
-                        if 'alias' in general:
-                            self.alias_input.value = general['alias']
-                        if 'user_description' in general:
-                            self.user_description_textarea.value = general['user_description']
-                        if 'enabled' in general:
-                            self.enabled_checkbox.value = general['enabled']
-                        if 'virtual_equity' in general:
-                            self.virtual_equity_input.value = str(general['virtual_equity'])
+                    # Extract data from import
+                    general = import_data.get('general', {})
+                    expert_settings = import_data.get('expert_settings', {})
+                    expert_type = import_data.get('expert_type')
+                    instruments_data = import_data.get('instruments', {})
                     
-                    # Import expert settings
-                    if expert_instance and 'expert_settings' in import_data:
-                        self._imported_expert_settings = import_data['expert_settings']
-                        logger.info(f'Stored imported expert settings with keys: {list(import_data["expert_settings"].keys())}')
+                    if not expert_type:
+                        ui.notify('Import file missing expert_type field', type='negative')
+                        return
                     
-                    # Import ruleset references by name (before reload so they can be applied)
-                    if expert_instance:
+                    # Create new ExpertInstance in database
+                    from ...core.models import ExpertInstance
+                    from ...core.db import add_instance, get_db
+                    from sqlmodel import select
+                    
+                    # Get account_id from current expert or use a default
+                    account_id = expert_instance.account_id if expert_instance else 1
+                    
+                    new_expert_instance = ExpertInstance(
+                        account_id=account_id,
+                        expert=expert_type,
+                        alias=general.get('alias', 'Imported Expert'),
+                        user_description=general.get('user_description', ''),
+                        enabled=False,  # Always disabled for imported experts for safety
+                        virtual_equity=general.get('virtual_equity', 10000.0)
+                    )
+                    
+                    # Resolve and set rulesets by name
+                    session = get_db()
+                    try:
                         if 'enter_market_ruleset_name' in import_data:
-                            self._imported_enter_market_ruleset_name = import_data['enter_market_ruleset_name']
-                            logger.info(f'Stored imported enter market ruleset: {self._imported_enter_market_ruleset_name}')
+                            ruleset_name = import_data['enter_market_ruleset_name']
+                            from ...core.models import Ruleset
+                            statement = select(Ruleset).where(Ruleset.name == ruleset_name)
+                            ruleset = session.exec(statement).first()
+                            if ruleset:
+                                new_expert_instance.enter_market_ruleset_id = ruleset.id
+                                logger.info(f'Set enter_market_ruleset to: {ruleset_name} (ID: {ruleset.id})')
+                        
                         if 'open_positions_ruleset_name' in import_data:
-                            self._imported_open_positions_ruleset_name = import_data['open_positions_ruleset_name']
-                            logger.info(f'Stored imported open positions ruleset: {self._imported_open_positions_ruleset_name}')
+                            ruleset_name = import_data['open_positions_ruleset_name']
+                            from ...core.models import Ruleset
+                            statement = select(Ruleset).where(Ruleset.name == ruleset_name)
+                            ruleset = session.exec(statement).first()
+                            if ruleset:
+                                new_expert_instance.open_positions_ruleset_id = ruleset.id
+                                logger.info(f'Set open_positions_ruleset to: {ruleset_name} (ID: {ruleset.id})')
+                    finally:
+                        session.close()
                     
-                    # Now reload general settings to update UI with imported schedules and rulesets
-                    if expert_instance and (hasattr(self, '_imported_expert_settings') or 
-                                           hasattr(self, '_imported_enter_market_ruleset_name') or 
-                                           hasattr(self, '_imported_open_positions_ruleset_name')):
-                        self._load_general_settings(expert_instance)
-                        logger.info('Reloaded general settings after import')
-                        ui.notify('Expert settings ready to import (will be applied on save)', type='info')
+                    # Save to database
+                    new_expert_id = add_instance(new_expert_instance)
+                    logger.info(f'Created new expert instance with ID: {new_expert_id}')
                     
-                    # Import symbol settings
-                    if expert_instance and 'symbol_settings' in import_data:
-                        self._imported_symbol_settings = import_data['symbol_settings']
-                        logger.info('Stored imported symbol settings')
-                        ui.notify('Symbol settings ready to import (will be applied on save)', type='info')
+                    # Now load the expert and apply all settings
+                    from ...core.utils import get_expert_instance_from_id
+                    expert = get_expert_instance_from_id(new_expert_id)
                     
-                    # Import instruments
-                    if 'instruments' in import_data:
-                        instruments_data = import_data['instruments']
-                        instrument_configs = {}
-                        for inst_id_str, inst_config in instruments_data.items():
+                    if expert:
+                        # Save all expert settings
+                        for setting_key, setting_value in expert_settings.items():
                             try:
-                                instrument_configs[int(inst_id_str)] = inst_config
-                            except ValueError:
-                                logger.warning(f'Invalid instrument ID: {inst_id_str}')
+                                expert.save_setting(setting_key, setting_value)
+                                logger.debug(f'Imported setting: {setting_key}')
+                            except Exception as e:
+                                logger.warning(f'Could not import setting {setting_key}: {e}')
                         
-                        # Store for later application when selector is created
-                        self._imported_instrument_configs = instrument_configs
+                        # Save instruments
+                        if instruments_data:
+                            # Convert instrument IDs back to symbols and create enabled_instruments config
+                            session = get_db()
+                            try:
+                                from ...core.models import Instrument
+                                enabled_instruments = {}
+                                for inst_id_str, inst_config in instruments_data.items():
+                                    try:
+                                        inst_id = int(inst_id_str)
+                                        statement = select(Instrument).where(Instrument.id == inst_id)
+                                        instrument = session.exec(statement).first()
+                                        if instrument and inst_config.get('enabled', False):
+                                            enabled_instruments[instrument.name] = {
+                                                'weight': inst_config.get('weight', 100.0)
+                                            }
+                                    except ValueError:
+                                        logger.warning(f'Invalid instrument ID: {inst_id_str}')
+                                
+                                if enabled_instruments:
+                                    expert.set_enabled_instruments(enabled_instruments)
+                                    logger.info(f'Set {len(enabled_instruments)} enabled instruments')
+                            finally:
+                                session.close()
                         
-                        # Apply now if selector exists
-                        if hasattr(self, 'instrument_selector') and self.instrument_selector:
-                            self.instrument_selector.set_selected_instruments(instrument_configs)
-                            logger.info('Applied imported instruments to existing selector')
+                        logger.info(f'Successfully created and configured expert from import')
                     
-                    ui.notify('✅ Settings imported successfully! Click Save to apply all changes.', type='positive')
-                    logger.info(f'Successfully imported expert settings from file')
+                    # Close current dialog
+                    self.dialog.close()
+                    
+                    # Refresh the experts table
+                    if hasattr(self, 'table') and self.table:
+                        self._load_experts()
+                    
+                    # Reopen edit dialog for the newly created expert
+                    from ...core.models import ExpertInstance
+                    from ...core.db import get_db
+                    from sqlmodel import select
+                    session = get_db()
+                    try:
+                        statement = select(ExpertInstance).where(ExpertInstance.id == new_expert_id)
+                        new_instance = session.exec(statement).first()
+                        if new_instance:
+                            ui.notify(f'✅ Expert "{general.get("alias", "Imported Expert")}" created successfully! Opening for review...', type='positive')
+                            # Small delay to allow dialog to close and table to refresh
+                            await asyncio.sleep(0.5)
+                            self._show_expert_dialog(new_instance)
+                        else:
+                            ui.notify(f'✅ Expert created but could not reopen for editing', type='warning')
+                    finally:
+                        session.close()
                     
                 except json.JSONDecodeError as e:
                     logger.error(f'Invalid JSON format: {e}')
