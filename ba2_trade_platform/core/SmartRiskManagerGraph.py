@@ -440,6 +440,12 @@ Simply provide your assessment - no approval required.
 ## CURRENT PORTFOLIO STATUS
 {portfolio_status}
 
+## 🚨 IMPORTANT: VALID TRANSACTION IDs 🚨
+**ONLY the transaction IDs listed in "Open Positions:" above are valid for actions.**
+- Do NOT reference transaction IDs from previous sessions, closed positions, or failed transactions
+- Do NOT attempt to modify transactions that belong to other experts
+- When planning actions, ONLY use transaction IDs you see explicitly listed in the current portfolio summary
+
 ## TASK
 Review the portfolio and create an initial assessment covering:
 1. Overall portfolio health (P&L, concentration, diversification)
@@ -522,11 +528,14 @@ You have full access to these research tools - use them freely and repeatedly:
 
 **Action Recommendation Tools (MANDATORY - use these to recommend specific actions):**
 
-**IMPORTANT: Transaction IDs**
+**🚨 CRITICAL: Transaction ID Rules - READ THIS FIRST 🚨**
+- **ONLY use transaction IDs from the CURRENT PORTFOLIO SUMMARY above**
 - Each open position in the portfolio summary is shown as "Transaction #XXX: SYMBOL"
-- Use the transaction ID number when referencing positions in action recommendations
 - Example: "Transaction #248: CRWD" means the transaction_id is 248
-- You can only modify transactions that belong to your expert - attempting to modify another expert's transaction will fail
+- **You CANNOT modify transactions from other experts** - attempting to do so will FAIL
+- **You CANNOT modify CLOSED or FAILED transactions** - only OPENED transactions listed in portfolio summary are valid
+- **If unsure about a transaction ID, DO NOT use it** - only use IDs you see explicitly listed in the "Open Positions:" section above
+- Attempting to use invalid transaction IDs wastes iterations and produces errors - always verify IDs before recommending actions
 
 - **recommend_close_position(transaction_id: int, reason: str, confidence: int)** - Recommend closing an existing position
   * transaction_id: ID of the open transaction/position to close (from portfolio summary)
@@ -1367,15 +1376,20 @@ Previous Final Summary:
         llm = create_llm(risk_manager_model, 0.1, backend_url, api_key)
         
         # Build portfolio summary for prompt
+        num_open_positions = len(state['open_positions'])
+        num_pending_positions = portfolio_status.get('risk_metrics', {}).get('num_pending', 0)
+        total_positions = num_open_positions + num_pending_positions
+        
         portfolio_summary = f"""
 Total Virtual Equity: ${portfolio_status['account_virtual_equity']:.2f}
 Available Balance (includes pending positions): ${portfolio_status['account_available_balance']:.2f} ({portfolio_status['account_balance_pct_available']:.1f}%)
-Pending Transactions: {portfolio_status.get('risk_metrics', {}).get('num_pending', 0)} (${portfolio_status.get('pending_transactions_value', 0):.2f}, {portfolio_status.get('pending_transactions_pct', 0):.1f}% of equity)
-Total Open Positions: {len(state['open_positions'])}
 
-Open Positions:
+FILLED Positions (Live Trades - {num_open_positions} total):
 """
+        # Collect valid transaction IDs for emphasis
+        valid_transaction_ids = []
         for pos in state["open_positions"]:
+            valid_transaction_ids.append(str(pos['transaction_id']))
             portfolio_summary += f"\n- Transaction #{pos['transaction_id']}: {pos['symbol']}: {pos['quantity']} shares @ ${pos['current_price']:.2f}"
             portfolio_summary += f" | P&L: {pos['unrealized_pnl_pct']:.2f}% (${pos['unrealized_pnl']:.2f})"
             
@@ -1396,9 +1410,26 @@ Open Positions:
         # Add pending positions if any
         pending_positions = portfolio_status.get('pending_positions', [])
         if pending_positions:
-            portfolio_summary += "\n\nPending Positions (Orders sent to broker but not yet filled):"
+            portfolio_summary += f"\n\nPENDING Positions (Orders sent to broker but NOT yet filled - {num_pending_positions} total):"
+            portfolio_summary += f"\nValue: ${portfolio_status.get('pending_transactions_value', 0):.2f} ({portfolio_status.get('pending_transactions_pct', 0):.1f}% of equity)"
             for pending in pending_positions:
-                portfolio_summary += f"\n- {pending['symbol']}: {pending['pending_quantity']} shares (est. ${pending['estimated_price']:.2f}, value: ${pending['estimated_value']:.2f})"
+                portfolio_summary += f"\n- Transaction #{pending['transaction_id']}: {pending['symbol']}: {pending['pending_quantity']} shares (est. ${pending['estimated_price']:.2f}, value: ${pending['estimated_value']:.2f})"
+        else:
+            portfolio_summary += "\n(No pending positions)"
+        
+        # Add summary line
+        portfolio_summary += f"\n\n📊 PORTFOLIO SUMMARY: {num_open_positions} FILLED + {num_pending_positions} PENDING = {total_positions} TOTAL POSITIONS"
+        
+        # Add prominent reminder about valid transaction IDs (include both filled and pending)
+        all_transaction_ids = valid_transaction_ids.copy()
+        if pending_positions:
+            all_transaction_ids.extend([str(p['transaction_id']) for p in pending_positions])
+        
+        if all_transaction_ids:
+            portfolio_summary += f"\n\n🚨 VALID TRANSACTION IDs FOR ACTIONS: {', '.join(all_transaction_ids)} 🚨"
+            portfolio_summary += "\nYou can ONLY modify these transaction IDs. Do NOT use IDs from previous runs or other experts."
+        else:
+            portfolio_summary += "\n\n(No transactions available)"
         
         # Get LLM analysis
         analysis_prompt = PORTFOLIO_ANALYSIS_PROMPT.format(
@@ -2085,6 +2116,40 @@ def create_research_tools(toolkit: SmartRiskManagerToolkit, recommended_actions_
         recommended_actions_list.append(action)
         return f"Recorded sell position recommendation for {symbol} ({quantity} shares). Total actions: {len(recommended_actions_list)}"
     
+    @tool
+    @smart_risk_manager_tool
+    def get_all_transactions_tool(
+        format_type: Annotated[str, "Output format: 'markdown' (default for reading) or 'json' (for structured data)"] = "markdown"
+    ) -> str:
+        """Get comprehensive view of all transactions: filled + pending + future actions.
+        
+        This tool provides a complete snapshot including:
+        1. **FILLED positions** - Live trades currently in portfolio
+        2. **PENDING positions** - Orders sent to broker awaiting fill
+        3. **FUTURE actions** - Recommended actions not yet executed (from research analysis)
+        
+        Use this to see:
+        - The full picture of current portfolio state
+        - What actions have been recommended so far
+        - All transaction IDs available for modification
+        
+        Format options:
+        - "markdown": Human-readable format (recommended for research)
+        - "json": Structured data format (for data processing)
+        
+        Args:
+            format_type: "markdown" (default) or "json"
+            
+        Returns:
+            Formatted transaction summary including pending recommended actions
+        """
+        # Pass the current recommended_actions_list to include pending actions
+        return toolkit.get_all_transactions(
+            include_pending_actions=True,
+            pending_actions=recommended_actions_list.copy(),
+            format_type=format_type
+        )
+    
     return [
         get_analysis_outputs_tool,
         get_analysis_output_detail_tool,
@@ -2092,6 +2157,7 @@ def create_research_tools(toolkit: SmartRiskManagerToolkit, recommended_actions_
         get_historical_analyses_tool,
         get_all_recent_analyses_tool,
         get_current_price_tool,
+        get_all_transactions_tool,
         recommend_close_position,
         recommend_adjust_quantity,
         recommend_update_stop_loss,

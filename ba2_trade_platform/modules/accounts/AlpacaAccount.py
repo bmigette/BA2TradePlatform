@@ -2028,16 +2028,24 @@ class AlpacaAccount(AccountInterface):
                 adjustment_type.append(f"SL=${new_sl_price:.2f}")
             logger.info(f"Adjusting {', '.join(adjustment_type)} for transaction {transaction.id}")
             
-            # 1. Update transaction (source of truth)
-            if new_tp_price is not None:
-                transaction.take_profit = new_tp_price
-            if new_sl_price is not None:
-                transaction.stop_loss = new_sl_price
-            update_instance(transaction)
-            
-            # 2. Get entry order (first market/limit order for this transaction, not TP/SL)
+            # Use a single session context to avoid SQLAlchemy session conflicts
             from sqlmodel import Session, select
             with Session(get_db().bind) as session:
+                # 1. Get fresh transaction in this session (avoids session attachment conflicts)
+                transaction_in_session = session.get(Transaction, transaction.id)
+                if not transaction_in_session:
+                    logger.error(f"Transaction {transaction.id} not found in database")
+                    return False
+                
+                # 2. Update transaction (source of truth)
+                if new_tp_price is not None:
+                    transaction_in_session.take_profit = new_tp_price
+                if new_sl_price is not None:
+                    transaction_in_session.stop_loss = new_sl_price
+                session.add(transaction_in_session)
+                session.commit()
+                
+                # 3. Get entry order (first market/limit order for this transaction, not TP/SL)
                 entry_order = session.exec(
                     select(TradingOrder).where(
                         TradingOrder.transaction_id == transaction.id,
@@ -2071,8 +2079,8 @@ class AlpacaAccount(AccountInterface):
                         existing_sl = order
                 
                 # Determine if we need OCO (both TP and SL defined)
-                has_tp = transaction.take_profit is not None and transaction.take_profit > 0
-                has_sl = transaction.stop_loss is not None and transaction.stop_loss > 0
+                has_tp = transaction_in_session.take_profit is not None and transaction_in_session.take_profit > 0
+                has_sl = transaction_in_session.stop_loss is not None and transaction_in_session.stop_loss > 0
                 need_oco = has_tp and has_sl
                 
                 logger.debug(f"Entry order {entry_order.id} status: {entry_order.status}, "
@@ -2085,7 +2093,7 @@ class AlpacaAccount(AccountInterface):
                 if entry_order.status in OrderStatus.get_unsent_statuses():
                     # Entry not sent to broker yet - create/update pending orders
                     return self._handle_pending_entry_tpsl(
-                        session, transaction, entry_order, 
+                        session, transaction_in_session, entry_order, 
                         new_tp_price, new_sl_price,
                         existing_tp, existing_sl, existing_oco,
                         need_oco
@@ -2094,7 +2102,7 @@ class AlpacaAccount(AccountInterface):
                 elif entry_order.status in OrderStatus.get_executed_statuses():
                     # Entry filled - work with broker
                     return self._handle_filled_entry_tpsl(
-                        session, transaction, entry_order,
+                        session, transaction_in_session, entry_order,
                         new_tp_price, new_sl_price,
                         existing_tp, existing_sl, existing_oco,
                         all_orders, need_oco

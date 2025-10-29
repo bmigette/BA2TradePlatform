@@ -5,6 +5,7 @@ Provides LangChain-compatible tools for the Smart Risk Manager agent graph.
 All tools are wrappers around existing platform functionality.
 """
 
+import json
 from typing import Dict, Any, List, Optional, Annotated
 from datetime import datetime, timedelta, timezone
 from sqlmodel import Session, select
@@ -367,6 +368,160 @@ class SmartRiskManagerToolkit:
         except Exception as e:
             logger.error(f"Error getting portfolio status: {e}", exc_info=True)
             raise
+
+    def get_all_transactions(
+        self,
+        include_pending_actions: bool = False,
+        pending_actions: Optional[List[Dict[str, Any]]] = None,
+        format_type: str = "markdown"
+    ) -> str:
+        """
+        Retrieve all transactions (filled + pending + future recommended actions).
+        
+        This comprehensive tool provides a complete view of:
+        1. FILLED positions (live trades currently in portfolio)
+        2. PENDING positions (orders submitted to broker, awaiting fill)
+        3. FUTURE transactions (recommended actions not yet executed)
+        
+        Can output as Markdown (for LLM consumption) or JSON (for structured data).
+        
+        Args:
+            include_pending_actions: Whether to include recommended actions as future transactions
+            pending_actions: List of recommended actions from research node (if include_pending_actions=True)
+            format_type: Output format - "markdown" (default) or "json"
+            
+        Returns:
+            Formatted string with all transactions data
+            
+        Examples:
+            # Get all transactions as markdown (for research node to read)
+            result = toolkit.get_all_transactions(format_type="markdown")
+            
+            # Get all transactions with pending actions as JSON
+            result = toolkit.get_all_transactions(
+                include_pending_actions=True,
+                pending_actions=recommended_actions,
+                format_type="json"
+            )
+        """
+        try:
+            logger.debug(f"Getting all transactions: include_pending={include_pending_actions}, format={format_type}")
+            
+            # Get portfolio status to access all transactions
+            portfolio_status = self.get_portfolio_status()
+            
+            # Build data structure
+            transactions_data = {
+                "account_virtual_equity": portfolio_status["account_virtual_equity"],
+                "account_available_balance": portfolio_status["account_available_balance"],
+                "filled_positions": portfolio_status["open_positions"],
+                "pending_positions": portfolio_status["pending_positions"],
+                "future_transactions": []
+            }
+            
+            # Add pending actions as future transactions if requested
+            if include_pending_actions and pending_actions:
+                transactions_data["future_transactions"] = pending_actions
+            
+            # Format output based on format_type
+            if format_type == "json":
+                return json.dumps(transactions_data, indent=2)
+            else:  # markdown (default)
+                return self._format_transactions_as_markdown(transactions_data)
+        
+        except Exception as e:
+            logger.error(f"Error getting all transactions: {e}", exc_info=True)
+            if format_type == "json":
+                return json.dumps({"error": str(e)})
+            else:
+                return f"Error retrieving transactions: {str(e)}"
+    
+    def _format_transactions_as_markdown(self, transactions_data: Dict[str, Any]) -> str:
+        """
+        Format transaction data as readable markdown.
+        
+        Args:
+            transactions_data: Transaction data from get_all_transactions
+            
+        Returns:
+            Formatted markdown string
+        """
+        md = []
+        md.append("# All Transactions Report")
+        md.append("")
+        md.append(f"**Virtual Equity:** ${transactions_data['account_virtual_equity']:,.2f}")
+        md.append(f"**Available Balance:** ${transactions_data['account_available_balance']:,.2f}")
+        md.append("")
+        
+        # Filled positions
+        filled = transactions_data.get("filled_positions", [])
+        md.append(f"## Filled Positions ({len(filled)} total)")
+        md.append("")
+        if filled:
+            for pos in filled:
+                md.append(f"### Transaction #{pos['transaction_id']}: {pos['symbol']}")
+                md.append(f"- **Direction:** {pos['direction'].upper()}")
+                md.append(f"- **Quantity:** {pos['quantity']} shares")
+                md.append(f"- **Entry Price:** ${pos['entry_price']:.2f}")
+                md.append(f"- **Current Price:** ${pos['current_price']:.2f}")
+                md.append(f"- **P&L:** {pos['unrealized_pnl_pct']:.2f}% (${pos['unrealized_pnl']:,.2f})")
+                md.append(f"- **Position Value:** ${pos['position_value']:,.2f}")
+                
+                tp_order = pos.get("tp_order")
+                sl_order = pos.get("sl_order")
+                
+                if tp_order and tp_order.get("price"):
+                    md.append(f"- **Take Profit:** ${tp_order['price']:.2f}")
+                else:
+                    md.append(f"- **Take Profit:** ⚠️ Not set")
+                
+                if sl_order and sl_order.get("price"):
+                    md.append(f"- **Stop Loss:** ${sl_order['price']:.2f}")
+                else:
+                    md.append(f"- **Stop Loss:** ⚠️ Not set")
+                
+                md.append("")
+        else:
+            md.append("*(No filled positions)*")
+            md.append("")
+        
+        # Pending positions
+        pending = transactions_data.get("pending_positions", [])
+        md.append(f"## Pending Positions ({len(pending)} total)")
+        md.append("")
+        if pending:
+            for pos in pending:
+                md.append(f"### Transaction #{pos['transaction_id']}: {pos['symbol']}")
+                md.append(f"- **Direction:** {pos['direction'].upper()}")
+                md.append(f"- **Pending Quantity:** {pos['pending_quantity']} shares")
+                md.append(f"- **Estimated Price:** ${pos['estimated_price']:.2f}")
+                md.append(f"- **Estimated Value:** ${pos['estimated_value']:,.2f}")
+                md.append("")
+        else:
+            md.append("*(No pending positions)*")
+            md.append("")
+        
+        # Future transactions (recommended actions)
+        future = transactions_data.get("future_transactions", [])
+        md.append(f"## Recommended Future Actions ({len(future)} total)")
+        md.append("")
+        if future:
+            for i, action in enumerate(future, 1):
+                if isinstance(action, dict):
+                    action_type = action.get("action_type", "UNKNOWN")
+                    md.append(f"### Action {i}: {action_type}")
+                    for key, value in action.items():
+                        if key != "action_type":
+                            md.append(f"- **{key}:** {value}")
+                    md.append("")
+                else:
+                    md.append(f"### Action {i}: {str(action)}")
+                    md.append("")
+        else:
+            md.append("*(No recommended actions)*")
+            md.append("")
+        
+        return "\n".join(md)
 
     def get_recent_analyses(
         self,
@@ -1831,6 +1986,18 @@ class SmartRiskManagerToolkit:
                             session.add(trans)
                             session.commit()
                     
+                    # Log failed transaction creation
+                    from .utils import log_transaction_created_activity
+                    log_transaction_created_activity(
+                        trading_order=entry_order,
+                        account_id=self.account_id,
+                        transaction_id=transaction_id,
+                        expert_id=self.expert_instance_id,
+                        current_price=current_price,
+                        success=False,
+                        error_message="Failed to submit entry order"
+                    )
+                    
                     return {
                         "success": False,
                         "message": f"Failed to submit entry order for {symbol}",
@@ -1844,6 +2011,17 @@ class SmartRiskManagerToolkit:
                 order_id = submitted_order.id
                 logger.info(f"Successfully opened position: transaction_id={transaction_id}, order_id={order_id}")
                 
+                # Log successful transaction creation
+                from .utils import log_transaction_created_activity
+                log_transaction_created_activity(
+                    trading_order=entry_order,
+                    account_id=self.account_id,
+                    transaction_id=transaction_id,
+                    expert_id=self.expert_instance_id,
+                    current_price=current_price,
+                    success=True
+                )
+                
             except Exception as e:
                 # Mark transaction as FAILED if order submission raised exception
                 with get_db() as session:
@@ -1852,6 +2030,18 @@ class SmartRiskManagerToolkit:
                         trans.status = TransactionStatus.FAILED
                         session.add(trans)
                         session.commit()
+                
+                # Log failed transaction creation
+                from .utils import log_transaction_created_activity
+                log_transaction_created_activity(
+                    trading_order=entry_order,
+                    account_id=self.account_id,
+                    transaction_id=transaction_id,
+                    expert_id=self.expert_instance_id,
+                    current_price=current_price,
+                    success=False,
+                    error_message=str(e)
+                )
                 
                 logger.error(f"Error submitting entry order for {symbol}: {e}", exc_info=True)
                 return {
