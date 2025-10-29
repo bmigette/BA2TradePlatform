@@ -843,9 +843,12 @@ Expected Profit % = (Weighted Delta / Current) × 100 = {expected_profit_percent
                         ui.label('Price Range').classes('text-caption text-grey-7 mb-2')
                         
                         # Calculate positions for visualization
-                        price_range = high - low
-                        current_pos = ((current_price - low) / price_range * 100) if price_range > 0 else 50
-                        consensus_pos = ((consensus - low) / price_range * 100) if price_range > 0 else 50
+                        # Include current_price in scale to ensure it's always visible
+                        scale_min = min(current_price, low)
+                        scale_max = max(current_price, high)
+                        price_range = scale_max - scale_min
+                        current_pos = ((current_price - scale_min) / price_range * 100) if price_range > 0 else 50
+                        consensus_pos = ((consensus - scale_min) / price_range * 100) if price_range > 0 else 50
                         
                         with ui.element('div').classes('relative w-full h-12 bg-grey-3 rounded'):
                             # Low to High gradient background
@@ -862,8 +865,8 @@ Expected Profit % = (Weighted Delta / Current) × 100 = {expected_profit_percent
                                     ui.label('Target').classes('text-xs font-bold text-orange-600')
                         
                         with ui.row().classes('w-full justify-between mt-8'):
-                            ui.label(f'${low:.2f}').classes('text-xs text-grey-6')
-                            ui.label(f'${high:.2f}').classes('text-xs text-grey-6')
+                            ui.label(f'${scale_min:.2f}').classes('text-xs text-grey-6')
+                            ui.label(f'${scale_max:.2f}').classes('text-xs text-grey-6')
             
             # Analyst Recommendations Breakdown
             analyst_breakdown = state.get('analyst_breakdown', {})
