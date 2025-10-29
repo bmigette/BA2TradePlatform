@@ -6,7 +6,7 @@ from typing import Optional, List, TYPE_CHECKING
 from datetime import datetime, timezone
 from .db import get_instance, get_db
 from .models import ExpertInstance, TradingOrder, ExpertRecommendation, MarketAnalysis, Transaction
-from .types import OrderStatus, TransactionStatus, ActivityLogSeverity, ActivityLogType
+from .types import OrderStatus, TransactionStatus, ActivityLogSeverity, ActivityLogType, OrderDirection
 from ..modules.experts import get_expert_class
 from ..modules.accounts import get_account_class
 from ..logger import logger
@@ -361,9 +361,94 @@ def close_transaction_with_logging(
         if close_reason in ["entry_orders_terminal_no_execution", "entry_orders_terminal_after_opening"]:
             severity = ActivityLogSeverity.INFO
         
-        # Log activity
+        # Log activity (best effort - don't fail transaction close if logging fails)
+        try:
+            from .db import log_activity
+            
+            log_activity(
+                severity=severity,
+                activity_type=ActivityLogType.TRANSACTION_CLOSED,
+                description=description,
+                data=activity_data,
+                source_account_id=account_id,
+                source_expert_id=transaction.expert_id
+            )
+        except Exception as log_error:
+            # Log activity failed, but don't fail the transaction close
+            logger.warning(f"Failed to log activity for transaction {transaction.id} closure: {log_error}")
+        
+        logger.info(f"Closed transaction {transaction.id} ({transaction.symbol}): {close_reason}")
+        
+    except Exception as e:
+        logger.error(f"Error closing transaction {transaction.id} with logging: {e}", exc_info=True)
+
+
+def log_close_order_activity(
+    transaction: Transaction,
+    account_id: int,
+    success: bool,
+    error_message: Optional[str] = None,
+    close_order_id: Optional[int] = None,
+    quantity: Optional[float] = None,
+    side: Optional[OrderDirection] = None,
+    canceled_count: int = 0,
+    deleted_count: int = 0,
+    is_retry: bool = False
+) -> None:
+    """
+    Log activity for close order submission (success or failure).
+    
+    This centralized function should be used by all code paths that submit close orders
+    to ensure consistent activity logging.
+    
+    Args:
+        transaction: The transaction being closed
+        account_id: The account ID for activity logging
+        success: Whether the order submission was successful
+        error_message: Error message if submission failed (optional)
+        close_order_id: The ID of the submitted close order (if successful)
+        quantity: The quantity of the close order
+        side: The side of the close order (BUY/SELL)
+        canceled_count: Number of orders canceled
+        deleted_count: Number of orders deleted
+        is_retry: Whether this is a retry of a previous order
+    """
+    try:
         from .db import log_activity
         
+        # Build activity description
+        action = "Retried" if is_retry else "Submitted"
+        status = "closing order" if success else "to submit closing order"
+        
+        description = f"{action if not success else 'Submitted'} closing order for {transaction.symbol} transaction #{transaction.id}"
+        if not success:
+            description = f"Failed {action.lower()} closing order for {transaction.symbol} transaction #{transaction.id}"
+        
+        # Build activity data
+        activity_data = {
+            "transaction_id": transaction.id,
+            "symbol": transaction.symbol,
+            "canceled_count": canceled_count,
+            "deleted_count": deleted_count
+        }
+        
+        if is_retry:
+            activity_data["retry"] = True
+        
+        if success and close_order_id:
+            activity_data["close_order_id"] = close_order_id
+            if quantity is not None:
+                activity_data["quantity"] = quantity
+            if side is not None:
+                activity_data["side"] = side.value
+        
+        if not success and error_message:
+            activity_data["error"] = error_message
+        
+        # Determine severity
+        severity = ActivityLogSeverity.SUCCESS if success else ActivityLogSeverity.FAILURE
+        
+        # Log activity
         log_activity(
             severity=severity,
             activity_type=ActivityLogType.TRANSACTION_CLOSED,
@@ -373,8 +458,157 @@ def close_transaction_with_logging(
             source_expert_id=transaction.expert_id
         )
         
-        logger.info(f"Closed transaction {transaction.id} ({transaction.symbol}): {close_reason}")
+    except Exception as e:
+        logger.warning(f"Failed to log close order activity: {e}")
+
+
+def log_transaction_created_activity(
+    trading_order: TradingOrder,
+    account_id: int,
+    transaction_id: Optional[int] = None,
+    expert_id: Optional[int] = None,
+    current_price: Optional[float] = None,
+    success: bool = True,
+    error_message: Optional[str] = None
+) -> None:
+    """
+    Log activity for transaction creation (success or failure).
+    
+    This centralized function should be used by all code paths that create transactions
+    to ensure consistent activity logging.
+    
+    Args:
+        trading_order: The trading order for which transaction was created
+        account_id: The account ID for activity logging
+        transaction_id: The ID of the created transaction (if successful)
+        expert_id: The expert ID that created the transaction
+        current_price: The current price at transaction creation
+        success: Whether the transaction creation was successful
+        error_message: Error message if creation failed (optional)
+    """
+    try:
+        from .db import log_activity
+        
+        if success:
+            description = f"Created {trading_order.side.value} transaction for {trading_order.symbol} (quantity: {trading_order.quantity})"
+            activity_data = {
+                "transaction_id": transaction_id,
+                "symbol": trading_order.symbol,
+                "side": trading_order.side.value,
+                "quantity": trading_order.quantity,
+                "order_id": trading_order.id
+            }
+            if current_price is not None:
+                activity_data["open_price"] = current_price
+            
+            severity = ActivityLogSeverity.SUCCESS
+        else:
+            description = f"Failed to create transaction for {trading_order.symbol}: {error_message or 'Unknown error'}"
+            activity_data = {
+                "symbol": trading_order.symbol,
+                "side": trading_order.side.value,
+                "quantity": trading_order.quantity,
+                "order_id": trading_order.id
+            }
+            if error_message:
+                activity_data["error"] = error_message
+            
+            severity = ActivityLogSeverity.FAILURE
+        
+        # Log activity
+        log_activity(
+            severity=severity,
+            activity_type=ActivityLogType.TRANSACTION_CREATED,
+            description=description,
+            data=activity_data,
+            source_expert_id=expert_id,
+            source_account_id=account_id
+        )
         
     except Exception as e:
-        logger.error(f"Error closing transaction {transaction.id} with logging: {e}", exc_info=True)
+        logger.warning(f"Failed to log transaction creation activity: {e}")
+
+
+def log_tp_sl_adjustment_activity(
+    trading_order: TradingOrder,
+    account_id: int,
+    adjustment_type: str,  # "tp" or "sl"
+    new_price: Optional[float] = None,
+    percent: Optional[float] = None,
+    order_id: Optional[int] = None,
+    success: bool = True,
+    error_message: Optional[str] = None
+) -> None:
+    """
+    Log activity for TP/SL adjustment (success or failure).
+    
+    This centralized function should be used by all code paths that adjust TP/SL
+    to ensure consistent activity logging.
+    
+    Args:
+        trading_order: The trading order whose TP/SL is being adjusted
+        account_id: The account ID for activity logging
+        adjustment_type: Type of adjustment ("tp" or "sl")
+        new_price: The new TP/SL price
+        percent: The TP/SL percentage
+        order_id: The ID of the TP/SL order
+        success: Whether the adjustment was successful
+        error_message: Error message if adjustment failed (optional)
+    """
+    try:
+        from .db import log_activity, get_instance
+        from .models import Transaction
+        
+        # Get transaction for expert_id
+        transaction = None
+        if trading_order and trading_order.transaction_id:
+            transaction = get_instance(Transaction, trading_order.transaction_id)
+        
+        adjustment_name = "TP" if adjustment_type == "tp" else "SL"
+        
+        if success:
+            description = f"Changed {adjustment_name} for {trading_order.symbol}"
+            if new_price is not None:
+                description += f" to ${new_price:.2f}"
+            if percent is not None:
+                description += f" ({percent:.2f}%)"
+            
+            activity_data = {
+                "order_id": order_id,
+                "symbol": trading_order.symbol,
+                "transaction_id": trading_order.transaction_id
+            }
+            if new_price is not None:
+                activity_data[f"new_{adjustment_type}"] = new_price
+            if percent is not None:
+                activity_data[f"{adjustment_type}_percent"] = percent
+            
+            severity = ActivityLogSeverity.SUCCESS
+            activity_type = ActivityLogType.TRANSACTION_TP_CHANGED if adjustment_type == "tp" else ActivityLogType.TRANSACTION_SL_CHANGED
+        else:
+            description = f"Failed to set {adjustment_name} for {trading_order.symbol}: {error_message or 'Unknown error'}"
+            activity_data = {
+                "order_id": trading_order.id if trading_order else None,
+                "symbol": trading_order.symbol if trading_order else None,
+                "transaction_id": trading_order.transaction_id if trading_order else None
+            }
+            if error_message:
+                activity_data["error"] = error_message
+            
+            severity = ActivityLogSeverity.FAILURE
+            activity_type = ActivityLogType.TRANSACTION_TP_CHANGED if adjustment_type == "tp" else ActivityLogType.TRANSACTION_SL_CHANGED
+        
+        # Log activity
+        log_activity(
+            severity=severity,
+            activity_type=activity_type,
+            description=description,
+            data=activity_data,
+            source_expert_id=transaction.expert_id if transaction else None,
+            source_account_id=account_id
+        )
+        
+    except Exception as e:
+        logger.warning(f"Failed to log {adjustment_type.upper()} adjustment activity: {e}")
+
 

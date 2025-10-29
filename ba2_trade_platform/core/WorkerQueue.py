@@ -885,7 +885,7 @@ class WorkerQueue:
             from .db import get_instance, add_instance, update_instance
             from .models import ExpertInstance, SmartRiskManagerJob
             from .SmartRiskManagerGraph import run_smart_risk_manager
-            from ..core.interfaces import get_expert_instance_from_id
+            from .utils import get_expert_instance_from_id
             
             # Get the expert instance to retrieve settings
             expert_instance = get_instance(ExpertInstance, task.expert_instance_id)
@@ -993,6 +993,29 @@ class WorkerQueue:
             
             execution_time = task.completed_at - task.started_at
             logger.error(f"Smart Risk Manager task '{task.id}' failed after {execution_time:.2f}s: {e}", exc_info=True)
+            
+            # Log activity for task failure
+            try:
+                from .db import log_activity
+                from .types import ActivityLogSeverity, ActivityLogType
+                
+                log_activity(
+                    severity=ActivityLogSeverity.FAILURE,
+                    activity_type=ActivityLogType.TASK_FAILED,
+                    description=f"Smart Risk Manager task '{task.id}' failed: {str(e)}",
+                    data={
+                        "task_id": task.id,
+                        "task_type": "smart_risk_manager",
+                        "expert_instance_id": task.expert_instance_id,
+                        "job_id": job_id,
+                        "execution_time": execution_time,
+                        "error": str(e)
+                    },
+                    source_expert_id=task.expert_instance_id,
+                    source_account_id=None  # No account context for SRM tasks
+                )
+            except Exception as log_error:
+                logger.warning(f"Failed to log Smart Risk Manager task failure activity: {log_error}")
         
         finally:
             # Clean up task key mapping for completed/failed tasks

@@ -1144,6 +1144,12 @@ class Toolkit:
         if "ohlcv" not in self.provider_map or not self.provider_map["ohlcv"]:
             return "Error: No OHLCV providers configured"
         
+        # Validate date parameters
+        if not start_date or not start_date.strip():
+            return "Error: start_date is required and cannot be empty"
+        if not end_date or not end_date.strip():
+            return "Error: end_date is required and cannot be empty"
+        
         try:
             start_dt = datetime.strptime(start_date, "%Y-%m-%d")
             end_dt = datetime.strptime(end_date, "%Y-%m-%d")

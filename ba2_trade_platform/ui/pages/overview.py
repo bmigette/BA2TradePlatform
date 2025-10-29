@@ -3169,12 +3169,14 @@ class TransactionsTab:
                 
                 # Filter controls
                 with ui.row().classes('gap-2'):
+                    # Multi-select status filter with all except CLOSED selected by default
                     self.status_filter = ui.select(
                         label='Status Filter',
-                        options=['All', 'Open', 'Closed', 'Waiting'],
-                        value='All',
+                        options=['Waiting', 'Open', 'Closing', 'Closed'],
+                        value=['Waiting', 'Open', 'Closing'],  # Default: all except Closed
+                        multiple=True,
                         on_change=lambda: self._refresh_transactions()
-                    ).classes('w-32')
+                    ).classes('w-48')
                     
                     # Expert filter - populated with all experts
                     self.expert_filter = ui.select(
@@ -3414,16 +3416,20 @@ class TransactionsTab:
             
             logger.debug(f"[TRANSACTIONS] Initial query built")
             
-            # Apply status filter
-            status_value = self.status_filter.value if hasattr(self, 'status_filter') else 'All'
-            logger.debug(f"[TRANSACTIONS] Status filter: {status_value}")
-            if status_value != 'All':
+            # Apply status filter (multi-select)
+            status_values = self.status_filter.value if hasattr(self, 'status_filter') else ['Waiting', 'Open', 'Closing']
+            logger.debug(f"[TRANSACTIONS] Status filter: {status_values}")
+            if status_values and len(status_values) > 0:
                 status_map = {
                     'Open': TransactionStatus.OPENED,
                     'Closed': TransactionStatus.CLOSED,
+                    'Closing': TransactionStatus.CLOSING,
                     'Waiting': TransactionStatus.WAITING
                 }
-                statement = statement.where(Transaction.status == status_map[status_value])
+                # Filter by selected statuses
+                selected_statuses = [status_map[s] for s in status_values if s in status_map]
+                if selected_statuses:
+                    statement = statement.where(Transaction.status.in_(selected_statuses))
             
             # Apply expert filter
             if hasattr(self, 'expert_filter') and self.expert_filter.value != 'All':

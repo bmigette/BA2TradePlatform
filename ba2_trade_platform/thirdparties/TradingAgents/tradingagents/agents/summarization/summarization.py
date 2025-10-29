@@ -3,6 +3,7 @@ Final summarization agent for TradingAgents with proper LangGraph integration
 Uses LangChain's structured output capabilities to generate JSON recommendations
 """
 import json
+import re
 from typing import Dict, Any, Optional
 from datetime import datetime
 from pydantic import BaseModel, Field
@@ -11,6 +12,25 @@ from langchain_core.output_parsers import JsonOutputParser, PydanticOutputParser
 
 from ...prompts import get_prompt
 from ... import logger
+
+
+def clean_json_string(json_str: str) -> str:
+    """
+    Clean common JSON formatting issues from LLM output
+    - Removes trailing commas before closing brackets/braces
+    - Removes comments
+    """
+    # Remove trailing commas before closing brackets/braces
+    # Pattern: comma followed by optional whitespace and closing bracket/brace
+    json_str = re.sub(r',(\s*[}\]])', r'\1', json_str)
+    
+    # Remove single-line comments (// ...)
+    json_str = re.sub(r'//.*$', '', json_str, flags=re.MULTILINE)
+    
+    # Remove multi-line comments (/* ... */)
+    json_str = re.sub(r'/\*.*?\*/', '', json_str, flags=re.DOTALL)
+    
+    return json_str
 
 
 # Pydantic models for structured output
@@ -52,9 +72,17 @@ def create_final_summarization_agent(llm):
         Function that can be used as a LangGraph node
     """
     
-    # Use JsonOutputParser for reliable JSON output extraction
-    # This works with both OpenAI and NagaAI without API compatibility issues
-    json_parser = JsonOutputParser(pydantic_object=ExpertRecommendation)
+    # Custom JSON parser that cleans common LLM formatting issues
+    class CleanJsonOutputParser(JsonOutputParser):
+        """JsonOutputParser with JSON cleaning for LLM outputs"""
+        
+        def parse(self, text: str) -> Any:
+            """Parse JSON with cleaning to handle trailing commas and comments"""
+            cleaned_text = clean_json_string(text)
+            return super().parse(cleaned_text)
+    
+    # Use custom parser with JSON cleaning
+    json_parser = CleanJsonOutputParser(pydantic_object=ExpertRecommendation)
     
     def summarization_agent_node(state: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -101,6 +129,9 @@ def create_final_summarization_agent(llm):
         except Exception as e:
             logger.error(f"Error in summarization agent: {str(e)}", exc_info=True)
             logger.log_step_complete("Final Summarization Agent", False)
+            
+            # Log activity for analysis failure
+            _log_analysis_failure(state, symbol, str(e))
             
             # Return state with fallback recommendation
             fallback_recommendation = _create_fallback_recommendation(state, symbol, current_price, str(e))
@@ -197,6 +228,61 @@ def _prepare_analysis_context(state: Dict[str, Any], symbol: str, current_price:
         ])
     
     return "\n".join(context_parts)
+
+
+def _log_analysis_failure(state: Dict[str, Any], symbol: str, error_msg: str) -> None:
+    """Log analysis failure to ActivityLog"""
+    try:
+        # Only log if we have market_analysis_id (database mode)
+        market_analysis_id = state.get("market_analysis_id")
+        if not market_analysis_id:
+            return
+        
+        # Import BA2 platform dependencies
+        from ba2_trade_platform.core.db import get_instance, log_activity
+        from ba2_trade_platform.core.models import MarketAnalysis, ExpertInstance
+        from ba2_trade_platform.core.types import ActivityLogSeverity, ActivityLogType
+        
+        # Get market analysis to retrieve expert_instance_id
+        market_analysis = get_instance(MarketAnalysis, market_analysis_id)
+        if not market_analysis:
+            logger.warning(f"Could not find MarketAnalysis {market_analysis_id} for activity logging")
+            return
+        
+        expert_instance_id = market_analysis.expert_instance_id
+        
+        # Get expert instance to retrieve account_id
+        expert_instance = get_instance(ExpertInstance, expert_instance_id)
+        if not expert_instance:
+            logger.warning(f"Could not find ExpertInstance {expert_instance_id} for activity logging")
+            return
+        
+        account_id = expert_instance.account_id
+        
+        # Determine error type for better categorization
+        error_type = "JSON Parsing Error" if "json" in error_msg.lower() or "parse" in error_msg.lower() else "Analysis Error"
+        
+        # Log the failure
+        log_activity(
+            severity=ActivityLogSeverity.FAILURE,
+            activity_type=ActivityLogType.ANALYSIS_FAILED,
+            description=f"TradingAgents analysis failed for {symbol}: {error_type}",
+            data={
+                "symbol": symbol,
+                "error_message": error_msg[:500],  # Truncate to 500 chars
+                "error_type": error_type,
+                "market_analysis_id": market_analysis_id,
+                "fallback_action": "HOLD"
+            },
+            source_account_id=account_id,
+            source_expert_id=expert_instance_id
+        )
+        
+        logger.info(f"Logged analysis failure activity for {symbol} (MarketAnalysis #{market_analysis_id})")
+        
+    except Exception as log_error:
+        # Don't let logging failures break the analysis
+        logger.warning(f"Failed to log analysis failure activity: {log_error}")
 
 
 def _create_fallback_recommendation(state: Dict[str, Any], symbol: str, current_price: float, error_msg: str) -> Dict[str, Any]:

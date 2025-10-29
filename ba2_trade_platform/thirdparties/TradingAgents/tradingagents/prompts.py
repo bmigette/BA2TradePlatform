@@ -292,18 +292,19 @@ FINAL_SUMMARIZATION_AGENT_PROMPT = """You are the Final Summarization Agent for 
 ## CRITICAL REQUIREMENTS
 1. **OUTPUT ONLY VALID JSON** - No markdown, explanations, or additional text
 2. **Use EXACT schema provided** - All fields are required
-3. **FOLLOW THE final_trade_decision EXCLUSIVELY** - The final_trade_decision is the authoritative recommendation
-4. **Use supporting data ONLY for context** - Market, News, Fundamentals, Sentiment, Macro data provide background information only
-5. **NEVER contradict the final_trade_decision** - All outputs must align with and support the final trade decision
+3. **NO TRAILING COMMAS** - Arrays and objects must NOT have commas after the last element
+4. **FOLLOW THE final_trade_decision EXCLUSIVELY** - The final_trade_decision is the authoritative recommendation
+5. **Use supporting data ONLY for context** - Market, News, Fundamentals, Sentiment, Macro data provide background information only
+6. **NEVER contradict the final_trade_decision** - All outputs must align with and support the final trade decision
 
 ## JSON SCHEMA (REQUIRED OUTPUT FORMAT)
 ```json
 {{
     "symbol": "TICKER",
     "recommended_action": "BUY|SELL|HOLD",
-    "expected_profit_percent": 0.0,  // REQUIRED: Estimate potential profit/loss percentage based on analysis. For BUY/SELL provide realistic estimate (e.g., 5-20%)
+    "expected_profit_percent": 0.0,
     "price_at_date": 0.0,
-    "confidence": 0.0,  // Confidence level (0-100 scale)
+    "confidence": 0.0,
     "details": "Detailed explanation (max 2000 chars)",
     "risk_level": "LOW|MEDIUM|HIGH",
     "time_horizon": "SHORT_TERM|MEDIUM_TERM|LONG_TERM",
@@ -318,6 +319,29 @@ FINAL_SUMMARIZATION_AGENT_PROMPT = """You are the Final Summarization Agent for 
         "technical_signals": "BUY|SELL|NEUTRAL"
     }}
 }}
+```
+
+## CRITICAL JSON FORMATTING RULES
+⚠️ **COMMON MISTAKES TO AVOID**:
+1. ❌ NO trailing commas: `["item1", "item2",]` ← INVALID
+2. ✅ Correct format: `["item1", "item2"]` ← VALID
+3. ❌ NO comments in JSON: `"confidence": 72.0,  // high confidence` ← INVALID
+4. ✅ Use only data: `"confidence": 72.0` ← VALID
+
+**Examples of INVALID JSON (DO NOT OUTPUT)**:
+```
+"key_factors": [
+    "Factor 1",
+    "Factor 2",  ← INVALID TRAILING COMMA
+]
+```
+
+**Examples of VALID JSON (CORRECT FORMAT)**:
+```
+"key_factors": [
+    "Factor 1",
+    "Factor 2"
+]
 ```
 
 ## DECISION FRAMEWORK - FINAL_TRADE_DECISION PRIORITY

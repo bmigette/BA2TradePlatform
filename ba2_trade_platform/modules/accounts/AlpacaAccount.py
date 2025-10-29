@@ -771,29 +771,52 @@ class AlpacaAccount(AccountInterface):
         Cancel an existing order.
         
         Args:
-            order_id (str): Our database order ID (will be looked up to get broker_order_id).
+            order_id (str): Either our database order ID or broker_order_id (UUID).
+                           If it's a UUID (contains dashes), it's treated as broker_order_id.
+                           Otherwise, it's treated as database order ID.
             
         Returns:
             bool: True if cancellation was successful, False otherwise.
         """
         try:
-            # Look up the order in our database to get the broker_order_id
-            db_order = get_instance(TradingOrder, int(order_id))
-            if not db_order:
-                logger.error(f"Order {order_id} not found in database")
-                return False
-            
-            if not db_order.broker_order_id:
-                logger.error(f"Order {order_id} has no broker_order_id")
-                return False
+            # Determine if order_id is a broker_order_id (UUID) or database ID
+            if '-' in str(order_id):
+                # It's a broker_order_id (UUID format)
+                broker_order_id = str(order_id)
+                # Look up database order by broker_order_id
+                with Session(get_db().bind) as session:
+                    statement = select(TradingOrder).where(TradingOrder.broker_order_id == broker_order_id)
+                    db_order = session.exec(statement).first()
+                    if db_order:
+                        db_order_id = db_order.id
+                    else:
+                        logger.warning(f"Order with broker_order_id {broker_order_id} not found in database, attempting cancellation anyway")
+                        db_order_id = None
+            else:
+                # It's a database order ID
+                db_order_id = int(order_id)
+                db_order = get_instance(TradingOrder, db_order_id)
+                if not db_order:
+                    logger.error(f"Order {order_id} not found in database")
+                    return False
+                
+                if not db_order.broker_order_id:
+                    logger.error(f"Order {order_id} has no broker_order_id")
+                    return False
+                
+                broker_order_id = db_order.broker_order_id
             
             # Cancel using the broker's order ID (UUID)
-            self.client.cancel_order_by_id(db_order.broker_order_id)
-            logger.info(f"Cancelled Alpaca order: database_id={order_id}, broker_order_id={db_order.broker_order_id}")
+            self.client.cancel_order_by_id(broker_order_id)
+            logger.info(f"Cancelled Alpaca order: broker_order_id={broker_order_id}" + 
+                       (f", database_id={db_order_id}" if db_order_id else ""))
             
-            # Update the order status in our database
-            db_order.status = OrderStatus.CANCELED
-            update_instance(db_order)
+            # Update the order status in our database if we found it
+            if db_order_id:
+                db_order = get_instance(TradingOrder, db_order_id)
+                if db_order:
+                    db_order.status = OrderStatus.CANCELED
+                    update_instance(db_order)
             
             return True
         except Exception as e:

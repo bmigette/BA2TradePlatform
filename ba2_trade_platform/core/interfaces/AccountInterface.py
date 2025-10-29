@@ -356,53 +356,29 @@ class AccountInterface(ExtendableSettingsInterface):
             
             logger.info(f"Created transaction {transaction_id} for order: {trading_order.symbol} {trading_order.side.value} {trading_order.quantity} (expert_id={expert_id})")
             
-            # Log activity
-            try:
-                from ..db import log_activity
-                from ..types import ActivityLogSeverity, ActivityLogType
-                
-                log_activity(
-                    severity=ActivityLogSeverity.SUCCESS,
-                    activity_type=ActivityLogType.TRANSACTION_CREATED,
-                    description=f"Created {trading_order.side.value} transaction for {trading_order.symbol} (quantity: {trading_order.quantity})",
-                    data={
-                        "transaction_id": transaction_id,
-                        "symbol": trading_order.symbol,
-                        "side": trading_order.side.value,
-                        "quantity": trading_order.quantity,
-                        "open_price": current_price,
-                        "order_id": trading_order.id
-                    },
-                    source_expert_id=expert_id,
-                    source_account_id=self.id
-                )
-            except Exception as log_error:
-                logger.warning(f"Failed to log transaction creation activity: {log_error}")
+            # Log activity using centralized helper
+            from ..utils import log_transaction_created_activity
+            log_transaction_created_activity(
+                trading_order=trading_order,
+                account_id=self.id,
+                transaction_id=transaction_id,
+                expert_id=expert_id,
+                current_price=current_price,
+                success=True
+            )
             
         except Exception as e:
             logger.error(f"Error creating transaction for order: {e}", exc_info=True)
             
-            # Log activity for transaction creation failure
-            try:
-                from ..db import log_activity
-                from ..types import ActivityLogSeverity, ActivityLogType
-                
-                log_activity(
-                    severity=ActivityLogSeverity.FAILURE,
-                    activity_type=ActivityLogType.TRANSACTION_CREATED,
-                    description=f"Failed to create transaction for {trading_order.symbol}: {str(e)}",
-                    data={
-                        "symbol": trading_order.symbol,
-                        "side": trading_order.side.value,
-                        "quantity": trading_order.quantity,
-                        "order_id": trading_order.id,
-                        "error": str(e)
-                    },
-                    source_expert_id=expert_id if 'expert_id' in locals() else None,
-                    source_account_id=self.id
-                )
-            except Exception as log_error:
-                logger.warning(f"Failed to log transaction creation failure activity: {log_error}")
+            # Log activity for transaction creation failure using centralized helper
+            from ..utils import log_transaction_created_activity
+            log_transaction_created_activity(
+                trading_order=trading_order,
+                account_id=self.id,
+                expert_id=expert_id if 'expert_id' in locals() else None,
+                success=False,
+                error_message=str(e)
+            )
             
             raise ValueError(f"Failed to create transaction for order: {e}")
     
@@ -1324,28 +1300,17 @@ class AccountInterface(ExtendableSettingsInterface):
                     
                     logger.info(f"Successfully updated TP order {tp_order.id} to ${tp_price}")
                     
-                    # Log activity for TP change
-                    try:
-                        from ..db import log_activity
-                        from ..types import ActivityLogSeverity, ActivityLogType
-                        
-                        log_activity(
-                            severity=ActivityLogSeverity.SUCCESS,
-                            activity_type=ActivityLogType.TRANSACTION_TP_CHANGED,
-                            description=f"Updated TP for {transaction.symbol} transaction #{transaction_id} to ${tp_price:.2f}" + 
-                                       (f" ({tp_percent:.1f}%)" if tp_percent else ""),
-                            data={
-                                "transaction_id": transaction_id,
-                                "symbol": transaction.symbol,
-                                "new_tp": tp_price,
-                                "tp_percent": tp_percent,
-                                "order_id": existing_tp_order.id
-                            },
-                            source_expert_id=transaction.expert_id,
-                            source_account_id=self.id
-                        )
-                    except Exception as log_error:
-                        logger.warning(f"Failed to log TP change activity: {log_error}")
+                    # Log activity for TP change using centralized helper
+                    from ..utils import log_tp_sl_adjustment_activity
+                    log_tp_sl_adjustment_activity(
+                        trading_order=trading_order,
+                        account_id=self.id,
+                        adjustment_type="tp",
+                        new_price=tp_price,
+                        percent=tp_percent,
+                        order_id=existing_tp_order.id,
+                        success=True
+                    )
                 else:
                     # Create new TP order
                     if trading_order.side.upper() == "BUY":
@@ -1414,29 +1379,15 @@ class AccountInterface(ExtendableSettingsInterface):
         except Exception as e:
             logger.error(f"Error setting take profit for order {trading_order.id if trading_order else 'None'}: {e}", exc_info=True)
             
-            # Log activity for TP adjustment failure
-            try:
-                from ..db import log_activity
-                from ..types import ActivityLogSeverity, ActivityLogType
-                
-                transaction_id = trading_order.transaction_id if trading_order else None
-                transaction = get_instance(Transaction, transaction_id) if transaction_id else None
-                
-                log_activity(
-                    severity=ActivityLogSeverity.FAILURE,
-                    activity_type=ActivityLogType.TRANSACTION_TP_CHANGED,
-                    description=f"Failed to set TP for {trading_order.symbol if trading_order else 'unknown'}: {str(e)}",
-                    data={
-                        "order_id": trading_order.id if trading_order else None,
-                        "symbol": trading_order.symbol if trading_order else None,
-                        "transaction_id": transaction_id,
-                        "error": str(e)
-                    },
-                    source_expert_id=transaction.expert_id if transaction else None,
-                    source_account_id=self.id
-                )
-            except Exception as log_error:
-                logger.warning(f"Failed to log TP adjustment failure activity: {log_error}")
+            # Log activity for TP adjustment failure using centralized helper
+            from ..utils import log_tp_sl_adjustment_activity
+            log_tp_sl_adjustment_activity(
+                trading_order=trading_order,
+                account_id=self.id,
+                adjustment_type="tp",
+                success=False,
+                error_message=str(e)
+            )
             
             raise
 
@@ -1609,28 +1560,17 @@ class AccountInterface(ExtendableSettingsInterface):
                     
                     logger.info(f"Successfully updated SL order {sl_order.id} to ${sl_price}")
                     
-                    # Log activity for SL change
-                    try:
-                        from ..db import log_activity
-                        from ..types import ActivityLogSeverity, ActivityLogType
-                        
-                        log_activity(
-                            severity=ActivityLogSeverity.SUCCESS,
-                            activity_type=ActivityLogType.TRANSACTION_SL_CHANGED,
-                            description=f"Updated SL for {transaction.symbol} transaction #{transaction_id} to ${sl_price:.2f}" + 
-                                       (f" ({sl_percent:.1f}%)" if sl_percent else ""),
-                            data={
-                                "transaction_id": transaction_id,
-                                "symbol": transaction.symbol,
-                                "new_sl": sl_price,
-                                "sl_percent": sl_percent,
-                                "order_id": existing_sl_order.id
-                            },
-                            source_expert_id=transaction.expert_id,
-                            source_account_id=self.id
-                        )
-                    except Exception as log_error:
-                        logger.warning(f"Failed to log SL change activity: {log_error}")
+                    # Log activity for SL change using centralized helper
+                    from ..utils import log_tp_sl_adjustment_activity
+                    log_tp_sl_adjustment_activity(
+                        trading_order=trading_order,
+                        account_id=self.id,
+                        adjustment_type="sl",
+                        new_price=sl_price,
+                        percent=sl_percent,
+                        order_id=existing_sl_order.id,
+                        success=True
+                    )
                 else:
                     # Create new SL order
                     if trading_order.side.upper() == "BUY":
@@ -1699,29 +1639,15 @@ class AccountInterface(ExtendableSettingsInterface):
         except Exception as e:
             logger.error(f"Error setting stop loss for order {trading_order.id if trading_order else 'None'}: {e}", exc_info=True)
             
-            # Log activity for SL adjustment failure
-            try:
-                from ..db import log_activity
-                from ..types import ActivityLogSeverity, ActivityLogType
-                
-                transaction_id = trading_order.transaction_id if trading_order else None
-                transaction = get_instance(Transaction, transaction_id) if transaction_id else None
-                
-                log_activity(
-                    severity=ActivityLogSeverity.FAILURE,
-                    activity_type=ActivityLogType.TRANSACTION_SL_CHANGED,
-                    description=f"Failed to set SL for {trading_order.symbol if trading_order else 'unknown'}: {str(e)}",
-                    data={
-                        "order_id": trading_order.id if trading_order else None,
-                        "symbol": trading_order.symbol if trading_order else None,
-                        "transaction_id": transaction_id,
-                        "error": str(e)
-                    },
-                    source_expert_id=transaction.expert_id if transaction else None,
-                    source_account_id=self.id
-                )
-            except Exception as log_error:
-                logger.warning(f"Failed to log SL adjustment failure activity: {log_error}")
+            # Log activity for SL adjustment failure using centralized helper
+            from ..utils import log_tp_sl_adjustment_activity
+            log_tp_sl_adjustment_activity(
+                trading_order=trading_order,
+                account_id=self.id,
+                adjustment_type="sl",
+                success=False,
+                error_message=str(e)
+            )
             
             raise
 
@@ -2516,11 +2442,47 @@ class AccountInterface(ExtendableSettingsInterface):
                                         result['message'] += f' ({result["canceled_count"]} orders canceled)'
                                     if result['deleted_count'] > 0:
                                         result['message'] += f' ({result["deleted_count"]} waiting orders deleted)'
+                                    
+                                    # Log successful retry
+                                    from ..utils import log_close_order_activity
+                                    log_close_order_activity(
+                                        transaction=transaction,
+                                        account_id=self.id,
+                                        success=True,
+                                        close_order_id=result['close_order_id'],
+                                        canceled_count=result['canceled_count'],
+                                        deleted_count=result['deleted_count'],
+                                        is_retry=True
+                                    )
                                 else:
                                     result['message'] = 'Failed to retry closing order'
+                                    
+                                    # Log failed retry
+                                    from ..utils import log_close_order_activity
+                                    log_close_order_activity(
+                                        transaction=transaction,
+                                        account_id=self.id,
+                                        success=False,
+                                        error_message="Order retry returned None",
+                                        canceled_count=result['canceled_count'],
+                                        deleted_count=result['deleted_count'],
+                                        is_retry=True
+                                    )
                             except Exception as e:
                                 logger.error(f"Error retrying close order: {e}", exc_info=True)
                                 result['message'] = f'Error retrying close order: {str(e)}'
+                                
+                                # Log retry exception
+                                from ..utils import log_close_order_activity
+                                log_close_order_activity(
+                                    transaction=transaction,
+                                    account_id=self.id,
+                                    success=False,
+                                    error_message=str(e),
+                                    canceled_count=result['canceled_count'],
+                                    deleted_count=result['deleted_count'],
+                                    is_retry=True
+                                )
                         else:
                             # Close order exists but not in error - do nothing
                             logger.info(f"Close order {existing_close_order.id} exists with status {existing_close_order.status}, no action needed")
@@ -2557,8 +2519,32 @@ class AccountInterface(ExtendableSettingsInterface):
                                 result['message'] += f' ({result["canceled_count"]} orders canceled)'
                             if result['deleted_count'] > 0:
                                 result['message'] += f' ({result["deleted_count"]} waiting orders deleted)'
+                            
+                            # Log successful close order submission
+                            from ..utils import log_close_order_activity
+                            log_close_order_activity(
+                                transaction=transaction,
+                                account_id=self.id,
+                                success=True,
+                                close_order_id=result['close_order_id'],
+                                quantity=abs(transaction.quantity),
+                                side=close_side,
+                                canceled_count=result['canceled_count'],
+                                deleted_count=result['deleted_count']
+                            )
                         else:
                             result['message'] = 'Failed to submit closing order'
+                            
+                            # Log failed close order submission
+                            from ..utils import log_close_order_activity
+                            log_close_order_activity(
+                                transaction=transaction,
+                                account_id=self.id,
+                                success=False,
+                                error_message="Order submission returned None",
+                                canceled_count=result['canceled_count'],
+                                deleted_count=result['deleted_count']
+                            )
                 else:
                     # No filled position, just report cleanup
                     result['success'] = True

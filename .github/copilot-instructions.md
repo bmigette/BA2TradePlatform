@@ -24,7 +24,8 @@ ba2_trade_platform/
 │   ├── ExtendableSettingsInterface.py  # Settings management
 │   ├── models.py           # SQLModel database models
 │   ├── types.py            # Enums (OrderStatus, ExpertActionType, etc.)
-│   └── db.py              # Database utilities
+│   ├── db.py              # Database utilities
+│   └── utils.py           # Shared utility functions (close_transaction_with_logging, etc.)
 ├── modules/
 │   ├── accounts/          # Account implementations (AlpacaAccount)
 │   └── experts/           # Expert implementations (TradingAgents)
@@ -38,7 +39,68 @@ ba2_trade_platform/
 
 ## Key Patterns
 
-### 1. **Settings Management**
+### 1. **CRITICAL: Avoid Code Duplication**
+**MOST IMPORTANT RULE**: Before writing any code, check if similar functionality already exists. If it does, refactor to use/extend the existing code instead of duplicating.
+
+**Common Anti-Patterns to Avoid**:
+- ❌ Copying try-except blocks with log_activity() calls
+- ❌ Duplicating transaction closing logic in multiple places
+- ❌ Repeating activity logging patterns with slight variations
+- ❌ Copy-pasting order submission, cancellation, or validation logic
+
+**Proper Approach**:
+- ✅ **ALWAYS check `core/utils.py` first** for existing helper functions
+- ✅ **Create helper functions** in `core/utils.py` for repeated patterns
+- ✅ **Extract common logic** into centralized functions with clear parameters
+- ✅ **Reuse existing functions** even if they need small modifications - extend them!
+
+**Example of Good Practice**:
+```python
+# ❌ BAD: Duplicated logging code
+try:
+    from ..db import log_activity
+    from ..types import ActivityLogSeverity, ActivityLogType
+    log_activity(
+        severity=ActivityLogSeverity.SUCCESS,
+        activity_type=ActivityLogType.TRANSACTION_CLOSED,
+        description=f"Submitted closing order for {symbol}",
+        data={...},
+        source_account_id=self.id,
+        source_expert_id=expert_id
+    )
+except Exception as e:
+    logger.warning(f"Failed to log: {e}")
+
+# ✅ GOOD: Use centralized helper function
+from ..utils import log_close_order_activity
+log_close_order_activity(
+    transaction=transaction,
+    account_id=self.id,
+    success=True,
+    close_order_id=order_id
+)
+```
+
+**Existing Helper Functions in `core/utils.py`**:
+- `close_transaction_with_logging()` - Close transactions with P&L calculation and activity logging
+- `log_close_order_activity()` - Log close order submission (success/failure/retry)
+- `get_account_instance_from_id()` - Get cached account instances
+
+**When to Create New Helper Functions**:
+- When you find yourself writing similar code in 2+ places
+- When error handling + logging patterns repeat
+- When business logic (like order validation, price calculations) is duplicated
+- When database operations follow the same pattern
+
+**Refactoring Checklist**:
+1. Search for similar code patterns in the codebase (`grep_search`, `semantic_search`)
+2. Identify what varies and what stays the same
+3. Extract common logic into a function with parameters for variations
+4. Add the function to `core/utils.py` with clear docstring
+5. Replace all instances with calls to the new function
+6. Test to ensure behavior is preserved
+
+### 2. **Settings Management**
 All plugins use the ExtendableSettingsInterface pattern:
 ```python
 class MyAccount(AccountInterface):
@@ -250,6 +312,34 @@ def open_sell_position(self, symbol, quantity, ...):
 
 See `docs/SMART_RISK_MANAGER_FUNCTION_SPLIT.md` for complete case study.
 
+### 10. **Activity Logging - Use Helper Functions**
+**CRITICAL RULE**: NEVER duplicate activity logging code. Always use or create helper functions in `core/utils.py`.
+
+**Existing Helper Functions**:
+- `close_transaction_with_logging()` - For transaction closures with P&L calculation
+- `log_close_order_activity()` - For close order submissions (success/failure/retry)
+
+**Pattern for New Activity Logging**:
+```python
+# ❌ BAD: Duplicated 50+ lines of try-except with log_activity
+try:
+    from ..db import log_activity
+    from ..types import ActivityLogSeverity, ActivityLogType
+    log_activity(severity=..., activity_type=..., description=..., data={...})
+except Exception as e:
+    logger.warning(f"Failed to log: {e}")
+
+# ✅ GOOD: Create/use helper function
+from ..utils import log_transaction_created_activity
+log_transaction_created_activity(transaction, account_id, success=True)
+```
+
+**When You Need Activity Logging**:
+1. Check if a helper function exists in `core/utils.py`
+2. If it exists, use it!
+3. If it doesn't exist but similar patterns do, refactor to create one
+4. Add proper docstring explaining parameters and usage
+
 ## Dependencies
 - **Trading**: `alpaca-py` (primary broker), `yfinance`, `backtrader`
 - **AI/ML**: `langchain-*` ecosystem, `stockstats`
@@ -306,3 +396,16 @@ See `docs/SMART_RISK_MANAGER_FUNCTION_SPLIT.md` for complete case study.
 
 **Rationale**: Automatic documentation generation clutters the repository and the user prefers to control when documentation is needed. Keep the focus on implementing solutions, not documenting them unless requested.
 
+## Code Review Checklist
+
+Before completing any task, verify:
+- [ ] No code duplication - checked for existing similar functions
+- [ ] Helper functions used from `core/utils.py` where applicable
+- [ ] Activity logging uses centralized helper functions
+- [ ] No `exc_info=True` outside exception handlers
+- [ ] Configuration access uses `config["key"]` not `.get()`
+- [ ] Live data has proper None checks, no default fallbacks
+- [ ] Confidence values use 1-100 scale consistently
+- [ ] API design uses explicit function names for AI agents
+- [ ] Database operations use core helpers (`get_instance`, etc.)
+- [ ] Proper error handling with explicit failures

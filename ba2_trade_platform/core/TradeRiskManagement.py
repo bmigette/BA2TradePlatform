@@ -190,9 +190,8 @@ class TradeRiskManagement:
             
             # Log activity for risk manager failure
             try:
-                from .db import log_activity, get_instance
+                from .db import log_activity
                 from .types import ActivityLogSeverity, ActivityLogType
-                from .models import ExpertInstance
                 
                 expert_instance = get_instance(ExpertInstance, expert_instance_id)
                 
