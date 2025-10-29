@@ -2659,6 +2659,9 @@ class ExpertSettingsTab:
                     
                     export_data = {}
                     
+                    # Export expert type/class
+                    export_data['expert_type'] = expert_instance.expert
+                    
                     # Export general settings
                     if export_general.value:
                         export_data['general'] = {
@@ -2768,6 +2771,14 @@ class ExpertSettingsTab:
                     # Import expert settings
                     if expert_instance and 'expert_settings' in import_data and hasattr(self, '_imported_expert_settings'):
                         self._imported_expert_settings = import_data['expert_settings']
+                        
+                        # Update UI with imported schedule configurations
+                        if 'execution_schedule_enter_market' in import_data['expert_settings']:
+                            self._load_enter_market_schedule_config(import_data['expert_settings']['execution_schedule_enter_market'])
+                        
+                        if 'execution_schedule_open_positions' in import_data['expert_settings']:
+                            self._load_open_positions_schedule_config(import_data['expert_settings']['execution_schedule_open_positions'])
+                        
                         ui.notify('Expert settings ready to import (will be applied on save)', type='info')
                     
                     # Import ruleset references by name
