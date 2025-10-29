@@ -7,12 +7,12 @@ risk manager runs, analysis execution, and more.
 """
 
 from nicegui import ui
-from sqlmodel import select, or_, and_
+from sqlmodel import select, or_, and_, Session
 from datetime import datetime, timezone
 from typing import Optional
 import asyncio
 
-from ...core.db import get_session, get_instance
+from ...core.db import get_db, get_instance
 from ...core.models import ActivityLog, ExpertInstance, AccountDefinition
 from ...core.types import ActivityLogSeverity, ActivityLogType
 from ...logger import logger
@@ -41,7 +41,7 @@ class ActivityMonitorPage:
             return
             
         try:
-            with get_session() as session:
+            with Session(get_db().bind) as session:
                 # Build query with filters
                 query = select(ActivityLog).order_by(ActivityLog.created_at.desc())
                 
@@ -212,7 +212,7 @@ class ActivityMonitorPage:
                     ui.label("Expert")
                     expert_options = {None: "All Experts"}
                     try:
-                        with get_session() as session:
+                        with Session(get_db().bind) as session:
                             experts = session.exec(select(ExpertInstance)).all()
                             for expert in experts:
                                 display = expert.alias or f"{expert.expert} #{expert.id}"

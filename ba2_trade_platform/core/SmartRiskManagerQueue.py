@@ -387,11 +387,57 @@ class SmartRiskManagerQueue:
                     smart_risk_job.duration_seconds = int(duration)
                 
                 logger.info(f"{worker_name} SmartRiskManagerJob {job_id} completed: {result.get('iterations', 0)} iterations, {result.get('actions_count', 0)} actions")
+                
+                # Log activity for successful smart risk manager execution
+                try:
+                    from .db import log_activity
+                    from .types import ActivityLogSeverity, ActivityLogType
+                    
+                    log_activity(
+                        severity=ActivityLogSeverity.SUCCESS,
+                        activity_type=ActivityLogType.RISK_MANAGER_RAN,
+                        description=f"Smart risk manager completed: {result.get('actions_count', 0)} actions in {result.get('iterations', 0)} iterations",
+                        data={
+                            "mode": "smart",
+                            "job_id": job_id,
+                            "iterations": result.get("iterations", 0),
+                            "actions_count": result.get("actions_count", 0),
+                            "model": model_used,
+                            "duration_seconds": smart_risk_job.duration_seconds,
+                            "initial_equity": initial_portfolio_equity,
+                            "final_equity": final_portfolio_equity
+                        },
+                        source_expert_id=task.expert_instance_id,
+                        source_account_id=task.account_id
+                    )
+                except Exception as log_error:
+                    logger.warning(f"Failed to log smart risk manager activity: {log_error}")
             else:
                 smart_risk_job.status = "FAILED"
                 error_message = result.get("error", "Unknown error")
                 smart_risk_job.error_message = error_message
                 logger.error(f"{worker_name} SmartRiskManagerJob {job_id} failed: {error_message}")
+                
+                # Log activity for failed smart risk manager execution
+                try:
+                    from .db import log_activity
+                    from .types import ActivityLogSeverity, ActivityLogType
+                    
+                    log_activity(
+                        severity=ActivityLogSeverity.FAILURE,
+                        activity_type=ActivityLogType.RISK_MANAGER_RAN,
+                        description=f"Smart risk manager failed: {error_message}",
+                        data={
+                            "mode": "smart",
+                            "job_id": job_id,
+                            "error": error_message,
+                            "model": model_used
+                        },
+                        source_expert_id=task.expert_instance_id,
+                        source_account_id=task.account_id
+                    )
+                except Exception as log_error:
+                    logger.warning(f"Failed to log smart risk manager failure activity: {log_error}")
             
             update_instance(smart_risk_job)
             
@@ -430,6 +476,27 @@ class SmartRiskManagerQueue:
                         update_instance(smart_risk_job)
                 except Exception as update_error:
                     logger.error(f"{worker_name} failed to update SmartRiskManagerJob {job_id} with error status: {update_error}")
+            
+            # Log activity for exception during smart risk manager execution
+            try:
+                from .db import log_activity
+                from .types import ActivityLogSeverity, ActivityLogType
+                
+                log_activity(
+                    severity=ActivityLogSeverity.FAILURE,
+                    activity_type=ActivityLogType.RISK_MANAGER_RAN,
+                    description=f"Smart risk manager exception: {str(e)}",
+                    data={
+                        "mode": "smart",
+                        "job_id": job_id,
+                        "error": str(e),
+                        "exception_type": type(e).__name__
+                    },
+                    source_expert_id=task.expert_instance_id,
+                    source_account_id=task.account_id
+                )
+            except Exception as log_error:
+                logger.warning(f"Failed to log smart risk manager exception activity: {log_error}")
             
             # Update task with failure
             with self._task_lock:

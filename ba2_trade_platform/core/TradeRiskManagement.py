@@ -163,8 +163,53 @@ class TradeRiskManagement:
             self.logger.info(f"Risk management completed for expert {expert_instance_id}: "
                            f"updated {len(updated_orders)} orders, deleted {len(orders_to_delete) if orders_to_delete else 0} unfunded orders")
             
+            # Log activity for risk manager execution
+            try:
+                from .db import log_activity
+                from .types import ActivityLogSeverity, ActivityLogType
+                
+                log_activity(
+                    severity=ActivityLogSeverity.SUCCESS,
+                    activity_type=ActivityLogType.RISK_MANAGER_RAN,
+                    description=f"Classic risk manager processed {len(updated_orders)} orders",
+                    data={
+                        "mode": "classic",
+                        "orders_updated": len(updated_orders),
+                        "orders_deleted": len(orders_to_delete) if orders_to_delete else 0,
+                        "available_balance": total_virtual_balance,
+                        "max_per_instrument": max_equity_per_instrument
+                    },
+                    source_expert_id=expert_instance_id,
+                    source_account_id=expert_instance.account_id
+                )
+            except Exception as log_error:
+                self.logger.warning(f"Failed to log risk manager activity: {log_error}")
+            
         except Exception as e:
             self.logger.error(f"Error in risk management for expert {expert_instance_id}: {e}", exc_info=True)
+            
+            # Log activity for risk manager failure
+            try:
+                from .db import log_activity, get_instance
+                from .types import ActivityLogSeverity, ActivityLogType
+                from .models import ExpertInstance
+                
+                expert_instance = get_instance(ExpertInstance, expert_instance_id)
+                
+                log_activity(
+                    severity=ActivityLogSeverity.FAILURE,
+                    activity_type=ActivityLogType.RISK_MANAGER_RAN,
+                    description=f"Classic risk manager failed: {str(e)}",
+                    data={
+                        "mode": "classic",
+                        "error": str(e)
+                    },
+                    source_expert_id=expert_instance_id,
+                    source_account_id=expert_instance.account_id if expert_instance else None
+                )
+            except Exception as log_error:
+                self.logger.warning(f"Failed to log risk manager failure activity: {log_error}")
+            
             raise  # Re-raise the exception to allow UI to handle it
         
         return updated_orders
