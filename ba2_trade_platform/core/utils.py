@@ -753,7 +753,8 @@ def get_risk_manager_mode(settings: dict, default: str = "classic") -> str:
     if not settings or not isinstance(settings, dict):
         return default
     
-    risk_manager_mode = settings.get("risk_manager_mode", "").strip().lower()
+    risk_manager_mode = settings.get("risk_manager_mode", "") or ""
+    risk_manager_mode = risk_manager_mode.strip().lower()
     
     # Validate the value
     valid_modes = ["classic", "smart"]

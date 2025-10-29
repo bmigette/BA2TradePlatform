@@ -2001,32 +2001,38 @@ class AlpacaAccount(AccountInterface):
         else:
             return order.side == OrderDirection.BUY and order.stop_price > (entry_order.open_price or 0)
     
-    def adjust_tp(self, transaction: Transaction, new_tp_price: float) -> bool:
+    def _adjust_tpsl_internal(
+        self, 
+        transaction: Transaction, 
+        new_tp_price: float | None = None, 
+        new_sl_price: float | None = None
+    ) -> bool:
         """
-        Adjust take profit for a transaction (Alpaca-specific stateless implementation).
+        Internal unified helper for adjusting TP and/or SL.
         
-        This method is stateless - it determines the action based on current state:
-        
-        1. Update transaction.take_profit (source of truth)
-        2. Find entry order and existing TP order (if any)
-        3. Determine action based on order states:
-           - Entry order in PENDING/WAITING_TRIGGER: Create/update PENDING TP order
-           - Entry order FILLED + no existing TP: Create OCO/OTO order to broker
-           - Entry order FILLED + existing TP PENDING: Update pending order
-           - Entry order FILLED + existing TP ACCEPTED/FILLED: Try replace, if fails create PENDING_CANCEL order
+        This consolidates all the duplicated logic from adjust_tp(), adjust_sl(), and adjust_tp_sl().
         
         Args:
-            transaction: Transaction to adjust TP for
-            new_tp_price: New take profit price
+            transaction: Transaction to adjust
+            new_tp_price: New take profit price (None = don't adjust TP)
+            new_sl_price: New stop loss price (None = don't adjust SL)
             
         Returns:
             bool: True if adjustment succeeded
         """
         try:
-            logger.info(f"Adjusting TP for transaction {transaction.id} to ${new_tp_price:.2f}")
+            adjustment_type = []
+            if new_tp_price is not None:
+                adjustment_type.append(f"TP=${new_tp_price:.2f}")
+            if new_sl_price is not None:
+                adjustment_type.append(f"SL=${new_sl_price:.2f}")
+            logger.info(f"Adjusting {', '.join(adjustment_type)} for transaction {transaction.id}")
             
             # 1. Update transaction (source of truth)
-            transaction.take_profit = new_tp_price
+            if new_tp_price is not None:
+                transaction.take_profit = new_tp_price
+            if new_sl_price is not None:
+                transaction.stop_loss = new_sl_price
             update_instance(transaction)
             
             # 2. Get entry order (first market/limit order for this transaction, not TP/SL)
@@ -2043,124 +2049,286 @@ class AlpacaAccount(AccountInterface):
                     logger.error(f"No entry order found for transaction {transaction.id}")
                     return False
                 
-                # 3. Find existing TP order (any non-terminal order that functions as TP)
-                # This includes legacy LIMIT orders, STOP_LIMIT with limit price, and new OTO/OCO orders
+                # 3. Find existing TP/SL/OCO orders
                 all_orders = session.exec(
                     select(TradingOrder).where(
                         TradingOrder.transaction_id == transaction.id,
                         TradingOrder.status.notin_(OrderStatus.get_terminal_statuses()),
-                        TradingOrder.id != entry_order.id  # Exclude entry order
+                        TradingOrder.id != entry_order.id
                     )
                 ).all()
                 
                 existing_tp = None
-                existing_oco = None  # OCO orders that might contain TP
+                existing_sl = None
+                existing_oco = None
+                
                 for order in all_orders:
-                    if self._is_tp_order(order, entry_order):
-                        existing_tp = order
-                        break
-                    # Also check for OCO orders (they have both TP and SL)
                     if order.order_type == CoreOrderType.OCO and order.limit_price and order.stop_price:
                         existing_oco = order
+                    elif self._is_tp_order(order, entry_order):
+                        existing_tp = order
+                    elif self._is_sl_order(order, entry_order):
+                        existing_sl = order
                 
-                # 4. Determine action based on states
-                logger.debug(f"Entry order {entry_order.id} status: {entry_order.status}, existing_tp: {existing_tp.id if existing_tp else None}, existing_oco: {existing_oco.id if existing_oco else None}")
+                # Determine if we need OCO (both TP and SL defined)
+                has_tp = transaction.take_profit is not None and transaction.take_profit > 0
+                has_sl = transaction.stop_loss is not None and transaction.stop_loss > 0
+                need_oco = has_tp and has_sl
+                
+                logger.debug(f"Entry order {entry_order.id} status: {entry_order.status}, "
+                           f"existing_tp: {existing_tp.id if existing_tp else None}, "
+                           f"existing_sl: {existing_sl.id if existing_sl else None}, "
+                           f"existing_oco: {existing_oco.id if existing_oco else None}, "
+                           f"need_oco: {need_oco}")
+                
+                # 4. Determine action based on entry order state
                 if entry_order.status in OrderStatus.get_unsent_statuses():
-                    # Entry not sent to broker yet - create/update pending TP order
-                    if existing_tp:
-                        existing_tp.limit_price = new_tp_price
-                        # Upgrade legacy order types to new SELL_LIMIT/BUY_LIMIT/OCO
-                        order_type_value = existing_tp.order_type.value if hasattr(existing_tp.order_type, 'value') else str(existing_tp.order_type)
-                        logger.debug(f"TP order {existing_tp.id} (entry unsent) has type: {order_type_value}")
-                        if order_type_value not in ["sell_limit", "buy_limit", "oco"]:
-                            has_sl = transaction.stop_loss is not None and transaction.stop_loss > 0
-                            if has_sl:
-                                existing_tp.order_type = CoreOrderType.OCO
-                            else:
-                                # Determine correct limit type based on side
-                                tp_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
-                                existing_tp.order_type = CoreOrderType.SELL_LIMIT if tp_side == OrderDirection.SELL else CoreOrderType.BUY_LIMIT
-                            logger.info(f"Upgraded TP order {existing_tp.id} from {order_type_value} to {existing_tp.order_type.value}")
-                        session.add(existing_tp)
-                        session.commit()
-                        logger.info(f"Updated pending TP order {existing_tp.id} to ${new_tp_price:.2f}")
-                    elif existing_oco:
-                        # Update existing OCO order with new TP price
-                        existing_oco.limit_price = new_tp_price
-                        session.add(existing_oco)
-                        session.commit()
-                        logger.info(f"Updated pending OCO order {existing_oco.id} TP to ${new_tp_price:.2f}")
-                    else:
-                        # Create new pending TP order
-                        tp_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
-                        tp_comment = self._generate_tpsl_comment("TP", self.id, transaction.id, entry_order.id)
-                        
-                        # Use direction-specific limit type for TP-only orders
-                        order_type = CoreOrderType.SELL_LIMIT if tp_side == OrderDirection.SELL else CoreOrderType.BUY_LIMIT
-                        
-                        tp_order = TradingOrder(
-                            account_id=self.id,
-                            symbol=entry_order.symbol,
-                            quantity=entry_order.quantity,
-                            side=tp_side,
-                            order_type=order_type,
-                            limit_price=new_tp_price,
-                            transaction_id=transaction.id,
-                            status=OrderStatus.PENDING,
-                            depends_on_order=entry_order.id,
-                            open_type=OrderOpenType.AUTOMATIC,
-                            comment=tp_comment,
-                            data={"tp_percent_target": self._calculate_tp_percent(entry_order, new_tp_price)},
-                            created_at=datetime.now(timezone.utc)
-                        )
-                        session.add(tp_order)
-                        session.commit()
-                        logger.info(f"Created pending {order_type.value} TP order for transaction {transaction.id}")
-                    
-                    return True
+                    # Entry not sent to broker yet - create/update pending orders
+                    return self._handle_pending_entry_tpsl(
+                        session, transaction, entry_order, 
+                        new_tp_price, new_sl_price,
+                        existing_tp, existing_sl, existing_oco,
+                        need_oco
+                    )
                 
                 elif entry_order.status in OrderStatus.get_executed_statuses():
                     # Entry filled - work with broker
-                    
-                    # Cancel ALL existing TP/SL/OCO orders before creating new TP order
-                    orders_to_cancel = []
-                    if existing_tp:
-                        orders_to_cancel.append(existing_tp)
-                    if existing_oco:
-                        orders_to_cancel.append(existing_oco)
-                    # Also check for any other non-terminal TP/SL orders we might have missed
-                    for order in all_orders:
-                        if order not in orders_to_cancel and order.id not in [existing_tp.id if existing_tp else None, existing_oco.id if existing_oco else None]:
-                            # This is another TP/SL order - cancel it too
-                            orders_to_cancel.append(order)
-                    
-                    if orders_to_cancel:
-                        logger.info(f"Cancelling {len(orders_to_cancel)} existing TP/SL/OCO orders before creating new TP")
-                        for order in orders_to_cancel:
-                            if order.broker_order_id:
-                                # Order at broker - cancel via API
-                                try:
-                                    self.cancel_order(order.id)
-                                    logger.info(f"Cancelled broker order {order.id} (broker_id={order.broker_order_id})")
-                                except Exception as e:
-                                    logger.warning(f"Failed to cancel broker order {order.id}: {e}")
-                            else:
-                                # Pending order - just mark as cancelled in DB
-                                order.status = OrderStatus.CANCELED
-                                session.add(order)
-                                logger.info(f"Cancelled pending order {order.id}")
-                        session.commit()
-                    
-                    # Create new TP order
-                    return self._create_broker_tp_order(session, transaction, entry_order, new_tp_price)
+                    return self._handle_filled_entry_tpsl(
+                        session, transaction, entry_order,
+                        new_tp_price, new_sl_price,
+                        existing_tp, existing_sl, existing_oco,
+                        all_orders, need_oco
+                    )
                 
                 else:
                     logger.warning(f"Entry order {entry_order.id} in unexpected state: {entry_order.status.value}")
                     return False
                     
         except Exception as e:
-            logger.error(f"Error adjusting TP for transaction {transaction.id}: {e}", exc_info=True)
+            logger.error(f"Error adjusting TP/SL for transaction {transaction.id}: {e}", exc_info=True)
             return False
+    
+    def _handle_pending_entry_tpsl(
+        self,
+        session: Session,
+        transaction: Transaction,
+        entry_order: TradingOrder,
+        new_tp_price: float | None,
+        new_sl_price: float | None,
+        existing_tp: TradingOrder | None,
+        existing_sl: TradingOrder | None,
+        existing_oco: TradingOrder | None,
+        need_oco: bool
+    ) -> bool:
+        """Handle TP/SL adjustment when entry order is still pending (not sent to broker)."""
+        
+        if need_oco:
+            # Need OCO order with both TP and SL
+            if existing_oco:
+                # Update existing OCO
+                if new_tp_price is not None:
+                    existing_oco.limit_price = new_tp_price
+                if new_sl_price is not None:
+                    existing_oco.stop_price = new_sl_price
+                session.add(existing_oco)
+                session.commit()
+                logger.info(f"Updated pending OCO order {existing_oco.id}")
+            else:
+                # Cancel separate TP/SL orders if they exist
+                if existing_tp:
+                    existing_tp.status = OrderStatus.CANCELED
+                    session.add(existing_tp)
+                if existing_sl:
+                    existing_sl.status = OrderStatus.CANCELED
+                    session.add(existing_sl)
+                
+                # Create new OCO order
+                oco_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
+                oco_comment = self._generate_tpsl_comment("TPSL", self.id, transaction.id, entry_order.id)
+                oco_order = TradingOrder(
+                    account_id=self.id,
+                    symbol=entry_order.symbol,
+                    quantity=entry_order.quantity,
+                    side=oco_side,
+                    order_type=CoreOrderType.OCO,
+                    limit_price=transaction.take_profit,
+                    stop_price=transaction.stop_loss,
+                    transaction_id=transaction.id,
+                    status=OrderStatus.PENDING,
+                    depends_on_order=entry_order.id,
+                    depends_order_status_trigger=OrderStatus.FILLED,
+                    open_type=OrderOpenType.AUTOMATIC,
+                    comment=oco_comment,
+                    data={
+                        "tp_percent_target": self._calculate_tp_percent(entry_order, transaction.take_profit) if transaction.take_profit else 0,
+                        "sl_percent_target": self._calculate_sl_percent(entry_order, transaction.stop_loss) if transaction.stop_loss else 0
+                    },
+                    created_at=datetime.now(timezone.utc)
+                )
+                session.add(oco_order)
+                session.commit()
+                logger.info(f"Created pending OCO order {oco_order.id}")
+        else:
+            # Need separate TP and/or SL orders
+            if new_tp_price is not None:
+                if existing_oco:
+                    # Had OCO, now only need TP - cancel OCO and create TP
+                    existing_oco.status = OrderStatus.CANCELED
+                    session.add(existing_oco)
+                if existing_tp:
+                    # Update existing TP
+                    existing_tp.limit_price = new_tp_price
+                    # Upgrade legacy order types
+                    order_type_value = existing_tp.order_type.value if hasattr(existing_tp.order_type, 'value') else str(existing_tp.order_type)
+                    if order_type_value not in ["sell_limit", "buy_limit"]:
+                        tp_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
+                        existing_tp.order_type = CoreOrderType.SELL_LIMIT if tp_side == OrderDirection.SELL else CoreOrderType.BUY_LIMIT
+                    session.add(existing_tp)
+                    session.commit()
+                    logger.info(f"Updated pending TP order {existing_tp.id}")
+                else:
+                    # Create new TP order
+                    tp_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
+                    tp_comment = self._generate_tpsl_comment("TP", self.id, transaction.id, entry_order.id)
+                    order_type = CoreOrderType.SELL_LIMIT if tp_side == OrderDirection.SELL else CoreOrderType.BUY_LIMIT
+                    tp_order = TradingOrder(
+                        account_id=self.id,
+                        symbol=entry_order.symbol,
+                        quantity=entry_order.quantity,
+                        side=tp_side,
+                        order_type=order_type,
+                        limit_price=new_tp_price,
+                        transaction_id=transaction.id,
+                        status=OrderStatus.PENDING,
+                        depends_on_order=entry_order.id,
+                        depends_order_status_trigger=OrderStatus.FILLED,
+                        open_type=OrderOpenType.AUTOMATIC,
+                        comment=tp_comment,
+                        data={"tp_percent_target": self._calculate_tp_percent(entry_order, new_tp_price)},
+                        created_at=datetime.now(timezone.utc)
+                    )
+                    session.add(tp_order)
+                    session.commit()
+                    logger.info(f"Created pending TP order {tp_order.id}")
+            
+            if new_sl_price is not None:
+                if existing_oco:
+                    # Had OCO, now only need SL - cancel OCO and create SL
+                    existing_oco.status = OrderStatus.CANCELED
+                    session.add(existing_oco)
+                if existing_sl:
+                    # Update existing SL
+                    existing_sl.stop_price = new_sl_price
+                    # Upgrade legacy order types
+                    order_type_value = existing_sl.order_type.value if hasattr(existing_sl.order_type, 'value') else str(existing_sl.order_type)
+                    if order_type_value not in ["sell_stop", "buy_stop"]:
+                        sl_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
+                        existing_sl.order_type = CoreOrderType.SELL_STOP if sl_side == OrderDirection.SELL else CoreOrderType.BUY_STOP
+                    session.add(existing_sl)
+                    session.commit()
+                    logger.info(f"Updated pending SL order {existing_sl.id}")
+                else:
+                    # Create new SL order
+                    sl_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
+                    sl_comment = self._generate_tpsl_comment("SL", self.id, transaction.id, entry_order.id)
+                    order_type = CoreOrderType.SELL_STOP if sl_side == OrderDirection.SELL else CoreOrderType.BUY_STOP
+                    sl_order = TradingOrder(
+                        account_id=self.id,
+                        symbol=entry_order.symbol,
+                        quantity=entry_order.quantity,
+                        side=sl_side,
+                        order_type=order_type,
+                        stop_price=new_sl_price,
+                        transaction_id=transaction.id,
+                        status=OrderStatus.PENDING,
+                        depends_on_order=entry_order.id,
+                        depends_order_status_trigger=OrderStatus.FILLED,
+                        open_type=OrderOpenType.AUTOMATIC,
+                        comment=sl_comment,
+                        data={"sl_percent_target": self._calculate_sl_percent(entry_order, new_sl_price)},
+                        created_at=datetime.now(timezone.utc)
+                    )
+                    session.add(sl_order)
+                    session.commit()
+                    logger.info(f"Created pending SL order {sl_order.id}")
+        
+        return True
+    
+    def _handle_filled_entry_tpsl(
+        self,
+        session: Session,
+        transaction: Transaction,
+        entry_order: TradingOrder,
+        new_tp_price: float | None,
+        new_sl_price: float | None,
+        existing_tp: TradingOrder | None,
+        existing_sl: TradingOrder | None,
+        existing_oco: TradingOrder | None,
+        all_orders: list,
+        need_oco: bool
+    ) -> bool:
+        """Handle TP/SL adjustment when entry order is filled (at broker)."""
+        
+        # Cancel ALL existing TP/SL/OCO orders before creating new ones
+        orders_to_cancel = []
+        if existing_tp:
+            orders_to_cancel.append(existing_tp)
+        if existing_sl:
+            orders_to_cancel.append(existing_sl)
+        if existing_oco:
+            orders_to_cancel.append(existing_oco)
+        
+        # Also check for any other non-terminal TP/SL orders we might have missed
+        for order in all_orders:
+            if order not in orders_to_cancel and order.id not in [
+                existing_tp.id if existing_tp else None,
+                existing_sl.id if existing_sl else None,
+                existing_oco.id if existing_oco else None
+            ]:
+                orders_to_cancel.append(order)
+        
+        if orders_to_cancel:
+            logger.info(f"Cancelling {len(orders_to_cancel)} existing TP/SL/OCO orders before creating new ones")
+            for order in orders_to_cancel:
+                if order.broker_order_id:
+                    # Order at broker - cancel via API
+                    try:
+                        self.cancel_order(order.id)
+                        logger.info(f"Cancelled broker order {order.id} (broker_id={order.broker_order_id})")
+                    except Exception as e:
+                        logger.warning(f"Failed to cancel broker order {order.id}: {e}")
+                else:
+                    # Pending order - just mark as cancelled in DB
+                    order.status = OrderStatus.CANCELED
+                    session.add(order)
+                    logger.info(f"Cancelled pending order {order.id}")
+            session.commit()
+        
+        # Create new order(s) at broker
+        if need_oco:
+            # Create OCO order with both TP and SL
+            return self._create_broker_oco_order(session, transaction, entry_order, transaction.take_profit, transaction.stop_loss)
+        else:
+            # Create separate TP and/or SL orders
+            success = True
+            if new_tp_price is not None:
+                success = success and self._create_broker_tp_order(session, transaction, entry_order, new_tp_price)
+            if new_sl_price is not None:
+                success = success and self._create_broker_sl_order(session, transaction, entry_order, new_sl_price)
+            return success
+    
+    def adjust_tp(self, transaction: Transaction, new_tp_price: float) -> bool:
+        """
+        Adjust take profit for a transaction.
+        
+        Args:
+            transaction: Transaction to adjust TP for
+            new_tp_price: New take profit price
+            
+        Returns:
+            bool: True if adjustment succeeded
+        """
+        return self._adjust_tpsl_internal(transaction, new_tp_price=new_tp_price, new_sl_price=None)
     
     def _calculate_tp_percent(self, entry_order: TradingOrder, tp_price: float) -> float:
         """Calculate TP percent from entry price"""
@@ -2336,151 +2504,66 @@ class AlpacaAccount(AccountInterface):
     
     def adjust_sl(self, transaction: Transaction, new_sl_price: float) -> bool:
         """
-        Adjust stop loss for a transaction (Alpaca-specific stateless implementation).
+        Adjust stop loss for a transaction.
         
-        Similar logic to adjust_tp but for stop loss orders.
+        Args:
+            transaction: Transaction to adjust SL for
+            new_sl_price: New stop loss price
+            
+        Returns:
+            bool: True if adjustment succeeded
         """
-        try:
-            logger.info(f"Adjusting SL for transaction {transaction.id} to ${new_sl_price:.2f}")
-            
-            # 1. Update transaction (source of truth)
-            transaction.stop_loss = new_sl_price
-            update_instance(transaction)
-            
-            # 2. Get entry order (first market/limit order for this transaction, not TP/SL)
-            from sqlmodel import Session, select
-            with Session(get_db().bind) as session:
-                entry_order = session.exec(
-                    select(TradingOrder).where(
-                        TradingOrder.transaction_id == transaction.id,
-                        TradingOrder.order_type.in_([CoreOrderType.MARKET, "limit"])
-                    ).order_by(TradingOrder.created_at)
-                ).first()
-                
-                if not entry_order:
-                    logger.error(f"No entry order found for transaction {transaction.id}")
-                    return False
-                
-                # 3. Find existing SL order (any non-terminal order that functions as SL)
-                # This includes legacy STOP orders, STOP_LIMIT with stop price, and new OTO/OCO orders
-                all_orders = session.exec(
-                    select(TradingOrder).where(
-                        TradingOrder.transaction_id == transaction.id,
-                        TradingOrder.status.notin_(OrderStatus.get_terminal_statuses()),
-                        TradingOrder.id != entry_order.id  # Exclude entry order
-                    )
-                ).all()
-                
-                existing_sl = None
-                existing_oco = None  # OCO orders that might contain SL
-                for order in all_orders:
-                    if self._is_sl_order(order, entry_order):
-                        existing_sl = order
-                        break
-                    # Also check for OCO orders (they have both TP and SL)
-                    if order.order_type == CoreOrderType.OCO and order.limit_price and order.stop_price:
-                        existing_oco = order
-                
-                # 4. Determine action (same logic as TP)
-                logger.debug(f"Entry order {entry_order.id} status: {entry_order.status}, existing_sl: {existing_sl.id if existing_sl else None}, existing_oco: {existing_oco.id if existing_oco else None}")
-                if entry_order.status in OrderStatus.get_unsent_statuses():
-                    if existing_sl:
-                        existing_sl.stop_price = new_sl_price
-                        # Upgrade legacy order types to new SELL_STOP/BUY_STOP/OCO
-                        # Check if order type is not already the correct type (compare values, not enums)
-                        order_type_value = existing_sl.order_type.value if hasattr(existing_sl.order_type, 'value') else str(existing_sl.order_type)
-                        if order_type_value not in ["sell_stop", "buy_stop", "oco"]:
-                            has_tp = transaction.take_profit is not None and transaction.take_profit > 0
-                            if has_tp:
-                                existing_sl.order_type = CoreOrderType.OCO
-                            else:
-                                # Determine correct stop type based on side
-                                sl_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
-                                existing_sl.order_type = CoreOrderType.SELL_STOP if sl_side == OrderDirection.SELL else CoreOrderType.BUY_STOP
-                            logger.info(f"Upgraded SL order {existing_sl.id} from {order_type_value} to {existing_sl.order_type.value}")
-                        session.add(existing_sl)
-                        session.commit()
-                        logger.info(f"Updated pending SL order {existing_sl.id} to ${new_sl_price:.2f}")
-                    elif existing_oco:
-                        # Update existing OCO order with new SL price
-                        existing_oco.stop_price = new_sl_price
-                        session.add(existing_oco)
-                        session.commit()
-                        logger.info(f"Updated pending OCO order {existing_oco.id} SL to ${new_sl_price:.2f}")
-                    else:
-                        sl_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
-                        sl_comment = self._generate_tpsl_comment("SL", self.id, transaction.id, entry_order.id)
-                        
-                        # Use direction-specific stop type for SL-only orders
-                        order_type = CoreOrderType.SELL_STOP if sl_side == OrderDirection.SELL else CoreOrderType.BUY_STOP
-                        
-                        sl_order = TradingOrder(
-                            account_id=self.id,
-                            symbol=entry_order.symbol,
-                            quantity=entry_order.quantity,
-                            side=sl_side,
-                            order_type=order_type,
-                            stop_price=new_sl_price,
-                            transaction_id=transaction.id,
-                            status=OrderStatus.PENDING,
-                            depends_on_order=entry_order.id,
-                            open_type=OrderOpenType.AUTOMATIC,
-                            comment=sl_comment,
-                            data={"sl_percent_target": self._calculate_sl_percent(entry_order, new_sl_price)},
-                            created_at=datetime.now(timezone.utc)
-                        )
-                        session.add(sl_order)
-                        session.commit()
-                        logger.info(f"Created pending {order_type.value} SL order for transaction {transaction.id}")
-                    return True
-                
-                elif entry_order.status in OrderStatus.get_executed_statuses():
-                    # Entry filled - work with broker
-                    
-                    # Cancel ALL existing TP/SL/OCO orders before creating new SL order
-                    orders_to_cancel = []
-                    if existing_sl:
-                        orders_to_cancel.append(existing_sl)
-                    if existing_oco:
-                        orders_to_cancel.append(existing_oco)
-                    # Also check for any other non-terminal TP/SL orders we might have missed
-                    for order in all_orders:
-                        if order not in orders_to_cancel and order.id not in [existing_sl.id if existing_sl else None, existing_oco.id if existing_oco else None]:
-                            # This is another TP/SL order - cancel it too
-                            orders_to_cancel.append(order)
-                    
-                    if orders_to_cancel:
-                        logger.info(f"Cancelling {len(orders_to_cancel)} existing TP/SL/OCO orders before creating new SL")
-                        for order in orders_to_cancel:
-                            if order.broker_order_id:
-                                # Order at broker - cancel via API
-                                try:
-                                    self.cancel_order(order.id)
-                                    logger.info(f"Cancelled broker order {order.id} (broker_id={order.broker_order_id})")
-                                except Exception as e:
-                                    logger.warning(f"Failed to cancel broker order {order.id}: {e}")
-                            else:
-                                # Pending order - just mark as cancelled in DB
-                                order.status = OrderStatus.CANCELED
-                                session.add(order)
-                                logger.info(f"Cancelled pending order {order.id}")
-                        session.commit()
-                    
-                    # Create new SL order
-                    return self._create_broker_sl_order(session, transaction, entry_order, new_sl_price)
-                else:
-                    logger.warning(f"Entry order {entry_order.id} in unexpected state: {entry_order.status.value}")
-                    return False
-                    
-        except Exception as e:
-            logger.error(f"Error adjusting SL for transaction {transaction.id}: {e}", exc_info=True)
-            return False
+        return self._adjust_tpsl_internal(transaction, new_tp_price=None, new_sl_price=new_sl_price)
     
     def _calculate_sl_percent(self, entry_order: TradingOrder, sl_price: float) -> float:
         """Calculate SL percent from entry price"""
         if not entry_order.open_price or entry_order.open_price == 0:
             return 0.0
         return ((entry_order.open_price - sl_price) / entry_order.open_price) * 100
+    
+    def _create_broker_oco_order(self, session: Session, transaction: Transaction, entry_order: TradingOrder, tp_price: float, sl_price: float) -> bool:
+        """Create new OCO order at broker with both TP and SL."""
+        try:
+            logger.info(f"Creating OCO order at broker for transaction {transaction.id} with TP=${tp_price:.2f}, SL=${sl_price:.2f}")
+            
+            oco_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
+            oco_comment = self._generate_tpsl_comment("TPSL", self.id, transaction.id, entry_order.id)
+            
+            oco_order = TradingOrder(
+                account_id=self.id,
+                symbol=entry_order.symbol,
+                quantity=entry_order.quantity,
+                side=oco_side,
+                order_type=CoreOrderType.OCO,
+                limit_price=tp_price,
+                stop_price=sl_price,
+                transaction_id=transaction.id,
+                status=OrderStatus.PENDING,
+                open_type=OrderOpenType.AUTOMATIC,
+                comment=oco_comment,
+                data={
+                    "tp_percent_target": self._calculate_tp_percent(entry_order, tp_price),
+                    "sl_percent_target": self._calculate_sl_percent(entry_order, sl_price)
+                },
+                created_at=datetime.now(timezone.utc)
+            )
+            session.add(oco_order)
+            session.commit()
+            session.refresh(oco_order)
+            
+            # Submit to broker
+            logger.info(f"Submitting OCO order {oco_order.id} to broker")
+            try:
+                self.submit_order(oco_order)
+                logger.info(f"Successfully submitted OCO order {oco_order.id} for transaction {transaction.id}")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to submit OCO order to broker: {e}", exc_info=True)
+                return False
+            
+        except Exception as e:
+            logger.error(f"Error creating broker OCO order: {e}", exc_info=True)
+            return False
     
     def _create_broker_sl_order(self, session: Session, transaction: Transaction, entry_order: TradingOrder, sl_price: float) -> bool:
         """Create new SL order at broker using OCO (both TP+SL) or simple stop order (SL only)"""
@@ -2646,176 +2729,15 @@ class AlpacaAccount(AccountInterface):
         """
         Adjust both take profit and stop loss for a transaction.
         
-        This creates a SINGLE OCO order with both TP and SL prices.
-        Implements stateless logic per TP_SL_LOGIC.md specification.
+        Args:
+            transaction: Transaction to adjust TP/SL for
+            new_tp_price: New take profit price
+            new_sl_price: New stop loss price
+            
+        Returns:
+            bool: True if adjustment succeeded
         """
-        try:
-            logger.info(f"Adjusting TP/SL for transaction {transaction.id} to TP=${new_tp_price:.2f}, SL=${new_sl_price:.2f}")
-            
-            # 1. Update transaction (source of truth)
-            transaction.take_profit = new_tp_price
-            transaction.stop_loss = new_sl_price
-            update_instance(transaction)
-            
-            # 2. Get entry order and existing TP/SL orders
-            from sqlmodel import Session, select
-            with Session(get_db().bind) as session:
-                entry_order = session.exec(
-                    select(TradingOrder).where(
-                        TradingOrder.transaction_id == transaction.id,
-                        TradingOrder.order_type.in_([CoreOrderType.MARKET, "limit"])
-                    ).order_by(TradingOrder.created_at)
-                ).first()
-                
-                if not entry_order:
-                    logger.error(f"No entry order found for transaction {transaction.id}")
-                    return False
-                
-                # 3. Find existing TP and SL orders
-                all_orders = session.exec(
-                    select(TradingOrder).where(
-                        TradingOrder.transaction_id == transaction.id,
-                        TradingOrder.status.notin_(OrderStatus.get_terminal_statuses()),
-                        TradingOrder.id != entry_order.id
-                    )
-                ).all()
-                
-                existing_tp = None
-                existing_sl = None
-                existing_oco = None  # Existing combined OCO order
-                
-                for order in all_orders:
-                    # Check if this is a combined OCO order (has both TP and SL prices)
-                    if order.order_type == CoreOrderType.OCO and order.limit_price and order.stop_price:
-                        existing_oco = order
-                        logger.debug(f"Found existing OCO order {order.id} with TP={order.limit_price}, SL={order.stop_price}")
-                    elif self._is_tp_order(order, entry_order):
-                        existing_tp = order
-                    elif self._is_sl_order(order, entry_order):
-                        existing_sl = order
-                
-                # 4. Determine action based on states
-                logger.debug(f"Entry order {entry_order.id} status: {entry_order.status}, existing_oco: {existing_oco.id if existing_oco else None}, existing_tp: {existing_tp.id if existing_tp else None}, existing_sl: {existing_sl.id if existing_sl else None}")
-                
-                if entry_order.status in OrderStatus.get_unsent_statuses():
-                    # SCENARIO 1: Entry not sent to broker yet
-                    if existing_oco:
-                        # Update existing pending OCO order
-                        existing_oco.limit_price = new_tp_price
-                        existing_oco.stop_price = new_sl_price
-                        existing_oco.data = {
-                            "tp_percent_target": self._calculate_tp_percent(entry_order, new_tp_price),
-                            "sl_percent_target": self._calculate_sl_percent(entry_order, new_sl_price)
-                        }
-                        session.add(existing_oco)
-                        session.commit()
-                        logger.info(f"Updated pending OCO order {existing_oco.id}")
-                        return True
-                    else:
-                        # Cancel any separate TP/SL orders and create new combined OCO
-                        if existing_tp:
-                            existing_tp.status = OrderStatus.CANCELED
-                            session.add(existing_tp)
-                        if existing_sl:
-                            existing_sl.status = OrderStatus.CANCELED
-                            session.add(existing_sl)
-                        
-                        # Create pending OCO order
-                        oco_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
-                        oco_comment = self._generate_tpsl_comment("TPSL", self.id, transaction.id, entry_order.id)
-                        oco_order = TradingOrder(
-                            account_id=self.id,
-                            symbol=entry_order.symbol,
-                            quantity=entry_order.quantity,
-                            side=oco_side,
-                            order_type=CoreOrderType.OCO,
-                            limit_price=new_tp_price,
-                            stop_price=new_sl_price,
-                            transaction_id=transaction.id,
-                            status=OrderStatus.PENDING,
-                            depends_on_order=entry_order.id,
-                            open_type=OrderOpenType.AUTOMATIC,
-                            comment=oco_comment,
-                            data={
-                                "tp_percent_target": self._calculate_tp_percent(entry_order, new_tp_price),
-                                "sl_percent_target": self._calculate_sl_percent(entry_order, new_sl_price)
-                            },
-                            created_at=datetime.now(timezone.utc)
-                        )
-                        session.add(oco_order)
-                        session.commit()
-                        logger.info(f"Created pending OCO order {oco_order.id} for transaction {transaction.id}")
-                        return True
-                
-                elif entry_order.status in OrderStatus.get_executed_statuses():
-                    # SCENARIO 2: Entry filled - work with broker
-                    
-                    # Cancel ALL existing TP/SL orders (pending or at broker)
-                    orders_to_cancel = []
-                    if existing_oco:
-                        orders_to_cancel.append(existing_oco)
-                    if existing_tp:
-                        orders_to_cancel.append(existing_tp)
-                    if existing_sl:
-                        orders_to_cancel.append(existing_sl)
-                    
-                    if orders_to_cancel:
-                        logger.info(f"Cancelling {len(orders_to_cancel)} existing TP/SL orders before creating new OCO")
-                        for order in orders_to_cancel:
-                            if order.broker_order_id:
-                                # Order at broker - cancel via API
-                                try:
-                                    self.cancel_order(order.id)
-                                    logger.info(f"Cancelled broker order {order.id} (broker_id={order.broker_order_id})")
-                                except Exception as e:
-                                    logger.warning(f"Failed to cancel broker order {order.id}: {e}")
-                            else:
-                                # Pending order - just mark as cancelled in DB
-                                order.status = OrderStatus.CANCELED
-                                session.add(order)
-                                logger.info(f"Cancelled pending order {order.id}")
-                    
-                    # Create and submit new OCO order to broker
-                    oco_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
-                    oco_comment = self._generate_tpsl_comment("TPSL", self.id, transaction.id, entry_order.id)
-                    oco_order = TradingOrder(
-                        account_id=self.id,
-                        symbol=entry_order.symbol,
-                        quantity=entry_order.quantity,
-                        side=oco_side,
-                        order_type=CoreOrderType.OCO,
-                        limit_price=new_tp_price,
-                        stop_price=new_sl_price,
-                        transaction_id=transaction.id,
-                        status=OrderStatus.PENDING,
-                        open_type=OrderOpenType.AUTOMATIC,
-                        comment=oco_comment,
-                        data={
-                            "tp_percent_target": self._calculate_tp_percent(entry_order, new_tp_price),
-                            "sl_percent_target": self._calculate_sl_percent(entry_order, new_sl_price)
-                        },
-                        created_at=datetime.now(timezone.utc)
-                    )
-                    session.add(oco_order)
-                    session.commit()
-                    session.refresh(oco_order)
-                    
-                    # Submit to broker
-                    logger.info(f"Submitting OCO order {oco_order.id} to broker")
-                    try:
-                        self.submit_order(oco_order)
-                        logger.info(f"Successfully submitted OCO order {oco_order.id} for transaction {transaction.id}")
-                        return True
-                    except Exception as e:
-                        logger.error(f"Failed to submit OCO order: {e}", exc_info=True)
-                        return False
-                else:
-                    logger.warning(f"Entry order {entry_order.id} in unexpected state: {entry_order.status.value}")
-                    return False
-            
-        except Exception as e:
-            logger.error(f"Error adjusting TP/SL for transaction {transaction.id}: {e}", exc_info=True)
-            return False
+        return self._adjust_tpsl_internal(transaction, new_tp_price=new_tp_price, new_sl_price=new_sl_price)
     
     def _replace_broker_oco_order(self, session: Session, existing_oco: TradingOrder, new_tp_price: float, new_sl_price: float) -> bool:
         """
