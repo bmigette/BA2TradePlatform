@@ -2962,7 +2962,7 @@ class ExpertSettingsTab:
                             ui.notify(f'✅ Expert "{general.get("alias", "Imported Expert")}" {action} successfully! Opening for review...', type='positive')
                             # Small delay to allow dialog to close and table to refresh
                             await asyncio.sleep(0.5)
-                            self._show_expert_dialog(target_instance)
+                            self.show_dialog(target_instance)
                         else:
                             ui.notify(f'✅ Expert saved but could not reopen for editing', type='warning')
                     finally:
