@@ -859,16 +859,18 @@ class JobManager:
             
             # Check if we should expand jobs or pass EXPERT symbol directly
             if not should_expand:
-                # Expert handles EXPERT symbol directly - execute single analysis with EXPERT as symbol
-                logger.info(f"Expert {expert_instance_id} has should_expand_instrument_jobs=False - executing analysis with EXPERT symbol")
+                # Expert handles EXPERT symbol directly - submit analysis task directly (not via submit_market_analysis)
+                # to avoid creating another expansion task
+                logger.info(f"Expert {expert_instance_id} has should_expand_instrument_jobs=False - submitting analysis with EXPERT symbol")
                 try:
-                    task_id = self.submit_market_analysis(
+                    worker_queue = get_worker_queue()
+                    task_id = worker_queue.submit_analysis_task(
                         expert_instance_id=expert_instance_id,
                         symbol="EXPERT",
                         subtype=subtype,
                         priority=0  # High priority - execute expansion results ASAP
                     )
-                    logger.info(f"Submitted expert-driven analysis with EXPERT symbol: {task_id}")
+                    logger.info(f"Submitted expert-driven analysis with EXPERT symbol directly: {task_id}")
                 except Exception as e:
                     logger.error(f"Error submitting expert-driven analysis with EXPERT symbol: {e}")
                 return

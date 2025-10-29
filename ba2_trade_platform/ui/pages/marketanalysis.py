@@ -3169,7 +3169,8 @@ class OrderRecommendationsTab:
                 return
             
             # Check risk_manager_mode setting (default to "classic" if not set)
-            risk_manager_mode = expert_instance.settings.get("risk_manager_mode", "classic")
+            from ...core.utils import get_risk_manager_mode
+            risk_manager_mode = get_risk_manager_mode(expert_instance.settings)
             
             if risk_manager_mode == "smart":
                 # Run Smart Risk Manager (AI-powered agentic workflow)

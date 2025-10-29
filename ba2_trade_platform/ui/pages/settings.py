@@ -1123,7 +1123,8 @@ class ExpertSettingsTab:
                 
                 # Check if risk manager is in Smart mode
                 expert = get_expert_instance_from_id(instance.id)
-                risk_manager_mode = expert.settings.get('risk_manager_mode', 'classic') if expert else 'classic'
+                from ...core.utils import get_risk_manager_mode
+                risk_manager_mode = get_risk_manager_mode(expert.settings) if expert else 'classic'
                 is_smart_mode = risk_manager_mode == 'smart'
                 
                 # Fetch and add ruleset names

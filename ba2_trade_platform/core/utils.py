@@ -701,3 +701,65 @@ def log_tp_sl_adjustment_activity(
         logger.warning(f"Failed to log {adjustment_type.upper()} adjustment activity: {e}")
 
 
+def convert_utc_to_local(utc_datetime: datetime) -> datetime:
+    """
+    Convert UTC datetime to local time.
+    
+    Args:
+        utc_datetime: UTC datetime object (with timezone.utc)
+        
+    Returns:
+        Local datetime object (without timezone, local time)
+        
+    Example:
+        >>> utc_time = datetime.now(timezone.utc)
+        >>> local_time = convert_utc_to_local(utc_time)
+        >>> print(local_time)  # Displays in local timezone
+    """
+    try:
+        if not utc_datetime:
+            return utc_datetime
+        
+        # If naive datetime, assume UTC
+        if utc_datetime.tzinfo is None:
+            utc_datetime = utc_datetime.replace(tzinfo=timezone.utc)
+        
+        # Convert to local time
+        local_time = utc_datetime.astimezone()
+        
+        # Remove timezone info for display (we want naive local time)
+        return local_time.replace(tzinfo=None)
+    except Exception as e:
+        logger.warning(f"Failed to convert UTC time to local: {e}")
+        return utc_datetime
+
+
+def get_risk_manager_mode(settings: dict, default: str = "classic") -> str:
+    """
+    Get risk_manager_mode setting with fallback to default if missing or invalid.
+    
+    Args:
+        settings: Dictionary of expert settings
+        default: Default value if setting is missing or invalid (default: "classic")
+        
+    Returns:
+        Risk manager mode: "smart" or "classic"
+        
+    Example:
+        >>> mode = get_risk_manager_mode(expert.settings)
+        >>> # Returns "classic" if missing or invalid
+        >>> # Returns "smart" if explicitly set to "smart"
+    """
+    if not settings or not isinstance(settings, dict):
+        return default
+    
+    risk_manager_mode = settings.get("risk_manager_mode", "").strip().lower()
+    
+    # Validate the value
+    valid_modes = ["classic", "smart"]
+    if risk_manager_mode not in valid_modes:
+        logger.debug(f"Invalid risk_manager_mode '{risk_manager_mode}', using default '{default}'")
+        return default
+    
+    return risk_manager_mode
+
