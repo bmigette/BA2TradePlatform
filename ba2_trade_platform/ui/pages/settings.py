@@ -2785,7 +2785,7 @@ class ExpertSettingsTab:
             ui.label('Upload a previously exported JSON settings file to restore settings:').classes('text-body2 mb-2')
             
             async def handle_import_upload(e: UploadEventArguments):
-                """Handle JSON file upload for settings import - creates a new expert from imported data."""
+                """Handle JSON file upload for settings import - updates existing expert or creates new one."""
                 import asyncio
                 
                 try:
@@ -2798,6 +2798,7 @@ class ExpertSettingsTab:
                     
                     import_data = json.loads(import_json)
                     logger.info(f'Importing expert settings from file')
+                    logger.info(f'Import data keys: {list(import_data.keys())}')
                     
                     # Extract data from import
                     general = import_data.get('general', {})
@@ -2805,57 +2806,105 @@ class ExpertSettingsTab:
                     expert_type = import_data.get('expert_type')
                     instruments_data = import_data.get('instruments', {})
                     
+                    logger.info(f'Extracted expert_type: {expert_type}')
+                    
                     if not expert_type:
+                        logger.error(f'Import file missing expert_type field. Available keys: {list(import_data.keys())}')
                         ui.notify('Import file missing expert_type field', type='negative')
                         return
                     
-                    # Create new ExpertInstance in database
                     from ...core.models import ExpertInstance
-                    from ...core.db import add_instance, get_db
+                    from ...core.db import add_instance, get_db, update_instance
                     from sqlmodel import select
                     
-                    # Get account_id from current expert or use a default
-                    account_id = expert_instance.account_id if expert_instance else 1
-                    
-                    new_expert_instance = ExpertInstance(
-                        account_id=account_id,
-                        expert=expert_type,
-                        alias=general.get('alias', 'Imported Expert'),
-                        user_description=general.get('user_description', ''),
-                        enabled=False,  # Always disabled for imported experts for safety
-                        virtual_equity=general.get('virtual_equity', 10000.0)
-                    )
-                    
-                    # Resolve and set rulesets by name
-                    session = get_db()
-                    try:
-                        if 'enter_market_ruleset_name' in import_data:
-                            ruleset_name = import_data['enter_market_ruleset_name']
-                            from ...core.models import Ruleset
-                            statement = select(Ruleset).where(Ruleset.name == ruleset_name)
-                            ruleset = session.exec(statement).first()
-                            if ruleset:
-                                new_expert_instance.enter_market_ruleset_id = ruleset.id
-                                logger.info(f'Set enter_market_ruleset to: {ruleset_name} (ID: {ruleset.id})')
+                    # Determine if we're updating an existing expert or creating a new one
+                    if expert_instance:
+                        # Update existing expert
+                        logger.info(f'Updating existing expert ID: {expert_instance.id}')
+                        target_expert_id = expert_instance.id
                         
-                        if 'open_positions_ruleset_name' in import_data:
-                            ruleset_name = import_data['open_positions_ruleset_name']
-                            from ...core.models import Ruleset
-                            statement = select(Ruleset).where(Ruleset.name == ruleset_name)
-                            ruleset = session.exec(statement).first()
-                            if ruleset:
-                                new_expert_instance.open_positions_ruleset_id = ruleset.id
-                                logger.info(f'Set open_positions_ruleset to: {ruleset_name} (ID: {ruleset.id})')
-                    finally:
-                        session.close()
-                    
-                    # Save to database
-                    new_expert_id = add_instance(new_expert_instance)
-                    logger.info(f'Created new expert instance with ID: {new_expert_id}')
+                        # Update the ExpertInstance fields
+                        expert_instance.expert = expert_type
+                        expert_instance.alias = general.get('alias', expert_instance.alias)
+                        expert_instance.user_description = general.get('user_description', '')
+                        expert_instance.enabled = False  # Always disabled for safety
+                        expert_instance.virtual_equity = general.get('virtual_equity', 10000.0)
+                        
+                        # Resolve and set rulesets by name
+                        session = get_db()
+                        try:
+                            if 'enter_market_ruleset_name' in import_data:
+                                ruleset_name = import_data['enter_market_ruleset_name']
+                                from ...core.models import Ruleset
+                                statement = select(Ruleset).where(Ruleset.name == ruleset_name)
+                                ruleset = session.exec(statement).first()
+                                if ruleset:
+                                    expert_instance.enter_market_ruleset_id = ruleset.id
+                                    logger.info(f'Set enter_market_ruleset to: {ruleset_name} (ID: {ruleset.id})')
+                                else:
+                                    expert_instance.enter_market_ruleset_id = None
+                            
+                            if 'open_positions_ruleset_name' in import_data:
+                                ruleset_name = import_data['open_positions_ruleset_name']
+                                from ...core.models import Ruleset
+                                statement = select(Ruleset).where(Ruleset.name == ruleset_name)
+                                ruleset = session.exec(statement).first()
+                                if ruleset:
+                                    expert_instance.open_positions_ruleset_id = ruleset.id
+                                    logger.info(f'Set open_positions_ruleset to: {ruleset_name} (ID: {ruleset.id})')
+                                else:
+                                    expert_instance.open_positions_ruleset_id = None
+                        finally:
+                            session.close()
+                        
+                        # Update in database
+                        update_instance(expert_instance)
+                        logger.info(f'Updated expert instance ID: {target_expert_id}')
+                        
+                    else:
+                        # Create new expert
+                        logger.info(f'Creating new expert')
+                        account_id = 1  # Default account
+                        
+                        new_expert_instance = ExpertInstance(
+                            account_id=account_id,
+                            expert=expert_type,
+                            alias=general.get('alias', 'Imported Expert'),
+                            user_description=general.get('user_description', ''),
+                            enabled=False,  # Always disabled for imported experts for safety
+                            virtual_equity=general.get('virtual_equity', 10000.0)
+                        )
+                        
+                        # Resolve and set rulesets by name
+                        session = get_db()
+                        try:
+                            if 'enter_market_ruleset_name' in import_data:
+                                ruleset_name = import_data['enter_market_ruleset_name']
+                                from ...core.models import Ruleset
+                                statement = select(Ruleset).where(Ruleset.name == ruleset_name)
+                                ruleset = session.exec(statement).first()
+                                if ruleset:
+                                    new_expert_instance.enter_market_ruleset_id = ruleset.id
+                                    logger.info(f'Set enter_market_ruleset to: {ruleset_name} (ID: {ruleset.id})')
+                            
+                            if 'open_positions_ruleset_name' in import_data:
+                                ruleset_name = import_data['open_positions_ruleset_name']
+                                from ...core.models import Ruleset
+                                statement = select(Ruleset).where(Ruleset.name == ruleset_name)
+                                ruleset = session.exec(statement).first()
+                                if ruleset:
+                                    new_expert_instance.open_positions_ruleset_id = ruleset.id
+                                    logger.info(f'Set open_positions_ruleset to: {ruleset_name} (ID: {ruleset.id})')
+                        finally:
+                            session.close()
+                        
+                        # Save to database
+                        target_expert_id = add_instance(new_expert_instance)
+                        logger.info(f'Created new expert instance with ID: {target_expert_id}')
                     
                     # Now load the expert and apply all settings
                     from ...core.utils import get_expert_instance_from_id
-                    expert = get_expert_instance_from_id(new_expert_id)
+                    expert = get_expert_instance_from_id(target_expert_id)
                     
                     if expert:
                         # Save all expert settings
@@ -2891,7 +2940,7 @@ class ExpertSettingsTab:
                             finally:
                                 session.close()
                         
-                        logger.info(f'Successfully created and configured expert from import')
+                        logger.info(f'Successfully configured expert from import')
                     
                     # Close current dialog
                     self.dialog.close()
@@ -2900,21 +2949,22 @@ class ExpertSettingsTab:
                     if hasattr(self, 'table') and self.table:
                         self._load_experts()
                     
-                    # Reopen edit dialog for the newly created expert
+                    # Reopen edit dialog for the expert
                     from ...core.models import ExpertInstance
                     from ...core.db import get_db
                     from sqlmodel import select
                     session = get_db()
                     try:
-                        statement = select(ExpertInstance).where(ExpertInstance.id == new_expert_id)
-                        new_instance = session.exec(statement).first()
-                        if new_instance:
-                            ui.notify(f'✅ Expert "{general.get("alias", "Imported Expert")}" created successfully! Opening for review...', type='positive')
+                        statement = select(ExpertInstance).where(ExpertInstance.id == target_expert_id)
+                        target_instance = session.exec(statement).first()
+                        if target_instance:
+                            action = "updated" if expert_instance else "created"
+                            ui.notify(f'✅ Expert "{general.get("alias", "Imported Expert")}" {action} successfully! Opening for review...', type='positive')
                             # Small delay to allow dialog to close and table to refresh
                             await asyncio.sleep(0.5)
-                            self._show_expert_dialog(new_instance)
+                            self._show_expert_dialog(target_instance)
                         else:
-                            ui.notify(f'✅ Expert created but could not reopen for editing', type='warning')
+                            ui.notify(f'✅ Expert saved but could not reopen for editing', type='warning')
                     finally:
                         session.close()
                     
