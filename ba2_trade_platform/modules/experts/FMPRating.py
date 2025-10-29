@@ -675,6 +675,8 @@ Expected Profit % = (Weighted Delta / Current) × 100 = {expected_profit_percent
                 self._render_failed(market_analysis)
             elif market_analysis.status == MarketAnalysisStatus.COMPLETED:
                 self._render_completed(market_analysis)
+            elif market_analysis.status == MarketAnalysisStatus.SKIPPED:
+                self._render_skipped(market_analysis)
             else:
                 with ui.card().classes('w-full p-4'):
                     ui.label(f"Unknown analysis status: {market_analysis.status}")
@@ -716,6 +718,19 @@ Expected Profit % = (Weighted Delta / Current) × 100 = {expected_profit_percent
             if market_analysis.state and isinstance(market_analysis.state, dict):
                 error_msg = market_analysis.state.get('error', 'Unknown error')
                 ui.label(f'Error: {error_msg}').classes('text-grey-8')
+    
+    def _render_skipped(self, market_analysis: MarketAnalysis) -> None:
+        """Render skipped analysis state."""
+        from nicegui import ui
+        
+        with ui.card().classes('w-full p-4'):
+            with ui.row().classes('items-center mb-4'):
+                ui.icon('skip_next', color='orange', size='2rem')
+                ui.label('Analysis Skipped').classes('text-h5 text-orange ml-2')
+            
+            if market_analysis.state and isinstance(market_analysis.state, dict):
+                skip_reason = market_analysis.state.get('skip_reason', 'Analysis was skipped')
+                ui.label(f'Reason: {skip_reason}').classes('text-grey-8')
     
     def _render_completed(self, market_analysis: MarketAnalysis) -> None:
         """Render completed analysis with beautiful UI."""
