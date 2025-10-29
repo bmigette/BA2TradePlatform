@@ -1964,8 +1964,12 @@ class ExpertSettingsTab:
             settings_source = self._imported_expert_settings if hasattr(self, '_imported_expert_settings') and self._imported_expert_settings else expert.settings
             logger.info(f'Loading general settings from: {"imported data" if settings_source is self._imported_expert_settings else "database"}')
             
+            if settings_source is self._imported_expert_settings:
+                logger.info(f'Imported settings keys: {list(settings_source.keys()) if settings_source else "None"}')
+            
             # Load execution schedule (entering market)
             enter_market_schedule = settings_source.get('execution_schedule_enter_market')
+            logger.info(f'enter_market_schedule from settings_source: {enter_market_schedule}')
             if enter_market_schedule:
                 if isinstance(enter_market_schedule, str):
                     import json
@@ -2199,10 +2203,14 @@ class ExpertSettingsTab:
 
     def _load_enter_market_schedule_config(self, schedule_config):
         """Load enter market schedule configuration from a JSON dict."""
+        logger.info(f'_load_enter_market_schedule_config called with config: {schedule_config}')
+        
         if not schedule_config:
+            logger.warning('_load_enter_market_schedule_config: schedule_config is empty')
             return
         
         if not hasattr(self, 'enter_market_times_container') or self.enter_market_times_container is None:
+            logger.warning('_load_enter_market_schedule_config: enter_market_times_container not available')
             return
             
         # Load days
@@ -2210,10 +2218,13 @@ class ExpertSettingsTab:
         if hasattr(self, 'enter_market_schedule_days'):
             for day, checkbox in self.enter_market_schedule_days.items():
                 default_value = day not in ['saturday', 'sunday']
-                checkbox.value = days.get(day, default_value)
+                new_value = days.get(day, default_value)
+                checkbox.value = new_value
+                logger.debug(f'Set enter market day {day} to {new_value}')
         
         # Load times
         times = schedule_config.get('times', ['09:30'])
+        logger.info(f'Loading enter market times: {times}')
         
         # Clear existing time inputs
         if hasattr(self, 'enter_market_execution_times'):
@@ -2223,17 +2234,23 @@ class ExpertSettingsTab:
         # Add time inputs for each configured time
         for time_str in times:
             self._add_time_input_enter_market(time_str)
+            logger.debug(f'Added enter market time input: {time_str}')
         
         # If no times were configured, add a default
         if not times:
             self._add_time_input_enter_market('09:30')
+            logger.debug('Added default enter market time: 09:30')
 
     def _load_open_positions_schedule_config(self, schedule_config):
         """Load open positions schedule configuration from a JSON dict."""
+        logger.info(f'_load_open_positions_schedule_config called with config: {schedule_config}')
+        
         if not schedule_config:
+            logger.warning('_load_open_positions_schedule_config: schedule_config is empty')
             return
         
         if not hasattr(self, 'open_positions_times_container') or self.open_positions_times_container is None:
+            logger.warning('_load_open_positions_schedule_config: open_positions_times_container not available')
             return
             
         # Load days
@@ -2241,10 +2258,13 @@ class ExpertSettingsTab:
         if hasattr(self, 'open_positions_schedule_days'):
             for day, checkbox in self.open_positions_schedule_days.items():
                 default_value = day not in ['saturday', 'sunday']
-                checkbox.value = days.get(day, default_value)
+                new_value = days.get(day, default_value)
+                checkbox.value = new_value
+                logger.debug(f'Set open positions day {day} to {new_value}')
         
         # Load times
         times = schedule_config.get('times', ['15:00'])
+        logger.info(f'Loading open positions times: {times}')
         
         # Clear existing time inputs
         if hasattr(self, 'open_positions_execution_times'):
@@ -2254,11 +2274,13 @@ class ExpertSettingsTab:
         # Add time inputs for each configured time
         for time_str in times:
             self._add_time_input_open_positions(time_str)
+            logger.debug(f'Added open positions time input: {time_str}')
         
         # If no times were configured, add defaults
         if not times:
             for time in ['09:30', '10:30', '11:30', '12:30', '13:30', '14:30', '15:30']:
                 self._add_time_input_open_positions(time)
+            logger.debug('Added default open positions times')
     
     def _on_expert_type_change_dialog(self, event, expert_instance):
         """Handle expert type change in the dialog."""
@@ -2790,19 +2812,24 @@ class ExpertSettingsTab:
                     # Import expert settings
                     if expert_instance and 'expert_settings' in import_data and hasattr(self, '_imported_expert_settings'):
                         self._imported_expert_settings = import_data['expert_settings']
-                        
-                        # Reload general settings to update UI with imported schedules
-                        self._load_general_settings(expert_instance)
-                        logger.info('Reloaded general settings after import')
-                        
-                        ui.notify('Expert settings ready to import (will be applied on save)', type='info')
+                        logger.info('Stored imported expert settings')
                     
-                    # Import ruleset references by name
+                    # Import ruleset references by name (before reload so they can be applied)
                     if expert_instance:
                         if 'enter_market_ruleset_name' in import_data:
                             self._imported_enter_market_ruleset_name = import_data['enter_market_ruleset_name']
+                            logger.info(f'Stored imported enter market ruleset: {self._imported_enter_market_ruleset_name}')
                         if 'open_positions_ruleset_name' in import_data:
                             self._imported_open_positions_ruleset_name = import_data['open_positions_ruleset_name']
+                            logger.info(f'Stored imported open positions ruleset: {self._imported_open_positions_ruleset_name}')
+                    
+                    # Now reload general settings to update UI with imported schedules and rulesets
+                    if expert_instance and (hasattr(self, '_imported_expert_settings') or 
+                                           hasattr(self, '_imported_enter_market_ruleset_name') or 
+                                           hasattr(self, '_imported_open_positions_ruleset_name')):
+                        self._load_general_settings(expert_instance)
+                        logger.info('Reloaded general settings after import')
+                        ui.notify('Expert settings ready to import (will be applied on save)', type='info')
                     
                     # Import symbol settings
                     if expert_instance and 'symbol_settings' in import_data and hasattr(self, '_imported_symbol_settings'):
