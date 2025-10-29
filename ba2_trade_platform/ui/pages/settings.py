@@ -2810,9 +2810,9 @@ class ExpertSettingsTab:
                             self.virtual_equity_input.value = str(general['virtual_equity'])
                     
                     # Import expert settings
-                    if expert_instance and 'expert_settings' in import_data and hasattr(self, '_imported_expert_settings'):
+                    if expert_instance and 'expert_settings' in import_data:
                         self._imported_expert_settings = import_data['expert_settings']
-                        logger.info('Stored imported expert settings')
+                        logger.info(f'Stored imported expert settings with keys: {list(import_data["expert_settings"].keys())}')
                     
                     # Import ruleset references by name (before reload so they can be applied)
                     if expert_instance:
@@ -2832,8 +2832,9 @@ class ExpertSettingsTab:
                         ui.notify('Expert settings ready to import (will be applied on save)', type='info')
                     
                     # Import symbol settings
-                    if expert_instance and 'symbol_settings' in import_data and hasattr(self, '_imported_symbol_settings'):
+                    if expert_instance and 'symbol_settings' in import_data:
                         self._imported_symbol_settings = import_data['symbol_settings']
+                        logger.info('Stored imported symbol settings')
                         ui.notify('Symbol settings ready to import (will be applied on save)', type='info')
                     
                     # Import instruments
