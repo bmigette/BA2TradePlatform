@@ -1962,6 +1962,7 @@ class ExpertSettingsTab:
             
             # Check if we have imported settings to use instead
             settings_source = self._imported_expert_settings if hasattr(self, '_imported_expert_settings') and self._imported_expert_settings else expert.settings
+            logger.info(f'Loading general settings from: {"imported data" if settings_source is self._imported_expert_settings else "database"}')
             
             # Load execution schedule (entering market)
             enter_market_schedule = settings_source.get('execution_schedule_enter_market')
@@ -2060,9 +2061,13 @@ class ExpertSettingsTab:
             if hasattr(self, 'smart_risk_manager_user_instructions_input'):
                 self.smart_risk_manager_user_instructions_input.value = smart_risk_manager_user_instructions
             
-            # Load ruleset assignments from ExpertInstance model
+            # Load ruleset assignments from ExpertInstance model or imported data
             if hasattr(self, 'enter_market_ruleset_select') and hasattr(self, 'enter_market_ruleset_map'):
-                if expert_instance.enter_market_ruleset_id:
+                # Check if we have an imported ruleset name
+                if hasattr(self, '_imported_enter_market_ruleset_name') and self._imported_enter_market_ruleset_name:
+                    self.enter_market_ruleset_select.value = self._imported_enter_market_ruleset_name
+                    logger.info(f'Loaded imported enter market ruleset: {self._imported_enter_market_ruleset_name}')
+                elif expert_instance.enter_market_ruleset_id:
                     # Find the display name for this ruleset ID
                     for display_name, ruleset_id in self.enter_market_ruleset_map.items():
                         if ruleset_id == expert_instance.enter_market_ruleset_id:
@@ -2072,7 +2077,11 @@ class ExpertSettingsTab:
                     self.enter_market_ruleset_select.value = '(None)'
             
             if hasattr(self, 'open_positions_ruleset_select') and hasattr(self, 'open_positions_ruleset_map'):
-                if expert_instance.open_positions_ruleset_id:
+                # Check if we have an imported ruleset name
+                if hasattr(self, '_imported_open_positions_ruleset_name') and self._imported_open_positions_ruleset_name:
+                    self.open_positions_ruleset_select.value = self._imported_open_positions_ruleset_name
+                    logger.info(f'Loaded imported open positions ruleset: {self._imported_open_positions_ruleset_name}')
+                elif expert_instance.open_positions_ruleset_id:
                     # Find the display name for this ruleset ID
                     for display_name, ruleset_id in self.open_positions_ruleset_map.items():
                         if ruleset_id == expert_instance.open_positions_ruleset_id:
@@ -2782,20 +2791,9 @@ class ExpertSettingsTab:
                     if expert_instance and 'expert_settings' in import_data and hasattr(self, '_imported_expert_settings'):
                         self._imported_expert_settings = import_data['expert_settings']
                         
-                        # Update UI with imported schedule configurations (only if containers exist)
-                        if 'execution_schedule_enter_market' in import_data['expert_settings']:
-                            if hasattr(self, 'enter_market_times_container') and self.enter_market_times_container is not None:
-                                self._load_enter_market_schedule_config(import_data['expert_settings']['execution_schedule_enter_market'])
-                                logger.info('Loaded enter market schedule from import')
-                            else:
-                                logger.info('Deferred enter market schedule loading (containers not yet created)')
-                        
-                        if 'execution_schedule_open_positions' in import_data['expert_settings']:
-                            if hasattr(self, 'open_positions_times_container') and self.open_positions_times_container is not None:
-                                self._load_open_positions_schedule_config(import_data['expert_settings']['execution_schedule_open_positions'])
-                                logger.info('Loaded open positions schedule from import')
-                            else:
-                                logger.info('Deferred open positions schedule loading (containers not yet created)')
+                        # Reload general settings to update UI with imported schedules
+                        self._load_general_settings(expert_instance)
+                        logger.info('Reloaded general settings after import')
                         
                         ui.notify('Expert settings ready to import (will be applied on save)', type='info')
                     
