@@ -1480,6 +1480,10 @@ class SmartRiskManagerToolkit:
         """
         Update stop loss order for a position.
         
+        Supports both WAITING and OPENED transactions:
+        - WAITING: Updates SL in database only (entry order not submitted to broker yet)
+        - OPENED: Modifies actual broker orders via account interface
+        
         Args:
             transaction_id: ID of Transaction
             new_sl_price: New stop loss price
@@ -1502,10 +1506,11 @@ class SmartRiskManagerToolkit:
                         "new_sl_price": new_sl_price
                     }
                 
-                if transaction.status != TransactionStatus.OPENED:
+                # Allow modification for WAITING or OPENED transactions
+                if transaction.status not in [TransactionStatus.WAITING, TransactionStatus.OPENED]:
                     return {
                         "success": False,
-                        "message": f"Transaction {transaction_id} is not open (status: {transaction.status})",
+                        "message": f"Cannot modify SL for {transaction.status} transaction. Only WAITING or OPENED allowed.",
                         "order_id": None,
                         "old_sl_price": None,
                         "new_sl_price": new_sl_price
@@ -1606,6 +1611,10 @@ class SmartRiskManagerToolkit:
         """
         Update take profit order for a position.
         
+        Supports both WAITING and OPENED transactions:
+        - WAITING: Updates TP in database only (entry order not submitted to broker yet)
+        - OPENED: Modifies actual broker orders via account interface
+        
         Args:
             transaction_id: ID of Transaction
             new_tp_price: New take profit price
@@ -1628,10 +1637,11 @@ class SmartRiskManagerToolkit:
                         "new_tp_price": new_tp_price
                     }
                 
-                if transaction.status != TransactionStatus.OPENED:
+                # Allow modification for WAITING or OPENED transactions
+                if transaction.status not in [TransactionStatus.WAITING, TransactionStatus.OPENED]:
                     return {
                         "success": False,
-                        "message": f"Transaction {transaction_id} is not open (status: {transaction.status})",
+                        "message": f"Cannot modify TP for {transaction.status} transaction. Only WAITING or OPENED allowed.",
                         "order_id": None,
                         "old_tp_price": None,
                         "new_tp_price": new_tp_price

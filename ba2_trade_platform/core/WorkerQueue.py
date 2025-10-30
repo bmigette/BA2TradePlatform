@@ -959,9 +959,12 @@ class WorkerQueue:
             
             # Check if all analysis tasks are completed for this expert
             # If so, trigger automated order processing
+            logger.debug(f"[RISK_MGR_TRIGGER] Task '{task.id}' (expert {task.expert_instance_id}, {task.subtype.value}) completed. Checking for SmartRiskManager trigger...")
             if task.subtype == AnalysisUseCase.ENTER_MARKET:
+                logger.debug(f"[RISK_MGR_TRIGGER] Calling _check_and_process_expert_recommendations for ENTER_MARKET")
                 self._check_and_process_expert_recommendations(task.expert_instance_id, AnalysisUseCase.ENTER_MARKET)
             elif task.subtype == AnalysisUseCase.OPEN_POSITIONS:
+                logger.debug(f"[RISK_MGR_TRIGGER] Calling _check_and_process_expert_recommendations for OPEN_POSITIONS")
                 self._check_and_process_expert_recommendations(task.expert_instance_id, AnalysisUseCase.OPEN_POSITIONS)
             
         except Exception as e:
@@ -1232,39 +1235,54 @@ class WorkerQueue:
             use_case: The analysis use case (ENTER_MARKET or OPEN_POSITIONS)
         """
         try:
+            logger.debug(f"[RISK_MGR_TRIGGER] ===== START _check_and_process_expert_recommendations for expert {expert_instance_id}, use_case={use_case.value} =====")
+            
             # Check if there are any pending tasks for this expert
             # Use lock to prevent race condition when multiple jobs complete simultaneously
             with self._risk_manager_lock:
                 # Check if this expert is already being processed by another thread
                 lock_key = f"expert_{expert_instance_id}_{use_case.value}"
                 if lock_key in self._processing_experts:
-                    logger.debug(f"Expert {expert_instance_id} ({use_case.value}) is already being processed, skipping")
+                    logger.debug(f"[RISK_MGR_TRIGGER] Expert {expert_instance_id} ({use_case.value}) is already being processed, skipping")
                     return
+                
+                logger.debug(f"[RISK_MGR_TRIGGER] Checking for pending tasks for expert {expert_instance_id}, use_case={use_case.value}")
                 
                 # Check for pending tasks
                 has_pending = False
+                pending_tasks = []
                 with self._task_lock:
                     for task in self._tasks.values():
                         if (task.expert_instance_id == expert_instance_id and
                             task.subtype == use_case and
                             task.status in [WorkerTaskStatus.PENDING, WorkerTaskStatus.RUNNING]):
                             has_pending = True
-                            break
+                            pending_tasks.append((task.id, task.symbol, task.status))
+                
+                if has_pending:
+                    logger.debug(f"[RISK_MGR_TRIGGER] Still has {len(pending_tasks)} pending {use_case.value} tasks for expert {expert_instance_id}: {pending_tasks}")
+                    logger.debug(f"[RISK_MGR_TRIGGER] ===== END (pending tasks found, skipping) =====")
+                    return
+                
+                logger.info(f"[RISK_MGR_TRIGGER] No pending {use_case.value} tasks for expert {expert_instance_id}, proceeding with risk manager check")
                 
                 if not has_pending:
                     # Mark this expert as being processed
                     self._processing_experts.add(lock_key)
                     
                     try:
-                        logger.info(f"All {use_case.value} analysis tasks completed for expert {expert_instance_id}, triggering automated processing")
+                        logger.info(f"[RISK_MGR_TRIGGER] All {use_case.value} analysis tasks completed for expert {expert_instance_id}, triggering automated processing")
                         
                         # Get expert instance with loaded settings (MarketExpertInterface)
                         from .utils import get_expert_instance_from_id
                         
                         expert = get_expert_instance_from_id(expert_instance_id)
                         if not expert:
-                            logger.error(f"Expert instance {expert_instance_id} not found or invalid expert type")
+                            logger.error(f"[RISK_MGR_TRIGGER] Expert instance {expert_instance_id} not found or invalid expert type")
+                            logger.debug(f"[RISK_MGR_TRIGGER] ===== END (expert not found) =====")
                             return
+                        
+                        logger.debug(f"[RISK_MGR_TRIGGER] Got expert instance: {type(expert).__name__}")
                         
                         # Check risk_manager_mode setting with validation and error logging
                         from .utils import get_risk_manager_mode
@@ -1274,10 +1292,12 @@ class WorkerQueue:
                         settings = expert.settings or {}
                         risk_manager_mode = get_risk_manager_mode(settings)
                         
+                        logger.debug(f"[RISK_MGR_TRIGGER] Retrieved risk_manager_mode: {risk_manager_mode}, settings keys: {list(settings.keys())}")
+                        
                         # Validate risk_manager_mode is properly configured
                         if not risk_manager_mode:
                             error_msg = f"Risk manager mode not configured for expert {expert_instance_id}"
-                            logger.error(error_msg)
+                            logger.error(f"[RISK_MGR_TRIGGER] {error_msg}")
                             try:
                                 log_activity(
                                     severity=ActivityLogSeverity.FAILURE,
@@ -1288,15 +1308,17 @@ class WorkerQueue:
                                 )
                             except Exception as e:
                                 logger.warning(f"Failed to log activity for missing risk_manager_mode: {e}")
+                            logger.debug(f"[RISK_MGR_TRIGGER] ===== END (risk_manager_mode not configured) =====")
                             return
                         
                         # Check for classic mode without rules configured
                         if risk_manager_mode == "classic":
+                            logger.debug(f"[RISK_MGR_TRIGGER] Using CLASSIC risk manager mode")
                             enter_market_ruleset_id = expert.enter_market_ruleset_id
                             # Check if ruleset ID is actually set (not None, not empty string)
                             if not enter_market_ruleset_id or (isinstance(enter_market_ruleset_id, str) and not enter_market_ruleset_id.strip()):
                                 error_msg = f"Classic risk manager mode enabled but no enter_market_ruleset_id configured for expert {expert_instance_id}"
-                                logger.error(error_msg)
+                                logger.error(f"[RISK_MGR_TRIGGER] {error_msg}")
                                 logger.error(f"Settings keys: {list(settings.keys()) if settings else 'None'}")
                                 logger.error(f"enter_market_ruleset_id value: {repr(enter_market_ruleset_id)}")
                                 try:
@@ -1309,55 +1331,69 @@ class WorkerQueue:
                                     )
                                 except Exception as e:
                                     logger.warning(f"Failed to log activity for missing classic rules: {e}")
+                                logger.debug(f"[RISK_MGR_TRIGGER] ===== END (classic mode but no ruleset) =====")
                                 return
                         
                         if risk_manager_mode == "smart":
                             # Use Smart Risk Manager for automated processing
-                            logger.info(f"Expert {expert_instance_id} using Smart Risk Manager mode, triggering SmartRiskManager")
+                            logger.info(f"[RISK_MGR_TRIGGER] Expert {expert_instance_id} using SMART risk manager mode, triggering SmartRiskManager")
                             
                             # Get account_id from expert instance database record
                             from .db import get_instance
                             from .models import ExpertInstance
                             expert_instance = get_instance(ExpertInstance, expert_instance_id)
                             if not expert_instance or not expert_instance.account_id:
-                                logger.error(f"Expert instance {expert_instance_id} not found in database or has no account_id")
+                                logger.error(f"[RISK_MGR_TRIGGER] Expert instance {expert_instance_id} not found in database or has no account_id")
+                                logger.debug(f"[RISK_MGR_TRIGGER] ===== END (no expert instance or account_id) =====")
                                 return
+                            
+                            logger.debug(f"[RISK_MGR_TRIGGER] Found expert instance with account_id={expert_instance.account_id}")
                             
                             account_id = expert_instance.account_id
                             
                             # Add Smart Risk Manager task to queue
                             try:
+                                logger.debug(f"[RISK_MGR_TRIGGER] Submitting SmartRiskManager task for expert {expert_instance_id}, account {account_id}")
                                 task_id = self.submit_smart_risk_manager_task(expert_instance_id, account_id)
-                                logger.info(f"Queued Smart Risk Manager task {task_id} for expert {expert_instance_id}")
+                                logger.info(f"[RISK_MGR_TRIGGER] ✓ Queued Smart Risk Manager task {task_id} for expert {expert_instance_id}")
+                                logger.debug(f"[RISK_MGR_TRIGGER] ===== END (SmartRiskManager queued successfully) =====")
                             except Exception as e:
-                                logger.error(f"Failed to queue Smart Risk Manager task for expert {expert_instance_id}: {e}", exc_info=True)
+                                logger.error(f"[RISK_MGR_TRIGGER] ✗ Failed to queue Smart Risk Manager task for expert {expert_instance_id}: {e}", exc_info=True)
+                                logger.debug(f"[RISK_MGR_TRIGGER] ===== END (error queuing SmartRiskManager) =====")
                         else:
                             # Use classic TradeManager for automated processing
-                            logger.info(f"Expert {expert_instance_id} using classic risk manager mode, triggering TradeManager")
+                            logger.info(f"[RISK_MGR_TRIGGER] Expert {expert_instance_id} using CLASSIC risk manager mode, triggering TradeManager")
                             
                             from .TradeManager import get_trade_manager
                             trade_manager = get_trade_manager()
                             
                             if use_case == AnalysisUseCase.ENTER_MARKET:
+                                logger.debug(f"[RISK_MGR_TRIGGER] Processing ENTER_MARKET recommendations")
                                 created_orders = trade_manager.process_expert_recommendations_after_analysis(expert_instance_id)
                             elif use_case == AnalysisUseCase.OPEN_POSITIONS:
+                                logger.debug(f"[RISK_MGR_TRIGGER] Processing OPEN_POSITIONS recommendations")
                                 created_orders = trade_manager.process_open_positions_recommendations(expert_instance_id)
                             else:
-                                logger.error(f"Unknown use case: {use_case}")
+                                logger.error(f"[RISK_MGR_TRIGGER] Unknown use case: {use_case}")
+                                logger.debug(f"[RISK_MGR_TRIGGER] ===== END (unknown use case) =====")
                                 return
                             
                             if created_orders:
-                                logger.info(f"Automated processing created {len(created_orders)} orders for expert {expert_instance_id}")
+                                logger.info(f"[RISK_MGR_TRIGGER] Automated processing created {len(created_orders)} orders for expert {expert_instance_id}")
                             else:
-                                logger.debug(f"No orders created by automated processing for expert {expert_instance_id}")
+                                logger.debug(f"[RISK_MGR_TRIGGER] No orders created by automated processing for expert {expert_instance_id}")
+                            logger.debug(f"[RISK_MGR_TRIGGER] ===== END (classic mode completed) =====")
                     finally:
                         # Always remove from processing set, even if an error occurred
+                        logger.debug(f"[RISK_MGR_TRIGGER] Removing from processing set for {lock_key}")
                         self._processing_experts.discard(lock_key)
                 else:
-                    logger.debug(f"Still has pending {use_case.value} tasks for expert {expert_instance_id}, skipping automated processing")
+                    logger.debug(f"[RISK_MGR_TRIGGER] Still has pending {use_case.value} tasks for expert {expert_instance_id}, skipping automated processing")
+                    logger.debug(f"[RISK_MGR_TRIGGER] ===== END (has pending tasks) =====")
                 
         except Exception as e:
-            logger.error(f"Error checking and processing recommendations for expert {expert_instance_id} ({use_case.value}): {e}", exc_info=True)
+            logger.error(f"[RISK_MGR_TRIGGER] ✗ Error checking and processing recommendations for expert {expert_instance_id} ({use_case.value}): {e}", exc_info=True)
+            logger.debug(f"[RISK_MGR_TRIGGER] ===== END (exception) =====")
     
     def has_existing_transactions(self, expert_id: int, symbol: str) -> bool:
         """

@@ -402,6 +402,13 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                 "type": "bool", "required": True, "default": True,
                 "description": "Use memory system for context-aware analysis",
                 "tooltip": "When enabled, agents retrieve past experiences and recommendations from memory to inform current decisions. Memories are always stored but only used when this is enabled. Disabling may be useful for fresh analysis without historical bias."
+            },
+            
+            # Dynamic Instrument Selection
+            "max_instruments": {
+                "type": "int", "required": True, "default": 30,
+                "description": "Maximum number of instruments for dynamic AI selection",
+                "tooltip": "When using dynamic AI-driven instrument selection (e.g., for DYNAMIC symbol analysis), this setting limits the number of instruments returned by the AI selector. This prevents excessive analysis queue buildup. Default: 30 instruments per dynamic selection."
             }
         }
 

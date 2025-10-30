@@ -7,6 +7,8 @@ import os
 import threading
 import time
 from typing import Any
+from queue import Queue
+import atexit
 
 
 # Create engine and session
@@ -19,6 +21,10 @@ logger.debug(f"Database file path: {DB_FILE}")
 
 # Thread lock for all database write operations
 _db_write_lock = threading.Lock()
+
+# Activity logging queue for async processing (prevents blocking on database locks)
+_activity_log_queue = Queue(maxsize=1000)
+_activity_log_thread = None
 
 # Configure connection pool for multi-threaded application
 
@@ -130,6 +136,76 @@ def retry_on_lock_critical(func):
     return wrapper
 
 
+def _activity_log_worker():
+    """
+    Background worker thread that processes activity log entries from the queue.
+    This prevents activity logging from blocking database writes during high concurrency.
+    """
+    from .models import ActivityLog
+    
+    while True:
+        try:
+            # Get item from queue with timeout (allows thread to exit cleanly)
+            item = _activity_log_queue.get(timeout=2.0)
+            
+            if item is None:  # Sentinel value to stop the thread
+                break
+            
+            # Try to add the activity log entry with retries
+            severity, activity_type, description, data, source_expert_id, source_account_id = item
+            
+            try:
+                activity = ActivityLog(
+                    severity=severity,
+                    type=activity_type,
+                    description=description,
+                    data=data or {},
+                    source_expert_id=source_expert_id,
+                    source_account_id=source_account_id
+                )
+                add_instance(activity)  # This has @retry_on_lock decorator
+                logger.debug(f"Activity logged (async): {activity_type}")
+            except Exception as e:
+                # Even async logging failed - log warning but don't crash worker
+                logger.warning(f"Failed to log activity (async): {e}")
+        
+        except Exception as e:
+            # Queue timeout or other error - continue processing
+            if "Empty" not in str(type(e)):
+                logger.debug(f"Activity log worker: {e}")
+
+
+def _start_activity_log_worker():
+    """Start the background activity log worker thread."""
+    global _activity_log_thread
+    
+    if _activity_log_thread is None or not _activity_log_thread.is_alive():
+        _activity_log_thread = threading.Thread(target=_activity_log_worker, daemon=True)
+        _activity_log_thread.name = "ActivityLogWorker"
+        _activity_log_thread.start()
+        logger.debug("Started activity log worker thread")
+
+
+def _stop_activity_log_worker():
+    """Stop the background activity log worker thread gracefully."""
+    global _activity_log_thread
+    
+    if _activity_log_thread and _activity_log_thread.is_alive():
+        # Send sentinel to stop the worker
+        try:
+            _activity_log_queue.put(None, timeout=1.0)
+        except Exception as e:
+            logger.warning(f"Could not send stop signal to activity log worker: {e}")
+        
+        # Wait for worker to finish
+        _activity_log_thread.join(timeout=5.0)
+        logger.debug("Stopped activity log worker thread")
+
+
+# Register cleanup function to stop worker on exit
+atexit.register(_stop_activity_log_worker)
+
+
 def init_db():
     """
     Import models and create all database tables if they do not exist.
@@ -142,6 +218,9 @@ def init_db():
     os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
     SQLModel.metadata.create_all(engine)
     logger.info("Database initialized with WAL mode enabled")
+    
+    # Start activity log worker thread
+    _start_activity_log_worker()
 
 def get_db_gen():
     """
@@ -673,9 +752,12 @@ def log_activity(
     data: dict = None,
     source_expert_id: int = None,
     source_account_id: int = None
-) -> int:
+) -> None:
     """
-    Log an activity to the ActivityLog table.
+    Log an activity to the ActivityLog table (asynchronously).
+    
+    This function queues activity logs to be written asynchronously by a background worker.
+    This prevents activity logging from blocking database operations during high concurrency.
     
     Args:
         severity: ActivityLogSeverity enum value
@@ -686,7 +768,7 @@ def log_activity(
         source_account_id: Optional account ID
         
     Returns:
-        int: ID of the created activity log entry
+        None (logging is asynchronous)
         
     Example:
         log_activity(
@@ -697,15 +779,16 @@ def log_activity(
             source_expert_id=42
         )
     """
-    from .models import ActivityLog
+    # Ensure worker thread is running
+    if _activity_log_thread is None or not _activity_log_thread.is_alive():
+        _start_activity_log_worker()
     
-    activity = ActivityLog(
-        severity=severity,
-        type=activity_type,
-        description=description,
-        data=data or {},
-        source_expert_id=source_expert_id,
-        source_account_id=source_account_id
-    )
-    
-    return add_instance(activity)
+    # Queue the activity log entry for async processing
+    try:
+        _activity_log_queue.put(
+            (severity, activity_type, description, data, source_expert_id, source_account_id),
+            timeout=2.0  # Don't block if queue is full, just skip this log
+        )
+    except Exception as e:
+        # Queue full or other error - log warning but don't block caller
+        logger.debug(f"Could not queue activity log: {e}")

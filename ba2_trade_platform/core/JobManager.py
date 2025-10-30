@@ -812,14 +812,21 @@ class JobManager:
                 logger.warning(f"AI selection returned no instruments for expert {expert_instance_id}")
                 return
             
-            logger.info(f"AI selected {len(selected_instruments)} instruments for expert {expert_instance_id}: {selected_instruments[:10]}{'...' if len(selected_instruments) > 10 else ''}")
+            # Ensure symbols are unique and limited by max_instruments setting
+            max_instruments = expert.settings.get('max_instruments', 30)
+            unique_instruments = list(dict.fromkeys(selected_instruments))[:max_instruments]
+            
+            if len(unique_instruments) < len(selected_instruments):
+                logger.info(f"Deduplicated and limited instruments: {len(selected_instruments)} -> {len(unique_instruments)} (max_instruments={max_instruments})")
+            
+            logger.info(f"AI selected {len(unique_instruments)} instruments for expert {expert_instance_id}: {unique_instruments[:10]}{'...' if len(unique_instruments) > 10 else ''}")
             
             # Auto-add instruments to database if they don't exist
             try:
                 from .InstrumentAutoAdder import get_instrument_auto_adder
                 auto_adder = get_instrument_auto_adder()
                 auto_adder.queue_instruments_for_addition(
-                    symbols=selected_instruments,
+                    symbols=unique_instruments,
                     expert_shortname=expert.shortname,
                     source='ai_dynamic'
                 )
@@ -827,7 +834,7 @@ class JobManager:
                 logger.warning(f"Could not queue instruments for auto-addition: {e}")
             
             # Submit analysis jobs for selected instruments
-            for instrument in selected_instruments:
+            for instrument in unique_instruments:
                 try:
                     # Check if this is OPEN_POSITIONS and if there are open transactions
                     if subtype == AnalysisUseCase.OPEN_POSITIONS:

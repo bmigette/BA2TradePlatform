@@ -83,14 +83,27 @@ def log_provider_call(func: Callable) -> Callable:
 def validate_date_range(
     start_date: Optional[datetime],
     end_date: Optional[datetime],
+    lookback_days: Optional[int] = None,
     max_days: Optional[int] = None
 ) -> tuple[Optional[datetime], Optional[datetime]]:
     """
-    Validate and normalize date range parameters.
+    Validate and normalize date range parameters with intelligent optional handling.
+    
+    OPTIONAL DATE LOGIC:
+    - If both start_date and end_date are provided: use them as-is
+    - If end_date is None or empty string: use current date as end_date
+    - If start_date is None or empty string:
+        * If lookback_days provided: start_date = end_date - lookback_days
+        * Otherwise: use default 30-day lookback
+    - If both start_date and lookback_days provided (no end_date): 
+        * end_date = start_date + lookback_days
+    
+    Treats empty strings as None for convenience.
     
     Args:
-        start_date: Start date (optional)
-        end_date: End date (optional)
+        start_date: Start date (optional) - if None/empty, calculated from lookback_days
+        end_date: End date (optional) - if None/empty, defaults to current date
+        lookback_days: Days to look back (optional) - used to calculate missing dates
         max_days: Maximum allowed days in range (optional)
     
     Returns:
@@ -100,12 +113,50 @@ def validate_date_range(
         ValueError: If dates are invalid or range exceeds max_days
         
     Example:
+        >>> # Provide end_date only - uses end_date - 30 days
+        >>> start, end = validate_date_range(None, datetime(2025, 1, 31))
+        
+        >>> # Provide start_date and lookback - calculates end_date
+        >>> start, end = validate_date_range(datetime(2025, 1, 1), None, lookback_days=30)
+        
+        >>> # Provide both - uses both directly
         >>> start, end = validate_date_range(
         ...     datetime(2025, 1, 1),
         ...     datetime(2025, 1, 31),
-        ...     max_days=365
         ... )
     """
+    # Treat empty strings as None
+    if isinstance(start_date, str) and not start_date.strip():
+        start_date = None
+    if isinstance(end_date, str) and not end_date.strip():
+        end_date = None
+    
+    # Default lookback if not specified
+    if lookback_days is None:
+        lookback_days = 30
+    
+    # Get current time in UTC
+    now = datetime.now(timezone.utc)
+    
+    # Handle case where both dates are missing
+    if start_date is None and end_date is None:
+        end_date = now
+        start_date = end_date - timedelta(days=lookback_days)
+    
+    # Handle case where only end_date is missing
+    elif end_date is None:
+        # If start_date is provided, calculate end_date from start + lookback_days
+        if start_date is not None:
+            end_date = start_date + timedelta(days=lookback_days)
+        else:
+            # Both must have been None at start (handled above), but just in case
+            end_date = now
+            start_date = end_date - timedelta(days=lookback_days)
+    
+    # Handle case where only start_date is missing
+    elif start_date is None:
+        start_date = end_date - timedelta(days=lookback_days)
+    
     # Normalize to UTC
     if start_date and start_date.tzinfo is None:
         start_date = start_date.replace(tzinfo=timezone.utc)
@@ -117,7 +168,6 @@ def validate_date_range(
         raise ValueError(f"start_date ({start_date}) must be before end_date ({end_date})")
     
     # Validate future dates
-    now = datetime.now(timezone.utc)
     if end_date and end_date > now + timedelta(days=1):
         logger.warning(f"end_date ({end_date}) is in the future, capping to now")
         end_date = now

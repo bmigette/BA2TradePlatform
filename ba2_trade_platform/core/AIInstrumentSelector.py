@@ -273,6 +273,18 @@ Your response:"""
                     logger.error(f"AI response is not a list: {type(instruments)}")
                     return None
                 
+                # Get max_instruments setting from expert if available
+                max_instruments = 50  # Default fallback
+                if expert_instance_id:
+                    try:
+                        from .utils import get_expert_instance_from_id
+                        expert = get_expert_instance_from_id(expert_instance_id)
+                        if expert and expert.settings:
+                            max_instruments = expert.settings.get('max_instruments', 50)
+                            logger.debug(f"Using max_instruments setting: {max_instruments}")
+                    except Exception as e:
+                        logger.debug(f"Could not retrieve max_instruments setting: {e}")
+                
                 # Validate all items are strings (symbols)
                 valid_instruments = []
                 for item in instruments:
@@ -289,9 +301,12 @@ Your response:"""
                 if not valid_instruments:
                     logger.error("No valid instruments found in AI response")
                     return None
+                
+                # Ensure uniqueness and apply length limit
+                unique_instruments = list(dict.fromkeys(valid_instruments))[:max_instruments]
 
-                logger.info(f"AI selected {len(valid_instruments)} instruments: {valid_instruments}")
-                return valid_instruments
+                logger.info(f"AI selected {len(unique_instruments)} instruments (max_instruments={max_instruments}): {unique_instruments}")
+                return unique_instruments
 
             except json.JSONDecodeError as e:
                 # Enhanced error logging with model and expert info
@@ -327,7 +342,7 @@ Your response:"""
                     logger.warning(f"Could not log activity: {log_error}")
                 
                 # Try to extract symbols from text if JSON parsing failed
-                return self._extract_symbols_from_text(response_content)
+                return self._extract_symbols_from_text(response_content, expert_instance_id)
 
         except Exception as e:
             logger.error(f"Error during AI instrument selection with {self.model_string}" + 
@@ -335,18 +350,31 @@ Your response:"""
                         f": {e}", exc_info=True)
             return None
 
-    def _extract_symbols_from_text(self, text: str) -> Optional[List[str]]:
+    def _extract_symbols_from_text(self, text: str, expert_instance_id: Optional[int] = None) -> Optional[List[str]]:
         """
         Fallback method to extract symbols from text when JSON parsing fails.
         
         Args:
             text (str): Raw text response from AI
+            expert_instance_id (Optional[int]): ID of the expert instance triggering this selection (for getting max_instruments setting)
             
         Returns:
             Optional[List[str]]: Extracted symbols or None if extraction failed
         """
         try:
             import re
+            
+            # Get max_instruments setting from expert if available
+            max_instruments = 100  # Default fallback
+            if expert_instance_id:
+                try:
+                    from .utils import get_expert_instance_from_id
+                    expert = get_expert_instance_from_id(expert_instance_id)
+                    if expert and expert.settings:
+                        max_instruments = expert.settings.get('max_instruments', 100)
+                        logger.debug(f"Using max_instruments setting: {max_instruments}")
+                except Exception as e:
+                    logger.debug(f"Could not retrieve max_instruments setting: {e}")
             
             # Look for patterns like stock symbols (2-5 uppercase letters)
             symbol_pattern = r'\b[A-Z]{2,5}\b'
@@ -360,11 +388,11 @@ Your response:"""
                 if symbol not in common_words and len(symbol) >= 2:
                     valid_symbols.append(symbol)
             
-            # Remove duplicates and limit to reasonable number
-            unique_symbols = list(dict.fromkeys(valid_symbols))[:100]
+            # Remove duplicates and limit to max_instruments
+            unique_symbols = list(dict.fromkeys(valid_symbols))[:max_instruments]
             
             if unique_symbols:
-                logger.info(f"Extracted {len(unique_symbols)} symbols from text: {unique_symbols}")
+                logger.info(f"Extracted {len(unique_symbols)} symbols from text (max_instruments={max_instruments}): {unique_symbols}")
                 return unique_symbols
             else:
                 logger.error("No valid symbols could be extracted from AI response text")

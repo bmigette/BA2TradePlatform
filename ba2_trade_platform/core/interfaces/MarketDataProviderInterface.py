@@ -6,14 +6,14 @@ All data providers should extend this class and implement the fetch methods.
 """
 
 from abc import ABC, abstractmethod
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, time, timezone
 from typing import List, Optional, Dict, Any
 import pandas as pd
 import os
 from ba2_trade_platform.core.types import MarketDataPoint
 from ba2_trade_platform.logger import logger
 from ba2_trade_platform import config
-from ba2_trade_platform.core.provider_utils import log_provider_call
+from ba2_trade_platform.core.provider_utils import log_provider_call, validate_date_range
 from ba2_trade_platform.core.interfaces.DataProviderInterface import DataProviderInterface
 
 
@@ -246,30 +246,39 @@ class MarketDataProviderInterface(DataProviderInterface):
     def get_data(
         self,
         symbol: str,
-        start_date: datetime,
-        end_date: datetime,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
         interval: str = '1d',
         use_cache: bool = True,
-        max_cache_age_hours: int = 24
+        max_cache_age_hours: int = 24,
+        lookback_days: int = 30
     ) -> List[MarketDataPoint]:
         """
-        Get market data with smart caching.
+        Get market data with smart caching and optional date range.
         
         This is the main public method to fetch data. It handles:
-        1. Normalize start/end dates to interval boundaries
-        2. Cache validation (check if cache exists and is recent)
-        3. Loading from cache if valid
-        4. Fetching from source if cache invalid
-        5. Filtering to requested date range
-        6. Converting to MarketDataPoint objects
+        1. Calculate missing date parameters using lookback_days
+        2. Normalize start/end dates to interval boundaries
+        3. Cache validation (check if cache exists and is recent)
+        4. Loading from cache if valid
+        5. Fetching from source if cache invalid
+        6. Filtering to requested date range
+        7. Converting to MarketDataPoint objects
+        
+        OPTIONAL DATE LOGIC:
+        - If both start_date and end_date are provided: uses them as-is
+        - If end_date is None: defaults to current date
+        - If start_date is None: defaults to end_date - lookback_days
         
         Args:
             symbol: Ticker symbol (e.g., 'AAPL', 'MSFT')
-            start_date: Start date for data (will be floored to interval boundary)
-            end_date: End date for data
+            start_date: Start date for data (optional, will be floored to interval boundary).
+                If None, defaults to end_date - lookback_days
+            end_date: End date for data (optional). If None, defaults to current date
             interval: Data interval ('1m', '5m', '15m', '30m', '1h', '4h', '1d', '1wk', '1mo')
             use_cache: Whether to use caching (default: True)
             max_cache_age_hours: Maximum age of cache in hours (default: 24)
+            lookback_days: Days to look back if dates not provided (default: 30)
         
         Returns:
             List of MarketDataPoint objects for the requested date range
@@ -277,6 +286,9 @@ class MarketDataProviderInterface(DataProviderInterface):
         Raises:
             Exception: If data fetching fails
         """
+        # Validate and normalize dates with intelligent optional handling
+        start_date, end_date = validate_date_range(start_date, end_date, lookback_days)
+        
         # Normalize start_date to interval boundary for proper time series alignment
         normalized_start = self.normalize_time_to_interval(start_date, interval)
         
@@ -347,11 +359,12 @@ class MarketDataProviderInterface(DataProviderInterface):
     def get_ohlcv_data(
         self,
         symbol: str,
-        start_date: datetime,
-        end_date: datetime,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
         interval: str = '1d',
         use_cache: bool = True,
-        max_cache_age_hours: int = 24
+        max_cache_age_hours: int = 24,
+        lookback_days: int = 30
     ) -> pd.DataFrame:
         """
         Get OHLCV (Open, High, Low, Close, Volume) market data as DataFrame.
@@ -359,17 +372,27 @@ class MarketDataProviderInterface(DataProviderInterface):
         This is the main public method for retrieving market data with caching support.
         Use this method instead of calling _get_ohlcv_data_impl() directly.
         
+        OPTIONAL DATE LOGIC:
+        - If both start_date and end_date are provided: uses them as-is
+        - If end_date is None: defaults to current date
+        - If start_date is None: defaults to end_date - lookback_days
+        
         Args:
             symbol: Ticker symbol
-            start_date: Start date for data (will be floored to interval boundary)
-            end_date: End date for data
+            start_date: Start date for data (optional, will be floored to interval boundary).
+                If None, defaults to end_date - lookback_days
+            end_date: End date for data (optional). If None, defaults to current date
             interval: Data interval
             use_cache: Whether to use caching
             max_cache_age_hours: Maximum age of cache in hours
+            lookback_days: Days to look back if dates not provided (default: 30)
         
         Returns:
             DataFrame with columns: Date, Open, High, Low, Close, Volume
         """
+        # Validate and normalize dates with intelligent optional handling
+        start_date, end_date = validate_date_range(start_date, end_date, lookback_days)
+        
         # Normalize start_date to interval boundary for proper time series alignment
         normalized_start = self.normalize_time_to_interval(start_date, interval)
         

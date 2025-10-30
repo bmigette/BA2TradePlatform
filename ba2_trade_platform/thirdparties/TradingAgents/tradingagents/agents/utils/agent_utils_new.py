@@ -1106,14 +1106,15 @@ class Toolkit:
     def get_ohlcv_data(
         self,
         symbol: Annotated[str, "Stock ticker symbol (e.g., 'AAPL', 'MSFT', 'TSLA')"],
-        start_date: Annotated[str, "Start date in YYYY-MM-DD format (e.g., '2024-01-01')"],
-        end_date: Annotated[str, "End date in YYYY-MM-DD format (e.g., '2024-03-15')"],
+        start_date: Annotated[Optional[str], "Start date in YYYY-MM-DD format (e.g., '2024-01-01'). Optional - defaults to 30 days ago."] = None,
+        end_date: Annotated[Optional[str], "End date in YYYY-MM-DD format (e.g., '2024-03-15'). Optional - defaults to today."] = None,
         interval: Annotated[
             Optional[str],
             "Data interval/timeframe: '1d' (daily), '1h' (hourly), '1m' (1-minute), '5m' (5-minute), etc. "
             "Shorter intervals (1m, 5m) for day trading, medium (1h, 1d) for swing trading, longer (1wk, 1mo) for position trading. "
             "If not provided, uses timeframe from expert config."
-        ] = None
+        ] = None,
+        lookback_days: Annotated[int, "Days to look back if dates not provided. Default: 30 days."] = 30
     ) -> str:
         """
         Retrieve OHLCV (Open, High, Low, Close, Volume) stock price data.
@@ -1125,14 +1126,20 @@ class Toolkit:
         - Close: Closing price for the period
         - Volume: Number of shares traded
         
+        OPTIONAL DATE LOGIC:
+        - If both start_date and end_date are provided: uses them as-is
+        - If end_date is None/empty: defaults to current date
+        - If start_date is None/empty: defaults to end_date - lookback_days (default 30 days)
+        
         Uses FALLBACK logic: tries first provider, if it fails, tries second provider, etc.
         Only one provider's data is returned (the first successful one).
         
         Args:
             symbol: Stock ticker symbol
-            start_date: Start date in YYYY-MM-DD format
-            end_date: End date in YYYY-MM-DD format
+            start_date: Start date in YYYY-MM-DD format (optional)
+            end_date: End date in YYYY-MM-DD format (optional)
             interval: Data interval (default from expert config)
+            lookback_days: Days to look back if dates not provided (default: 30)
         
         Returns:
             str: Markdown-formatted OHLCV data from first successful provider
@@ -1140,19 +1147,40 @@ class Toolkit:
         Example:
             >>> ohlcv = get_ohlcv_data("AAPL", "2024-01-01", "2024-03-15", interval="1d")
             >>> # Returns daily price data for Apple for the specified period
+            >>> ohlcv = get_ohlcv_data("AAPL", interval="1d")
+            >>> # Returns last 30 days of daily data
         """
         if "ohlcv" not in self.provider_map or not self.provider_map["ohlcv"]:
             return "Error: No OHLCV providers configured"
         
-        # Validate date parameters
-        if not start_date or not start_date.strip():
-            return "Error: start_date is required and cannot be empty"
-        if not end_date or not end_date.strip():
-            return "Error: end_date is required and cannot be empty"
-        
         try:
-            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-            end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+            from datetime import datetime as dt_class, timezone
+            from ba2_trade_platform.core.provider_utils import validate_date_range
+            
+            # Treat empty strings as None
+            if isinstance(start_date, str) and not start_date.strip():
+                start_date = None
+            if isinstance(end_date, str) and not end_date.strip():
+                end_date = None
+            
+            # Convert date strings to datetime objects if provided
+            start_dt = None
+            end_dt = None
+            
+            if start_date:
+                try:
+                    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+                except ValueError:
+                    return f"Error: Invalid start_date format. Expected YYYY-MM-DD, got '{start_date}'"
+            
+            if end_date:
+                try:
+                    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+                except ValueError:
+                    return f"Error: Invalid end_date format. Expected YYYY-MM-DD, got '{end_date}'"
+            
+            # Validate and normalize dates with smart defaults
+            start_dt, end_dt = validate_date_range(start_dt, end_dt, lookback_days)
             
             # Get interval from config if not provided
             if interval is None:
@@ -1187,6 +1215,10 @@ class Toolkit:
                     # Convert DataFrame to markdown and JSON using helper method
                     markdown_text, json_data = self._format_ohlcv_dataframe(df, symbol)
                     
+                    # Format original dates for storage
+                    orig_start = start_date if start_date else start_dt.strftime("%Y-%m-%d")
+                    orig_end = end_date if end_date else end_dt.strftime("%Y-%m-%d")
+                    
                     # Return structured format for LoggingToolNode to store both text and data
                     # This allows the database to store complete OHLCV data in JSON format
                     return {
@@ -1195,8 +1227,8 @@ class Toolkit:
                         "json_for_storage": {
                             "tool": "get_ohlcv_data",
                             "symbol": symbol,
-                            "start_date": start_date,
-                            "end_date": end_date,
+                            "start_date": orig_start,
+                            "end_date": orig_end,
                             "interval": interval,
                             "provider": provider_name,
                             "data": json_data
@@ -1210,7 +1242,7 @@ class Toolkit:
             return "Error: All OHLCV providers failed to retrieve data"
             
         except Exception as e:
-            logger.error(f"Error in get_ohlcv_data: {e}")
+            logger.error(f"Error in get_ohlcv_data: {e}", exc_info=True)
             return f"Error retrieving OHLCV data: {str(e)}"
     
     # ========================================================================
@@ -1233,13 +1265,14 @@ class Toolkit:
             "USAGE NOTES: RSI extremes (>70 or <30) signal overbought/oversold. MACD crossovers signal trend changes. "
             "Bollinger bands signal volatility extremes. ATR helps size positions based on volatility."
         ],
-        start_date: Annotated[str, "Start date in YYYY-MM-DD format"],
-        end_date: Annotated[str, "End date in YYYY-MM-DD format"],
+        start_date: Annotated[Optional[str], "Start date in YYYY-MM-DD format. Optional - defaults to 30 days ago."] = None,
+        end_date: Annotated[Optional[str], "End date in YYYY-MM-DD format. Optional - defaults to today."] = None,
         interval: Annotated[
             Optional[str],
             "Data interval/timeframe: '1d' (daily), '1h' (hourly), etc. "
             "Must match the timeframe you're analyzing. If not provided, uses timeframe from expert config."
-        ] = None
+        ] = None,
+        lookback_days: Annotated[int, "Days to look back if dates not provided. Default: 30 days."] = 30
     ) -> str:
         """
         Retrieve technical indicator data for analysis.
@@ -1250,15 +1283,21 @@ class Toolkit:
         - Volatility: Bollinger Bands, ATR
         - Volume: VWMA
         
+        OPTIONAL DATE LOGIC:
+        - If both start_date and end_date are provided: uses them as-is
+        - If end_date is None/empty: defaults to current date
+        - If start_date is None/empty: defaults to end_date - lookback_days (default 30 days)
+        
         Uses FALLBACK logic: tries first provider, if it fails, tries second provider, etc.
         Only one provider's data is returned (the first successful one).
         
         Args:
             symbol: Stock ticker symbol
             indicator: Indicator name (e.g., 'rsi', 'macd', 'close_50_sma')
-            start_date: Start date in YYYY-MM-DD format
-            end_date: End date in YYYY-MM-DD format
+            start_date: Start date in YYYY-MM-DD format (optional)
+            end_date: End date in YYYY-MM-DD format (optional)
             interval: Data interval (default from expert config)
+            lookback_days: Days to look back if dates not provided (default: 30)
         
         Returns:
             str: Markdown-formatted indicator data from first successful provider
@@ -1266,15 +1305,40 @@ class Toolkit:
         Example:
             >>> rsi = get_indicator_data("AAPL", "rsi", "2024-01-01", "2024-03-15", interval="1d")
             >>> # Returns RSI indicator values for Apple
+            >>> rsi = get_indicator_data("AAPL", "rsi", interval="1d")
+            >>> # Returns RSI for last 30 days
         """
         if "indicators" not in self.provider_map or not self.provider_map["indicators"]:
             return "Error: No indicator providers configured"
         
         try:
             import json as json_module
+            from ba2_trade_platform.core.provider_utils import validate_date_range
             
-            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-            end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+            # Treat empty strings as None
+            if isinstance(start_date, str) and not start_date.strip():
+                start_date = None
+            if isinstance(end_date, str) and not end_date.strip():
+                end_date = None
+            
+            # Convert date strings to datetime objects if provided
+            start_dt = None
+            end_dt = None
+            
+            if start_date:
+                try:
+                    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+                except ValueError:
+                    return f"Error: Invalid start_date format. Expected YYYY-MM-DD, got '{start_date}'"
+            
+            if end_date:
+                try:
+                    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+                except ValueError:
+                    return f"Error: Invalid end_date format. Expected YYYY-MM-DD, got '{end_date}'"
+            
+            # Validate and normalize dates with smart defaults
+            start_dt, end_dt = validate_date_range(start_dt, end_dt, lookback_days)
             
             # Get interval from config if not provided
             if interval is None:
@@ -1313,12 +1377,16 @@ class Toolkit:
                     # Return structured format for LoggingToolNode storage
                     text_for_agent = f"## {indicator.upper()} from {provider_name.upper()}\n\n{markdown_data}"
                     
+                    # Format original dates for storage
+                    orig_start = start_date if start_date else start_dt.strftime("%Y-%m-%d")
+                    orig_end = end_date if end_date else end_dt.strftime("%Y-%m-%d")
+                    
                     json_for_storage = {
                         "tool": "get_indicator_data",
                         "symbol": symbol,
                         "indicator": indicator,
-                        "start_date": start_date,
-                        "end_date": end_date,
+                        "start_date": orig_start,
+                        "end_date": orig_end,
                         "interval": interval,
                         "provider": provider_name,
                         "data": indicator_data if isinstance(indicator_data, dict) else {"raw": str(indicator_data)}
