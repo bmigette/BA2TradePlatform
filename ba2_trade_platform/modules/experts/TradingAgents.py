@@ -821,6 +821,11 @@ Analysis completed at: {self._get_current_timestamp()}"""
             # Execute TradingAgents analysis
             final_state, processed_signal = self._execute_tradingagents_analysis(symbol, market_analysis.id, market_analysis.subtype)
             
+            # Check if analysis encountered an error (expert_recommendation would be empty from summarization error)
+            if not final_state.get('expert_recommendation'):
+                # Analysis failed - let exception handler mark as FAILED
+                raise Exception(f"TradingAgents analysis returned no recommendation for {symbol}")
+            
             # Extract recommendation data
             recommendation_data = self._extract_recommendation_data(final_state, processed_signal, symbol)
             
@@ -990,24 +995,25 @@ Analysis completed at: {self._get_current_timestamp()}"""
     
     def _handle_analysis_error(self, market_analysis: MarketAnalysis, symbol: str, error_message: str) -> None:
         """Handle analysis errors by storing error state and creating error output."""
-        # Store error in market analysis
+        # Store error in market analysis with ID for traceability
         market_analysis.state = {
             'error': error_message,
             'error_timestamp': self._get_current_timestamp(),
             'analysis_failed': True,
-            'analysis_method': 'tradingagents_full'
+            'analysis_method': 'tradingagents_full',
+            'analysis_id': market_analysis.id
         }
         market_analysis.status = MarketAnalysisStatus.FAILED
         update_instance(market_analysis)
         
-        # Create error output
+        # Create error output with analysis ID for traceability
         try:
             session = get_db()
             error_output = AnalysisOutput(
                 market_analysis_id=market_analysis.id,
                 name="Analysis Error",
                 type="error",
-                text=f"TradingAgents analysis failed for {symbol}: {error_message}"
+                text=f"TradingAgents analysis failed (ID {market_analysis.id}) for {symbol}: {error_message}"
             )
             session.add(error_output)
             session.commit()

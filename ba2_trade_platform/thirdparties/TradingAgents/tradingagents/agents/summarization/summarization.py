@@ -133,9 +133,9 @@ def create_final_summarization_agent(llm):
             # Log activity for analysis failure
             _log_analysis_failure(state, symbol, str(e))
             
-            # Return state with fallback recommendation
-            fallback_recommendation = _create_fallback_recommendation(state, symbol, current_price, str(e))
-            state["expert_recommendation"] = fallback_recommendation
+            # Do NOT create fallback recommendation on error - let error handling in TradingAgents.py take over
+            # This ensures MarketAnalysis stays FAILED and no ExpertRecommendation is created
+            state["expert_recommendation"] = {}
             return state
     
     return summarization_agent_node
@@ -262,17 +262,16 @@ def _log_analysis_failure(state: Dict[str, Any], symbol: str, error_msg: str) ->
         # Determine error type for better categorization
         error_type = "JSON Parsing Error" if "json" in error_msg.lower() or "parse" in error_msg.lower() else "Analysis Error"
         
-        # Log the failure
+        # Log the failure with analysis ID in description for traceability
         log_activity(
             severity=ActivityLogSeverity.FAILURE,
             activity_type=ActivityLogType.ANALYSIS_FAILED,
-            description=f"TradingAgents analysis failed for {symbol}: {error_type}",
+            description=f"TradingAgents analysis failed (ID {market_analysis_id}) for {symbol}: {error_type}",
             data={
                 "symbol": symbol,
                 "error_message": error_msg[:500],  # Truncate to 500 chars
                 "error_type": error_type,
-                "market_analysis_id": market_analysis_id,
-                "fallback_action": "HOLD"
+                "market_analysis_id": market_analysis_id
             },
             source_account_id=account_id,
             source_expert_id=expert_instance_id
