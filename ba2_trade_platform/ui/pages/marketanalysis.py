@@ -1463,10 +1463,35 @@ class ManualAnalysisTab:
             # Submit analysis jobs for all selected instruments
             from ...core.JobManager import get_job_manager
             from ...core.types import AnalysisUseCase
+            import time
+            import uuid
+            
             job_manager = get_job_manager()
             
             # Convert analysis type string to enum
             subtype = AnalysisUseCase.ENTER_MARKET if self.analysis_type == AnalysisUseCase.ENTER_MARKET.value else AnalysisUseCase.OPEN_POSITIONS
+            
+            # Generate batch ID for this manual submission
+            # Format: "manual_TIMESTAMP_expert_EXPERT_ID_BATCH_UUID"
+            timestamp = int(time.time())
+            batch_uuid = str(uuid.uuid4())[:8]  # Use first 8 chars of UUID for brevity
+            expert_id = int(self.expert_instance_id)
+            
+            is_batch = len(selected_instruments) > 1
+            batch_id = f"manual_{timestamp}_{expert_id}_{batch_uuid}"
+            
+            # Log the manual analysis submission
+            try:
+                from ...core.utils import log_manual_analysis
+                symbols = [inst['name'] for inst in selected_instruments]
+                log_manual_analysis(
+                    expert_instance_id=expert_id,
+                    symbols=symbols,
+                    analysis_type=subtype,
+                    is_batch=is_batch
+                )
+            except Exception as e:
+                logger.warning(f"Failed to log manual analysis: {e}")
             
             successful_submissions = 0
             failed_submissions = 0
@@ -1477,16 +1502,17 @@ class ManualAnalysisTab:
                 
                 try:
                     success = job_manager.submit_market_analysis(
-                        int(self.expert_instance_id), 
+                        expert_id, 
                         symbol, 
                         subtype=subtype,
                         bypass_balance_check=True,  # Manual analysis bypasses balance check
-                        bypass_transaction_check=True  # Manual analysis bypasses transaction checks
+                        bypass_transaction_check=True,  # Manual analysis bypasses transaction checks
+                        batch_id=batch_id  # All symbols in this submission share the same batch ID
                     )
                     
                     if success:
                         successful_submissions += 1
-                        logger.debug(f"Successfully submitted analysis for {symbol}")
+                        logger.debug(f"Successfully submitted analysis for {symbol} with batch_id={batch_id}")
                     else:
                         duplicate_submissions += 1
                         logger.debug(f"Analysis already pending for {symbol}")

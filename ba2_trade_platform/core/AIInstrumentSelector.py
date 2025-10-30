@@ -217,13 +217,14 @@ EXAMPLE FORMAT (respond exactly like this):
 
 Your response:"""
 
-    def select_instruments(self, prompt: Optional[str] = None) -> Optional[List[str]]:
+    def select_instruments(self, prompt: Optional[str] = None, expert_instance_id: Optional[int] = None) -> Optional[List[str]]:
         """
         Use AI to select instruments based on the provided prompt.
         
         Args:
             prompt (Optional[str]): Custom prompt for instrument selection. 
                                   If None, uses default prompt.
+            expert_instance_id (Optional[int]): ID of the expert instance triggering this selection (for logging)
         
         Returns:
             Optional[List[str]]: List of selected instrument symbols, or None if failed
@@ -235,7 +236,8 @@ Your response:"""
             # Use provided prompt or default
             selection_prompt = prompt if prompt else self.get_default_prompt()
             
-            logger.info(f"Requesting AI instrument selection using model: {self.model_string}")
+            logger.info(f"Requesting AI instrument selection using model: {self.model_string}" + 
+                       (f" (Expert: {expert_instance_id})" if expert_instance_id else ""))
             logger.debug(f"Using prompt: {selection_prompt}...")
 
             # Call appropriate API with web search enabled
@@ -292,14 +294,45 @@ Your response:"""
                 return valid_instruments
 
             except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse AI response as JSON: {e}")
-                logger.error(f"Raw response: {response_content}")
+                # Enhanced error logging with model and expert info
+                error_msg = f"Failed to parse AI response as JSON: {e}"
+                logger.error(error_msg)
+                logger.error(f"Model: {self.model_string}")
+                logger.error(f"Expert Instance ID: {expert_instance_id if expert_instance_id else 'Unknown'}")
+                logger.error(f"Raw response: {response_content[:500]}")  # Truncate very long responses
+                
+                # Log to activity log for better tracking
+                try:
+                    from .db import get_instance
+                    from .models import ExpertInstance
+                    from .db import log_activity
+                    from .types import ActivityLogSeverity, ActivityLogType
+                    
+                    if expert_instance_id:
+                        expert = get_instance(ExpertInstance, expert_instance_id)
+                        if expert:
+                            log_activity(
+                                severity=ActivityLogSeverity.ERROR,
+                                activity_type=ActivityLogType.ANALYSIS_FAILED,
+                                description=f"AI instrument selection failed: Invalid JSON response from {self.model_string}",
+                                data={
+                                    "model": self.model_string,
+                                    "provider": self.provider,
+                                    "response_snippet": response_content[:200],
+                                    "error": str(e)
+                                },
+                                source_expert_id=expert_instance_id
+                            )
+                except Exception as log_error:
+                    logger.warning(f"Could not log activity: {log_error}")
                 
                 # Try to extract symbols from text if JSON parsing failed
                 return self._extract_symbols_from_text(response_content)
 
         except Exception as e:
-            logger.error(f"Error during AI instrument selection with {self.model_string}: {e}")
+            logger.error(f"Error during AI instrument selection with {self.model_string}" + 
+                        (f" (Expert: {expert_instance_id})" if expert_instance_id else "") + 
+                        f": {e}", exc_info=True)
             return None
 
     def _extract_symbols_from_text(self, text: str) -> Optional[List[str]]:

@@ -39,6 +39,7 @@ class AnalysisTask:
     market_analysis_id: Optional[int] = None  # Reference to MarketAnalysis record
     bypass_balance_check: bool = False  # If True, skip balance verification for this task
     bypass_transaction_check: bool = False  # If True, skip existing transaction checks for this task
+    batch_id: Optional[str] = None  # Batch ID for grouping related analysis jobs (e.g., "expertid_HHmm_YYYYMMDD" for scheduled, timestamp-based for manual)
     
     def __post_init__(self):
         if self.created_at is None:
@@ -87,6 +88,7 @@ class InstrumentExpansionTask:
     created_at: float = None
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
+    batch_id: Optional[str] = None  # Batch ID for grouping related expansion tasks
     
     def __post_init__(self):
         if self.created_at is None:
@@ -118,6 +120,12 @@ class WorkerQueue:
         self._queue_counter = 0  # Counter for tiebreaking in priority queue
         self._risk_manager_lock = threading.Lock()  # Lock for risk manager processing per expert
         self._processing_experts: Set[int] = set()  # Track which experts are currently being processed
+        
+        # Batch analysis tracking for activity logging
+        self._batch_start_times: Dict[str, float] = {}  # Maps batch_id to start timestamp
+        self._batch_task_counts: Dict[str, int] = {}  # Maps batch_id to total job count
+        self._batch_completed_counts: Dict[str, int] = {}  # Maps batch_id to completed job count
+        self._batch_lock = threading.Lock()  # Lock for batch tracking
         
         logger.info("WorkerQueue system initialized")
         
@@ -191,7 +199,8 @@ class WorkerQueue:
                            priority: int = 0, task_id: Optional[str] = None,
                            bypass_balance_check: bool = False,
                            bypass_transaction_check: bool = False,
-                           market_analysis_id: Optional[int] = None) -> str:
+                           market_analysis_id: Optional[int] = None,
+                           batch_id: Optional[str] = None) -> str:
         """
         Submit an analysis task to be processed by the worker queue.
         
@@ -204,6 +213,7 @@ class WorkerQueue:
             bypass_balance_check: If True, skip balance verification for this task
             bypass_transaction_check: If True, skip existing transaction checks for this task
             market_analysis_id: Optional existing MarketAnalysis ID to reuse (for retries)
+            batch_id: Optional batch identifier for grouping related analysis jobs (e.g., "expertid_HHmm_YYYYMMDD" for scheduled)
             
         Returns:
             Task ID that can be used to track the task
@@ -238,7 +248,8 @@ class WorkerQueue:
                 priority=priority,
                 bypass_balance_check=bypass_balance_check,
                 bypass_transaction_check=bypass_transaction_check,
-                market_analysis_id=market_analysis_id
+                market_analysis_id=market_analysis_id,
+                batch_id=batch_id
             )
             
             self._tasks[task_id] = task
@@ -252,7 +263,7 @@ class WorkerQueue:
         
         self._queue.put(queue_entry)
         
-        logger.debug(f"Analysis task '{task_id}' submitted for expert {expert_instance_id}, symbol {symbol}, priority {priority}")
+        logger.debug(f"Analysis task '{task_id}' submitted for expert {expert_instance_id}, symbol {symbol}, priority {priority}, batch_id={batch_id}")
         return task_id
     
     def submit_smart_risk_manager_task(self, expert_instance_id: int, account_id: int, 
@@ -315,7 +326,7 @@ class WorkerQueue:
         
     def submit_instrument_expansion_task(self, expert_instance_id: int, expansion_type: str, 
                                         subtype: str = "ENTER_MARKET", priority: int = 5, 
-                                        task_id: Optional[str] = None) -> str:
+                                        task_id: Optional[str] = None, batch_id: Optional[str] = None) -> str:
         """
         Submit an instrument expansion task (DYNAMIC/EXPERT/OPEN_POSITIONS) to be processed by worker queue.
         
@@ -325,6 +336,7 @@ class WorkerQueue:
             subtype: Analysis use case subtype (default "ENTER_MARKET")
             priority: Task priority (lower numbers = higher priority, default 5)
             task_id: Optional custom task ID
+            batch_id: Optional batch identifier for grouping related expansion tasks
             
         Returns:
             Task ID that can be used to track the task
@@ -357,7 +369,8 @@ class WorkerQueue:
                 expert_instance_id=expert_instance_id,
                 expansion_type=expansion_type,
                 subtype=subtype,
-                priority=priority
+                priority=priority,
+                batch_id=batch_id
             )
             
             self._tasks[task_id] = task
@@ -370,7 +383,7 @@ class WorkerQueue:
         
         self._queue.put(queue_entry)
         
-        logger.info(f"Instrument expansion task '{task_id}' ({expansion_type}) submitted for expert {expert_instance_id}, priority {priority}")
+        logger.info(f"Instrument expansion task '{task_id}' ({expansion_type}) submitted for expert {expert_instance_id}, priority {priority}, batch_id={batch_id}")
         return task_id
         
     def get_task_status(self, task_id: str) -> Optional[AnalysisTask]:
@@ -397,6 +410,85 @@ class WorkerQueue:
     def is_running(self) -> bool:
         """Check if the worker queue is running."""
         return self._running
+    
+    def track_batch_start(self, batch_id: str, total_tasks: int) -> float:
+        """
+        Track the start of a batch of analysis jobs.
+        
+        Args:
+            batch_id: Unique batch identifier
+            total_tasks: Total number of tasks in the batch
+            
+        Returns:
+            Start timestamp
+        """
+        with self._batch_lock:
+            start_time = time.time()
+            self._batch_start_times[batch_id] = start_time
+            self._batch_task_counts[batch_id] = total_tasks
+            self._batch_completed_counts[batch_id] = 0
+            logger.debug(f"Batch {batch_id} tracking started with {total_tasks} tasks")
+            return start_time
+    
+    def track_batch_job_completion(self, batch_id: str) -> Optional[tuple[float, int, int]]:
+        """
+        Track completion of a job in a batch. Returns batch end info if this was the last job.
+        
+        Args:
+            batch_id: Unique batch identifier
+            
+        Returns:
+            Tuple of (start_time, elapsed_seconds, total_tasks) if batch is complete, None otherwise
+        """
+        with self._batch_lock:
+            if batch_id not in self._batch_completed_counts:
+                logger.warning(f"Batch {batch_id} not found in tracking")
+                return None
+            
+            self._batch_completed_counts[batch_id] += 1
+            completed = self._batch_completed_counts[batch_id]
+            total = self._batch_task_counts.get(batch_id, completed)
+            
+            if completed >= total:
+                # Batch is complete
+                start_time = self._batch_start_times.pop(batch_id, time.time())
+                elapsed = time.time() - start_time
+                self._batch_task_counts.pop(batch_id, None)
+                self._batch_completed_counts.pop(batch_id, None)
+                logger.debug(f"Batch {batch_id} completed. Total tasks: {total}, Elapsed: {elapsed:.2f}s")
+                return (start_time, int(elapsed), total)
+            
+            return None
+    
+    def cleanup_stale_batches(self, max_age_hours: int = 24) -> int:
+        """
+        Clean up stale batch tracking entries that haven't been completed.
+        Useful for clearing incomplete batches from failed/cancelled jobs.
+        
+        Args:
+            max_age_hours: Maximum age in hours before a batch is considered stale
+            
+        Returns:
+            Number of batches cleaned up
+        """
+        with self._batch_lock:
+            current_time = time.time()
+            max_age_seconds = max_age_hours * 3600
+            cleaned = 0
+            
+            stale_batches = []
+            for batch_id, start_time in self._batch_start_times.items():
+                if current_time - start_time > max_age_seconds:
+                    stale_batches.append(batch_id)
+            
+            for batch_id in stale_batches:
+                self._batch_start_times.pop(batch_id, None)
+                self._batch_task_counts.pop(batch_id, None)
+                self._batch_completed_counts.pop(batch_id, None)
+                cleaned += 1
+                logger.info(f"Cleaned up stale batch {batch_id}")
+            
+            return cleaned
         
     def get_all_tasks(self) -> Dict[str, AnalysisTask]:
         """Get all tasks (pending, running, completed, failed)."""
@@ -641,6 +733,26 @@ class WorkerQueue:
                         self._queue.task_done()
                     continue
                 
+                # For AnalysisTask, track batch start if this is first task in a batch
+                if isinstance(task, AnalysisTask) and task.batch_id:
+                    with self._batch_lock:
+                        if task.batch_id not in self._batch_start_times:
+                            # This is the first task in this batch
+                            self.track_batch_start(task.batch_id, 1)  # We'll update count in JobManager
+                            
+                            # Log batch start activity
+                            try:
+                                from .utils import log_analysis_batch_start
+                                log_analysis_batch_start(
+                                    batch_id=task.batch_id,
+                                    expert_instance_id=task.expert_instance_id,
+                                    total_jobs=1,  # Will be corrected in final log
+                                    analysis_type=task.subtype,
+                                    is_scheduled="_" in task.batch_id  # Scheduled batches have format: expertid_HHmm_YYYYMMDD
+                                )
+                            except Exception as e:
+                                logger.warning(f"Failed to log batch start for {task.batch_id}: {e}")
+                
                 # For AnalysisTask, check if we should skip based on existing transactions
                 should_skip = self._should_skip_task(task)
                 if should_skip:
@@ -863,6 +975,28 @@ class WorkerQueue:
             logger.error(f"Analysis task '{task.id}' failed after {execution_time:.2f}s: {e}", exc_info=True)
         
         finally:
+            # Handle batch completion logging if this task belongs to a batch
+            if hasattr(task, 'batch_id') and task.batch_id:
+                try:
+                    batch_completion = self.track_batch_job_completion(task.batch_id)
+                    if batch_completion:
+                        # This was the last job in the batch
+                        start_time, elapsed_seconds, total_jobs = batch_completion
+                        try:
+                            from .utils import log_analysis_batch_end
+                            log_analysis_batch_end(
+                                batch_id=task.batch_id,
+                                expert_instance_id=task.expert_instance_id,
+                                total_jobs=total_jobs,
+                                elapsed_seconds=elapsed_seconds,
+                                analysis_type=task.subtype,
+                                is_scheduled="_" in task.batch_id  # Scheduled batches have format: expertid_HHmm_YYYYMMDD
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to log batch end for {task.batch_id}: {e}")
+                except Exception as e:
+                    logger.warning(f"Error tracking batch completion for {task.batch_id}: {e}")
+            
             # Clean up task key mapping for completed/failed tasks
             with self._task_lock:
                 if task.status in [WorkerTaskStatus.COMPLETED, WorkerTaskStatus.FAILED]:
@@ -1158,16 +1292,19 @@ class WorkerQueue:
                         
                         # Check for classic mode without rules configured
                         if risk_manager_mode == "classic":
-                            enter_market_ruleset_id = settings.get("enter_market_ruleset_id")
-                            if not enter_market_ruleset_id:
+                            enter_market_ruleset_id = expert.enter_market_ruleset_id
+                            # Check if ruleset ID is actually set (not None, not empty string)
+                            if not enter_market_ruleset_id or (isinstance(enter_market_ruleset_id, str) and not enter_market_ruleset_id.strip()):
                                 error_msg = f"Classic risk manager mode enabled but no enter_market_ruleset_id configured for expert {expert_instance_id}"
                                 logger.error(error_msg)
+                                logger.error(f"Settings keys: {list(settings.keys()) if settings else 'None'}")
+                                logger.error(f"enter_market_ruleset_id value: {repr(enter_market_ruleset_id)}")
                                 try:
                                     log_activity(
                                         severity=ActivityLogSeverity.FAILURE,
                                         activity_type=ActivityLogType.RISK_MANAGER_EXECUTION,
                                         description=error_msg,
-                                        data={"expert_id": expert_instance_id, "issue": "missing_classic_rules"},
+                                        data={"expert_id": expert_instance_id, "issue": "missing_classic_rules", "settings_keys": list(settings.keys()) if settings else []},
                                         source_expert_id=expert_instance_id
                                     )
                                 except Exception as e:

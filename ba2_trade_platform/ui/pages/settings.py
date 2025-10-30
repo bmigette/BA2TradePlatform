@@ -1069,6 +1069,7 @@ class ExpertSettingsTab:
             
             self.experts_table = ui.table(
                 columns=[
+                    {'name': 'id', 'label': 'Expert ID', 'field': 'id', 'sortable': True},
                     {'name': 'expert', 'label': 'Expert Type', 'field': 'expert', 'sortable': True},
                     {'name': 'alias', 'label': 'Alias', 'field': 'alias', 'sortable': True},
                     {'name': 'enabled', 'label': 'Enabled', 'field': 'enabled', 'align': 'center'},

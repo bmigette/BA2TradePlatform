@@ -197,7 +197,7 @@ class JobManager:
         self._scheduler.shutdown()
         logger.info("JobManager shutdown complete")
         
-    def submit_market_analysis(self, expert_instance_id: int, symbol: str, subtype: str = AnalysisUseCase.ENTER_MARKET, priority: int = 0, bypass_balance_check: bool = False, bypass_transaction_check: bool = False) -> str:
+    def submit_market_analysis(self, expert_instance_id: int, symbol: str, subtype: str = AnalysisUseCase.ENTER_MARKET, priority: int = 0, bypass_balance_check: bool = False, bypass_transaction_check: bool = False, batch_id: Optional[str] = None) -> str:
         """
         Submit a manual analysis job to the worker queue.
         
@@ -208,6 +208,7 @@ class JobManager:
             priority: Task priority (lower = higher priority)
             bypass_balance_check: If True, skip balance verification (used for manual analysis)
             bypass_transaction_check: If True, skip existing transaction checks (used for manual analysis)
+            batch_id: Optional batch identifier for grouping related jobs (e.g., "expertid_HHmm_YYYYMMDD" for scheduled, timestamp-based for manual)
             
         Returns:
             Task ID for tracking, or None if submission was skipped
@@ -289,10 +290,11 @@ class JobManager:
             subtype=subtype,
             priority=priority,
             bypass_balance_check=bypass_balance_check,
-            bypass_transaction_check=bypass_transaction_check
+            bypass_transaction_check=bypass_transaction_check,
+            batch_id=batch_id
         )
         
-        logger.info(f"Manual analysis job submitted: expert={expert_instance_id}, symbol={symbol}, subtype={subtype}, bypass_balance_check={bypass_balance_check}, task_id={task_id}")
+        logger.info(f"Manual analysis job submitted: expert={expert_instance_id}, symbol={symbol}, subtype={subtype}, bypass_balance_check={bypass_balance_check}, batch_id={batch_id}, task_id={task_id}")
         return task_id
         
     def get_job_status(self, task_id: str) -> Optional[AnalysisTask]:
@@ -711,18 +713,27 @@ class JobManager:
         try:
             logger.info(f"Executing scheduled analysis: expert={expert_instance_id}, symbol={symbol}, subtype={subtype}")
             
+            # Generate batch_id for this scheduled job execution
+            # Format: expert_id_HHmm_YYYYMMDD (e.g., "3_0930_20251030")
+            from datetime import datetime
+            now = datetime.now()
+            time_str = now.strftime("%H%M")  # HHmm (e.g., "0930")
+            date_str = now.strftime("%Y%m%d")  # YYYYMMDD (e.g., "20251030")
+            batch_id = f"{expert_instance_id}_{time_str}_{date_str}"
+            
             # Handle special symbols for dynamic and expert-driven selection - queue to worker
             if symbol in ["DYNAMIC", "EXPERT", "OPEN_POSITIONS"]:
-                logger.info(f"Special symbol '{symbol}' detected in scheduled analysis - queuing expansion task")
+                logger.info(f"Special symbol '{symbol}' detected in scheduled analysis - queuing expansion task with batch_id={batch_id}")
                 try:
                     worker_queue = get_worker_queue()
                     task_id = worker_queue.submit_instrument_expansion_task(
                         expert_instance_id=expert_instance_id,
                         expansion_type=symbol,
                         subtype=subtype,
-                        priority=10  # Lower priority for scheduled tasks (higher number = lower priority)
+                        priority=10,  # Lower priority for scheduled tasks (higher number = lower priority)
+                        batch_id=batch_id
                     )
-                    logger.info(f"Queued scheduled expansion task '{task_id}' for {symbol} analysis")
+                    logger.info(f"Queued scheduled expansion task '{task_id}' for {symbol} analysis with batch_id={batch_id}")
                 except ValueError as e:
                     # Task already pending/running
                     logger.warning(f"Scheduled expansion task for {symbol} already queued: {e}")
@@ -742,15 +753,16 @@ class JobManager:
                     logger.debug(f"Skipping OPEN_POSITIONS analysis for expert {expert_instance_id}, symbol {symbol}: no open transactions found")
                     return
             
-            # Submit to worker queue with low priority (higher number = lower priority)
+            # Submit to worker queue with low priority (higher number = lower priority) and batch_id
             task_id = self.submit_market_analysis(
                 expert_instance_id=expert_instance_id,
                 symbol=symbol,
                 subtype=subtype,
-                priority=10  # Lower priority for scheduled jobs
+                priority=10,  # Lower priority for scheduled jobs
+                batch_id=batch_id
             )
             
-            logger.debug(f"Scheduled analysis submitted with task_id: {task_id}")
+            logger.debug(f"Scheduled analysis submitted with task_id={task_id}, batch_id={batch_id}")
             
         except ValueError as e:
             # Handle the case where ENTER_MARKET analysis is skipped due to existing orders
