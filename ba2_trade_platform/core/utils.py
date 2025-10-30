@@ -994,3 +994,144 @@ def log_manual_analysis(expert_instance_id: int, symbols: List[str], analysis_ty
         logger.info(f"Logged manual analysis for expert {expert_instance_id}: {symbols}")
     except Exception as e:
         logger.warning(f"Failed to log manual analysis for expert {expert_instance_id}: {e}")
+
+
+def calculate_fmp_trade_metrics(trades: List[dict]) -> dict:
+    """
+    Calculate metrics for FMP Senate/House trades including total money spent
+    and percentage of yearly trading.
+    
+    Analyzes the provided trades to extract financial metrics about the trader's activity.
+    
+    Args:
+        trades: List of trade dictionaries from FMP API. Each trade should contain:
+                - 'amount' (str or int): The amount range of the trade (e.g., "$1,000,001 - $5,000,000")
+                - 'transactionDate' (str): The date of the trade (YYYY-MM-DD format)
+    
+    Returns:
+        Dictionary with metrics:
+        - 'total_money_spent': float - Sum of all trade amounts in dollars
+        - 'percent_of_yearly': float - Percentage this trade represents of yearly trading volume
+        - 'num_trades': int - Number of trades analyzed
+        - 'avg_trade_amount': float - Average trade amount
+        - 'min_trade_amount': float - Minimum trade amount
+        - 'max_trade_amount': float - Maximum trade amount
+        - 'trade_value_breakdown': dict - Breakdown of amount ranges and their counts
+        - 'error': str (optional) - Error message if calculation failed
+    
+    Example:
+        >>> trades = [
+        ...     {'amount': '$1,000,001 - $5,000,000', 'transactionDate': '2025-10-30'},
+        ...     {'amount': '$500,001 - $1,000,000', 'transactionDate': '2025-10-25'}
+        ... ]
+        >>> metrics = calculate_fmp_trade_metrics(trades)
+        >>> print(f"Total spent: ${metrics['total_money_spent']:,.0f}")
+        >>> print(f"Percent of yearly: {metrics['percent_of_yearly']:.2f}%")
+    """
+    try:
+        if not trades:
+            return {
+                'total_money_spent': 0.0,
+                'percent_of_yearly': 0.0,
+                'num_trades': 0,
+                'avg_trade_amount': 0.0,
+                'min_trade_amount': 0.0,
+                'max_trade_amount': 0.0,
+                'trade_value_breakdown': {}
+            }
+        
+        from datetime import datetime, timezone, timedelta
+        
+        # FMP amount ranges and their midpoints for calculation
+        AMOUNT_RANGES = {
+            '$1,000 - $15,000': 8_000,
+            '$15,001 - $50,000': 32_500,
+            '$50,001 - $100,000': 75_000,
+            '$100,001 - $250,000': 175_000,
+            '$250,001 - $500,000': 375_000,
+            '$500,001 - $1,000,000': 750_000,
+            '$1,000,001 - $5,000,000': 3_000_000,
+            '$5,000,001 - $25,000,000': 15_000_000,
+            '$25,000,001 - $50,000,000': 37_500_000,
+            '$50,000,001 - $100,000,000': 75_000_000,
+            '$100,000,001+': 150_000_000,
+        }
+        
+        trade_amounts = []
+        value_breakdown = {}
+        
+        now = datetime.now(timezone.utc)
+        year_ago = now - timedelta(days=365)
+        
+        for trade in trades:
+            try:
+                amount_range = trade.get('amount', '').strip()
+                
+                # Track value breakdown
+                if amount_range not in value_breakdown:
+                    value_breakdown[amount_range] = 0
+                value_breakdown[amount_range] += 1
+                
+                # Get midpoint of the range
+                if amount_range in AMOUNT_RANGES:
+                    trade_amount = AMOUNT_RANGES[amount_range]
+                    trade_amounts.append(trade_amount)
+                else:
+                    logger.debug(f"Unknown FMP amount range: {amount_range}")
+                    # Default to 0 for unknown ranges
+                    trade_amounts.append(0)
+                    
+            except Exception as e:
+                logger.debug(f"Error processing individual trade: {e}")
+                continue
+        
+        if not trade_amounts:
+            return {
+                'total_money_spent': 0.0,
+                'percent_of_yearly': 0.0,
+                'num_trades': len(trades),
+                'avg_trade_amount': 0.0,
+                'min_trade_amount': 0.0,
+                'max_trade_amount': 0.0,
+                'trade_value_breakdown': value_breakdown
+            }
+        
+        # Calculate metrics
+        total_spent = sum(trade_amounts)
+        avg_amount = total_spent / len(trade_amounts) if trade_amounts else 0.0
+        min_amount = min(trade_amounts)
+        max_amount = max(trade_amounts)
+        
+        # Estimate yearly trading volume from number of trades and average amount
+        # Assumption: trader makes roughly the same number of trades throughout the year
+        estimated_yearly_volume = total_spent * (365 / 30) if total_spent > 0 else 0  # Rough estimate
+        
+        # Calculate percentage
+        if estimated_yearly_volume > 0:
+            percent_of_yearly = (total_spent / estimated_yearly_volume) * 100
+        else:
+            percent_of_yearly = 0.0
+        
+        return {
+            'total_money_spent': total_spent,
+            'percent_of_yearly': min(percent_of_yearly, 100.0),  # Cap at 100%
+            'num_trades': len(trades),
+            'avg_trade_amount': avg_amount,
+            'min_trade_amount': min_amount,
+            'max_trade_amount': max_amount,
+            'trade_value_breakdown': value_breakdown
+        }
+        
+    except Exception as e:
+        logger.error(f"Error calculating FMP trade metrics: {e}", exc_info=True)
+        return {
+            'total_money_spent': 0.0,
+            'percent_of_yearly': 0.0,
+            'num_trades': len(trades) if trades else 0,
+            'avg_trade_amount': 0.0,
+            'min_trade_amount': 0.0,
+            'max_trade_amount': 0.0,
+            'trade_value_breakdown': {},
+            'error': str(e)
+        }
+

@@ -936,14 +936,48 @@ All {len(trade_details)} trades shown above for transparency.
             'buy_count': buy_count,
             'sell_count': sell_count,
             'total_buy_amount': total_buy_amount,
-            'total_sell_amount': total_sell_amount
+            'total_sell_amount': total_sell_amount,
+            # Add trade metrics
+            'trade_metrics': self._calculate_trade_metrics(filtered_trades)
         }
+    
+    def _calculate_trade_metrics(self, trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Calculate financial metrics for trades including total money spent
+        and percentage of yearly trading.
+        
+        Args:
+            trades: List of filtered trade dictionaries
+            
+        Returns:
+            Dictionary with financial metrics
+        """
+        from ...core.utils import calculate_fmp_trade_metrics
+        return calculate_fmp_trade_metrics(trades)
     
     def _create_expert_recommendation(self, recommendation_data: Dict[str, Any], 
                                      symbol: str, market_analysis_id: int,
                                      current_price: Optional[float]) -> int:
         """Create ExpertRecommendation record in database."""
         try:
+            # Get trade metrics
+            trade_metrics = recommendation_data.get('trade_metrics', {})
+            
+            # Store senate trade specific data with trade metrics
+            senate_trade_data = {
+                'buy_count': recommendation_data.get('buy_count', 0),
+                'sell_count': recommendation_data.get('sell_count', 0),
+                'total_buy_amount': recommendation_data.get('total_buy_amount', 0.0),
+                'total_sell_amount': recommendation_data.get('total_sell_amount', 0.0),
+                'trade_count': recommendation_data.get('trade_count', 0),
+                # Financial metrics
+                'money_spent': trade_metrics.get('total_money_spent', 0.0),
+                'percent_of_yearly': trade_metrics.get('percent_of_yearly', 0.0),
+                'avg_trade_amount': trade_metrics.get('avg_trade_amount', 0.0),
+                'min_trade_amount': trade_metrics.get('min_trade_amount', 0.0),
+                'max_trade_amount': trade_metrics.get('max_trade_amount', 0.0)
+            }
+            
             expert_recommendation = ExpertRecommendation(
                 instance_id=self.id,
                 symbol=symbol,
@@ -955,13 +989,17 @@ All {len(trade_details)} trades shown above for transparency.
                 risk_level=RiskLevel.MEDIUM,  # Senate trades are medium risk
                 time_horizon=TimeHorizon.MEDIUM_TERM,  # Medium term based on disclosure lag
                 market_analysis_id=market_analysis_id,
+                data={'SenateWeight': senate_trade_data},  # Store with "SenateWeight" key
                 created_at=datetime.now(timezone.utc)
             )
             
             recommendation_id = add_instance(expert_recommendation)
+            trade_metrics = recommendation_data.get('trade_metrics', {})
             self.logger.info(f"Created ExpertRecommendation (ID: {recommendation_id}) for {symbol}: "
                        f"{recommendation_data['signal'].value} with {recommendation_data['confidence']:.1f}% confidence, "
-                       f"based on {recommendation_data['trade_count']} senate/house trades")
+                       f"based on {recommendation_data['trade_count']} senate/house trades, "
+                       f"Total spent: ${trade_metrics.get('total_money_spent', 0.0):,.0f}, "
+                       f"Percent of yearly: {trade_metrics.get('percent_of_yearly', 0.0):.1f}%")
             return recommendation_id
             
         except Exception as e:
@@ -1106,13 +1144,17 @@ All {len(trade_details)} trades shown above for transparency.
             )
             
             # Store analysis state
+            trade_metrics = recommendation_data.get('trade_metrics', {})
             market_analysis.state = {
                 'senate_trade': {
                     'recommendation': {
                         'signal': recommendation_data['signal'].value,
                         'confidence': recommendation_data['confidence'],
                         'expected_profit_percent': recommendation_data['expected_profit_percent'],
-                        'details': recommendation_data['details']
+                        'details': recommendation_data['details'],
+                        # Add financial metrics
+                        'money_spent': trade_metrics.get('total_money_spent', 0.0),
+                        'percent_of_yearly': trade_metrics.get('percent_of_yearly', 0.0)
                     },
                     'trade_statistics': {
                         'total_trades': len(all_trades),

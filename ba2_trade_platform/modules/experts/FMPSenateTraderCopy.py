@@ -669,6 +669,10 @@ Trades for {symbol}: {len(symbol_trades)}
 Note: If multiple trades exist for the same instrument, the most recent trade determines the signal.
 """
         
+        # Calculate trader money spent and percentage of yearly trading
+        from ...core.utils import calculate_fmp_trade_metrics
+        trade_metrics = calculate_fmp_trade_metrics(symbol_trades)
+        
         return {
             'signal': signal,
             'confidence': confidence,
@@ -679,7 +683,8 @@ Note: If multiple trades exist for the same instrument, the most recent trade de
             'copy_trades_found': len(copy_trades),
             'trader_name': primary_trader,  # Primary trader for this recommendation
             'trader_names': trader_names,  # All traders with same signal direction
-            'num_traders': len(trader_names)  # Count of unique traders
+            'num_traders': len(trader_names),  # Count of unique traders
+            'trade_metrics': trade_metrics  # Financial metrics for the trades
         }
     
     def _create_expert_recommendation(self, recommendation_data: Dict[str, Any], 
@@ -687,12 +692,21 @@ Note: If multiple trades exist for the same instrument, the most recent trade de
                                      current_price: Optional[float]) -> int:
         """Create ExpertRecommendation record in database."""
         try:
-            # Store senate copy specific data
+            # Get trade metrics
+            trade_metrics = recommendation_data.get('trade_metrics', {})
+            
+            # Store senate copy specific data with trade metrics
             senate_copy_data = {
                 'trader_names': recommendation_data.get('trader_names', []),
                 'num_traders': recommendation_data.get('num_traders', 1),
                 'trade_count': recommendation_data.get('trade_count', 0),
-                'trades': recommendation_data.get('trades', [])
+                'trades': recommendation_data.get('trades', []),
+                # Financial metrics
+                'money_spent': trade_metrics.get('total_money_spent', 0.0),
+                'percent_of_yearly': trade_metrics.get('percent_of_yearly', 0.0),
+                'avg_trade_amount': trade_metrics.get('avg_trade_amount', 0.0),
+                'min_trade_amount': trade_metrics.get('min_trade_amount', 0.0),
+                'max_trade_amount': trade_metrics.get('max_trade_amount', 0.0)
             }
             
             expert_recommendation = ExpertRecommendation(
@@ -713,7 +727,9 @@ Note: If multiple trades exist for the same instrument, the most recent trade de
             recommendation_id = add_instance(expert_recommendation)
             self.logger.info(f"Created ExpertRecommendation (ID: {recommendation_id}) for {symbol}: "
                        f"{recommendation_data['signal'].value} with {recommendation_data['confidence']:.1f}% confidence, "
-                       f"based on {recommendation_data['trade_count']} copy trades from {recommendation_data.get('num_traders', 1)} trader(s)")
+                       f"based on {recommendation_data['trade_count']} copy trades from {recommendation_data.get('num_traders', 1)} trader(s), "
+                       f"Total spent: ${trade_metrics.get('total_money_spent', 0.0):,.0f}, "
+                       f"Percent of yearly: {trade_metrics.get('percent_of_yearly', 0.0):.1f}%")
             return recommendation_id
             
         except Exception as e:
@@ -1017,7 +1033,10 @@ Recommendations Generated:"""
                         'expected_profit_percent': recommendation_data['expected_profit_percent'],
                         'current_price': current_price,
                         'trade_count': len(symbol_trades),
-                        'trader_name': recommendation_data.get('trader_name', 'Unknown')  # Include trader name
+                        'trader_name': recommendation_data.get('trader_name', 'Unknown'),  # Include trader name
+                        # Add financial metrics from trade metrics
+                        'money_spent': recommendation_data.get('trade_metrics', {}).get('total_money_spent', 0.0),
+                        'percent_of_yearly': recommendation_data.get('trade_metrics', {}).get('percent_of_yearly', 0.0)
                     }
                     
                     self.logger.info(f"Created recommendation for {trade_symbol}: {recommendation_data['signal'].value} "
@@ -1575,24 +1594,43 @@ Recommendations Generated:"""
                                         ui.icon('receipt', size='sm', color='orange')
                                         ui.label(f'{trade_count} Trade{"s" if trade_count != 1 else ""}').classes('text-sm text-orange-700 text-weight-medium')
                                     
-                                    # Stats grid - more spacious
-                                    with ui.grid(columns=3).classes('w-full gap-3'):
-                                        # Confidence
-                                        with ui.column().classes('text-center'):
-                                            ui.label(f'{confidence:.0f}%').classes('text-h6 text-weight-bold text-blue-700')
-                                            ui.label('Confidence').classes('text-xs text-grey-7')
+                                    # Get financial metrics
+                                    money_spent = rec_data.get('money_spent', 0.0)
+                                    percent_yearly = rec_data.get('percent_of_yearly', 0.0)
+                                    
+                                    # Stats grid - extended to 2 rows
+                                    with ui.column().classes('w-full gap-3'):
+                                        # Row 1: Confidence, Expected Profit, Current Price
+                                        with ui.grid(columns=3).classes('w-full gap-3'):
+                                            # Confidence
+                                            with ui.column().classes('text-center'):
+                                                ui.label(f'{confidence:.0f}%').classes('text-h6 text-weight-bold text-blue-700')
+                                                ui.label('Confidence').classes('text-xs text-grey-7')
+                                            
+                                            # Expected Profit
+                                            with ui.column().classes('text-center'):
+                                                profit_color = 'positive' if expected_profit > 0 else 'negative' if expected_profit < 0 else 'grey'
+                                                ui.label(f'{expected_profit:+.1f}%').classes(f'text-h6 text-weight-bold text-{profit_color}')
+                                                ui.label('Expected').classes('text-xs text-grey-7')
+                                            
+                                            # Current Price
+                                            with ui.column().classes('text-center'):
+                                                price_label = f'${current_price:.2f}' if current_price > 0 else 'N/A'
+                                                ui.label(price_label).classes('text-h6 text-weight-bold')
+                                                ui.label('Price').classes('text-xs text-grey-7')
                                         
-                                        # Expected Profit
-                                        with ui.column().classes('text-center'):
-                                            profit_color = 'positive' if expected_profit > 0 else 'negative' if expected_profit < 0 else 'grey'
-                                            ui.label(f'{expected_profit:+.1f}%').classes(f'text-h6 text-weight-bold text-{profit_color}')
-                                            ui.label('Expected').classes('text-xs text-grey-7')
-                                        
-                                        # Current Price
-                                        with ui.column().classes('text-center'):
-                                            price_label = f'${current_price:.2f}' if current_price > 0 else 'N/A'
-                                            ui.label(price_label).classes('text-h6 text-weight-bold')
-                                            ui.label('Price').classes('text-xs text-grey-7')
+                                        # Row 2: Money Spent, Percent of Yearly
+                                        with ui.grid(columns=2).classes('w-full gap-3 mt-2 pt-2 border-t border-grey-3'):
+                                            # Money Spent
+                                            with ui.column().classes('text-center'):
+                                                money_label = f'${money_spent:,.0f}' if money_spent > 0 else '$0'
+                                                ui.label(money_label).classes('text-h6 text-weight-bold text-orange-700')
+                                                ui.label('Money Spent').classes('text-xs text-grey-7')
+                                            
+                                            # Percent of Yearly Trading
+                                            with ui.column().classes('text-center'):
+                                                ui.label(f'{percent_yearly:.1f}%').classes('text-h6 text-weight-bold text-purple-700')
+                                                ui.label('of Yearly').classes('text-xs text-grey-7')
             
             # Followed Traders
             copy_trade_names = settings.get('copy_trade_names', '')
@@ -1702,9 +1740,21 @@ Recommendations Generated:"""
                         profit_color = 'positive' if expected_profit > 0 else 'negative' if expected_profit < 0 else 'grey'
                         ui.label(f'{expected_profit:+.1f}%').classes(f'text-h4 text-{profit_color}')
                 
+                # Add price and financial metrics
                 if current_price:
                     ui.separator().classes('my-2')
                     ui.label(f'Current Price: ${current_price:.2f}').classes('text-grey-7')
+                
+                # Add money spent and percent of yearly if available
+                if rec.get('money_spent') or rec.get('percent_of_yearly'):
+                    with ui.row().classes('gap-4 mt-2'):
+                        money_spent = rec.get('money_spent', 0.0)
+                        if money_spent > 0:
+                            ui.label(f'💰 Money Spent: ${money_spent:,.0f}').classes('text-sm text-orange-700 text-weight-medium')
+                        
+                        percent_yearly = rec.get('percent_of_yearly', 0.0)
+                        if percent_yearly > 0:
+                            ui.label(f'📊 {percent_yearly:.1f}% of Yearly Trading').classes('text-sm text-purple-700 text-weight-medium')
             
             # Trade Statistics
             total_trades = stats.get('total_trades', 0)
