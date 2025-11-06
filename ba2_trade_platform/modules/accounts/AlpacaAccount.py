@@ -235,7 +235,7 @@ class AlpacaAccount(AccountInterface):
                     status=alpaca_leg_order.status,
                     filled_qty=alpaca_leg_order.filled_qty,
                     open_price=alpaca_leg_order.open_price,
-                    comment=f"OCO-{leg_type_label}-[PARENT:{parent_order.id}/BROKER:{parent_order.broker_order_id}]",
+                    comment=f"{int(datetime.now(timezone.utc).timestamp())}-OCO-{leg_type_label}-[PARENT:{parent_order.id}/BROKER:{parent_order.broker_order_id}]",
                     transaction_id=parent_order.transaction_id,
                     parent_order_id=parent_order.id,  # Link to parent OCO order
                     created_at=alpaca_leg_order.created_at
@@ -350,7 +350,7 @@ class AlpacaAccount(AccountInterface):
                         status=leg_status,
                         filled_qty=leg_filled_qty,
                         open_price=leg_filled_avg_price,  # Average fill price
-                        comment=f"OCO-{leg_type_label}-[PARENT:{parent_order.id}/BROKER:{alpaca_oco_order.id}]",
+                        comment=f"{int(datetime.now(timezone.utc).timestamp())}-OCO-{leg_type_label}-[PARENT:{parent_order.id}/BROKER:{alpaca_oco_order.id}]",
                         transaction_id=transaction_id,
                         parent_order_id=parent_order.id,  # Link to parent OCO order
                         created_at=datetime.now(timezone.utc)
@@ -459,7 +459,14 @@ class AlpacaAccount(AccountInterface):
         final_order_type = order_type
         legs_broker_ids = None
         
-        if hasattr(order, 'order_class') and order.order_class and str(order.order_class).lower() == 'oco':
+        # Check if order_class contains 'oco' (handles both string and enum representations)
+        order_class_val = getattr(order, 'order_class', None)
+        is_oco = False
+        if order_class_val:
+            order_class_str = str(order_class_val).lower()
+            is_oco = 'oco' in order_class_str
+        
+        if is_oco:
             final_order_type = CoreOrderType.OCO
             logger.debug(f"Order {getattr(order, 'id', 'unknown')} detected as OCO based on order_class field")
             
@@ -468,9 +475,7 @@ class AlpacaAccount(AccountInterface):
                 legs_broker_ids = [str(leg.id) for leg in order.legs if hasattr(leg, 'id') and leg.id]
                 logger.debug(f"OCO order {getattr(order, 'id', 'unknown')} has {len(legs_broker_ids)} legs: {legs_broker_ids}")
         else:
-            order_class_val = getattr(order, 'order_class', None)
-            order_class_str = str(order_class_val).lower() if order_class_val else "none"
-            logger.debug(f"Order {getattr(order, 'id', 'unknown')}: order_class check - has attr: {hasattr(order, 'order_class')}, value: {order_class_val}, str: {order_class_str}, is oco: {'oco' in order_class_str if order_class_val else False}")
+            logger.debug(f"Order {getattr(order, 'id', 'unknown')}: order_class check - has attr: {hasattr(order, 'order_class')}, value: {order_class_val}, str: {str(order_class_val).lower() if order_class_val else 'none'}, is oco: {is_oco}")
         
         return TradingOrder(
             broker_order_id=str(getattr(order, "id", None)) if getattr(order, "id", None) else None,  # Set Alpaca order ID as broker_order_id
@@ -555,6 +560,7 @@ class AlpacaAccount(AccountInterface):
                         filter_params["until"] = until_date
                     
                     filter = GetOrdersRequest(**filter_params)
+                    filter.nested = True  # Get nested orders (for OCO)
                     alpaca_orders = self.client.get_orders(filter)
                     
                     # If no orders returned, we've fetched everything
@@ -621,6 +627,7 @@ class AlpacaAccount(AccountInterface):
                     status=status,
                     limit=limit
                 )
+                filter.nested = True  # Get nested orders (for OCO)
                 alpaca_orders = self.client.get_orders(filter)
                 logger.debug(f"Fetched {len(alpaca_orders)} orders (single page, no pagination)")
             
@@ -1392,7 +1399,13 @@ class AlpacaAccount(AccountInterface):
                         # Safety check: Don't mark as CANCELED if order was created very recently
                         # This prevents race conditions where order was just submitted but not yet in Alpaca's response
                         if db_order.created_at:
-                            order_age_minutes = (datetime.now(timezone.utc) - db_order.created_at).total_seconds() / 60
+                            # Ensure both datetimes have the same timezone awareness
+                            created_at = db_order.created_at
+                            if created_at.tzinfo is None:
+                                # created_at is offset-naive, make it aware in UTC
+                                created_at = created_at.replace(tzinfo=timezone.utc)
+                            
+                            order_age_minutes = (datetime.now(timezone.utc) - created_at).total_seconds() / 60
                             if order_age_minutes < 5:
                                 logger.debug(
                                     f"Order {db_order.id} (broker_order_id={db_order.broker_order_id}) "
