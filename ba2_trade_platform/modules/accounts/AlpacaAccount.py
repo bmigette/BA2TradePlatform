@@ -175,6 +175,201 @@ class AlpacaAccount(AccountInterface):
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
         return f"{timestamp}-{order_type}-[ACC:{account_id}/TR:{transaction_id}/PORD:{parent_order_id}]"
     
+    def _insert_oco_legs_from_broker_ids(self, parent_order: TradingOrder, legs_broker_ids: list[str]) -> int:
+        """
+        Insert OCO leg orders by fetching them from Alpaca using their broker IDs.
+        
+        Used during account refresh when we have the leg broker IDs but not the full leg objects.
+        Fetches each leg from Alpaca and creates database records linked to the parent OCO order.
+        
+        Args:
+            parent_order: The parent OCO TradingOrder record
+            legs_broker_ids: List of broker order IDs for the OCO legs (from Alpaca submit response)
+            
+        Returns:
+            int: Number of leg orders successfully inserted
+        """
+        if not legs_broker_ids:
+            return 0
+        
+        inserted_count = 0
+        
+        for leg_broker_id in legs_broker_ids:
+            try:
+                # Check if leg already exists in database to prevent duplicates
+                with Session(get_db().bind) as session:
+                    existing_leg = session.exec(
+                        select(TradingOrder).where(
+                            TradingOrder.broker_order_id == leg_broker_id,
+                            TradingOrder.account_id == self.id
+                        )
+                    ).first()
+                
+                if existing_leg:
+                    logger.debug(f"OCO leg {leg_broker_id} already exists in database as order {existing_leg.id}, skipping insertion")
+                    continue
+                
+                # Fetch the leg order from Alpaca
+                alpaca_leg_order = self.get_order(leg_broker_id)
+                if not alpaca_leg_order:
+                    logger.warning(f"Could not fetch OCO leg order {leg_broker_id} from Alpaca")
+                    continue
+                
+                # Determine leg type from the leg order's properties
+                is_tp_leg = alpaca_leg_order.order_type in [CoreOrderType.BUY_LIMIT, CoreOrderType.SELL_LIMIT] and alpaca_leg_order.limit_price and not alpaca_leg_order.stop_price
+                is_sl_leg = alpaca_leg_order.stop_price
+                
+                leg_type_label = "TP" if is_tp_leg else ("SL" if is_sl_leg else "LEG")
+                
+                # Create leg order record with proper linkage to parent OCO order
+                leg_order = TradingOrder(
+                    account_id=self.id,
+                    symbol=parent_order.symbol,
+                    quantity=parent_order.quantity,
+                    side=alpaca_leg_order.side,
+                    order_type=alpaca_leg_order.order_type,
+                    broker_order_id=leg_broker_id,
+                    limit_price=alpaca_leg_order.limit_price,
+                    stop_price=alpaca_leg_order.stop_price,
+                    good_for=alpaca_leg_order.good_for,
+                    status=alpaca_leg_order.status,
+                    filled_qty=alpaca_leg_order.filled_qty,
+                    open_price=alpaca_leg_order.open_price,
+                    comment=f"OCO-{leg_type_label}-[PARENT:{parent_order.id}/BROKER:{parent_order.broker_order_id}]",
+                    transaction_id=parent_order.transaction_id,
+                    parent_order_id=parent_order.id,  # Link to parent OCO order
+                    created_at=alpaca_leg_order.created_at
+                )
+                
+                # Insert into database
+                leg_order_id = add_instance(leg_order)
+                logger.info(f"Inserted OCO {leg_type_label} leg order {leg_order_id} from broker_id {leg_broker_id}")
+                inserted_count += 1
+                
+            except Exception as e:
+                logger.error(f"Error inserting OCO leg {leg_broker_id}: {e}", exc_info=True)
+                continue
+        
+        return inserted_count
+    
+    def _insert_oco_order_legs(self, alpaca_oco_order, parent_order: TradingOrder, transaction_id: int | None) -> None:
+        """
+        Extract and insert OCO order legs (TP/SL orders) from Alpaca response into database.
+        
+        When an OCO order is submitted to Alpaca, the response includes leg orders for TP and SL.
+        Per Alpaca API docs: https://docs.alpaca.markets/reference/postorder
+        The response includes a 'legs' array where each leg is an order object with:
+        - id: broker order ID for the leg
+        - side: OrderSide (SELL for take-profit/stop-loss on long entry)
+        - type: order type (limit, stop, etc.)
+        - limit_price: limit price (for take-profit or stop-loss limit)
+        - stop_price: stop price (for stop-loss)
+        - status: order status
+        - filled_qty: quantity filled
+        - filled_avg_price: average fill price
+        
+        Args:
+            alpaca_oco_order: Alpaca order response object (order_class=OCO with legs array)
+            parent_order: The parent OCO TradingOrder record
+            transaction_id: Transaction ID to link the leg orders to
+        """
+        try:
+            # Check if this is an OCO order with legs array
+            if not hasattr(alpaca_oco_order, 'legs'):
+                logger.debug(f"OCO order {alpaca_oco_order.id} has no legs attribute")
+                return
+            
+            legs = getattr(alpaca_oco_order, 'legs', None)
+            if not legs:
+                logger.debug(f"OCO order {alpaca_oco_order.id} legs list is empty")
+                return
+            
+            logger.info(f"Processing {len(legs)} OCO order legs for parent order {parent_order.id} (broker_order_id={alpaca_oco_order.id})")
+            
+            for leg_index, leg in enumerate(legs):
+                try:
+                    # Extract leg information from Alpaca response
+                    # Each leg is an Order object from alpaca-py library
+                    leg_broker_id = str(leg.id) if hasattr(leg, 'id') and leg.id else None
+                    
+                    if not leg_broker_id:
+                        logger.warning(f"OCO leg {leg_index} missing broker ID, skipping")
+                        continue
+                    
+                    # Extract core leg attributes from Alpaca response
+                    # Alpaca returns OrderSide enum (lowercase 'buy'/'sell'), convert to OrderDirection enum
+                    leg_side_raw = leg.side if hasattr(leg, 'side') else None
+                    if leg_side_raw:
+                        leg_side_str = str(leg_side_raw).lower()
+                        leg_side = OrderDirection.BUY if 'buy' in leg_side_str else OrderDirection.SELL
+                    else:
+                        leg_side = None
+                    
+                    leg_status = leg.status if hasattr(leg, 'status') else OrderStatus.UNKNOWN
+                    leg_filled_qty = leg.filled_qty if hasattr(leg, 'filled_qty') else None
+                    leg_filled_avg_price = leg.filled_avg_price if hasattr(leg, 'filled_avg_price') else None
+                    leg_time_in_force = leg.time_in_force if hasattr(leg, 'time_in_force') else None
+                    
+                    # Extract price information based on leg type
+                    # Take-profit leg: has limit_price (SELL at this price), no stop_price
+                    # Stop-loss leg: has stop_price and optional limit_price (SELL at limit if stopped)
+                    leg_limit_price = leg.limit_price if hasattr(leg, 'limit_price') else None
+                    leg_stop_price = leg.stop_price if hasattr(leg, 'stop_price') else None
+                    
+                    # Determine leg type label for identification in comment
+                    if leg_limit_price and not leg_stop_price:
+                        leg_type_label = "TP"  # Take profit leg (limit order only)
+                        # TP legs are SELL_LIMIT for short/SELL positions, BUY_LIMIT for long/BUY
+                        leg_order_type = CoreOrderType.SELL_LIMIT if leg_side == OrderDirection.SELL else CoreOrderType.BUY_LIMIT
+                    elif leg_stop_price:
+                        leg_type_label = "SL"  # Stop loss leg
+                        # SL legs are SELL_STOP_LIMIT for short/SELL, BUY_STOP_LIMIT for long/BUY
+                        if leg_limit_price:
+                            leg_order_type = CoreOrderType.SELL_STOP_LIMIT if leg_side == OrderDirection.SELL else CoreOrderType.BUY_STOP_LIMIT
+                        else:
+                            leg_order_type = CoreOrderType.SELL_STOP if leg_side == OrderDirection.SELL else CoreOrderType.BUY_STOP
+                    else:
+                        leg_type_label = "LEG"
+                        leg_order_type = CoreOrderType.SELL_LIMIT  # Default to sell limit
+                    
+                    logger.debug(f"Processing OCO {leg_type_label} leg: id={leg_broker_id}, "
+                               f"limit_price={leg_limit_price}, stop_price={leg_stop_price}, "
+                               f"status={leg_status}, filled_qty={leg_filled_qty}")
+                    
+                    # Create leg order record
+                    leg_order = TradingOrder(
+                        account_id=self.id,
+                        symbol=parent_order.symbol,
+                        quantity=parent_order.quantity,
+                        side=leg_side,
+                        order_type=leg_order_type,
+                        broker_order_id=leg_broker_id,
+                        limit_price=leg_limit_price,
+                        stop_price=leg_stop_price,
+                        good_for=leg_time_in_force,
+                        status=leg_status,
+                        filled_qty=leg_filled_qty,
+                        open_price=leg_filled_avg_price,  # Average fill price
+                        comment=f"OCO-{leg_type_label}-[PARENT:{parent_order.id}/BROKER:{alpaca_oco_order.id}]",
+                        transaction_id=transaction_id,
+                        parent_order_id=parent_order.id,  # Link to parent OCO order
+                        created_at=datetime.now(timezone.utc)
+                    )
+                    
+                    # Insert into database
+                    leg_order_id = add_instance(leg_order)
+                    logger.info(f"Created OCO {leg_type_label} leg order {leg_order_id}: "
+                              f"broker_id={leg_broker_id}, status={leg_status}, "
+                              f"limit=${leg_limit_price}, stop=${leg_stop_price}, "
+                              f"filled_qty={leg_filled_qty}")
+                    
+                except Exception as leg_error:
+                    logger.error(f"Error processing OCO leg {leg_index}: {leg_error}", exc_info=True)
+                    continue
+            
+        except Exception as e:
+            logger.error(f"Error inserting OCO order legs for order {parent_order.id}: {e}", exc_info=True)
+    
     def alpaca_order_to_tradingorder(self, order):
         """
         Convert an Alpaca order object to a TradingOrder object.
@@ -259,12 +454,30 @@ class AlpacaAccount(AccountInterface):
             default_value=OrderStatus.UNKNOWN
         )
         
+        # Determine order type: Check for OCO order_class first, then fall back to type field
+        # OCO orders have order_class="oco" in Alpaca response, not a type-based designation
+        final_order_type = order_type
+        legs_broker_ids = None
+        
+        if hasattr(order, 'order_class') and order.order_class and str(order.order_class).lower() == 'oco':
+            final_order_type = CoreOrderType.OCO
+            logger.debug(f"Order {getattr(order, 'id', 'unknown')} detected as OCO based on order_class field")
+            
+            # Extract OCO leg broker IDs from the legs array (if present in response)
+            if hasattr(order, 'legs') and order.legs:
+                legs_broker_ids = [str(leg.id) for leg in order.legs if hasattr(leg, 'id') and leg.id]
+                logger.debug(f"OCO order {getattr(order, 'id', 'unknown')} has {len(legs_broker_ids)} legs: {legs_broker_ids}")
+        else:
+            order_class_val = getattr(order, 'order_class', None)
+            order_class_str = str(order_class_val).lower() if order_class_val else "none"
+            logger.debug(f"Order {getattr(order, 'id', 'unknown')}: order_class check - has attr: {hasattr(order, 'order_class')}, value: {order_class_val}, str: {order_class_str}, is oco: {'oco' in order_class_str if order_class_val else False}")
+        
         return TradingOrder(
             broker_order_id=str(getattr(order, "id", None)) if getattr(order, "id", None) else None,  # Set Alpaca order ID as broker_order_id
             symbol=getattr(order, "symbol", None),
             quantity=getattr(order, "qty", None),
             side=side,
-            order_type=order_type,
+            order_type=final_order_type,
             good_for=getattr(order, "time_in_force", None),
             limit_price=getattr(order, "limit_price", None),
             stop_price=getattr(order, "stop_price", None),
@@ -273,6 +486,7 @@ class AlpacaAccount(AccountInterface):
             open_price=getattr(order, "filled_avg_price", None),  # Use broker's filled_avg_price as open_price
             comment=getattr(order, "client_order_id", None),
             created_at=getattr(order, "created_at", None),
+            legs_broker_ids=legs_broker_ids,  # Store OCO leg broker IDs for upstream processing
         )
     
     def alpaca_position_to_position(self, position):
@@ -620,7 +834,16 @@ class AlpacaAccount(AccountInterface):
                 
                 logger.info(f"Updated order {fresh_order.id} in database: broker_order_id={fresh_order.broker_order_id}, status={fresh_order.status}")
                 
-                # Step 4: Handle TP/SL if provided (delegate to adjust methods which handle pending triggers)
+                # Step 4a: Handle OCO order legs - extract leg order IDs from broker response
+                logger.debug(f"Checking for OCO legs: fresh_order.order_type={fresh_order.order_type}, is OCO: {fresh_order.order_type == CoreOrderType.OCO}")
+                logger.debug(f"Alpaca order: has order_class={hasattr(alpaca_order, 'order_class')}, value={getattr(alpaca_order, 'order_class', None)}")
+                if fresh_order.order_type == CoreOrderType.OCO and alpaca_order.order_class == OrderClass.OCO:
+                    logger.info(f"Order {fresh_order.id} is OCO, inserting legs...")
+                    self._insert_oco_order_legs(alpaca_order, fresh_order, trading_order.transaction_id)
+                else:
+                    logger.debug(f"Skipping OCO leg insertion for order {fresh_order.id}")
+                
+                # Step 4b: Handle TP/SL if provided (delegate to adjust methods which handle pending triggers)
                 if tp_price or sl_price:
                     # Get the transaction for this order
                     if fresh_order.transaction_id:
@@ -1124,6 +1347,26 @@ class AlpacaAccount(AccountInterface):
                         update_instance(db_order)
                         updated_count += 1
                         logger.debug(f"Updated database order {db_order.id} with changes from Alpaca order {alpaca_order.broker_order_id}")
+                    
+                    # Step 3a: Insert OCO order legs if this is an OCO order and we have a matched DB order
+                    if db_order.order_type == CoreOrderType.OCO:
+                        legs_inserted = 0
+                        
+                        # Try to insert legs from the converted order's legs_broker_ids field
+                        # This field is populated by alpaca_order_to_tradingorder() when Alpaca returns legs
+                        if alpaca_order.legs_broker_ids:
+                            logger.debug(f"Order {db_order.id} has {len(alpaca_order.legs_broker_ids)} OCO leg broker IDs: {alpaca_order.legs_broker_ids}")
+                            legs_inserted = self._insert_oco_legs_from_broker_ids(db_order, alpaca_order.legs_broker_ids)
+                        
+                        # Also try insert legs from the raw Alpaca order if it has them
+                        # (Alpaca submit_order response includes full leg objects, but get_orders response doesn't)
+                        if (hasattr(alpaca_order, 'order_class') and 
+                            alpaca_order.order_class == OrderClass.OCO and
+                            hasattr(alpaca_order, 'legs') and alpaca_order.legs):
+                            self._insert_oco_order_legs(alpaca_order, db_order, db_order.transaction_id)
+                        
+                        if legs_inserted > 0:
+                            logger.info(f"Order {db_order.id}: Inserted {legs_inserted} OCO leg orders")
             
             # Step 4: Mark database orders with broker_order_ids that don't exist in Alpaca as CANCELED
             # This catches orders that were canceled in Alpaca but status wasn't updated in database

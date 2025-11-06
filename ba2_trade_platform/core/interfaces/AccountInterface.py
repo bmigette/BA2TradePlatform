@@ -2161,8 +2161,44 @@ class AccountInterface(ExtendableSettingsInterface):
                             has_changes = True
                             logger.debug(f"Transaction {transaction.id} close_price updated to {closing_order.open_price} from filled closing order {closing_order.id}")
                     
+                    # OPENED -> CLOSED: If at least one OCO leg is filled
+                    # OCO legs are dependent orders on the parent entry order with order_type = OCO or specific leg markers
+                    oco_leg_filled = False
+                    for dep_order in dependent_orders:
+                        # Check if this is an OCO leg order (identified by depends_on_order and comment)
+                        if (dep_order.status == OrderStatus.FILLED and 
+                            ("OCO-" in (dep_order.comment or "") or dep_order.order_type == OrderType.OCO)):
+                            oco_leg_filled = True
+                            logger.debug(f"Transaction {transaction.id} has filled OCO leg: {dep_order.id} ({dep_order.comment})")
+                            break
+                    
+                    if oco_leg_filled and transaction.status == TransactionStatus.OPENED:
+                        # Update close_price from the filled OCO leg
+                        filled_oco_legs = [
+                            o for o in dependent_orders 
+                            if (o.status == OrderStatus.FILLED and 
+                                ("OCO-" in (o.comment or "") or o.order_type == OrderType.OCO) and
+                                o.open_price)
+                        ]
+                        if filled_oco_legs:
+                            oco_leg = filled_oco_legs[0]
+                            if transaction.close_price != oco_leg.open_price:
+                                transaction.close_price = oco_leg.open_price
+                                has_changes = True
+                                logger.debug(f"Transaction {transaction.id} close_price updated to {oco_leg.open_price} from filled OCO leg {oco_leg.id}")
+                        
+                        from ..utils import close_transaction_with_logging
+                        close_transaction_with_logging(
+                            transaction=transaction,
+                            account_id=self.id,
+                            close_reason="oco_leg_filled",
+                            session=session
+                        )
+                        new_status = TransactionStatus.CLOSED
+                        has_changes = True
+                    
                     # OPENED -> CLOSED: If we have a filled closing order (TP/SL)
-                    if filled_closing_orders and transaction.status == TransactionStatus.OPENED:
+                    elif filled_closing_orders and transaction.status == TransactionStatus.OPENED:
                         from ..utils import close_transaction_with_logging
                         close_transaction_with_logging(
                             transaction=transaction,

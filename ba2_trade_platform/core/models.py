@@ -408,19 +408,50 @@ class TradingOrder(SQLModel, table=True):
     transaction_id: int | None = Field(foreign_key="transaction.id", nullable=True, ondelete="CASCADE")
     transaction: Optional["Transaction"] = Relationship(back_populates="trading_orders")
     
-    # Self-referencing relationship for order dependencies
+    # Self-referencing relationship for order dependencies - uses depends_on_order FK
     dependent_orders: List["TradingOrder"] = Relationship(
         back_populates="depends_on_order_rel",
-        sa_relationship_kwargs={"remote_side": "TradingOrder.id"}
+        sa_relationship_kwargs={
+            "remote_side": "TradingOrder.id",
+            "foreign_keys": "[TradingOrder.depends_on_order]"
+        }
     )
     depends_on_order_rel: Optional["TradingOrder"] = Relationship(
-        back_populates="dependent_orders"
+        back_populates="dependent_orders",
+        sa_relationship_kwargs={
+            "foreign_keys": "[TradingOrder.depends_on_order]"
+        }
     )
     
     # Optional JSON data field for storing order metadata
     # For WAITING_TRIGGER TP/SL orders: stores {"tp_percent": float, "parent_filled_price": float}
     # Allows recalculation of TP/SL from parent order fill price when order is triggered
     data: dict | None = Field(sa_column=Column(JSON), default=None, description="Optional order metadata (e.g., TP/SL percent for WAITING_TRIGGER orders)")
+    
+    # OCO leg broker IDs - only set for OCO orders
+    # List of broker order IDs (strings) for the TP and SL legs of an OCO order
+    # Format: ["broker_id_1", "broker_id_2", ...] where each is a UUID from Alpaca
+    # Upstream AccountInterface uses this to look up and insert the leg orders into database
+    legs_broker_ids: list[str] | None = Field(sa_column=Column(JSON), default=None, description="Broker order IDs of OCO leg orders (TP and SL) for upstream processing")
+    
+    # Parent OCO order ID - set when this order is a leg (TP/SL) of an OCO order
+    # Links leg orders back to their parent OCO order
+    parent_order_id: int | None = Field(default=None, foreign_key="tradingorder.id", description="ID of parent OCO order if this is a leg")
+    
+    # Self-referencing relationship for OCO parent-child - uses parent_order_id FK
+    oco_child_orders: List["TradingOrder"] = Relationship(
+        back_populates="oco_parent_order",
+        sa_relationship_kwargs={
+            "remote_side": "TradingOrder.id",
+            "foreign_keys": "[TradingOrder.parent_order_id]"
+        }
+    )
+    oco_parent_order: Optional["TradingOrder"] = Relationship(
+        back_populates="oco_child_orders",
+        sa_relationship_kwargs={
+            "foreign_keys": "[TradingOrder.parent_order_id]"
+        }
+    )
 
     def as_string(self) -> str:
         return f"Order(id={self.id}, symbol={self.symbol}, quantity={self.quantity}, side={self.side}, type={self.order_type}, status={self.status})"
