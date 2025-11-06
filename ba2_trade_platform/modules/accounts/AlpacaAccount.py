@@ -175,6 +175,100 @@ class AlpacaAccount(AccountInterface):
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
         return f"{timestamp}-{order_type}-[ACC:{account_id}/TR:{transaction_id}/PORD:{parent_order_id}]"
     
+    def _update_existing_oco_legs(self, parent_order: TradingOrder, alpaca_parent_order) -> int:
+        """
+        Update status and other fields of existing OCO leg orders in the database.
+        
+        CRITICAL FIX: OCO leg orders are NOT returned by Alpaca's get_orders() API as separate items.
+        They are only returned as metadata on the parent OCO order. However, they exist in our database
+        as separate TradingOrder records. During refresh_orders(), we must explicitly update these legs
+        because they won't be processed by the main loop.
+        
+        This method:
+        1. Finds all leg orders linked to this parent OCO order in the database
+        2. For each leg, fetches its current status from Alpaca (via get_order API)
+        3. Updates the database record if the status or filled_qty changed
+        
+        Args:
+            parent_order: The parent OCO TradingOrder record
+            alpaca_parent_order: The Alpaca order object for the parent OCO
+            
+        Returns:
+            int: Number of leg orders updated
+        """
+        try:
+            from sqlmodel import Session, select
+            
+            updated_count = 0
+            
+            # Find all leg orders linked to this parent OCO
+            with Session(get_db().bind) as session:
+                leg_orders = session.exec(
+                    select(TradingOrder).where(
+                        TradingOrder.parent_order_id == parent_order.id,
+                        TradingOrder.account_id == self.id
+                    )
+                ).all()
+            
+            if not leg_orders:
+                logger.debug(f"Parent OCO order {parent_order.id} has no linked leg orders in database")
+                return 0
+            
+            logger.debug(f"Found {len(leg_orders)} leg orders to update for parent OCO {parent_order.id}")
+            
+            for leg_order in leg_orders:
+                if not leg_order.broker_order_id:
+                    logger.warning(f"Leg order {leg_order.id} has no broker_order_id, cannot fetch from Alpaca")
+                    continue
+                
+                try:
+                    # Fetch the current status of this leg from Alpaca
+                    alpaca_leg_order = self.get_order(leg_order.broker_order_id)
+                    if not alpaca_leg_order:
+                        logger.warning(f"Could not fetch OCO leg order {leg_order.broker_order_id} (order {leg_order.id}) from Alpaca")
+                        continue
+                    
+                    # Check if any fields have changed
+                    has_changes = False
+                    
+                    # Check status
+                    if leg_order.status != alpaca_leg_order.status:
+                        logger.debug(f"OCO leg order {leg_order.id} status changed: {leg_order.status} -> {alpaca_leg_order.status}")
+                        leg_order.status = alpaca_leg_order.status
+                        has_changes = True
+                    
+                    # Check filled_qty
+                    if (leg_order.filled_qty is None or 
+                        float(leg_order.filled_qty) != float(alpaca_leg_order.filled_qty)):
+                        logger.debug(f"OCO leg order {leg_order.id} filled_qty changed: {leg_order.filled_qty} -> {alpaca_leg_order.filled_qty}")
+                        leg_order.filled_qty = alpaca_leg_order.filled_qty
+                        has_changes = True
+                    
+                    # Check open_price
+                    if (leg_order.open_price is None and alpaca_leg_order.open_price is not None) or \
+                       (leg_order.open_price is not None and 
+                        (alpaca_leg_order.open_price is None or 
+                         float(leg_order.open_price) != float(alpaca_leg_order.open_price))):
+                        logger.debug(f"OCO leg order {leg_order.id} open_price changed: {leg_order.open_price} -> {alpaca_leg_order.open_price}")
+                        leg_order.open_price = alpaca_leg_order.open_price
+                        has_changes = True
+                    
+                    # Persist changes if any
+                    if has_changes:
+                        update_instance(leg_order)
+                        updated_count += 1
+                        logger.info(f"Updated OCO leg order {leg_order.id}: status={leg_order.status}, filled_qty={leg_order.filled_qty}")
+                    
+                except Exception as e:
+                    logger.error(f"Error updating OCO leg order {leg_order.id}: {e}", exc_info=True)
+                    continue
+            
+            return updated_count
+            
+        except Exception as e:
+            logger.error(f"Error in _update_existing_oco_legs for parent order {parent_order.id}: {e}", exc_info=True)
+            return 0
+    
     def _insert_oco_legs_from_broker_ids(self, parent_order: TradingOrder, legs_broker_ids: list[str]) -> int:
         """
         Insert OCO leg orders by fetching them from Alpaca using their broker IDs.
@@ -1290,10 +1384,10 @@ class AlpacaAccount(AccountInterface):
                     db_order = broker_id_map[alpaca_order.broker_order_id]
                 else:
                     # Standard lookup by broker_order_id
-                    db_order = get_instance(TradingOrder, None) if False else None  # Placeholder
                     with Session(get_db().bind) as session:
                         statement = select(TradingOrder).where(
-                            TradingOrder.broker_order_id == alpaca_order.broker_order_id
+                            TradingOrder.broker_order_id == alpaca_order.broker_order_id,
+                            TradingOrder.account_id == self.id
                         )
                         result = session.exec(statement).first()
                         if result:
@@ -1314,6 +1408,7 @@ class AlpacaAccount(AccountInterface):
                 # Step 3: Update order state if we found a match
                 if db_order:
                     has_changes = False
+                    logger.debug(f"Processing order {db_order.id}: DB status={db_order.status}, Alpaca status={alpaca_order.status}, alpaca_broker_id={alpaca_order.broker_order_id}")
                     
                     # Special handling for PENDING_CANCEL orders: Can only transition to CANCELLED
                     # PENDING_CANCEL means we're waiting for cancellation before replacing the order
@@ -1355,14 +1450,20 @@ class AlpacaAccount(AccountInterface):
                         updated_count += 1
                         logger.debug(f"Updated database order {db_order.id} with changes from Alpaca order {alpaca_order.broker_order_id}")
                     
-                    # Step 3a: Insert OCO order legs if this is an OCO order and we have a matched DB order
+                    # Step 3a: Update or insert OCO order legs if this is an OCO order and we have a matched DB order
                     if db_order.order_type == CoreOrderType.OCO:
                         legs_inserted = 0
+                        legs_updated = 0
                         
-                        # Try to insert legs from the converted order's legs_broker_ids field
+                        # Try to update existing legs from the converted order's legs_broker_ids field
                         # This field is populated by alpaca_order_to_tradingorder() when Alpaca returns legs
                         if alpaca_order.legs_broker_ids:
                             logger.debug(f"Order {db_order.id} has {len(alpaca_order.legs_broker_ids)} OCO leg broker IDs: {alpaca_order.legs_broker_ids}")
+                            # CRITICAL FIX: Update existing OCO legs that are already in database
+                            # OCO legs are NOT returned by get_orders() as separate items, so we must update them
+                            # based on the parent order's status and information
+                            legs_updated = self._update_existing_oco_legs(db_order, alpaca_order)
+                            # Then insert any legs that don't exist yet
                             legs_inserted = self._insert_oco_legs_from_broker_ids(db_order, alpaca_order.legs_broker_ids)
                         
                         # Also try insert legs from the raw Alpaca order if it has them
@@ -1372,8 +1473,8 @@ class AlpacaAccount(AccountInterface):
                             hasattr(alpaca_order, 'legs') and alpaca_order.legs):
                             self._insert_oco_order_legs(alpaca_order, db_order, db_order.transaction_id)
                         
-                        if legs_inserted > 0:
-                            logger.info(f"Order {db_order.id}: Inserted {legs_inserted} OCO leg orders")
+                        if legs_inserted > 0 or legs_updated > 0:
+                            logger.info(f"Order {db_order.id}: Updated {legs_updated} OCO legs, Inserted {legs_inserted} OCO leg orders")
             
             # Step 4: Mark database orders with broker_order_ids that don't exist in Alpaca as CANCELED
             # This catches orders that were canceled in Alpaca but status wasn't updated in database
