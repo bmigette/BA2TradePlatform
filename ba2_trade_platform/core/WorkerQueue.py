@@ -125,7 +125,7 @@ class WorkerQueue:
         self._batch_start_times: Dict[str, float] = {}  # Maps batch_id to start timestamp
         self._batch_task_counts: Dict[str, int] = {}  # Maps batch_id to total job count
         self._batch_completed_counts: Dict[str, int] = {}  # Maps batch_id to completed job count
-        self._batch_lock = threading.Lock()  # Lock for batch tracking
+        self._batch_lock = threading.RLock()  # Lock for batch tracking (reentrant for nested calls)
         
         logger.info("WorkerQueue system initialized")
         

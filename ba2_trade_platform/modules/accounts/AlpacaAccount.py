@@ -569,7 +569,8 @@ class AlpacaAccount(AccountInterface):
                 legs_broker_ids = [str(leg.id) for leg in order.legs if hasattr(leg, 'id') and leg.id]
                 logger.debug(f"OCO order {getattr(order, 'id', 'unknown')} has {len(legs_broker_ids)} legs: {legs_broker_ids}")
         else:
-            logger.debug(f"Order {getattr(order, 'id', 'unknown')}: order_class check - has attr: {hasattr(order, 'order_class')}, value: {order_class_val}, str: {str(order_class_val).lower() if order_class_val else 'none'}, is oco: {is_oco}")
+            pass
+            #logger.debug(f"Order {getattr(order, 'id', 'unknown')}: order_class check - has attr: {hasattr(order, 'order_class')}, value: {order_class_val}, str: {str(order_class_val).lower() if order_class_val else 'none'}, is oco: {is_oco}")
         
         return TradingOrder(
             broker_order_id=str(getattr(order, "id", None)) if getattr(order, "id", None) else None,  # Set Alpaca order ID as broker_order_id
@@ -1408,7 +1409,7 @@ class AlpacaAccount(AccountInterface):
                 # Step 3: Update order state if we found a match
                 if db_order:
                     has_changes = False
-                    logger.debug(f"Processing order {db_order.id}: DB status={db_order.status}, Alpaca status={alpaca_order.status}, alpaca_broker_id={alpaca_order.broker_order_id}")
+                    #logger.debug(f"Processing order {db_order.id}: DB status={db_order.status}, Alpaca status={alpaca_order.status}, alpaca_broker_id={alpaca_order.broker_order_id}")
                     
                     # Special handling for PENDING_CANCEL orders: Can only transition to CANCELLED
                     # PENDING_CANCEL means we're waiting for cancellation before replacing the order
@@ -1480,6 +1481,24 @@ class AlpacaAccount(AccountInterface):
             # This catches orders that were canceled in Alpaca but status wasn't updated in database
             canceled_count = 0
             alpaca_broker_ids = {order.broker_order_id for order in alpaca_orders if order.broker_order_id}
+            
+            # CRITICAL: Add OCO leg broker IDs to safe set
+            # OCO legs are not returned by get_orders() as separate items, but they exist in our database
+            # We must include their broker IDs in the safe set so they don't get incorrectly marked as CANCELED
+            oco_leg_broker_ids = set()
+            with Session(get_db().bind) as session:
+                oco_legs = session.exec(
+                    select(TradingOrder).where(
+                        TradingOrder.account_id == self.id,
+                        TradingOrder.parent_order_id.is_not(None),  # Has a parent = is an OCO leg
+                        TradingOrder.broker_order_id.is_not(None)
+                    )
+                ).all()
+                oco_leg_broker_ids = {leg.broker_order_id for leg in oco_legs}
+            
+            # Combine both sets: parent orders + OCO legs
+            alpaca_broker_ids = alpaca_broker_ids.union(oco_leg_broker_ids)
+            logger.debug(f"Total broker IDs to check (parents + OCO legs): {len(alpaca_broker_ids)} (parents: {len(alpaca_broker_ids) - len(oco_leg_broker_ids)}, legs: {len(oco_leg_broker_ids)})")
             
             with Session(get_db().bind) as session:
                 # Get all database orders for this account with broker_order_id and non-terminal status
