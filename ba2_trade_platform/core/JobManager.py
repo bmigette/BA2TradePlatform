@@ -813,7 +813,7 @@ class JobManager:
                 return
             
             # Ensure symbols are unique and limited by max_instruments setting
-            max_instruments = expert.settings.get('max_instruments', 30)
+            max_instruments = int(expert.settings.get('max_instruments', 30))
             unique_instruments = list(dict.fromkeys(selected_instruments))[:max_instruments]
             
             if len(unique_instruments) < len(selected_instruments):
