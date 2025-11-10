@@ -163,14 +163,28 @@ class Toolkit:
             markdown_lines.append(f"**Records**: {len(df)}")
             markdown_lines.append(f"**Date Range**: {df['Date'].min()} to {df['Date'].max()}")
             markdown_lines.append("")
-            markdown_lines.append("| Date | Open | High | Low | Close | Volume |")
-            markdown_lines.append("|------|------|------|-----|-------|--------|")
+            
+            # Check if data contains intraday (has time component)
+            has_intraday = any(
+                hasattr(d, 'hour') and (d.hour != 0 or d.minute != 0 or d.second != 0)
+                for d in df['Date']
+            )
+            
+            if has_intraday:
+                markdown_lines.append("| DateTime | Open | High | Low | Close | Volume |")
+                markdown_lines.append("|----------|------|------|-----|-------|--------|")
+            else:
+                markdown_lines.append("| Date | Open | High | Low | Close | Volume |")
+                markdown_lines.append("|------|------|------|-----|-------|--------|")
             
             # Show first 10, last 10 rows in markdown (limit output)
             rows_to_show = min(10, len(df))
             for idx in range(rows_to_show):
                 row = df.iloc[idx]
-                date_str = row['Date'].strftime('%Y-%m-%d')
+                if has_intraday:
+                    date_str = row['Date'].strftime('%Y-%m-%d %H:%M:%S')
+                else:
+                    date_str = row['Date'].strftime('%Y-%m-%d')
                 markdown_lines.append(
                     f"| {date_str} | {row['Open']:.2f} | {row['High']:.2f} | {row['Low']:.2f} | {row['Close']:.2f} | {int(row['Volume'])} |"
                 )
@@ -179,7 +193,10 @@ class Toolkit:
                 markdown_lines.append("| ... | ... | ... | ... | ... | ... |")
                 for idx in range(len(df) - rows_to_show, len(df)):
                     row = df.iloc[idx]
-                    date_str = row['Date'].strftime('%Y-%m-%d')
+                    if has_intraday:
+                        date_str = row['Date'].strftime('%Y-%m-%d %H:%M:%S')
+                    else:
+                        date_str = row['Date'].strftime('%Y-%m-%d')
                     markdown_lines.append(
                         f"| {date_str} | {row['Open']:.2f} | {row['High']:.2f} | {row['Low']:.2f} | {row['Close']:.2f} | {int(row['Volume'])} |"
                     )
@@ -187,9 +204,19 @@ class Toolkit:
             markdown_text = "\n".join(markdown_lines)
             
             # Create JSON structure (clean, JSON-serializable)
+            # Preserve full timestamp for intraday data (time component)
+            dates_list = []
+            for date in df['Date']:
+                # Use isoformat to preserve timestamp precision
+                if hasattr(date, 'isoformat'):
+                    dates_list.append(date.isoformat())
+                else:
+                    # Fallback to date-only format if not a datetime
+                    dates_list.append(str(date)[:10])
+            
             json_dict = {
                 "symbol": symbol,
-                "dates": df['Date'].dt.strftime('%Y-%m-%d').tolist(),
+                "dates": dates_list,
                 "opens": df['Open'].round(4).tolist(),
                 "highs": df['High'].round(4).tolist(),
                 "lows": df['Low'].round(4).tolist(),

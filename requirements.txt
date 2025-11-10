@@ -17,6 +17,7 @@ langchain-openai
 langchain-experimental
 langchain_core
 langchain_anthropic
+langchain-text-splitters
 pandas
 yfinance
 praw

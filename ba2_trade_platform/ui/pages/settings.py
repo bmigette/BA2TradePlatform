@@ -3010,6 +3010,17 @@ class ExpertSettingsTab:
                 format='%.0f'
             ).classes('w-full mb-4').props('outlined')
             
+            # Cleanup type selector
+            ui.label('What to delete:').classes('text-body2 mb-2')
+            self.cleanup_type_select = ui.select(
+                label='Cleanup Scope',
+                value='all',
+                options={
+                    'all': '🗑️ All Data - Delete analyses AND their outputs/recommendations',
+                    'outputs_only': '📄 Outputs Only - Keep analyses, delete outputs/recommendations'
+                }
+            ).classes('w-full mb-4').props('outlined')
+            
             # Status filter
             ui.label('Select which analysis statuses to clean up:').classes('text-body2 mb-2')
             with ui.column().classes('w-full mb-4'):
@@ -3101,7 +3112,9 @@ class ExpertSettingsTab:
                 ui.label(f'Error loading statistics: {str(e)}').classes('text-negative')
     
     def _preview_cleanup(self, expert_instance=None):
-        """Preview what would be cleaned up."""
+        """Preview what would be cleaned up (async with progress)."""
+        import asyncio
+        
         self.cleanup_preview_container.clear()
         
         try:
@@ -3119,68 +3132,124 @@ class ExpertSettingsTab:
             
             # Get days to keep
             days_to_keep = int(self.cleanup_days_input.value)
-            
-            # Get preview
+            cleanup_type = self.cleanup_type_select.value
             expert_id = expert_instance.id if expert_instance else None
-            preview = preview_cleanup(
-                days_to_keep=days_to_keep,
-                statuses=selected_statuses,
-                expert_instance_id=expert_id
-            )
             
+            logger.info(f"Starting cleanup preview: days_to_keep={days_to_keep}, expert_id={expert_id}, "
+                       f"cleanup_type={cleanup_type}, statuses={selected_statuses}")
+            
+            # Show progress indicator
             with self.cleanup_preview_container:
-                # Summary
-                with ui.card().classes('w-full p-4 mb-4').style('border: 2px solid orange'):
-                    ui.label('Cleanup Summary').classes('text-subtitle2 mb-2')
+                progress_label = ui.label('Analyzing database for cleanup candidates...').classes('text-body2')
+                progress_bar = ui.linear_progress(value=0.1).classes('w-full')
+            
+            # Use asyncio.ensure_future for proper event loop handling
+            async def run_preview():
+                """Run preview in background and update UI."""
+                try:
+                    logger.info('[PREVIEW] Starting database query')
+                    progress_label.set_text('Fetching old analyses from database...')
+                    progress_bar.set_value(0.2)
                     
-                    if preview['deletable_analyses'] == 0:
-                        ui.label('✅ No analyses to clean up with current settings.').classes('text-positive')
-                        self.cleanup_execute_button.set_enabled(False)
-                        return
+                    # Run preview in thread pool to avoid blocking
+                    loop = asyncio.get_event_loop()
                     
-                    with ui.grid(columns=2).classes('w-full gap-4'):
-                        with ui.column():
-                            ui.label(f"Will delete: {preview['deletable_analyses']} analyses").classes('text-body1 font-bold text-orange')
-                            ui.label(f"Protected: {preview['protected_analyses']} analyses (have open transactions)").classes('text-body2')
+                    preview = await loop.run_in_executor(
+                        None,
+                        preview_cleanup,
+                        days_to_keep,
+                        selected_statuses,
+                        expert_id
+                    )
+                    
+                    logger.info(f"[PREVIEW] Database query complete: {preview['deletable_analyses']} deletable, "
+                              f"{preview['protected_analyses']} protected analyses")
+                    
+                    # Update progress
+                    progress_label.set_text('Preparing preview display...')
+                    progress_bar.set_value(0.8)
+                    
+                    # Clear and rebuild display
+                    self.cleanup_preview_container.clear()
+                    
+                    with self.cleanup_preview_container:
+                        # Summary
+                        with ui.card().classes('w-full p-4 mb-4').style('border: 2px solid orange'):
+                            # Show cleanup type and scope
+                            scope_text = "All Data (Analyses + Outputs + Recommendations)" if cleanup_type == "all" else "Outputs & Recommendations Only"
+                            ui.label(f'✓ Cleanup Summary - {scope_text}').classes('text-subtitle2 mb-2')
+                            
+                            if preview['deletable_analyses'] == 0:
+                                ui.label('✅ No analyses to clean up with current settings.').classes('text-positive')
+                                self.cleanup_execute_button.set_enabled(False)
+                                logger.info("No analyses matched cleanup criteria")
+                                return
+                            
+                            with ui.grid(columns=2).classes('w-full gap-4'):
+                                with ui.column():
+                                    if cleanup_type == "all":
+                                        ui.label(f"Will delete: {preview['deletable_analyses']} analyses").classes('text-body1 font-bold text-orange')
+                                    else:
+                                        ui.label(f"Will delete outputs for: {preview['deletable_analyses']} analyses").classes('text-body1 font-bold text-orange')
+                                    ui.label(f"Protected: {preview['protected_analyses']} analyses (have open transactions)").classes('text-body2')
+                                
+                                with ui.column():
+                                    ui.label(f"Outputs to delete: {preview['estimated_outputs_deleted']}").classes('text-body2')
+                                    ui.label(f"Recommendations to delete: {preview['estimated_recommendations_deleted']}").classes('text-body2')
                         
-                        with ui.column():
-                            ui.label(f"Outputs to delete: {preview['estimated_outputs_deleted']}").classes('text-body2')
-                            ui.label(f"Recommendations to delete: {preview['estimated_recommendations_deleted']}").classes('text-body2')
+                        # Details table
+                        if preview['preview_items']:
+                            ui.label('Sample of analyses to be deleted (up to 100):').classes('text-body2 mt-4 mb-2')
+                            
+                            columns = [
+                                {'name': 'id', 'label': 'ID', 'field': 'id', 'align': 'left', 'sortable': True},
+                                {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left', 'sortable': True},
+                                {'name': 'status', 'label': 'Status', 'field': 'status', 'align': 'left', 'sortable': True},
+                                {'name': 'created_at', 'label': 'Created', 'field': 'created_at', 'align': 'left', 'sortable': True},
+                                {'name': 'outputs_count', 'label': 'Outputs', 'field': 'outputs_count', 'align': 'right', 'sortable': True},
+                                {'name': 'recommendations_count', 'label': 'Recs', 'field': 'recommendations_count', 'align': 'right', 'sortable': True}
+                            ]
+                            
+                            ui.table(
+                                columns=columns,
+                                rows=preview['preview_items'],
+                                row_key='id'
+                            ).classes('w-full')
+                        
+                        # Complete
+                        progress_bar.set_value(1.0)
+                        ui.label('✓ Preview ready').classes('text-positive text-caption mt-2')
+                        
+                        # Enable execute button
+                        self.cleanup_execute_button.set_enabled(True)
+                        logger.info("Cleanup preview display completed successfully")
                 
-                # Details table
-                if preview['preview_items']:
-                    ui.label('Sample of analyses to be deleted (up to 100):').classes('text-body2 mt-4 mb-2')
-                    
-                    columns = [
-                        {'name': 'id', 'label': 'ID', 'field': 'id', 'align': 'left', 'sortable': True},
-                        {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left', 'sortable': True},
-                        {'name': 'status', 'label': 'Status', 'field': 'status', 'align': 'left', 'sortable': True},
-                        {'name': 'created_at', 'label': 'Created', 'field': 'created_at', 'align': 'left', 'sortable': True},
-                        {'name': 'outputs_count', 'label': 'Outputs', 'field': 'outputs_count', 'align': 'right', 'sortable': True},
-                        {'name': 'recommendations_count', 'label': 'Recs', 'field': 'recommendations_count', 'align': 'right', 'sortable': True}
-                    ]
-                    
-                    ui.table(
-                        columns=columns,
-                        rows=preview['preview_items'],
-                        row_key='id'
-                    ).classes('w-full')
-                
-                # Enable execute button
-                self.cleanup_execute_button.set_enabled(True)
+                except Exception as e:
+                    logger.error(f'Error running cleanup preview: {e}', exc_info=True)
+                    self.cleanup_preview_container.clear()
+                    with self.cleanup_preview_container:
+                        ui.label(f'❌ Error: {str(e)}').classes('text-negative')
+                    self.cleanup_execute_button.set_enabled(False)
+            
+            # Schedule the async function to run
+            asyncio.ensure_future(run_preview())
         
         except Exception as e:
-            logger.error(f'Error previewing cleanup: {e}')
+            logger.error(f'Error starting cleanup preview: {e}', exc_info=True)
             with self.cleanup_preview_container:
                 ui.label(f'❌ Error: {str(e)}').classes('text-negative')
             self.cleanup_execute_button.set_enabled(False)
     
     def _execute_cleanup(self, expert_instance=None):
         """Execute the cleanup operation."""
+        # Get cleanup type for confirmation message
+        cleanup_type = self.cleanup_type_select.value
+        scope_text = "all data (analyses + outputs + recommendations)" if cleanup_type == "all" else "outputs and recommendations only"
+        
         # Create confirmation dialog
         with ui.dialog() as dialog, ui.card():
             ui.label('⚠️ Confirm Cleanup').classes('text-h6 mb-4')
-            ui.label('This will permanently delete the previewed analyses and their data.').classes('text-body1 mb-4')
+            ui.label(f'This will permanently delete {scope_text}.').classes('text-body1 mb-4')
             ui.label('Are you sure you want to continue?').classes('text-body2 mb-4')
             
             with ui.row().classes('w-full justify-end gap-2'):
@@ -3190,8 +3259,13 @@ class ExpertSettingsTab:
         dialog.open()
     
     def _perform_cleanup(self, expert_instance, dialog):
-        """Perform the actual cleanup operation."""
+        """Perform the actual cleanup operation (async with progress)."""
+        import asyncio
+        
         dialog.close()
+        
+        # Replace preview with progress display
+        self.cleanup_preview_container.clear()
         
         try:
             # Get selected statuses
@@ -3202,44 +3276,120 @@ class ExpertSettingsTab:
             
             # Get days to keep
             days_to_keep = int(self.cleanup_days_input.value)
-            
-            # Execute cleanup
+            cleanup_type = self.cleanup_type_select.value
             expert_id = expert_instance.id if expert_instance else None
-            cleanup_result = execute_cleanup(
-                days_to_keep=days_to_keep,
-                statuses=selected_statuses,
-                expert_instance_id=expert_id
-            )
             
-            if cleanup_result['success']:
-                message = f"✅ Cleanup completed!\n"
-                message += f"Deleted: {cleanup_result['analyses_deleted']} analyses\n"
-                message += f"Protected: {cleanup_result['analyses_protected']} analyses with open transactions\n"
-                message += f"Outputs deleted: {cleanup_result['outputs_deleted']}\n"
-                message += f"Recommendations deleted: {cleanup_result['recommendations_deleted']}"
+            # Show progress
+            with self.cleanup_preview_container:
+                progress_label = ui.label('Starting cleanup operation...').classes('text-body2')
+                progress_bar = ui.linear_progress(value=0).classes('w-full')
+                status_log = ui.column().classes('w-full p-2 bg-grey-2 rounded text-caption')
+            
+            logger.info(f"Starting cleanup execution: days_to_keep={days_to_keep}, expert_id={expert_id}, "
+                       f"cleanup_type={cleanup_type}, statuses={selected_statuses}")
+            
+            async def run_cleanup():
+                """Run cleanup in background and update UI."""
+                try:
+                    # Add to log
+                    def log_status(msg):
+                        logger.info(f"[CLEANUP] {msg}")
+                        with status_log:
+                            ui.label(f"• {msg}").classes('text-caption')
+                    
+                    loop = asyncio.get_event_loop()
+                    scope_text = "all data" if cleanup_type == "all" else "outputs only"
+                    log_status(f"Validating cleanup parameters (scope: {scope_text})...")
+                    progress_bar.set_value(0.1)
+                    
+                    # Run execute in thread pool
+                    progress_label.set_text('Executing cleanup (this may take a few moments)...')
+                    log_status("Querying database for analyses to delete...")
+                    progress_bar.set_value(0.2)
+                    
+                    # Call execute_cleanup with cleanup_type parameter
+                    # Note: execute_cleanup will be called with keyword arguments
+                    def execute_with_type():
+                        # Call execute_cleanup - it will handle outputs_only mode if cleanup_type == "outputs_only"
+                        return execute_cleanup(
+                            days_to_keep=days_to_keep,
+                            statuses=selected_statuses,
+                            expert_instance_id=expert_id,
+                            outputs_only=(cleanup_type == "outputs_only")
+                        )
+                    
+                    cleanup_result = await loop.run_in_executor(None, execute_with_type)
+                    
+                    progress_bar.set_value(0.8)
+                    
+                    if cleanup_result['success']:
+                        if cleanup_type == "all":
+                            log_status(f"Deleted {cleanup_result['analyses_deleted']} analyses")
+                        else:
+                            log_status(f"Kept {cleanup_result['analyses_deleted']} analyses (outputs deleted)")
+                        log_status(f"Protected {cleanup_result['analyses_protected']} analyses with open transactions")
+                        log_status(f"Deleted {cleanup_result['outputs_deleted']} analysis outputs")
+                        log_status(f"Deleted {cleanup_result['recommendations_deleted']} expert recommendations")
+                        
+                        if cleanup_result['errors']:
+                            log_status(f"⚠️ {len(cleanup_result['errors'])} errors occurred during cleanup")
+                            for i, error in enumerate(cleanup_result['errors'][:5], 1):
+                                log_status(f"  Error {i}: {error}")
+                            if len(cleanup_result['errors']) > 5:
+                                log_status(f"  ... and {len(cleanup_result['errors']) - 5} more errors")
+                        
+                        # Complete
+                        progress_bar.set_value(1.0)
+                        progress_label.set_text('✓ Cleanup completed successfully!').classes('text-positive')
+                        log_status("Cleanup operation finished")
+                        
+                        # Show summary
+                        message = f"✅ Cleanup completed!\n"
+                        message += f"Deleted: {cleanup_result['analyses_deleted']} analyses\n"
+                        message += f"Protected: {cleanup_result['analyses_protected']} analyses with open transactions\n"
+                        message += f"Outputs deleted: {cleanup_result['outputs_deleted']}\n"
+                        message += f"Recommendations deleted: {cleanup_result['recommendations_deleted']}"
+                        
+                        if cleanup_result['errors']:
+                            message += f"\n⚠️ {len(cleanup_result['errors'])} errors occurred"
+                        
+                        ui.notify(message, type='positive', multi_line=True, timeout=5000)
+                        
+                        # Refresh statistics
+                        logger.info("Refreshing cleanup statistics after successful cleanup")
+                        self._refresh_cleanup_statistics(expert_instance)
+                        
+                        # Disable execute button until next preview
+                        self.cleanup_execute_button.set_enabled(False)
+                        
+                        logger.info("Cleanup operation completed successfully")
+                    else:
+                        progress_bar.set_value(1.0)
+                        progress_label.set_text('❌ Cleanup failed').classes('text-negative')
+                        error_msg = "❌ Cleanup failed:\n" + "\n".join(cleanup_result['errors'])
+                        log_status("Cleanup failed with errors")
+                        for error in cleanup_result['errors'][:5]:
+                            log_status(f"  Error: {error}")
+                        ui.notify(error_msg, type='negative', multi_line=True, timeout=5000)
+                        logger.error(f"Cleanup failed: {cleanup_result['errors']}")
                 
-                if cleanup_result['errors']:
-                    message += f"\n⚠️ {len(cleanup_result['errors'])} errors occurred"
-                
-                ui.notify(message, type='positive', multi_line=True, timeout=5000)
-                
-                # Refresh statistics
-                self._refresh_cleanup_statistics(expert_instance)
-                
-                # Clear preview
-                self.cleanup_preview_container.clear()
-                with self.cleanup_preview_container:
-                    ui.label('Click "Preview Cleanup" to see what will be deleted.').classes('text-body2 text-grey')
-                
-                # Disable execute button
-                self.cleanup_execute_button.set_enabled(False)
-            else:
-                error_msg = "❌ Cleanup failed:\n" + "\n".join(cleanup_result['errors'])
-                ui.notify(error_msg, type='negative', multi_line=True, timeout=5000)
+                except Exception as e:
+                    logger.error(f'Error running cleanup: {e}', exc_info=True)
+                    progress_bar.set_value(1.0)
+                    progress_label.set_text('❌ Error during cleanup').classes('text-negative')
+                    with status_log:
+                        ui.label(f"✗ Exception: {str(e)}").classes('text-negative text-caption')
+                    ui.notify(f'❌ Error: {str(e)}', type='negative')
+            
+            # Start async operation
+            asyncio.create_task(run_cleanup())
         
         except Exception as e:
-            logger.error(f'Error executing cleanup: {e}')
-            ui.notify(f'❌ Error: {str(e)}', type='negative')
+            logger.error(f'Error starting cleanup: {e}', exc_info=True)
+            self.cleanup_preview_container.clear()
+            with self.cleanup_preview_container:
+                ui.label(f'❌ Error: {str(e)}').classes('text-negative')
+            ui.notify(f'❌ Error starting cleanup: {str(e)}', type='negative')
     
     def _on_instrument_selection_change(self, selected_instruments):
         """Handle instrument selection changes."""
@@ -4829,6 +4979,7 @@ class BatchCleanupTab:
         """Initialize batch cleanup tab UI."""
         self.expert_checkboxes = {}
         self.cleanup_days_input = None
+        self.cleanup_type_select = None
         self.cleanup_status_checkboxes = {}
         self.cleanup_stats_container = None
         self.cleanup_preview_container = None
@@ -4900,6 +5051,17 @@ class BatchCleanupTab:
                     max=365,
                     step=1,
                     format='%.0f'
+                ).classes('w-full mb-4').props('outlined')
+                
+                # Cleanup type selector
+                ui.label('What to delete:').classes('text-body2 mb-2')
+                self.cleanup_type_select = ui.select(
+                    label='Cleanup Scope',
+                    value='all',
+                    options={
+                        'all': '🗑️ All Data - Delete analyses AND their outputs/recommendations',
+                        'outputs_only': '📄 Outputs Only - Keep analyses, delete outputs/recommendations'
+                    }
                 ).classes('w-full mb-4').props('outlined')
                 
                 # Status filter
@@ -5038,6 +5200,8 @@ class BatchCleanupTab:
     
     def _preview_batch_cleanup(self):
         """Preview cleanup for selected experts."""
+        import asyncio
+        
         self.cleanup_preview_container.clear()
         
         selected_expert_ids = self._get_selected_expert_ids()
@@ -5063,76 +5227,137 @@ class BatchCleanupTab:
             
             # Get days to keep
             days_to_keep = int(self.cleanup_days_input.value)
+            cleanup_type = self.cleanup_type_select.value
             
-            # Aggregate preview across all selected experts
-            total_deletable = 0
-            total_protected = 0
-            total_outputs_deleted = 0
-            total_recommendations_deleted = 0
-            combined_preview_items = []
+            logger.info(f"Starting batch cleanup preview: days_to_keep={days_to_keep}, experts={len(selected_expert_ids)}, "
+                       f"cleanup_type={cleanup_type}, statuses={selected_statuses}")
             
-            for expert_id in selected_expert_ids:
-                preview = preview_cleanup(
-                    days_to_keep=days_to_keep,
-                    statuses=selected_statuses,
-                    expert_instance_id=expert_id
-                )
-                
-                total_deletable += preview['deletable_analyses']
-                total_protected += preview['protected_analyses']
-                total_outputs_deleted += preview['estimated_outputs_deleted']
-                total_recommendations_deleted += preview['estimated_recommendations_deleted']
-                
-                # Add expert ID to preview items
-                for item in preview['preview_items']:
-                    item['expert_id'] = expert_id
-                    combined_preview_items.append(item)
-            
+            # Show progress indicator
             with self.cleanup_preview_container:
-                # Summary
-                with ui.card().classes('w-full p-4 mb-4').style('border: 2px solid orange'):
-                    ui.label('Batch Cleanup Summary').classes('text-subtitle2 mb-2')
-                    ui.label(f'Across {len(selected_expert_ids)} selected expert(s)').classes('text-body2 mb-2')
+                progress_label = ui.label('Analyzing database for cleanup candidates...').classes('text-body2')
+                progress_bar = ui.linear_progress(value=0.1).classes('w-full')
+            
+            async def run_preview():
+                """Run preview in background and update UI."""
+                try:
+                    logger.info('[BATCH PREVIEW] Starting database query for all selected experts')
+                    progress_label.set_text('Fetching analyses from database for all experts...')
+                    progress_bar.set_value(0.2)
                     
-                    if total_deletable == 0:
-                        ui.label('✅ No analyses to clean up with current settings.').classes('text-positive')
-                        self.cleanup_execute_button.set_enabled(False)
-                        return
+                    # Run preview in thread pool to avoid blocking
+                    loop = asyncio.get_event_loop()
                     
-                    with ui.grid(columns=2).classes('w-full gap-4'):
-                        with ui.column():
-                            ui.label(f"Will delete: {total_deletable} analyses").classes('text-body1 font-bold text-orange')
-                            ui.label(f"Protected: {total_protected} analyses (have open transactions)").classes('text-body2')
+                    # Aggregate preview across all selected experts
+                    def aggregate_previews():
+                        total_deletable = 0
+                        total_protected = 0
+                        total_outputs_deleted = 0
+                        total_recommendations_deleted = 0
+                        combined_preview_items = []
                         
-                        with ui.column():
-                            ui.label(f"Outputs to delete: {total_outputs_deleted}").classes('text-body2')
-                            ui.label(f"Recommendations to delete: {total_recommendations_deleted}").classes('text-body2')
-                
-                # Details table (limit to 100 items for performance)
-                if combined_preview_items:
-                    ui.label(f'Sample of analyses to be deleted (up to 100 of {total_deletable}):').classes('text-body2 mt-4 mb-2')
+                        for expert_id in selected_expert_ids:
+                            preview = preview_cleanup(
+                                days_to_keep=days_to_keep,
+                                statuses=selected_statuses,
+                                expert_instance_id=expert_id
+                            )
+                            
+                            total_deletable += preview['deletable_analyses']
+                            total_protected += preview['protected_analyses']
+                            total_outputs_deleted += preview['estimated_outputs_deleted']
+                            total_recommendations_deleted += preview['estimated_recommendations_deleted']
+                            
+                            # Add expert ID to preview items
+                            for item in preview['preview_items']:
+                                item['expert_id'] = expert_id
+                                combined_preview_items.append(item)
+                        
+                        return {
+                            'total_deletable': total_deletable,
+                            'total_protected': total_protected,
+                            'total_outputs_deleted': total_outputs_deleted,
+                            'total_recommendations_deleted': total_recommendations_deleted,
+                            'combined_preview_items': combined_preview_items
+                        }
                     
-                    columns = [
-                        {'name': 'expert_id', 'label': 'Expert ID', 'field': 'expert_id', 'align': 'left', 'sortable': True},
-                        {'name': 'id', 'label': 'Analysis ID', 'field': 'id', 'align': 'left', 'sortable': True},
-                        {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left', 'sortable': True},
-                        {'name': 'status', 'label': 'Status', 'field': 'status', 'align': 'left', 'sortable': True},
-                        {'name': 'created_at', 'label': 'Created', 'field': 'created_at', 'align': 'left', 'sortable': True},
-                        {'name': 'outputs_count', 'label': 'Outputs', 'field': 'outputs_count', 'align': 'right', 'sortable': True},
-                        {'name': 'recommendations_count', 'label': 'Recs', 'field': 'recommendations_count', 'align': 'right', 'sortable': True}
-                    ]
+                    results = await loop.run_in_executor(None, aggregate_previews)
                     
-                    ui.table(
-                        columns=columns,
-                        rows=combined_preview_items[:100],
-                        row_key='id'
-                    ).classes('w-full')
+                    logger.info(f"[BATCH PREVIEW] Database query complete: {results['total_deletable']} deletable, "
+                              f"{results['total_protected']} protected analyses across {len(selected_expert_ids)} experts")
+                    
+                    # Update progress
+                    progress_label.set_text('Preparing preview display...')
+                    progress_bar.set_value(0.8)
+                    
+                    # Clear and rebuild display
+                    self.cleanup_preview_container.clear()
+                    
+                    with self.cleanup_preview_container:
+                        # Summary
+                        with ui.card().classes('w-full p-4 mb-4').style('border: 2px solid orange'):
+                            # Show cleanup type and scope
+                            scope_text = "All Data (Analyses + Outputs + Recommendations)" if cleanup_type == "all" else "Outputs & Recommendations Only"
+                            ui.label(f'✓ Batch Cleanup Summary - {scope_text}').classes('text-subtitle2 mb-2')
+                            ui.label(f'Across {len(selected_expert_ids)} selected expert(s)').classes('text-body2 mb-2')
+                            
+                            if results['total_deletable'] == 0:
+                                ui.label('✅ No analyses to clean up with current settings.').classes('text-positive')
+                                self.cleanup_execute_button.set_enabled(False)
+                                logger.info("No analyses matched batch cleanup criteria")
+                                return
+                            
+                            with ui.grid(columns=2).classes('w-full gap-4'):
+                                with ui.column():
+                                    if cleanup_type == "all":
+                                        ui.label(f"Will delete: {results['total_deletable']} analyses").classes('text-body1 font-bold text-orange')
+                                    else:
+                                        ui.label(f"Will delete outputs for: {results['total_deletable']} analyses").classes('text-body1 font-bold text-orange')
+                                    ui.label(f"Protected: {results['total_protected']} analyses (have open transactions)").classes('text-body2')
+                                
+                                with ui.column():
+                                    ui.label(f"Outputs to delete: {results['total_outputs_deleted']}").classes('text-body2')
+                                    ui.label(f"Recommendations to delete: {results['total_recommendations_deleted']}").classes('text-body2')
+                        
+                        # Details table
+                        if results['combined_preview_items']:
+                            ui.label(f'Sample of analyses to be deleted (up to 100 of {results["total_deletable"]}):').classes('text-body2 mt-4 mb-2')
+                            
+                            columns = [
+                                {'name': 'expert_id', 'label': 'Expert ID', 'field': 'expert_id', 'align': 'left', 'sortable': True},
+                                {'name': 'id', 'label': 'Analysis ID', 'field': 'id', 'align': 'left', 'sortable': True},
+                                {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left', 'sortable': True},
+                                {'name': 'status', 'label': 'Status', 'field': 'status', 'align': 'left', 'sortable': True},
+                                {'name': 'created_at', 'label': 'Created', 'field': 'created_at', 'align': 'left', 'sortable': True},
+                                {'name': 'outputs_count', 'label': 'Outputs', 'field': 'outputs_count', 'align': 'right', 'sortable': True},
+                                {'name': 'recommendations_count', 'label': 'Recs', 'field': 'recommendations_count', 'align': 'right', 'sortable': True}
+                            ]
+                            
+                            ui.table(
+                                columns=columns,
+                                rows=results['combined_preview_items'][:100],
+                                row_key='id'
+                            ).classes('w-full')
+                        
+                        # Complete
+                        progress_bar.set_value(1.0)
+                        ui.label('✓ Preview ready').classes('text-positive text-caption mt-2')
+                        
+                        # Enable execute button
+                        self.cleanup_execute_button.set_enabled(True)
+                        logger.info("Batch cleanup preview display completed successfully")
                 
-                # Enable execute button
-                self.cleanup_execute_button.set_enabled(True)
+                except Exception as e:
+                    logger.error(f'Error running batch cleanup preview: {e}', exc_info=True)
+                    self.cleanup_preview_container.clear()
+                    with self.cleanup_preview_container:
+                        ui.label(f'❌ Error: {str(e)}').classes('text-negative')
+                    self.cleanup_execute_button.set_enabled(False)
+            
+            # Schedule the async function to run
+            asyncio.ensure_future(run_preview())
         
         except Exception as e:
-            logger.error(f'Error previewing batch cleanup: {e}')
+            logger.error(f'Error starting batch cleanup preview: {e}', exc_info=True)
             with self.cleanup_preview_container:
                 ui.label(f'❌ Error: {str(e)}').classes('text-negative')
             self.cleanup_execute_button.set_enabled(False)
@@ -5154,10 +5379,13 @@ class BatchCleanupTab:
         dialog.open()
     
     def _perform_batch_cleanup(self, dialog):
-        """Perform the actual batch cleanup operation."""
+        """Perform the actual batch cleanup operation (async)."""
+        import asyncio
+        
         dialog.close()
         
         selected_expert_ids = self._get_selected_expert_ids()
+        cleanup_type = self.cleanup_type_select.value
         
         try:
             # Get selected statuses
@@ -5169,58 +5397,123 @@ class BatchCleanupTab:
             # Get days to keep
             days_to_keep = int(self.cleanup_days_input.value)
             
-            # Execute cleanup for each expert
-            total_analyses_deleted = 0
-            total_analyses_protected = 0
-            total_outputs_deleted = 0
-            total_recommendations_deleted = 0
-            all_errors = []
-            
-            for expert_id in selected_expert_ids:
-                cleanup_result = execute_cleanup(
-                    days_to_keep=days_to_keep,
-                    statuses=selected_statuses,
-                    expert_instance_id=expert_id
-                )
-                
-                if cleanup_result['success']:
-                    total_analyses_deleted += cleanup_result['analyses_deleted']
-                    total_analyses_protected += cleanup_result['analyses_protected']
-                    total_outputs_deleted += cleanup_result['outputs_deleted']
-                    total_recommendations_deleted += cleanup_result['recommendations_deleted']
-                    
-                    if cleanup_result['errors']:
-                        all_errors.extend(cleanup_result['errors'])
-                else:
-                    all_errors.extend(cleanup_result['errors'])
-            
-            # Show summary notification
-            message = f"✅ Batch cleanup completed across {len(selected_expert_ids)} expert(s)!\n"
-            message += f"Deleted: {total_analyses_deleted} analyses\n"
-            message += f"Protected: {total_analyses_protected} analyses with open transactions\n"
-            message += f"Outputs deleted: {total_outputs_deleted}\n"
-            message += f"Recommendations deleted: {total_recommendations_deleted}"
-            
-            if all_errors:
-                message += f"\n⚠️ {len(all_errors)} errors occurred"
-            
-            ui.notify(message, type='positive', multi_line=True, timeout=5000)
-            
-            # Clear preview
+            # Show progress
             self.cleanup_preview_container.clear()
             with self.cleanup_preview_container:
-                ui.label('Click "Preview Cleanup" to see what will be deleted.').classes('text-body2 text-grey')
+                progress_label = ui.label('Starting batch cleanup operation...').classes('text-body2')
+                progress_bar = ui.linear_progress(value=0).classes('w-full')
+                status_log = ui.column().classes('w-full p-2 bg-grey-2 rounded text-caption')
             
-            # Disable execute button
-            self.cleanup_execute_button.set_enabled(False)
+            logger.info(f"Starting batch cleanup execution: days_to_keep={days_to_keep}, experts={len(selected_expert_ids)}, "
+                       f"cleanup_type={cleanup_type}, statuses={selected_statuses}")
             
-            # Optionally refresh statistics
-            if selected_expert_ids:
-                self._refresh_batch_statistics()
+            async def run_batch_cleanup():
+                """Run batch cleanup in background and update UI."""
+                try:
+                    def log_status(msg):
+                        logger.info(f"[BATCH CLEANUP] {msg}")
+                        with status_log:
+                            ui.label(f"• {msg}").classes('text-caption')
+                    
+                    loop = asyncio.get_event_loop()
+                    scope_text = "all data" if cleanup_type == "all" else "outputs only"
+                    log_status(f"Starting batch cleanup (scope: {scope_text}, {len(selected_expert_ids)} experts)...")
+                    progress_bar.set_value(0.1)
+                    
+                    # Run cleanup in thread pool
+                    progress_label.set_text('Executing batch cleanup (this may take a few moments)...')
+                    log_status("Executing cleanup for each expert...")
+                    progress_bar.set_value(0.2)
+                    
+                    # Execute cleanup for each expert
+                    def execute_all_cleanups():
+                        total_analyses_deleted = 0
+                        total_analyses_protected = 0
+                        total_outputs_deleted = 0
+                        total_recommendations_deleted = 0
+                        all_errors = []
+                        
+                        for i, expert_id in enumerate(selected_expert_ids):
+                            cleanup_result = execute_cleanup(
+                                days_to_keep=days_to_keep,
+                                statuses=selected_statuses,
+                                expert_instance_id=expert_id,
+                                outputs_only=(cleanup_type == "outputs_only")
+                            )
+                            
+                            if cleanup_result['success']:
+                                total_analyses_deleted += cleanup_result['analyses_deleted']
+                                total_analyses_protected += cleanup_result['analyses_protected']
+                                total_outputs_deleted += cleanup_result['outputs_deleted']
+                                total_recommendations_deleted += cleanup_result['recommendations_deleted']
+                                
+                                if cleanup_result['errors']:
+                                    all_errors.extend(cleanup_result['errors'])
+                            else:
+                                all_errors.extend(cleanup_result['errors'])
+                        
+                        return {
+                            'total_analyses_deleted': total_analyses_deleted,
+                            'total_analyses_protected': total_analyses_protected,
+                            'total_outputs_deleted': total_outputs_deleted,
+                            'total_recommendations_deleted': total_recommendations_deleted,
+                            'all_errors': all_errors
+                        }
+                    
+                    cleanup_result = await loop.run_in_executor(None, execute_all_cleanups)
+                    
+                    progress_bar.set_value(0.8)
+                    
+                    # Log results based on cleanup type
+                    if cleanup_type == "all":
+                        log_status(f"Deleted {cleanup_result['total_analyses_deleted']} analyses")
+                    else:
+                        log_status(f"Kept {cleanup_result['total_analyses_deleted']} analyses (outputs deleted)")
+                    log_status(f"Protected {cleanup_result['total_analyses_protected']} analyses with open transactions")
+                    log_status(f"Deleted {cleanup_result['total_outputs_deleted']} analysis outputs")
+                    log_status(f"Deleted {cleanup_result['total_recommendations_deleted']} expert recommendations")
+                    
+                    if cleanup_result['all_errors']:
+                        log_status(f"⚠️ {len(cleanup_result['all_errors'])} errors occurred during cleanup")
+                        for i, error in enumerate(cleanup_result['all_errors'][:5], 1):
+                            log_status(f"  Error {i}: {error}")
+                        if len(cleanup_result['all_errors']) > 5:
+                            log_status(f"  ... and {len(cleanup_result['all_errors']) - 5} more errors")
+                    
+                    # Complete
+                    progress_bar.set_value(1.0)
+                    log_status("✓ Batch cleanup completed successfully")
+                    
+                    # Clear preview and disable button
+                    self.cleanup_preview_container.clear()
+                    with self.cleanup_preview_container:
+                        ui.label('Click "Preview Cleanup" to see what will be deleted.').classes('text-body2 text-grey')
+                    
+                    self.cleanup_execute_button.set_enabled(False)
+                    
+                    # Refresh statistics
+                    if selected_expert_ids:
+                        self._refresh_batch_statistics()
+                    
+                    logger.info(f"Batch cleanup completed: {cleanup_result['total_analyses_deleted']} analyses deleted, "
+                              f"{cleanup_result['total_analyses_protected']} protected")
                 
+                except Exception as e:
+                    logger.error(f'Error running batch cleanup: {e}', exc_info=True)
+                    self.cleanup_preview_container.clear()
+                    with self.cleanup_preview_container:
+                        ui.label(f'❌ Error: {str(e)}').classes('text-negative')
+                    self.cleanup_execute_button.set_enabled(False)
+            
+            # Schedule the async function to run
+            asyncio.ensure_future(run_batch_cleanup())
+        
         except Exception as e:
-            logger.error(f'Error executing batch cleanup: {e}')
-            ui.notify(f'❌ Batch cleanup failed: {str(e)}', type='negative')
+            logger.error(f'Error starting batch cleanup: {e}', exc_info=True)
+            self.cleanup_preview_container.clear()
+            with self.cleanup_preview_container:
+                ui.label(f'❌ Error: {str(e)}').classes('text-negative')
+            self.cleanup_execute_button.set_enabled(False)
 
 
 def content() -> None:

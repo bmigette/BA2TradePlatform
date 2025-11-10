@@ -7,13 +7,14 @@ analyses that have linked open transactions.
 
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
-from sqlmodel import Session, select, func
+from sqlmodel import Session, select, func, text
 from ba2_trade_platform.core.models import (
     MarketAnalysis, 
     AnalysisOutput, 
     ExpertRecommendation,
     TradingOrder,
-    Transaction
+    Transaction,
+    TradeActionResult
 )
 from ba2_trade_platform.core.types import MarketAnalysisStatus, TransactionStatus
 from ba2_trade_platform.core.db import get_db
@@ -130,7 +131,8 @@ def preview_cleanup(
 def execute_cleanup(
     days_to_keep: int = 30,
     statuses: Optional[List[MarketAnalysisStatus]] = None,
-    expert_instance_id: Optional[int] = None
+    expert_instance_id: Optional[int] = None,
+    outputs_only: bool = False
 ) -> Dict[str, Any]:
     """
     Execute cleanup of old MarketAnalysis records and associated data.
@@ -141,6 +143,7 @@ def execute_cleanup(
         days_to_keep: Number of days to keep. Analyses older than this will be deleted.
         statuses: List of MarketAnalysisStatus values to target. If None, all statuses.
         expert_instance_id: If provided, only cleanup for this expert instance.
+        outputs_only: If True, only delete outputs/recommendations (keep analyses). If False, delete all.
     
     Returns:
         Dictionary with cleanup results:
@@ -163,7 +166,25 @@ def execute_cleanup(
     
     try:
         with get_db() as session:
-            # Build base query for old analyses
+            # Step 1: Clean up orphaned trade_action_result records (with NULL expert_recommendation_id)
+            try:
+                orphaned_count = session.exec(
+                    select(TradeActionResult).where(
+                        TradeActionResult.expert_recommendation_id == None
+                    )
+                ).all()
+                
+                for orphaned in orphaned_count:
+                    session.delete(orphaned)
+                
+                if orphaned_count:
+                    logger.info(f"Cleanup: Deleted {len(orphaned_count)} orphaned trade_action_result records")
+                    session.commit()
+            except Exception as e:
+                logger.warning(f"Cleanup: Could not clean orphaned trade_action_result records: {e}")
+                session.rollback()
+            
+            # Step 2: Build base query for old analyses
             query = select(MarketAnalysis).where(MarketAnalysis.created_at < cutoff_date)
             
             # Add status filter if provided
@@ -195,30 +216,43 @@ def execute_cleanup(
                         session.delete(output)
                     outputs_deleted += outputs_count
                     
-                    # Delete expert recommendations
+                    # Delete expert recommendations (this will cascade delete trade_action_results via FK)
                     for recommendation in analysis.expert_recommendations:
                         session.delete(recommendation)
                     recommendations_deleted += recommendations_count
                     
-                    # Delete the analysis itself
-                    session.delete(analysis)
-                    analyses_deleted += 1
-                    
-                    logger.debug(f"Cleanup: Deleted analysis {analysis.id} ({analysis.symbol}, {analysis.status.value})")
+                    # Delete the analysis itself only if not outputs_only mode
+                    if not outputs_only:
+                        session.delete(analysis)
+                        analyses_deleted += 1
+                        logger.debug(f"Cleanup: Deleted analysis {analysis.id} ({analysis.symbol}, {analysis.status.value})")
+                    else:
+                        # In outputs_only mode, just mark as "cleaned" by counting it
+                        analyses_deleted += 1
+                        logger.debug(f"Cleanup: Deleted outputs for analysis {analysis.id} ({analysis.symbol}, {analysis.status.value})")
                     
                 except Exception as e:
                     error_msg = f"Error deleting analysis {analysis.id}: {str(e)}"
                     logger.error(error_msg)
                     errors.append(error_msg)
+                    session.rollback()
                     continue
             
             # Commit all deletions
             session.commit()
-            logger.info(f"Cleanup completed: {analyses_deleted} analyses deleted, {analyses_protected} protected")
+            cleanup_mode = "outputs only" if outputs_only else "all data"
+            logger.info(f"Cleanup completed ({cleanup_mode}): {analyses_deleted} analyses processed, {analyses_protected} protected")
+            
+            # Step 3: Run VACUUM to reclaim disk space
+            try:
+                session.exec(text("VACUUM"))
+                logger.info("Cleanup: Database VACUUM completed - disk space reclaimed")
+            except Exception as e:
+                logger.warning(f"Cleanup: VACUUM operation failed: {e}")
             
     except Exception as e:
         error_msg = f"Cleanup failed: {str(e)}"
-        logger.error(error_msg)
+        logger.error(error_msg, exc_info=True)
         errors.append(error_msg)
         return {
             'success': False,

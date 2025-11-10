@@ -344,6 +344,7 @@ class ActivityLogType(str, Enum):
     TRANSACTION_SL_CHANGED = "transaction_sl_changed"
     TRANSACTION_CLOSED = "transaction_closed"
     RISK_MANAGER_RAN = "risk_manager_ran"
+    ANALYSIS_STARTED = "analysis_started"
     ANALYSIS_COMPLETED = "analysis_completed"
     ANALYSIS_FAILED = "analysis_failed"
     ORDER_SUBMITTED = "order_submitted"

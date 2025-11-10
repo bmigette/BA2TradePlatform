@@ -959,7 +959,7 @@ class WorkerQueue:
             
             # Check if all analysis tasks are completed for this expert
             # If so, trigger automated order processing
-            logger.debug(f"[RISK_MGR_TRIGGER] Task '{task.id}' (expert {task.expert_instance_id}, {task.subtype.value}) completed. Checking for SmartRiskManager trigger...")
+            logger.debug(f"[RISK_MGR_TRIGGER] Task '{task.id}' (expert {task.expert_instance_id}, {task.subtype}) completed. Checking for SmartRiskManager trigger...")
             if task.subtype == AnalysisUseCase.ENTER_MARKET:
                 logger.debug(f"[RISK_MGR_TRIGGER] Calling _check_and_process_expert_recommendations for ENTER_MARKET")
                 self._check_and_process_expert_recommendations(task.expert_instance_id, AnalysisUseCase.ENTER_MARKET)

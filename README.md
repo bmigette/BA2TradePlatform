@@ -403,6 +403,278 @@ Cache (ChromaDB, price data) is stored in:
 ~/Documents/ba2_trade_platform/cache/
 ```
 
+## 🐳 Docker Installation (Recommended for Production)
+
+BA2 Trade Platform can be easily run in Docker with persistent data storage. The Docker setup uses separate volumes for database and cache, allowing you to persist only what you need.
+
+### Prerequisites
+- [Docker](https://docs.docker.com/get-docker/) 20.10+
+- [Docker Compose](https://docs.docker.com/compose/install/) 1.29+ (optional but recommended)
+
+### Quick Start with Docker Compose (Easiest)
+
+**1. Clone the repository**:
+```bash
+git clone https://github.com/bmigette/BA2TradePlatform.git
+cd BA2TradePlatform
+```
+
+**2. Start the platform**:
+```bash
+docker-compose up -d
+```
+
+This will:
+- Build the Docker image from Dockerfile
+- Create three named volumes (`ba2_db_volume`, `ba2_cache_volume`, `ba2_logs_volume`)
+- Start the container with web interface on port 8000
+- Automatically restart if the container stops
+
+**3. Access the web interface**:
+```
+http://localhost:8000
+```
+
+**4. View logs**:
+```bash
+docker-compose logs -f
+```
+
+**5. Stop the platform**:
+```bash
+docker-compose down
+```
+
+### Docker Compose Volume Management
+
+The `docker-compose.yml` file defines three independent volumes:
+
+| Volume | Purpose | Path in Container |
+|--------|---------|-------------------|
+| `ba2_db_volume` | Database persistence | `/opt/ba2_trade_platform/db` |
+| `ba2_cache_volume` | Cache persistence | `/opt/ba2_trade_platform/cache` |
+| `ba2_logs_volume` | Logs persistence | `/opt/ba2_trade_platform/logs` |
+
+**Persist Only Database** (best for development):
+```yaml
+volumes:
+  - ba2_db_volume:/opt/ba2_trade_platform/db
+  # Don't mount cache or logs - they'll be ephemeral
+```
+
+**Persist Only Cache** (for stateless deployments):
+```yaml
+volumes:
+  - ba2_cache_volume:/opt/ba2_trade_platform/cache
+```
+
+**Persist Everything** (default in docker-compose.yml):
+```yaml
+volumes:
+  - ba2_db_volume:/opt/ba2_trade_platform/db
+  - ba2_cache_volume:/opt/ba2_trade_platform/cache
+  - ba2_logs_volume:/opt/ba2_trade_platform/logs
+```
+
+### Using Docker Without Compose
+
+**1. Build the image**:
+```bash
+docker build -t ba2-trade-platform:latest .
+```
+
+**2. Create volumes** (optional but recommended):
+```bash
+docker volume create ba2_db_volume
+docker volume create ba2_cache_volume
+docker volume create ba2_logs_volume
+```
+
+**3. Run the container**:
+```bash
+docker run -d \
+  --name ba2-trade-platform \
+  -p 8000:8000 \
+  -v ba2_db_volume:/opt/ba2_trade_platform/db \
+  -v ba2_cache_volume:/opt/ba2_trade_platform/cache \
+  -v ba2_logs_volume:/opt/ba2_trade_platform/logs \
+  ba2-trade-platform:latest
+```
+
+**4. Access the web interface**:
+```
+http://localhost:8000
+```
+
+### Docker Run Examples
+
+**Development Setup** (persist only database):
+```bash
+docker run -d \
+  --name ba2-dev \
+  -p 8001:8000 \
+  -v ba2_dev_db:/opt/ba2_trade_platform/db \
+  ba2-trade-platform:latest
+```
+
+**Production Setup** (persist everything, custom port):
+```bash
+docker run -d \
+  --name ba2-prod \
+  -p 80:8000 \
+  --restart unless-stopped \
+  -v ba2_prod_db:/opt/ba2_trade_platform/db \
+  -v ba2_prod_cache:/opt/ba2_trade_platform/cache \
+  -v ba2_prod_logs:/opt/ba2_trade_platform/logs \
+  ba2-trade-platform:latest
+```
+
+**Custom Database Location** (use host folder instead of volume):
+```bash
+mkdir -p /data/ba2-trade/db /data/ba2-trade/cache
+chmod 755 /data/ba2-trade/*
+
+docker run -d \
+  --name ba2-custom \
+  -p 8000:8000 \
+  -v /data/ba2-trade/db:/opt/ba2_trade_platform/db \
+  -v /data/ba2-trade/cache:/opt/ba2_trade_platform/cache \
+  ba2-trade-platform:latest
+```
+
+### Docker Volume Inspection
+
+**List volumes**:
+```bash
+docker volume ls | grep ba2
+```
+
+**Inspect a volume**:
+```bash
+docker volume inspect ba2_db_volume
+```
+
+**View volume data** (Linux/macOS):
+```bash
+# Find where Docker stores volumes (Docker Desktop on macOS stores at ~/Library/Docker/volumes)
+ls -la /var/lib/docker/volumes/ba2_db_volume/_data/
+```
+
+### Backing Up Data
+
+**Backup database**:
+```bash
+docker cp ba2-trade-platform:/opt/ba2_trade_platform/db/db.sqlite ~/backup/db.sqlite
+```
+
+**Backup everything**:
+```bash
+docker run --rm \
+  -v ba2_db_volume:/data/db \
+  -v ba2_cache_volume:/data/cache \
+  -v ba2_logs_volume:/data/logs \
+  -v ~/backup:/backup \
+  ubuntu tar czf /backup/ba2-backup-$(date +%Y%m%d).tar.gz /data
+```
+
+### Cleaning Up
+
+**Stop and remove container**:
+```bash
+docker-compose down
+# or
+docker stop ba2-trade-platform
+docker rm ba2-trade-platform
+```
+
+**Remove volumes** (CAUTION - deletes data):
+```bash
+docker-compose down -v
+# or
+docker volume rm ba2_db_volume ba2_cache_volume ba2_logs_volume
+```
+
+**Remove image**:
+```bash
+docker rmi ba2-trade-platform:latest
+```
+
+### Docker Environment Details
+
+The Dockerfile:
+- **Base Image**: `python:3.11-slim` (minimal footprint)
+- **Multi-stage Build**: Reduces final image size
+- **Non-root User**: Runs as `trader` user for security
+- **Working Directory**: `/app`
+- **Exposed Port**: `8000` (web interface)
+- **Entry Point**: Automatically starts with proper volume paths
+
+**Default Paths in Container**:
+- Database: `/opt/ba2_trade_platform/db/db.sqlite`
+- Cache: `/opt/ba2_trade_platform/cache`
+- Logs: `/opt/ba2_trade_platform/logs`
+
+### Troubleshooting Docker
+
+**Port Already in Use**:
+```bash
+# Change port in docker-compose.yml or use different port
+docker run -p 9000:8000 ba2-trade-platform:latest
+
+# Check what's using port 8000
+lsof -i :8000  # Linux/macOS
+netstat -ano | findstr :8000  # Windows
+```
+
+**Container Won't Start**:
+```bash
+# View detailed logs
+docker logs ba2-trade-platform
+
+# Or with compose
+docker-compose logs -f ba2-trade-platform
+
+# Check container status
+docker ps -a | grep ba2
+```
+
+**Data Persistence Issues**:
+```bash
+# Verify volumes exist
+docker volume ls | grep ba2
+
+# Check volume data
+docker volume inspect ba2_db_volume
+
+# View volume contents
+docker run --rm -v ba2_db_volume:/data ubuntu ls -la /data
+```
+
+**Permission Denied Errors**:
+- Docker container runs as non-root user `trader` (UID 1000)
+- If using host directories, ensure they have proper permissions:
+```bash
+mkdir -p /data/ba2-trade/{db,cache}
+chmod 755 /data/ba2-trade
+chown -R 1000:1000 /data/ba2-trade
+```
+
+**Out of Disk Space**:
+```bash
+# Clean up unused volumes and images
+docker system prune -a --volumes
+
+# View disk usage
+docker system df
+```
+
+**Database Corruption**:
+- Delete the database volume and start fresh:
+```bash
+docker-compose down -v  # Removes all volumes
+docker-compose up -d    # Creates new volumes with fresh database
+```
+
 ### Troubleshooting Installation
 
 **Virtual Environment Issues**:
@@ -422,7 +694,10 @@ uv pip install -r requirements.txt
 **Port Already in Use**:
 - NiceGUI runs on port 8080 by default
 - Check for other applications using this port
-- Stop conflicting services or modify the port in `main.py`
+- Stop conflicting services or use `--port` argument:
+```bash
+python main.py --port 9090
+```
 
 **Permission Errors**:
 - Ensure you have write permissions in `~/Documents/`

@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  ba2-trade-platform:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ba2-trade-platform
+    ports:
+      - "8000:8000"
+    volumes:
+      # Database persistence (separate folder)
+      - ba2_db_volume:/opt/ba2_trade_platform/db
+      # Cache persistence (separate folder)
+      - ba2_cache_volume:/opt/ba2_trade_platform/cache
+      # Logs persistence
+      - ba2_logs_volume:/opt/ba2_trade_platform/logs
+    restart: unless-stopped
+    networks:
+      - ba2_network
+
+volumes:
+  # Database volume - independent persistence
+  ba2_db_volume:
+    driver: local
+  # Cache volume - independent persistence
+  ba2_cache_volume:
+    driver: local
+  # Logs volume
+  ba2_logs_volume:
+    driver: local
+
+networks:
+  ba2_network:
+    driver: bridge
