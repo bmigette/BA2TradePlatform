@@ -10,7 +10,7 @@ import asyncio
 import threading
 from typing import List, Optional, Dict, Any
 from sqlmodel import select
-from ..core.models import Instrument, Label
+from ..core.models import Instrument
 from ..core.db import get_db, add_instance, get_instance
 from ..logger import logger
 import yfinance as yf
@@ -87,8 +87,12 @@ class InstrumentAutoAdder:
                 
                 if existing:
                     logger.debug(f"Instrument {symbol} already exists in database")
-                    # Add expert label if not present
-                    await self._ensure_expert_label(existing, expert_shortname)
+                    # Add labels to existing instrument if not already present
+                    if expert_shortname and expert_shortname not in existing.labels:
+                        existing.labels.append(expert_shortname)
+                        session.add(existing)
+                        session.commit()
+                        logger.debug(f"Added expert label '{expert_shortname}' to existing instrument {symbol}")
                     return
             
             # Instrument doesn't exist - create it
@@ -105,12 +109,21 @@ class InstrumentAutoAdder:
                     'description': f'Auto-added instrument from {source}'
                 }
             
-            # Create instrument
+            # Create instrument with labels
+            labels = ['auto_added']
+            if expert_shortname:
+                labels.append(expert_shortname)
+            if source == 'ai_dynamic':
+                labels.append('ai_selected')
+            elif source == 'expert':
+                labels.append('expert_selected')
+            
             instrument = Instrument(
                 name=symbol,
                 category=instrument_data.get('category', 'Unknown'),
                 enabled=True,
                 description=instrument_data.get('description', f'Auto-added from {source}'),
+                labels=labels,
                 created_at=datetime.now(timezone.utc)
             )
             
@@ -118,9 +131,6 @@ class InstrumentAutoAdder:
             instrument_id = add_instance(instrument)
             if instrument_id:
                 logger.info(f"Successfully added instrument {symbol} with ID {instrument_id}")
-                
-                # Add labels
-                await self._add_instrument_labels(instrument, expert_shortname, source)
             else:
                 logger.error(f"Failed to add instrument {symbol} to database")
                 
@@ -194,62 +204,6 @@ class InstrumentAutoAdder:
             return 'Cryptocurrency'
         else:
             return 'Equity'  # Default for stocks
-    
-    async def _add_instrument_labels(self, instrument: Instrument, expert_shortname: str, source: str):
-        """Add appropriate labels to the instrument."""
-        try:
-            labels_to_add = []
-            
-            # Add auto_added label
-            labels_to_add.append('auto_added')
-            
-            # Add expert shortname label
-            if expert_shortname:
-                labels_to_add.append(expert_shortname)
-            
-            # Add source label
-            if source == 'ai':
-                labels_to_add.append('ai_selected')
-            elif source == 'expert':
-                labels_to_add.append('expert_selected')
-            
-            # Create/get labels and associate with instrument
-            for label_name in labels_to_add:
-                await self._create_or_get_label(label_name, instrument.id)
-                
-        except Exception as e:
-            logger.error(f"Error adding labels to instrument {instrument.name}: {e}", exc_info=True)
-    
-    async def _ensure_expert_label(self, instrument: Instrument, expert_shortname: str):
-        """Ensure expert label is added to existing instrument."""
-        try:
-            if expert_shortname:
-                await self._create_or_get_label(expert_shortname, instrument.id)
-        except Exception as e:
-            logger.error(f"Error ensuring expert label for instrument {instrument.name}: {e}", exc_info=True)
-    
-    async def _create_or_get_label(self, label_name: str, instrument_id: int):
-        """Create or get a label and associate it with the instrument."""
-        try:
-            with get_db() as session:
-                # Check if label exists
-                stmt = select(Label).where(Label.name == label_name)
-                label = session.exec(stmt).first()
-                
-                if not label:
-                    # Create new label
-                    label = Label(
-                        name=label_name,
-                        created_at=datetime.now(timezone.utc)
-                    )
-                    label_id = add_instance(label)
-                    logger.debug(f"Created new label '{label_name}' with ID {label_id}")
-                
-                # TODO: Associate label with instrument if needed
-                # This depends on how the Label-Instrument relationship is implemented
-                
-        except Exception as e:
-            logger.error(f"Error creating/getting label '{label_name}': {e}", exc_info=True)
     
     def queue_instruments_for_addition(self, symbols: List[str], expert_shortname: str, source: str = 'expert'):
         """

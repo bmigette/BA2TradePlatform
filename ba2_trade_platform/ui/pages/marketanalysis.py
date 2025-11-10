@@ -193,7 +193,7 @@ class JobMonitoringTab:
     async def _async_load_analysis_table(self):
         """Load analysis table data asynchronously and update the UI."""
         try:
-            logger.debug("[JobMonitoringTab] Starting async analysis table load")
+            #logger.debug("[JobMonitoringTab] Starting async analysis table load")
             
             # Fetch data in background (non-blocking)
             analysis_data, total_records = await asyncio.to_thread(self._get_analysis_data)
@@ -1087,7 +1087,7 @@ class JobMonitoringTab:
     async def _async_refresh_analysis_table(self):
         """Asynchronously refresh analysis table data without blocking UI."""
         try:
-            logger.debug("[JobMonitoringTab] Starting async analysis table refresh")
+            #logger.debug("[JobMonitoringTab] Starting async analysis table refresh")
             
             # Fetch data in background
             analysis_data, total_records = await asyncio.to_thread(self._get_analysis_data)
