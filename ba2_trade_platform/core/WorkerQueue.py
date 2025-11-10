@@ -1275,6 +1275,8 @@ class WorkerQueue:
                         
                         # Get expert instance with loaded settings (MarketExpertInterface)
                         from .utils import get_expert_instance_from_id
+                        from .db import get_instance
+                        from .models import ExpertInstance
                         
                         expert = get_expert_instance_from_id(expert_instance_id)
                         if not expert:
@@ -1283,6 +1285,14 @@ class WorkerQueue:
                             return
                         
                         logger.debug(f"[RISK_MGR_TRIGGER] Got expert instance: {type(expert).__name__}")
+                        
+                        # Get the ExpertInstance database record (already cached by get_expert_instance_from_id)
+                        expert_instance_record = get_instance(ExpertInstance, expert_instance_id)
+                        if not expert_instance_record:
+                            error_msg = f"ExpertInstance {expert_instance_id} not found in database"
+                            logger.error(f"[RISK_MGR_TRIGGER] {error_msg}")
+                            logger.debug(f"[RISK_MGR_TRIGGER] ===== END (expert instance record not found) =====")
+                            return
                         
                         # Check risk_manager_mode setting with validation and error logging
                         from .utils import get_risk_manager_mode
@@ -1311,10 +1321,11 @@ class WorkerQueue:
                             logger.debug(f"[RISK_MGR_TRIGGER] ===== END (risk_manager_mode not configured) =====")
                             return
                         
-                        # Check for classic mode without rules configured
                         if risk_manager_mode == "classic":
                             logger.debug(f"[RISK_MGR_TRIGGER] Using CLASSIC risk manager mode")
-                            enter_market_ruleset_id = expert.enter_market_ruleset_id
+                            
+                            # Get ruleset ID from ExpertInstance database record
+                            enter_market_ruleset_id = expert_instance_record.enter_market_ruleset_id
                             # Check if ruleset ID is actually set (not None, not empty string)
                             if not enter_market_ruleset_id or (isinstance(enter_market_ruleset_id, str) and not enter_market_ruleset_id.strip()):
                                 error_msg = f"Classic risk manager mode enabled but no enter_market_ruleset_id configured for expert {expert_instance_id}"
