@@ -160,11 +160,6 @@ class JobMonitoringTab:
         analysis_data, self.total_records = self._get_analysis_data()
         self.total_pages = max(1, math.ceil(self.total_records / self.page_size))
         
-        # Debug check for analysis_data structure
-        logger.debug(f"[DEBUG] analysis_data type: {type(analysis_data)}, length: {len(analysis_data) if hasattr(analysis_data, '__len__') else 'N/A'}")
-        if analysis_data and isinstance(analysis_data, list):
-            logger.debug(f"[DEBUG] First row type: {type(analysis_data[0])}, keys: {analysis_data[0].keys() if isinstance(analysis_data[0], dict) else 'NOT A DICT'}")
-        
         with ui.card().classes('w-full'):
             with ui.row().classes('w-full justify-between items-center mb-2'):
                 ui.label('Analysis Jobs').classes('text-md font-bold')
@@ -238,11 +233,6 @@ class JobMonitoringTab:
         ]
         
         smart_risk_data = self._get_smart_risk_manager_data()
-        
-        # Debug check for smart_risk_data structure
-        logger.debug(f"[DEBUG] smart_risk_data type: {type(smart_risk_data)}, length: {len(smart_risk_data) if hasattr(smart_risk_data, '__len__') else 'N/A'}")
-        if smart_risk_data and isinstance(smart_risk_data, list):
-            logger.debug(f"[DEBUG] First smart_risk row type: {type(smart_risk_data[0])}, keys: {smart_risk_data[0].keys() if isinstance(smart_risk_data[0], dict) else 'NOT A DICT'}")
         
         with ui.card().classes('w-full'):
             with ui.row().classes('w-full justify-between items-center mb-2'):
@@ -1936,11 +1926,6 @@ class ScheduledJobsTab:
         ]
         
         scheduled_data, _ = self._get_scheduled_jobs_data()
-        
-        # Debug check for scheduled_data structure
-        logger.debug(f"[DEBUG] scheduled_data type: {type(scheduled_data)}, length: {len(scheduled_data) if hasattr(scheduled_data, '__len__') else 'N/A'}")
-        if scheduled_data and isinstance(scheduled_data, list):
-            logger.debug(f"[DEBUG] First scheduled row type: {type(scheduled_data[0])}, keys: {scheduled_data[0].keys() if isinstance(scheduled_data[0], dict) else 'NOT A DICT'}")
         
         with ui.card().classes('w-full'):
             # Header with bulk action button

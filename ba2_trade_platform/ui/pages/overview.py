@@ -1962,7 +1962,8 @@ class AccountOverviewTab:
                     'created_at': created_at_str,
                     'expert': expert_name,
                     'waited_status': order.depends_order_status_trigger if order.status == OrderStatus.WAITING_TRIGGER else '',
-                    'can_submit': order.status == OrderStatus.PENDING and not order.broker_order_id
+                    'can_submit': order.status == OrderStatus.PENDING and not order.broker_order_id,
+                    'actions': 'actions'
                 }
                 rows.append(row)
             

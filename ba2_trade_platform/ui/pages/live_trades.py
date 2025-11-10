@@ -570,6 +570,7 @@ class LiveTradesTab:
                     'has_missing_tpsl_orders': has_missing_tpsl_orders,  # Track if TP/SL defined but no valid orders
                     'orders': orders_data,  # Add orders for expansion
                     'order_count': len(orders_data),  # Show order count
+                    'actions': 'actions'
                 }
                 rows.append(row)
 

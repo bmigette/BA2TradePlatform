@@ -76,6 +76,7 @@ class InstrumentSettingsTab:
             inst = dict(instrument)
             inst['categories'] = ", ".join(instrument.categories) if instrument.categories else ""
             inst['labels'] = ", ".join(instrument.labels) if instrument.labels else ""
+            inst['actions'] = 'actions'
             r.append(inst)
         logger.debug(f'Fetched {len(r)} instruments')
         return r
@@ -1009,7 +1010,7 @@ class AccountDefinitionsTab:
                     {'name': 'description', 'label': 'Description', 'field': 'description'},
                     {'name': 'actions', 'label': 'Actions', 'field': 'actions'}
                 ],
-                rows=[dict(a) for a in accounts],
+                rows=[{**dict(a), 'actions': 'actions'} for a in accounts],
                 row_key='id'
             ).classes('w-full')
             self.accounts_table.add_slot(f'body-cell-actions', """
@@ -1142,6 +1143,9 @@ class ExpertSettingsTab:
                     row['open_positions_ruleset_name'] = f"{ruleset_name} (Smart)" if is_smart_mode else ruleset_name
                 else:
                     row['open_positions_ruleset_name'] = 'Smart' if is_smart_mode else '(None)'
+                
+                # Add actions field for NiceGUI 3.2 compatibility
+                row['actions'] = 'actions'
                 
                 rows.append(row)
             logger.debug(f'Fetched {len(rows)} expert instances')
@@ -4009,7 +4013,8 @@ class TradeSettingsTab:
                     'subtype': rule.subtype.value if rule.subtype else 'Not set',
                     'continue_processing': rule.continue_processing,
                     'triggers_count': len(rule.triggers) if rule.triggers else 0,
-                    'actions_count': len(rule.actions) if rule.actions else 0
+                    'actions_count': len(rule.actions) if rule.actions else 0,
+                    'actions': 'actions'
                 }
                 rows.append(row)
             logger.debug(f'Fetched {len(rows)} rules')
@@ -4039,7 +4044,8 @@ class TradeSettingsTab:
                     'name': ruleset.name,
                     'description': ruleset.description[:47] + '...' if ruleset.description and len(ruleset.description) > 50 else ruleset.description,
                     'subtype': ruleset.subtype.value if ruleset.subtype else 'Not set',
-                    'rules_count': len(ruleset.event_actions) if ruleset.event_actions else 0
+                    'rules_count': len(ruleset.event_actions) if ruleset.event_actions else 0,
+                    'actions': 'actions'
                 }
                 rows.append(row)
             
