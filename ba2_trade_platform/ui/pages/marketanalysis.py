@@ -149,12 +149,14 @@ class JobMonitoringTab:
                 
                 with ui.row().classes('gap-2'):
                     ui.button('Clear Filters', on_click=self._clear_filters, icon='clear')
-                    ui.button('Refresh', on_click=self.refresh_data, icon='refresh')
+                    ui.button('Refresh', on_click=self._start_async_refresh, icon='refresh')
                     with ui.switch('Auto-refresh', value=True) as auto_refresh:
                         auto_refresh.on_value_change(self.toggle_auto_refresh)
             
-            # Analysis jobs table
-            self._create_analysis_table()
+            # Analysis jobs table container (will be populated async)
+            self.analysis_table_container = ui.column().classes('w-full')
+            self._create_analysis_table_placeholder()
+            
             # Pagination controls container
             self.pagination_container = ui.row().classes('w-full')
             with self.pagination_container:
@@ -172,10 +174,57 @@ class JobMonitoringTab:
             # Smart Risk Manager jobs table
             self._create_smart_risk_manager_table()
         
+        # Start loading data asynchronously - don't block on this
+        asyncio.create_task(self._async_load_analysis_table())
+        
         # Start auto-refresh
         self.start_auto_refresh()
 
-    def _create_analysis_table(self):
+    def _create_analysis_table_placeholder(self):
+        """Create a placeholder with loading indicator for the analysis table."""
+        self.analysis_table_container.clear()
+        with self.analysis_table_container:
+            with ui.card().classes('w-full'):
+                with ui.row().classes('w-full justify-between items-center mb-2'):
+                    ui.label('Analysis Jobs').classes('text-md font-bold')
+                    ui.spinner('dots').classes('ml-auto')
+                ui.label('Loading analysis jobs...').classes('text-sm text-gray-500')
+    
+    async def _async_load_analysis_table(self):
+        """Load analysis table data asynchronously and update the UI."""
+        try:
+            logger.debug("[JobMonitoringTab] Starting async analysis table load")
+            
+            # Fetch data in background (non-blocking)
+            analysis_data, total_records = await asyncio.to_thread(self._get_analysis_data)
+            self.total_records = total_records
+            self.total_pages = max(1, math.ceil(self.total_records / self.page_size))
+            
+            logger.debug(f"[JobMonitoringTab] Fetched {len(analysis_data)} analysis records")
+            
+            # Update the container with actual table
+            self.analysis_table_container.clear()
+            with self.analysis_table_container:
+                self._create_analysis_table(analysis_data, self.total_records)
+            
+            # Update pagination controls
+            self._create_pagination_controls()
+            
+            logger.debug("[JobMonitoringTab] Analysis table loaded successfully")
+        except Exception as e:
+            logger.error(f"[JobMonitoringTab] Error loading analysis table: {e}", exc_info=True)
+            self.analysis_table_container.clear()
+            with self.analysis_table_container:
+                with ui.card().classes('w-full'):
+                    ui.label('Error Loading Analysis Jobs').classes('text-md font-bold text-red-600')
+                    ui.label(f'Failed to load data: {str(e)}').classes('text-sm text-gray-600')
+                    ui.button('Retry', on_click=lambda: asyncio.create_task(self._async_load_analysis_table()))
+    
+    def _start_async_refresh(self):
+        """Start async refresh of analysis table."""
+        asyncio.create_task(self._async_load_analysis_table())
+
+    def _create_analysis_table(self, analysis_data=None, total_records=None):
         """Create the analysis jobs table."""
         columns = [
             {'name': 'id', 'label': 'ID', 'field': 'id', 'sortable': True, 'style': 'width: 80px'},
@@ -190,7 +239,12 @@ class JobMonitoringTab:
             {'name': 'actions', 'label': 'Actions', 'field': 'actions', 'sortable': False, 'style': 'width: 100px'}
         ]
         
-        analysis_data, self.total_records = self._get_analysis_data()
+        # Use provided data or fetch it (for backward compatibility)
+        if analysis_data is None:
+            analysis_data, self.total_records = self._get_analysis_data()
+        elif total_records is not None:
+            self.total_records = total_records
+        
         self.total_pages = max(1, math.ceil(self.total_records / self.page_size))
         
         with ui.card().classes('w-full'):
@@ -1015,21 +1069,9 @@ class JobMonitoringTab:
     def refresh_data(self):
         """Refresh the data in all tables."""
         try:
-            # Update analysis table with pagination
+            # Update analysis table asynchronously
             if self.analysis_table:
-                analysis_data, self.total_records = self._get_analysis_data()
-                self.total_pages = max(1, math.ceil(self.total_records / self.page_size))
-                
-                # Ensure current page is valid
-                if self.current_page > self.total_pages:
-                    self.current_page = max(1, self.total_pages)
-                
-                self.analysis_table.rows = analysis_data
-                # Note: In NiceGUI 3.0+, .update() is automatic when modifying table.rows
-                # self.analysis_table.update()  # Not needed in 3.0+
-                
-                # Re-create pagination controls to update button states
-                self._create_pagination_controls()
+                asyncio.create_task(self._async_refresh_analysis_table())
             
             # Update Smart Risk Manager table
             if hasattr(self, 'smart_risk_table') and self.smart_risk_table:
@@ -1039,10 +1081,33 @@ class JobMonitoringTab:
             # Update worker queue status display
             self._update_queue_status_display()
             
-            #logger.debug("Job monitoring data refreshed")
-            
         except Exception as e:
             logger.error(f"Error refreshing job monitoring data: {e}", exc_info=True)
+    
+    async def _async_refresh_analysis_table(self):
+        """Asynchronously refresh analysis table data without blocking UI."""
+        try:
+            logger.debug("[JobMonitoringTab] Starting async analysis table refresh")
+            
+            # Fetch data in background
+            analysis_data, total_records = await asyncio.to_thread(self._get_analysis_data)
+            self.total_records = total_records
+            self.total_pages = max(1, math.ceil(self.total_records / self.page_size))
+            
+            # Ensure current page is valid
+            if self.current_page > self.total_pages:
+                self.current_page = max(1, self.total_pages)
+            
+            # Update table if it exists
+            if self.analysis_table:
+                self.analysis_table.rows = analysis_data
+            
+            # Re-create pagination controls to update button states
+            self._create_pagination_controls()
+            
+            logger.debug(f"[JobMonitoringTab] Analysis table refreshed with {len(analysis_data)} records")
+        except Exception as e:
+            logger.error(f"Error in async analysis table refresh: {e}", exc_info=True)
 
     def toggle_auto_refresh(self, enabled: bool):
         """Toggle auto-refresh on/off."""
