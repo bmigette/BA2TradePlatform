@@ -160,6 +160,11 @@ class JobMonitoringTab:
         analysis_data, self.total_records = self._get_analysis_data()
         self.total_pages = max(1, math.ceil(self.total_records / self.page_size))
         
+        # Debug check for analysis_data structure
+        logger.debug(f"[DEBUG] analysis_data type: {type(analysis_data)}, length: {len(analysis_data) if hasattr(analysis_data, '__len__') else 'N/A'}")
+        if analysis_data and isinstance(analysis_data, list):
+            logger.debug(f"[DEBUG] First row type: {type(analysis_data[0])}, keys: {analysis_data[0].keys() if isinstance(analysis_data[0], dict) else 'NOT A DICT'}")
+        
         with ui.card().classes('w-full'):
             with ui.row().classes('w-full justify-between items-center mb-2'):
                 ui.label('Analysis Jobs').classes('text-md font-bold')
@@ -233,6 +238,11 @@ class JobMonitoringTab:
         ]
         
         smart_risk_data = self._get_smart_risk_manager_data()
+        
+        # Debug check for smart_risk_data structure
+        logger.debug(f"[DEBUG] smart_risk_data type: {type(smart_risk_data)}, length: {len(smart_risk_data) if hasattr(smart_risk_data, '__len__') else 'N/A'}")
+        if smart_risk_data and isinstance(smart_risk_data, list):
+            logger.debug(f"[DEBUG] First smart_risk row type: {type(smart_risk_data[0])}, keys: {smart_risk_data[0].keys() if isinstance(smart_risk_data[0], dict) else 'NOT A DICT'}")
         
         with ui.card().classes('w-full'):
             with ui.row().classes('w-full justify-between items-center mb-2'):
@@ -328,7 +338,8 @@ class JobMonitoringTab:
                         'run_date_local': run_date_local,
                         'duration_display': duration_display,
                         'iteration_count': job.iteration_count or 0,
-                        'actions_taken_count': job.actions_taken_count or 0
+                        'actions_taken_count': job.actions_taken_count or 0,
+                        'detail': 'detail'  # Placeholder for detail slot (NiceGUI 3.2 requires all columns to have values)
                     })
                 
                 return rows
@@ -585,7 +596,8 @@ class JobMonitoringTab:
                         'created_at_local': created_local,
                         'subtype': subtype_display,
                         'can_cancel': can_cancel,
-                        'expert_instance_id': analysis.expert_instance_id
+                        'expert_instance_id': analysis.expert_instance_id,
+                        'actions': 'actions'  # Placeholder for actions slot (NiceGUI 3.2 requires all columns to have values)
                     })
                 
                 return analysis_data, total_count
@@ -1923,7 +1935,12 @@ class ScheduledJobsTab:
             {'name': 'actions', 'label': 'Actions', 'field': 'actions', 'sortable': False}
         ]
         
-        scheduled_data = self._get_scheduled_jobs_data()
+        scheduled_data, _ = self._get_scheduled_jobs_data()
+        
+        # Debug check for scheduled_data structure
+        logger.debug(f"[DEBUG] scheduled_data type: {type(scheduled_data)}, length: {len(scheduled_data) if hasattr(scheduled_data, '__len__') else 'N/A'}")
+        if scheduled_data and isinstance(scheduled_data, list):
+            logger.debug(f"[DEBUG] First scheduled row type: {type(scheduled_data[0])}, keys: {scheduled_data[0].keys() if isinstance(scheduled_data[0], dict) else 'NOT A DICT'}")
         
         with ui.card().classes('w-full'):
             # Header with bulk action button
@@ -2059,6 +2076,7 @@ class ScheduledJobsTab:
                                 'subtype': subtype.value,
                                 'weekdays': ', '.join(enabled_weekdays) if enabled_weekdays else 'None',
                                 'times': ', '.join(times) if times else 'Not specified',
+                                'actions': 'actions',
                                 'expert_disabled': False
                             }
                         else:
@@ -2075,6 +2093,7 @@ class ScheduledJobsTab:
                                     'subtype': subtype.value,
                                     'weekdays': ', '.join(enabled_weekdays) if enabled_weekdays else 'None',
                                     'times': ', '.join(times) if times else 'Not specified',
+                                    'actions': 'actions',
                                     'expert_disabled': False
                                 }
                 
@@ -2544,7 +2563,8 @@ class OrderRecommendationsTab:
                         'hold_count': result.hold_count or 0,
                         'avg_confidence': f"{result.avg_confidence:.1f}%" if result.avg_confidence else 'N/A',
                         'orders_created': orders_count,
-                        'latest': result.latest_created_at.strftime('%Y-%m-%d %H:%M') if result.latest_created_at else 'N/A'
+                        'latest': result.latest_created_at.strftime('%Y-%m-%d %H:%M') if result.latest_created_at else 'N/A',
+                        'actions': 'actions'
                     })
                 
                 return summary_data
@@ -2760,7 +2780,8 @@ class OrderRecommendationsTab:
                         'can_place_order': can_place_order,
                         'has_pending_order': has_pending_order,
                         'existing_orders_count': len(existing_orders),
-                        'has_evaluation_data': has_evaluation_data  # NEW: Flag for showing magnifying glass icon
+                        'has_evaluation_data': has_evaluation_data,  # NEW: Flag for showing magnifying glass icon
+                        'actions': 'actions'
                     })
                 
                 return recommendations
