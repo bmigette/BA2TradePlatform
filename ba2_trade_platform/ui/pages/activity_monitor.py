@@ -229,7 +229,7 @@ class ActivityMonitorPage:
                         value=str(self.refresh_interval),
                         on_change=lambda e: self.update_refresh_interval(e.value)
                     ).classes("w-20")
-                    ui.button("Refresh Now", on_click=self.refresh_activities, icon="refresh").props("outline")
+                    ui.button("Refresh Now", on_click=lambda: asyncio.create_task(self.refresh_activities()), icon="refresh").props("outline")
         
         # Filters
         with ui.expansion("🔍 Filters", icon="filter_list").classes("w-full"):
@@ -281,44 +281,75 @@ class ActivityMonitorPage:
             
             # Filter action buttons
             with ui.row().classes("p-4 gap-2"):
-                ui.button("Apply Filters", on_click=self.apply_filters, icon="check").props("color=primary")
-                ui.button("Clear Filters", on_click=self.clear_filters, icon="clear").props("outline")
+                ui.button("Apply Filters", on_click=lambda: asyncio.create_task(self.apply_filters()), icon="check").props("color=primary")
+                ui.button("Clear Filters", on_click=lambda: asyncio.create_task(self.clear_filters()), icon="clear").props("outline")
         
-        # Activities table
-        with ui.card().classes("w-full"):
-            self.activities_table = ui.table(
-                columns=[
-                    {"name": "timestamp", "label": "Timestamp", "field": "timestamp", "align": "left", "sortable": True},
-                    {"name": "severity", "label": "Severity", "field": "severity", "align": "center", "sortable": True},
-                    {"name": "type", "label": "Type", "field": "type", "align": "left", "sortable": True},
-                    {"name": "expert", "label": "Expert", "field": "expert", "align": "left", "sortable": True},
-                    {"name": "account", "label": "Account", "field": "account", "align": "left", "sortable": True},
-                    {"name": "description", "label": "Description", "field": "description", "align": "left"},
-                ],
-                rows=[],
-                row_key="id",
-                pagination={"rowsPerPage": 50, "sortBy": "timestamp", "descending": True}
-            ).classes("w-full")
-            
-            # Add custom styling for severity column
-            self.activities_table.add_slot('body-cell-severity', '''
-                <q-td :props="props">
-                    <q-badge 
-                        :color="props.value === 'success' ? 'green' : 
-                                props.value === 'failure' ? 'red' : 
-                                props.value === 'warning' ? 'orange' :
-                                props.value === 'info' ? 'blue' : 'grey'"
-                        :label="props.value"
-                    />
-                </q-td>
-            ''')
+        # Activities table container
+        self.table_container = ui.column().classes("w-full")
+        with self.table_container:
+            with ui.card().classes("w-full"):
+                with ui.row().classes("w-full items-center gap-2 mb-2"):
+                    ui.label("Activity Log").classes("text-lg font-bold")
+                    ui.spinner('dots').classes('ml-auto')
+                ui.label("Loading activities...").classes("text-sm text-gray-500")
         
         # Initial load and start auto-refresh
-        asyncio.create_task(self.refresh_activities())
+        asyncio.create_task(self._async_load_activities())
         
         # Start auto-refresh task since it's enabled by default
         if self.auto_refresh and (not self.refresh_task or self.refresh_task.done()):
             self.refresh_task = asyncio.create_task(self.auto_refresh_loop())
+
+    async def _async_load_activities(self):
+        """Load activities asynchronously on initial render."""
+        try:
+            logger.debug("[ActivityMonitor] Starting async activity load")
+            
+            # Fetch and format activities
+            activities = await asyncio.to_thread(self._fetch_activities_raw)
+            rows = self._format_activities_rows(activities)
+            
+            logger.debug(f"[ActivityMonitor] Loaded {len(rows)} activities")
+            
+            # Update the table container with actual table
+            self.table_container.clear()
+            with self.table_container:
+                with ui.card().classes("w-full"):
+                    self.activities_table = ui.table(
+                        columns=[
+                            {"name": "timestamp", "label": "Timestamp", "field": "timestamp", "align": "left", "sortable": True},
+                            {"name": "severity", "label": "Severity", "field": "severity", "align": "center", "sortable": True},
+                            {"name": "type", "label": "Type", "field": "type", "align": "left", "sortable": True},
+                            {"name": "expert", "label": "Expert", "field": "expert", "align": "left", "sortable": True},
+                            {"name": "account", "label": "Account", "field": "account", "align": "left", "sortable": True},
+                            {"name": "description", "label": "Description", "field": "description", "align": "left"},
+                        ],
+                        rows=rows,
+                        row_key="id",
+                        pagination={"rowsPerPage": 50, "sortBy": "timestamp", "descending": True}
+                    ).classes("w-full")
+                    
+                    # Add custom styling for severity column
+                    self.activities_table.add_slot('body-cell-severity', '''
+                        <q-td :props="props">
+                            <q-badge 
+                                :color="props.value === 'success' ? 'green' : 
+                                        props.value === 'failure' ? 'red' : 
+                                        props.value === 'warning' ? 'orange' :
+                                        props.value === 'info' ? 'blue' : 'grey'"
+                                :label="props.value"
+                            />
+                        </q-td>
+                    ''')
+            
+            logger.debug("[ActivityMonitor] Activity table loaded successfully")
+        except Exception as e:
+            logger.error(f"[ActivityMonitor] Error loading activities: {e}", exc_info=True)
+            self.table_container.clear()
+            with self.table_container:
+                with ui.card().classes("w-full"):
+                    ui.label("Error Loading Activities").classes("text-md font-bold text-red-600")
+                    ui.label(f"Failed to load data: {str(e)}").classes("text-sm text-gray-600")
 
 
 def render():
