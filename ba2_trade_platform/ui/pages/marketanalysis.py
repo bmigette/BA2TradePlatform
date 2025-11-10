@@ -1652,10 +1652,14 @@ class ScheduledJobsTab:
             ui.label('Scheduled Analysis Jobs').classes('text-lg font-bold')
             ui.label('View all scheduled analysis jobs for the current week').classes('text-sm text-gray-600 mb-4')
             
-            # Weekly calendar view (in a container for dynamic refresh)
+            # Weekly calendar view container (will be populated async)
             self.calendar_container = ui.column().classes('w-full')
             with self.calendar_container:
-                self._create_weekly_calendar()
+                with ui.card().classes('w-full mb-4 p-3'):
+                    with ui.row().classes('w-full items-center gap-2'):
+                        ui.label('Weekly Schedule Overview').classes('text-md font-bold')
+                        ui.spinner('dots').classes('ml-auto')
+                    ui.label('Loading schedule...').classes('text-sm text-gray-500')
             
             ui.separator().classes('my-4')
             
@@ -1698,23 +1702,83 @@ class ScheduledJobsTab:
                 
                 with ui.row().classes('gap-2'):
                     ui.button('Clear Filters', on_click=self._clear_filters, icon='clear')
-                    ui.button('Refresh', on_click=self.refresh_data, icon='refresh')
+                    ui.button('Refresh', on_click=self._start_async_refresh, icon='refresh')
                     with ui.switch('Auto-refresh', value=True) as auto_refresh:
                         auto_refresh.on_value_change(self.toggle_auto_refresh)
             
-            # Scheduled jobs table
-            self._create_scheduled_jobs_table()
-            
-            # Bind text filter to table
-            self.filter_input.bind_value(self.scheduled_jobs_table, "filter")
+            # Scheduled jobs table container (will be populated async)
+            self.scheduled_jobs_table_container = ui.column().classes('w-full')
+            with self.scheduled_jobs_table_container:
+                with ui.card().classes('w-full'):
+                    with ui.row().classes('w-full items-center gap-2 mb-2'):
+                        ui.label('Current Week Scheduled Jobs').classes('text-md font-bold')
+                        ui.spinner('dots').classes('ml-auto')
+                    ui.label('Loading scheduled jobs...').classes('text-sm text-gray-500')
             
             # Pagination controls container
             self.pagination_container = ui.row().classes('w-full')
             with self.pagination_container:
                 self._create_pagination_controls()
         
+        # Start loading calendar and table data asynchronously
+        asyncio.create_task(self._async_load_calendar())
+        asyncio.create_task(self._async_load_scheduled_jobs_table())
+        
         # Start auto-refresh
         self.start_auto_refresh()
+
+    async def _async_load_calendar(self):
+        """Load calendar data asynchronously."""
+        try:
+            logger.debug("[ScheduledJobs] Starting async calendar load")
+            await asyncio.to_thread(self._create_weekly_calendar)
+            logger.debug("[ScheduledJobs] Calendar loaded successfully")
+        except Exception as e:
+            logger.error(f"[ScheduledJobs] Error loading calendar: {e}", exc_info=True)
+            self.calendar_container.clear()
+            with self.calendar_container:
+                with ui.card().classes('w-full mb-4 p-3'):
+                    ui.label('Error Loading Schedule').classes('text-md font-bold text-red-600')
+                    ui.label(f'Failed to load schedule: {str(e)}').classes('text-sm text-gray-600')
+
+    async def _async_load_scheduled_jobs_table(self):
+        """Load scheduled jobs table asynchronously."""
+        try:
+            logger.debug("[ScheduledJobs] Starting async table load")
+            
+            # Fetch data in background
+            scheduled_data, total_records = await asyncio.to_thread(self._get_scheduled_jobs_data)
+            self.total_records = total_records
+            self.total_pages = max(1, math.ceil(self.total_records / self.page_size))
+            
+            logger.debug(f"[ScheduledJobs] Fetched {len(scheduled_data)} scheduled jobs")
+            
+            # Update the container with actual table
+            self.scheduled_jobs_table_container.clear()
+            with self.scheduled_jobs_table_container:
+                self._create_scheduled_jobs_table(scheduled_data, total_records)
+            
+            # Bind text filter to table
+            if self.scheduled_jobs_table:
+                self.filter_input.bind_value(self.scheduled_jobs_table, "filter")
+            
+            # Update pagination controls
+            self._create_pagination_controls()
+            
+            logger.debug("[ScheduledJobs] Table loaded successfully")
+        except Exception as e:
+            logger.error(f"[ScheduledJobs] Error loading table: {e}", exc_info=True)
+            self.scheduled_jobs_table_container.clear()
+            with self.scheduled_jobs_table_container:
+                with ui.card().classes('w-full'):
+                    ui.label('Error Loading Scheduled Jobs').classes('text-md font-bold text-red-600')
+                    ui.label(f'Failed to load data: {str(e)}').classes('text-sm text-gray-600')
+                    ui.button('Retry', on_click=lambda: asyncio.create_task(self._async_load_scheduled_jobs_table()))
+
+    def _start_async_refresh(self):
+        """Start async refresh of calendar and table."""
+        asyncio.create_task(self._async_load_calendar())
+        asyncio.create_task(self._async_load_scheduled_jobs_table())
 
     def _create_weekly_calendar(self):
         """Create a condensed weekly timeline view showing scheduled jobs by expert."""
@@ -2005,7 +2069,7 @@ class ScheduledJobsTab:
             self.filter_input.value = ''
         self.refresh_data()
 
-    def _create_scheduled_jobs_table(self):
+    def _create_scheduled_jobs_table(self, scheduled_data=None, total_records=None):
         """Create the scheduled jobs table."""
         columns = [
             {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True},
@@ -2017,7 +2081,9 @@ class ScheduledJobsTab:
             {'name': 'actions', 'label': 'Actions', 'field': 'actions', 'sortable': False}
         ]
         
-        scheduled_data, _ = self._get_scheduled_jobs_data()
+        # Use provided data or fetch it (for backward compatibility)
+        if scheduled_data is None:
+            scheduled_data, _ = self._get_scheduled_jobs_data()
         
         with ui.card().classes('w-full'):
             # Header with bulk action button
@@ -2355,83 +2421,13 @@ class ScheduledJobsTab:
             ui.notify(f"Error starting jobs: {str(e)}", type='negative')
 
     def refresh_data(self):
-        """Refresh the scheduled jobs data with async loading and caching."""
+        """Refresh the scheduled jobs data asynchronously."""
         try:
-            # Get filter state for cache invalidation detection
-            filter_state = self._get_filter_state()
-            
-            # Check if filters changed and invalidate cache if needed
-            if self.cache_manager.should_invalidate_cache(filter_state):
-                logger.debug("[ScheduledJobs] Filters changed, invalidating cache")
-                self.cache_manager.invalidate_cache()
-            
-            if self.scheduled_jobs_table:
-                # Start async refresh in background
-                asyncio.create_task(self._async_refresh_scheduled_jobs())
-                logger.debug("[ScheduledJobs] Async refresh task started")
+            asyncio.create_task(self._async_load_calendar())
+            asyncio.create_task(self._async_load_scheduled_jobs_table())
         except Exception as e:
-            logger.error(f"Error starting scheduled jobs async refresh: {e}", exc_info=True)
-            # Fallback to sync refresh
-            try:
-                scheduled_data, self.total_records = self._get_scheduled_jobs_data()
-                self.total_pages = max(1, math.ceil(self.total_records / self.page_size))
-                
-                if self.current_page > self.total_pages:
-                    self.current_page = max(1, self.total_pages)
-                
-                self.scheduled_jobs_table.rows = scheduled_data
-                self._create_pagination_controls()
-            except Exception as e2:
-                logger.error(f"Error in scheduled jobs fallback refresh: {e2}", exc_info=True)
+            logger.error(f"Error starting scheduled jobs refresh: {e}", exc_info=True)
     
-    async def _async_refresh_scheduled_jobs(self):
-        """Async refresh of scheduled jobs with cache and progressive loading."""
-        try:
-            filter_state = self._get_filter_state()
-            
-            # Use cache manager to get data
-            scheduled_data, self.total_records = await self.cache_manager.get_data(
-                fetch_func=self._get_scheduled_jobs_data_raw,
-                filter_state=filter_state,
-                format_func=self._format_scheduled_jobs_records,
-                page=self.current_page,
-                page_size=self.page_size
-            )
-            
-            self.total_pages = max(1, math.ceil(self.total_records / self.page_size))
-            
-            if self.current_page > self.total_pages:
-                self.current_page = max(1, self.total_pages)
-            
-            # Use async loader for progressive rendering
-            if not self.async_loader and self.scheduled_jobs_table:
-                self.async_loader = AsyncTableLoader(self.scheduled_jobs_table, batch_size=50)
-            
-            if self.async_loader:
-                await self.async_loader.load_rows_async(scheduled_data)
-            else:
-                self.scheduled_jobs_table.rows = scheduled_data
-            
-            self._create_pagination_controls()
-            logger.debug(f"[ScheduledJobs] Async refresh completed with {len(scheduled_data)} rows")
-        except Exception as e:
-            logger.error(f"Error in scheduled jobs async refresh: {e}", exc_info=True)
-    
-    def _get_filter_state(self) -> tuple:
-        """Get current filter state for cache invalidation detection."""
-        return (self.expert_filter, self.analysis_type_filter)
-    
-    def _get_scheduled_jobs_data_raw(self) -> tuple:
-        """Wrapper for _get_scheduled_jobs_data for use with cache manager."""
-        return self._get_scheduled_jobs_data()
-    
-    def _format_scheduled_jobs_records(self, data_tuple) -> List[dict]:
-        """Format raw scheduled jobs data. Data is already tuple (jobs, total)."""
-        if isinstance(data_tuple, tuple):
-            jobs, _ = data_tuple
-            return jobs
-        return []
-
     def toggle_auto_refresh(self, enabled: bool):
         """Toggle auto-refresh on/off."""
         if enabled:
