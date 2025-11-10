@@ -187,6 +187,8 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                     "NagaAI/qwen3-max",
                     "NagaAI/qwen3-next-80b-a3b-instruct",
                     "NagaAI/qwen3-next-80b-a3b-thinking",
+                    # Kimi (NagaAC - advanced reasoning)
+                    "NagaAI/kimi-k2-thinking",
                 ],
                 "allow_custom": True,  # Allow users to enter custom model names not in the list
                 "tooltip": "The AI model used for in-depth analysis requiring complex reasoning, such as fundamental analysis and debate arbitration. Format: Provider/ModelName. OpenAI models provide proven performance. Naga AI provides access to multiple frontier models including GPT-5, GPT-4, O1/O3, Grok-4, Gemini 2.5, and DeepSeek v3 with free tier available. You can also enter custom model names."
@@ -236,6 +238,8 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                     "NagaAI/qwen3-max",
                     "NagaAI/qwen3-next-80b-a3b-instruct",
                     "NagaAI/qwen3-next-80b-a3b-thinking",
+                    # Kimi (NagaAC - advanced reasoning)
+                    "NagaAI/kimi-k2-thinking",
                 ],
                 "allow_custom": True,  # Allow users to enter custom model names not in the list
                 "help": "For more information, see [OpenAI Models](https://platform.openai.com/docs/models) and [Naga AI Models](https://naga.ac/models)",
@@ -258,6 +262,8 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                     "NagaAI/grok-4-0709",
                     "NagaAI/grok-4-fast-non-reasoning",
                     "NagaAI/grok-4-fast-reasoning",
+                    # Kimi (NagaAC - advanced reasoning)
+                    "NagaAI/kimi-k2-thinking",
                 ],
                 "allow_custom": True,  # Allow users to enter custom model names not in the list
                 "help": "For more information, see [OpenAI Docs](https://platform.openai.com/docs/models) and [Naga AI Web Search](https://docs.naga.ac/features/web-search)",

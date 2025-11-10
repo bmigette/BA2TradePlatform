@@ -130,6 +130,8 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         "NagaAI/deepseek-chat-v3.1:free",
                         "NagaAI/deepseek-reasoner-0528",
                         "NagaAI/deepseek-reasoner-0528:free",
+                        # Kimi (NagaAC - advanced reasoning)
+                        "NagaAI/kimi-k2-thinking",
                     ],
                     "allow_custom": True,
                     "help": "For more information, see [OpenAI Docs](https://platform.openai.com/docs/models) and [Naga AI Web Search](https://docs.naga.ac/features/web-search)",
@@ -163,6 +165,8 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         "NagaAI/deepseek-chat-v3.1:free",
                         "NagaAI/deepseek-reasoner-0528",
                         "NagaAI/deepseek-reasoner-0528:free",
+                        # Kimi (NagaAC - advanced reasoning)
+                        "NagaAI/kimi-k2-thinking",
                     ],
                     "allow_custom": True,
                     "help": "For more information, see [OpenAI Docs](https://platform.openai.com/docs/models) and [Naga AI Web Search](https://docs.naga.ac/features/web-search)",
