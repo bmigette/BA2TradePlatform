@@ -450,17 +450,24 @@ class FMPSenateTraderCopy(MarketExpertInterface):
         try:
             from sqlmodel import Session, select
             from ...core.db import get_db
-            from ...core.models import Order
+            from ...core.models import TradingOrder, ExpertRecommendation
             from ...core.types import OrderStatus
             
             with Session(get_db().bind) as session:
-                # Query for orders with this symbol that are open
-                statement = select(Order).where(
-                    Order.expert_id == self.id,
-                    Order.symbol == symbol,
-                    Order.status.in_([
-                        OrderStatus.OPENED,
-                        OrderStatus.WAITING
+                # Query for trading orders with this symbol that are open
+                # Orders linked to this expert via recommendations
+                statement = select(TradingOrder).join(
+                    ExpertRecommendation,
+                    TradingOrder.expert_recommendation_id == ExpertRecommendation.id,
+                    isouter=True
+                ).where(
+                    ExpertRecommendation.instance_id == self.id,
+                    TradingOrder.symbol == symbol,
+                    TradingOrder.status.in_([
+                        OrderStatus.PENDING,
+                        OrderStatus.SUBMITTED,
+                        OrderStatus.PARTIALLY_FILLED,
+                        OrderStatus.FILLED
                     ])
                 )
                 

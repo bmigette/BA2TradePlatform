@@ -1613,6 +1613,14 @@ class AlpacaAccount(AccountInterface):
                             logger.info(f"Order {order.id} dependency met: parent order {parent_order.id} reached terminal status {parent_order.status}")
                     
                     if dependency_met:
+                        # Verify parent order has valid quantity before submitting dependent order
+                        if not parent_order.quantity or parent_order.quantity <= 0:
+                            logger.warning(f"Cannot submit dependent order {order.id}: parent order {parent_order.id} has invalid quantity {parent_order.quantity}. Marking as ERROR.")
+                            order.status = OrderStatus.ERROR
+                            session.add(order)
+                            session.commit()
+                            continue
+                        
                         # Submit the dependent order
                         logger.info(f"Submitting dependent order {order.id} (depends on {parent_order.id})")
                         try:
@@ -2377,6 +2385,60 @@ class AlpacaAccount(AccountInterface):
         else:
             return order.side == OrderDirection.BUY and order.stop_price > (entry_order.open_price or 0)
     
+    def adjust_tp(self, transaction: Transaction, new_tp_price: float) -> bool:
+        """
+        Adjust take profit for a transaction.
+        
+        Args:
+            transaction: Transaction to adjust TP for
+            new_tp_price: New take profit price
+            
+        Returns:
+            bool: True if adjustment succeeded
+        """
+        return self.adjust_tp_sl(transaction, new_tp_price=new_tp_price, new_sl_price=None)
+    
+    def adjust_sl(self, transaction: Transaction, new_sl_price: float) -> bool:
+        """
+        Adjust stop loss for a transaction.
+        
+        Args:
+            transaction: Transaction to adjust SL for
+            new_sl_price: New stop loss price
+            
+        Returns:
+            bool: True if adjustment succeeded
+        """
+        return self.adjust_tp_sl(transaction, new_tp_price=None, new_sl_price=new_sl_price)
+    
+    def adjust_tp_sl(
+        self, 
+        transaction: Transaction, 
+        new_tp_price: float | None = None, 
+        new_sl_price: float | None = None
+    ) -> bool:
+        """
+        Adjust take profit and/or stop loss for a transaction.
+        
+        This is the main implementation for transaction-level TP/SL management. It handles:
+        - Entry order in PENDING state (creates/updates WAITING_TRIGGER orders)
+        - Entry order FILLED (creates/updates broker orders)
+        - Mixed states (OCO vs separate TP/SL orders)
+        
+        Args:
+            transaction: Transaction to adjust
+            new_tp_price: New take profit price (None = don't adjust TP)
+            new_sl_price: New stop loss price (None = don't adjust SL)
+            
+        Returns:
+            bool: True if adjustment succeeded
+        """
+        return self._adjust_tpsl_internal(
+            transaction=transaction,
+            new_tp_price=new_tp_price,
+            new_sl_price=new_sl_price
+        )
+
     def _adjust_tpsl_internal(
         self, 
         transaction: Transaction, 
@@ -2505,6 +2567,11 @@ class AlpacaAccount(AccountInterface):
         need_oco: bool
     ) -> bool:
         """Handle TP/SL adjustment when entry order is still pending (not sent to broker)."""
+        
+        # Validate entry order has valid quantity before creating TP/SL orders
+        if not entry_order.quantity or entry_order.quantity <= 0:
+            logger.error(f"Cannot create TP/SL orders for transaction {transaction.id}: entry order {entry_order.id} has invalid quantity {entry_order.quantity}")
+            return False
         
         if need_oco:
             # Need OCO order with both TP and SL
@@ -2723,6 +2790,11 @@ class AlpacaAccount(AccountInterface):
     def _create_broker_tp_order(self, session: Session, transaction: Transaction, entry_order: TradingOrder, tp_price: float) -> bool:
         """Create new TP order at broker using OCO (both TP+SL) or simple limit order (TP only)"""
         try:
+            # Validate entry order has valid quantity
+            if not entry_order.quantity or entry_order.quantity <= 0:
+                logger.error(f"Cannot create TP order for transaction {transaction.id}: entry order {entry_order.id} has invalid quantity {entry_order.quantity}")
+                return False
+            
             logger.info(f"Creating TP order at broker for transaction {transaction.id}")
             
             # Determine if we need OCO (both TP and SL) or simple limit order (only TP)
@@ -2908,6 +2980,11 @@ class AlpacaAccount(AccountInterface):
     def _create_broker_oco_order(self, session: Session, transaction: Transaction, entry_order: TradingOrder, tp_price: float, sl_price: float) -> bool:
         """Create new OCO order at broker with both TP and SL."""
         try:
+            # Validate entry order has valid quantity
+            if not entry_order.quantity or entry_order.quantity <= 0:
+                logger.error(f"Cannot create OCO order for transaction {transaction.id}: entry order {entry_order.id} has invalid quantity {entry_order.quantity}")
+                return False
+            
             logger.info(f"Creating OCO order at broker for transaction {transaction.id} with TP=${tp_price:.2f}, SL=${sl_price:.2f}")
             
             oco_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
@@ -2952,6 +3029,11 @@ class AlpacaAccount(AccountInterface):
     def _create_broker_sl_order(self, session: Session, transaction: Transaction, entry_order: TradingOrder, sl_price: float) -> bool:
         """Create new SL order at broker using OCO (both TP+SL) or simple stop order (SL only)"""
         try:
+            # Validate entry order has valid quantity
+            if not entry_order.quantity or entry_order.quantity <= 0:
+                logger.error(f"Cannot create SL order for transaction {transaction.id}: entry order {entry_order.id} has invalid quantity {entry_order.quantity}")
+                return False
+            
             logger.info(f"Creating SL order at broker for transaction {transaction.id}")
             
             has_tp = transaction.take_profit is not None and transaction.take_profit > 0

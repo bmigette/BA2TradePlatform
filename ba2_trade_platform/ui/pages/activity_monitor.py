@@ -16,6 +16,7 @@ from ...core.db import get_db, get_instance
 from ...core.models import ActivityLog, ExpertInstance, AccountDefinition
 from ...core.types import ActivityLogSeverity, ActivityLogType
 from ...logger import logger
+from ..utils.TableCacheManager import TableCacheManager, AsyncTableLoader
 
 
 class ActivityMonitorPage:
@@ -35,11 +36,52 @@ class ActivityMonitorPage:
         self.auto_refresh_switch = None
         self.refresh_interval_input = None
         
+        # Initialize cache manager and async loader
+        self.cache_manager = TableCacheManager("ActivityMonitor")
+        self.async_loader = None
+        
     async def refresh_activities(self):
-        """Refresh the activities table with current filters."""
+        """Refresh the activities table with current filters and async loading."""
         if not self.activities_table:
             return
+        
+        try:
+            # Get filter state
+            filter_state = self._get_filter_state()
             
+            # Check if filters changed and invalidate cache if needed
+            if self.cache_manager.should_invalidate_cache(filter_state):
+                logger.debug("[ActivityMonitor] Filters changed, invalidating cache")
+                self.cache_manager.invalidate_cache()
+            
+            # Use cache manager for data fetching
+            rows, _ = await self.cache_manager.get_data(
+                fetch_func=self._fetch_activities_raw,
+                filter_state=filter_state,
+                format_func=self._format_activities_rows
+            )
+            
+            # Use async loader for progressive rendering
+            if not self.async_loader and self.activities_table:
+                self.async_loader = AsyncTableLoader(self.activities_table, batch_size=100)
+            
+            if self.async_loader:
+                await self.async_loader.load_rows_async(rows)
+            else:
+                self.activities_table.rows = rows
+            
+            logger.debug(f"[ActivityMonitor] Loaded {len(rows)} activities")
+            
+        except Exception as e:
+            logger.error(f"Error refreshing activities: {e}", exc_info=True)
+            ui.notify(f"Error refreshing activities: {str(e)}", type="negative")
+    
+    def _get_filter_state(self) -> tuple:
+        """Get current filter state for cache invalidation."""
+        return (self.filter_type, self.filter_severity, self.filter_expert_id, self.filter_text)
+    
+    def _fetch_activities_raw(self):
+        """Fetch raw activities from database."""
         try:
             with Session(get_db().bind) as session:
                 # Build query with filters
@@ -51,7 +93,6 @@ class ActivityMonitorPage:
                     filters.append(ActivityLog.type == self.filter_type)
                     
                 if self.filter_severity:
-                    # Filter for selected severity and higher (order: DEBUG < INFO < WARNING < SUCCESS < FAILURE)
                     severity_order = [
                         ActivityLogSeverity.DEBUG,
                         ActivityLogSeverity.INFO,
@@ -75,43 +116,47 @@ class ActivityMonitorPage:
                 query = query.limit(1000)
                 
                 activities = session.exec(query).all()
-                
-                # Format rows for table
-                rows = []
-                for activity in activities:
-                    # Format expert display
-                    expert_display = ""
-                    if activity.source_expert_id:
-                        expert = get_instance(ExpertInstance, activity.source_expert_id)
-                        if expert:
-                            if expert.alias:
-                                expert_display = expert.alias
-                            else:
-                                expert_display = f"{expert.expert} #{expert.id}"
-                    
-                    # Format account display
-                    account_display = ""
-                    if activity.source_account_id:
-                        account = get_instance(AccountDefinition, activity.source_account_id)
-                        if account:
-                            account_display = account.name
-                    
-                    rows.append({
-                        "id": activity.id,
-                        "timestamp": activity.created_at.strftime("%Y-%m-%d %H:%M:%S"),
-                        "severity": activity.severity.value,
-                        "type": activity.type.value.replace("_", " ").title(),
-                        "expert": expert_display,
-                        "account": account_display,
-                        "description": activity.description,
-                        "data": str(activity.data) if activity.data else ""
-                    })
-                
-                self.activities_table.rows = rows
-                
+                return activities
         except Exception as e:
-            logger.error(f"Error refreshing activities: {e}", exc_info=True)
-            ui.notify(f"Error refreshing activities: {str(e)}", type="negative")
+            logger.error(f"Error fetching activities: {e}", exc_info=True)
+            return []
+    
+    def _format_activities_rows(self, activities) -> list:
+        """Format activities into table rows."""
+        rows = []
+        try:
+            for activity in activities:
+                # Format expert display
+                expert_display = ""
+                if activity.source_expert_id:
+                    expert = get_instance(ExpertInstance, activity.source_expert_id)
+                    if expert:
+                        if expert.alias:
+                            expert_display = expert.alias
+                        else:
+                            expert_display = f"{expert.expert} #{expert.id}"
+                
+                # Format account display
+                account_display = ""
+                if activity.source_account_id:
+                    account = get_instance(AccountDefinition, activity.source_account_id)
+                    if account:
+                        account_display = account.name
+                
+                rows.append({
+                    "id": activity.id,
+                    "timestamp": activity.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    "severity": activity.severity.value,
+                    "type": activity.type.value.replace("_", " ").title(),
+                    "expert": expert_display,
+                    "account": account_display,
+                    "description": activity.description,
+                    "data": str(activity.data) if activity.data else ""
+                })
+        except Exception as e:
+            logger.error(f"Error formatting activities: {e}", exc_info=True)
+        
+        return rows
     
     async def auto_refresh_loop(self):
         """Background task for auto-refreshing activities."""

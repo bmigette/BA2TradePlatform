@@ -2,6 +2,7 @@ from nicegui import ui
 from datetime import datetime, timezone
 from typing import List, Optional
 import math
+import asyncio
 
 from ...core.WorkerQueue import get_worker_queue
 from ...core.db import get_all_instances, get_instance, get_db
@@ -14,6 +15,7 @@ from ...modules.accounts import get_account_class
 from ...core.db import add_instance
 from ...logger import logger
 from ...core.utils import get_account_instance_from_id
+from ..utils.TableCacheManager import TableCacheManager, AsyncTableLoader
 from sqlmodel import select, func, distinct
 
 
@@ -40,6 +42,13 @@ class JobMonitoringTab:
         self.type_filter = 'all'  # Filter by analysis type (ENTER_MARKET or OPEN_POSITIONS)
         self.recommendation_filter = 'all'  # Filter by recommendation (BUY, SELL, HOLD)
         self.symbol_filter = ''  # Filter by symbol - filters at database level, not client-side
+        
+        # ===== CACHING for performance =====
+        # Cache entire filtered dataset to avoid recomputing on pagination/page size changes
+        self.cached_analysis_data = []  # Full filtered result set
+        self.cache_valid = False  # Whether cache matches current filters
+        self.last_filter_state = None  # Track filter state to detect changes
+        
         self.render()
     
     def _get_worker_queue(self):
@@ -47,6 +56,30 @@ class JobMonitoringTab:
         if self.worker_queue is None:
             self.worker_queue = get_worker_queue()
         return self.worker_queue
+    
+    def _get_filter_state(self) -> tuple:
+        """Get current filter state as a hashable tuple for cache invalidation."""
+        return (
+            self.status_filter,
+            self.expert_filter,
+            self.type_filter,
+            self.recommendation_filter,
+            self.symbol_filter
+        )
+    
+    def _should_invalidate_cache(self) -> bool:
+        """Check if filters have changed, requiring cache invalidation."""
+        current_state = self._get_filter_state()
+        if self.last_filter_state != current_state:
+            self.last_filter_state = current_state
+            return True
+        return False
+    
+    def _invalidate_cache(self):
+        """Invalidate the analysis data cache."""
+        self.cached_analysis_data = []
+        self.cache_valid = False
+
 
     def render(self):
         with ui.card().classes('w-full'):
@@ -377,224 +410,215 @@ class JobMonitoringTab:
                 self.queue_status_labels['total_tasks'] = ui.label(f"Total Tasks: {queue_info['total_tasks']}")
 
     def _get_analysis_data(self) -> tuple[List[dict], int]:
-        """Get analysis jobs data for the table with pagination and filtering."""
+        """Get analysis jobs data for the table with pagination and filtering.
+        
+        OPTIMIZATION: Caches the entire filtered dataset to avoid recomputing on pagination changes.
+        Only recomputes when filters actually change.
+        """
         try:
-            with get_db() as session:
-                # Build base query
-                statement = select(MarketAnalysis)
+            # Check if cache needs invalidation due to filter changes
+            if self._should_invalidate_cache():
+                logger.debug(f"Cache invalidated - filters changed. Recomputing...")
+                self.current_page = 1  # Reset to first page when filters change
                 
-                # Apply status filter
-                if self.status_filter != 'all':
-                    statement = statement.where(MarketAnalysis.status == MarketAnalysisStatus(self.status_filter))
-                
-                # Apply expert filter
-                if self.expert_filter != 'all':
-                    statement = statement.where(MarketAnalysis.expert_instance_id == int(self.expert_filter))
-                
-                # Apply analysis type filter (ENTER_MARKET vs OPEN_POSITIONS)
-                if self.type_filter != 'all':
-                    from ...core.types import AnalysisUseCase
-                    if self.type_filter == 'enter_market':
-                        statement = statement.where(MarketAnalysis.subtype == AnalysisUseCase.ENTER_MARKET)
-                    elif self.type_filter == 'open_positions':
-                        statement = statement.where(MarketAnalysis.subtype == AnalysisUseCase.OPEN_POSITIONS)
-                
-                # Apply symbol filter (case-insensitive substring match)
-                if self.symbol_filter:
-                    statement = statement.where(MarketAnalysis.symbol.ilike(f"%{self.symbol_filter}%"))
-                
-                # Apply recommendation filter (BUY, SELL, HOLD) - filter analyses that have at least one recommendation matching the filter
-                if self.recommendation_filter != 'all':
-                    from ...core.types import OrderRecommendation
-                    # Only include analyses that have recommendations with the selected action
-                    statement = statement.join(
-                        ExpertRecommendation,
-                        MarketAnalysis.id == ExpertRecommendation.market_analysis_id
-                    ).where(
-                        ExpertRecommendation.recommended_action == OrderRecommendation[self.recommendation_filter]
-                    ).distinct()
-          
-                # Get total count for pagination
-                # When using joins, need to count distinct MarketAnalysis.id to avoid duplicates
-                count_statement = select(func.count(distinct(MarketAnalysis.id)))
-                if self.status_filter != 'all':
-                    count_statement = count_statement.where(MarketAnalysis.status == MarketAnalysisStatus(self.status_filter))
-                if self.expert_filter != 'all':
-                    count_statement = count_statement.where(MarketAnalysis.expert_instance_id == int(self.expert_filter))
-                if self.type_filter != 'all':
-                    from ...core.types import AnalysisUseCase
-                    if self.type_filter == 'enter_market':
-                        count_statement = count_statement.where(MarketAnalysis.subtype == AnalysisUseCase.ENTER_MARKET)
-                    elif self.type_filter == 'open_positions':
-                        count_statement = count_statement.where(MarketAnalysis.subtype == AnalysisUseCase.OPEN_POSITIONS)
-                if self.symbol_filter:
-                    count_statement = count_statement.where(MarketAnalysis.symbol.ilike(f"%{self.symbol_filter}%"))
-                if self.recommendation_filter != 'all':
-                    from ...core.types import OrderRecommendation
-                    count_statement = count_statement.join(
-                        ExpertRecommendation,
-                        MarketAnalysis.id == ExpertRecommendation.market_analysis_id
-                    ).where(
-                        ExpertRecommendation.recommended_action == OrderRecommendation[self.recommendation_filter]
-                    )
- 
-                total_count = session.exec(count_statement).first() or 0
-                
-                # Apply ordering and pagination
-                statement = statement.order_by(MarketAnalysis.created_at.desc())
-                offset = (self.current_page - 1) * self.page_size
-                statement = statement.offset(offset).limit(self.page_size)
-                
-                market_analyses = session.exec(statement).all()
-                
-                analysis_data = []
-                for analysis in market_analyses:
-                    # Get expert instance info (handle missing instances gracefully)
-                    try:
-                        expert_instance = get_instance(ExpertInstance, analysis.expert_instance_id)
-                        if expert_instance:
-                            expert_alias = expert_instance.alias or expert_instance.expert
-                            expert_name = f"{expert_alias}-{analysis.expert_instance_id}"
-                        else:
-                            expert_name = f"Unknown-{analysis.expert_instance_id}"
-                    except Exception as e:
-                        logger.warning(f"Expert instance {analysis.expert_instance_id} not found for analysis {analysis.id}: {e}")
-                        expert_name = f"[Deleted]-{analysis.expert_instance_id}"
-                        expert_instance = None
+                # Fetch and format ALL matching records (no pagination in query)
+                with get_db() as session:
+                    statement = select(MarketAnalysis)
                     
-                    # Convert UTC to local time for display
-                    local_time = analysis.created_at.replace(tzinfo=timezone.utc).astimezone() if analysis.created_at else None
-                    created_local = local_time.strftime("%Y-%m-%d %H:%M:%S") if local_time else "Unknown"
+                    # Apply all filters
+                    if self.status_filter != 'all':
+                        statement = statement.where(MarketAnalysis.status == MarketAnalysisStatus(self.status_filter))
                     
-                    # Status with icon
-                    status_icons = {
-                        'pending': '⏳',
-                        'running': '🔄', 
-                        'completed': '✅',
-                        'failed': '❌',
-                        'cancelled': '🚫'
-                    }
-                    status_value = analysis.status.value if analysis.status else 'unknown'
-                    status_icon = status_icons.get(status_value, '❓')
-                    status_display = f'{status_icon} {status_value.title()}'
+                    if self.expert_filter != 'all':
+                        statement = statement.where(MarketAnalysis.expert_instance_id == int(self.expert_filter))
                     
-                    # Add skip reason to status if this is a skipped analysis
-                    skip_reason = None
-                    if analysis.state and isinstance(analysis.state, dict):
-                        if analysis.state.get('skipped'):
-                            skip_reason = analysis.state.get('skip_reason', 'Analysis was skipped')
-                            status_display = f'⊘ Skipped'  # Use different icon for skipped
+                    if self.type_filter != 'all':
+                        from ...core.types import AnalysisUseCase
+                        if self.type_filter == 'enter_market':
+                            statement = statement.where(MarketAnalysis.subtype == AnalysisUseCase.ENTER_MARKET)
+                        elif self.type_filter == 'open_positions':
+                            statement = statement.where(MarketAnalysis.subtype == AnalysisUseCase.OPEN_POSITIONS)
                     
-                    # Determine if can cancel
-                    can_cancel = analysis.status in [MarketAnalysisStatus.PENDING]
+                    if self.symbol_filter:
+                        statement = statement.where(MarketAnalysis.symbol.ilike(f"%{self.symbol_filter}%"))
                     
-                    # Get subtype display
-                    subtype_display = analysis.subtype.value.replace('_', ' ').title() if analysis.subtype else 'Unknown'
+                    if self.recommendation_filter != 'all':
+                        from ...core.types import OrderRecommendation
+                        statement = statement.join(
+                            ExpertRecommendation,
+                            MarketAnalysis.id == ExpertRecommendation.market_analysis_id
+                        ).where(
+                            ExpertRecommendation.recommended_action == OrderRecommendation[self.recommendation_filter]
+                        ).distinct()
                     
-                    # Get recommendation and confidence from expert_recommendations
-                    recommendation_display = '-'
-                    confidence_display = '-'
-                    expected_profit_display = '-'
+                    # Order by newest first
+                    statement = statement.order_by(MarketAnalysis.created_at.desc())
                     
-                    if analysis.expert_recommendations and len(analysis.expert_recommendations) > 0:
-                        recommendations = analysis.expert_recommendations
-                        
-                        if len(recommendations) == 1:
-                            # Single recommendation - show as before
-                            rec = recommendations[0]
-                            if rec.recommended_action:
-                                # Add icons for BUY/SELL
-                                action_icons = {
-                                    'BUY': '📈',
-                                    'SELL': '📉',
-                                    'HOLD': '⏸️',
-                                    'ERROR': '❌'
-                                }
-                                action_value = rec.recommended_action.value
-                                action_icon = action_icons.get(action_value, '')
-                                recommendation_display = f'{action_icon} {action_value}'
-                            
-                            if rec.confidence is not None:
-                                confidence_display = f'{rec.confidence:.1f}%'
-                            
-                            if rec.expected_profit_percent is not None:
-                                # Format with + or - sign and color indicator
-                                sign = '+' if rec.expected_profit_percent >= 0 else ''
-                                expected_profit_display = f'{sign}{rec.expected_profit_percent:.2f}%'
-                        else:
-                            # Multiple recommendations - show summary
-                            action_counts = {}
-                            confidences = []
-                            profits = []
-                            symbols = []
-                            
-                            for rec in recommendations:
-                                if rec.recommended_action:
-                                    action = rec.recommended_action.value
-                                    action_counts[action] = action_counts.get(action, 0) + 1
-                                
-                                if rec.confidence is not None:
-                                    confidences.append(rec.confidence)
-                                
-                                if rec.expected_profit_percent is not None:
-                                    profits.append(rec.expected_profit_percent)
-                                
-                                if rec.symbol:
-                                    symbols.append(rec.symbol)
-                            
-                            # Format recommendation summary
-                            if action_counts:
-                                action_summary = []
-                                action_icons = {'BUY': '📈', 'SELL': '📉', 'HOLD': '⏸️', 'ERROR': '❌'}
-                                for action, count in sorted(action_counts.items()):
-                                    icon = action_icons.get(action, '')
-                                    action_summary.append(f'{icon}{count}')
-                                recommendation_display = ' '.join(action_summary) + f' ({len(recommendations)} symbols)'
-                            
-                            # Format confidence summary
-                            if confidences:
-                                avg_confidence = sum(confidences) / len(confidences)
-                                confidence_display = f'{avg_confidence:.1f}% avg'
-                            
-                            # Format profit summary
-                            if profits:
-                                avg_profit = sum(profits) / len(profits)
-                                sign = '+' if avg_profit >= 0 else ''
-                                expected_profit_display = f'{sign}{avg_profit:.2f}% avg'
+                    # Fetch ALL matching records at once
+                    market_analyses = session.exec(statement).all()
                     
-                    # Determine symbol display - show actual traded symbols for multi-instrument analysis
-                    symbol_display = analysis.symbol
-                    if analysis.expert_recommendations and len(analysis.expert_recommendations) > 1:
-                        # Multi-instrument analysis - show list of symbols
-                        rec_symbols = [rec.symbol for rec in analysis.expert_recommendations if rec.symbol]
-                        if rec_symbols:
-                            if len(rec_symbols) <= 3:
-                                symbol_display = ', '.join(rec_symbols)
-                            else:
-                                symbol_display = f'{", ".join(rec_symbols[:3])}... (+{len(rec_symbols)-3})'
-                    
-                    analysis_data.append({
-                        'id': analysis.id,
-                        'symbol': symbol_display,
-                        'expert_name': expert_name,
-                        'status': status_value,
-                        'status_display': status_display,
-                        'skip_reason': skip_reason,  # Include skip reason for tooltip/display
-                        'recommendation': recommendation_display,
-                        'confidence': confidence_display,
-                        'expected_profit': expected_profit_display,
-                        'created_at_local': created_local,
-                        'subtype': subtype_display,
-                        'can_cancel': can_cancel,
-                        'expert_instance_id': analysis.expert_instance_id,
-                        'actions': 'actions'  # Placeholder for actions slot (NiceGUI 3.2 requires all columns to have values)
-                    })
-                
-                return analysis_data, total_count
+                    # Process all records and cache them
+                    self.cached_analysis_data = self._format_analysis_records(market_analyses)
+                    self.cache_valid = True
+            
+            # Use cached data and apply pagination
+            self.total_records = len(self.cached_analysis_data)
+            self.total_pages = max(1, math.ceil(self.total_records / self.page_size))
+            
+            # Ensure current page is valid
+            if self.current_page > self.total_pages:
+                self.current_page = max(1, self.total_pages)
+            
+            # Apply pagination to cached data
+            start_idx = (self.current_page - 1) * self.page_size
+            end_idx = start_idx + self.page_size
+            paginated_data = self.cached_analysis_data[start_idx:end_idx]
+            
+            return paginated_data, self.total_records
                 
         except Exception as e:
             logger.error(f"Error getting analysis data: {e}", exc_info=True)
             return [], 0
+    
+    def _format_analysis_records(self, market_analyses) -> List[dict]:
+        """Format raw market analysis records into displayable data.
+        
+        Extracted to separate method so it can be called once per filter change,
+        then cached for pagination operations.
+        """
+        analysis_data = []
+        
+        status_icons = {
+            'pending': '⏳',
+            'running': '🔄', 
+            'completed': '✅',
+            'failed': '❌',
+            'cancelled': '🚫'
+        }
+        
+        action_icons = {
+            'BUY': '📈',
+            'SELL': '📉',
+            'HOLD': '⏸️',
+            'ERROR': '❌'
+        }
+        
+        for analysis in market_analyses:
+            try:
+                # Get expert instance info
+                try:
+                    expert_instance = get_instance(ExpertInstance, analysis.expert_instance_id)
+                    if expert_instance:
+                        expert_alias = expert_instance.alias or expert_instance.expert
+                        expert_name = f"{expert_alias}-{analysis.expert_instance_id}"
+                    else:
+                        expert_name = f"Unknown-{analysis.expert_instance_id}"
+                except Exception as e:
+                    logger.warning(f"Expert instance {analysis.expert_instance_id} not found: {e}")
+                    expert_name = f"[Deleted]-{analysis.expert_instance_id}"
+                
+                # Format timestamp
+                local_time = analysis.created_at.replace(tzinfo=timezone.utc).astimezone() if analysis.created_at else None
+                created_local = local_time.strftime("%Y-%m-%d %H:%M:%S") if local_time else "Unknown"
+                
+                # Format status
+                status_value = analysis.status.value if analysis.status else 'unknown'
+                status_icon = status_icons.get(status_value, '❓')
+                status_display = f'{status_icon} {status_value.title()}'
+                
+                skip_reason = None
+                if analysis.state and isinstance(analysis.state, dict) and analysis.state.get('skipped'):
+                    skip_reason = analysis.state.get('skip_reason', 'Analysis was skipped')
+                    status_display = '⊘ Skipped'
+                
+                # Format recommendations
+                recommendation_display = '-'
+                confidence_display = '-'
+                expected_profit_display = '-'
+                
+                if analysis.expert_recommendations and len(analysis.expert_recommendations) > 0:
+                    recommendations = analysis.expert_recommendations
+                    
+                    if len(recommendations) == 1:
+                        rec = recommendations[0]
+                        if rec.recommended_action:
+                            action_value = rec.recommended_action.value
+                            action_icon = action_icons.get(action_value, '')
+                            recommendation_display = f'{action_icon} {action_value}'
+                        
+                        if rec.confidence is not None:
+                            confidence_display = f'{rec.confidence:.1f}%'
+                        
+                        if rec.expected_profit_percent is not None:
+                            sign = '+' if rec.expected_profit_percent >= 0 else ''
+                            expected_profit_display = f'{sign}{rec.expected_profit_percent:.2f}%'
+                    else:
+                        # Multiple recommendations
+                        action_counts = {}
+                        confidences = []
+                        profits = []
+                        
+                        for rec in recommendations:
+                            if rec.recommended_action:
+                                action = rec.recommended_action.value
+                                action_counts[action] = action_counts.get(action, 0) + 1
+                            
+                            if rec.confidence is not None:
+                                confidences.append(rec.confidence)
+                            
+                            if rec.expected_profit_percent is not None:
+                                profits.append(rec.expected_profit_percent)
+                        
+                        if action_counts:
+                            action_summary = []
+                            for action, count in sorted(action_counts.items()):
+                                icon = action_icons.get(action, '')
+                                action_summary.append(f'{icon}{count}')
+                            recommendation_display = ' '.join(action_summary) + f' ({len(recommendations)} symbols)'
+                        
+                        if confidences:
+                            avg_confidence = sum(confidences) / len(confidences)
+                            confidence_display = f'{avg_confidence:.1f}% avg'
+                        
+                        if profits:
+                            avg_profit = sum(profits) / len(profits)
+                            sign = '+' if avg_profit >= 0 else ''
+                            expected_profit_display = f'{sign}{avg_profit:.2f}% avg'
+                
+                # Format symbol
+                symbol_display = analysis.symbol
+                if analysis.expert_recommendations and len(analysis.expert_recommendations) > 1:
+                    rec_symbols = [rec.symbol for rec in analysis.expert_recommendations if rec.symbol]
+                    if rec_symbols:
+                        if len(rec_symbols) <= 3:
+                            symbol_display = ', '.join(rec_symbols)
+                        else:
+                            symbol_display = f'{", ".join(rec_symbols[:3])}... (+{len(rec_symbols)-3})'
+                
+                subtype_display = analysis.subtype.value.replace('_', ' ').title() if analysis.subtype else 'Unknown'
+                can_cancel = analysis.status in [MarketAnalysisStatus.PENDING]
+                
+                analysis_data.append({
+                    'id': analysis.id,
+                    'symbol': symbol_display,
+                    'expert_name': expert_name,
+                    'status': status_value,
+                    'status_display': status_display,
+                    'skip_reason': skip_reason,
+                    'recommendation': recommendation_display,
+                    'confidence': confidence_display,
+                    'expected_profit': expected_profit_display,
+                    'created_at_local': created_local,
+                    'subtype': subtype_display,
+                    'can_cancel': can_cancel,
+                    'expert_instance_id': analysis.expert_instance_id,
+                    'actions': 'actions'
+                })
+            except Exception as e:
+                logger.warning(f"Error formatting analysis {analysis.id}: {e}")
+                continue
+        
+        return analysis_data
 
     def _create_pagination_controls(self):
         """Create pagination controls."""
@@ -638,18 +662,18 @@ class JobMonitoringTab:
                 page_size_select.on_value_change(self._on_page_size_change)
     
     def _change_page(self, new_page: int):
-        """Change to a specific page."""
+        """Change to a specific page - NO database query needed, just updates UI."""
         if 1 <= new_page <= self.total_pages:
             self.current_page = new_page
-            self.refresh_data()
+            self.refresh_data()  # This will use cached data, no DB query
     
     def _on_page_size_change(self, event):
-        """Handle page size change."""
+        """Handle page size change - NO database query needed, just re-paginates cached data."""
         try:
             new_size = int(event.value)
             self.page_size = new_size
             self.current_page = 1  # Reset to first page
-            self.refresh_data()
+            self.refresh_data()  # This will use cached data, no DB query
         except ValueError:
             pass
     
@@ -1553,6 +1577,9 @@ class ScheduledJobsTab:
         self.total_records = 0
         self.expert_filter = 'all'  # Filter by expert instance ID
         self.analysis_type_filter = 'all'  # Filter by analysis type (Enter Market / Open Positions)
+        # Initialize cache manager for lazy loading
+        self.cache_manager = TableCacheManager("ScheduledJobs")
+        self.async_loader = None
         self.render()
 
     def render(self):
@@ -2263,27 +2290,82 @@ class ScheduledJobsTab:
             ui.notify(f"Error starting jobs: {str(e)}", type='negative')
 
     def refresh_data(self):
-        """Refresh the scheduled jobs data."""
+        """Refresh the scheduled jobs data with async loading and caching."""
         try:
+            # Get filter state for cache invalidation detection
+            filter_state = self._get_filter_state()
+            
+            # Check if filters changed and invalidate cache if needed
+            if self.cache_manager.should_invalidate_cache(filter_state):
+                logger.debug("[ScheduledJobs] Filters changed, invalidating cache")
+                self.cache_manager.invalidate_cache()
+            
             if self.scheduled_jobs_table:
+                # Start async refresh in background
+                asyncio.create_task(self._async_refresh_scheduled_jobs())
+                logger.debug("[ScheduledJobs] Async refresh task started")
+        except Exception as e:
+            logger.error(f"Error starting scheduled jobs async refresh: {e}", exc_info=True)
+            # Fallback to sync refresh
+            try:
                 scheduled_data, self.total_records = self._get_scheduled_jobs_data()
                 self.total_pages = max(1, math.ceil(self.total_records / self.page_size))
                 
-                # Ensure current page is valid
                 if self.current_page > self.total_pages:
                     self.current_page = max(1, self.total_pages)
                 
                 self.scheduled_jobs_table.rows = scheduled_data
-                # Note: In NiceGUI 3.0+, .update() is automatic when modifying table.rows
-                # self.scheduled_jobs_table.update()  # Not needed in 3.0+
-                
-                # Re-create pagination controls to update button states
                 self._create_pagination_controls()
+            except Exception as e2:
+                logger.error(f"Error in scheduled jobs fallback refresh: {e2}", exc_info=True)
+    
+    async def _async_refresh_scheduled_jobs(self):
+        """Async refresh of scheduled jobs with cache and progressive loading."""
+        try:
+            filter_state = self._get_filter_state()
             
-            #logger.debug("Scheduled jobs data refreshed")
+            # Use cache manager to get data
+            scheduled_data, self.total_records = await self.cache_manager.get_data(
+                fetch_func=self._get_scheduled_jobs_data_raw,
+                filter_state=filter_state,
+                format_func=self._format_scheduled_jobs_records,
+                page=self.current_page,
+                page_size=self.page_size
+            )
             
+            self.total_pages = max(1, math.ceil(self.total_records / self.page_size))
+            
+            if self.current_page > self.total_pages:
+                self.current_page = max(1, self.total_pages)
+            
+            # Use async loader for progressive rendering
+            if not self.async_loader and self.scheduled_jobs_table:
+                self.async_loader = AsyncTableLoader(self.scheduled_jobs_table, batch_size=50)
+            
+            if self.async_loader:
+                await self.async_loader.load_rows_async(scheduled_data)
+            else:
+                self.scheduled_jobs_table.rows = scheduled_data
+            
+            self._create_pagination_controls()
+            logger.debug(f"[ScheduledJobs] Async refresh completed with {len(scheduled_data)} rows")
         except Exception as e:
-            logger.error(f"Error refreshing scheduled jobs data: {e}", exc_info=True)
+            logger.error(f"Error in scheduled jobs async refresh: {e}", exc_info=True)
+    
+    def _get_filter_state(self) -> tuple:
+        """Get current filter state for cache invalidation detection."""
+        return (self.expert_filter, self.analysis_type_filter)
+    
+    def _get_scheduled_jobs_data_raw(self) -> tuple:
+        """Wrapper for _get_scheduled_jobs_data for use with cache manager."""
+        return self._get_scheduled_jobs_data()
+    
+    def _format_scheduled_jobs_records(self, data_tuple) -> List[dict]:
+        """Format raw scheduled jobs data. Data is already tuple (jobs, total)."""
+        if isinstance(data_tuple, tuple):
+            jobs, _ = data_tuple
+            return jobs
+        return []
 
     def toggle_auto_refresh(self, enabled: bool):
         """Toggle auto-refresh on/off."""

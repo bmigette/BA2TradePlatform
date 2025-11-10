@@ -214,7 +214,7 @@ class AccountInterface(ExtendableSettingsInterface):
         validation_result = self._validate_trading_order(trading_order)
         if not validation_result['is_valid']:
             error_msg = f"Order validation failed: {', '.join(validation_result['errors'])}"
-            logger.error(f"Order validation failed for order: {error_msg}", exc_info=True)
+            logger.error(f"Order validation failed for order: {error_msg}")
             raise ValueError(error_msg)
         
         # Handle transaction requirements based on order type
@@ -1253,6 +1253,17 @@ class AccountInterface(ExtendableSettingsInterface):
                     
                     if should_submit_immediately:
                         logger.info(f"Parent order {trading_order.id} is now EXECUTED (status: {trading_order.status.value}), submitting TP order {existing_tp_order.id} to broker")
+                        
+                        # CRITICAL: Validate parent order has valid quantity before updating TP order quantity
+                        # This prevents submitting TP orders with qty=0 when entry order has qty=0
+                        if not trading_order.quantity or trading_order.quantity <= 0:
+                            logger.error(f"Cannot submit TP order {existing_tp_order.id}: parent order {trading_order.id} has invalid quantity {trading_order.quantity}. Skipping TP submission.")
+                            # Mark TP order as ERROR instead of submitting
+                            existing_tp_order.status = OrderStatus.ERROR
+                            session.add(existing_tp_order)
+                            session.commit()
+                            raise ValueError(f"Parent order {trading_order.id} has invalid quantity {trading_order.quantity}, cannot create TP order")
+                        
                         existing_tp_order.quantity = trading_order.quantity
                         # Don't set to PENDING - submit directly and let submit_order set the status
                     
@@ -1513,6 +1524,17 @@ class AccountInterface(ExtendableSettingsInterface):
                     
                     if should_submit_immediately:
                         logger.info(f"Parent order {trading_order.id} is now EXECUTED (status: {trading_order.status.value}), submitting SL order {existing_sl_order.id} to broker")
+                        
+                        # CRITICAL: Validate parent order has valid quantity before updating SL order quantity
+                        # This prevents submitting SL orders with qty=0 when entry order has qty=0
+                        if not trading_order.quantity or trading_order.quantity <= 0:
+                            logger.error(f"Cannot submit SL order {existing_sl_order.id}: parent order {trading_order.id} has invalid quantity {trading_order.quantity}. Skipping SL submission.")
+                            # Mark SL order as ERROR instead of submitting
+                            existing_sl_order.status = OrderStatus.ERROR
+                            session.add(existing_sl_order)
+                            session.commit()
+                            raise ValueError(f"Parent order {trading_order.id} has invalid quantity {trading_order.quantity}, cannot create SL order")
+                        
                         existing_sl_order.quantity = trading_order.quantity
                         # Don't set to PENDING - submit directly and let submit_order set the status
                     
@@ -1962,6 +1984,10 @@ class AccountInterface(ExtendableSettingsInterface):
         from ba2_trade_platform.core.db import get_instance
         transaction = get_instance(Transaction, existing_order.transaction_id)
         entry_order = get_instance(TradingOrder, transaction.entry_order_id)
+        
+        # Validate entry order has valid quantity
+        if not entry_order or not entry_order.quantity or entry_order.quantity <= 0:
+            raise ValueError(f"Cannot create STOP_LIMIT order: entry order has invalid quantity {entry_order.quantity if entry_order else 'None'}")
         
         # Determine correct side and type
         if entry_order.side == OrderDirection.BUY:

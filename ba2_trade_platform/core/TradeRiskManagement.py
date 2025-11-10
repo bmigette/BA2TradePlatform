@@ -544,19 +544,61 @@ class TradeRiskManagement:
         return orders_to_update, orders_to_delete
     
     def _update_orders_in_database(self, orders: List[TradingOrder]) -> None:
-        """Update orders in the database with calculated quantities."""
+        """
+        Update orders in the database with calculated quantities using TransactionHelper.
+        
+        For each order, updates its transaction and all related orders (entry + TP/SL) in sync
+        to prevent qty mismatches and invalid order states.
+        """
+        from .TransactionHelper import TransactionHelper
+        from .db import get_db
+        from sqlmodel import Session, select
+        
         try:
             updated_count = 0
+            grouped_by_transaction = {}
             
-            for order in orders:
-                if update_instance(order):
-                    updated_count += 1
-                    if order.quantity > 0:
-                        self.logger.debug(f"Updated order {order.id} with quantity {order.quantity}")
-                else:
-                    self.logger.error(f"Failed to update order {order.id} in database")
+            # Group orders by transaction
+            with Session(get_db().bind) as session:
+                for order in orders:
+                    if order.transaction_id:
+                        if order.transaction_id not in grouped_by_transaction:
+                            # Load transaction from DB
+                            transaction = session.get(Transaction, order.transaction_id)
+                            if transaction:
+                                grouped_by_transaction[order.transaction_id] = {
+                                    'transaction': transaction,
+                                    'orders': [order]
+                                }
+                        else:
+                            grouped_by_transaction[order.transaction_id]['orders'].append(order)
+                    else:
+                        # Order without transaction - update directly (legacy support)
+                        from .db import update_instance
+                        if update_instance(order):
+                            updated_count += 1
+                            self.logger.debug(f"Updated orphan order {order.id} with quantity {order.quantity}")
             
-            self.logger.info(f"Successfully updated {updated_count} orders in database")
+            # Update each transaction and its related orders
+            for txn_id, data in grouped_by_transaction.items():
+                transaction = data['transaction']
+                orders_in_txn = data['orders']
+                
+                # Use the first order's new quantity (all should be the same)
+                if orders_in_txn:
+                    new_quantity = orders_in_txn[0].quantity
+                    
+                    # Use TransactionHelper to update transaction and all related orders in sync
+                    if TransactionHelper.adjust_qty(transaction, new_quantity):
+                        updated_count += len(orders_in_txn)
+                        self.logger.debug(
+                            f"Updated transaction {txn_id} with quantity {new_quantity} "
+                            f"and {len(orders_in_txn)} related orders"
+                        )
+                    else:
+                        self.logger.error(f"Failed to update transaction {txn_id}")
+            
+            self.logger.info(f"Successfully updated {updated_count} orders in database via TransactionHelper")
             
         except Exception as e:
             self.logger.error(f"Error updating orders in database: {e}", exc_info=True)

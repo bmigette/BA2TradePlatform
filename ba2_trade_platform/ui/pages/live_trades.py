@@ -13,6 +13,7 @@ from ...core.types import MarketAnalysisStatus, OrderRecommendation, OrderStatus
 from ...core.utils import get_expert_instance_from_id, get_market_analysis_id_from_order_id, get_account_instance_from_id, get_order_status_color, get_expert_options_for_ui
 from ...modules.accounts import providers
 from ...logger import logger
+from ..utils.TableCacheManager import TableCacheManager, AsyncTableLoader
 
 class LiveTradesTab:
     """Comprehensive transactions management tab with full control over positions."""
@@ -23,6 +24,9 @@ class LiveTradesTab:
         self.selected_transaction = None
         self.selected_transactions = {}  # Dictionary to track selected transaction IDs
         self.batch_operations_container = None
+        # Initialize cache manager for lazy loading
+        self.cache_manager = TableCacheManager("LiveTrades")
+        self.async_loader = None
         self.render()
 
     def _get_order_status_color(self, status):
@@ -133,11 +137,17 @@ class LiveTradesTab:
         logger.debug(f"[POPULATE] Populated expert filter with {len(expert_options)} options")
 
     def _refresh_transactions(self):
-        """Refresh the transactions table."""
+        """Refresh the transactions table with async loading and caching."""
         logger.debug("[REFRESH] _refresh_transactions() - Updating table rows")
 
         # Refresh expert filter options (in case new experts were added)
         self._populate_expert_filter()
+
+        # Invalidate cache if filters changed
+        filter_state = self._get_filter_state()
+        if self.cache_manager.should_invalidate_cache(filter_state):
+            logger.debug("[REFRESH] Filters changed, invalidating cache")
+            self.cache_manager.invalidate_cache()
 
         # If table doesn't exist yet, create it
         if not self.transactions_table:
@@ -147,25 +157,62 @@ class LiveTradesTab:
                 self._render_transactions_table()
             return
 
-        # Otherwise, just update the rows data
+        # Otherwise, async load and update the rows data
         try:
-            new_rows = self._get_transactions_data()
-            logger.debug(f"[REFRESH] Updating table with {len(new_rows)} rows")
-
-            # Update the table rows
-            self.transactions_table.rows.clear()
-            self.transactions_table.rows.extend(new_rows)
-            # Note: In NiceGUI 3.0+, .update() is automatic when modifying table.rows
-            # self.transactions_table.update()  # Not needed in 3.0+
-
-            logger.debug("[REFRESH] _refresh_transactions() - Complete")
+            # Run async load in background
+            asyncio.create_task(self._async_refresh_transactions())
+            logger.debug("[REFRESH] Async refresh task started")
         except Exception as e:
-            logger.error(f"Error refreshing transactions table: {e}", exc_info=True)
-            # If update fails, recreate the table
-            logger.debug("[REFRESH] Update failed, recreating table")
-            self.transactions_container.clear()
-            with self.transactions_container:
-                self._render_transactions_table()
+            logger.error(f"Error starting async refresh: {e}", exc_info=True)
+            # Fallback to sync refresh
+            try:
+                new_rows = self._get_transactions_data()
+                logger.debug(f"[REFRESH] Updating table with {len(new_rows)} rows")
+                self.transactions_table.rows.clear()
+                self.transactions_table.rows.extend(new_rows)
+                logger.debug("[REFRESH] _refresh_transactions() - Complete")
+            except Exception as e2:
+                logger.error(f"Error in fallback refresh: {e2}", exc_info=True)
+                logger.debug("[REFRESH] Fallback failed, recreating table")
+                self.transactions_container.clear()
+                with self.transactions_container:
+                    self._render_transactions_table()
+    
+    async def _async_refresh_transactions(self):
+        """Async transaction refresh with cache and progressive loading."""
+        try:
+            filter_state = self._get_filter_state()
+            
+            # Use cache manager to get data (fetches only if filters changed)
+            new_rows, _ = await self.cache_manager.get_data(
+                fetch_func=self._get_transactions_data,
+                filter_state=filter_state
+            )
+            
+            if not new_rows:
+                self.transactions_table.rows = []
+                return
+            
+            # Use async loader for progressive rendering on large datasets
+            if not self.async_loader and self.transactions_table:
+                self.async_loader = AsyncTableLoader(self.transactions_table, batch_size=50)
+            
+            if self.async_loader:
+                await self.async_loader.load_rows_async(new_rows)
+            else:
+                self.transactions_table.rows = new_rows
+            
+            logger.debug(f"[ASYNC] Transaction table refreshed with {len(new_rows)} rows")
+        except Exception as e:
+            logger.error(f"Error in async refresh: {e}", exc_info=True)
+    
+    def _get_filter_state(self) -> tuple:
+        """Get current filter state as hashable tuple for cache invalidation."""
+        status_values = tuple(sorted(self.status_filter.value if hasattr(self, 'status_filter') and self.status_filter.value else []))
+        expert_value = self.expert_filter.value if hasattr(self, 'expert_filter') else 'All'
+        symbol_value = self.symbol_filter.value if hasattr(self, 'symbol_filter') else ''
+        broker_order_value = self.broker_order_id_filter.value if hasattr(self, 'broker_order_id_filter') else ''
+        return (status_values, expert_value, symbol_value, broker_order_value)
 
     def _force_refresh_account_now(self):
         """Force an immediate account refresh (non-blocking)."""
