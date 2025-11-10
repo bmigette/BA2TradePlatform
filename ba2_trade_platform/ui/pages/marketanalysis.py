@@ -1652,14 +1652,10 @@ class ScheduledJobsTab:
             ui.label('Scheduled Analysis Jobs').classes('text-lg font-bold')
             ui.label('View all scheduled analysis jobs for the current week').classes('text-sm text-gray-600 mb-4')
             
-            # Weekly calendar view container (will be populated async)
+            # Weekly calendar view container
             self.calendar_container = ui.column().classes('w-full')
             with self.calendar_container:
-                with ui.card().classes('w-full mb-4 p-3'):
-                    with ui.row().classes('w-full items-center gap-2'):
-                        ui.label('Weekly Schedule Overview').classes('text-md font-bold')
-                        ui.spinner('dots').classes('ml-auto')
-                    ui.label('Loading schedule...').classes('text-sm text-gray-500')
+                self._create_weekly_calendar()
             
             ui.separator().classes('my-4')
             
@@ -1720,26 +1716,11 @@ class ScheduledJobsTab:
             with self.pagination_container:
                 self._create_pagination_controls()
         
-        # Start loading calendar and table data asynchronously
-        asyncio.create_task(self._async_load_calendar())
+        # Start loading table data asynchronously (not calendar - it renders immediately)
         asyncio.create_task(self._async_load_scheduled_jobs_table())
         
         # Start auto-refresh
         self.start_auto_refresh()
-
-    async def _async_load_calendar(self):
-        """Load calendar data asynchronously."""
-        try:
-            logger.debug("[ScheduledJobs] Starting async calendar load")
-            await asyncio.to_thread(self._create_weekly_calendar)
-            logger.debug("[ScheduledJobs] Calendar loaded successfully")
-        except Exception as e:
-            logger.error(f"[ScheduledJobs] Error loading calendar: {e}", exc_info=True)
-            self.calendar_container.clear()
-            with self.calendar_container:
-                with ui.card().classes('w-full mb-4 p-3'):
-                    ui.label('Error Loading Schedule').classes('text-md font-bold text-red-600')
-                    ui.label(f'Failed to load schedule: {str(e)}').classes('text-sm text-gray-600')
 
     async def _async_load_scheduled_jobs_table(self):
         """Load scheduled jobs table asynchronously."""
@@ -1776,8 +1757,7 @@ class ScheduledJobsTab:
                     ui.button('Retry', on_click=lambda: asyncio.create_task(self._async_load_scheduled_jobs_table()))
 
     def _start_async_refresh(self):
-        """Start async refresh of calendar and table."""
-        asyncio.create_task(self._async_load_calendar())
+        """Start async refresh of table only."""
         asyncio.create_task(self._async_load_scheduled_jobs_table())
 
     def _create_weekly_calendar(self):
@@ -2423,7 +2403,6 @@ class ScheduledJobsTab:
     def refresh_data(self):
         """Refresh the scheduled jobs data asynchronously."""
         try:
-            asyncio.create_task(self._async_load_calendar())
             asyncio.create_task(self._async_load_scheduled_jobs_table())
         except Exception as e:
             logger.error(f"Error starting scheduled jobs refresh: {e}", exc_info=True)
