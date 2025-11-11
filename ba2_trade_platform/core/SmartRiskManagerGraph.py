@@ -29,7 +29,8 @@ from .models import SmartRiskManagerJob, MarketAnalysis
 from .db import get_db, add_instance, update_instance, get_instance
 from .models import AppSetting
 from .SmartRiskManagerToolkit import SmartRiskManagerToolkit
-from .utils import get_expert_instance_from_id
+from .utils import get_expert_instance_from_id, get_setting_with_interface_default
+from .interfaces import MarketExpertInterface
 
 
 # ==================== DEBUG CALLBACK ====================
@@ -504,10 +505,10 @@ You have full access to these research tools - use them freely and repeatedly:
   * output_key: Key of the output to retrieve (e.g., 'final_trade_decision', 'technical_analysis')
   * Returns: Dict with analysis_id, output_key, and full content
 
-- **get_analysis_outputs_batch_tool(analysis_ids: List[int], output_keys: List[str], max_tokens: int = 100000)** - Efficiently fetch multiple outputs at once (RECOMMENDED for speed)
+- **get_analysis_outputs_batch_tool(analysis_ids: List[int], output_keys: List[str], max_tokens: int = 50000)** - Efficiently fetch multiple outputs at once (RECOMMENDED for speed)
   * analysis_ids: List of MarketAnalysis IDs to fetch from (e.g., [123, 124, 125])
   * output_keys: List of output keys to fetch from each analysis (e.g., ["analysis_summary", "market_report"])
-  * max_tokens: Maximum tokens in response (default: 100000)
+  * max_tokens: Maximum tokens in response (default: 50000)
   * Returns: Dict with outputs list, truncated status, and metadata
 
 - **get_all_recent_analyses_tool(max_age_hours: int = 72)** - Get ALL recent analyses across all symbols without filtering
@@ -1008,7 +1009,7 @@ def create_toolkit_tools(toolkit: SmartRiskManagerToolkit) -> List:
     
     @tool
     @smart_risk_manager_tool
-    def get_analysis_outputs_batch_tool(analysis_ids: List[int], output_keys: List[str], max_tokens: int = 100000) -> Dict[str, Any]:
+    def get_analysis_outputs_batch_tool(analysis_ids: List[int], output_keys: List[str], max_tokens: int = 50000) -> Dict[str, Any]:
         """Fetch multiple analysis outputs efficiently in a single call.
         
         Use this instead of calling get_analysis_output_detail_tool multiple times.
@@ -1211,7 +1212,7 @@ def initialize_context(state: SmartRiskManagerState) -> Dict[str, Any]:
             "enable_buy": settings.get("enable_buy", True),
             "enable_sell": settings.get("enable_sell", True),
             "enabled_instruments": expert.get_enabled_instruments() if hasattr(expert, 'get_enabled_instruments') else [],
-            "max_virtual_equity_per_instrument_percent": settings.get("max_virtual_equity_per_instrument_percent", 100.0)
+            "max_virtual_equity_per_instrument_percent": get_setting_with_interface_default(settings, MarketExpertInterface, "max_virtual_equity_per_instrument_percent")
         }
         
         # Create toolkit
@@ -1713,9 +1714,12 @@ def initialize_research_agent(state: SmartRiskManagerState) -> Dict[str, Any]:
         portfolio_status = state["portfolio_status"]
         
         # Calculate position size limits
-        # CRITICAL: Use available_balance, not virtual_equity, to ensure we don't exceed available cash
-        max_position_pct = expert_settings.get("max_virtual_equity_per_instrument_percent", 100.0)
-        current_equity = float(portfolio_status.get("account_available_balance", 0))
+        # Use account_virtual_equity (expert's total allocation), not available_balance
+        # Virtual equity = account_balance * virtual_equity_pct (e.g., 5% of total)
+        # Available balance = virtual_equity - already_deployed_trades
+        # Position sizing should be against virtual_equity (the expert's allocation)
+        max_position_pct = get_setting_with_interface_default(expert_settings, MarketExpertInterface, "max_virtual_equity_per_instrument_percent")
+        current_equity = float(portfolio_status.get("account_virtual_equity", 0))
         max_position_equity = current_equity * (max_position_pct / 100.0)
         
         # Create toolkit
@@ -1826,7 +1830,7 @@ def create_research_tools(toolkit: SmartRiskManagerToolkit, recommended_actions_
     def get_analysis_outputs_batch_tool(
         analysis_ids: Annotated[List[int], "List of MarketAnalysis IDs to fetch from (e.g., [123, 124, 125])"],
         output_keys: Annotated[List[str], "List of output keys to fetch from each analysis (e.g., ['analysis_summary', 'market_report'])"],
-        max_tokens: Annotated[Optional[int], "Maximum tokens in response (default: 100000)"] = None
+        max_tokens: Annotated[Optional[int], "Maximum tokens in response (default: 50000)"] = None
     ) -> Dict[str, Any]:
         """Fetch multiple analysis outputs efficiently in a single call.
         
@@ -1837,7 +1841,7 @@ def create_research_tools(toolkit: SmartRiskManagerToolkit, recommended_actions_
         Args:
             analysis_ids: List of MarketAnalysis IDs to fetch from (e.g., [123, 124, 125])
             output_keys: List of output keys to fetch from each analysis (e.g., ["analysis_summary", "market_report"])
-            max_tokens: Maximum tokens in response (default: 100000)
+            max_tokens: Maximum tokens in response (default: 50000)
             
         Returns:
             Dictionary with outputs, truncated status, and metadata
@@ -1851,7 +1855,7 @@ def create_research_tools(toolkit: SmartRiskManagerToolkit, recommended_actions_
         """
         # Use default value if None is passed
         if max_tokens is None:
-            max_tokens = 100000
+            max_tokens = 50000
         return toolkit.get_analysis_outputs_batch(analysis_ids, output_keys, max_tokens)
     
     @tool
@@ -2197,9 +2201,12 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
         max_iterations = state["max_iterations"]
         
         # Calculate position size limits
-        # CRITICAL: Use available_balance, not virtual_equity, to ensure we don't exceed available cash
-        max_position_pct = expert_settings.get("max_virtual_equity_per_instrument_percent", 100.0)
-        current_equity = float(portfolio_status.get("account_available_balance", 0))
+        # Use account_virtual_equity (expert's total allocation), not available_balance
+        # Virtual equity = account_balance * virtual_equity_pct (e.g., 5% of total)
+        # Available balance = virtual_equity - already_deployed_trades
+        # Position sizing should be against virtual_equity (the expert's allocation)
+        max_position_pct = get_setting_with_interface_default(expert_settings, MarketExpertInterface, "max_virtual_equity_per_instrument_percent")
+        current_equity = float(portfolio_status.get("account_virtual_equity", 0))
         max_position_equity = current_equity * (max_position_pct / 100.0)
         
         # Create toolkit
@@ -2251,7 +2258,7 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
         def get_analysis_outputs_batch_tool(
             analysis_ids: Annotated[List[int], "List of MarketAnalysis IDs to fetch from (e.g., [123, 124, 125])"],
             output_keys: Annotated[List[str], "List of output keys to fetch from each analysis (e.g., ['analysis_summary', 'market_report'])"],
-            max_tokens: Annotated[Optional[int], "Maximum tokens in response (default: 100000)"] = None
+            max_tokens: Annotated[Optional[int], "Maximum tokens in response (default: 50000)"] = None
         ) -> Dict[str, Any]:
             """Fetch multiple analysis outputs efficiently in a single call.
             
@@ -2262,7 +2269,7 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             Args:
                 analysis_ids: List of MarketAnalysis IDs to fetch from (e.g., [123, 124, 125])
                 output_keys: List of output keys to fetch from each analysis (e.g., ["analysis_summary", "market_report"])
-                max_tokens: Maximum tokens in response (default: 100000)
+                max_tokens: Maximum tokens in response (default: 50000)
                 
             Returns:
                 Dictionary with outputs, truncated status, and metadata
@@ -2276,7 +2283,7 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             """
             # Use default value if None is passed
             if max_tokens is None:
-                max_tokens = 100000
+                max_tokens = 50000
             return toolkit.get_analysis_outputs_batch(analysis_ids, output_keys, max_tokens)
         
         @tool
@@ -3205,11 +3212,11 @@ class SmartRiskManagerGraph:
         def get_analysis_outputs_batch_tool(
             analysis_ids: Annotated[List[int], "List of MarketAnalysis IDs"],
             output_keys: Annotated[List[str], "List of output keys to fetch"],
-            max_tokens: Annotated[Optional[int], "Maximum tokens (default: 100000)"] = None
+            max_tokens: Annotated[Optional[int], "Maximum tokens (default: 50000)"] = None
         ) -> Dict[str, Any]:
             """Fetch multiple analysis outputs efficiently in a single call."""
             if max_tokens is None:
-                max_tokens = 100000
+                max_tokens = 50000
             return self.toolkit.get_analysis_outputs_batch(analysis_ids, output_keys, max_tokens)
         
         @tool
@@ -3426,9 +3433,12 @@ class SmartRiskManagerGraph:
             portfolio_status = state["portfolio_status"]
             
             # Calculate position size limits
-            # CRITICAL: Use available_balance, not virtual_equity, to ensure we don't exceed available cash
-            max_position_pct = expert_settings.get("max_virtual_equity_per_instrument_percent", 100.0)
-            current_equity = float(portfolio_status.get("account_available_balance", 0))
+            # Use account_virtual_equity (expert's total allocation), not available_balance
+            # Virtual equity = account_balance * virtual_equity_pct (e.g., 5% of total)
+            # Available balance = virtual_equity - already_deployed_trades
+            # Position sizing should be against virtual_equity (the expert's allocation)
+            max_position_pct = get_setting_with_interface_default(expert_settings, MarketExpertInterface, "max_virtual_equity_per_instrument_percent")
+            current_equity = float(portfolio_status.get("account_virtual_equity", 0))
             max_position_equity = current_equity * (max_position_pct / 100.0)
             
             # Get expert-specific instructions

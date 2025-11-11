@@ -1074,7 +1074,12 @@ class WorkerQueue:
                 
                 # Update duration
                 if smart_risk_job.run_date:
-                    duration = (datetime.now(timezone.utc) - smart_risk_job.run_date).total_seconds()
+                    # Ensure run_date is timezone-aware (handle legacy data)
+                    if smart_risk_job.run_date.tzinfo is None:
+                        run_date_utc = smart_risk_job.run_date.replace(tzinfo=timezone.utc)
+                    else:
+                        run_date_utc = smart_risk_job.run_date
+                    duration = (datetime.now(timezone.utc) - run_date_utc).total_seconds()
                     smart_risk_job.duration_seconds = int(duration)
                 
                 logger.info(f"SmartRiskManagerJob {job_id} completed successfully: {result.get('iterations', 0)} iterations, {result.get('actions_count', 0)} actions")
@@ -1115,7 +1120,12 @@ class WorkerQueue:
                         
                         # Update duration
                         if smart_risk_job.run_date:
-                            duration = (datetime.now(timezone.utc) - smart_risk_job.run_date).total_seconds()
+                            # Ensure run_date is timezone-aware (handle legacy data)
+                            if smart_risk_job.run_date.tzinfo is None:
+                                run_date_utc = smart_risk_job.run_date.replace(tzinfo=timezone.utc)
+                            else:
+                                run_date_utc = smart_risk_job.run_date
+                            duration = (datetime.now(timezone.utc) - run_date_utc).total_seconds()
                             smart_risk_job.duration_seconds = int(duration)
                         
                         update_instance(smart_risk_job)

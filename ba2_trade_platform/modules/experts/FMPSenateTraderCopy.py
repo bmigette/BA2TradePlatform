@@ -465,7 +465,7 @@ class FMPSenateTraderCopy(MarketExpertInterface):
                     TradingOrder.symbol == symbol,
                     TradingOrder.status.in_([
                         OrderStatus.PENDING,
-                        OrderStatus.SUBMITTED,
+                        OrderStatus.NEW,
                         OrderStatus.PARTIALLY_FILLED,
                         OrderStatus.FILLED
                     ])

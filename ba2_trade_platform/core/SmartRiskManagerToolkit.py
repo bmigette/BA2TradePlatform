@@ -17,7 +17,8 @@ from .models import (
 )
 from .types import TransactionStatus, OrderStatus, OrderType, OrderDirection, MarketAnalysisStatus, OrderOpenType
 from .db import get_db, get_instance, add_instance
-from .utils import get_expert_instance_from_id, get_account_instance_from_id
+from .utils import get_expert_instance_from_id, get_account_instance_from_id, get_setting_with_interface_default
+from .interfaces import MarketExpertInterface
 
 
 class SmartRiskManagerToolkit:
@@ -773,7 +774,7 @@ class SmartRiskManagerToolkit:
             List[str],
             "List of output keys to fetch for each analysis (e.g., ['analysis_summary', 'market_report'])"
         ],
-        max_tokens: Annotated[int, "Maximum tokens in response (approximate, using 4 chars/token)"] = 100000
+        max_tokens: Annotated[int, "Maximum tokens in response (approximate, using 4 chars/token)"] = 50000
     ) -> Dict[str, Any]:
         """
         Fetch multiple analysis outputs in a single call with automatic truncation.
@@ -1926,7 +1927,7 @@ class SmartRiskManagerToolkit:
             
             # Check position size limits and adjust if necessary
             settings = self.expert.settings
-            max_position_pct = settings.get("max_virtual_equity_per_instrument_percent", 100.0)
+            max_position_pct = get_setting_with_interface_default(settings, MarketExpertInterface, "max_virtual_equity_per_instrument_percent")
             max_position_value = virtual_equity * (max_position_pct / 100.0)
             
             original_quantity = quantity
@@ -1983,9 +1984,10 @@ class SmartRiskManagerToolkit:
                 comment=f"New position: {reason}"
             )
             
-            # Submit order
+            # Submit order with TP/SL as bracket order if provided
             try:
-                submitted_order = self.account.submit_order(entry_order)
+                # Pass TP/SL prices to submit_order for bracket order creation
+                submitted_order = self.account.submit_order(entry_order, tp_price=tp_price, sl_price=sl_price)
                 
                 if not submitted_order or not submitted_order.id:
                     # Mark transaction as FAILED if order submission failed
@@ -2104,18 +2106,29 @@ class SmartRiskManagerToolkit:
                         if success:
                             tp_created = True
                             sl_created = True
+                        else:
+                            error_msg = "adjust_tp_sl() returned False - likely entry order not yet filled"
+                            logger.warning(error_msg)
+                            tp_warning = error_msg
+                            sl_warning = error_msg
                     elif tp_price and tp_valid:
                         # Set TP only
                         logger.info(f"Adjusting TP to {tp_price:.2f} using account.adjust_tp()")
                         success = self.account.adjust_tp(transaction, tp_price)
                         if success:
                             tp_created = True
+                        else:
+                            tp_warning = "adjust_tp() returned False - likely entry order not yet filled"
+                            logger.warning(tp_warning)
                     elif sl_price and sl_valid:
                         # Set SL only
                         logger.info(f"Adjusting SL to {sl_price:.2f} using account.adjust_sl()")
                         success = self.account.adjust_sl(transaction, sl_price)
                         if success:
                             sl_created = True
+                        else:
+                            sl_warning = "adjust_sl() returned False - likely entry order not yet filled"
+                            logger.warning(sl_warning)
                 except Exception as e:
                     error_msg = f"Failed to adjust TP/SL: {str(e)}"
                     logger.error(error_msg, exc_info=True)

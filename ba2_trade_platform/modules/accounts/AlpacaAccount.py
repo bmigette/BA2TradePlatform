@@ -2537,6 +2537,15 @@ class AlpacaAccount(AccountInterface):
                         need_oco
                     )
                 
+                elif entry_order.status in OrderStatus.get_unfilled_statuses():
+                    # Entry sent to broker but not filled yet - create triggered orders (OTO/OCO)
+                    return self._handle_submitted_entry_tpsl(
+                        session, transaction_in_session, entry_order,
+                        new_tp_price, new_sl_price,
+                        existing_tp, existing_sl, existing_oco,
+                        all_orders, need_oco
+                    )
+                
                 elif entry_order.status in OrderStatus.get_executed_statuses():
                     # Entry filled - work with broker
                     return self._handle_filled_entry_tpsl(
@@ -2767,6 +2776,140 @@ class AlpacaAccount(AccountInterface):
             if new_sl_price is not None:
                 success = success and self._create_broker_sl_order(session, transaction, entry_order, new_sl_price)
             return success
+    
+    def _handle_submitted_entry_tpsl(
+        self,
+        session: Session,
+        transaction: Transaction,
+        entry_order: TradingOrder,
+        new_tp_price: float | None,
+        new_sl_price: float | None,
+        existing_tp: TradingOrder | None,
+        existing_sl: TradingOrder | None,
+        existing_oco: TradingOrder | None,
+        all_orders: list,
+        need_oco: bool
+    ) -> bool:
+        """Handle TP/SL adjustment when entry order is submitted but not yet filled (PENDING_NEW, OPEN, etc.)."""
+        
+        logger.info(f"Creating triggered TP/SL orders for submitted entry order {entry_order.id} in state {entry_order.status}")
+        
+        # Cancel ALL existing TP/SL/OCO orders before creating triggered ones
+        orders_to_cancel = []
+        if existing_tp:
+            orders_to_cancel.append(existing_tp)
+        if existing_sl:
+            orders_to_cancel.append(existing_sl)
+        if existing_oco:
+            orders_to_cancel.append(existing_oco)
+        
+        # Also check for any other non-terminal TP/SL orders we might have missed
+        for order in all_orders:
+            if order not in orders_to_cancel and order.id not in [
+                existing_tp.id if existing_tp else None,
+                existing_sl.id if existing_sl else None,
+                existing_oco.id if existing_oco else None
+            ]:
+                orders_to_cancel.append(order)
+        
+        if orders_to_cancel:
+            logger.info(f"Cancelling {len(orders_to_cancel)} existing TP/SL/OCO orders before creating triggered ones")
+            for order in orders_to_cancel:
+                if order.broker_order_id:
+                    # Order at broker - cancel via API
+                    try:
+                        self.cancel_order(order.id)
+                        logger.info(f"Cancelled broker order {order.id} (broker_id={order.broker_order_id})")
+                    except Exception as e:
+                        logger.warning(f"Failed to cancel broker order {order.id}: {e}")
+                else:
+                    # Pending order - just mark as cancelled in DB
+                    order.status = OrderStatus.CANCELED
+                    session.add(order)
+                    logger.info(f"Cancelled pending order {order.id}")
+            session.commit()
+        
+        # Create triggered order(s) in database only - they'll be submitted when entry order fills
+        if need_oco:
+            # Create triggered OCO order with both TP and SL
+            oco_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
+            oco_comment = self._generate_tpsl_comment("TPSL", self.id, transaction.id, entry_order.id)
+            oco_order = TradingOrder(
+                account_id=self.id,
+                symbol=entry_order.symbol,
+                quantity=entry_order.quantity,
+                side=oco_side,
+                order_type=CoreOrderType.OCO,
+                limit_price=new_tp_price,
+                stop_price=new_sl_price,
+                transaction_id=transaction.id,
+                status=OrderStatus.PENDING,
+                depends_on_order=entry_order.id,
+                depends_order_status_trigger=OrderStatus.FILLED,
+                open_type=OrderOpenType.AUTOMATIC,
+                comment=oco_comment,
+                data={
+                    "tp_percent_target": self._calculate_tp_percent(entry_order, new_tp_price) if new_tp_price else 0,
+                    "sl_percent_target": self._calculate_sl_percent(entry_order, new_sl_price) if new_sl_price else 0
+                },
+                created_at=datetime.now(timezone.utc)
+            )
+            session.add(oco_order)
+            session.commit()
+            logger.info(f"Created triggered OCO order {oco_order.id} waiting for entry order {entry_order.id} to fill")
+        else:
+            # Create separate triggered TP and/or SL orders
+            success = True
+            
+            if new_tp_price is not None:
+                tp_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
+                tp_order_type = CoreOrderType.SELL_LIMIT if tp_side == OrderDirection.SELL else CoreOrderType.BUY_LIMIT
+                tp_comment = self._generate_tpsl_comment("TP", self.id, transaction.id, entry_order.id)
+                tp_order = TradingOrder(
+                    account_id=self.id,
+                    symbol=entry_order.symbol,
+                    quantity=entry_order.quantity,
+                    side=tp_side,
+                    order_type=tp_order_type,
+                    limit_price=new_tp_price,
+                    transaction_id=transaction.id,
+                    status=OrderStatus.PENDING,
+                    depends_on_order=entry_order.id,
+                    depends_order_status_trigger=OrderStatus.FILLED,
+                    open_type=OrderOpenType.AUTOMATIC,
+                    comment=tp_comment,
+                    data={"tp_percent_target": self._calculate_tp_percent(entry_order, new_tp_price)},
+                    created_at=datetime.now(timezone.utc)
+                )
+                session.add(tp_order)
+                logger.info(f"Created triggered TP order {tp_order.id} waiting for entry order {entry_order.id} to fill")
+                
+            if new_sl_price is not None:
+                sl_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
+                sl_comment = self._generate_tpsl_comment("SL", self.id, transaction.id, entry_order.id)
+                sl_order = TradingOrder(
+                    account_id=self.id,
+                    symbol=entry_order.symbol,
+                    quantity=entry_order.quantity,
+                    side=sl_side,
+                    order_type=CoreOrderType.STOP,
+                    stop_price=new_sl_price,
+                    transaction_id=transaction.id,
+                    status=OrderStatus.PENDING,
+                    depends_on_order=entry_order.id,
+                    depends_order_status_trigger=OrderStatus.FILLED,
+                    open_type=OrderOpenType.AUTOMATIC,
+                    comment=sl_comment,
+                    data={"sl_percent_target": self._calculate_sl_percent(entry_order, new_sl_price)},
+                    created_at=datetime.now(timezone.utc)
+                )
+                session.add(sl_order)
+                logger.info(f"Created triggered SL order {sl_order.id} waiting for entry order {entry_order.id} to fill")
+                
+            session.commit()
+            
+        logger.info(f"Successfully created triggered TP/SL orders for submitted entry order {entry_order.id}")
+        return True
     
     def adjust_tp(self, transaction: Transaction, new_tp_price: float) -> bool:
         """
