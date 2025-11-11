@@ -1713,8 +1713,9 @@ def initialize_research_agent(state: SmartRiskManagerState) -> Dict[str, Any]:
         portfolio_status = state["portfolio_status"]
         
         # Calculate position size limits
+        # CRITICAL: Use available_balance, not virtual_equity, to ensure we don't exceed available cash
         max_position_pct = expert_settings.get("max_virtual_equity_per_instrument_percent", 100.0)
-        current_equity = float(portfolio_status.get("account_virtual_equity", 0))
+        current_equity = float(portfolio_status.get("account_available_balance", 0))
         max_position_equity = current_equity * (max_position_pct / 100.0)
         
         # Create toolkit
@@ -2196,8 +2197,9 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
         max_iterations = state["max_iterations"]
         
         # Calculate position size limits
+        # CRITICAL: Use available_balance, not virtual_equity, to ensure we don't exceed available cash
         max_position_pct = expert_settings.get("max_virtual_equity_per_instrument_percent", 100.0)
-        current_equity = float(portfolio_status.get("account_virtual_equity", 0))
+        current_equity = float(portfolio_status.get("account_available_balance", 0))
         max_position_equity = current_equity * (max_position_pct / 100.0)
         
         # Create toolkit
@@ -3424,8 +3426,9 @@ class SmartRiskManagerGraph:
             portfolio_status = state["portfolio_status"]
             
             # Calculate position size limits
+            # CRITICAL: Use available_balance, not virtual_equity, to ensure we don't exceed available cash
             max_position_pct = expert_settings.get("max_virtual_equity_per_instrument_percent", 100.0)
-            current_equity = float(portfolio_status.get("account_virtual_equity", 0))
+            current_equity = float(portfolio_status.get("account_available_balance", 0))
             max_position_equity = current_equity * (max_position_pct / 100.0)
             
             # Get expert-specific instructions
