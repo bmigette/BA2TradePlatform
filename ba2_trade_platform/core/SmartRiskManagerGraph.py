@@ -25,7 +25,7 @@ import langchain
 
 from ..logger import logger
 from .. import config as config_module
-from .models import SmartRiskManagerJob, MarketAnalysis
+from .models import SmartRiskManagerJob, MarketAnalysis, Transaction
 from .db import get_db, add_instance, update_instance, get_instance
 from .models import AppSetting
 from .SmartRiskManagerToolkit import SmartRiskManagerToolkit
@@ -578,6 +578,7 @@ You have full access to these research tools - use them freely and repeatedly:
   * sl_price: Optional stop loss price level
   * Use when: Strong buying opportunity identified
   * Returns: Confirmation with total action count
+  * **CRITICAL: TP/SL are set automatically when you provide tp_price/sl_price parameters. DO NOT call separate recommend_update_take_profit() or recommend_update_stop_loss() after opening a position - this creates duplicate orders!**
 
 - **recommend_open_sell_position(symbol: str, quantity: int, reason: str, confidence: int, tp_price: float = None, sl_price: float = None)** - Recommend opening a new SELL (short) position
   * symbol: Instrument symbol to sell short (e.g., 'AAPL', 'MSFT')
@@ -588,6 +589,7 @@ You have full access to these research tools - use them freely and repeatedly:
   * sl_price: Optional stop loss price level
   * Use when: Strong short-selling opportunity identified
   * Returns: Confirmation with total action count
+  * **CRITICAL: TP/SL are set automatically when you provide tp_price/sl_price parameters. DO NOT call separate recommend_update_take_profit() or recommend_update_stop_loss() after opening a position - this creates duplicate orders!**
 
 **Summary Tool (MANDATORY - call this last):**
 - **finish_research_tool(summary: str)** - **REQUIRED**: Call this last with your summary after recommending actions
@@ -671,6 +673,35 @@ Want to short AAPL (opposite direction):
 - Harder to track total exposure to a single symbol
 - Opposite direction positions (long + short) create confusing hedged positions
 - The action node should not have to manage duplicate positions
+
+## 🚨 CRITICAL: AVOID DUPLICATE TP/SL CALLS 🚨
+**NEVER call separate TP/SL adjustment tools after opening a position with TP/SL parameters:**
+
+**❌ WRONG WORKFLOW - Creates Duplicate Orders:**
+```
+Step 1: recommend_open_buy_position(symbol="AAPL", quantity=10, tp_price=200.0, sl_price=150.0, ...)
+Step 2: recommend_update_take_profit(transaction_id=XXX, new_tp_price=200.0, ...) ← DUPLICATE!
+Step 3: recommend_update_stop_loss(transaction_id=XXX, new_sl_price=150.0, ...)   ← DUPLICATE!
+```
+**This creates 3 separate TP/SL orders for the same position, causing order cancellations and confusion.**
+
+**✅ CORRECT WORKFLOW - Single TP/SL Creation:**
+```
+# Option 1: Include TP/SL in position opening (RECOMMENDED)
+recommend_open_buy_position(symbol="AAPL", quantity=10, tp_price=200.0, sl_price=150.0, reason="...", confidence=75)
+
+# Option 2: Open position without TP/SL, then set them separately
+recommend_open_buy_position(symbol="AAPL", quantity=10, reason="...", confidence=75)
+recommend_update_take_profit(transaction_id=XXX, new_tp_price=200.0, reason="...", confidence=75)
+recommend_update_stop_loss(transaction_id=XXX, new_sl_price=150.0, reason="...", confidence=75)
+```
+
+**REMEMBER**: When you specify `tp_price` and `sl_price` in `recommend_open_buy_position()` or `recommend_open_sell_position()`, the TP/SL orders are created automatically. DO NOT make additional calls to set the same levels.
+
+**Only use separate TP/SL adjustment tools when:**
+- ✅ Modifying EXISTING positions that already have TP/SL levels
+- ✅ Adding TP/SL to positions that were opened without them
+- ✅ Changing TP/SL levels based on new market conditions
 
 ## CRITICAL: USE DEDICATED RECOMMENDATION TOOLS
 **DO NOT just write action recommendations in text.** You MUST call the specific recommendation tools.
@@ -778,6 +809,7 @@ You have access to these trading tools. Call them directly to execute actions:
   * sl_price: Optional stop loss price (must be below entry price)
   * reason: Explanation for opening this position (for audit trail)
   * Returns: Dict with success, message, transaction_id, order_id, symbol, quantity, direction
+  * **CRITICAL: When you provide tp_price/sl_price, TP/SL orders are created automatically. DO NOT call update_take_profit() or update_stop_loss() afterwards - this creates duplicate orders!**
 
 - **open_sell_position(symbol: str, quantity: float, tp_price: float = None, sl_price: float = None, reason: str = "")** - Open new SHORT (SELL) position {open_position_note}
   * symbol: Instrument symbol to sell short
@@ -786,6 +818,7 @@ You have access to these trading tools. Call them directly to execute actions:
   * sl_price: Optional stop loss price (must be above entry price)
   * reason: Explanation for opening this position (for audit trail)
   * Returns: Dict with success, message, transaction_id, order_id, symbol, quantity, direction
+  * **CRITICAL: When you provide tp_price/sl_price, TP/SL orders are created automatically. DO NOT call update_take_profit() or update_stop_loss() afterwards - this creates duplicate orders!**
 
 **Price Information:**
 - **get_current_price(symbol: str)** - Get current bid price for an instrument
@@ -861,6 +894,30 @@ Want to short AAPL (opposite direction):
 - Harder to track total exposure to a single symbol
 - Opposite direction positions (long + short) create confusing hedged positions
 - Can lead to unexpected behavior when closing positions
+
+## 🚨 CRITICAL: AVOID DUPLICATE TP/SL CALLS 🚨
+**NEVER call separate TP/SL adjustment tools after opening a position with TP/SL parameters:**
+
+**❌ WRONG WORKFLOW - Creates Duplicate Orders:**
+```
+Step 1: open_buy_position(symbol="AAPL", quantity=10, tp_price=200.0, sl_price=150.0, ...)
+Step 2: update_take_profit(transaction_id=XXX, new_tp_price=200.0, ...)  ← DUPLICATE!
+Step 3: update_stop_loss(transaction_id=XXX, new_sl_price=150.0, ...)    ← DUPLICATE!
+```
+**This creates 3 separate TP/SL orders for the same position, causing order cancellations and confusion.**
+
+**✅ CORRECT WORKFLOW - Single TP/SL Creation:**
+```
+# Option 1: Include TP/SL in position opening (RECOMMENDED)
+open_buy_position(symbol="AAPL", quantity=10, tp_price=200.0, sl_price=150.0, reason="...")
+
+# Option 2: Open position without TP/SL, then set them separately
+open_buy_position(symbol="AAPL", quantity=10, reason="...")
+update_take_profit(transaction_id=XXX, new_tp_price=200.0, reason="...")
+update_stop_loss(transaction_id=XXX, new_sl_price=150.0, reason="...")
+```
+
+**REMEMBER**: When you specify `tp_price` and `sl_price` in `open_buy_position()` or `open_sell_position()`, the TP/SL orders are created automatically. DO NOT make additional calls to set the same levels.
 
 ## HANDLING FAILED ACTIONS - CRITICAL
 **If an action fails, CONTINUE with remaining actions:**
@@ -2848,8 +2905,62 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
         actions_log = state["actions_log"].copy()
         detailed_action_reports = []
         
-        # Execute each recommended action using toolkit methods directly (Pure Python - No LLM)
-        for idx, action in enumerate(recommended_actions):
+        # OPTIMIZATION: Group TP/SL actions by transaction_id to combine them into single adjust_tp_sl calls
+        tp_sl_grouped_actions = {}  # transaction_id -> {"tp_action": action, "sl_action": action}
+        other_actions = []
+        
+        for action in recommended_actions:
+            action_type = action.get("action_type")
+            if action_type in ["update_stop_loss", "update_take_profit"]:
+                transaction_id = action.get("parameters", {}).get("transaction_id")
+                if transaction_id:
+                    if transaction_id not in tp_sl_grouped_actions:
+                        tp_sl_grouped_actions[transaction_id] = {"tp_action": None, "sl_action": None}
+                    
+                    if action_type == "update_take_profit":
+                        tp_sl_grouped_actions[transaction_id]["tp_action"] = action
+                    else:  # update_stop_loss
+                        tp_sl_grouped_actions[transaction_id]["sl_action"] = action
+                else:
+                    # No transaction_id, treat as regular action
+                    other_actions.append(action)
+            else:
+                other_actions.append(action)
+        
+        # Convert grouped TP/SL actions back to optimized action list
+        optimized_actions = []
+        for transaction_id, grouped in tp_sl_grouped_actions.items():
+            tp_action = grouped["tp_action"]
+            sl_action = grouped["sl_action"]
+            
+            if tp_action and sl_action:
+                # Both TP and SL - combine into single adjust_tp_sl action
+                combined_action = {
+                    "action_type": "adjust_tp_sl",
+                    "parameters": {
+                        "transaction_id": transaction_id,
+                        "new_tp_price": tp_action["parameters"]["new_tp_price"],
+                        "new_sl_price": sl_action["parameters"]["new_sl_price"]
+                    },
+                    "reason": f"TP: {tp_action.get('reason', 'No reason')}, SL: {sl_action.get('reason', 'No reason')}",
+                    "confidence": max(tp_action.get("confidence", 0), sl_action.get("confidence", 0))
+                }
+                optimized_actions.append(combined_action)
+                logger.info(f"Optimization: Combined TP and SL adjustments for transaction {transaction_id} into single adjust_tp_sl call")
+            elif tp_action:
+                # Only TP
+                optimized_actions.append(tp_action)
+            elif sl_action:
+                # Only SL
+                optimized_actions.append(sl_action)
+        
+        # Add all other actions
+        optimized_actions.extend(other_actions)
+        
+        logger.info(f"Optimized {len(recommended_actions)} actions into {len(optimized_actions)} actions (combined TP/SL where possible)")
+        
+        # Execute each optimized action using toolkit methods directly (Pure Python - No LLM)
+        for idx, action in enumerate(optimized_actions):
                 action_type = action.get("action_type")
                 parameters = action.get("parameters", {})
                 reason = action.get("reason", "Recommended by research node")
@@ -2885,6 +2996,44 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
                         transaction_id = parameters["transaction_id"]
                         new_tp_price = parameters["new_tp_price"]
                         result = toolkit.update_take_profit(transaction_id, new_tp_price, reason)
+                        
+                    elif action_type == "adjust_tp_sl":
+                        # OPTIMIZATION: Combined TP/SL adjustment in single call
+                        transaction_id = parameters["transaction_id"]
+                        new_tp_price = parameters["new_tp_price"]
+                        new_sl_price = parameters["new_sl_price"]
+                        
+                        # Get transaction for adjust_tp_sl call
+                        with get_db() as session:
+                            transaction = session.get(Transaction, transaction_id)
+                            if transaction:
+                                result = toolkit.account.adjust_tp_sl(transaction, new_tp_price, new_sl_price)
+                                
+                                if result:
+                                    # Create success result dict matching other action formats
+                                    result = {
+                                        "success": True,
+                                        "message": f"Updated both TP to ${new_tp_price:.2f} and SL to ${new_sl_price:.2f}",
+                                        "transaction_id": transaction_id,
+                                        "old_tp_price": transaction.take_profit,
+                                        "new_tp_price": new_tp_price,
+                                        "old_sl_price": transaction.stop_loss,
+                                        "new_sl_price": new_sl_price
+                                    }
+                                    logger.info(f"Successfully updated both TP and SL for transaction {transaction_id}")
+                                else:
+                                    result = {
+                                        "success": False,
+                                        "message": f"Failed to update TP/SL for transaction {transaction_id} - likely entry order not yet filled",
+                                        "transaction_id": transaction_id
+                                    }
+                                    logger.warning(f"Failed to update TP/SL for transaction {transaction_id}")
+                            else:
+                                result = {
+                                    "success": False,
+                                    "message": f"Transaction {transaction_id} not found",
+                                    "transaction_id": transaction_id
+                                }
                         
                     elif action_type == "open_buy_position":
                         symbol = parameters["symbol"]
@@ -2942,6 +3091,15 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
                             new_tp = result.get('new_tp_price', 0)
                             old_tp_str = f"${old_tp:.2f}" if old_tp is not None else "None"
                             summary = f"Updated TP for transaction #{parameters.get('transaction_id')} from {old_tp_str} to ${new_tp:.2f}"
+                        elif action_type == "adjust_tp_sl":
+                            # Combined TP/SL adjustment summary
+                            old_tp = result.get('old_tp_price')
+                            new_tp = result.get('new_tp_price', 0)
+                            old_sl = result.get('old_sl_price')
+                            new_sl = result.get('new_sl_price', 0)
+                            old_tp_str = f"${old_tp:.2f}" if old_tp is not None else "None"
+                            old_sl_str = f"${old_sl:.2f}" if old_sl is not None else "None"
+                            summary = f"Updated TP/SL for transaction #{parameters.get('transaction_id')} from TP:{old_tp_str}/SL:{old_sl_str} to TP:${new_tp:.2f}/SL:${new_sl:.2f}"
                         else:
                             summary = result.get('message', 'Completed')
                     else:
@@ -2996,7 +3154,8 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
                     })
         
         # Build summary for recommended actions
-        summary_lines = [f"Executed {len(recommended_actions)} actions recommended by research node:"]
+        optimization_note = f" (optimized from {len(recommended_actions)} recommendations)" if len(optimized_actions) < len(recommended_actions) else ""
+        summary_lines = [f"Executed {len(optimized_actions)} actions{optimization_note}:"]
         for r in detailed_action_reports:
             tool_label = r.get("tool")
             if r.get("result"):
