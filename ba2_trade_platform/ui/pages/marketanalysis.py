@@ -466,7 +466,8 @@ class JobMonitoringTab:
     def _get_analysis_data(self) -> tuple[List[dict], int]:
         """Get analysis jobs data for the table with pagination and filtering.
         
-        OPTIMIZATION: Caches the entire filtered dataset to avoid recomputing on pagination changes.
+        OPTIMIZATION: Uses joins to avoid N+1 queries and eager-loads relationships.
+        Caches the entire filtered dataset to avoid recomputing on pagination changes.
         Only recomputes when filters actually change.
         """
         try:
@@ -477,42 +478,63 @@ class JobMonitoringTab:
                 
                 # Fetch and format ALL matching records (no pagination in query)
                 with get_db() as session:
-                    statement = select(MarketAnalysis)
+                    from sqlalchemy.orm import joinedload, selectinload
+                    from sqlalchemy import and_
+                    
+                    # Use eager loading to avoid N+1 queries
+                    statement = select(MarketAnalysis).options(
+                        selectinload(MarketAnalysis.expert_recommendations)
+                    )
                     
                     # Apply all filters
+                    filters = []
+                    
                     if self.status_filter != 'all':
-                        statement = statement.where(MarketAnalysis.status == MarketAnalysisStatus(self.status_filter))
+                        filters.append(MarketAnalysis.status == MarketAnalysisStatus(self.status_filter))
                     
                     if self.expert_filter != 'all':
-                        statement = statement.where(MarketAnalysis.expert_instance_id == int(self.expert_filter))
+                        filters.append(MarketAnalysis.expert_instance_id == int(self.expert_filter))
                     
                     if self.type_filter != 'all':
                         from ...core.types import AnalysisUseCase
                         if self.type_filter == 'enter_market':
-                            statement = statement.where(MarketAnalysis.subtype == AnalysisUseCase.ENTER_MARKET)
+                            filters.append(MarketAnalysis.subtype == AnalysisUseCase.ENTER_MARKET)
                         elif self.type_filter == 'open_positions':
-                            statement = statement.where(MarketAnalysis.subtype == AnalysisUseCase.OPEN_POSITIONS)
+                            filters.append(MarketAnalysis.subtype == AnalysisUseCase.OPEN_POSITIONS)
                     
                     if self.symbol_filter:
-                        statement = statement.where(MarketAnalysis.symbol.ilike(f"%{self.symbol_filter}%"))
+                        filters.append(MarketAnalysis.symbol.ilike(f"%{self.symbol_filter}%"))
                     
                     if self.recommendation_filter != 'all':
                         from ...core.types import OrderRecommendation
                         statement = statement.join(
                             ExpertRecommendation,
                             MarketAnalysis.id == ExpertRecommendation.market_analysis_id
-                        ).where(
+                        )
+                        filters.append(
                             ExpertRecommendation.recommended_action == OrderRecommendation[self.recommendation_filter]
-                        ).distinct()
+                        )
+                    
+                    # Apply all filters at once
+                    if filters:
+                        statement = statement.where(and_(*filters))
                     
                     # Order by newest first
                     statement = statement.order_by(MarketAnalysis.created_at.desc())
                     
                     # Fetch ALL matching records at once
-                    market_analyses = session.exec(statement).all()
+                    market_analyses = session.exec(statement).unique().all()
+                    
+                    # Pre-fetch expert instances for all records
+                    expert_ids = set(m.expert_instance_id for m in market_analyses)
+                    expert_instances = {}
+                    if expert_ids:
+                        stmt = select(ExpertInstance).where(ExpertInstance.id.in_(expert_ids))
+                        for expert in session.exec(stmt).all():
+                            expert_instances[expert.id] = expert
                     
                     # Process all records and cache them
-                    self.cached_analysis_data = self._format_analysis_records(market_analyses)
+                    self.cached_analysis_data = self._format_analysis_records(market_analyses, expert_instances)
                     self.cache_valid = True
             
             # Use cached data and apply pagination
@@ -534,13 +556,21 @@ class JobMonitoringTab:
             logger.error(f"Error getting analysis data: {e}", exc_info=True)
             return [], 0
     
-    def _format_analysis_records(self, market_analyses) -> List[dict]:
+    def _format_analysis_records(self, market_analyses, expert_instances=None) -> List[dict]:
         """Format raw market analysis records into displayable data.
+        
+        Args:
+            market_analyses: List of MarketAnalysis objects
+            expert_instances: Optional dict of expert_id -> ExpertInstance for avoiding N+1 queries
         
         Extracted to separate method so it can be called once per filter change,
         then cached for pagination operations.
         """
         analysis_data = []
+        
+        # Use provided expert instances or fetch them individually (slower)
+        if expert_instances is None:
+            expert_instances = {}
         
         status_icons = {
             'pending': '⏳',
@@ -559,9 +589,9 @@ class JobMonitoringTab:
         
         for analysis in market_analyses:
             try:
-                # Get expert instance info
+                # Get expert instance info - use pre-fetched if available
                 try:
-                    expert_instance = get_instance(ExpertInstance, analysis.expert_instance_id)
+                    expert_instance = expert_instances.get(analysis.expert_instance_id)
                     if expert_instance:
                         expert_alias = expert_instance.alias or expert_instance.expert
                         expert_name = f"{expert_alias}-{analysis.expert_instance_id}"
@@ -1069,9 +1099,9 @@ class JobMonitoringTab:
     def refresh_data(self):
         """Refresh the data in all tables."""
         try:
-            # Update analysis table asynchronously
+            # Update analysis table asynchronously - force fresh data fetch (bypass cache)
             if self.analysis_table:
-                asyncio.create_task(self._async_refresh_analysis_table())
+                asyncio.create_task(self._async_refresh_analysis_table(force_fresh=True))
             
             # Update Smart Risk Manager table
             if hasattr(self, 'smart_risk_table') and self.smart_risk_table:
@@ -1084,13 +1114,29 @@ class JobMonitoringTab:
         except Exception as e:
             logger.error(f"Error refreshing job monitoring data: {e}", exc_info=True)
     
-    async def _async_refresh_analysis_table(self):
-        """Asynchronously refresh analysis table data without blocking UI."""
+    async def _async_refresh_analysis_table(self, force_fresh: bool = False):
+        """Asynchronously refresh analysis table data without blocking UI.
+        
+        Args:
+            force_fresh: If True, always fetch fresh data from database (ignore cache).
+                        Used by auto-refresh timer to show current job status.
+        """
         try:
-            #logger.debug("[JobMonitoringTab] Starting async analysis table refresh")
+            # For auto-refresh (force_fresh=True), always invalidate cache to get current job status
+            if force_fresh:
+                logger.debug("[JobMonitoringTab] Auto-refresh: invalidating cache to get fresh job status")
+                self._invalidate_cache()
             
-            # Fetch data in background
-            analysis_data, total_records = await asyncio.to_thread(self._get_analysis_data)
+            # Check if filters changed - if not and cache valid, just re-paginate the cached data
+            if not self._should_invalidate_cache() and self.cached_analysis_data and not force_fresh:
+                # Filters didn't change, just use cached data
+                logger.debug("[JobMonitoringTab] Using cached analysis data (no filter changes)")
+                analysis_data, total_records = self._get_analysis_data()
+            else:
+                # Filters changed or cache empty or force_fresh - fetch fresh data in background
+                logger.debug("[JobMonitoringTab] Fetching fresh analysis data")
+                analysis_data, total_records = await asyncio.to_thread(self._get_analysis_data)
+            
             self.total_records = total_records
             self.total_pages = max(1, math.ceil(self.total_records / self.page_size))
             
@@ -1121,7 +1167,7 @@ class JobMonitoringTab:
         if self.refresh_timer:
             self.refresh_timer.cancel()
         
-        self.refresh_timer = ui.timer(5.0, self.refresh_data)  # Refresh every 5 seconds
+        self.refresh_timer = ui.timer(30.0, self.refresh_data)  # Refresh every 30 seconds
 
     def stop_auto_refresh(self):
         """Stop auto-refresh timer."""

@@ -1135,3 +1135,43 @@ def calculate_fmp_trade_metrics(trades: List[dict]) -> dict:
             'error': str(e)
         }
 
+
+def get_setting_safe(settings: dict, key: str, default, as_type=None):
+    """
+    Safely get a setting value, handling None values stored in settings dict.
+    
+    When settings are stored in the database, they might be stored as None if not explicitly set.
+    This helper ensures that None values are replaced with the default, and optionally converts
+    the result to a specific type.
+    
+    Args:
+        settings: The settings dictionary (from expert.settings)
+        key: The setting key to retrieve
+        default: The default value to use if key is missing or value is None
+        as_type: Optional type to convert the value to (e.g., int, float, str)
+        
+    Returns:
+        The setting value, the default if missing/None, optionally converted to as_type
+        
+    Examples:
+        >>> get_setting_safe(settings, 'max_instruments', 30, int)
+        30
+        
+        >>> get_setting_safe({'max_instruments': None}, 'max_instruments', 30, int)
+        30
+        
+        >>> get_setting_safe({'max_instruments': 50}, 'max_instruments', 30, int)
+        50
+    """
+    value = settings.get(key, default)
+    
+    # If value is None (stored as None in DB), use default
+    if value is None:
+        value = default
+    
+    # Convert to specified type if requested
+    if as_type is not None and value is not None:
+        value = as_type(value)
+    
+    return value
+

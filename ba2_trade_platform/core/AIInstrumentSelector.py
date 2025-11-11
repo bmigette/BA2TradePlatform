@@ -277,10 +277,10 @@ Your response:"""
                 max_instruments = 50  # Default fallback
                 if expert_instance_id:
                     try:
-                        from .utils import get_expert_instance_from_id
+                        from .utils import get_expert_instance_from_id, get_setting_safe
                         expert = get_expert_instance_from_id(expert_instance_id)
                         if expert and expert.settings:
-                            max_instruments = expert.settings.get('max_instruments', 50)
+                            max_instruments = get_setting_safe(expert.settings, 'max_instruments', 50, int)
                             logger.debug(f"Using max_instruments setting: {max_instruments}")
                     except Exception as e:
                         logger.debug(f"Could not retrieve max_instruments setting: {e}")
@@ -368,10 +368,10 @@ Your response:"""
             max_instruments = 100  # Default fallback
             if expert_instance_id:
                 try:
-                    from .utils import get_expert_instance_from_id
+                    from .utils import get_expert_instance_from_id, get_setting_safe
                     expert = get_expert_instance_from_id(expert_instance_id)
                     if expert and expert.settings:
-                        max_instruments = expert.settings.get('max_instruments', 100)
+                        max_instruments = get_setting_safe(expert.settings, 'max_instruments', 100, int)
                         logger.debug(f"Using max_instruments setting: {max_instruments}")
                 except Exception as e:
                     logger.debug(f"Could not retrieve max_instruments setting: {e}")

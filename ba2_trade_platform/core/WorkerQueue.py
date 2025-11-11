@@ -1438,7 +1438,7 @@ class WorkerQueue:
                 transaction = session.exec(statement).first()
                 has_transactions = transaction is not None
                 
-                logger.debug(f"Transaction check for expert {expert_id}, symbol {symbol}: {'found' if has_transactions else 'not found'}")
+                logger.debug(f"Existing Transactions check for expert {expert_id}, symbol {symbol}: {'found' if has_transactions else 'no transactions found found'}")
                 return has_transactions
                 
         except Exception as e:
