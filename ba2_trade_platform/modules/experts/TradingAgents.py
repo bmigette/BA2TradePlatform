@@ -432,22 +432,22 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
         # Choose debate settings based on analysis subtype
         if subtype == AnalysisUseCase.ENTER_MARKET:
             # For new position analysis, use debates_new_positions setting
-            max_debate_rounds = int(self.settings.get('debates_new_positions', settings_def['debates_new_positions']['default']))
-            max_risk_discuss_rounds = int(self.settings.get('debates_new_positions', settings_def['debates_new_positions']['default']))
+            max_debate_rounds = int(self.settings.get('debates_new_positions') or settings_def['debates_new_positions']['default'])
+            max_risk_discuss_rounds = int(self.settings.get('debates_new_positions') or settings_def['debates_new_positions']['default'])
         elif subtype == AnalysisUseCase.OPEN_POSITIONS:
             # For existing position analysis, use debates_existing_positions setting
-            max_debate_rounds = int(self.settings.get('debates_existing_positions', settings_def['debates_existing_positions']['default']))
-            max_risk_discuss_rounds = int(self.settings.get('debates_existing_positions', settings_def['debates_existing_positions']['default']))
+            max_debate_rounds = int(self.settings.get('debates_existing_positions') or settings_def['debates_existing_positions']['default'])
+            max_risk_discuss_rounds = int(self.settings.get('debates_existing_positions') or settings_def['debates_existing_positions']['default'])
         else:
             # Default fallback
-            max_debate_rounds = int(self.settings.get('debates_new_positions', settings_def['debates_new_positions']['default']))
-            max_risk_discuss_rounds = int(self.settings.get('debates_existing_positions', settings_def['debates_existing_positions']['default']))
+            max_debate_rounds = int(self.settings.get('debates_new_positions') or settings_def['debates_new_positions']['default'])
+            max_risk_discuss_rounds = int(self.settings.get('debates_existing_positions') or settings_def['debates_existing_positions']['default'])
         
         # Build tool_vendors mapping from individual vendor settings
         # Convert list-type vendor settings to comma-separated strings
         def _get_vendor_string(key: str) -> str:
             """Get vendor setting as comma-separated string."""
-            value = self.settings.get(key, settings_def[key]['default'])
+            value = self.settings.get(key) or settings_def[key]['default']
             # If value is already a list, join with commas; otherwise return as-is
             if isinstance(value, list):
                 return ','.join(value)
@@ -467,9 +467,9 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
         }
         
         # Parse model configurations to extract provider and actual model names
-        deep_think_model_str = self.settings.get('deep_think_llm', settings_def['deep_think_llm']['default'])
-        quick_think_model_str = self.settings.get('quick_think_llm', settings_def['quick_think_llm']['default'])
-        embedding_model_str = self.settings.get('embedding_model', settings_def['embedding_model']['default'])
+        deep_think_model_str = self.settings.get('deep_think_llm') or settings_def['deep_think_llm']['default']
+        quick_think_model_str = self.settings.get('quick_think_llm') or settings_def['quick_think_llm']['default']
+        embedding_model_str = self.settings.get('embedding_model') or settings_def['embedding_model']['default']
         
         deep_think_config = self._parse_model_config(deep_think_model_str)
         quick_think_config = self._parse_model_config(quick_think_model_str)
@@ -493,11 +493,11 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
             'embedding_model': embedding_config['model'],  # Embedding model name
             'embedding_backend_url': embedding_config['base_url'],  # Embedding endpoint
             'embedding_api_key_setting': embedding_config['api_key_setting'],  # Embedding API key
-            'news_lookback_days': int(self.settings.get('news_lookback_days', settings_def['news_lookback_days']['default'])),
-            'market_history_days': int(self.settings.get('market_history_days', settings_def['market_history_days']['default'])),
-            'economic_data_days': int(self.settings.get('economic_data_days', settings_def['economic_data_days']['default'])),
-            'social_sentiment_days': int(self.settings.get('social_sentiment_days', settings_def['social_sentiment_days']['default'])),
-            'timeframe': self.settings.get('timeframe', settings_def['timeframe']['default']),
+            'news_lookback_days': int(self.settings.get('news_lookback_days') or settings_def['news_lookback_days']['default']),
+            'market_history_days': int(self.settings.get('market_history_days') or settings_def['market_history_days']['default']),
+            'economic_data_days': int(self.settings.get('economic_data_days') or settings_def['economic_data_days']['default']),
+            'social_sentiment_days': int(self.settings.get('social_sentiment_days') or settings_def['social_sentiment_days']['default']),
+            'timeframe': self.settings.get('timeframe') or settings_def['timeframe']['default'],
             'tool_vendors': tool_vendors,  # Add tool_vendors to config
         })
         
@@ -923,10 +923,12 @@ Analysis completed at: {self._get_current_timestamp()}"""
             # Use default value
             websearch_model = settings_def['dataprovider_websearch_model']['default']
         
-        alpha_vantage_source = self.settings.get('alpha_vantage_source', settings_def['alpha_vantage_source']['default'])
-        economic_data_days = int(self.settings.get('economic_data_days', settings_def['economic_data_days']['default']))
-        news_lookback_days = int(self.settings.get('news_lookback_days', settings_def['news_lookback_days']['default']))
-        social_sentiment_days = int(self.settings.get('social_sentiment_days', settings_def['social_sentiment_days']['default']))
+        # Get settings with proper None-aware fallback to defaults
+        # (settings can be None if not configured in database)
+        alpha_vantage_source = self.settings.get('alpha_vantage_source') or settings_def['alpha_vantage_source']['default']
+        economic_data_days = int(self.settings.get('economic_data_days') or settings_def['economic_data_days']['default'])
+        news_lookback_days = int(self.settings.get('news_lookback_days') or settings_def['news_lookback_days']['default'])
+        social_sentiment_days = int(self.settings.get('social_sentiment_days') or settings_def['social_sentiment_days']['default'])
         provider_args = {
             'websearch_model': websearch_model,
             'alpha_vantage_source': alpha_vantage_source,

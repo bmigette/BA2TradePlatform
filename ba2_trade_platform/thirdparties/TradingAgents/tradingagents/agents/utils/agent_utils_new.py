@@ -59,11 +59,13 @@ class Toolkit:
         Args:
             provider_map: Dictionary mapping provider categories to list of provider classes
             provider_args: Optional dictionary with arguments for provider instantiation
-                          (e.g., {"websearch_model": "gpt-5"})
+                          (e.g., {"websearch_model": "gpt-5", "economic_data_days": 90, ...})
         """
         self.provider_map = provider_map
         self.provider_args = provider_args or {}
         logger.debug(f"Toolkit initialized with provider_map keys: {list(provider_map.keys())}")
+        logger.debug(f"Toolkit initialized with provider_args keys: {list(self.provider_args.keys())}")
+        logger.debug(f"Toolkit provider_args: economic_data_days={self.provider_args.get('economic_data_days', 'NOT_SET')}, news_lookback_days={self.provider_args.get('news_lookback_days', 'NOT_SET')}, social_sentiment_days={self.provider_args.get('social_sentiment_days', 'NOT_SET')}")
         
         # Log model configuration for AI providers
         if self.provider_args and 'websearch_model' in self.provider_args:
@@ -75,7 +77,7 @@ class Toolkit:
             logger.info(f"[TRADING_AGENTS_CONFIG] Data Provider Model: {provider_prefix}{model}")
         
         if self.provider_args:
-            logger.debug(f"Provider args: {self.provider_args}")
+            logger.debug(f"Provider args summary: {self.provider_args}")
     
     def _instantiate_provider(self, provider_class: Type[DataProviderInterface]) -> DataProviderInterface:
         """
@@ -632,6 +634,9 @@ class Toolkit:
             # Default lookback_days from provider_args (expert settings) if not provided
             if lookback_days is None:
                 lookback_days = self.provider_args.get("economic_data_days", 90)
+                logger.info(f"[TOOLKIT_DEFAULT] get_insider_transactions: Using lookback_days={lookback_days} from expert settings (economic_data_days)")
+            else:
+                logger.debug(f"[TOOLKIT_VALUE] get_insider_transactions: Using provided lookback_days={lookback_days}")
             
             results = []
             for provider_class in self.provider_map["insider"]:
@@ -704,6 +709,9 @@ class Toolkit:
             # Default lookback_days from provider_args (expert settings) if not provided
             if lookback_days is None:
                 lookback_days = self.provider_args.get("economic_data_days", 90)
+                logger.info(f"[TOOLKIT_DEFAULT] get_insider_sentiment: Using lookback_days={lookback_days} from expert settings (economic_data_days)")
+            else:
+                logger.debug(f"[TOOLKIT_VALUE] get_insider_sentiment: Using provided lookback_days={lookback_days}")
             
             results = []
             for provider_class in self.provider_map["insider"]:

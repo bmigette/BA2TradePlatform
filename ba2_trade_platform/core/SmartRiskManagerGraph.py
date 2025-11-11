@@ -442,7 +442,7 @@ Simply provide your assessment - no approval required.
 {portfolio_status}
 
 ## 🚨 IMPORTANT: VALID TRANSACTION IDs 🚨
-**ONLY the transaction IDs listed in "Open Positions:" above are valid for actions.**
+**ONLY the transaction IDs listed in "FILLED Positions:" above are valid for actions.**
 - Do NOT reference transaction IDs from previous sessions, closed positions, or failed transactions
 - Do NOT attempt to modify transactions that belong to other experts
 - When planning actions, ONLY use transaction IDs you see explicitly listed in the current portfolio summary
@@ -535,7 +535,7 @@ You have full access to these research tools - use them freely and repeatedly:
 - Example: "Transaction #248: CRWD" means the transaction_id is 248
 - **You CANNOT modify transactions from other experts** - attempting to do so will FAIL
 - **You CANNOT modify CLOSED or FAILED transactions** - only OPENED transactions listed in portfolio summary are valid
-- **If unsure about a transaction ID, DO NOT use it** - only use IDs you see explicitly listed in the "Open Positions:" section above
+- **If unsure about a transaction ID, DO NOT use it** - only use IDs you see explicitly listed in the "FILLED Positions:" section above
 - Attempting to use invalid transaction IDs wastes iterations and produces errors - always verify IDs before recommending actions
 
 - **recommend_close_position(transaction_id: int, reason: str, confidence: int)** - Recommend closing an existing position
@@ -591,6 +591,24 @@ You have full access to these research tools - use them freely and repeatedly:
   * Returns: Confirmation with total action count
   * **CRITICAL: TP/SL are set automatically when you provide tp_price/sl_price parameters. DO NOT call separate recommend_update_take_profit() or recommend_update_stop_loss() after opening a position - this creates duplicate orders!**
 
+**Pending Actions Management Tools:**
+- **get_pending_actions_tool()** - See all currently recommended actions queued for execution
+  * Returns: Formatted list of pending actions with their action numbers
+  * Use when: You want to review what you've already recommended or check for duplicates
+  * Important: Actions are executed AFTER research completes, not immediately
+
+- **modify_pending_tp_sl_tool(symbol: str, new_tp_price: float = None, new_sl_price: float = None, reason: str)** - Modify TP/SL for pending position
+  * symbol: Symbol of pending open position action (e.g., 'AAPL')
+  * new_tp_price: New take profit price (None to leave unchanged)
+  * new_sl_price: New stop loss price (None to leave unchanged)  
+  * reason: Explanation for the modification
+  * Use when: You want to adjust TP/SL levels for positions you've already recommended but haven't been executed yet
+
+- **cancel_pending_action_tool(action_number: int)** - Cancel a specific pending action
+  * action_number: 1-based action number from get_pending_actions_tool() output (e.g., 1 for "Action #1")
+  * Returns: Confirmation with updated action list and renumbered actions
+  * Use when: You want to remove an action you no longer want to execute
+
 **Summary Tool (MANDATORY - call this last):**
 - **finish_research_tool(summary: str)** - **REQUIRED**: Call this last with your summary after recommending actions
   * summary: Concise summary of key findings from your research (2-3 paragraphs)
@@ -637,6 +655,20 @@ Step 10: finish_research_tool("Addressed all 5 existing positions, opened 2 new 
 - If you find 20 opportunities, recommend 20 actions
 - **Do NOT stop prematurely** - address everything before calling finish_research_tool()
 
+## 🚨 CRITICAL: ACTION EXECUTION WORKFLOW 🚨
+**IMPORTANT: Your recommendations are NOT executed immediately!**
+- **Research phase**: You recommend actions (they are queued for later execution)
+- **Action phase**: A separate process executes all your recommendations
+- **Why you don't see results**: Actions happen AFTER your research session completes
+- **Portfolio won't update**: You won't see new positions or closed positions during research
+- **This is normal**: The system executes your recommendations automatically after you finish
+
+**Managing your recommendations:**
+- Use `get_pending_actions_tool()` to review what you've recommended so far
+- Use `modify_pending_tp_sl_tool()` to adjust TP/SL levels for pending positions  
+- Use `cancel_pending_action_tool()` to remove actions you no longer want
+- **Don't worry about immediate results** - focus on making the right recommendations
+
 ## AVOID DUPLICATE POSITIONS - CRITICAL
 **NEVER recommend opening a new position for a symbol that already has an open position:**
 - ❌ WRONG: If AAPL position exists, do NOT call recommend_open_buy_position("AAPL", ...)
@@ -675,7 +707,7 @@ Want to short AAPL (opposite direction):
 - The action node should not have to manage duplicate positions
 
 ## 🚨 CRITICAL: AVOID DUPLICATE TP/SL CALLS 🚨
-**NEVER call separate TP/SL adjustment tools after opening a position with TP/SL parameters:**
+**NEVER call separate TP/SL adjustment tools after opening a position with TP/SL parameters (unless you want to change their value after creation):**
 
 **❌ WRONG WORKFLOW - Creates Duplicate Orders:**
 ```
@@ -858,12 +890,20 @@ DO NOT defer or wait for better conditions - implement ALL risk management actio
 DO NOT write explanatory code - USE THE TOOLS DIRECTLY to execute trades.
 **DO NOT stop prematurely** - if you were given 15 recommended actions, execute all 15.
 
+## 🚨 CRITICAL: NEW POSITIONS HAVE NO TRANSACTION ID 🚨
+- **When opening NEW positions, there is NO transaction_id yet** - the position must be opened first!
+- **NEVER call update_take_profit() or update_stop_loss() on positions you just opened**
+- **For new positions**: Use tp_price/sl_price parameters in open_buy_position() or open_sell_position()
+- **For existing positions**: Use the transaction_id from the portfolio summary and call separate TP/SL tools
+- **Example WRONG**: open_buy_position("AAPL", 10) then update_take_profit(999, 200.0) ← transaction 999 doesn't exist!
+- **Example CORRECT**: open_buy_position("AAPL", 10, tp_price=200.0, sl_price=150.0) ← TP/SL included in position opening
+
 ## AVOID DUPLICATE POSITIONS - CRITICAL
 **NEVER open a new position for a symbol that already has an open position:**
 - ❌ WRONG: If AAPL position exists, do NOT call open_buy_position("AAPL", ...)
 - ❌ WRONG: If TSLA short position exists, do NOT call open_sell_position("TSLA", ...)
 - ✅ CORRECT: Use adjust_quantity() to increase an existing position instead
-- ✅ CORRECT: Check the "Open Positions" list above before opening new positions
+- ✅ CORRECT: Check the "FILLED Positions" list above before opening new positions
 
 **NEVER open opposite direction positions on the same symbol:**
 - ❌ WRONG: If AAPL BUY position exists, do NOT call open_sell_position("AAPL", ...)
@@ -871,7 +911,7 @@ DO NOT write explanatory code - USE THE TOOLS DIRECTLY to execute trades.
 - ✅ CORRECT: Close existing position first, then open new position in opposite direction if needed
 
 **Before opening ANY new position:**
-1. Check if the symbol is already in the "Open Positions" list above (any direction)
+1. Check if the symbol is already in the "FILLED Positions" list above (any direction)
 2. If it exists with SAME direction, use adjust_quantity(transaction_id, new_quantity, reason) to add to it
 3. If it exists with OPPOSITE direction, close it first if you want to reverse the position
 4. If it does NOT exist, then you can use open_buy_position() or open_sell_position()
@@ -2212,6 +2252,183 @@ def create_research_tools(toolkit: SmartRiskManagerToolkit, recommended_actions_
             format_type=format_type
         )
     
+    @tool
+    @smart_risk_manager_tool
+    def get_pending_actions_tool() -> str:
+        """Get list of all currently recommended actions that are queued for execution.
+        
+        Use this to:
+        - Review what actions you have already recommended
+        - Check if you need to modify or cancel any pending actions
+        - Avoid recommending duplicate actions
+        
+        Returns:
+            Formatted list of pending actions with their numbers for reference
+        """
+        if not recommended_actions_list:
+            return "No pending actions. All recommendations have been cleared or none have been made yet."
+        
+        result = "## PENDING ACTIONS (Queued for Execution)\n\n"
+        result += f"**Total actions queued: {len(recommended_actions_list)}**\n\n"
+        
+        for idx, action in enumerate(recommended_actions_list):
+            action_num = idx + 1
+            action_type = action.get("action_type", "unknown")
+            params = action.get("parameters", {})
+            reason = action.get("reason", "No reason provided")
+            confidence = action.get("confidence", 0)
+            
+            result += f"**Action #{action_num}: {action_type}**\n"
+            
+            if action_type == "open_buy_position":
+                symbol = params.get("symbol", "N/A")
+                quantity = params.get("quantity", 0)
+                tp_price = params.get("tp_price")
+                sl_price = params.get("sl_price")
+                result += f"- Symbol: {symbol}\n"
+                result += f"- Quantity: {quantity} shares\n"
+                result += f"- TP: ${tp_price:.2f}\n" if tp_price else "- TP: Not set\n"
+                result += f"- SL: ${sl_price:.2f}\n" if sl_price else "- SL: Not set\n"
+            elif action_type == "open_sell_position":
+                symbol = params.get("symbol", "N/A")
+                quantity = params.get("quantity", 0)
+                tp_price = params.get("tp_price")
+                sl_price = params.get("sl_price")
+                result += f"- Symbol: {symbol} (SHORT)\n"
+                result += f"- Quantity: {quantity} shares\n"
+                result += f"- TP: ${tp_price:.2f}\n" if tp_price else "- TP: Not set\n"
+                result += f"- SL: ${sl_price:.2f}\n" if sl_price else "- SL: Not set\n"
+            elif action_type in ["close_position", "adjust_quantity", "update_stop_loss", "update_take_profit"]:
+                transaction_id = params.get("transaction_id", "N/A")
+                result += f"- Transaction ID: {transaction_id}\n"
+                if action_type == "adjust_quantity":
+                    result += f"- New Quantity: {params.get('new_quantity', 'N/A')}\n"
+                elif action_type == "update_stop_loss":
+                    result += f"- New Stop Loss: ${params.get('new_sl_price', 0):.2f}\n"
+                elif action_type == "update_take_profit":
+                    result += f"- New Take Profit: ${params.get('new_tp_price', 0):.2f}\n"
+            
+            result += f"- Reason: {reason}\n"
+            result += f"- Confidence: {confidence}%\n\n"
+        
+        result += "**Note**: These actions will be executed when the research phase completes. "
+        result += "Use cancel_pending_action() to remove actions or modify_pending_tp_sl() to adjust TP/SL levels.\n"
+        
+        return result
+    
+    @tool
+    @smart_risk_manager_tool
+    def modify_pending_tp_sl_tool(
+        symbol: Annotated[str, "Symbol of the pending position to modify (e.g., 'AAPL')"],
+        new_tp_price: Annotated[Optional[float], "New take profit price (optional, use None to remove)"] = None,
+        new_sl_price: Annotated[Optional[float], "New stop loss price (optional, use None to remove)"] = None,
+        reason: Annotated[str, "Reason for modifying the TP/SL levels"] = "TP/SL adjustment"
+    ) -> str:
+        """Modify take profit and/or stop loss levels for pending position actions.
+        
+        Use this to adjust TP/SL levels for positions you have already recommended to open
+        but haven't been executed yet. This is useful when market conditions change
+        or you want to fine-tune the risk management levels.
+        
+        Args:
+            symbol: Symbol to modify (must have a pending open position action)
+            new_tp_price: New take profit price (None to remove TP)
+            new_sl_price: New stop loss price (None to remove SL) 
+            reason: Explanation for the modification
+            
+        Returns:
+            Confirmation message
+        """
+        # Find pending open position actions for this symbol
+        matching_actions = []
+        for idx, action in enumerate(recommended_actions_list):
+            if (action.get("action_type") in ["open_buy_position", "open_sell_position"] and 
+                action.get("parameters", {}).get("symbol") == symbol):
+                matching_actions.append((idx, action))
+        
+        if not matching_actions:
+            return f"❌ No pending open position actions found for symbol {symbol}. Use get_pending_actions_tool() to see current pending actions."
+        
+        modified_count = 0
+        for idx, action in matching_actions:
+            # Update the TP/SL prices in the action parameters
+            if new_tp_price is not None:
+                recommended_actions_list[idx]["parameters"]["tp_price"] = new_tp_price
+            if new_sl_price is not None:
+                recommended_actions_list[idx]["parameters"]["sl_price"] = new_sl_price
+                
+            # Update the reason to include modification note
+            original_reason = recommended_actions_list[idx].get("reason", "")
+            recommended_actions_list[idx]["reason"] = f"{original_reason} | Modified TP/SL: {reason}"
+            modified_count += 1
+        
+        tp_msg = f"TP=${new_tp_price:.2f}" if new_tp_price is not None else "TP=unchanged"
+        sl_msg = f"SL=${new_sl_price:.2f}" if new_sl_price is not None else "SL=unchanged"
+        
+        return f"✅ Modified {modified_count} pending action(s) for {symbol}: {tp_msg}, {sl_msg}. Total actions: {len(recommended_actions_list)}"
+    
+    @tool
+    @smart_risk_manager_tool
+    def cancel_pending_action_tool(
+        action_number: Annotated[int, "Action number from get_pending_actions_tool() (1-based index)"]
+    ) -> str:
+        """Cancel a specific pending action by its number.
+        
+        Use this to remove actions you no longer want to execute.
+        The action number corresponds to the "Action #X" shown in get_pending_actions_tool().
+        
+        Args:
+            action_number: 1-based action number (e.g., 1 for "Action #1")
+            
+        Returns:
+            Confirmation message with updated action list
+        """
+        if not recommended_actions_list:
+            return "❌ No pending actions to cancel."
+        
+        if action_number < 1 or action_number > len(recommended_actions_list):
+            return f"❌ Invalid action number {action_number}. Valid range: 1-{len(recommended_actions_list)}. Use get_pending_actions_tool() to see current actions."
+        
+        # Convert 1-based to 0-based index
+        idx = action_number - 1
+        cancelled_action = recommended_actions_list.pop(idx)
+        
+        action_type = cancelled_action.get("action_type", "unknown")
+        params = cancelled_action.get("parameters", {})
+        
+        # Format cancelled action info
+        if action_type in ["open_buy_position", "open_sell_position"]:
+            symbol = params.get("symbol", "N/A")
+            direction = "BUY" if action_type == "open_buy_position" else "SELL"
+            action_info = f"{direction} {symbol}"
+        else:
+            transaction_id = params.get("transaction_id", "N/A")
+            action_info = f"{action_type} for transaction {transaction_id}"
+        
+        result = f"✅ Cancelled Action #{action_number}: {action_info}\n\n"
+        
+        # Show updated action list with new numbers
+        if recommended_actions_list:
+            result += "**Updated pending actions (renumbered):**\n"
+            for idx, action in enumerate(recommended_actions_list):
+                new_action_num = idx + 1
+                action_type = action.get("action_type", "unknown")
+                params = action.get("parameters", {})
+                
+                if action_type in ["open_buy_position", "open_sell_position"]:
+                    symbol = params.get("symbol", "N/A")
+                    direction = "BUY" if action_type == "open_buy_position" else "SELL"
+                    result += f"Action #{new_action_num}: {direction} {symbol}\n"
+                else:
+                    transaction_id = params.get("transaction_id", "N/A")
+                    result += f"Action #{new_action_num}: {action_type} for transaction {transaction_id}\n"
+        else:
+            result += "**No pending actions remaining.**\n"
+        
+        result += f"\n**Total remaining actions: {len(recommended_actions_list)}**"
+        
+        return result
+    
     return [
         get_analysis_outputs_tool,
         get_analysis_output_detail_tool,
@@ -2220,6 +2437,9 @@ def create_research_tools(toolkit: SmartRiskManagerToolkit, recommended_actions_
         get_all_recent_analyses_tool,
         get_current_price_tool,
         get_all_transactions_tool,
+        get_pending_actions_tool,
+        modify_pending_tp_sl_tool,
+        cancel_pending_action_tool,
         recommend_close_position,
         recommend_adjust_quantity,
         recommend_update_stop_loss,
@@ -2990,12 +3210,34 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
                     elif action_type == "update_stop_loss":
                         transaction_id = parameters["transaction_id"]
                         new_sl_price = parameters["new_sl_price"]
-                        result = toolkit.update_stop_loss(transaction_id, new_sl_price, reason)
+                        
+                        # Validate transaction exists
+                        with get_db() as session:
+                            transaction = session.get(Transaction, transaction_id)
+                            if not transaction:
+                                result = {
+                                    "success": False,
+                                    "message": f"❌ Transaction {transaction_id} not found. Cannot update stop loss on non-existent position. Use tp_price/sl_price parameters when opening NEW positions instead.",
+                                    "error_type": "invalid_transaction_id"
+                                }
+                            else:
+                                result = toolkit.update_stop_loss(transaction_id, new_sl_price, reason)
                         
                     elif action_type == "update_take_profit":
                         transaction_id = parameters["transaction_id"]
                         new_tp_price = parameters["new_tp_price"]
-                        result = toolkit.update_take_profit(transaction_id, new_tp_price, reason)
+                        
+                        # Validate transaction exists
+                        with get_db() as session:
+                            transaction = session.get(Transaction, transaction_id)
+                            if not transaction:
+                                result = {
+                                    "success": False,
+                                    "message": f"❌ Transaction {transaction_id} not found. Cannot update take profit on non-existent position. Use tp_price/sl_price parameters when opening NEW positions instead.",
+                                    "error_type": "invalid_transaction_id"
+                                }
+                            else:
+                                result = toolkit.update_take_profit(transaction_id, new_tp_price, reason)
                         
                     elif action_type == "adjust_tp_sl":
                         # OPTIMIZATION: Combined TP/SL adjustment in single call
@@ -3031,7 +3273,8 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
                             else:
                                 result = {
                                     "success": False,
-                                    "message": f"Transaction {transaction_id} not found",
+                                    "message": f"❌ Transaction {transaction_id} not found. Cannot adjust TP/SL on non-existent position. This typically happens when trying to modify a position that was just recommended to open but doesn't exist yet.",
+                                    "error_type": "invalid_transaction_id",
                                     "transaction_id": transaction_id
                                 }
                         

@@ -1186,3 +1186,101 @@ def get_setting_safe(settings: dict, key: str, default, as_type=None):
     
     return value
 
+
+def get_setting_default_from_interface(interface_class, setting_key: str):
+    """
+    Get the default value for a setting from an interface class definition.
+    
+    This function retrieves the default value defined in the interface's builtin settings
+    (via get_settings_definitions() or _builtin_settings). This ensures we always use
+    the official default from the interface definition, not hardcoded values scattered
+    in the codebase.
+    
+    Args:
+        interface_class: The interface class (MarketExpertInterface, AccountInterface, etc.)
+        setting_key: The setting key to look up (e.g., "max_virtual_equity_per_instrument_percent")
+        
+    Returns:
+        The default value from the interface definition, or None if not found
+        
+    Raises:
+        ValueError: If the setting is not found in the interface definition
+        
+    Example:
+        >>> from ba2_trade_platform.core.interfaces import MarketExpertInterface
+        >>> default = get_setting_default_from_interface(MarketExpertInterface, "max_virtual_equity_per_instrument_percent")
+        >>> print(default)  # 10.0
+    """
+    try:
+        # Get merged settings definitions (builtin + implementation-specific)
+        settings_defs = interface_class.get_merged_settings_definitions()
+        
+        if not settings_defs or setting_key not in settings_defs:
+            raise ValueError(f"Setting '{setting_key}' not found in {interface_class.__name__} interface definition")
+        
+        setting_def = settings_defs[setting_key]
+        default_value = setting_def.get("default")
+        
+        if default_value is None:
+            logger.warning(f"Setting '{setting_key}' in {interface_class.__name__} has no default value defined")
+        
+        return default_value
+        
+    except Exception as e:
+        logger.error(f"Error getting default for setting '{setting_key}' from {interface_class.__name__}: {e}", exc_info=True)
+        raise
+
+
+def get_setting_with_interface_default(settings: dict, interface_class, setting_key: str, log_warning: bool = True):
+    """
+    Get a setting value from the settings dict, falling back to the interface's default definition.
+    
+    This is the preferred way to access settings in code. It ensures:
+    1. If the setting is in the dict and not None, use it
+    2. Otherwise, use the default from the interface definition
+    3. Log a warning if falling back to default (so we know when settings aren't explicitly configured)
+    
+    This prevents hardcoded defaults scattered throughout the code and ensures consistency.
+    
+    Args:
+        settings: The settings dictionary (from expert.settings or account.settings)
+        interface_class: The interface class (MarketExpertInterface, AccountInterface, etc.)
+        setting_key: The setting key to look up
+        log_warning: If True, log a warning when using the interface default (default True)
+        
+    Returns:
+        The setting value from the dict, or the interface default if not set
+        
+    Example:
+        >>> from ba2_trade_platform.core.interfaces import MarketExpertInterface
+        >>> # If setting is configured:
+        >>> value = get_setting_with_interface_default(expert.settings, MarketExpertInterface, "max_virtual_equity_per_instrument_percent")
+        >>> print(value)  # Returns configured value
+        
+        >>> # If setting is not configured:
+        >>> value = get_setting_with_interface_default(expert.settings, MarketExpertInterface, "max_virtual_equity_per_instrument_percent")
+        >>> # Logs warning: "Using interface default for setting 'max_virtual_equity_per_instrument_percent': 10.0"
+        >>> print(value)  # Returns 10.0 (the interface default)
+    """
+    try:
+        # Check if setting exists and is not None in the provided dict
+        if setting_key in settings and settings[setting_key] is not None:
+            return settings[setting_key]
+        
+        # Get the default from the interface definition
+        default_value = get_setting_default_from_interface(interface_class, setting_key)
+        
+        # Log warning about using default (if requested)
+        if log_warning:
+            logger.warning(f"Using interface default for setting '{setting_key}': {default_value}")
+        
+        return default_value
+        
+    except ValueError as e:
+        # Setting not found in interface definition
+        logger.error(f"Error getting setting '{setting_key}': {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Error getting setting with interface default for '{setting_key}': {e}", exc_info=True)
+        raise
+

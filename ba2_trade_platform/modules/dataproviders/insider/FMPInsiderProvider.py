@@ -257,6 +257,11 @@ class FMPInsiderProvider(CompanyInsiderInterface):
         Raises:
             ValueError: If both start_date and lookback_days are provided, or if neither is provided
         """
+        # Default to 90 days if neither start_date nor lookback_days provided
+        if not start_date and not lookback_days:
+            lookback_days = 90
+            logger.warning(f"No date range provided for insider sentiment, defaulting to lookback_days=90")
+        
         # Get transaction data first
         transactions_dict = self.get_insider_transactions(
             symbol=symbol,

@@ -754,8 +754,8 @@ class TradingAgentsUI:
                 trading_agents = TradingAgents(expert_instance.id)
                 
                 # Extract key parameters directly from settings
-                market_history_days = int(trading_agents.settings.get('market_history_days', settings_def['market_history_days']['default']))
-                timeframe = trading_agents.settings.get('timeframe', settings_def['timeframe']['default'])
+                market_history_days = int(trading_agents.settings.get('market_history_days') or settings_def['market_history_days']['default'])
+                timeframe = trading_agents.settings.get('timeframe') or settings_def['timeframe']['default']
                 
                 # Calculate date range - start from original analysis date, extend to current date
                 from datetime import datetime
