@@ -522,15 +522,15 @@ class JobMonitoringTab:
                     # Order by newest first
                     statement = statement.order_by(MarketAnalysis.created_at.desc())
                     
-                    # Fetch ALL matching records at once
-                    market_analyses = session.exec(statement).unique().all()
+                    # Fetch ALL matching records at once using scalars() to get model objects
+                    market_analyses = list(session.scalars(statement))
                     
                     # Pre-fetch expert instances for all records
                     expert_ids = set(m.expert_instance_id for m in market_analyses)
                     expert_instances = {}
                     if expert_ids:
                         stmt = select(ExpertInstance).where(ExpertInstance.id.in_(expert_ids))
-                        for expert in session.exec(stmt).all():
+                        for expert in session.scalars(stmt):
                             expert_instances[expert.id] = expert
                     
                     # Process all records and cache them
