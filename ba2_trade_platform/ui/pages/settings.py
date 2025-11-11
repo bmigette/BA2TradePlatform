@@ -4038,8 +4038,7 @@ class TradeSettingsTab:
             
             # Use selectinload to eagerly load the event_actions relationship
             statement = select(Ruleset).options(selectinload(Ruleset.event_actions))
-            results = session.exec(statement)
-            rulesets = results.all()
+            rulesets = list(session.scalars(statement))
             
             rows = []
             for ruleset in rulesets:
