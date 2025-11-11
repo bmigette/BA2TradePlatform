@@ -468,12 +468,12 @@ class JobMonitoringTab:
         
         OPTIMIZATION: Uses joins to avoid N+1 queries and eager-loads relationships.
         Caches the entire filtered dataset to avoid recomputing on pagination changes.
-        Only recomputes when filters actually change.
+        Only recomputes when filters actually change or cache is empty.
         """
         try:
-            # Check if cache needs invalidation due to filter changes
-            if self._should_invalidate_cache():
-                logger.debug(f"Cache invalidated - filters changed. Recomputing...")
+            # Check if cache needs invalidation due to filter changes OR cache is empty
+            if self._should_invalidate_cache() or not self.cache_valid:
+                logger.debug(f"Cache invalidated - {'filters changed' if self._should_invalidate_cache() else 'cache empty'}. Recomputing...")
                 self.current_page = 1  # Reset to first page when filters change
                 
                 # Fetch and format ALL matching records (no pagination in query)
