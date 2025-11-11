@@ -1162,6 +1162,9 @@ def get_setting_safe(settings: dict, key: str, default, as_type=None):
         
         >>> get_setting_safe({'max_instruments': 50}, 'max_instruments', 30, int)
         50
+        
+        >>> get_setting_safe({'max_instruments': '50'}, 'max_instruments', 30, int)
+        50
     """
     value = settings.get(key, default)
     
@@ -1170,8 +1173,16 @@ def get_setting_safe(settings: dict, key: str, default, as_type=None):
         value = default
     
     # Convert to specified type if requested
+    # This also handles case where value was stored as string (e.g., '50') instead of int/float
     if as_type is not None and value is not None:
-        value = as_type(value)
+        try:
+            value = as_type(value)
+        except (ValueError, TypeError) as e:
+            # If conversion fails, use the default
+            logger.warning(f"Could not convert setting '{key}' value '{value}' to type {as_type.__name__}: {e}, using default {default}")
+            value = default
+            if as_type is not None:
+                value = as_type(value) if default is not None else None
     
     return value
 

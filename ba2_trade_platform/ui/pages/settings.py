@@ -2624,6 +2624,9 @@ class ExpertSettingsTab:
                         elif meta["type"] == "bool":
                             value = current_value if current_value is not None else default_value or False
                             inp = ui.checkbox(text=display_label, value=bool(value))
+                        elif meta["type"] == "int":
+                            value = current_value if current_value is not None else default_value or 0
+                            inp = ui.input(label=display_label, value=str(int(value))).classes('w-full')
                         elif meta["type"] == "float":
                             value = current_value if current_value is not None else default_value or 0.0
                             inp = ui.input(label=display_label, value=str(value)).classes('w-full')
@@ -3630,6 +3633,8 @@ class ExpertSettingsTab:
                 
                 if meta.get("type") == "bool":
                     expert.save_setting(key, inp.value, setting_type="bool")
+                elif meta.get("type") == "int":
+                    expert.save_setting(key, int(inp.value or 0), setting_type="float")
                 elif meta.get("type") == "float":
                     expert.save_setting(key, float(inp.value or 0), setting_type="float")
                 elif meta.get("type") == "list":
