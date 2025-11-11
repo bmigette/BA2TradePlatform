@@ -70,7 +70,7 @@ class ActivityMonitorPage:
             else:
                 self.activities_table.rows = rows
             
-            logger.debug(f"[ActivityMonitor] Loaded {len(rows)} activities")
+            #logger.debug(f"[ActivityMonitor] Loaded {len(rows)} activities")
             
         except Exception as e:
             logger.error(f"Error refreshing activities: {e}", exc_info=True)
@@ -309,7 +309,7 @@ class ActivityMonitorPage:
             activities = await asyncio.to_thread(self._fetch_activities_raw)
             rows = self._format_activities_rows(activities)
             
-            logger.debug(f"[ActivityMonitor] Loaded {len(rows)} activities")
+            #logger.debug(f"[ActivityMonitor] Loaded {len(rows)} activities")
             
             # Update the table container with actual table
             self.table_container.clear()

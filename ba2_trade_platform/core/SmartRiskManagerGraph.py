@@ -3466,7 +3466,9 @@ def finalize(state: SmartRiskManagerState) -> Dict[str, Any]:
         account_id = state["account_id"]
         toolkit = SmartRiskManagerToolkit(expert_instance_id, account_id)
         final_portfolio = toolkit.get_portfolio_status()
-        final_summary = f"Virtual Equity: ${final_portfolio['account_virtual_equity']:.2f} | Positions: {len(final_portfolio.get('positions', []))}"
+        num_open_positions = len(final_portfolio.get('open_positions', []))
+        num_pending_positions = len(final_portfolio.get('pending_positions', []))
+        final_summary = f"Virtual Equity: ${final_portfolio['account_virtual_equity']:.2f} | Positions: {num_open_positions} (+ {num_pending_positions} pending)"
         
         actions_summary = "\n".join(
             f"{i+1}. {action['action_type']}: {action.get('summary', 'No summary')}"

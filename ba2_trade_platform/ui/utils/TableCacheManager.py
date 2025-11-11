@@ -142,7 +142,8 @@ class TableCacheManager:
                 self.last_filter_state = current_filter_tuple
                 logger.debug(f"[{self.cache_name}] Cached {len(self.cached_data)} rows")
             else:
-                logger.debug(f"[{self.cache_name}] Using cached data ({len(self.cached_data)} rows)")
+                pass
+                #logger.debug(f"[{self.cache_name}] Using cached data ({len(self.cached_data)} rows)")
             
             # Apply in-memory pagination to cached data
             total_count = len(self.cached_data)

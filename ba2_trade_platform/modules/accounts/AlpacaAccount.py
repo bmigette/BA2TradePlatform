@@ -879,9 +879,11 @@ class AlpacaAccount(AccountInterface):
             elif order_type_value == CoreOrderType.OCO.value.lower():
                 # OCO (One-Cancels-Other): Both TP and SL in one submission
                 # Per Alpaca API: OCO orders don't have limit_price on main order, only in take_profit/stop_loss legs
-                if not trading_order.limit_price:
+                if not trading_order.limit_price or trading_order.limit_price <= 0:
+                    logger.error(f"Invalid take profit price for OCO order {trading_order.id}: {trading_order.limit_price}")
                     raise ValueError("Limit price (take profit) is required for OCO orders")
-                if not trading_order.stop_price:
+                if not trading_order.stop_price or trading_order.stop_price <= 0:
+                    logger.error(f"Invalid stop loss price for OCO order {trading_order.id}: {trading_order.stop_price}")
                     raise ValueError("Stop price (stop loss) is required for OCO orders")
                 
                 # Round prices using Alpaca pricing rules
@@ -2605,6 +2607,15 @@ class AlpacaAccount(AccountInterface):
                 # Create new OCO order
                 oco_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
                 oco_comment = self._generate_tpsl_comment("TPSL", self.id, transaction.id, entry_order.id)
+                
+                # Double-check TP/SL values before creating OCO order
+                if not transaction.take_profit or transaction.take_profit <= 0:
+                    logger.error(f"Cannot create OCO order for transaction {transaction.id}: invalid take_profit {transaction.take_profit}")
+                    return False
+                if not transaction.stop_loss or transaction.stop_loss <= 0:
+                    logger.error(f"Cannot create OCO order for transaction {transaction.id}: invalid stop_loss {transaction.stop_loss}")
+                    return False
+                
                 oco_order = TradingOrder(
                     account_id=self.id,
                     symbol=entry_order.symbol,
@@ -2831,6 +2842,14 @@ class AlpacaAccount(AccountInterface):
         
         # Create triggered order(s) in database only - they'll be submitted when entry order fills
         if need_oco:
+            # Validate TP/SL prices before creating OCO order
+            if not new_tp_price or new_tp_price <= 0:
+                logger.error(f"Cannot create triggered OCO order for transaction {transaction.id}: invalid take_profit {new_tp_price}")
+                return False
+            if not new_sl_price or new_sl_price <= 0:
+                logger.error(f"Cannot create triggered OCO order for transaction {transaction.id}: invalid stop_loss {new_sl_price}")
+                return False
+                
             # Create triggered OCO order with both TP and SL
             oco_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
             oco_comment = self._generate_tpsl_comment("TPSL", self.id, transaction.id, entry_order.id)
@@ -2943,6 +2962,17 @@ class AlpacaAccount(AccountInterface):
             # Determine if we need OCO (both TP and SL) or simple limit order (only TP)
             has_sl = transaction.stop_loss is not None and transaction.stop_loss > 0
             
+            # Validate TP price
+            if not tp_price or tp_price <= 0:
+                logger.error(f"Cannot create TP order for transaction {transaction.id}: invalid take_profit {tp_price}")
+                return False
+            
+            # Validate SL price if creating OCO
+            if has_sl:
+                if not transaction.stop_loss or transaction.stop_loss <= 0:
+                    logger.error(f"Cannot create OCO TP order for transaction {transaction.id}: invalid stop_loss {transaction.stop_loss}")
+                    return False
+            
             # Create TP order
             tp_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
             
@@ -3004,6 +3034,17 @@ class AlpacaAccount(AccountInterface):
             # Get transaction to check if we need limit or OCO
             transaction = get_instance(Transaction, existing_tp.transaction_id)
             has_sl = transaction.stop_loss is not None and transaction.stop_loss > 0
+            
+            # Validate TP price
+            if not new_tp_price or new_tp_price <= 0:
+                logger.error(f"Cannot replace TP order {existing_tp.id}: invalid take_profit {new_tp_price}")
+                return False
+            
+            # Validate SL price if creating OCO
+            if has_sl:
+                if not transaction.stop_loss or transaction.stop_loss <= 0:
+                    logger.error(f"Cannot replace TP order {existing_tp.id} with OCO: invalid stop_loss {transaction.stop_loss}")
+                    return False
             
             # Determine correct order type
             if has_sl:
@@ -3123,6 +3164,14 @@ class AlpacaAccount(AccountInterface):
     def _create_broker_oco_order(self, session: Session, transaction: Transaction, entry_order: TradingOrder, tp_price: float, sl_price: float) -> bool:
         """Create new OCO order at broker with both TP and SL."""
         try:
+            # Validate TP/SL prices before creating OCO order
+            if not tp_price or tp_price <= 0:
+                logger.error(f"Cannot create broker OCO order for transaction {transaction.id}: invalid take_profit {tp_price}")
+                return False
+            if not sl_price or sl_price <= 0:
+                logger.error(f"Cannot create broker OCO order for transaction {transaction.id}: invalid stop_loss {sl_price}")
+                return False
+                
             # Validate entry order has valid quantity
             if not entry_order.quantity or entry_order.quantity <= 0:
                 logger.error(f"Cannot create OCO order for transaction {transaction.id}: entry order {entry_order.id} has invalid quantity {entry_order.quantity}")
@@ -3180,6 +3229,17 @@ class AlpacaAccount(AccountInterface):
             logger.info(f"Creating SL order at broker for transaction {transaction.id}")
             
             has_tp = transaction.take_profit is not None and transaction.take_profit > 0
+            
+            # Validate SL price
+            if not sl_price or sl_price <= 0:
+                logger.error(f"Cannot create SL order for transaction {transaction.id}: invalid stop_loss {sl_price}")
+                return False
+            
+            # Validate TP price if creating OCO
+            if has_tp:
+                if not transaction.take_profit or transaction.take_profit <= 0:
+                    logger.error(f"Cannot create OCO SL order for transaction {transaction.id}: invalid take_profit {transaction.take_profit}")
+                    return False
             
             sl_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
             
@@ -3241,6 +3301,17 @@ class AlpacaAccount(AccountInterface):
             # Get transaction to check if we need stop or OCO
             transaction = get_instance(Transaction, existing_sl.transaction_id)
             has_tp = transaction.take_profit is not None and transaction.take_profit > 0
+            
+            # Validate SL price
+            if not new_sl_price or new_sl_price <= 0:
+                logger.error(f"Cannot replace SL order {existing_sl.id}: invalid stop_loss {new_sl_price}")
+                return False
+            
+            # Validate TP price if creating OCO
+            if has_tp:
+                if not transaction.take_profit or transaction.take_profit <= 0:
+                    logger.error(f"Cannot replace SL order {existing_sl.id} with OCO: invalid take_profit {transaction.take_profit}")
+                    return False
             
             # Determine correct order type
             if has_tp:
@@ -3396,6 +3467,14 @@ class AlpacaAccount(AccountInterface):
                     existing_oco.status = OrderStatus.PENDING_CANCEL
                     session.add(existing_oco)
                     
+                    # Validate TP/SL prices before creating replacement OCO order
+                    if not new_tp_price or new_tp_price <= 0:
+                        logger.error(f"Cannot create replacement OCO order: invalid take_profit {new_tp_price}")
+                        raise ValueError(f"Invalid take_profit price for OCO replacement: {new_tp_price}")
+                    if not new_sl_price or new_sl_price <= 0:
+                        logger.error(f"Cannot create replacement OCO order: invalid stop_loss {new_sl_price}")
+                        raise ValueError(f"Invalid stop_loss price for OCO replacement: {new_sl_price}")
+                        
                     # Create new pending OCO order to replace it
                     new_oco = TradingOrder(
                         account_id=existing_oco.account_id,
