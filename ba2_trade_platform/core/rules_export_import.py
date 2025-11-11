@@ -543,7 +543,7 @@ class RulesExportImportUI:
             with get_db() as session:
                 from sqlalchemy.orm import selectinload
                 statement = select(Ruleset).options(selectinload(Ruleset.event_actions))
-                rulesets = session.exec(statement).all()
+                rulesets = list(session.scalars(statement))
 
                 return [
                     {

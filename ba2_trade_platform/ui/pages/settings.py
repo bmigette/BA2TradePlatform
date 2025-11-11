@@ -4823,7 +4823,7 @@ class TradeSettingsTab:
             from ...core.models import RulesetEventActionLink
             
             statement = select(Ruleset).where(Ruleset.id == ruleset_id).options(selectinload(Ruleset.event_actions))
-            ruleset = session.exec(statement).first()
+            ruleset = session.scalars(statement).first()
             
             if ruleset:
                 logger.debug(f'Duplicating ruleset {ruleset_id}')

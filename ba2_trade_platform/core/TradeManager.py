@@ -698,7 +698,7 @@ class TradeManager:
                 statement = select(Ruleset).where(Ruleset.id == ruleset_id).options(
                     selectinload(Ruleset.event_actions)
                 )
-                ruleset = session.exec(statement).first()
+                ruleset = session.scalars(statement).first()
                 
                 if not ruleset:
                     self.logger.warning(f"Ruleset {ruleset_id} not found")
