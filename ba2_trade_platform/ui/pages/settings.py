@@ -2658,8 +2658,15 @@ class ExpertSettingsTab:
                             value = current_value if current_value is not None else default_value or False
                             inp = ui.checkbox(text=display_label, value=bool(value))
                         elif meta["type"] == "int":
-                            value = current_value if current_value is not None else default_value or 0
-                            inp = ui.input(label=display_label, value=str(int(value))).classes('w-full')
+                            # Handle empty strings and None values for integer fields
+                            if current_value is not None and current_value != "":
+                                try:
+                                    value = int(current_value)
+                                except (ValueError, TypeError):
+                                    value = default_value or 0
+                            else:
+                                value = default_value or 0
+                            inp = ui.input(label=display_label, value=str(value)).classes('w-full')
                         elif meta["type"] == "float":
                             value = current_value if current_value is not None else default_value or 0.0
                             inp = ui.input(label=display_label, value=str(value)).classes('w-full')
@@ -3655,7 +3662,11 @@ class ExpertSettingsTab:
         
         # Save smart risk manager max iterations
         if hasattr(self, 'smart_risk_manager_max_iterations_input'):
-            expert.save_setting('smart_risk_manager_max_iterations', int(self.smart_risk_manager_max_iterations_input.value), setting_type="int")
+            try:
+                max_iterations = int(self.smart_risk_manager_max_iterations_input.value) if self.smart_risk_manager_max_iterations_input.value and self.smart_risk_manager_max_iterations_input.value.strip() != "" else 10
+            except (ValueError, TypeError):
+                max_iterations = 10  # Default value
+            expert.save_setting('smart_risk_manager_max_iterations', max_iterations, setting_type="int")
             logger.debug(f'Saved smart risk manager max iterations: {int(self.smart_risk_manager_max_iterations_input.value)}')
         
         # Save instrument selection method (moved to main panel)
@@ -3677,9 +3688,19 @@ class ExpertSettingsTab:
                 if meta.get("type") == "bool":
                     expert.save_setting(key, inp.value, setting_type="bool")
                 elif meta.get("type") == "int":
-                    expert.save_setting(key, int(inp.value or 0), setting_type="float")
+                    # Handle empty strings and ensure proper type
+                    try:
+                        int_value = int(inp.value) if inp.value and inp.value.strip() != "" else 0
+                    except (ValueError, TypeError):
+                        int_value = 0
+                    expert.save_setting(key, int_value, setting_type="int")
                 elif meta.get("type") == "float":
-                    expert.save_setting(key, float(inp.value or 0), setting_type="float")
+                    # Handle empty strings and ensure proper type
+                    try:
+                        float_value = float(inp.value) if inp.value and inp.value.strip() != "" else 0.0
+                    except (ValueError, TypeError):
+                        float_value = 0.0
+                    expert.save_setting(key, float_value, setting_type="float")
                 elif meta.get("type") == "list":
                     # Handle list types - save as JSON
                     expert.save_setting(key, inp.value, setting_type="json")
