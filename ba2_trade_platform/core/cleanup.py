@@ -168,17 +168,17 @@ def execute_cleanup(
         with get_db() as session:
             # Step 1: Clean up orphaned trade_action_result records (with NULL expert_recommendation_id)
             try:
-                orphaned_count = session.exec(
+                orphaned_results = session.exec(
                     select(TradeActionResult).where(
                         TradeActionResult.expert_recommendation_id == None
                     )
                 ).all()
                 
-                for orphaned in orphaned_count:
+                for orphaned in orphaned_results:
                     session.delete(orphaned)
                 
-                if orphaned_count:
-                    logger.info(f"Cleanup: Deleted {len(orphaned_count)} orphaned trade_action_result records")
+                if orphaned_results:
+                    logger.info(f"Cleanup: Deleted {len(orphaned_results)} orphaned trade_action_result records")
                     session.commit()
             except Exception as e:
                 logger.warning(f"Cleanup: Could not clean orphaned trade_action_result records: {e}")
@@ -200,53 +200,76 @@ def execute_cleanup(
             logger.info(f"Cleanup: Found {len(old_analyses)} analyses older than {days_to_keep} days")
             
             for analysis in old_analyses:
+                # Create a new session context for each analysis to avoid rollback cascade issues
                 try:
-                    # Check if analysis has open transactions
-                    if _has_open_transaction(session, analysis.id):
-                        analyses_protected += 1
-                        logger.debug(f"Cleanup: Protecting analysis {analysis.id} (has open transaction)")
-                        continue
-                    
-                    # Count what we're about to delete
-                    outputs_count = len(analysis.analysis_outputs)
-                    recommendations_count = len(analysis.expert_recommendations)
-                    
-                    # Delete analysis outputs
-                    for output in analysis.analysis_outputs:
-                        session.delete(output)
-                    outputs_deleted += outputs_count
-                    
-                    # Delete expert recommendations (this will cascade delete trade_action_results via FK)
-                    for recommendation in analysis.expert_recommendations:
-                        session.delete(recommendation)
-                    recommendations_deleted += recommendations_count
-                    
-                    # Delete the analysis itself only if not outputs_only mode
-                    if not outputs_only:
-                        session.delete(analysis)
-                        analyses_deleted += 1
-                        logger.debug(f"Cleanup: Deleted analysis {analysis.id} ({analysis.symbol}, {analysis.status.value})")
-                    else:
-                        # In outputs_only mode, just mark as "cleaned" by counting it
-                        analyses_deleted += 1
-                        logger.debug(f"Cleanup: Deleted outputs for analysis {analysis.id} ({analysis.symbol}, {analysis.status.value})")
+                    with get_db() as analysis_session:
+                        # Re-fetch the analysis in the new session
+                        analysis_obj = analysis_session.get(MarketAnalysis, analysis.id)
+                        if not analysis_obj:
+                            continue
+                        
+                        # Check if analysis has open transactions - use no_autoflush to prevent premature flushes
+                        with analysis_session.no_autoflush:
+                            has_open = _has_open_transaction(analysis_session, analysis_obj.id)
+                        
+                        if has_open:
+                            analyses_protected += 1
+                            logger.debug(f"Cleanup: Protecting analysis {analysis_obj.id} (has open transaction)")
+                            continue
+                        
+                        # Count what we're about to delete
+                        outputs_count = len(analysis_obj.analysis_outputs)
+                        recommendations_count = len(analysis_obj.expert_recommendations)
+                        
+                        # Delete in proper order to avoid constraint violations
+                        # 1. First delete TradeActionResult records explicitly to avoid CASCADE issues
+                        for recommendation in analysis_obj.expert_recommendations:
+                            trade_results = analysis_session.exec(
+                                select(TradeActionResult).where(
+                                    TradeActionResult.expert_recommendation_id == recommendation.id
+                                )
+                            ).all()
+                            for result in trade_results:
+                                analysis_session.delete(result)
+                        
+                        # 2. Then delete expert recommendations
+                        for recommendation in analysis_obj.expert_recommendations:
+                            analysis_session.delete(recommendation)
+                        recommendations_deleted += recommendations_count
+                        
+                        # 3. Delete analysis outputs
+                        for output in analysis_obj.analysis_outputs:
+                            analysis_session.delete(output)
+                        outputs_deleted += outputs_count
+                        
+                        # 4. Delete the analysis itself only if not outputs_only mode
+                        if not outputs_only:
+                            analysis_session.delete(analysis_obj)
+                            analyses_deleted += 1
+                            logger.debug(f"Cleanup: Deleted analysis {analysis_obj.id} ({analysis_obj.symbol}, {analysis_obj.status.value})")
+                        else:
+                            # In outputs_only mode, just mark as "cleaned" by counting it
+                            analyses_deleted += 1
+                            logger.debug(f"Cleanup: Deleted outputs for analysis {analysis_obj.id} ({analysis_obj.symbol}, {analysis_obj.status.value})")
+                        
+                        # Commit this analysis's changes
+                        analysis_session.commit()
                     
                 except Exception as e:
                     error_msg = f"Error deleting analysis {analysis.id}: {str(e)}"
                     logger.error(error_msg)
                     errors.append(error_msg)
-                    session.rollback()
+                    # No need to rollback - each analysis has its own session context
                     continue
             
-            # Commit all deletions
-            session.commit()
             cleanup_mode = "outputs only" if outputs_only else "all data"
             logger.info(f"Cleanup completed ({cleanup_mode}): {analyses_deleted} analyses processed, {analyses_protected} protected")
             
             # Step 3: Run VACUUM to reclaim disk space
             try:
-                session.exec(text("VACUUM"))
-                logger.info("Cleanup: Database VACUUM completed - disk space reclaimed")
+                with get_db() as vacuum_session:
+                    vacuum_session.exec(text("VACUUM"))
+                    logger.info("Cleanup: Database VACUUM completed - disk space reclaimed")
             except Exception as e:
                 logger.warning(f"Cleanup: VACUUM operation failed: {e}")
             
@@ -286,30 +309,35 @@ def _has_open_transaction(session: Session, market_analysis_id: int) -> bool:
     Returns:
         True if there are any open transactions linked to this analysis, False otherwise
     """
-    # Get all expert recommendations for this analysis
-    recommendations = session.exec(
-        select(ExpertRecommendation).where(
-            ExpertRecommendation.market_analysis_id == market_analysis_id
-        )
-    ).all()
-    
-    # Check each recommendation for linked open transactions
-    for recommendation in recommendations:
-        # Get trading orders for this recommendation
-        orders = session.exec(
-            select(TradingOrder).where(
-                TradingOrder.expert_recommendation_id == recommendation.id
+    try:
+        # Get all expert recommendations for this analysis
+        recommendations = session.exec(
+            select(ExpertRecommendation).where(
+                ExpertRecommendation.market_analysis_id == market_analysis_id
             )
         ).all()
         
-        # Check if any of these orders have open transactions
-        for order in orders:
-            if order.transaction_id:
-                transaction = session.get(Transaction, order.transaction_id)
-                if transaction and transaction.status == TransactionStatus.OPENED:
-                    return True
-    
-    return False
+        # Check each recommendation for linked open transactions
+        for recommendation in recommendations:
+            # Get trading orders for this recommendation
+            orders = session.exec(
+                select(TradingOrder).where(
+                    TradingOrder.expert_recommendation_id == recommendation.id
+                )
+            ).all()
+            
+            # Check if any of these orders have open transactions
+            for order in orders:
+                if order.transaction_id:
+                    transaction = session.get(Transaction, order.transaction_id)
+                    if transaction and transaction.status == TransactionStatus.OPENED:
+                        return True
+        
+        return False
+    except Exception as e:
+        # If we can't determine transaction status, err on the side of caution and protect the analysis
+        logger.warning(f"Could not check transaction status for analysis {market_analysis_id}: {e}")
+        return True
 
 
 def get_cleanup_statistics(expert_instance_id: Optional[int] = None) -> Dict[str, Any]:
