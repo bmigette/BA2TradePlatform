@@ -99,6 +99,11 @@ def initialize_system():
     logger.info("Initializing Smart Risk Manager queue system...")
     initialize_smart_risk_manager_queue()
     
+    # Initialize Instrument Auto Adder service
+    logger.info("Initializing Instrument Auto Adder service...")
+    from ba2_trade_platform.core.InstrumentAutoAdder import get_instrument_auto_adder
+    get_instrument_auto_adder()  # This starts the service
+    
     logger.info("BA2 Trade Platform initialization complete")
     
     # Log application startup activity

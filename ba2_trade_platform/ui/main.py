@@ -126,6 +126,11 @@ from ..config import HTTP_PORT
 def on_shutdown():
     """Log application shutdown activity."""
     try:
+        # Shutdown Instrument Auto Adder service
+        from ..core.InstrumentAutoAdder import shutdown_instrument_auto_adder
+        shutdown_instrument_auto_adder()
+        logger.info("InstrumentAutoAdder service shutdown completed")
+        
         from ..core.db import log_activity
         from ..core.types import ActivityLogSeverity, ActivityLogType
         

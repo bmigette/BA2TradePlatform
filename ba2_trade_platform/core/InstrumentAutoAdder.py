@@ -24,6 +24,7 @@ class InstrumentAutoAdder:
         self._task_queue = asyncio.Queue()
         self._worker_task = None
         self._running = False
+        self._worker_loop = None
     
     def start(self):
         """Start the background worker."""
@@ -45,9 +46,11 @@ class InstrumentAutoAdder:
         """Run the async worker in a separate thread."""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        self._worker_loop = loop  # Store reference for queue operations
         try:
             loop.run_until_complete(self._worker())
         finally:
+            self._worker_loop = None
             loop.close()
     
     async def _worker(self):
@@ -224,24 +227,18 @@ class InstrumentAutoAdder:
         }
         
         # Add task to queue (thread-safe)
-        if self._running:
+        if self._running and self._worker_loop and not self._worker_loop.is_closed():
             try:
                 # Use asyncio.run_coroutine_threadsafe to add to queue from any thread
-                loop = None
-                for thread in threading.enumerate():
-                    if hasattr(thread, '_target') and 'worker' in str(thread._target):
-                        loop = getattr(thread, '_loop', None)
-                        break
-                
-                if loop and not loop.is_closed():
-                    asyncio.run_coroutine_threadsafe(self._task_queue.put(task), loop)
-                    logger.debug(f"Queued {len(symbols)} instruments for auto-addition from {source}")
-                else:
-                    logger.warning("Could not queue instruments: worker loop not available")
+                asyncio.run_coroutine_threadsafe(self._task_queue.put(task), self._worker_loop)
+                logger.debug(f"Queued {len(symbols)} instruments for auto-addition from {source}")
             except Exception as e:
                 logger.error(f"Error queuing instruments for addition: {e}", exc_info=True)
         else:
-            logger.warning("InstrumentAutoAdder not running, cannot queue instruments")
+            if not self._running:
+                logger.warning("InstrumentAutoAdder not running, cannot queue instruments")
+            elif not self._worker_loop or self._worker_loop.is_closed():
+                logger.warning("Could not queue instruments: worker loop not available")
 
 
 # Global instance
