@@ -115,7 +115,7 @@ class InstrumentGraph:
             import plotly.graph_objects as go
             from plotly.subplots import make_subplots
             
-            # Align all indicators with price data date range for continuity
+            # Align indicator timezones with price data for proper plotting
             price_index = self.price_data.index if isinstance(self.price_data.index, pd.DatetimeIndex) else None
             
             # Debug: Log price index info
@@ -124,24 +124,35 @@ class InstrumentGraph:
                            f"first={price_index[0] if len(price_index) > 0 else 'N/A'}, "
                            f"last={price_index[-1] if len(price_index) > 0 else 'N/A'}")
             
+            # Only align timezones, don't force reindexing to avoid creating NaN gaps
             if price_index is not None:
                 for indicator_name in self.indicators_data.keys():
                     indicator_df = self.indicators_data[indicator_name]
                     if not indicator_df.empty and isinstance(indicator_df.index, pd.DatetimeIndex):
-                        # Debug: Log indicator index before reindex
-                        logger.debug(f"Indicator '{indicator_name}' before reindex: {len(indicator_df)} rows, tz={indicator_df.index.tz}, "
+                        # Debug: Log indicator index before timezone alignment
+                        logger.debug(f"Indicator '{indicator_name}' before timezone alignment: {len(indicator_df)} rows, tz={indicator_df.index.tz}, "
                                    f"first={indicator_df.index[0]}, last={indicator_df.index[-1]}")
                         
-                        # Reindex to match price data, filling with NaN for missing dates
-                        self.indicators_data[indicator_name] = indicator_df.reindex(price_index)
+                        # Only align timezones if they differ, preserve original dates to avoid gaps
+                        if price_index.tz is not None and indicator_df.index.tz != price_index.tz:
+                            if indicator_df.index.tz is None:
+                                # Indicator is naive, localize to match price data timezone
+                                indicator_df.index = indicator_df.index.tz_localize(price_index.tz)
+                                logger.debug(f"Localized naive indicator '{indicator_name}' to {price_index.tz}")
+                            else:
+                                # Convert indicator timezone to match price data
+                                indicator_df.index = indicator_df.index.tz_convert(price_index.tz)
+                                logger.debug(f"Converted indicator '{indicator_name}' from {indicator_df.index.tz} to {price_index.tz}")
+                            
+                            self.indicators_data[indicator_name] = indicator_df
                         
-                        # Debug: Log after reindex and check for NaN
-                        reindexed_df = self.indicators_data[indicator_name]
-                        non_nan_count = reindexed_df.notna().sum().sum()
-                        total_values = reindexed_df.shape[0] * reindexed_df.shape[1]
-                        logger.debug(f"Reindexed indicator '{indicator_name}' to match price data: "
-                                   f"before={len(indicator_df)} rows, after={len(reindexed_df)} rows, "
-                                   f"non-NaN values: {non_nan_count}/{total_values}")
+                        # Debug: Log final indicator stats (no gaps created)
+                        final_df = self.indicators_data[indicator_name]
+                        non_nan_count = final_df.notna().sum().sum()
+                        total_values = final_df.shape[0] * final_df.shape[1]
+                        logger.debug(f"Timezone-aligned indicator '{indicator_name}': "
+                                   f"{len(final_df)} rows preserved, "
+                                   f"non-NaN values: {non_nan_count}/{total_values} (no gaps created)")
             
             # Categorize indicators by type
             # Static mapping based on indicator definitions from MarketIndicatorsInterface
