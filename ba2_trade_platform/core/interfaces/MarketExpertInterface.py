@@ -185,6 +185,12 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "description": "Smart Risk Manager User Instructions",
                     "help": "Instructions for the AI-powered smart risk manager. This guides the risk manager's decision-making strategy when in Smart mode.",
                     "tooltip": "Provide high-level instructions to guide the smart risk manager's behavior. Examples: 'Maximize short term profit with medium risk taking', 'Focus on capital preservation with conservative risk', 'Aggressive growth with high risk tolerance'. Only used when risk_manager_mode is set to 'smart'."
+                },
+                "smart_risk_manager_max_iterations": {
+                    "type": "int", "required": False, "default": 10,
+                    "description": "Smart Risk Manager Maximum Iterations",
+                    "help": "Maximum number of iterations the smart risk manager will run before stopping. Prevents infinite loops and controls execution time.",
+                    "tooltip": "Controls how many analysis cycles the smart risk manager can perform before being forced to stop. Higher values allow more thorough analysis but take longer to execute. Recommended: 5-15 iterations. Only used when risk_manager_mode is set to 'smart'."
                 }
                 
             }

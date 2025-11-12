@@ -1603,6 +1603,17 @@ class ExpertSettingsTab:
                                 placeholder='Enter your risk management strategy instructions...'
                             ).classes('w-full').props('rows=3')
                             ui.label('Provide high-level instructions to guide the smart risk manager when in Smart mode (e.g., focus areas, risk tolerance, time horizon)').classes('text-body2 text-grey-7 ml-2')
+                            
+                            # Smart Risk Manager Max Iterations
+                            ui.label('Smart Risk Manager Max Iterations:').classes('text-sm font-medium mt-2')
+                            self.smart_risk_manager_max_iterations_input = ui.number(
+                                label='Maximum Iterations',
+                                value=10,
+                                min=1,
+                                max=50,
+                                step=1
+                            ).classes('w-full')
+                            ui.label('Maximum number of analysis cycles the smart risk manager can perform. Higher values allow more thorough analysis but take longer. Recommended: 5-15.').classes('text-body2 text-grey-7 ml-2')
                         
                         ui.separator().classes('my-4')
                         
@@ -2087,6 +2098,11 @@ class ExpertSettingsTab:
             smart_risk_manager_user_instructions = settings_source.get('smart_risk_manager_user_instructions', 'Maximize short term profit with medium risk taking')
             if hasattr(self, 'smart_risk_manager_user_instructions_input'):
                 self.smart_risk_manager_user_instructions_input.value = smart_risk_manager_user_instructions
+            
+            # Load smart risk manager max iterations
+            smart_risk_manager_max_iterations = settings_source.get('smart_risk_manager_max_iterations', 10)
+            if hasattr(self, 'smart_risk_manager_max_iterations_input'):
+                self.smart_risk_manager_max_iterations_input.value = int(smart_risk_manager_max_iterations)
             
             # Load ruleset assignments from ExpertInstance model or imported data
             if hasattr(self, 'enter_market_ruleset_select') and hasattr(self, 'enter_market_ruleset_map'):
@@ -3636,6 +3652,11 @@ class ExpertSettingsTab:
         if hasattr(self, 'smart_risk_manager_user_instructions_input'):
             expert.save_setting('smart_risk_manager_user_instructions', self.smart_risk_manager_user_instructions_input.value, setting_type="str")
             logger.debug(f'Saved smart risk manager user instructions: {self.smart_risk_manager_user_instructions_input.value}')
+        
+        # Save smart risk manager max iterations
+        if hasattr(self, 'smart_risk_manager_max_iterations_input'):
+            expert.save_setting('smart_risk_manager_max_iterations', int(self.smart_risk_manager_max_iterations_input.value), setting_type="int")
+            logger.debug(f'Saved smart risk manager max iterations: {int(self.smart_risk_manager_max_iterations_input.value)}')
         
         # Save instrument selection method (moved to main panel)
         if hasattr(self, 'instrument_selection_method_select'):
