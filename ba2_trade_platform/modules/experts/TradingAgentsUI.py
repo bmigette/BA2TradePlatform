@@ -924,68 +924,7 @@ class TradingAgentsUI:
                                                 logger.info(f"Reconstructed indicator '{indicator_name}' from cache: {len(indicator_df)} rows")
                                             except Exception as e:
                                                 logger.warning(f"Could not reconstruct indicator {indicator_name}: {e}")
-                                    
-                                    # Fallback: Parse markdown format if no JSON found
-                                    elif not output_obj.name.endswith('_json') and output_obj.text and 'tool_output_get_indicator_data' in output_obj.name.lower():
-                                        # Parse markdown-formatted indicator data (fallback for new format)
-                                        # Format: "Tool: get_indicator_data\nOutput:\n\n## INDICATOR_NAME from PROVIDER\n\n| Date | Value | ..."
-                                        lines = output_obj.text.strip().split('\n')
-                                        indicator_name = None
-                                        
-                                        # Extract indicator name from markdown header
-                                        for line in lines:
-                                            if line.startswith('##') and ' from ' in line:
-                                                # Format: "## CLOSE_200_SMA from PANDASINDICATORCALC"
-                                                parts = line.replace('##', '').strip().split(' from ')
-                                                indicator_name = parts[0].strip()
-                                                break
-                                        
-                                        if indicator_name:
-                                            # Clean up indicator name
-                                            indicator_name = indicator_name.replace('_', ' ').title()
-                                            logger.info(f"Parsing markdown indicator '{indicator_name}' from {output_obj.name}")
-                                            
-                                            # Parse markdown table: "| Date | Value |" format
-                                            dates = []
-                                            values = []
-                                            in_table = False
-                                            
-                                            for line in lines:
-                                                if '|' in line and 'Date' in line and 'Value' in line:
-                                                    in_table = True
-                                                    continue
-                                                
-                                                if in_table and '|' in line:
-                                                    parts = line.split('|')
-                                                    if len(parts) >= 3:
-                                                        try:
-                                                            date_str = parts[1].strip()
-                                                            value_str = parts[2].strip()
-                                                            
-                                                            # Skip separator lines and header
-                                                            if date_str and value_str and date_str != '-' * len(date_str):
-                                                                date = pd.to_datetime(date_str)
-                                                                value = float(value_str)
-                                                                dates.append(date)
-                                                                values.append(value)
-                                                        except (ValueError, IndexError):
-                                                            continue
-                                            
-                                            if dates and values:
-                                                indicator_df = pd.DataFrame({
-                                                    indicator_name: values
-                                                }, index=pd.DatetimeIndex(dates))
-                                                indicator_df.index.name = 'Date'
-                                                
-                                                # Make timezone-aware to match price data (UTC)
-                                                if indicator_df.index.tz is None:
-                                                    indicator_df.index = indicator_df.index.tz_localize('UTC')
-                                                
-                                                indicators_data[indicator_name] = indicator_df
-                                                logger.info(f"Loaded indicator '{indicator_name}' from markdown: {len(indicator_df)} rows")
-                                            else:
-                                                logger.warning(f"Could not extract indicator values from markdown for {indicator_name}")
-                                        
+
                                 except Exception as e:
                                     logger.error(f"Error parsing indicator data from {output_obj.name}: {e}", exc_info=True)
                     else:
