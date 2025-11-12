@@ -227,38 +227,4 @@ class AlphaVantageOHLCVProvider(AlphaVantageBaseProvider, MarketDataProviderInte
         """
         # AlphaVantage API key validated by alpha_vantage_common module
         return True
-    
-    def _format_as_dict(self, data: Any) -> Dict[str, Any]:
-        """
-        Format data as a structured dictionary.
-        
-        Args:
-            data: Provider data
-            
-        Returns:
-            Dict[str, Any]: Structured dictionary
-        """
-        if isinstance(data, dict):
-            return data
-        return {"data": data}
-    
-    def _format_as_markdown(self, data: Any) -> str:
-        """
-        Format data as markdown for LLM consumption.
-        
-        Args:
-            data: Provider data
-            
-        Returns:
-            str: Markdown-formatted string
-        """
-        if isinstance(data, dict):
-            md = "# Data\n\n"
-            for key, value in data.items():
-                if isinstance(value, (list, dict)):
-                    md += f"**{key}**: (complex data)\n"
-                else:
-                    md += f"**{key}**: {value}\n"
-            return md
-        return str(data)
 

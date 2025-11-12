@@ -625,3 +625,71 @@ class MarketDataProviderInterface(DataProviderInterface):
             }
         else:  # markdown
             return self._format_ohlcv_as_markdown(response)
+    
+    def _format_as_dict(self, data: Any) -> Dict[str, Any]:
+        """
+        Format data as a structured dictionary for OHLCV providers.
+        
+        This implementation handles OHLCV-specific data formatting for all 
+        MarketDataProvider subclasses. If data is a DataFrame, it converts
+        it to the standard OHLCV dictionary format.
+        
+        Args:
+            data: OHLCV data (DataFrame, dict, or other format)
+            
+        Returns:
+            Dict[str, Any]: Structured dictionary with OHLCV data
+        """
+        import pandas as pd
+        
+        if isinstance(data, dict):
+            # Already a dict, return as-is
+            return data
+        elif isinstance(data, pd.DataFrame) and not data.empty:
+            # Convert DataFrame to OHLCV dict format
+            data_points = []
+            for _, row in data.iterrows():
+                data_points.append({
+                    "date": self.format_datetime_for_dict(row.get("Date")),
+                    "open": round(float(row.get("Open", 0)), 2),
+                    "high": round(float(row.get("High", 0)), 2), 
+                    "low": round(float(row.get("Low", 0)), 2),
+                    "close": round(float(row.get("Close", 0)), 2),
+                    "volume": int(row.get("Volume", 0))
+                })
+            
+            return {
+                "symbol": "UNKNOWN",  # Will be overridden by get_ohlcv_data_formatted
+                "interval": "1d",     # Will be overridden by get_ohlcv_data_formatted
+                "data": data_points
+            }
+        else:
+            # Fallback for other data types
+            return {"data": data}
+    
+    def _format_as_markdown(self, data: Any) -> str:
+        """
+        Format data as markdown for OHLCV providers.
+        
+        This implementation handles OHLCV-specific markdown formatting for all
+        MarketDataProvider subclasses. It uses the specialized _format_ohlcv_as_markdown
+        method when dealing with OHLCV data to ensure proper datetime formatting.
+        
+        Args:
+            data: OHLCV data (DataFrame, dict, or other format)
+            
+        Returns:
+            str: Markdown-formatted string with proper OHLCV formatting
+        """
+        import pandas as pd
+        
+        if isinstance(data, pd.DataFrame) and not data.empty:
+            # Convert DataFrame to dict format and use OHLCV markdown formatter
+            dict_data = self._format_as_dict(data)
+            return self._format_ohlcv_as_markdown(dict_data)
+        elif isinstance(data, dict) and 'data' in data:
+            # Use specialized OHLCV markdown formatter
+            return self._format_ohlcv_as_markdown(data)
+        else:
+            # Generic fallback for non-OHLCV data
+            return f"# Market Data\n\n```\n{str(data)}\n```"

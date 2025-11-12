@@ -52,7 +52,7 @@ class Toolkit:
     }
     """
     
-    def __init__(self, provider_map: Dict[str, List[Type[DataProviderInterface]]], provider_args: Dict[str, any] = None):
+    def __init__(self, provider_map: Dict[str, List[Type[DataProviderInterface]]], provider_args: Dict[str, any] = None, expert_settings_defaults: Dict[str, any] = None):
         """
         Initialize toolkit with provider configuration.
         
@@ -60,9 +60,12 @@ class Toolkit:
             provider_map: Dictionary mapping provider categories to list of provider classes
             provider_args: Optional dictionary with arguments for provider instantiation
                           (e.g., {"websearch_model": "gpt-5", "economic_data_days": 90, ...})
+            expert_settings_defaults: Optional dictionary with expert settings defaults for fallback values
+                                    (e.g., {"news_lookback_days": {"default": 7}, "social_sentiment_days": {"default": 3}, ...})
         """
         self.provider_map = provider_map
         self.provider_args = provider_args or {}
+        self.expert_settings_defaults = expert_settings_defaults or {}
         logger.debug(f"Toolkit initialized with provider_map keys: {list(provider_map.keys())}")
         logger.debug(f"Toolkit initialized with provider_args keys: {list(self.provider_args.keys())}")
         logger.debug(f"Toolkit provider_args: economic_data_days={self.provider_args.get('economic_data_days', 'NOT_SET')}, news_lookback_days={self.provider_args.get('news_lookback_days', 'NOT_SET')}, social_sentiment_days={self.provider_args.get('social_sentiment_days', 'NOT_SET')}")
@@ -103,6 +106,7 @@ class Toolkit:
         
         # Check if this is an AI provider that supports model parameter (OpenAI or NagaAI)
         # Includes: AINewsProvider, AICompanyOverviewProvider, AISocialMediaSentiment, etc.
+        # TODO Not reliable for future use cases - consider a more robust way to identify AI providers
         elif (provider_name.startswith('AI') or 'OpenAI' in provider_name) and 'websearch_model' in self.provider_args:
             model = self.provider_args['websearch_model']
             logger.debug(f"Instantiating {provider_name} with model={model}")
@@ -131,111 +135,16 @@ class Toolkit:
         ohlcv_provider_class = self.provider_map["ohlcv"][0]
         provider_name = ohlcv_provider_class.__name__
         
-        # Check if AI provider needs model argument
-        if (provider_name.startswith('AI') or 'OpenAI' in provider_name) and 'websearch_model' in self.provider_args:
-            model = self.provider_args['websearch_model']
-            return ohlcv_provider_class(model=model)
-        # Check if Alpha Vantage provider needs source argument
-        elif 'AlphaVantage' in provider_name and 'alpha_vantage_source' in self.provider_args:
+        # OHLCV providers are typically data sources (Yahoo Finance, Alpha Vantage, etc.)
+        # They don't need AI model parameters - only source identification for Alpha Vantage
+        if 'AlphaVantage' in provider_name and 'alpha_vantage_source' in self.provider_args:
             source = self.provider_args['alpha_vantage_source']
             return ohlcv_provider_class(source=source)
         else:
+            # Standard OHLCV providers (Yahoo Finance, etc.) need no special arguments
             return ohlcv_provider_class()
     
-    def _format_ohlcv_dataframe(self, df, symbol: str) -> tuple:
-        """
-        Convert OHLCV DataFrame to markdown text and JSON dict.
-        
-        Args:
-            df: DataFrame with columns: Date, Open, High, Low, Close, Volume
-            symbol: Stock symbol (for metadata)
-        
-        Returns:
-            Tuple of (markdown_text, json_dict)
-        """
-        import pandas as pd
-        
-        try:
-            # Ensure Date is datetime
-            if 'Date' in df.columns:
-                df['Date'] = pd.to_datetime(df['Date'])
-            
-            # Create markdown representation
-            markdown_lines = [f"# OHLCV Data for {symbol}"]
-            markdown_lines.append(f"**Records**: {len(df)}")
-            markdown_lines.append(f"**Date Range**: {df['Date'].min()} to {df['Date'].max()}")
-            markdown_lines.append("")
-            
-            # Check if data contains intraday (has time component)
-            has_intraday = any(
-                hasattr(d, 'hour') and (d.hour != 0 or d.minute != 0 or d.second != 0)
-                for d in df['Date']
-            )
-            
-            if has_intraday:
-                markdown_lines.append("| DateTime | Open | High | Low | Close | Volume |")
-                markdown_lines.append("|----------|------|------|-----|-------|--------|")
-            else:
-                markdown_lines.append("| Date | Open | High | Low | Close | Volume |")
-                markdown_lines.append("|------|------|------|-----|-------|--------|")
-            
-            # Show first 10, last 10 rows in markdown (limit output)
-            rows_to_show = min(10, len(df))
-            for idx in range(rows_to_show):
-                row = df.iloc[idx]
-                if has_intraday:
-                    date_str = row['Date'].strftime('%Y-%m-%d %H:%M:%S')
-                else:
-                    date_str = row['Date'].strftime('%Y-%m-%d')
-                markdown_lines.append(
-                    f"| {date_str} | {row['Open']:.2f} | {row['High']:.2f} | {row['Low']:.2f} | {row['Close']:.2f} | {int(row['Volume'])} |"
-                )
-            
-            if len(df) > 20:
-                markdown_lines.append("| ... | ... | ... | ... | ... | ... |")
-                for idx in range(len(df) - rows_to_show, len(df)):
-                    row = df.iloc[idx]
-                    if has_intraday:
-                        date_str = row['Date'].strftime('%Y-%m-%d %H:%M:%S')
-                    else:
-                        date_str = row['Date'].strftime('%Y-%m-%d')
-                    markdown_lines.append(
-                        f"| {date_str} | {row['Open']:.2f} | {row['High']:.2f} | {row['Low']:.2f} | {row['Close']:.2f} | {int(row['Volume'])} |"
-                    )
-            
-            markdown_text = "\n".join(markdown_lines)
-            
-            # Create JSON structure (clean, JSON-serializable)
-            # Preserve full timestamp for intraday data (time component)
-            dates_list = []
-            for date in df['Date']:
-                # Use isoformat to preserve timestamp precision
-                if hasattr(date, 'isoformat'):
-                    dates_list.append(date.isoformat())
-                else:
-                    # Fallback to date-only format if not a datetime
-                    dates_list.append(str(date)[:10])
-            
-            json_dict = {
-                "symbol": symbol,
-                "dates": dates_list,
-                "opens": df['Open'].round(4).tolist(),
-                "highs": df['High'].round(4).tolist(),
-                "lows": df['Low'].round(4).tolist(),
-                "closes": df['Close'].round(4).tolist(),
-                "volumes": df['Volume'].astype(int).tolist(),
-                "metadata": {
-                    "total_records": len(df),
-                    "start_date": df['Date'].min().strftime('%Y-%m-%d'),
-                    "end_date": df['Date'].max().strftime('%Y-%m-%d')
-                }
-            }
-            
-            return markdown_text, json_dict
-            
-        except Exception as e:
-            logger.error(f"Error formatting OHLCV DataFrame: {e}", exc_info=True)
-            return f"Error formatting data: {str(e)}", {"error": str(e)}
+
     
     def _call_provider_with_both_format(self, provider, method_name: str, **kwargs) -> tuple:
         """
@@ -322,7 +231,7 @@ class Toolkit:
             
             # Default lookback_days from provider_args (expert settings) if not provided
             if lookback_days is None:
-                lookback_days = self.provider_args.get("news_lookback_days", 7)
+                lookback_days = self.provider_args["news_lookback_days"]
             
             results = []
             for provider_class in self.provider_map["news"]:
@@ -393,7 +302,7 @@ class Toolkit:
             
             # Default lookback_days from provider_args (expert settings) if not provided
             if lookback_days is None:
-                lookback_days = self.provider_args.get("news_lookback_days", 7)
+                lookback_days = self.provider_args["news_lookback_days"]
             
             results = []
             for provider_class in self.provider_map["news"]:
@@ -557,7 +466,7 @@ class Toolkit:
             
             # Default lookback_days from provider_args (expert settings) if not provided
             if lookback_days is None:
-                lookback_days = self.provider_args.get("social_sentiment_days", 3)
+                lookback_days = self.provider_args["social_sentiment_days"]
             
             results = []
             for provider_class in self.provider_map["social_media"]:
@@ -633,7 +542,7 @@ class Toolkit:
             
             # Default lookback_days from provider_args (expert settings) if not provided
             if lookback_days is None:
-                lookback_days = self.provider_args.get("economic_data_days", 90)
+                lookback_days = self.provider_args["economic_data_days"]
                 logger.info(f"[TOOLKIT_DEFAULT] get_insider_transactions: Using lookback_days={lookback_days} from expert settings (economic_data_days)")
             else:
                 logger.debug(f"[TOOLKIT_VALUE] get_insider_transactions: Using provided lookback_days={lookback_days}")
@@ -708,7 +617,7 @@ class Toolkit:
             
             # Default lookback_days from provider_args (expert settings) if not provided
             if lookback_days is None:
-                lookback_days = self.provider_args.get("economic_data_days", 90)
+                lookback_days = self.provider_args["economic_data_days"]
                 logger.info(f"[TOOLKIT_DEFAULT] get_insider_sentiment: Using lookback_days={lookback_days} from expert settings (economic_data_days)")
             else:
                 logger.debug(f"[TOOLKIT_VALUE] get_insider_sentiment: Using provided lookback_days={lookback_days}")
@@ -1247,8 +1156,25 @@ class Toolkit:
                     
                     logger.info(f"Successfully retrieved OHLCV data from {provider_name}")
                     
-                    # Convert DataFrame to markdown and JSON using helper method
-                    markdown_text, json_data = self._format_ohlcv_dataframe(df, symbol)
+                    # Use provider's get_ohlcv_data_formatted with format_type="both" to get both markdown and structured data
+                    result_both = provider.get_ohlcv_data_formatted(
+                        symbol=symbol, start_date=start_dt, end_date=end_dt, interval=interval, format_type="both"
+                    )
+                    
+                    # Extract markdown and structured data from provider response
+                    if isinstance(result_both, dict) and "text" in result_both and "data" in result_both:
+                        markdown_text = result_both["text"]
+                        json_data = result_both["data"]
+                    else:
+                        # Fallback: use markdown format and create minimal JSON structure
+                        markdown_text = provider.get_ohlcv_data(
+                            symbol=symbol, start_date=start_dt, end_date=end_dt, interval=interval, format_type="markdown"
+                        )
+                        json_data = {
+                            "symbol": symbol,
+                            "records": len(df) if df is not None else 0,
+                            "provider": provider_name
+                        }
                     
                     # Format original dates for storage
                     orig_start = start_date if start_date else start_dt.strftime("%Y-%m-%d")
@@ -1494,7 +1420,7 @@ class Toolkit:
             
             # Default lookback_days from provider_args (expert settings) if not provided
             if lookback_days is None:
-                lookback_days = self.provider_args.get("economic_data_days", 90)
+                lookback_days = self.provider_args["economic_data_days"]
             
             results = []
             for provider_class in self.provider_map["macro"]:
@@ -1568,7 +1494,7 @@ class Toolkit:
             
             # Default lookback_days from provider_args (expert settings) if not provided
             if lookback_days is None:
-                lookback_days = self.provider_args.get("economic_data_days", 90)
+                lookback_days = self.provider_args["economic_data_days"]
             
             results = []
             for provider_class in self.provider_map["macro"]:
@@ -1642,7 +1568,7 @@ class Toolkit:
             
             # Default lookback_days from provider_args (expert settings) if not provided
             if lookback_days is None:
-                lookback_days = self.provider_args.get("economic_data_days", 90)
+                lookback_days = self.provider_args["economic_data_days"]
                 logger.debug(f"Using default lookback_days from expert settings: {lookback_days}")
             
             # Ensure lookback_days is not None
