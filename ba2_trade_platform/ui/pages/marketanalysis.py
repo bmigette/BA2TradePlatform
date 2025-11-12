@@ -746,18 +746,38 @@ class JobMonitoringTab:
                 page_size_select.on_value_change(self._on_page_size_change)
     
     def _change_page(self, new_page: int):
-        """Change to a specific page - NO database query needed, just updates UI."""
+        """Change to a specific page - synchronous update using cached data."""
         if 1 <= new_page <= self.total_pages:
             self.current_page = new_page
-            self.refresh_data()  # This will use cached data, no DB query
+            # Update table synchronously using cached data (no async needed for pagination)
+            self._update_table_from_cache()
+    
+    def _update_table_from_cache(self):
+        """Update table and pagination controls synchronously from cached data."""
+        try:
+            # Get paginated data from cache (this is synchronous)
+            analysis_data, total_records = self._get_analysis_data()
+            
+            # Update table if it exists
+            if self.analysis_table:
+                self.analysis_table.rows = analysis_data
+            
+            # Update pagination controls with current state
+            self._create_pagination_controls()
+            
+        except Exception as e:
+            logger.error(f"Error updating table from cache: {e}", exc_info=True)
     
     def _on_page_size_change(self, event):
-        """Handle page size change - NO database query needed, just re-paginates cached data."""
+        """Handle page size change - synchronous update using cached data."""
         try:
             new_size = int(event.value)
             self.page_size = new_size
             self.current_page = 1  # Reset to first page
-            self.refresh_data()  # This will use cached data, no DB query
+            # Recalculate total pages based on new page size
+            self.total_pages = max(1, math.ceil(self.total_records / self.page_size))
+            # Update table synchronously using cached data (no async needed)
+            self._update_table_from_cache()
         except ValueError:
             pass
     
