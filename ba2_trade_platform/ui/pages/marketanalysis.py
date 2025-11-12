@@ -1370,7 +1370,7 @@ class JobMonitoringTab:
             
             # Update Smart Risk Manager table
             if hasattr(self, 'smart_risk_table') and self.smart_risk_table:
-                smart_risk_data = self._get_smart_risk_manager_data()
+                smart_risk_data, _ = self._get_smart_risk_manager_data()
                 self.smart_risk_table.rows = smart_risk_data
             
             # Update worker queue status display
