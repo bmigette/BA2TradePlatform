@@ -49,6 +49,20 @@ class JobMonitoringTab:
         self.cache_valid = False  # Whether cache matches current filters
         self.last_filter_state = None  # Track filter state to detect changes
         
+        # Smart Risk Manager Jobs pagination and filtering state
+        self.smart_risk_current_page = 1
+        self.smart_risk_page_size = 25
+        self.smart_risk_total_pages = 1
+        self.smart_risk_total_records = 0
+        self.smart_risk_status_filter = 'all'  # Filter by status (RUNNING, COMPLETED, FAILED)
+        self.smart_risk_expert_filter = 'all'  # Filter by expert
+        self.smart_risk_pagination_container = None  # Container for Smart Risk Manager pagination controls
+        
+        # Smart Risk Manager Jobs caching
+        self.cached_smart_risk_data = []  # Full filtered result set
+        self.smart_risk_cache_valid = False  # Whether cache matches current filters
+        self.last_smart_risk_filter_state = None  # Track filter state to detect changes
+        
         self.render()
     
     def _get_worker_queue(self):
@@ -319,12 +333,48 @@ class JobMonitoringTab:
             {'name': 'detail', 'label': '', 'field': 'detail', 'sortable': False, 'style': 'width: 80px'}
         ]
         
-        smart_risk_data = self._get_smart_risk_manager_data()
-        
         with ui.card().classes('w-full'):
             with ui.row().classes('w-full justify-between items-center mb-2'):
                 ui.label('Smart Risk Manager Jobs').classes('text-md font-bold')
-                ui.label(f'Showing {len(smart_risk_data)} jobs').classes('text-sm text-gray-600')
+                ui.button('Refresh', on_click=self.refresh_smart_risk_data, icon='refresh').props('flat dense')
+            
+            # Filters row
+            with ui.row().classes('w-full gap-4 mb-4'):
+                with ui.column().classes('w-48'):
+                    # Status filter
+                    status_options = {
+                        'all': 'All Statuses',
+                        'RUNNING': 'Running',
+                        'COMPLETED': 'Completed', 
+                        'FAILED': 'Failed'
+                    }
+                    self.smart_risk_status_select = ui.select(
+                        options=status_options,
+                        value=self.smart_risk_status_filter,
+                        label='Status Filter'
+                    ).classes('w-full')
+                    self.smart_risk_status_select.on_value_change(self._on_smart_risk_status_filter_change)
+                
+                with ui.column().classes('w-48'):
+                    # Expert filter
+                    expert_options = self._get_smart_risk_expert_options()
+                    self.smart_risk_expert_select = ui.select(
+                        options=expert_options,
+                        value=self.smart_risk_expert_filter,
+                        label='Expert Filter'
+                    ).classes('w-full')
+                    self.smart_risk_expert_select.on_value_change(self._on_smart_risk_expert_filter_change)
+            
+            # Get initial data
+            smart_risk_data, total_records = self._get_smart_risk_manager_data()
+            
+            # Info row showing total records and current page info
+            with ui.row().classes('w-full justify-between items-center mb-2'):
+                ui.label(f'Total: {total_records} jobs | Page {self.smart_risk_current_page} of {self.smart_risk_total_pages}').classes('text-sm text-gray-600')
+                if total_records > 0:
+                    start_record = (self.smart_risk_current_page - 1) * self.smart_risk_page_size + 1
+                    end_record = min(self.smart_risk_current_page * self.smart_risk_page_size, total_records)
+                    ui.label(f'Showing {start_record}-{end_record}').classes('text-sm text-gray-600')
             
             self.smart_risk_table = ui.table(
                 columns=columns,
@@ -350,18 +400,79 @@ class JobMonitoringTab:
                 </q-td>
             ''')
             
+            # Pagination controls container
+            self.smart_risk_pagination_container = ui.row().classes('w-full')
+            with self.smart_risk_pagination_container:
+                self._create_smart_risk_pagination_controls()
+            
             # Handle events
             self.smart_risk_table.on('view_smart_risk_detail', self.view_smart_risk_detail)
     
-    def _get_smart_risk_manager_data(self) -> List[dict]:
-        """Get Smart Risk Manager jobs data for the table."""
+    def _get_smart_risk_manager_data(self):
+        """Get Smart Risk Manager jobs data for the table with pagination and filtering.
+        
+        Returns:
+            Tuple of (paginated_data, total_records)
+            
+        Caches the entire filtered dataset to avoid recomputing on pagination changes.
+        """
+        try:
+            # Check if cache is valid (filter state hasn't changed)
+            current_filter_state = (
+                self.smart_risk_status_filter,
+                self.smart_risk_expert_filter
+            )
+            
+            if not self.smart_risk_cache_valid or self.last_smart_risk_filter_state != current_filter_state:
+                # Cache is invalid - fetch and format ALL matching records (no pagination in query)
+                self.cached_smart_risk_data = self._fetch_all_smart_risk_jobs()
+                self.smart_risk_cache_valid = True
+                self.last_smart_risk_filter_state = current_filter_state
+            
+            # Apply pagination to cached data
+            total_records = len(self.cached_smart_risk_data)
+            self.smart_risk_total_records = total_records
+            self.smart_risk_total_pages = max(1, math.ceil(total_records / self.smart_risk_page_size))
+            
+            # Ensure current page is within valid range
+            if self.smart_risk_current_page > self.smart_risk_total_pages:
+                self.smart_risk_current_page = self.smart_risk_total_pages
+            
+            # Get paginated subset
+            start_idx = (self.smart_risk_current_page - 1) * self.smart_risk_page_size
+            end_idx = start_idx + self.smart_risk_page_size
+            paginated_data = self.cached_smart_risk_data[start_idx:end_idx]
+            
+            return paginated_data, total_records
+            
+        except Exception as e:
+            logger.error(f"Error getting Smart Risk Manager jobs data: {e}", exc_info=True)
+            return [], 0
+    
+    def _fetch_all_smart_risk_jobs(self) -> List[dict]:
+        """Fetch all Smart Risk Manager jobs matching current filters (no pagination)."""
         try:
             from ...core.models import SmartRiskManagerJob, ExpertInstance
-            from sqlmodel import select, desc
+            from sqlmodel import select, desc, and_
             
             with get_db() as session:
-                # Get recent Smart Risk Manager jobs (last 50)
-                statement = select(SmartRiskManagerJob).order_by(desc(SmartRiskManagerJob.run_date)).limit(50)
+                # Build base query
+                statement = select(SmartRiskManagerJob)
+                
+                # Apply filters
+                filters = []
+                if self.smart_risk_status_filter != 'all':
+                    filters.append(SmartRiskManagerJob.status == self.smart_risk_status_filter)
+                
+                if self.smart_risk_expert_filter != 'all':
+                    filters.append(SmartRiskManagerJob.expert_instance_id == int(self.smart_risk_expert_filter))
+                
+                if filters:
+                    statement = statement.where(and_(*filters))
+                
+                # Order by run date descending
+                statement = statement.order_by(desc(SmartRiskManagerJob.run_date))
+                
                 jobs = session.exec(statement).all()
                 
                 rows = []
@@ -422,7 +533,7 @@ class JobMonitoringTab:
                 return rows
                 
         except Exception as e:
-            logger.error(f"Error getting Smart Risk Manager jobs data: {e}", exc_info=True)
+            logger.error(f"Error fetching Smart Risk Manager jobs: {e}", exc_info=True)
             return []
     
     def view_smart_risk_detail(self, event_data):
@@ -447,6 +558,140 @@ class JobMonitoringTab:
         except Exception as e:
             logger.error(f"Error navigating to Smart Risk Manager detail {job_id if job_id else 'unknown'}: {e}", exc_info=True)
             ui.notify(f"Error opening details: {str(e)}", type='negative')
+    
+    def _create_smart_risk_pagination_controls(self):
+        """Create pagination controls for Smart Risk Manager jobs."""
+        # Clear existing controls if container exists
+        if self.smart_risk_pagination_container is not None:
+            self.smart_risk_pagination_container.clear()
+        
+        if self.smart_risk_total_pages <= 1:
+            return
+        
+        # Create controls in the container
+        with self.smart_risk_pagination_container:
+            with ui.row().classes('w-full justify-center items-center mt-4 gap-2'):
+                # Previous button
+                prev_btn = ui.button('Previous', 
+                                   on_click=lambda: self._change_smart_risk_page(self.smart_risk_current_page - 1),
+                                   icon='chevron_left')
+                prev_btn.props('flat')
+                if self.smart_risk_current_page <= 1:
+                    prev_btn.props('disable')
+                
+                # Page info
+                ui.label(f'Page {self.smart_risk_current_page} of {self.smart_risk_total_pages}').classes('mx-4')
+                
+                # Next button  
+                next_btn = ui.button('Next',
+                                   on_click=lambda: self._change_smart_risk_page(self.smart_risk_current_page + 1),
+                                   icon='chevron_right')
+                next_btn.props('flat')
+                if self.smart_risk_current_page >= self.smart_risk_total_pages:
+                    next_btn.props('disable')
+                
+                # Page size selector
+                ui.separator().props('vertical').classes('mx-4')
+                page_size_options = {'10': '10 per page', '25': '25 per page', '50': '50 per page', '100': '100 per page'}
+                page_size_select = ui.select(
+                    options=page_size_options,
+                    value=str(self.smart_risk_page_size),
+                    label='Page Size'
+                ).classes('w-32')
+                page_size_select.on_value_change(self._on_smart_risk_page_size_change)
+    
+    def _change_smart_risk_page(self, new_page: int):
+        """Change to a specific page for Smart Risk Manager jobs - synchronous update using cached data."""
+        if 1 <= new_page <= self.smart_risk_total_pages:
+            self.smart_risk_current_page = new_page
+            # Update table synchronously using cached data (no async needed for pagination)
+            self._update_smart_risk_table_from_cache()
+    
+    def _update_smart_risk_table_from_cache(self):
+        """Update Smart Risk Manager table and pagination controls synchronously from cached data."""
+        try:
+            # Get paginated data from cache (this is synchronous)
+            smart_risk_data, total_records = self._get_smart_risk_manager_data()
+            
+            # Update table if it exists
+            if self.smart_risk_table:
+                self.smart_risk_table.rows = smart_risk_data
+            
+            # Update pagination controls with current state
+            self._create_smart_risk_pagination_controls()
+            
+        except Exception as e:
+            logger.error(f"Error updating Smart Risk Manager table from cache: {e}", exc_info=True)
+    
+    def _on_smart_risk_page_size_change(self, event):
+        """Handle page size change for Smart Risk Manager jobs - synchronous update using cached data."""
+        try:
+            new_size = int(event.value)
+            self.smart_risk_page_size = new_size
+            self.smart_risk_current_page = 1  # Reset to first page
+            # Recalculate total pages based on new page size
+            self.smart_risk_total_pages = max(1, math.ceil(self.smart_risk_total_records / self.smart_risk_page_size))
+            # Update table synchronously using cached data (no async needed)
+            self._update_smart_risk_table_from_cache()
+        except ValueError:
+            pass
+    
+    def _get_smart_risk_expert_options(self) -> dict:
+        """Get available expert instances for Smart Risk Manager filtering."""
+        try:
+            with get_db() as session:
+                # Get expert instances that have Smart Risk Manager jobs
+                from ...core.models import SmartRiskManagerJob
+                statement = select(ExpertInstance).join(SmartRiskManagerJob).distinct()
+                expert_instances = session.exec(statement).all()
+                
+                # Build options dictionary
+                options = {'all': 'All Experts'}
+                for expert in expert_instances:
+                    # Use alias if available, otherwise expert type
+                    # Format: alias-ID or expertType-ID
+                    base_name = expert.alias or expert.expert
+                    display_name = f"{base_name}-{expert.id}"
+                    options[str(expert.id)] = display_name
+                
+                return options
+        except Exception as e:
+            logger.error(f"Error getting Smart Risk Manager expert options: {e}", exc_info=True)
+            return {'all': 'All Experts'}
+    
+    def _on_smart_risk_status_filter_change(self, event):
+        """Handle status filter change for Smart Risk Manager jobs."""
+        self.smart_risk_status_filter = event.value
+        self.smart_risk_current_page = 1  # Reset to first page when filtering
+        self.refresh_smart_risk_data()
+    
+    def _on_smart_risk_expert_filter_change(self, event):
+        """Handle expert filter change for Smart Risk Manager jobs."""
+        self.smart_risk_expert_filter = event.value
+        self.smart_risk_current_page = 1  # Reset to first page when filtering
+        self.refresh_smart_risk_data()
+    
+    def refresh_smart_risk_data(self):
+        """Refresh Smart Risk Manager jobs data with current filters."""
+        try:
+            # Invalidate cache to force refresh
+            self.smart_risk_cache_valid = False
+            
+            # Get fresh data with current filters
+            smart_risk_data, total_records = self._get_smart_risk_manager_data()
+            
+            # Update table if it exists
+            if hasattr(self, 'smart_risk_table') and self.smart_risk_table:
+                self.smart_risk_table.rows = smart_risk_data
+            
+            # Update pagination controls
+            self._create_smart_risk_pagination_controls()
+            
+            logger.debug(f"Refreshed Smart Risk Manager data: {total_records} total records, {len(smart_risk_data)} on current page")
+            
+        except Exception as e:
+            logger.error(f"Error refreshing Smart Risk Manager data: {e}", exc_info=True)
+            ui.notify("Error refreshing data", type='negative')
 
     def _create_queue_status(self):
         """Create worker queue status display with live-updating labels."""
