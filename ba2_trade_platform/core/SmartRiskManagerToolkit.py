@@ -17,7 +17,7 @@ from .models import (
 )
 from .types import TransactionStatus, OrderStatus, OrderType, OrderDirection, MarketAnalysisStatus, OrderOpenType
 from .db import get_db, get_instance, add_instance
-from .utils import get_expert_instance_from_id, get_account_instance_from_id, get_setting_with_interface_default
+from .utils import get_expert_instance_from_id, get_account_instance_from_id
 from .interfaces import MarketExpertInterface
 
 
@@ -1412,7 +1412,7 @@ class SmartRiskManagerToolkit:
                     
                     # Check if adding to position is allowed based on expert settings
                     settings = self.expert.settings
-                    if entry_direction == OrderDirection.BUY and not settings.get("enable_buy", True):
+                    if entry_direction == OrderDirection.BUY and not self.expert.get_setting_with_interface_default("enable_buy"):
                         return {
                             "success": False,
                             "message": "Cannot add to long position: BUY orders are disabled in expert settings",
@@ -1420,7 +1420,7 @@ class SmartRiskManagerToolkit:
                             "old_quantity": old_quantity,
                             "new_quantity": new_quantity
                         }
-                    if entry_direction == OrderDirection.SELL and not settings.get("enable_sell", True):
+                    if entry_direction == OrderDirection.SELL and not self.expert.get_setting_with_interface_default("enable_sell"):
                         return {
                             "success": False,
                             "message": "Cannot add to short position: SELL orders are disabled in expert settings",
@@ -1870,7 +1870,7 @@ class SmartRiskManagerToolkit:
             
             # Check enable_buy/enable_sell settings
             settings = self.expert.settings
-            if order_direction == OrderDirection.BUY and not settings.get("enable_buy", True):
+            if order_direction == OrderDirection.BUY and not self.expert.get_setting_with_interface_default("enable_buy"):
                 return {
                     "success": False,
                     "message": "Buy orders are disabled in expert settings",
@@ -1880,7 +1880,7 @@ class SmartRiskManagerToolkit:
                     "quantity": quantity,
                     "direction": direction
                 }
-            if order_direction == OrderDirection.SELL and not settings.get("enable_sell", True):
+            if order_direction == OrderDirection.SELL and not self.expert.get_setting_with_interface_default("enable_sell"):
                 return {
                     "success": False,
                     "message": "Sell orders are disabled in expert settings",
@@ -1927,7 +1927,7 @@ class SmartRiskManagerToolkit:
             
             # Check position size limits and adjust if necessary
             settings = self.expert.settings
-            max_position_pct = get_setting_with_interface_default(settings, MarketExpertInterface, "max_virtual_equity_per_instrument_percent")
+            max_position_pct = self.expert.get_setting_with_interface_default("max_virtual_equity_per_instrument_percent")
             max_position_value = virtual_equity * (max_position_pct / 100.0)
             
             original_quantity = quantity

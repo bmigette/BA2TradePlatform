@@ -659,7 +659,7 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                             f"⚠️ PRICE DISCREPANCY for {symbol}: "
                             f"Graph=${graph_price:.2f} vs Account=${account_price:.2f} "
                             f"(diff: {price_diff_pct:.1f}%). Using graph price. "
-                            f"Data providers: {self.settings.get('vendor_stock_data', 'unknown')}"
+                            f"Data providers: {self.get_setting_with_interface_default('vendor_stock_data', log_warning=False) or 'unknown'}"
                         )
                     else:
                         self.logger.info(f"Price validation OK for {symbol}: Graph=${graph_price:.2f}, Account=${account_price:.2f} (diff: {price_diff_pct:.1f}%)")
@@ -805,12 +805,12 @@ Time Horizon: {recommendation_data.get('time_horizon', 'UNKNOWN')}
 Expert ID: {self.id}
 
 Configuration:
-- Deep Think LLM: {expert_settings.get('deep_think_llm', 'Unknown')}
-- Quick Think LLM: {expert_settings.get('quick_think_llm', 'Unknown')}
-- News Lookback: {expert_settings.get('news_lookback_days', 0)} days
-- Market History: {expert_settings.get('market_history_days', 0)} days
-- Economic Data: {expert_settings.get('economic_data_days', 0)} days
-- Social Sentiment: {expert_settings.get('social_sentiment_days', 0)} days
+- Deep Think LLM: {expert_settings.get('deep_think_llm') or 'Unknown'}
+- Quick Think LLM: {expert_settings.get('quick_think_llm') or 'Unknown'}
+- News Lookback: {expert_settings.get('news_lookback_days') or 0} days
+- Market History: {expert_settings.get('market_history_days') or 0} days
+- Economic Data: {expert_settings.get('economic_data_days') or 0} days
+- Social Sentiment: {expert_settings.get('social_sentiment_days') or 0} days
 - Timeframe: {expert_settings.get('timeframe', 'Unknown')}
 - Debates (New/Existing): {expert_settings.get('debates_new_positions', 0)}/{expert_settings.get('debates_existing_positions', 0)}
 
@@ -947,7 +947,7 @@ Analysis completed at: {self._get_current_timestamp()}"""
         
         # Initialize TradingAgents graph
         # Get debug mode from settings (defaults to True for detailed logging)
-        debug_mode = self.settings.get('debug_mode', True)
+        debug_mode = bool(self.get_setting_with_interface_default('debug_mode'))
         
         # Build selected_analysts list based on settings
         selected_analysts = self._build_selected_analysts()
@@ -1672,9 +1672,9 @@ Please check back in a few minutes for results."""
         """
         try:
             # Check if automatic trade opening is enabled for this expert
-            allow_automated_trade_opening = self.settings.get('allow_automated_trade_opening', False)
+            allow_automated_trade_opening = self.get_setting_with_interface_default('allow_automated_trade_opening')
             # Also check legacy setting for backward compatibility
-            legacy_automatic_trading = self.settings.get('automatic_trading', False)
+            legacy_automatic_trading = self.settings.get('automatic_trading', False)  # Legacy setting, keep hardcoded default
             
             if not allow_automated_trade_opening and not legacy_automatic_trading:
                 self.logger.debug(f"[TRADE MANAGER] Automatic trade opening disabled for expert {self.id}, skipping order creation for {symbol}")

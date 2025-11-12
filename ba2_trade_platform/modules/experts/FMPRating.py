@@ -541,8 +541,9 @@ Expected Profit % = (Weighted Delta / Current) × 100 = {expected_profit_percent
             update_instance(market_analysis)
             
             # Get settings
-            profit_ratio = float(self.settings.get('profit_ratio', 1.0))
-            min_analysts = int(self.settings.get('min_analysts', 3))
+            settings_def = self.get_settings_definitions()
+            profit_ratio = float(self.settings.get('profit_ratio') or settings_def['profit_ratio']['default'])
+            min_analysts = int(self.settings.get('min_analysts') or settings_def['min_analysts']['default'])
             
             # Get current price first (needed for calculation)
             current_price = self._get_current_price(symbol)

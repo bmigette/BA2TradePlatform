@@ -214,7 +214,7 @@ class AlpacaAccount(AccountInterface):
                 logger.debug(f"Parent OCO order {parent_order.id} has no linked leg orders in database")
                 return 0
             
-            logger.debug(f"Found {len(leg_orders)} leg orders to update for parent OCO {parent_order.id}")
+            #logger.debug(f"Found {len(leg_orders)} leg orders to update for parent OCO {parent_order.id}")
             
             for leg_order in leg_orders:
                 if not leg_order.broker_order_id:
@@ -562,7 +562,7 @@ class AlpacaAccount(AccountInterface):
         
         if is_oco:
             final_order_type = CoreOrderType.OCO
-            logger.debug(f"Order {getattr(order, 'id', 'unknown')} detected as OCO based on order_class field")
+            #logger.debug(f"Order {getattr(order, 'id', 'unknown')} detected as OCO based on order_class field")
             
             # Extract OCO leg broker IDs from the legs array (if present in response)
             if hasattr(order, 'legs') and order.legs:
@@ -1086,7 +1086,7 @@ class AlpacaAccount(AccountInterface):
         """
         try:
             order = self.client.get_order_by_id(order_id)
-            logger.debug(f"Fetched Alpaca order: {order.id}")
+            #logger.debug(f"Fetched Alpaca order: {order.id}")
             return self.alpaca_order_to_tradingorder(order)
         except Exception as e:
             logger.error(f"Error fetching Alpaca order {order_id}: {e}", exc_info=True)

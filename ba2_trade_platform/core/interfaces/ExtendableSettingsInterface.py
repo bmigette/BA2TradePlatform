@@ -66,6 +66,48 @@ class ExtendableSettingsInterface(ABC):
             
         return merged
 
+    def get_setting_with_interface_default(self, setting_key: str, log_warning: bool = True) -> Any:
+        """
+        Get setting value with automatic fallback to interface-defined default.
+        
+        This method checks the current settings first, then falls back to the default
+        value defined in the interface's get_merged_settings_definitions().
+        
+        Args:
+            setting_key: The setting key to retrieve
+            log_warning: Whether to log a warning when using interface default
+            
+        Returns:
+            The setting value or interface default
+            
+        Raises:
+            ValueError: If setting key not found in interface definitions
+        """
+        # Check if setting exists in current settings
+        setting_value = self.settings.get(setting_key)
+        if setting_value is not None:
+            return setting_value
+        
+        # Fall back to interface default
+        try:
+            merged_defs = type(self).get_merged_settings_definitions()
+            if setting_key in merged_defs:
+                default_value = merged_defs[setting_key].get('default')
+                if log_warning:
+                    logger.warning(
+                        f"Setting '{setting_key}' not configured for {type(self).__name__} "
+                        f"(ID: {getattr(self, 'id', 'unknown')}), using interface default: {default_value}"
+                    )
+                return default_value
+            else:
+                raise ValueError(
+                    f"Setting '{setting_key}' not found in {type(self).__name__} interface definitions. "
+                    f"Available settings: {list(merged_defs.keys())}"
+                )
+        except Exception as e:
+            logger.error(f"Error getting interface default for setting '{setting_key}': {e}")
+            raise
+
     def _save_single_setting(self, session, key: str, value: Any, setting_type: Optional[str] = None):
         """
         Helper method to save a single setting to the database.

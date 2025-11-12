@@ -962,7 +962,7 @@ Recommendations Generated:"""
             update_instance(market_analysis)
             
             # Get settings
-            copy_trade_names_setting = self.settings.get('copy_trade_names', '').strip()
+            copy_trade_names_setting = (self.get_setting_with_interface_default('copy_trade_names', log_warning=False) or '').strip()
             if not copy_trade_names_setting:
                 raise ValueError("No copy trade names configured. Please set 'copy_trade_names' in expert settings.")
             
@@ -971,8 +971,9 @@ Recommendations Generated:"""
             if not copy_trade_names:
                 raise ValueError("No valid copy trade names found after parsing.")
             
-            max_disclose_days = self.settings.get('max_disclose_date_days', 30)
-            max_exec_days = self.settings.get('max_trade_exec_days', 60)
+            settings_def = self.get_settings_definitions()
+            max_disclose_days = int(self.get_setting_with_interface_default('max_disclose_date_days'))
+            max_exec_days = int(self.get_setting_with_interface_default('max_trade_exec_days'))
             
             # Fetch all trades (no symbol filter)
             senate_trades = self._fetch_senate_trades(symbol=None)
@@ -1144,19 +1145,20 @@ Recommendations Generated:"""
             update_instance(market_analysis)
             
             # Get settings
-            copy_trade_names_setting = self.settings.get('copy_trade_names', '').strip()
+            copy_trade_names_setting = (self.get_setting_with_interface_default('copy_trade_names', log_warning=False) or '').strip()
             if not copy_trade_names_setting:
                 raise ValueError("No copy trade names configured. Please set 'copy_trade_names' in expert settings.")
             
-            close_only_for_same_trader = self.settings.get('close_only_for_same_trader', True)
+            close_only_for_same_trader = bool(self.get_setting_with_interface_default('close_only_for_same_trader'))
             
             # Parse copy trade names
             copy_trade_names = [name.strip().lower() for name in copy_trade_names_setting.split(',') if name.strip()]
             if not copy_trade_names:
                 raise ValueError("No valid copy trade names found after parsing.")
             
-            max_disclose_days = self.settings.get('max_disclose_date_days', 30)
-            max_exec_days = self.settings.get('max_trade_exec_days', 60)
+            settings_def = self.get_settings_definitions()
+            max_disclose_days = int(self.get_setting_with_interface_default('max_disclose_date_days'))
+            max_exec_days = int(self.get_setting_with_interface_default('max_trade_exec_days'))
             
             # OPEN_POSITIONS: Fetch trades only for the specific symbol being analyzed
             # This ensures we only analyze the position we're holding

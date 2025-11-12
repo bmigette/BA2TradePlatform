@@ -72,17 +72,25 @@ class TradeRiskManagement:
                 raise ValueError(error_msg)
             
             # Check if automated trade opening is enabled
-            allow_automated_trade_opening = expert.settings.get('allow_automated_trade_opening', False)
+            allow_automated_trade_opening = expert.get_setting_with_interface_default(
+                'allow_automated_trade_opening', log_warning=False
+            )
             if not allow_automated_trade_opening:
                 self.logger.debug(f"Automated trade opening disabled for expert {expert_instance_id}, skipping risk management")
                 return updated_orders
             
-            # Get expert trading permissions
-            enable_buy = expert.settings.get('enable_buy', True)
-            enable_sell = expert.settings.get('enable_sell', False)
+            # Get expert trading permissions using interface defaults
+            enable_buy = expert.get_setting_with_interface_default(
+                'enable_buy', log_warning=False
+            )
+            enable_sell = expert.get_setting_with_interface_default(
+                'enable_sell', log_warning=False
+            )
             
-            # Get virtual equity per instrument limit (default 10%)
-            max_virtual_equity_per_instrument_percent = expert.settings.get('max_virtual_equity_per_instrument_percent', 10.0)
+            # Get virtual equity per instrument limit using interface default
+            max_virtual_equity_per_instrument_percent = expert.get_setting_with_interface_default(
+                'max_virtual_equity_per_instrument_percent', log_warning=False
+            )
             if max_virtual_equity_per_instrument_percent is None:
                 self.logger.warning(f"Expert {expert_instance_id} has no max_virtual_equity_per_instrument_percent setting, defaulting to 10.0%")
                 max_virtual_equity_per_instrument_percent = 10.0
@@ -369,6 +377,7 @@ class TradeRiskManagement:
         """
         updated_orders = []
         remaining_balance = total_virtual_balance
+        early_skipped_count = 0  # Track orders skipped early due to unaffordability
         instrument_allocations = existing_allocations.copy()
         
         # Get instrument weight configurations from expert settings
@@ -418,6 +427,25 @@ class TradeRiskManagement:
                                f"current_allocation=${current_allocation:.2f}, "
                                f"available_for_instrument=${available_for_instrument:.2f}")
                 self.logger.debug(f"  ROI={recommendation.expected_profit_percent:.2f}%")
+                
+                # EARLY AFFORDABILITY CHECK: Skip if can't afford even 1 share
+                # This prevents creating orders that will immediately fail, avoiding TP/SL creation attempts
+                if (available_for_instrument < current_price and 
+                    symbol not in top_3_symbols):  # Allow top-3 ROI exception to proceed
+                    self.logger.warning(f"  ⚡ EARLY SKIP: {symbol} price ${current_price:.2f} exceeds available per-instrument "
+                                      f"${available_for_instrument:.2f} (can't afford 1 share) - marking for deletion")
+                    order.quantity = 0
+                    early_skipped_count += 1
+                    updated_orders.append(order)
+                    continue
+                
+                if remaining_balance < current_price:
+                    self.logger.warning(f"  ⚡ EARLY SKIP: {symbol} price ${current_price:.2f} exceeds remaining balance "
+                                      f"${remaining_balance:.2f} (can't afford 1 share) - marking for deletion")
+                    order.quantity = 0
+                    early_skipped_count += 1
+                    updated_orders.append(order)
+                    continue
                 
                 # Calculate maximum affordable quantity based on available equity per instrument
                 max_quantity_by_instrument = max(0, available_for_instrument / current_price) if current_price > 0 else 0
@@ -534,6 +562,10 @@ class TradeRiskManagement:
         self.logger.info(f"Risk management allocation complete: ${total_allocated:.2f} allocated, "
                         f"${remaining_balance:.2f} remaining")
         
+        if early_skipped_count > 0:
+            self.logger.info(f"⚡ Early skip optimization: {early_skipped_count} orders skipped due to unaffordability "
+                           f"(preventing unnecessary TP/SL creation attempts)")
+        
         # Separate orders into those to update (qty > 0) and those to delete (qty = 0)
         orders_to_update = [o for o in updated_orders if o.quantity > 0]
         orders_to_delete = [o for o in updated_orders if o.quantity == 0]
@@ -623,8 +655,9 @@ class TradeRiskManagement:
             with get_db() as session:
                 for order in orders:
                     try:
-                        # Log the deletion
-                        self.logger.info(f"Deleting unfunded order {order.id} ({order.symbol}, {order.side}) - insufficient funds")
+                        # Log the deletion with specific reason
+                        self.logger.info(f"Deleting unfunded order {order.id} ({order.symbol}, {order.side}) - "
+                                       f"price exceeds per-instrument limit (can't afford 1 share)")
                         
                         # Find and delete any linked orders (orders that depend on this order)
                         if order.id:

@@ -29,7 +29,7 @@ from .models import SmartRiskManagerJob, MarketAnalysis, Transaction
 from .db import get_db, add_instance, update_instance, get_instance
 from .models import AppSetting
 from .SmartRiskManagerToolkit import SmartRiskManagerToolkit
-from .utils import get_expert_instance_from_id, get_setting_with_interface_default
+from .utils import get_expert_instance_from_id
 from .interfaces import MarketExpertInterface
 
 
@@ -1277,13 +1277,16 @@ def initialize_context(state: SmartRiskManagerState) -> Dict[str, Any]:
         if not expert:
             raise ValueError(f"Expert instance {expert_instance_id} not found")
         
-        # Get settings
+        # Get settings using interface defaults
         settings = expert.settings
-        user_instructions = settings.get("smart_risk_manager_user_instructions", 
-                                         "Manage portfolio risk conservatively. Close positions with >10% loss or >20% gain.")
+        user_instructions = expert.get_setting_with_interface_default(
+            "smart_risk_manager_user_instructions", log_warning=False
+        )
         
-        # Get model and backend URL from settings with fallbacks
-        risk_manager_model = settings.get("risk_manager_model") or "gpt-4o-mini"
+        # Get model using interface default
+        risk_manager_model = expert.get_setting_with_interface_default(
+            "risk_manager_model", log_warning=False
+        )
         backend_url = os.getenv("OPENAI_BACKEND_URL", "https://api.openai.com/v1")
         api_key_setting_name = "openai_api_key"  # Default to OpenAI
         
@@ -1302,14 +1305,14 @@ def initialize_context(state: SmartRiskManagerState) -> Dict[str, Any]:
         # Get API key from database
         api_key = get_api_key_from_database(api_key_setting_name)
         
-        max_iterations = settings.get("smart_risk_manager_max_iterations", 10)
+        max_iterations = expert.get_setting_with_interface_default("smart_risk_manager_max_iterations", log_warning=False)
         
         # Extract relevant expert settings for trading restrictions
         expert_config = {
-            "enable_buy": settings.get("enable_buy", True),
-            "enable_sell": settings.get("enable_sell", True),
+            "enable_buy": expert.get_setting_with_interface_default("enable_buy"),
+            "enable_sell": expert.get_setting_with_interface_default("enable_sell"),
             "enabled_instruments": expert.get_enabled_instruments() if hasattr(expert, 'get_enabled_instruments') else [],
-            "max_virtual_equity_per_instrument_percent": get_setting_with_interface_default(settings, MarketExpertInterface, "max_virtual_equity_per_instrument_percent")
+            "max_virtual_equity_per_instrument_percent": expert.get_setting_with_interface_default("max_virtual_equity_per_instrument_percent")
         }
         
         # Create toolkit
@@ -1350,10 +1353,10 @@ def initialize_context(state: SmartRiskManagerState) -> Dict[str, Any]:
             logger.info(f"Created SmartRiskManagerJob {job_id}")
         
         # Prepare trading permission status messages
-        enable_buy = expert_config.get("enable_buy", True)
-        enable_sell = expert_config.get("enable_sell", True)
-        auto_trade_opening = settings.get("allow_automated_trade_opening", False)
-        auto_trade_modification = settings.get("allow_automated_trade_modification", False)
+        enable_buy = expert_config.get("enable_buy")  # Already fetched with interface defaults above
+        enable_sell = expert_config.get("enable_sell")  # Already fetched with interface defaults above
+        auto_trade_opening = expert.get_setting_with_interface_default("allow_automated_trade_opening")
+        auto_trade_modification = expert.get_setting_with_interface_default("allow_automated_trade_modification")
         auto_trading = auto_trade_opening and auto_trade_modification
         
         buy_status = "✅ ENABLED" if enable_buy else "❌ DISABLED"
@@ -1815,7 +1818,10 @@ def initialize_research_agent(state: SmartRiskManagerState) -> Dict[str, Any]:
         # Virtual equity = account_balance * virtual_equity_pct (e.g., 5% of total)
         # Available balance = virtual_equity - already_deployed_trades
         # Position sizing should be against virtual_equity (the expert's allocation)
-        max_position_pct = get_setting_with_interface_default(expert_settings, MarketExpertInterface, "max_virtual_equity_per_instrument_percent")
+        expert = get_expert_instance_from_id(expert_instance_id)
+        if not expert:
+            raise ValueError(f"Expert instance {expert_instance_id} not found")
+        max_position_pct = expert.get_setting_with_interface_default("max_virtual_equity_per_instrument_percent")
         current_equity = float(portfolio_status.get("account_virtual_equity", 0))
         max_position_equity = current_equity * (max_position_pct / 100.0)
         
@@ -2482,7 +2488,10 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
         # Virtual equity = account_balance * virtual_equity_pct (e.g., 5% of total)
         # Available balance = virtual_equity - already_deployed_trades
         # Position sizing should be against virtual_equity (the expert's allocation)
-        max_position_pct = get_setting_with_interface_default(expert_settings, MarketExpertInterface, "max_virtual_equity_per_instrument_percent")
+        expert = get_expert_instance_from_id(expert_instance_id)
+        if not expert:
+            raise ValueError(f"Expert instance {expert_instance_id} not found")
+        max_position_pct = expert.get_setting_with_interface_default("max_virtual_equity_per_instrument_percent")
         current_equity = float(portfolio_status.get("account_virtual_equity", 0))
         max_position_equity = current_equity * (max_position_pct / 100.0)
         
@@ -3841,7 +3850,10 @@ class SmartRiskManagerGraph:
             # Virtual equity = account_balance * virtual_equity_pct (e.g., 5% of total)
             # Available balance = virtual_equity - already_deployed_trades
             # Position sizing should be against virtual_equity (the expert's allocation)
-            max_position_pct = get_setting_with_interface_default(expert_settings, MarketExpertInterface, "max_virtual_equity_per_instrument_percent")
+            expert = get_expert_instance_from_id(expert_instance_id)
+            if not expert:
+                raise ValueError(f"Expert instance {expert_instance_id} not found")
+            max_position_pct = expert.get_setting_with_interface_default("max_virtual_equity_per_instrument_percent")
             current_equity = float(portfolio_status.get("account_virtual_equity", 0))
             max_position_equity = current_equity * (max_position_pct / 100.0)
             

@@ -24,6 +24,7 @@ from apscheduler.job import Job
 from ..core.utils import get_expert_instance_from_id
 from ..logger import logger
 from .db import get_all_instances, get_instance, get_setting
+from .interfaces import MarketExpertInterface
 from .models import ExpertInstance, ExpertSetting, Instrument
 from .WorkerQueue import get_worker_queue, AnalysisTask
 from .types import WorkerTaskStatus
@@ -578,8 +579,11 @@ class JobManager:
                 logger.warning(f"Expert instance {instance_id} not found")
                 return []
             
-            # Get instrument selection method
-            instrument_selection_method = expert.settings.get('instrument_selection_method', 'static')
+            # Get instrument selection method using interface default
+            instrument_selection_method = expert.get_setting_with_interface_default(
+                'instrument_selection_method',
+                log_warning=False  # Don't log warning for this common setting
+            )
             
             # Get expert properties to check capabilities
             expert_properties = expert.__class__.get_expert_properties()
@@ -790,11 +794,11 @@ class JobManager:
                 logger.error(f"No AI prompt configured for expert {expert_instance_id} - cannot perform dynamic selection")
                 return
             
-            # Get model configuration from expert settings (REQUIRED - no fallback)
-            model_string = expert.settings.get('dynamic_instrument_selection_model')
-            if not model_string:
-                logger.error(f"No dynamic_instrument_selection_model setting configured for expert {expert_instance_id} - cannot perform dynamic selection")
-                return
+            # Get model configuration from expert settings with interface default
+            model_string = expert.get_setting_with_interface_default(
+                'dynamic_instrument_selection_model',
+                log_warning=False  # Don't log warning for this common setting
+            )
             
             logger.info(f"Using model for dynamic selection: {model_string}")
             

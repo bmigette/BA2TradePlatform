@@ -11,6 +11,7 @@ import logging
 import threading
 from ..logger import logger
 from .models import ExpertRecommendation, ExpertInstance, TradingOrder, Ruleset, Transaction
+from .interfaces import MarketExpertInterface
 from .types import OrderRecommendation, OrderStatus, OrderDirection, OrderOpenType, OrderType
 from .db import get_instance, get_all_instances, add_instance, update_instance
 
@@ -641,13 +642,23 @@ class TradeManager:
                 return {}
             
             # Check for legacy automatic_trading setting and new settings
-            legacy_automatic_trading = expert.settings.get('automatic_trading', False)
-            allow_automated_trade_opening = expert.settings.get('allow_automated_trade_opening', legacy_automatic_trading)
-            allow_automated_trade_modification = expert.settings.get('allow_automated_trade_modification', legacy_automatic_trading)
+            legacy_automatic_trading = expert.settings.get('automatic_trading', False)  # Legacy setting, keep hardcoded default
+            
+            # Use interface defaults for modern settings
+            allow_automated_trade_opening = expert.get_setting_with_interface_default(
+                'allow_automated_trade_opening', log_warning=False
+            )
+            allow_automated_trade_modification = expert.get_setting_with_interface_default(
+                'allow_automated_trade_modification', log_warning=False
+            )
             
             return {
-                'enable_buy': expert.settings.get('enable_buy', True),
-                'enable_sell': expert.settings.get('enable_sell', False),
+                'enable_buy': expert.get_setting_with_interface_default(
+                    'enable_buy', log_warning=False
+                ),
+                'enable_sell': expert.get_setting_with_interface_default(
+                    'enable_sell', log_warning=False
+                ),
                 'allow_automated_trade_opening': allow_automated_trade_opening,
                 'allow_automated_trade_modification': allow_automated_trade_modification,
                 # Keep legacy setting for backward compatibility
@@ -916,7 +927,9 @@ class TradeManager:
                 return created_orders
             
             # Check if "Allow automated trade opening" is enabled
-            allow_automated_trade_opening = expert.settings.get('allow_automated_trade_opening', False)
+            allow_automated_trade_opening = expert.get_setting_with_interface_default(
+                'allow_automated_trade_opening', log_warning=False
+            )
             if not allow_automated_trade_opening:
                 self.logger.debug(f"Automated trade opening disabled for expert {expert_instance_id}, skipping recommendation processing")
                 return created_orders
@@ -1491,7 +1504,9 @@ class TradeManager:
                 return created_orders
             
             # Check if "Allow automated trade modification" is enabled
-            allow_automated_trade_modification = expert.settings.get('allow_automated_trade_modification', False)
+            allow_automated_trade_modification = expert.get_setting_with_interface_default(
+                'allow_automated_trade_modification', log_warning=False
+            )
             if not allow_automated_trade_modification:
                 self.logger.debug(f"Automated trade modification disabled for expert {expert_instance_id}, skipping recommendation processing")
                 return created_orders

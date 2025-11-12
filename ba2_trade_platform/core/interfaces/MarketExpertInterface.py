@@ -92,8 +92,9 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 },
                 # Balance Management Settings
                 "min_available_balance_pct": {
-                    "type": "float", "required": False, "default": 20.0,
-                    "description": "Minimum available balance percentage required to enter new market positions (default 20%)"
+                    "type": "float", "required": False, "default": 10.0,
+                    "description": "Minimum available balance percentage required to enter new market positions (%)",
+                    "tooltip": "Minimum percentage of virtual balance that must remain available before the expert stops opening new positions. Lower values (5-10%) allow more aggressive trading, higher values (15-25%) provide more conservative risk management."
                 },
                 # Risk Management Settings
                 "max_virtual_equity_per_instrument_percent": {
@@ -554,10 +555,13 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             bool: True if sufficient balance available, False otherwise
         """
         try:
-            # Get the minimum balance threshold from settings
-            min_balance_pct = self.settings.get('min_available_balance_pct', 10.0)
+            # Get the minimum balance threshold from settings with built-in default
+            min_balance_pct = self.settings.get('min_available_balance_pct')
             if min_balance_pct is None:
-                min_balance_pct = 10.0
+                # Get default from built-in settings if not set
+                default_value = self.__class__._builtin_settings.get('min_available_balance_pct', {}).get('default', 10.0)
+                min_balance_pct = default_value
+                logger.debug(f"Expert {self.id} using default min_available_balance_pct: {min_balance_pct}%")
             
             # Get virtual and available balances using direct methods
             virtual_balance = self.get_virtual_balance()
@@ -574,11 +578,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             
             available_balance_pct = (available_balance / virtual_balance) * 100.0
             
-            # Check if available balance meets minimum threshold (with None check)
-            if min_balance_pct is None:
-                logger.warning(f"Expert {self.id} has no minimum balance threshold set, defaulting to 20%")
-                min_balance_pct = 20.0
-            
+            # Check if available balance meets minimum threshold
             has_sufficient = available_balance_pct >= min_balance_pct
             
             logger.debug(f"Expert {self.id} balance check: Available={available_balance:.2f} "

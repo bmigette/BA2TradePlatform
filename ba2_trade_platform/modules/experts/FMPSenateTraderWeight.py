@@ -829,9 +829,7 @@ class FMPSenateTraderWeight(MarketExpertInterface):
             relevant_trades = trade_details
         
         # Get growth confidence multiplier from settings
-        growth_multiplier = self.settings.get('growth_confidence_multiplier')
-        if growth_multiplier is None:
-            growth_multiplier = 5.0  # Default value
+        growth_multiplier = self.get_setting_with_interface_default('growth_confidence_multiplier')
         
         # Calculate average symbol focus percentage across relevant trades
         if relevant_trades:
@@ -1095,9 +1093,10 @@ All {len(trade_details)} trades shown above for transparency.
             update_instance(market_analysis)
             
             # Get settings
-            max_disclose_days = self.settings.get('max_disclose_date_days', 30)
-            max_exec_days = self.settings.get('max_trade_exec_days', 60)
-            max_price_delta_pct = self.settings.get('max_trade_price_delta_pct', 10.0)
+            settings_def = self.get_settings_definitions()
+            max_disclose_days = int(self.get_setting_with_interface_default('max_disclose_date_days'))
+            max_exec_days = int(self.get_setting_with_interface_default('max_trade_exec_days'))
+            max_price_delta_pct = float(self.get_setting_with_interface_default('max_trade_price_delta_pct'))
             
             # Get current price first
             current_price = self._get_current_price(symbol)
