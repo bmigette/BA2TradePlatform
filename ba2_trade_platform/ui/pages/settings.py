@@ -1526,6 +1526,16 @@ class ExpertSettingsTab:
                                 ).classes('w-20')
                                 ui.label('%').classes('text-sm')
                             ui.label('Maximum percentage of virtual trading balance that can be allocated to a single instrument. Recommended: 5-15%.').classes('text-body2 text-grey-7 ml-2')
+                            
+                            # Min Available Balance Percentage
+                            with ui.row().classes('items-center gap-2 mt-2'):
+                                ui.label('Min balance for new positions (%):').classes('text-sm font-medium')
+                                self.min_available_balance_pct_input = ui.input(
+                                    value='10.0',
+                                    placeholder='10.0'
+                                ).classes('w-20')
+                                ui.label('%').classes('text-sm')
+                            ui.label('Minimum available balance percentage required to enter new market positions. Lower values (5-10%) allow more aggressive trading, higher values (15-25%) provide more conservative risk management.').classes('text-body2 text-grey-7 ml-2')
                         
                         ui.separator().classes('my-4')
                         
@@ -2046,6 +2056,13 @@ class ExpertSettingsTab:
             
             if hasattr(self, 'max_virtual_equity_per_instrument_input'):
                 self.max_virtual_equity_per_instrument_input.value = str(max_virtual_equity_per_instrument)
+            
+            min_available_balance_pct = settings_source.get('min_available_balance_pct', 10.0)
+            if isinstance(min_available_balance_pct, str):
+                min_available_balance_pct = float(min_available_balance_pct)
+            
+            if hasattr(self, 'min_available_balance_pct_input'):
+                self.min_available_balance_pct_input.value = str(min_available_balance_pct)
             
             # Load AI model settings
             risk_manager_model = settings_source.get('risk_manager_model', 'NagaAI/gpt-5-2025-08-07')
@@ -3595,6 +3612,11 @@ class ExpertSettingsTab:
             max_equity_value = float(self.max_virtual_equity_per_instrument_input.value or 10.0)
             expert.save_setting('max_virtual_equity_per_instrument_percent', max_equity_value, setting_type="float")
             logger.debug(f'Saved risk management: max_virtual_equity_per_instrument_percent={max_equity_value}%')
+        
+        if hasattr(self, 'min_available_balance_pct_input'):
+            min_balance_value = float(self.min_available_balance_pct_input.value or 10.0)
+            expert.save_setting('min_available_balance_pct', min_balance_value, setting_type="float")
+            logger.debug(f'Saved risk management: min_available_balance_pct={min_balance_value}%')
         
         # Save AI model settings
         if hasattr(self, 'risk_manager_model_select'):
