@@ -809,6 +809,15 @@ class TradingAgentsUI:
                     ).classes('flex')
                     ui.label('(Uncheck to recalculate indicators live)').classes('text-xs text-gray-500')
                 
+                # Add event handler to refresh the panel when checkbox value changes
+                def on_checkbox_change():
+                    """Refresh the entire data visualization panel when checkbox changes."""
+                    ui.notify('Refreshing indicators...', type='info')
+                    # Trigger a page refresh to reload with new checkbox state
+                    ui.run_javascript('window.location.reload()')
+                
+                use_stored_checkbox.on_value_change(lambda _: on_checkbox_change())
+                
                 # Get analysis outputs from database for indicators
                 session = get_db()
                 try:
@@ -983,165 +992,70 @@ class TradingAgentsUI:
                         # Recalculate indicators live if checkbox is unchecked
                         logger.info("Recalculating indicators live (checkbox unchecked)")
                         indicators_source = "Live Recalculation"
-                        # Recalculation logic would go here if implemented
-                        # For now, just indicate that live recalculation was requested
-                        ui.label("📊 Live indicator recalculation not yet implemented - showing database values").classes('text-sm text-amber-600 mb-2')
-                    
-                        # Old format: tool_output_get_stockstats_indicators_*
-                        # New format: tool_output_get_indicator_data (with _json variant)
-                        is_indicator_output = (
-                            'tool_output_get_indicator_data' in output_obj.name.lower() or
-                            'tool_output_get_stockstats_indicators' in output_obj.name.lower()
-                        )
+                        ui.label("📊 Recalculating indicators live...").classes('text-sm text-green-600 mb-2')
                         
-                        if is_indicator_output:
-                            try:
-                                # Prefer JSON format if available
-                                if output_obj.name.endswith('_json') and output_obj.text:
+                        # Extract indicator names from stored analysis outputs to know what to recalculate
+                        indicators_to_calculate = set()
+                        for output in outputs:
+                            output_obj = output[0] if isinstance(output, tuple) else output
+                            is_indicator_output = (
+                                'tool_output_get_indicator_data' in output_obj.name.lower() or
+                                'tool_output_get_stockstats_indicators' in output_obj.name.lower()
+                            )
+                            
+                            if is_indicator_output and output_obj.name.endswith('_json') and output_obj.text:
+                                try:
                                     import json
-                                    params = None
-                                    try:
-                                        params = json.loads(output_obj.text)
-                                    except json.JSONDecodeError:
-                                        logger.warning(f"Could not parse JSON from {output_obj.name}, skipping")
-                                        params = None
-                                    
-                                    if params:  # Only process if JSON was successfully parsed
-                                        logger.debug(f"Processing indicator JSON output: {output_obj.name}")
-                                        logger.debug(f"JSON keys: {params.keys() if isinstance(params, dict) else 'Not a dict'}")
-                                        
-                                        # Handle new format from get_indicator_data (get_indicator_data tool)
-                                        if params.get('tool') == 'get_indicator_data':
-                                            indicator_name = params.get('indicator', 'Unknown')
-                                            
-                                            # Clean up indicator name
-                                            indicator_name = indicator_name.replace('_', ' ').title()
-                                            
-                                            # Get the data - could be dict or raw string
-                                            indicator_data = params.get('data', {})
-                                            
-                                            if isinstance(indicator_data, dict):
-                                                # If data is a dict, try to convert to DataFrame
-                                                # Format: {"dates": [...], "values": [...]} or similar
-                                                try:
-                                                    if 'dates' in indicator_data and 'values' in indicator_data:
-                                                        dates = pd.to_datetime(indicator_data['dates'])
-                                                        indicator_df = pd.DataFrame({
-                                                            indicator_name: indicator_data['values']
-                                                        }, index=dates)
-                                                        indicator_df.index.name = 'Date'
-                                                        
-                                                        # Make timezone-aware to match price data (UTC)
-                                                        if indicator_df.index.tz is None:
-                                                            indicator_df.index = indicator_df.index.tz_localize('UTC')
-                                                        
-                                                        indicators_data[indicator_name] = indicator_df
-                                                        logger.info(f"Loaded indicator '{indicator_name}' from JSON: {len(indicator_df)} rows")
-                                                    else:
-                                                        logger.debug(f"Indicator data format not recognized for {indicator_name}, skipping")
-                                                except Exception as e:
-                                                    logger.warning(f"Could not convert indicator data to DataFrame: {e}")
-                                            else:
-                                                logger.debug(f"Indicator data is not a dict for {indicator_name}, might be raw data")
-                                        else:
-                                            logger.debug(f"Indicator data is not a dict for {indicator_name}, might be raw data")
-                                    
-                                    # Handle old format from get_stock_stats_indicators
-                                    elif params.get('tool') == 'get_stock_stats_indicators_window':
-                                        indicator_name = params.get('indicator', 'Unknown')
-                                        indicator_name = indicator_name.replace('_', ' ').title()
-                                        logger.info(f"Reconstructing indicator '{indicator_name}' from old JSON format")
-                                        
-                                        # Use StockstatsUtils to recalculate indicator from cached price data
-                                        from ba2_trade_platform.thirdparties.TradingAgents.tradingagents.dataflows.stockstats_utils import StockstatsUtils
-                                        
-                                        try:
-                                            indicator_df = StockstatsUtils.get_stock_stats_range(
-                                                symbol=params['symbol'],
-                                                indicator=params.get('indicator', ''),
-                                                start_date=params['start_date'],
-                                                end_date=params['end_date'],
-                                                data_dir='',  # Not used when online=True
-                                                online=True,  # Use data provider
-                                                interval=params.get('interval', '1d')
-                                            )
-                                            
-                                            # Convert Date column to datetime index and match price data timezone
-                                            if 'Date' in indicator_df.columns:
-                                                indicator_df['Date'] = pd.to_datetime(indicator_df['Date'])
-                                                # Make timezone-aware to match price data (UTC)
-                                                if indicator_df['Date'].dt.tz is None:
-                                                    indicator_df['Date'] = indicator_df['Date'].dt.tz_localize('UTC')
-                                                indicator_df.set_index('Date', inplace=True)
-                                            
-                                            indicators_data[indicator_name] = indicator_df
-                                            logger.info(f"Reconstructed indicator '{indicator_name}' from cache: {len(indicator_df)} rows")
-                                        except Exception as e:
-                                            logger.warning(f"Could not reconstruct indicator {indicator_name}: {e}")
+                                    params = json.loads(output_obj.text)
+                                    if params.get('tool') == 'get_indicator_data':
+                                        indicator_name = params.get('indicator', '')
+                                        if indicator_name:
+                                            indicators_to_calculate.add(indicator_name)
+                                except json.JSONDecodeError:
+                                    continue
+                        
+                        logger.info(f"Found {len(indicators_to_calculate)} indicators to recalculate: {list(indicators_to_calculate)}")
+                        
+                        # Recalculate each indicator using PandasIndicatorCalc
+                        from ...modules.dataproviders.indicators.PandasIndicatorCalc import PandasIndicatorCalc
+                        
+                        calculator = PandasIndicatorCalc()
+                        
+                        for indicator_name in indicators_to_calculate:
+                            try:
+                                logger.info(f"Recalculating indicator '{indicator_name}' live")
+                                indicator_result = calculator.get_indicator_data(
+                                    symbol=self.market_analysis.symbol,
+                                    indicator=indicator_name,
+                                    start_date=start_date.strftime('%Y-%m-%d'),
+                                    end_date=end_date.strftime('%Y-%m-%d'),
+                                    interval=timeframe,
+                                    format_type="dict"  # Get structured data only
+                                )
                                 
-                                # Fallback: Parse markdown format if no JSON found
-                                elif not output_obj.name.endswith('_json') and output_obj.text and 'tool_output_get_indicator_data' in output_obj.name.lower():
-                                    # Parse markdown-formatted indicator data (fallback for new format)
-                                    # Format: "Tool: get_indicator_data\nOutput:\n\n## INDICATOR_NAME from PROVIDER\n\n| Date | Value | ..."
-                                    lines = output_obj.text.strip().split('\n')
-                                    indicator_name = None
+                                if isinstance(indicator_result, dict) and 'dates' in indicator_result and 'values' in indicator_result:
+                                    # Convert to DataFrame format expected by chart
+                                    dates = pd.to_datetime(indicator_result['dates'])
+                                    display_name = indicator_name.replace('_', ' ').title()
                                     
-                                    # Extract indicator name from markdown header
-                                    for line in lines:
-                                        if line.startswith('##') and ' from ' in line:
-                                            # Format: "## CLOSE_200_SMA from PANDASINDICATORCALC"
-                                            parts = line.replace('##', '').strip().split(' from ')
-                                            indicator_name = parts[0].strip()
-                                            break
+                                    indicator_df = pd.DataFrame({
+                                        display_name: indicator_result['values']
+                                    }, index=dates)
+                                    indicator_df.index.name = 'Date'
                                     
-                                    if indicator_name:
-                                        # Clean up indicator name
-                                        indicator_name = indicator_name.replace('_', ' ').title()
-                                        logger.info(f"Parsing markdown indicator '{indicator_name}' from {output_obj.name}")
-                                        
-                                        # Parse markdown table: "| Date | Value |" format
-                                        dates = []
-                                        values = []
-                                        in_table = False
-                                        
-                                        for line in lines:
-                                            if '|' in line and 'Date' in line and 'Value' in line:
-                                                in_table = True
-                                                continue
-                                            
-                                            if in_table and '|' in line:
-                                                parts = line.split('|')
-                                                if len(parts) >= 3:
-                                                    try:
-                                                        date_str = parts[1].strip()
-                                                        value_str = parts[2].strip()
-                                                        
-                                                        # Skip separator lines and header
-                                                        if date_str and value_str and date_str != '-' * len(date_str):
-                                                            date = pd.to_datetime(date_str)
-                                                            value = float(value_str)
-                                                            dates.append(date)
-                                                            values.append(value)
-                                                    except (ValueError, IndexError):
-                                                        continue
-                                        
-                                        if dates and values:
-                                            indicator_df = pd.DataFrame({
-                                                indicator_name: values
-                                            }, index=pd.DatetimeIndex(dates))
-                                            indicator_df.index.name = 'Date'
-                                            
-                                            # Make timezone-aware to match price data (UTC)
-                                            if indicator_df.index.tz is None:
-                                                indicator_df.index = indicator_df.index.tz_localize('UTC')
-                                            
-                                            indicators_data[indicator_name] = indicator_df
-                                            logger.info(f"Loaded indicator '{indicator_name}' from markdown: {len(indicator_df)} rows")
-                                        else:
-                                            logger.warning(f"Could not extract indicator values from markdown for {indicator_name}")
+                                    # Make timezone-aware to match price data (UTC)
+                                    if indicator_df.index.tz is None:
+                                        indicator_df.index = indicator_df.index.tz_localize('UTC')
+                                    
+                                    indicators_data[display_name] = indicator_df
+                                    logger.info(f"Successfully recalculated indicator '{display_name}': {len(indicator_df)} rows")
+                                else:
+                                    logger.warning(f"Invalid format returned for indicator '{indicator_name}': {type(indicator_result)}")
                                     
                             except Exception as e:
-                                logger.error(f"Error parsing indicator data from {output_obj.name}: {e}", exc_info=True)
+                                logger.error(f"Failed to recalculate indicator '{indicator_name}': {e}", exc_info=True)
+                                ui.label(f"⚠️ Failed to recalculate {indicator_name}: {e}").classes('text-sm text-orange-600')
+
                     
                     # Render the graph if we have data
                     if price_data is not None and not price_data.empty:
