@@ -24,7 +24,7 @@ class TradeAction(ABC):
     Provides common functionality for executing trading actions based on:
     - Account interface
     - Instrument information
-    - Order recommendations
+    - Trade recommendations
     - Existing orders
     """
     
@@ -585,7 +585,7 @@ class AdjustTakeProfitAction(TradeAction):
         Args:
             instrument_name: Instrument name
             account: Account interface
-            order_recommendation: Order recommendation
+            order_recommendation: Trade recommendation
             existing_order: Existing order to adjust (required - from enter_market or open position)
             expert_recommendation: Optional expert recommendation for linking
             take_profit_price: New take profit price (if provided directly)
@@ -921,7 +921,7 @@ class AdjustStopLossAction(TradeAction):
         Args:
             instrument_name: Instrument name
             account: Account interface
-            order_recommendation: Order recommendation
+            order_recommendation: Trade recommendation
             existing_order: Existing order to adjust (required - from enter_market or open position)
             expert_recommendation: Optional expert recommendation for linking
             stop_loss_price: New stop loss price (if provided directly)
@@ -1291,7 +1291,7 @@ class IncreaseInstrumentShareAction(TradeAction):
         Args:
             instrument_name: Instrument name
             account: Account interface
-            order_recommendation: Order recommendation
+            order_recommendation: Trade recommendation
             existing_order: Existing order (optional)
             expert_recommendation: Expert recommendation for linking
             target_percent: Target percentage of virtual equity (e.g., 15.0 for 15%)
@@ -1470,7 +1470,7 @@ class DecreaseInstrumentShareAction(TradeAction):
         Args:
             instrument_name: Instrument name
             account: Account interface
-            order_recommendation: Order recommendation
+            order_recommendation: Trade recommendation
             existing_order: Existing order (optional)
             expert_recommendation: Expert recommendation for linking
             target_percent: Target percentage of virtual equity (e.g., 5.0 for 5%)
@@ -1656,7 +1656,7 @@ def create_action(action_type: ExpertActionType, instrument_name: str, account: 
         action_type: Type of action to create
         instrument_name: Instrument name
         account: Account interface
-        order_recommendation: Order recommendation
+        order_recommendation: Trade recommendation
         existing_order: Optional existing order
         expert_recommendation: Optional expert recommendation for linking
         **kwargs: Additional arguments for specific action types

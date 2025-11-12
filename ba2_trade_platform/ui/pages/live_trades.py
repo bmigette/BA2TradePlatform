@@ -1531,7 +1531,7 @@ class LiveTradesTab:
 
             # Recommendation details
             with ui.grid(columns=2).classes('w-full gap-4 mb-4'):
-                # Order recommendation
+                # Trade recommendation
                 with ui.card():
                     ui.label('Recommendation').classes('text-caption text-grey-7')
                     rec_color = 'green' if rec.recommended_action.value == 'BUY' else 'red' if rec.recommended_action.value == 'SELL' else 'grey'

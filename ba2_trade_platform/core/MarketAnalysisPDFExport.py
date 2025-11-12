@@ -2,7 +2,7 @@
 MarketAnalysisPDFExport - PDF Export functionality for Market Analysis
 
 This module provides functionality to export market analysis data to PDF format,
-including general analysis information, order recommendations, and expert-rendered content.
+including general analysis information, trade recommendations, and expert-rendered content.
 """
 
 from typing import Optional, Dict, Any, List, Tuple

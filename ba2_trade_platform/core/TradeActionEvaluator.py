@@ -577,7 +577,7 @@ class TradeActionEvaluator:
                 logger.debug(f"No actions defined for event action {event_action.name}")
                 return action_summaries
             
-            # Create order recommendation from expert recommendation
+            # Create trade recommendation from expert recommendation
             # Use recommended_action which is the correct attribute name in ExpertRecommendation model
             # The recommended_action is already an OrderRecommendation enum, so use it directly
             order_recommendation = expert_recommendation.recommended_action
@@ -679,7 +679,7 @@ class TradeActionEvaluator:
             action_type: Type of action to create
             action_config: Configuration for the action
             instrument_name: Instrument name
-            order_recommendation: Order recommendation
+            order_recommendation: Trade recommendation
             existing_order: Optional existing order
             expert_recommendation: Expert recommendation for linking
             

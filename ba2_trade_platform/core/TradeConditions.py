@@ -25,7 +25,7 @@ class TradeCondition(ABC):
     Provides common functionality for evaluating trading conditions based on:
     - Account state
     - Instrument information  
-    - Current order recommendation
+    - Current trade recommendation
     - Existing orders
     """
     

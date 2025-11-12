@@ -510,7 +510,7 @@ class OverviewTab:
             self._check_and_display_pending_orders(self.tabs_ref)
             
             with ui.grid(columns=4).classes('w-full gap-4'):
-                # Row 1: API Usage, Analysis Jobs, Order Statistics, and Order Recommendations
+                # Row 1: API Usage, Analysis Jobs, Order Statistics, and Trade Recommendations
                 self._render_api_usage_widget()
                 self._render_analysis_jobs_widget()
                 self._render_order_statistics_widget()
@@ -726,9 +726,9 @@ class OverviewTab:
                 session.close()
     
     def _render_order_recommendations_widget(self):
-        """Widget showing order recommendation statistics."""
+        """Widget showing trade recommendation statistics."""
         with ui.card().classes('p-4'):
-            ui.label('📈 Order Recommendations').classes('text-h6 mb-4')
+            ui.label('📈 Trade Recommendations').classes('text-h6 mb-4')
             
             # Calculate date ranges
             now = datetime.now()
@@ -1375,7 +1375,7 @@ class OverviewTab:
             from collections import defaultdict
             orders_by_expert = defaultdict(list)
             
-            # Get expert instance IDs from order recommendations
+            # Get expert instance IDs from trade recommendations
             from ...core.db import get_db
             from ...core.models import ExpertRecommendation
             
@@ -4635,7 +4635,7 @@ class TransactionsTab:
             
             # Recommendation details
             with ui.grid(columns=2).classes('w-full gap-4 mb-4'):
-                # Order recommendation
+                # Trade recommendation
                 with ui.card():
                     ui.label('Recommendation').classes('text-caption text-grey-7')
                     rec_color = 'green' if rec.recommended_action.value == 'BUY' else 'red' if rec.recommended_action.value == 'SELL' else 'grey'

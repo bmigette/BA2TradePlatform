@@ -67,7 +67,7 @@ Added two new chart widgets to the Overview page to provide better insights into
 
 The Overview page now has a 2-column grid with 3 rows:
 - **Row 1**: OpenAI Spending | Analysis Jobs
-- **Row 2**: Order Statistics | Order Recommendations  
+- **Row 2**: Order Statistics | Trade Recommendations  
 - **Row 3**: Profit Per Expert | Instrument Distribution *(NEW)*
 
 ## Usage

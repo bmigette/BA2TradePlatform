@@ -12,8 +12,8 @@ A sophisticated Python-based algorithmic trading platform featuring AI-driven ma
 ![Analysis Details](docs/screenshots/analysis_detail.png)
 *Multi-agent AI analysis with detailed recommendations and technical indicators*
 
-### Order Recommendations
-![Order Recommendations](docs/screenshots/order_recommendations.png)
+### Trade Recommendations
+![Trade Recommendations](docs/screenshots/order_recommendations.png)
 *AI-generated trading recommendations with confidence levels and action items*
 
 ### Recommendation History

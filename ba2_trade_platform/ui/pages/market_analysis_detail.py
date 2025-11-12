@@ -320,7 +320,7 @@ def _render_error_banner(market_analysis: MarketAnalysis) -> None:
 
 
 def _render_order_recommendations_tab(market_analysis: MarketAnalysis) -> None:
-    """Render the Order Recommendations tab showing orders linked to this analysis."""
+    """Render the Trade Recommendations tab showing orders linked to this analysis."""
     try:
         session = get_db()
         
@@ -502,9 +502,9 @@ def _render_order_recommendations_tab(market_analysis: MarketAnalysis) -> None:
                 ui.label('Orders may be created manually or automatically by the Trade Manager when enabled.').classes('text-sm text-grey-7')
     
     except Exception as e:
-        logger.error(f"Error rendering order recommendations tab: {e}", exc_info=True)
+        logger.error(f"Error rendering trade recommendations tab: {e}", exc_info=True)
         with ui.card().classes('w-full'):
-            ui.label('Error loading order recommendations').classes('text-h5 text-negative')
+            ui.label('Error loading trade recommendations').classes('text-h5 text-negative')
             ui.label(str(e)).classes('text-grey-7')
 
 

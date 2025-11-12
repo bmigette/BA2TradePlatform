@@ -2487,8 +2487,8 @@ class OrderRecommendationsTab:
 
     def render(self):
         with ui.card().classes('w-full'):
-            ui.label('Order Recommendations').classes('text-lg font-bold')
-            ui.label('Expert recommendations and generated orders').classes('text-sm text-gray-600 mb-4')
+            ui.label('Trade Recommendations').classes('text-lg font-bold')
+            ui.label('Expert recommendations and generated Trades').classes('text-sm text-gray-600 mb-4')
             
             # Controls Row 1: Action Buttons
             with ui.row().classes('w-full justify-between items-center mb-2 gap-4'):
@@ -2584,6 +2584,9 @@ class OrderRecommendationsTab:
                         {'name': 'avg_confidence', 'label': 'Avg Confidence', 'field': 'avg_confidence', 'align': 'right'},
                         {'name': 'orders_created', 'label': 'Orders Created', 'field': 'orders_created', 'align': 'right'},
                         {'name': 'latest', 'label': 'Latest', 'field': 'latest', 'align': 'center'},
+                        {'name': 'last_confidence', 'label': 'Last Confidence', 'field': 'last_confidence', 'align': 'right'},
+                        {'name': 'last_recommendation', 'label': 'Last Rec', 'field': 'last_recommendation', 'align': 'center'},
+                        {'name': 'last_price', 'label': 'Last Price', 'field': 'last_price', 'align': 'right'},
                         {'name': 'actions', 'label': 'Actions', 'field': 'actions', 'align': 'center'}
                     ]
                     
@@ -2628,7 +2631,7 @@ class OrderRecommendationsTab:
                 self.detail_container.clear()
                 
         except Exception as e:
-            logger.error(f"Error refreshing order recommendations data: {e}", exc_info=True)
+            logger.error(f"Error refreshing trade recommendations data: {e}", exc_info=True)
 
     def _get_recommendations_summary(self):
         """Get summary of recommendations grouped by symbol."""
@@ -2681,6 +2684,23 @@ class OrderRecommendationsTab:
                 for result in results:
                     symbol = result.symbol
                     
+                    # Get the latest recommendation for this symbol to extract last confidence, action, and price
+                    latest_rec_statement = (
+                        select(ExpertRecommendation)
+                        .where(ExpertRecommendation.symbol == symbol)
+                    )
+                    
+                    # Apply expert filter to latest recommendation if not 'all'
+                    if self.expert_filter and self.expert_filter != 'all':
+                        try:
+                            expert_id = int(self.expert_filter)
+                            latest_rec_statement = latest_rec_statement.where(ExpertRecommendation.instance_id == expert_id)
+                        except (ValueError, IndexError):
+                            pass
+                    
+                    latest_rec_statement = latest_rec_statement.order_by(ExpertRecommendation.created_at.desc()).limit(1)
+                    latest_recommendation = session.exec(latest_rec_statement).first()
+                    
                     # Count orders created for this symbol
                     orders_statement = select(func.count(TradingOrder.id)).where(
                         TradingOrder.symbol == symbol,
@@ -2708,6 +2728,21 @@ class OrderRecommendationsTab:
                         elif self.order_status_filter.value == 'Without Orders' and orders_count > 0:
                             continue  # Skip symbols with orders
                     
+                    # Extract last recommendation details
+                    last_confidence = 'N/A'
+                    last_recommendation = 'N/A'
+                    last_price = 'N/A'
+                    
+                    if latest_recommendation:
+                        if latest_recommendation.confidence is not None:
+                            last_confidence = f"{latest_recommendation.confidence:.1f}%"
+                        
+                        if latest_recommendation.recommended_action:
+                            last_recommendation = latest_recommendation.recommended_action.value
+                        
+                        if latest_recommendation.price_at_date is not None:
+                            last_price = f"${latest_recommendation.price_at_date:.2f}"
+                    
                     summary_data.append({
                         'symbol': symbol,
                         'total_recommendations': result.total_recommendations,
@@ -2717,6 +2752,9 @@ class OrderRecommendationsTab:
                         'avg_confidence': f"{result.avg_confidence:.1f}%" if result.avg_confidence else 'N/A',
                         'orders_created': orders_count,
                         'latest': result.latest_created_at.strftime('%Y-%m-%d %H:%M') if result.latest_created_at else 'N/A',
+                        'last_confidence': last_confidence,
+                        'last_recommendation': last_recommendation,
+                        'last_price': last_price,
                         'actions': 'actions'
                     })
                 
@@ -3175,7 +3213,7 @@ class OrderRecommendationsTab:
                 limit_price=limit_price,
                 open_type=OrderOpenType.MANUAL,
                 expert_recommendation_id=recommendation_id,
-                comment=f"Manual order from Order Recommendations - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                comment=f"Manual order from Trade Recommendations - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             )
             
             # Add to database first
@@ -3758,7 +3796,7 @@ def content() -> None:
         ('monitoring', 'Job Monitoring'),
         ('manual', 'Manual Analysis'),
         ('scheduled', 'Scheduled Jobs'),
-        ('recommendations', 'Order Recommendations')
+        ('recommendations', 'Trade Recommendations')
     ]
     
     with ui.tabs() as tabs:
@@ -3791,7 +3829,7 @@ def content() -> None:
                     'Job Monitoring': 'monitoring',
                     'Manual Analysis': 'manual',
                     'Scheduled Jobs': 'scheduled',
-                    'Order Recommendations': 'recommendations'
+                    'Trade Recommendations': 'recommendations'
                 };
                 
                 // Get tab name from tab element

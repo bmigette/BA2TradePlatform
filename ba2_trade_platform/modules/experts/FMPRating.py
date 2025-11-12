@@ -283,11 +283,11 @@ class FMPRating(MarketExpertInterface):
         if buy_score > sell_score and buy_score > hold_score:
             signal = OrderRecommendation.BUY
             dominant_score = buy_score
-            target_price = target_high if target_high else target_consensus
+            target_price = target_consensus  # Use consensus for expected profit calculation
         elif sell_score > buy_score and sell_score > hold_score:
             signal = OrderRecommendation.SELL
             dominant_score = sell_score
-            target_price = target_low if target_low else target_consensus
+            target_price = target_consensus  # Use consensus for expected profit calculation
         else:
             signal = OrderRecommendation.HOLD
             dominant_score = hold_score
@@ -335,7 +335,7 @@ class FMPRating(MarketExpertInterface):
             weighted_delta = price_delta * (confidence / 100.0) * profit_ratio
             expected_profit_percent = (weighted_delta / current_price) * 100
         elif signal == OrderRecommendation.SELL and target_price and current_price:
-            # For SELL, profit is from current to low target
+            # For SELL, profit is from current to consensus target
             price_delta = current_price - target_price
             weighted_delta = price_delta * (confidence / 100.0) * profit_ratio
             expected_profit_percent = (weighted_delta / current_price) * 100
@@ -385,7 +385,7 @@ Step 4 - Final Confidence (clamped to 0-100%):
 Final Confidence = Base Confidence + Avg Boost = {base_confidence:.1f}% + {price_target_boost:.1f}% = {confidence:.1f}%
 
 Expected Profit Calculation:
-Price Delta = {'High' if signal == OrderRecommendation.BUY else 'Low'} Target - Current = ${target_price:.2f} - ${current_price:.2f} = ${target_price - current_price:.2f}
+Price Delta = Consensus Target - Current = ${target_price:.2f} - ${current_price:.2f} = ${target_price - current_price:.2f}
 Weighted Delta = Price Delta × Confidence × Profit Ratio = ${target_price - current_price:.2f} × {confidence/100:.2f} × {profit_ratio} = ${(target_price - current_price) * (confidence/100) * profit_ratio:.2f}
 Expected Profit % = (Weighted Delta / Current) × 100 = {expected_profit_percent:.1f}%
 """
@@ -836,7 +836,10 @@ Expected Profit % = (Weighted Delta / Current) × 100 = {expected_profit_percent
                             ui.label(f'${low:.2f}').classes('text-h5 text-red-700')
                             if current_price:
                                 delta_pct = ((low - current_price) / current_price) * 100
-                                ui.label(f'{delta_pct:+.1f}% downside').classes('text-xs text-negative')
+                                if delta_pct >= 0:
+                                    ui.label(f'{delta_pct:+.1f}% upside').classes('text-xs text-positive')
+                                else:
+                                    ui.label(f'{delta_pct:+.1f}% downside').classes('text-xs text-negative')
                     
                     # Target range visualization
                     if current_price:
@@ -1022,10 +1025,12 @@ Expected Profit % = (Weighted Delta / Current) × 100 = {expected_profit_percent
                     ui.markdown(f'''
 **Signal Determination:**
 
-The recommendation signal is based on the price delta from current price to consensus target:
-- **BUY**: Consensus target is >5% above current price (uses High target for profit calc)
-- **SELL**: Consensus target is >5% below current price (uses Low target for profit calc)
-- **HOLD**: Consensus target is within ±5% of current price
+The recommendation signal is based on the dominant analyst score:
+- **BUY**: Buy score (Strong Buy × 2 + Buy) is highest
+- **SELL**: Sell score (Strong Sell × 2 + Sell) is highest  
+- **HOLD**: Hold score is highest or scores are tied
+
+All profit calculations use the **Consensus Target** price.
 
 ---
 
@@ -1056,12 +1061,12 @@ The recommendation signal is based on the price delta from current price to cons
 **Expected Profit Calculation:**
 
 For **BUY** signals:
-1. **Price Delta** = High Target - Current Price
+1. **Price Delta** = Consensus Target - Current Price
 2. **Weighted Delta** = Price Delta × (Confidence / 100) × Profit Ratio
 3. **Expected Profit %** = (Weighted Delta / Current Price) × 100
 
 For **SELL** signals:
-1. **Price Delta** = Current Price - Low Target
+1. **Price Delta** = Current Price - Consensus Target
 2. **Weighted Delta** = Price Delta × (Confidence / 100) × Profit Ratio
 3. **Expected Profit %** = (Weighted Delta / Current Price) × 100
 

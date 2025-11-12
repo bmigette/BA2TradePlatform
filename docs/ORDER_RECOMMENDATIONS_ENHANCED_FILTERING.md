@@ -1,16 +1,16 @@
-# Order Recommendations Table - Enhanced Filtering
+# Trade Recommendations Table - Enhanced Filtering
 
 **Date**: 2025-10-13  
 **Status**: ✅ Completed
 
 ## Overview
-Enhanced the Order Recommendations table in the Market Analysis page with comprehensive search and filter options to help users quickly find specific recommendations.
+Enhanced the Trade Recommendations table in the Market Analysis page with comprehensive search and filter options to help users quickly find specific recommendations.
 
 ## Changes Made
 
 ### New Filter Controls
 
-Added four filter controls to the Order Recommendations section:
+Added four filter controls to the Trade Recommendations section:
 
 1. **Expert Filter** (existing, reorganized)
    - Dropdown to filter by specific expert instance
