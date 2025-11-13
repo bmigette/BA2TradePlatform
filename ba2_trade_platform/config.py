@@ -29,6 +29,7 @@ PRICE_CACHE_TIME = 60  # Default to 60 seconds
 # Enable streaming responses from OpenAI API for faster initial response times
 # When enabled, responses are sent incrementally as they're generated
 # This can reduce perceived latency but may increase API costs slightly
+# This can also reduce likelihood of timeouts for long responses
 # Set OPENAI_ENABLE_STREAMING=false in .env file to disable
 # See: https://platform.openai.com/docs/guides/streaming-responses
 OPENAI_ENABLE_STREAMING = True  # Default to True for better performance

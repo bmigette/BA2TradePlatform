@@ -132,7 +132,8 @@ def execute_cleanup(
     days_to_keep: int = 30,
     statuses: Optional[List[MarketAnalysisStatus]] = None,
     expert_instance_id: Optional[int] = None,
-    outputs_only: bool = False
+    outputs_only: bool = False,
+    delete_outputs_from_open_transactions: bool = False
 ) -> Dict[str, Any]:
     """
     Execute cleanup of old MarketAnalysis records and associated data.
@@ -144,6 +145,7 @@ def execute_cleanup(
         statuses: List of MarketAnalysisStatus values to target. If None, all statuses.
         expert_instance_id: If provided, only cleanup for this expert instance.
         outputs_only: If True, only delete outputs/recommendations (keep analyses). If False, delete all.
+        delete_outputs_from_open_transactions: If True, delete outputs even from analyses with open transactions.
     
     Returns:
         Dictionary with cleanup results:
@@ -235,6 +237,19 @@ def execute_cleanup(
                         if has_open:
                             analyses_protected += 1
                             logger.debug(f"Cleanup: Protecting analysis {analysis_obj.id} (has open transaction)")
+                            
+                            # Optionally delete outputs from protected analyses (if configured)
+                            if delete_outputs_from_open_transactions:
+                                outputs_count = len(analysis_obj.analysis_outputs)
+                                for output in analysis_obj.analysis_outputs:
+                                    analysis_session.delete(output)
+                                outputs_deleted += outputs_count
+                                
+                                if outputs_count > 0:
+                                    logger.debug(f"Cleanup: Deleted {outputs_count} outputs from protected analysis {analysis_obj.id}")
+                                
+                                # Commit the output deletions
+                                analysis_session.commit()
                             continue
                         
                         # Count what we're about to delete

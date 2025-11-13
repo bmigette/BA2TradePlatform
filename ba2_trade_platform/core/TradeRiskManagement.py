@@ -179,9 +179,12 @@ class TradeRiskManagement:
                 log_activity(
                     severity=ActivityLogSeverity.SUCCESS,
                     activity_type=ActivityLogType.RISK_MANAGER_RAN,
-                    description=f"Classic risk manager processed {len(updated_orders)} orders",
+                    description=f"Classic risk manager: reviewed {len(pending_orders)} pending orders, updated {len(updated_orders)}, deleted {len(orders_to_delete) if orders_to_delete else 0} unfunded orders",
                     data={
                         "mode": "classic",
+                        "orders_reviewed": len(pending_orders),
+                        "orders_filtered": len(filtered_orders),
+                        "orders_with_recommendations": len(orders_with_recommendations),
                         "orders_updated": len(updated_orders),
                         "orders_deleted": len(orders_to_delete) if orders_to_delete else 0,
                         "available_balance": total_virtual_balance,

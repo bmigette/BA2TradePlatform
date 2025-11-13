@@ -2534,9 +2534,10 @@ class AlpacaAccount(AccountInterface):
                            f"need_oco: {need_oco}")
                 
                 # 4. Determine action based on entry order state
+                result = False
                 if entry_order.status in OrderStatus.get_unsent_statuses():
                     # Entry not sent to broker yet - create/update pending orders
-                    return self._handle_pending_entry_tpsl(
+                    result = self._handle_pending_entry_tpsl(
                         session, transaction_in_session, entry_order, 
                         new_tp_price, new_sl_price,
                         existing_tp, existing_sl, existing_oco,
@@ -2545,7 +2546,7 @@ class AlpacaAccount(AccountInterface):
                 
                 elif entry_order.status in OrderStatus.get_unfilled_statuses():
                     # Entry sent to broker but not filled yet - create triggered orders (OTO/OCO)
-                    return self._handle_submitted_entry_tpsl(
+                    result = self._handle_submitted_entry_tpsl(
                         session, transaction_in_session, entry_order,
                         new_tp_price, new_sl_price,
                         existing_tp, existing_sl, existing_oco,
@@ -2554,7 +2555,7 @@ class AlpacaAccount(AccountInterface):
                 
                 elif entry_order.status in OrderStatus.get_executed_statuses():
                     # Entry filled - work with broker
-                    return self._handle_filled_entry_tpsl(
+                    result = self._handle_filled_entry_tpsl(
                         session, transaction_in_session, entry_order,
                         new_tp_price, new_sl_price,
                         existing_tp, existing_sl, existing_oco,
@@ -2563,10 +2564,68 @@ class AlpacaAccount(AccountInterface):
                 
                 else:
                     logger.warning(f"Entry order {entry_order.id} in unexpected state: {entry_order.status.value}")
-                    return False
+                    result = False
+                
+                # Log activity for TP/SL adjustment
+                if result:
+                    try:
+                        from ...core.db import log_activity
+                        from ...core.types import ActivityLogSeverity, ActivityLogType
+                        
+                        adjustment_desc = []
+                        if new_tp_price is not None:
+                            adjustment_desc.append(f"TP to ${new_tp_price:.2f}")
+                        if new_sl_price is not None:
+                            adjustment_desc.append(f"SL to ${new_sl_price:.2f}")
+                        
+                        log_activity(
+                            severity=ActivityLogSeverity.SUCCESS,
+                            activity_type=ActivityLogType.TP_SL_ADJUSTED,
+                            description=f"Adjusted {' and '.join(adjustment_desc)} for transaction {transaction_in_session.id} ({transaction_in_session.symbol})",
+                            data={
+                                "transaction_id": transaction_in_session.id,
+                                "symbol": transaction_in_session.symbol,
+                                "new_tp_price": new_tp_price,
+                                "new_sl_price": new_sl_price,
+                                "entry_order_status": entry_order.status.value
+                            },
+                            source_account_id=self.id
+                        )
+                    except Exception as log_error:
+                        logger.warning(f"Failed to log TP/SL adjustment activity: {log_error}")
+                
+                return result
                     
         except Exception as e:
             logger.error(f"Error adjusting TP/SL for transaction {transaction.id}: {e}", exc_info=True)
+            
+            # Log activity for failed TP/SL adjustment
+            try:
+                from ...core.db import log_activity
+                from ...core.types import ActivityLogSeverity, ActivityLogType
+                
+                adjustment_desc = []
+                if new_tp_price is not None:
+                    adjustment_desc.append(f"TP to ${new_tp_price:.2f}")
+                if new_sl_price is not None:
+                    adjustment_desc.append(f"SL to ${new_sl_price:.2f}")
+                
+                log_activity(
+                    severity=ActivityLogSeverity.FAILURE,
+                    activity_type=ActivityLogType.TP_SL_ADJUSTED,
+                    description=f"Failed to adjust {' and '.join(adjustment_desc)} for transaction {transaction.id} ({transaction.symbol}): {str(e)}",
+                    data={
+                        "transaction_id": transaction.id,
+                        "symbol": transaction.symbol,
+                        "new_tp_price": new_tp_price,
+                        "new_sl_price": new_sl_price,
+                        "error": str(e)
+                    },
+                    source_account_id=self.id
+                )
+            except Exception as log_error:
+                logger.warning(f"Failed to log TP/SL adjustment failure activity: {log_error}")
+            
             return False
     
     def _handle_pending_entry_tpsl(
