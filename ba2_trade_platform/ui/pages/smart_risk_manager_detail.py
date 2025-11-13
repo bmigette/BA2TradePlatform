@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 
 from ...core.db import get_instance
-from ...core.models import SmartRiskManagerJob, ExpertInstance, AccountDefinition, MarketAnalysis
+from ...core.models import SmartRiskManagerJob, ExpertInstance, AccountDefinition, MarketAnalysis, Transaction
 from ...logger import logger
 
 
@@ -182,6 +182,22 @@ def content(job_id: int) -> None:
                                 symbol = action['arguments'].get('symbol')
                             if not symbol and action.get('result'):
                                 symbol = action['result'].get('symbol')
+                            
+                            # If still no symbol, try to look it up from transaction_id
+                            if not symbol:
+                                transaction_id = None
+                                if action.get('arguments'):
+                                    transaction_id = action['arguments'].get('transaction_id')
+                                if not transaction_id and action.get('result'):
+                                    transaction_id = action['result'].get('transaction_id')
+                                
+                                if transaction_id:
+                                    try:
+                                        transaction = get_instance(Transaction, transaction_id)
+                                        if transaction:
+                                            symbol = transaction.symbol
+                                    except Exception as e:
+                                        logger.debug(f"Could not lookup symbol for transaction {transaction_id}: {e}")
                             
                             # Build expansion title with symbol
                             title_parts = [f"{i+1}.", action.get('action_type', 'Unknown')]
