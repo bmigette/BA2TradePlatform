@@ -2489,7 +2489,11 @@ class AlpacaAccount(AccountInterface):
                 entry_order = session.exec(
                     select(TradingOrder).where(
                         TradingOrder.transaction_id == transaction.id,
-                        TradingOrder.order_type.in_([CoreOrderType.MARKET, "limit"])
+                        TradingOrder.order_type.in_([
+                            CoreOrderType.MARKET, 
+                            CoreOrderType.BUY_LIMIT, 
+                            CoreOrderType.SELL_LIMIT
+                        ])
                     ).order_by(TradingOrder.created_at)
                 ).first()
                 
@@ -2905,13 +2909,14 @@ class AlpacaAccount(AccountInterface):
                 
             if new_sl_price is not None:
                 sl_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
+                sl_order_type = CoreOrderType.SELL_STOP if sl_side == OrderDirection.SELL else CoreOrderType.BUY_STOP
                 sl_comment = self._generate_tpsl_comment("SL", self.id, transaction.id, entry_order.id)
                 sl_order = TradingOrder(
                     account_id=self.id,
                     symbol=entry_order.symbol,
                     quantity=entry_order.quantity,
                     side=sl_side,
-                    order_type=CoreOrderType.STOP,
+                    order_type=sl_order_type,
                     stop_price=new_sl_price,
                     transaction_id=transaction.id,
                     status=OrderStatus.PENDING,

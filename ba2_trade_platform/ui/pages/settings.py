@@ -3663,11 +3663,12 @@ class ExpertSettingsTab:
         # Save smart risk manager max iterations
         if hasattr(self, 'smart_risk_manager_max_iterations_input'):
             try:
-                max_iterations = int(self.smart_risk_manager_max_iterations_input.value) if self.smart_risk_manager_max_iterations_input.value and self.smart_risk_manager_max_iterations_input.value.strip() != "" else 10
+                value = self.smart_risk_manager_max_iterations_input.value
+                max_iterations = int(value) if value is not None else 10
             except (ValueError, TypeError):
                 max_iterations = 10  # Default value
             expert.save_setting('smart_risk_manager_max_iterations', max_iterations, setting_type="int")
-            logger.debug(f'Saved smart risk manager max iterations: {int(self.smart_risk_manager_max_iterations_input.value)}')
+            logger.debug(f'Saved smart risk manager max iterations: {max_iterations}')
         
         # Save instrument selection method (moved to main panel)
         if hasattr(self, 'instrument_selection_method_select'):

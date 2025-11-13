@@ -184,6 +184,26 @@ def execute_cleanup(
                 logger.warning(f"Cleanup: Could not clean orphaned trade_action_result records: {e}")
                 session.rollback()
             
+            # Step 1.5: Clean up old orphaned AnalysisOutput records (with NULL market_analysis_id)
+            try:
+                orphaned_outputs = session.exec(
+                    select(AnalysisOutput).where(
+                        AnalysisOutput.market_analysis_id == None,
+                        AnalysisOutput.created_at < cutoff_date
+                    )
+                ).all()
+                
+                for orphaned_output in orphaned_outputs:
+                    session.delete(orphaned_output)
+                    outputs_deleted += 1
+                
+                if orphaned_outputs:
+                    logger.info(f"Cleanup: Deleted {len(orphaned_outputs)} orphaned analysis output records")
+                    session.commit()
+            except Exception as e:
+                logger.warning(f"Cleanup: Could not clean orphaned analysis output records: {e}")
+                session.rollback()
+            
             # Step 2: Build base query for old analyses
             query = select(MarketAnalysis).where(MarketAnalysis.created_at < cutoff_date)
             

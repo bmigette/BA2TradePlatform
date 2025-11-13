@@ -1305,7 +1305,7 @@ def initialize_context(state: SmartRiskManagerState) -> Dict[str, Any]:
         # Get API key from database
         api_key = get_api_key_from_database(api_key_setting_name)
         
-        max_iterations = expert.get_setting_with_interface_default("smart_risk_manager_max_iterations", log_warning=False)
+        max_iterations = int(expert.get_setting_with_interface_default("smart_risk_manager_max_iterations", log_warning=False))
         
         # Extract relevant expert settings for trading restrictions
         expert_config = {
@@ -4248,6 +4248,27 @@ def run_smart_risk_manager(expert_instance_id: int, account_id: int, job_id: int
         if "job_id" in initial_state and initial_state["job_id"]:
             job_id = initial_state["job_id"]
             mark_job_as_failed(job_id, str(e))
+        
+        # Log activity for failed smart risk manager execution
+        try:
+            from .db import log_activity
+            from .types import ActivityLogSeverity, ActivityLogType
+            
+            log_activity(
+                severity=ActivityLogSeverity.FAILURE,
+                activity_type=ActivityLogType.RISK_MANAGER_RAN,
+                description=f"Smart risk manager execution failed: {str(e)}",
+                data={
+                    "mode": "smart",
+                    "job_id": job_id,
+                    "error": str(e),
+                    "error_type": type(e).__name__
+                },
+                source_expert_id=expert_instance_id,
+                source_account_id=account_id
+            )
+        except Exception as log_error:
+            logger.warning(f"Failed to log smart risk manager failure activity: {log_error}")
         
         return {
             "success": False,
