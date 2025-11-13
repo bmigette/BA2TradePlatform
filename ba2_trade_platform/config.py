@@ -25,8 +25,16 @@ ALPHA_VANTAGE_API_KEY=None
 # Price cache duration in seconds
 PRICE_CACHE_TIME = 60  # Default to 60 seconds
 
+# OpenAI streaming configuration
+# Enable streaming responses from OpenAI API for faster initial response times
+# When enabled, responses are sent incrementally as they're generated
+# This can reduce perceived latency but may increase API costs slightly
+# Set OPENAI_ENABLE_STREAMING=false in .env file to disable
+# See: https://platform.openai.com/docs/guides/streaming-responses
+OPENAI_ENABLE_STREAMING = True  # Default to True for better performance
+
 def load_config_from_env() -> None:
-    global FINNHUB_API_KEY, OPENAI_API_KEY, OPENAI_BACKEND_URL,  ALPHA_VANTAGE_API_KEY, FILE_LOGGING, PRICE_CACHE_TIME
+    global FINNHUB_API_KEY, OPENAI_API_KEY, OPENAI_BACKEND_URL, ALPHA_VANTAGE_API_KEY, FILE_LOGGING, PRICE_CACHE_TIME, OPENAI_ENABLE_STREAMING
     """Loads configuration from environment variables and database app settings."""
 
     env_file = os.path.join(HOME_PARENT, '.env')
@@ -42,6 +50,13 @@ def load_config_from_env() -> None:
         PRICE_CACHE_TIME = int(os.getenv('PRICE_CACHE_TIME', PRICE_CACHE_TIME))
     except ValueError:
         PRICE_CACHE_TIME = 60
+    
+    # Load OpenAI streaming configuration from environment
+    openai_streaming = os.getenv('OPENAI_ENABLE_STREAMING', '').lower()
+    if openai_streaming in ('true', '1', 'yes', 'on'):
+        OPENAI_ENABLE_STREAMING = True
+    elif openai_streaming in ('false', '0', 'no', 'off'):
+        OPENAI_ENABLE_STREAMING = False
     
     # Override with database app settings if available
     try:

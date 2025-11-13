@@ -101,8 +101,23 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             # Get API key based on the provider (defaults to openai_api_key for backward compatibility)
             api_key_setting = self.config.get("api_key_setting", "openai_api_key")
             api_key = get_api_key_from_database(api_key_setting)
-            self.deep_thinking_llm = ChatOpenAI(model=self.config["deep_think_llm"], base_url=self.config["backend_url"], api_key=api_key)
-            self.quick_thinking_llm = ChatOpenAI(model=self.config["quick_think_llm"], base_url=self.config["backend_url"], api_key=api_key)
+            
+            # Check if streaming is enabled in config
+            from ba2_trade_platform import config as ba2_config
+            streaming_enabled = ba2_config.OPENAI_ENABLE_STREAMING
+            
+            self.deep_thinking_llm = ChatOpenAI(
+                model=self.config["deep_think_llm"], 
+                base_url=self.config["backend_url"], 
+                api_key=api_key,
+                streaming=streaming_enabled
+            )
+            self.quick_thinking_llm = ChatOpenAI(
+                model=self.config["quick_think_llm"], 
+                base_url=self.config["backend_url"], 
+                api_key=api_key,
+                streaming=streaming_enabled
+            )
         elif self.config["llm_provider"].lower() == "anthropic":
             self.deep_thinking_llm = ChatAnthropic(model=self.config["deep_think_llm"], base_url=self.config["backend_url"])
             self.quick_thinking_llm = ChatAnthropic(model=self.config["quick_think_llm"], base_url=self.config["backend_url"])

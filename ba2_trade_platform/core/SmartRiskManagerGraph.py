@@ -357,11 +357,14 @@ def create_llm(model: str, temperature: float, base_url: str, api_key: str) -> C
     Returns:
         Configured ChatOpenAI instance with debug callback
     """
+    from .. import config as config_module
+    
     return ChatOpenAI(
         model=model,
         temperature=temperature,
         base_url=base_url,
         api_key=api_key,
+        streaming=config_module.OPENAI_ENABLE_STREAMING,
         callbacks=[SmartRiskManagerDebugCallback()]
     )
 

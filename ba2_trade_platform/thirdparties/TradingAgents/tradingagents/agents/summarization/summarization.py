@@ -331,7 +331,16 @@ def create_langgraph_summarization_node(config: Dict[str, Any]):
         api_key_setting = config.get("api_key_setting", "openai_api_key")
         api_key = get_api_key_from_database(api_key_setting)
         
-        llm = ChatOpenAI(model=model, base_url=base_url, api_key=api_key)
+        # Check if streaming is enabled in config
+        from ba2_trade_platform import config as ba2_config
+        streaming_enabled = ba2_config.OPENAI_ENABLE_STREAMING
+        
+        llm = ChatOpenAI(
+            model=model, 
+            base_url=base_url, 
+            api_key=api_key,
+            streaming=streaming_enabled
+        )
         return create_final_summarization_agent(llm)
     except KeyError as e:
         logger.error(f"Missing required configuration key: {e}", exc_info=True)
