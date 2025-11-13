@@ -176,9 +176,22 @@ def content(job_id: int) -> None:
                         
                         # Display each action with full details
                         for i, action in enumerate(actions_log):
+                            # Extract symbol from arguments or result
+                            symbol = None
+                            if action.get('arguments'):
+                                symbol = action['arguments'].get('symbol')
+                            if not symbol and action.get('result'):
+                                symbol = action['result'].get('symbol')
+                            
+                            # Build expansion title with symbol
+                            title_parts = [f"{i+1}.", action.get('action_type', 'Unknown')]
+                            if symbol:
+                                title_parts.append(f"({symbol})")
+                            title_parts.append('-')
+                            title_parts.append('✓ Success' if action.get('success') else '✗ Failed')
+                            
                             with ui.expansion(
-                                f"{i+1}. {action.get('action_type', 'Unknown')} - "
-                                f"{'✓ Success' if action.get('success') else '✗ Failed'}",
+                                ' '.join(title_parts),
                                 icon='check_circle' if action.get('success') else 'error'
                             ).classes('w-full mt-2'):
                                 with ui.column().classes('gap-2 p-2'):

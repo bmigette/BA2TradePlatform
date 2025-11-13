@@ -143,9 +143,16 @@ class ActivityMonitorPage:
                     if account:
                         account_display = account.name
                 
+                # Convert UTC timestamp to local time
+                timestamp_utc = activity.created_at
+                if timestamp_utc.tzinfo is None:
+                    # If naive datetime, assume it's UTC
+                    timestamp_utc = timestamp_utc.replace(tzinfo=timezone.utc)
+                timestamp_local = timestamp_utc.astimezone()
+                
                 rows.append({
                     "id": activity.id,
-                    "timestamp": activity.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    "timestamp": timestamp_local.strftime("%Y-%m-%d %H:%M:%S"),
                     "severity": activity.severity.value,
                     "type": activity.type.value.replace("_", " ").title(),
                     "expert": expert_display,
