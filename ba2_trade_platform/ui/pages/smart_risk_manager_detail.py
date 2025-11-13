@@ -121,28 +121,37 @@ def content(job_id: int) -> None:
                         ui.label(f"Actions Taken: {job.actions_taken_count or 0}").classes('text-sm')
         
         # Portfolio snapshot card (if available)
-        if job.initial_portfolio_equity is not None or job.final_portfolio_equity is not None:
+        if job.initial_portfolio_equity is not None or job.final_portfolio_equity is not None or job.initial_available_balance is not None:
             with ui.card().classes('w-full mb-4'):
                 ui.label('Portfolio Snapshot').classes('text-h6 mb-2')
                 ui.separator()
                 
-                with ui.grid(columns=3).classes('w-full gap-4 mt-2'):
-                    # Initial value
-                    with ui.column().classes('text-center'):
-                        ui.label('Initial Portfolio Equity').classes('text-sm text-grey-7')
+                # Initial Equity at Run
+                with ui.row().classes('w-full gap-4 mt-2 mb-3'):
+                    with ui.column().classes('text-center flex-1'):
+                        ui.label('Initial Portfolio Equity at Run').classes('text-sm text-grey-7')
                         ui.label(f"${job.initial_portfolio_equity:,.2f}" if job.initial_portfolio_equity else "N/A").classes('text-h6')
-                    
-                    # Final value
+                
+                ui.separator()
+                
+                # Available Balance Before/After
+                with ui.grid(columns=3).classes('w-full gap-4 mt-3'):
+                    # Initial balance
                     with ui.column().classes('text-center'):
-                        ui.label('Final Portfolio Equity').classes('text-sm text-grey-7')
-                        ui.label(f"${job.final_portfolio_equity:,.2f}" if job.final_portfolio_equity else "N/A").classes('text-h6')
+                        ui.label('Available Balance Before').classes('text-sm text-grey-7')
+                        ui.label(f"${job.initial_available_balance:,.2f}" if job.initial_available_balance else "N/A").classes('text-h6')
+                    
+                    # Final balance
+                    with ui.column().classes('text-center'):
+                        ui.label('Available Balance After').classes('text-sm text-grey-7')
+                        ui.label(f"${job.final_available_balance:,.2f}" if job.final_available_balance else "N/A").classes('text-h6')
                     
                     # Change
                     with ui.column().classes('text-center'):
-                        ui.label('Change').classes('text-sm text-grey-7')
-                        if job.initial_portfolio_equity and job.final_portfolio_equity:
-                            change = job.final_portfolio_equity - job.initial_portfolio_equity
-                            change_pct = (change / job.initial_portfolio_equity * 100) if job.initial_portfolio_equity > 0 else 0
+                        ui.label('Balance Change').classes('text-sm text-grey-7')
+                        if job.initial_available_balance is not None and job.final_available_balance is not None:
+                            change = job.final_available_balance - job.initial_available_balance
+                            change_pct = (change / job.initial_available_balance * 100) if job.initial_available_balance > 0 else 0
                             color = 'positive' if change >= 0 else 'negative'
                             sign = '+' if change >= 0 else ''
                             ui.label(f"{sign}${change:,.2f} ({sign}{change_pct:.2f}%)").classes(f'text-h6 text-{color}')

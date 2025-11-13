@@ -617,6 +617,8 @@ class SmartRiskManagerJob(SQLModel, table=True):
     # Portfolio Snapshot (equity/balance tracking)
     initial_portfolio_equity: Optional[float] = Field(default=None, description="Account virtual equity at start of execution")
     final_portfolio_equity: Optional[float] = Field(default=None, description="Account virtual equity at end of execution")
+    initial_available_balance: Optional[float] = Field(default=None, description="Available balance at start of execution")
+    final_available_balance: Optional[float] = Field(default=None, description="Available balance at end of execution")
     
     # Results
     actions_taken_count: int = Field(default=0, description="Number of trading actions executed")

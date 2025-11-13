@@ -1335,6 +1335,8 @@ def initialize_context(state: SmartRiskManagerState) -> Dict[str, Any]:
             job.user_instructions = user_instructions
             job.initial_portfolio_equity = float(portfolio_status["account_virtual_equity"])
             job.final_portfolio_equity = float(portfolio_status["account_virtual_equity"])
+            job.initial_available_balance = float(portfolio_status["account_available_balance"])
+            job.final_available_balance = float(portfolio_status["account_available_balance"])
             job.status = "RUNNING"
             update_instance(job)
             logger.info(f"Updated existing SmartRiskManagerJob {job_id}")
@@ -1347,6 +1349,8 @@ def initialize_context(state: SmartRiskManagerState) -> Dict[str, Any]:
                 user_instructions=user_instructions,
                 initial_portfolio_equity=float(portfolio_status["account_virtual_equity"]),
                 final_portfolio_equity=float(portfolio_status["account_virtual_equity"]),
+                initial_available_balance=float(portfolio_status["account_available_balance"]),
+                final_available_balance=float(portfolio_status["account_available_balance"]),
                 status="RUNNING"
             )
             job_id = add_instance(job)
@@ -3468,7 +3472,7 @@ def finalize(state: SmartRiskManagerState) -> Dict[str, Any]:
         
         # Build summaries
         initial_portfolio = state["portfolio_status"]
-        initial_summary = f"Virtual Equity: ${initial_portfolio['account_virtual_equity']:.2f} | Positions: {len(state['open_positions'])}"
+        initial_summary = f"Virtual Equity: ${initial_portfolio['account_virtual_equity']:.2f} | Available Balance: ${initial_portfolio['account_available_balance']:.2f} | Positions: {len(state['open_positions'])}"
         
         # Get final portfolio status
         expert_instance_id = state["expert_instance_id"]
@@ -3477,7 +3481,12 @@ def finalize(state: SmartRiskManagerState) -> Dict[str, Any]:
         final_portfolio = toolkit.get_portfolio_status()
         num_open_positions = len(final_portfolio.get('open_positions', []))
         num_pending_positions = len(final_portfolio.get('pending_positions', []))
-        final_summary = f"Virtual Equity: ${final_portfolio['account_virtual_equity']:.2f} | Positions: {num_open_positions} (+ {num_pending_positions} pending)"
+        
+        # Calculate balance change
+        balance_change = final_portfolio['account_available_balance'] - initial_portfolio['account_available_balance']
+        balance_change_str = f"+${balance_change:.2f}" if balance_change >= 0 else f"-${abs(balance_change):.2f}"
+        
+        final_summary = f"Virtual Equity: ${final_portfolio['account_virtual_equity']:.2f} | Available Balance: ${final_portfolio['account_available_balance']:.2f} ({balance_change_str}) | Positions: {num_open_positions} (+ {num_pending_positions} pending)"
         
         actions_summary = "\n".join(
             f"{i+1}. {action['action_type']}: {action.get('summary', 'No summary')}"
@@ -3502,6 +3511,7 @@ def finalize(state: SmartRiskManagerState) -> Dict[str, Any]:
             if job:
                 job.status = "COMPLETED"
                 job.final_portfolio_equity = float(final_portfolio["account_virtual_equity"])
+                job.final_available_balance = float(final_portfolio["account_available_balance"])
                 job.actions_taken_count = len(state["actions_log"])
                 job.actions_summary = response.content
                 job.iteration_count = state["iteration_count"]
