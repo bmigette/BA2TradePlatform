@@ -369,15 +369,33 @@ def create_llm(model: str, temperature: float, base_url: str, api_key: str, mode
     if model_kwargs:
         final_model_kwargs.update(model_kwargs)
     
-    return ChatOpenAI(
-        model=parsed['model'],
-        temperature=temperature,
-        base_url=base_url,
-        api_key=api_key,
-        streaming=config_module.OPENAI_ENABLE_STREAMING,
-        callbacks=[SmartRiskManagerDebugCallback()],
-        model_kwargs=final_model_kwargs if final_model_kwargs else None
-    )
+    # Extract parameters that should be passed directly to ChatOpenAI (not in model_kwargs)
+    # These are special parameters that ChatOpenAI recognizes at the class level
+    direct_params = ['reasoning', 'temperature', 'max_tokens', 'top_p', 'frequency_penalty', 'presence_penalty']
+    
+    # Build ChatOpenAI initialization parameters
+    llm_params = {
+        "model": parsed['model'],
+        "temperature": temperature,
+        "base_url": base_url,
+        "api_key": api_key,
+        "streaming": config_module.OPENAI_ENABLE_STREAMING,
+        "callbacks": [SmartRiskManagerDebugCallback()]
+    }
+    
+    # Separate direct params from model_kwargs
+    remaining_model_kwargs = {}
+    for key, value in final_model_kwargs.items():
+        if key in direct_params:
+            llm_params[key] = value
+        else:
+            remaining_model_kwargs[key] = value
+    
+    # Only add model_kwargs if there are remaining parameters
+    if remaining_model_kwargs:
+        llm_params["model_kwargs"] = remaining_model_kwargs
+    
+    return ChatOpenAI(**llm_params)
 
 
 # ==================== PROMPTS ====================
