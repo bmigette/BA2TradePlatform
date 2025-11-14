@@ -36,7 +36,9 @@ def create_news_analyst(llm, toolkit, tools):
             ]
         )
 
-        chain = prompt | llm.bind_tools(tools)
+        # Disable parallel tool calls to avoid call_id length issues with OpenAI API
+        # OpenAI enforces max 64 char limit on call_id, but LangGraph can generate longer IDs
+        chain = prompt | llm.bind_tools(tools, parallel_tool_calls=False)
         result = chain.invoke(state["messages"])
 
         report = ""

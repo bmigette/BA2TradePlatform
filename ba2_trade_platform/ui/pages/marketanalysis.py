@@ -1772,6 +1772,8 @@ class ManualAnalysisTab:
     
     def submit_bulk_analysis(self):
         """Submit analysis jobs for all selected instruments."""
+        from ...core.types import AnalysisUseCase
+        
         try:
             if not self.expert_instance_id:
                 ui.notify("Please select an expert instance", type='negative')
@@ -1917,7 +1919,6 @@ class ManualAnalysisTab:
             
             # Submit analysis jobs for all selected instruments
             from ...core.JobManager import get_job_manager
-            from ...core.types import AnalysisUseCase
             import time
             import uuid
             
