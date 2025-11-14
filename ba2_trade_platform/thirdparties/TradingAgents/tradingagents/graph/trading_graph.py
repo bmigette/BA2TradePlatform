@@ -110,20 +110,27 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             deep_think_kwargs = self.config.get("deep_think_llm_kwargs", {})
             quick_think_kwargs = self.config.get("quick_think_llm_kwargs", {})
             
-            self.deep_thinking_llm = ChatOpenAI(
-                model=self.config["deep_think_llm"], 
-                base_url=self.config["backend_url"], 
-                api_key=api_key,
-                streaming=streaming_enabled,
-                model_kwargs=deep_think_kwargs if deep_think_kwargs else None
-            )
-            self.quick_thinking_llm = ChatOpenAI(
-                model=self.config["quick_think_llm"], 
-                base_url=self.config["backend_url"], 
-                api_key=api_key,
-                streaming=streaming_enabled,
-                model_kwargs=quick_think_kwargs if quick_think_kwargs else None
-            )
+            # Build ChatOpenAI initialization parameters
+            deep_think_params = {
+                "model": self.config["deep_think_llm"],
+                "base_url": self.config["backend_url"],
+                "api_key": api_key,
+                "streaming": streaming_enabled
+            }
+            if deep_think_kwargs:
+                deep_think_params["model_kwargs"] = deep_think_kwargs
+            
+            quick_think_params = {
+                "model": self.config["quick_think_llm"],
+                "base_url": self.config["backend_url"],
+                "api_key": api_key,
+                "streaming": streaming_enabled
+            }
+            if quick_think_kwargs:
+                quick_think_params["model_kwargs"] = quick_think_kwargs
+            
+            self.deep_thinking_llm = ChatOpenAI(**deep_think_params)
+            self.quick_thinking_llm = ChatOpenAI(**quick_think_params)
         elif self.config["llm_provider"].lower() == "anthropic":
             self.deep_thinking_llm = ChatAnthropic(model=self.config["deep_think_llm"], base_url=self.config["backend_url"])
             self.quick_thinking_llm = ChatAnthropic(model=self.config["quick_think_llm"], base_url=self.config["backend_url"])
