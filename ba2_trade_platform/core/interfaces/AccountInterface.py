@@ -254,27 +254,28 @@ class AccountInterface(ExtendableSettingsInterface):
         result = self._submit_order_impl(trading_order, tp_price=tp_price, sl_price=sl_price)
         
         # Set TP and/or SL if provided and order was successfully submitted
-        # Use the new adjust methods which create OCO/OTO orders
+        # Use adjust methods which create OCO/OTO orders (avoids code duplication)
+        # The skip logic in adjust_tp_sl will prevent redundant calls if caller calls again
         if result and result.transaction_id:
             transaction = get_instance(Transaction, result.transaction_id)
             if transaction:
                 if tp_price and sl_price:
                     # Both TP and SL provided - use adjust_tp_sl for OCO order
-                    logger.info(f"Setting TP=${tp_price:.2f} and SL=${sl_price:.2f} for transaction {transaction.id} (OCO order)")
+                    logger.debug(f"Creating TP/SL orders for transaction {transaction.id} via adjust_tp_sl")
                     try:
                         self.adjust_tp_sl(transaction, tp_price, sl_price)
                     except NotImplementedError:
                         logger.warning(f"Broker {self.__class__.__name__} does not implement adjust_tp_sl - TP/SL not set")
                 elif tp_price:
                     # Only TP provided - use adjust_tp for OTO order
-                    logger.info(f"Setting TP=${tp_price:.2f} for transaction {transaction.id} (OTO order)")
+                    logger.debug(f"Creating TP order for transaction {transaction.id} via adjust_tp")
                     try:
                         self.adjust_tp(transaction, tp_price)
                     except NotImplementedError:
                         logger.warning(f"Broker {self.__class__.__name__} does not implement adjust_tp - TP not set")
                 elif sl_price:
                     # Only SL provided - use adjust_sl for OTO order
-                    logger.info(f"Setting SL=${sl_price:.2f} for transaction {transaction.id} (OTO order)")
+                    logger.debug(f"Creating SL order for transaction {transaction.id} via adjust_sl")
                     try:
                         self.adjust_sl(transaction, sl_price)
                     except NotImplementedError:

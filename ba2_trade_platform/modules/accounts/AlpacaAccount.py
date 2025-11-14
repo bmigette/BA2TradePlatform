@@ -961,15 +961,16 @@ class AlpacaAccount(AccountInterface):
                                 transaction.stop_loss = sl_price
                             update_instance(transaction)
                             
-                            # Delegate to adjust methods which handle all the pending trigger logic
+                            # Create TP/SL orders using adjust_tp_sl (avoids code duplication)
+                            # The skip logic in adjust_tp_sl will prevent redundant calls if caller calls again
                             if tp_price and sl_price:
-                                logger.info(f"Creating TP/SL orders via adjust_tp_sl for transaction {transaction.id}")
+                                logger.debug(f"Creating TP/SL orders for transaction {transaction.id} via adjust_tp_sl")
                                 self.adjust_tp_sl(transaction, tp_price, sl_price)
                             elif tp_price:
-                                logger.info(f"Creating TP order via adjust_tp for transaction {transaction.id}")
+                                logger.debug(f"Creating TP order for transaction {transaction.id} via adjust_tp")
                                 self.adjust_tp(transaction, tp_price)
                             elif sl_price:
-                                logger.info(f"Creating SL order via adjust_sl for transaction {transaction.id}")
+                                logger.debug(f"Creating SL order for transaction {transaction.id} via adjust_sl")
                                 self.adjust_sl(transaction, sl_price)
                         else:
                             logger.warning(f"Transaction {fresh_order.transaction_id} not found for setting TP/SL")
@@ -2476,6 +2477,36 @@ class AlpacaAccount(AccountInterface):
                 if not transaction_in_session:
                     logger.error(f"Transaction {transaction.id} not found in database")
                     return False
+                
+                # 2. Early skip check: if values unchanged and valid orders exist, skip adjustment
+                tp_unchanged = (new_tp_price is None or 
+                               (transaction_in_session.take_profit is not None and 
+                                abs(transaction_in_session.take_profit - new_tp_price) < 0.01))
+                sl_unchanged = (new_sl_price is None or 
+                               (transaction_in_session.stop_loss is not None and 
+                                abs(transaction_in_session.stop_loss - new_sl_price) < 0.01))
+                
+                if tp_unchanged and sl_unchanged:
+                    # Check if we have valid (non-error/non-canceled) TP/SL orders
+                    valid_tpsl_orders = session.exec(
+                        select(TradingOrder).where(
+                            TradingOrder.transaction_id == transaction.id,
+                            TradingOrder.order_type.in_([
+                                CoreOrderType.OCO,
+                                CoreOrderType.SELL_LIMIT, CoreOrderType.BUY_LIMIT,
+                                CoreOrderType.SELL_STOP, CoreOrderType.BUY_STOP
+                            ]),
+                            TradingOrder.status.notin_([
+                                OrderStatus.CANCELED, OrderStatus.EXPIRED, 
+                                OrderStatus.FAILED, OrderStatus.REJECTED
+                            ])
+                        )
+                    ).all()
+                    
+                    if valid_tpsl_orders:
+                        logger.info(f"Skipping TP/SL adjustment for transaction {transaction.id}: "
+                                   f"values unchanged and {len(valid_tpsl_orders)} valid order(s) already exist")
+                        return True
                 
                 # 2. Update transaction (source of truth)
                 if new_tp_price is not None:
