@@ -61,81 +61,15 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
         if hasattr(self, '_api_key_error'):
             self.logger.warning(f"Could not load API keys from database: {self._api_key_error}")
     
-    @staticmethod
-    def _parse_model_config(model_string: str) -> Dict[str, str]:
-        """
-        Parse model string to extract provider and model name.
+    def __init__(self, id: int):
+        """Initialize TradingAgents expert with database instance."""
+        super().__init__(id)
         
-        Format: Provider/ModelName (e.g., "OpenAI/gpt-5-mini" or "NagaAI/grok-4")
+        self._setup_api_keys()
+        self._load_expert_instance(id)
         
-        Returns:
-            dict with keys: 'provider', 'model', 'base_url', 'api_key_setting'
-        """
-        from ...core.db import get_setting
-        
-        # Handle legacy format (no provider prefix)
-        if '/' not in model_string:
-            # Default to OpenAI for backward compatibility
-            return {
-                'provider': 'OpenAI',
-                'model': model_string,
-                'base_url': 'https://api.openai.com/v1',
-                'api_key_setting': 'openai_api_key'
-            }
-        
-        # Parse Provider/Model format
-        provider, model = model_string.split('/', 1)
-        
-        if provider == 'OpenAI':
-            return {
-                'provider': 'OpenAI',
-                'model': model,
-                'base_url': 'https://api.openai.com/v1',
-                'api_key_setting': 'openai_api_key'
-            }
-        elif provider == 'NagaAI':
-            return {
-                'provider': 'NagaAI',
-                'model': model,
-                'base_url': 'https://api.naga.ac/v1',
-                'api_key_setting': 'naga_ai_api_key'
-            }
-        else:
-            # Unknown provider, default to OpenAI and use just the model name
-            # Note: Cannot log warning here as this is a static method
-            return {
-                'provider': 'OpenAI',
-                'model': model,  # Use just the model part, not the full string
-                'base_url': 'https://api.openai.com/v1',
-                'api_key_setting': 'openai_api_key'
-            }
-    
-    @classmethod
-    def get_settings_definitions(cls) -> Dict[str, Any]:
-        """Define configurable settings for TradingAgents expert."""
-        return {
-            # Analysis Configuration
-            "debates_new_positions": {
-                "type": "float", "required": True, "default": 3.0,
-                "description": "Number of debate rounds for new position analysis",
-                "tooltip": "Controls how many debate rounds the AI agents will conduct when analyzing potential new positions. More rounds = more thorough analysis but takes longer. Recommended: 2-4 rounds."
-            },
-            "debates_existing_positions": {
-                "type": "float", "required": True, "default": 3.0,
-                "description": "Number of debate rounds for existing position analysis",
-                "tooltip": "Controls how many debate rounds the AI agents will conduct when reviewing existing open positions. More rounds = more thorough analysis. Recommended: 2-3 rounds for faster real-time decisions."
-            },
-            "timeframe": {
-                "type": "str", "required": True, "default": "1h",
-                "description": "Analysis timeframe for market data",
-                "valid_values": cls._get_timeframe_valid_values(),
-                "tooltip": "The time interval used for technical analysis charts and indicators. Shorter timeframes (1m, 5m) are for day trading, medium (1h, 4h, 1d) for swing trading, longer (1wk, 1mo) for position trading."
-            },
-            
-            # LLM Models (Format: Provider/ModelName - e.g., OpenAI/gpt-4o-mini or NagaAI/gemini-2.5-flash:free)
-            "deep_think_llm": {
-                "type": "str", "required": True, "default": "OpenAI/gpt-4o-mini",
-                "description": "LLM model for complex reasoning and deep analysis",
+        # Initialize expert-specific logger
+        self.logger = get_expert_logger("TradingAgents", id)
                 "valid_values": [
                     # OpenAI models (direct) - Legacy + New models
                     "OpenAI/gpt-4o", "OpenAI/gpt-4o-mini",
@@ -143,6 +77,15 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                     "OpenAI/gpt-4.1", "OpenAI/gpt-4.1-mini", "OpenAI/gpt-4.1-nano",
                     "OpenAI/o1", "OpenAI/o1-mini", "OpenAI/o3-mini",
                     "OpenAI/o4-mini", "OpenAI/o4-mini-deep-research",
+                    # GPT-5 with reasoning effort variants (NagaAC)
+                    "NagaAC/gpt-5-2025-11-13",
+                    "NagaAC/gpt-5-2025-11-13{reasoning_effort:low}",
+                    "NagaAC/gpt-5-2025-11-13{reasoning_effort:medium}",
+                    "NagaAC/gpt-5-2025-11-13{reasoning_effort:high}",
+                    "NagaAC/gpt-5.1-2025-11-13",
+                    "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:low}",
+                    "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:medium}",
+                    "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:high}",
                     # GPT-5 (latest via Naga AI)
                     "NagaAI/gpt-5-2025-08-07",
                     "NagaAI/gpt-5-mini-2025-08-07",
@@ -203,6 +146,11 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                     "OpenAI/gpt-4.1", "OpenAI/gpt-4.1-mini", "OpenAI/gpt-4.1-nano",
                     "OpenAI/o1-mini", "OpenAI/o3-mini",
                     "OpenAI/o4-mini", "OpenAI/o4-mini-deep-research",
+                    # GPT-5/5.1 with reasoning effort variants (NagaAC)
+                    "NagaAC/gpt-5-2025-11-13",
+                    "NagaAC/gpt-5-2025-11-13{reasoning_effort:low}",
+                    "NagaAC/gpt-5.1-2025-11-13",
+                    "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:low}",
                     # GPT-5 mini/nano (latest, fast)
                     "NagaAI/gpt-5-mini-2025-08-07",
                     "NagaAI/gpt-5-mini-2025-08-07:free",
@@ -251,6 +199,15 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                 "valid_values": [
                     # OpenAI GPT-5 (direct - best for search)
                     "OpenAI/gpt-5", "OpenAI/gpt-5-mini", "OpenAI/gpt-5-nano",
+                    # NagaAC GPT-5/5.1 with reasoning effort
+                    "NagaAC/gpt-5-2025-11-13",
+                    "NagaAC/gpt-5-2025-11-13{reasoning_effort:low}",
+                    "NagaAC/gpt-5-2025-11-13{reasoning_effort:medium}",
+                    "NagaAC/gpt-5-2025-11-13{reasoning_effort:high}",
+                    "NagaAC/gpt-5.1-2025-11-13",
+                    "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:low}",
+                    "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:medium}",
+                    "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:high}",
                     # NagaAI GPT-5 (latest, excellent search)
                     "NagaAI/gpt-5-2025-08-07",
                     "NagaAI/gpt-5-mini-2025-08-07",
@@ -424,6 +381,8 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
     
     def _create_tradingagents_config(self, subtype: str) -> Dict[str, Any]:
         """Create TradingAgents configuration from expert settings."""
+        from ...core.utils import parse_model_config
+        
         config = DEFAULT_CONFIG.copy()
         
         # Get settings definitions for default values
@@ -471,9 +430,9 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
         quick_think_model_str = self.settings.get('quick_think_llm') or settings_def['quick_think_llm']['default']
         embedding_model_str = self.settings.get('embedding_model') or settings_def['embedding_model']['default']
         
-        deep_think_config = self._parse_model_config(deep_think_model_str)
-        quick_think_config = self._parse_model_config(quick_think_model_str)
-        embedding_config = self._parse_model_config(embedding_model_str)
+        deep_think_config = parse_model_config(deep_think_model_str)
+        quick_think_config = parse_model_config(quick_think_model_str)
+        embedding_config = parse_model_config(embedding_model_str)
         
         # Use the provider's base_url (they should match, but use deep_think as primary)
         backend_url = deep_think_config['base_url']
@@ -487,7 +446,9 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
             'max_debate_rounds': max_debate_rounds,
             'max_risk_discuss_rounds': max_risk_discuss_rounds,
             'deep_think_llm': deep_think_config['model'],  # Just the model name without provider prefix
+            'deep_think_llm_kwargs': deep_think_config['model_kwargs'],  # Model-specific parameters (e.g., reasoning_effort)
             'quick_think_llm': quick_think_config['model'],  # Just the model name without provider prefix
+            'quick_think_llm_kwargs': quick_think_config['model_kwargs'],  # Model-specific parameters
             'backend_url': backend_url,  # Dynamic base URL based on provider
             'api_key_setting': api_key_setting,  # Store which API key setting to use
             'embedding_model': embedding_config['model'],  # Embedding model name

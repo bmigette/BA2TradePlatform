@@ -344,28 +344,39 @@ def mark_job_as_failed(job_id: int, error_message: str) -> None:
         logger.error(f"Failed to update job status in database: {db_error}")
 
 
-def create_llm(model: str, temperature: float, base_url: str, api_key: str) -> ChatOpenAI:
+def create_llm(model: str, temperature: float, base_url: str, api_key: str, model_kwargs: dict = None) -> ChatOpenAI:
     """
     Create a ChatOpenAI instance with proper configuration and debug callback.
     
     Args:
-        model: Model name (e.g., 'gpt-4o-mini')
+        model: Model name (e.g., 'gpt-4o-mini' or 'gpt-5.1-2025-11-13' or 'Provider/ModelName{param:value}')
         temperature: Temperature for generation
         base_url: Base URL for API endpoint
         api_key: API key for authentication
+        model_kwargs: Optional model-specific parameters (e.g., {"reasoning_effort": "low"})
         
     Returns:
         Configured ChatOpenAI instance with debug callback
     """
     from .. import config as config_module
+    from .utils import parse_model_config
+    
+    # Parse model configuration (handles provider, model name, and parameters)
+    parsed = parse_model_config(model)
+    
+    # Merge any provided model_kwargs with parsed parameters
+    final_model_kwargs = parsed['model_kwargs'].copy()
+    if model_kwargs:
+        final_model_kwargs.update(model_kwargs)
     
     return ChatOpenAI(
-        model=model,
+        model=parsed['model'],
         temperature=temperature,
         base_url=base_url,
         api_key=api_key,
         streaming=config_module.OPENAI_ENABLE_STREAMING,
-        callbacks=[SmartRiskManagerDebugCallback()]
+        callbacks=[SmartRiskManagerDebugCallback()],
+        model_kwargs=final_model_kwargs if final_model_kwargs else None
     )
 
 

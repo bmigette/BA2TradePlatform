@@ -40,21 +40,18 @@ class AIInstrumentSelector:
         self._initialize_client()
 
     def _parse_model_string(self):
-        """Parse model string to extract provider and model name."""
+        """Parse model string to extract provider and model name using centralized parser."""
         try:
-            if "/" in self.model_string:
-                provider_part, model_part = self.model_string.split("/", 1)
-                self.provider = provider_part.lower()
-                self.model = model_part
-            else:
-                # No provider specified, assume it's just a model name for OpenAI
-                self.provider = "openai"
-                self.model = self.model_string
+            from .utils import parse_model_config
+            
+            parsed = parse_model_config(self.model_string)
+            self.provider = parsed['provider'].lower()
+            self.model = parsed['model']
             
             # Determine API type based on provider
             if self.provider == "openai":
                 self.api_type = "responses"  # Use responses API with web_search_preview
-            elif self.provider == "nagaai":
+            elif self.provider in ["nagaai", "nagaac"]:
                 self.api_type = "chat"  # Use chat completions API with web_search_options
             else:
                 logger.warning(f"Unknown provider '{self.provider}' in model string '{self.model_string}', defaulting to OpenAI")
@@ -79,7 +76,7 @@ class AIInstrumentSelector:
             if self.provider == "openai":
                 key_setting = session.exec(select(AppSetting).where(AppSetting.key == 'openai_api_key')).first()
                 base_url = None
-            elif self.provider == "nagaai":
+            elif self.provider in ["nagaai", "nagaac"]:
                 key_setting = session.exec(select(AppSetting).where(AppSetting.key == 'naga_ai_api_key')).first()
                 base_url = "https://api.naga.ac/v1"
             else:

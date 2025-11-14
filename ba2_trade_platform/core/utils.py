@@ -1230,3 +1230,95 @@ def get_setting_default_from_interface(interface_class, setting_key: str):
         logger.error(f"Error getting default for setting '{setting_key}' from {interface_class.__name__}: {e}", exc_info=True)
         raise
 
+
+def parse_model_config(model_string: str) -> dict:
+    """
+    Parse model string to extract provider, model name, and parameters.
+    
+    Format: Provider/ModelName{param:value} (e.g., "OpenAI/gpt-5-mini" or "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:low}")
+    
+    Args:
+        model_string: Model configuration string
+        
+    Returns:
+        dict with keys: 'provider', 'model', 'base_url', 'api_key_setting', 'model_kwargs'
+        
+    Example:
+        >>> config = parse_model_config("NagaAC/gpt-5.1-2025-11-13{reasoning_effort:low}")
+        >>> config['model']
+        'gpt-5.1-2025-11-13'
+        >>> config['model_kwargs']
+        {'reasoning_effort': 'low'}
+    """
+    import re
+    
+    # Extract parameters from model string (e.g., {reasoning_effort:low})
+    model_kwargs = {}
+    param_match = re.search(r'\{([^}]+)\}', model_string)
+    if param_match:
+        params_str = param_match.group(1)
+        # Remove parameters from model string to get clean model name
+        model_string = model_string[:param_match.start()]
+        # Parse parameters (format: param:value)
+        for param in params_str.split(','):
+            if ':' in param:
+                key, value = param.split(':', 1)
+                model_kwargs[key.strip()] = value.strip()
+        
+        # Log parsed parameters for visibility
+        if model_kwargs:
+            logger.info(f"Parsed model parameters from '{model_string}': {model_kwargs}")
+    
+    # Handle legacy format (no provider prefix)
+    if '/' not in model_string:
+        # Default to OpenAI for backward compatibility
+        result = {
+            'provider': 'OpenAI',
+            'model': model_string,
+            'base_url': 'https://api.openai.com/v1',
+            'api_key_setting': 'openai_api_key',
+            'model_kwargs': model_kwargs
+        }
+        logger.debug(f"Parsed legacy model string '{model_string}' -> provider={result['provider']}, model={result['model']}")
+        return result
+    
+    # Parse Provider/Model format
+    provider, model = model_string.split('/', 1)
+    
+    if provider == 'OpenAI':
+        result = {
+            'provider': 'OpenAI',
+            'model': model,
+            'base_url': 'https://api.openai.com/v1',
+            'api_key_setting': 'openai_api_key',
+            'model_kwargs': model_kwargs
+        }
+    elif provider == 'NagaAI':
+        result = {
+            'provider': 'NagaAI',
+            'model': model,
+            'base_url': 'https://api.naga.ac/v1',
+            'api_key_setting': 'naga_ai_api_key',
+            'model_kwargs': model_kwargs
+        }
+    elif provider == 'NagaAC':
+        result = {
+            'provider': 'NagaAC',
+            'model': model,
+            'base_url': 'https://api.naga.ac/v1',
+            'api_key_setting': 'naga_ai_api_key',
+            'model_kwargs': model_kwargs
+        }
+    else:
+        # Unknown provider, default to OpenAI and use just the model name
+        logger.warning(f"Unknown provider '{provider}' in model string '{model_string}', defaulting to OpenAI")
+        result = {
+            'provider': 'OpenAI',
+            'model': model,  # Use just the model part, not the full string
+            'base_url': 'https://api.openai.com/v1',
+            'api_key_setting': 'openai_api_key',
+            'model_kwargs': model_kwargs
+        }
+    
+    logger.debug(f"Parsed model string '{model_string}' -> provider={result['provider']}, model={result['model']}, kwargs={result['model_kwargs']}")
+    return result

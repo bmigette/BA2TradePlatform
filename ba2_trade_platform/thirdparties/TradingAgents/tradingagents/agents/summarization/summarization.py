@@ -335,11 +335,15 @@ def create_langgraph_summarization_node(config: Dict[str, Any]):
         from ba2_trade_platform import config as ba2_config
         streaming_enabled = ba2_config.OPENAI_ENABLE_STREAMING
         
+        # Get model-specific parameters if available
+        model_kwargs = config.get("quick_think_llm_kwargs", {})
+        
         llm = ChatOpenAI(
             model=model, 
             base_url=base_url, 
             api_key=api_key,
-            streaming=streaming_enabled
+            streaming=streaming_enabled,
+            model_kwargs=model_kwargs if model_kwargs else None
         )
         return create_final_summarization_agent(llm)
     except KeyError as e:

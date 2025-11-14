@@ -114,6 +114,15 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         "NagaAI/gpt-5-mini-2025-08-07",
                         "NagaAI/gpt-5-chat-latest",
                         "NagaAI/gpt-5-codex",
+                        # NagaAC GPT-5/5.1 (with reasoning effort support)
+                        "NagaAC/gpt-5-2025-11-13",
+                        "NagaAC/gpt-5-2025-11-13{reasoning_effort:low}",
+                        "NagaAC/gpt-5-2025-11-13{reasoning_effort:medium}",
+                        "NagaAC/gpt-5-2025-11-13{reasoning_effort:high}",
+                        "NagaAC/gpt-5.1-2025-11-13",
+                        "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:low}",
+                        "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:medium}",
+                        "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:high}",
                         # NagaAI GPT-4o Search (optimized for web search)
                         "NagaAI/gpt-4o-search-preview-2025-03-11",
                         # NagaAI Grok-4 (excellent for real-time search with X integration)
@@ -136,7 +145,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     ],
                     "allow_custom": True,
                     "help": "For more information, see [OpenAI Docs](https://platform.openai.com/docs/models) and [Naga AI Web Search](https://docs.naga.ac/features/web-search)",
-                    "tooltip": "The model used for risk management analysis with web search capabilities. Format: Provider/ModelName. Optimized for risk analysis: GPT-5 (best reasoning), GPT-4o-search (web-optimized), Grok-4 (real-time data). You can also enter custom model names."
+                    "tooltip": "The model used for risk management analysis with web search capabilities. Format: Provider/ModelName or Provider/ModelName{param:value}. Optimized for risk analysis: GPT-5 (best reasoning), GPT-4o-search (web-optimized), Grok-4 (real-time data). Supports reasoning_effort parameter for NagaAC GPT-5/5.1 models. You can also enter custom model names."
                 },
                 "dynamic_instrument_selection_model": {
                     "type": "str", "required": True, "default": "NagaAI/gpt-5-2025-08-07",
@@ -149,6 +158,15 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         "NagaAI/gpt-5-mini-2025-08-07",
                         "NagaAI/gpt-5-chat-latest",
                         "NagaAI/gpt-5-codex",
+                        # NagaAC GPT-5/5.1 (with reasoning effort support)
+                        "NagaAC/gpt-5-2025-11-13",
+                        "NagaAC/gpt-5-2025-11-13{reasoning_effort:low}",
+                        "NagaAC/gpt-5-2025-11-13{reasoning_effort:medium}",
+                        "NagaAC/gpt-5-2025-11-13{reasoning_effort:high}",
+                        "NagaAC/gpt-5.1-2025-11-13",
+                        "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:low}",
+                        "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:medium}",
+                        "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:high}",
                         # NagaAI GPT-4o Search (optimized for web search)
                         "NagaAI/gpt-4o-search-preview-2025-03-11",
                         # NagaAI Grok-4 (excellent for real-time search with X integration)
@@ -171,7 +189,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     ],
                     "allow_custom": True,
                     "help": "For more information, see [OpenAI Docs](https://platform.openai.com/docs/models) and [Naga AI Web Search](https://docs.naga.ac/features/web-search)",
-                    "tooltip": "The model used for dynamic AI-powered instrument selection with web search capabilities. Format: Provider/ModelName. Optimized for market research: GPT-5 (best general search), GPT-4o-search (web-optimized), Grok-4 (real-time with X/Twitter integration). You can also enter custom model names."
+                    "tooltip": "The model used for dynamic AI-powered instrument selection with web search capabilities. Format: Provider/ModelName or Provider/ModelName{param:value}. Optimized for market research: GPT-5 (best general search), GPT-4o-search (web-optimized), Grok-4 (real-time with X/Twitter integration). Supports reasoning_effort parameter for NagaAC GPT-5/5.1 models. You can also enter custom model names."
                 },
                 "risk_manager_mode": {
                     "type": "str", "required": True, "default": "classic",

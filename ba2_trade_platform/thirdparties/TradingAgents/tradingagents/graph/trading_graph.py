@@ -106,17 +106,23 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             from ba2_trade_platform import config as ba2_config
             streaming_enabled = ba2_config.OPENAI_ENABLE_STREAMING
             
+            # Get model-specific parameters (e.g., reasoning_effort for GPT-5)
+            deep_think_kwargs = self.config.get("deep_think_llm_kwargs", {})
+            quick_think_kwargs = self.config.get("quick_think_llm_kwargs", {})
+            
             self.deep_thinking_llm = ChatOpenAI(
                 model=self.config["deep_think_llm"], 
                 base_url=self.config["backend_url"], 
                 api_key=api_key,
-                streaming=streaming_enabled
+                streaming=streaming_enabled,
+                model_kwargs=deep_think_kwargs if deep_think_kwargs else None
             )
             self.quick_thinking_llm = ChatOpenAI(
                 model=self.config["quick_think_llm"], 
                 base_url=self.config["backend_url"], 
                 api_key=api_key,
-                streaming=streaming_enabled
+                streaming=streaming_enabled,
+                model_kwargs=quick_think_kwargs if quick_think_kwargs else None
             )
         elif self.config["llm_provider"].lower() == "anthropic":
             self.deep_thinking_llm = ChatAnthropic(model=self.config["deep_think_llm"], base_url=self.config["backend_url"])
@@ -133,7 +139,11 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         logger.info(f"  Provider: {self.config['llm_provider']}")
         logger.info(f"  Backend URL: {self.config.get('backend_url', 'N/A')}")
         logger.info(f"  Deep Think Model: {self.config['deep_think_llm']}")
+        if deep_think_kwargs:
+            logger.info(f"  Deep Think Model Parameters: {deep_think_kwargs}")
         logger.info(f"  Quick Think Model: {self.config['quick_think_llm']}")
+        if quick_think_kwargs:
+            logger.info(f"  Quick Think Model Parameters: {quick_think_kwargs}")
         logger.info(f"  WebSearch Model: {self.provider_args.get('websearch_model', 'N/A')}")
         logger.info(f"  Embedding Model: {self.config.get('embedding_model', 'N/A')}")
         logger.info("=" * 80)
