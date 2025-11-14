@@ -110,24 +110,47 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             deep_think_kwargs = self.config.get("deep_think_llm_kwargs", {})
             quick_think_kwargs = self.config.get("quick_think_llm_kwargs", {})
             
-            # Build ChatOpenAI initialization parameters
+            # Extract parameters that should be passed directly to ChatOpenAI (not in model_kwargs)
+            # These are special parameters that ChatOpenAI recognizes at the class level
+            direct_params = ['reasoning', 'temperature', 'max_tokens', 'top_p', 'frequency_penalty', 'presence_penalty']
+            
+            # Build ChatOpenAI initialization parameters for deep thinking model
             deep_think_params = {
                 "model": self.config["deep_think_llm"],
                 "base_url": self.config["backend_url"],
                 "api_key": api_key,
                 "streaming": streaming_enabled
             }
-            if deep_think_kwargs:
-                deep_think_params["model_kwargs"] = deep_think_kwargs
             
+            # Separate direct params from model_kwargs for deep_think
+            deep_think_model_kwargs = {}
+            for key, value in deep_think_kwargs.items():
+                if key in direct_params:
+                    deep_think_params[key] = value
+                else:
+                    deep_think_model_kwargs[key] = value
+            
+            if deep_think_model_kwargs:
+                deep_think_params["model_kwargs"] = deep_think_model_kwargs
+            
+            # Build ChatOpenAI initialization parameters for quick thinking model
             quick_think_params = {
                 "model": self.config["quick_think_llm"],
                 "base_url": self.config["backend_url"],
                 "api_key": api_key,
                 "streaming": streaming_enabled
             }
-            if quick_think_kwargs:
-                quick_think_params["model_kwargs"] = quick_think_kwargs
+            
+            # Separate direct params from model_kwargs for quick_think
+            quick_think_model_kwargs = {}
+            for key, value in quick_think_kwargs.items():
+                if key in direct_params:
+                    quick_think_params[key] = value
+                else:
+                    quick_think_model_kwargs[key] = value
+            
+            if quick_think_model_kwargs:
+                quick_think_params["model_kwargs"] = quick_think_model_kwargs
             
             self.deep_thinking_llm = ChatOpenAI(**deep_think_params)
             self.quick_thinking_llm = ChatOpenAI(**quick_think_params)
