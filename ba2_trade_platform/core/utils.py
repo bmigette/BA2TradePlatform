@@ -1235,7 +1235,11 @@ def parse_model_config(model_string: str) -> dict:
     """
     Parse model string to extract provider, model name, and parameters.
     
-    Format: Provider/ModelName{param:value} (e.g., "OpenAI/gpt-5-mini" or "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:low}")
+    Format: Provider/ModelName{key=subkey:value} or Provider/ModelName{key:value}
+    Examples: 
+        - "OpenAI/gpt-5-mini" (no parameters)
+        - "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:low}" (nested parameter)
+        - "OpenAI/gpt-4{temperature:0.7}" (flat parameter)
     
     Args:
         model_string: Model configuration string
@@ -1244,24 +1248,34 @@ def parse_model_config(model_string: str) -> dict:
         dict with keys: 'provider', 'model', 'base_url', 'api_key_setting', 'model_kwargs'
         
     Example:
-        >>> config = parse_model_config("NagaAC/gpt-5.1-2025-11-13{reasoning_effort:low}")
+        >>> config = parse_model_config("NagaAC/gpt-5.1-2025-11-13{reasoning=effort:low}")
         >>> config['model']
         'gpt-5.1-2025-11-13'
         >>> config['model_kwargs']
-        {'reasoning_effort': 'low'}
+        {'reasoning': {'effort': 'low'}}
     """
     import re
     
-    # Extract parameters from model string (e.g., {reasoning_effort:low})
+    # Extract parameters from model string (e.g., {reasoning=effort:low})
     model_kwargs = {}
     param_match = re.search(r'\{([^}]+)\}', model_string)
     if param_match:
         params_str = param_match.group(1)
         # Remove parameters from model string to get clean model name
         model_string = model_string[:param_match.start()]
-        # Parse parameters (format: param:value)
+        # Parse parameters (format: key=subkey:value or key:value)
         for param in params_str.split(','):
-            if ':' in param:
+            if '=' in param:
+                # Nested format: key=subkey:value (e.g., reasoning=effort:low)
+                key, nested_part = param.split('=', 1)
+                key = key.strip()
+                if ':' in nested_part:
+                    subkey, value = nested_part.split(':', 1)
+                    model_kwargs[key] = {subkey.strip(): value.strip()}
+                else:
+                    model_kwargs[key] = nested_part.strip()
+            elif ':' in param:
+                # Flat format: key:value
                 key, value = param.split(':', 1)
                 model_kwargs[key.strip()] = value.strip()
         

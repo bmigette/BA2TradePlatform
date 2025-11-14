@@ -116,13 +116,13 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         "NagaAI/gpt-5-codex",
                         # NagaAC GPT-5/5.1 (with reasoning effort support)
                         "NagaAC/gpt-5-2025-11-13",
-                        "NagaAC/gpt-5-2025-11-13{reasoning_effort:low}",
-                        "NagaAC/gpt-5-2025-11-13{reasoning_effort:medium}",
-                        "NagaAC/gpt-5-2025-11-13{reasoning_effort:high}",
+                        "NagaAC/gpt-5-2025-11-13{reasoning=effort:low}",
+                        "NagaAC/gpt-5-2025-11-13{reasoning=effort:medium}",
+                        "NagaAC/gpt-5-2025-11-13{reasoning=effort:high}",
                         "NagaAC/gpt-5.1-2025-11-13",
-                        "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:low}",
-                        "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:medium}",
-                        "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:high}",
+                        "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:low}",
+                        "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:medium}",
+                        "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:high}",
                         # NagaAI GPT-4o Search (optimized for web search)
                         "NagaAI/gpt-4o-search-preview-2025-03-11",
                         # NagaAI Grok-4 (excellent for real-time search with X integration)
@@ -160,13 +160,13 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         "NagaAI/gpt-5-codex",
                         # NagaAC GPT-5/5.1 (with reasoning effort support)
                         "NagaAC/gpt-5-2025-11-13",
-                        "NagaAC/gpt-5-2025-11-13{reasoning_effort:low}",
-                        "NagaAC/gpt-5-2025-11-13{reasoning_effort:medium}",
-                        "NagaAC/gpt-5-2025-11-13{reasoning_effort:high}",
+                        "NagaAC/gpt-5-2025-11-13{reasoning=effort:low}",
+                        "NagaAC/gpt-5-2025-11-13{reasoning=effort:medium}",
+                        "NagaAC/gpt-5-2025-11-13{reasoning=effort:high}",
                         "NagaAC/gpt-5.1-2025-11-13",
-                        "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:low}",
-                        "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:medium}",
-                        "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:high}",
+                        "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:low}",
+                        "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:medium}",
+                        "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:high}",
                         # NagaAI GPT-4o Search (optimized for web search)
                         "NagaAI/gpt-4o-search-preview-2025-03-11",
                         # NagaAI Grok-4 (excellent for real-time search with X integration)

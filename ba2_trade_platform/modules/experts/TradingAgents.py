@@ -61,15 +61,32 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
         if hasattr(self, '_api_key_error'):
             self.logger.warning(f"Could not load API keys from database: {self._api_key_error}")
     
-    def __init__(self, id: int):
-        """Initialize TradingAgents expert with database instance."""
-        super().__init__(id)
-        
-        self._setup_api_keys()
-        self._load_expert_instance(id)
-        
-        # Initialize expert-specific logger
-        self.logger = get_expert_logger("TradingAgents", id)
+    @classmethod
+    def get_settings_definitions(cls) -> Dict[str, Any]:
+        """Define configurable settings for TradingAgents expert."""
+        return {
+            # Analysis Configuration
+            "debates_new_positions": {
+                "type": "float", "required": True, "default": 3.0,
+                "description": "Number of debate rounds for new position analysis",
+                "tooltip": "Controls how many debate rounds the AI agents will conduct when analyzing potential new positions. More rounds = more thorough analysis but takes longer. Recommended: 2-4 rounds."
+            },
+            "debates_existing_positions": {
+                "type": "float", "required": True, "default": 3.0,
+                "description": "Number of debate rounds for existing position analysis",
+                "tooltip": "Controls how many debate rounds the AI agents will conduct when reviewing existing open positions. More rounds = more thorough analysis. Recommended: 2-3 rounds for faster real-time decisions."
+            },
+            "timeframe": {
+                "type": "str", "required": True, "default": "1h",
+                "description": "Analysis timeframe for market data",
+                "valid_values": cls._get_timeframe_valid_values(),
+                "tooltip": "The time interval used for technical analysis charts and indicators. Shorter timeframes (1m, 5m) are for day trading, medium (1h, 4h, 1d) for swing trading, longer (1wk, 1mo) for position trading."
+            },
+            
+            # LLM Models (Format: Provider/ModelName - e.g., OpenAI/gpt-4o-mini or NagaAI/gemini-2.5-flash:free)
+            "deep_think_llm": {
+                "type": "str", "required": True, "default": "OpenAI/gpt-4o-mini",
+                "description": "LLM model for complex reasoning and deep analysis",
                 "valid_values": [
                     # OpenAI models (direct) - Legacy + New models
                     "OpenAI/gpt-4o", "OpenAI/gpt-4o-mini",
@@ -79,13 +96,13 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                     "OpenAI/o4-mini", "OpenAI/o4-mini-deep-research",
                     # GPT-5 with reasoning effort variants (NagaAC)
                     "NagaAC/gpt-5-2025-11-13",
-                    "NagaAC/gpt-5-2025-11-13{reasoning_effort:low}",
-                    "NagaAC/gpt-5-2025-11-13{reasoning_effort:medium}",
-                    "NagaAC/gpt-5-2025-11-13{reasoning_effort:high}",
+                    "NagaAC/gpt-5-2025-11-13{reasoning=effort:low}",
+                    "NagaAC/gpt-5-2025-11-13{reasoning=effort:medium}",
+                    "NagaAC/gpt-5-2025-11-13{reasoning=effort:high}",
                     "NagaAC/gpt-5.1-2025-11-13",
-                    "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:low}",
-                    "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:medium}",
-                    "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:high}",
+                    "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:low}",
+                    "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:medium}",
+                    "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:high}",
                     # GPT-5 (latest via Naga AI)
                     "NagaAI/gpt-5-2025-08-07",
                     "NagaAI/gpt-5-mini-2025-08-07",
@@ -148,9 +165,9 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                     "OpenAI/o4-mini", "OpenAI/o4-mini-deep-research",
                     # GPT-5/5.1 with reasoning effort variants (NagaAC)
                     "NagaAC/gpt-5-2025-11-13",
-                    "NagaAC/gpt-5-2025-11-13{reasoning_effort:low}",
+                    "NagaAC/gpt-5-2025-11-13{reasoning=effort:low}",
                     "NagaAC/gpt-5.1-2025-11-13",
-                    "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:low}",
+                    "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:low}",
                     # GPT-5 mini/nano (latest, fast)
                     "NagaAI/gpt-5-mini-2025-08-07",
                     "NagaAI/gpt-5-mini-2025-08-07:free",
@@ -201,13 +218,13 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                     "OpenAI/gpt-5", "OpenAI/gpt-5-mini", "OpenAI/gpt-5-nano",
                     # NagaAC GPT-5/5.1 with reasoning effort
                     "NagaAC/gpt-5-2025-11-13",
-                    "NagaAC/gpt-5-2025-11-13{reasoning_effort:low}",
-                    "NagaAC/gpt-5-2025-11-13{reasoning_effort:medium}",
-                    "NagaAC/gpt-5-2025-11-13{reasoning_effort:high}",
+                    "NagaAC/gpt-5-2025-11-13{reasoning=effort:low}",
+                    "NagaAC/gpt-5-2025-11-13{reasoning=effort:medium}",
+                    "NagaAC/gpt-5-2025-11-13{reasoning=effort:high}",
                     "NagaAC/gpt-5.1-2025-11-13",
-                    "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:low}",
-                    "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:medium}",
-                    "NagaAC/gpt-5.1-2025-11-13{reasoning_effort:high}",
+                    "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:low}",
+                    "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:medium}",
+                    "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:high}",
                     # NagaAI GPT-5 (latest, excellent search)
                     "NagaAI/gpt-5-2025-08-07",
                     "NagaAI/gpt-5-mini-2025-08-07",
