@@ -1235,11 +1235,12 @@ def parse_model_config(model_string: str) -> dict:
     """
     Parse model string to extract provider, model name, and parameters.
     
-    Format: Provider/ModelName{key=subkey:value} or Provider/ModelName{key:value}
+    Format: Provider/ModelName{key=subkey:value} or Provider/ModelName{key=value} or Provider/ModelName{key:value}
     Examples: 
         - "OpenAI/gpt-5-mini" (no parameters)
         - "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:low}" (nested parameter)
-        - "OpenAI/gpt-4{temperature:0.7}" (flat parameter)
+        - "OpenAI/gpt-4{temperature=0.7}" (simple key=value)
+        - "OpenAI/gpt-4{temperature:0.7}" (legacy key:value)
     
     Args:
         model_string: Model configuration string
@@ -1253,6 +1254,10 @@ def parse_model_config(model_string: str) -> dict:
         'gpt-5.1-2025-11-13'
         >>> config['model_kwargs']
         {'reasoning': {'effort': 'low'}}
+        
+        >>> config = parse_model_config("OpenAI/gpt-4{temperature=0.7}")
+        >>> config['model_kwargs']
+        {'temperature': '0.7'}
     """
     import re
     
@@ -1263,19 +1268,21 @@ def parse_model_config(model_string: str) -> dict:
         params_str = param_match.group(1)
         # Remove parameters from model string to get clean model name
         model_string = model_string[:param_match.start()]
-        # Parse parameters (format: key=subkey:value or key:value)
+        # Parse parameters (format: key=subkey:value, key=value, or key:value)
         for param in params_str.split(','):
             if '=' in param:
-                # Nested format: key=subkey:value (e.g., reasoning=effort:low)
+                # Format with equals: key=subkey:value or key=value
                 key, nested_part = param.split('=', 1)
                 key = key.strip()
                 if ':' in nested_part:
+                    # Nested format: key=subkey:value (e.g., reasoning=effort:low)
                     subkey, value = nested_part.split(':', 1)
                     model_kwargs[key] = {subkey.strip(): value.strip()}
                 else:
+                    # Simple key=value format (e.g., temperature=0.7)
                     model_kwargs[key] = nested_part.strip()
             elif ':' in param:
-                # Flat format: key:value
+                # Flat format: key:value (legacy support)
                 key, value = param.split(':', 1)
                 model_kwargs[key.strip()] = value.strip()
         
