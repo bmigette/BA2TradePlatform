@@ -1565,42 +1565,71 @@ class ManualAnalysisTab:
                     self._render_static_selector(expert)
                     
             elif selection_method == 'dynamic':
-                # AI-driven dynamic selection - show prompt input
-                with ui.card().classes('w-full p-4 bg-green-50 border-l-4 border-green-400'):
-                    with ui.row():
-                        ui.icon('psychology').classes('text-green-600 text-xl mr-3')
-                        with ui.column():
-                            ui.label('AI-Powered Dynamic Instrument Selection').classes('text-lg font-semibold text-green-800')
-                            ui.label('Enter a prompt to let AI select instruments based on your criteria.').classes('text-green-600')
-                
-                with ui.column().classes('w-full mt-4'):
-                    ui.label('AI Selection Prompt:').classes('text-sm font-medium mb-2')
+                # Check if this is OPEN_POSITIONS analysis - skip AI selection
+                from ...core.types import AnalysisUseCase
+                if self.analysis_type == AnalysisUseCase.OPEN_POSITIONS.value:
+                    # For OPEN_POSITIONS, just show info that we'll use existing positions
+                    with ui.card().classes('w-full p-4 bg-purple-50 border-l-4 border-purple-400'):
+                        with ui.row():
+                            ui.icon('inventory').classes('text-purple-600 text-xl mr-3')
+                            with ui.column():
+                                ui.label('Open Positions Analysis').classes('text-lg font-semibold text-purple-800')
+                                ui.label('Analysis will be performed on existing open positions for this expert.').classes('text-purple-600')
                     
-                    # Get default prompt from AIInstrumentSelector
-                    # Get model from expert settings - use dynamic_instrument_selection_model setting
-                    model_string = expert.settings.get('dynamic_instrument_selection_model')
-                    if not model_string:
-                        logger.error(f"Expert {expert.id} has no dynamic_instrument_selection_model setting - cannot perform AI instrument selection")
-                        ui.notify("Expert is not configured for AI instrument selection (missing model setting)", type='negative')
-                        return
+                    # Add manual override option
+                    with ui.column().classes('w-full mt-4'):
+                        ui.label('Override Instruments (Optional):').classes('text-sm font-medium mb-2')
+                        ui.label('Enter comma-separated symbols to override automatic open position detection').classes('text-xs text-gray-500 mb-1')
+                        self.instrument_override_input = ui.input(
+                            placeholder='e.g., AAPL, GOOGL, MSFT (leave empty to use open positions)'
+                        ).classes('w-full')
                     
-                    from ...core.AIInstrumentSelector import AIInstrumentSelector
-                    ai_selector = AIInstrumentSelector(model_string=model_string)
-                    default_prompt = ai_selector.get_default_prompt()
+                    self.instrument_selector = None
+                    self.ai_prompt_textarea = None
+                else:
+                    # AI-driven dynamic selection - show prompt input
+                    with ui.card().classes('w-full p-4 bg-green-50 border-l-4 border-green-400'):
+                        with ui.row():
+                            ui.icon('psychology').classes('text-green-600 text-xl mr-3')
+                            with ui.column():
+                                ui.label('AI-Powered Dynamic Instrument Selection').classes('text-lg font-semibold text-green-800')
+                                ui.label('Enter a prompt to let AI select instruments based on your criteria.').classes('text-green-600')
                     
-                    self.ai_prompt_textarea = ui.textarea(
-                        value=default_prompt,
-                        placeholder='Enter your prompt for AI instrument selection...'
-                    ).classes('w-full').props('rows=6')
+                    with ui.column().classes('w-full mt-4'):
+                        ui.label('AI Selection Prompt:').classes('text-sm font-medium mb-2')
+                        
+                        # Get default prompt from AIInstrumentSelector
+                        # Get model from expert settings - use dynamic_instrument_selection_model setting
+                        model_string = expert.settings.get('dynamic_instrument_selection_model')
+                        if not model_string:
+                            logger.error(f"Expert {expert.id} has no dynamic_instrument_selection_model setting - cannot perform AI instrument selection")
+                            ui.notify("Expert is not configured for AI instrument selection (missing model setting)", type='negative')
+                            return
+                        
+                        from ...core.AIInstrumentSelector import AIInstrumentSelector
+                        ai_selector = AIInstrumentSelector(model_string=model_string)
+                        default_prompt = ai_selector.get_default_prompt()
+                        
+                        self.ai_prompt_textarea = ui.textarea(
+                            value=default_prompt,
+                            placeholder='Enter your prompt for AI instrument selection...'
+                        ).classes('w-full').props('rows=6')
+                        
+                        with ui.row().classes('w-full justify-between mt-2'):
+                            ui.button('Reset to Default', on_click=lambda: self.ai_prompt_textarea.set_value(default_prompt), icon='refresh').classes('bg-gray-500')
+                            self.ai_generate_button = ui.button('Generate AI Selection', on_click=self._generate_ai_selection, icon='auto_awesome').classes('bg-green-600')
+                        
+                        # Container for AI-selected instruments (will be populated after AI selection)
+                        self.ai_results_container = ui.column().classes('w-full mt-4')
+                        
+                        # Add manual override option for ENTER_MARKET as well
+                        ui.label('Override Instruments (Optional):').classes('text-sm font-medium mb-2 mt-4')
+                        ui.label('Enter comma-separated symbols to override AI selection').classes('text-xs text-gray-500 mb-1')
+                        self.instrument_override_input = ui.input(
+                            placeholder='e.g., AAPL, GOOGL, MSFT (leave empty to use AI selection)'
+                        ).classes('w-full')
                     
-                    with ui.row().classes('w-full justify-between mt-2'):
-                        ui.button('Reset to Default', on_click=lambda: self.ai_prompt_textarea.set_value(default_prompt), icon='refresh').classes('bg-gray-500')
-                        self.ai_generate_button = ui.button('Generate AI Selection', on_click=self._generate_ai_selection, icon='auto_awesome').classes('bg-green-600')
-                    
-                    # Container for AI-selected instruments (will be populated after AI selection)
-                    self.ai_results_container = ui.column().classes('w-full mt-4')
-                
-                self.instrument_selector = None  # Will be created after AI selection
+                    self.instrument_selector = None  # Will be created after AI selection
                 
             else:  # static (default)
                 self._render_static_selector(expert)
@@ -1794,8 +1823,32 @@ class ManualAnalysisTab:
                     ui.notify(f"Error getting expert recommendations: {str(e)}", type='negative')
                     return
             elif instrument_selection_method == 'dynamic':
-                # AI-powered dynamic selection
-                if self.instrument_selector:
+                # First check for manual override
+                instrument_override = getattr(self, 'instrument_override_input', None)
+                if instrument_override and instrument_override.value and instrument_override.value.strip():
+                    # User provided manual override - parse comma-separated symbols
+                    symbols_str = instrument_override.value.strip()
+                    selected_symbols = [s.strip().upper() for s in symbols_str.split(',') if s.strip()]
+                    
+                    if not selected_symbols:
+                        ui.notify("Override input is empty or invalid. Please enter comma-separated symbols.", type='negative')
+                        return
+                    
+                    logger.info(f"Using manual instrument override for analysis: {selected_symbols}")
+                    ui.notify(f"Using manual override: {len(selected_symbols)} symbol(s)", type='info')
+                    
+                    # Convert to expected format
+                    selected_instruments = [{'name': symbol} for symbol in selected_symbols]
+                
+                # For OPEN_POSITIONS with dynamic selection, use special symbol that will be expanded by job execution
+                elif self.analysis_type == AnalysisUseCase.OPEN_POSITIONS.value:
+                    # Use special OPEN_POSITIONS symbol - the job execution will expand this to actual open positions
+                    selected_instruments = [{'name': 'OPEN_POSITIONS'}]
+                    logger.info(f"Using OPEN_POSITIONS symbol for expert {expert.id} - will expand to open positions at execution time")
+                    ui.notify("Analysis will be performed on all open positions", type='info')
+                
+                # Otherwise, use AI selection (for ENTER_MARKET)
+                elif self.instrument_selector:
                     # User already generated AI selection - use selected instruments
                     selected_instruments = self.instrument_selector.get_selected_instruments()
                     
