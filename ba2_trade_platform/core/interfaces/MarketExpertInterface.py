@@ -209,6 +209,12 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "description": "Smart Risk Manager Maximum Iterations",
                     "help": "Maximum number of iterations the smart risk manager will run before stopping. Prevents infinite loops and controls execution time.",
                     "tooltip": "Controls how many analysis cycles the smart risk manager can perform before being forced to stop. Higher values allow more thorough analysis but take longer to execute. Recommended: 5-15 iterations. Only used when risk_manager_mode is set to 'smart'."
+                },
+                "smart_risk_manager_parallel_tool_calls": {
+                    "type": "bool", "required": False, "default": True,
+                    "description": "Smart Risk Manager Parallel Tool Calls",
+                    "help": "Enable parallel tool calls for smart risk manager. May cause issues with some LLM providers (e.g., GPT-4.5/5.1 reasoning modes).",
+                    "tooltip": "Allows the smart risk manager to call multiple tools simultaneously for faster execution. Disable if experiencing corrupted tool names or call_id errors with certain LLM models (especially GPT-4.5/5.1 with reasoning). Only used when risk_manager_mode is set to 'smart'."
                 }
                 
             }

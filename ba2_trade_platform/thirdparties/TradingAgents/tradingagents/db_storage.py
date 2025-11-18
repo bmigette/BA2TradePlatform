@@ -367,7 +367,87 @@ class LoggingToolNode:
         return wrapped_tool
     
     def __call__(self, state):
-        """Execute tools via ToolNode."""
+        """Execute tools via ToolNode with call_id truncation for OpenAI compatibility.
+        
+        OpenAI enforces a 64-character limit on tool call IDs, but LangGraph can generate
+        longer IDs when parallel tool calls are enabled. This method truncates call_ids
+        in ALL AIMessages in the conversation history before passing to ToolNode.
+        """
+        import hashlib
+        import copy
+        from langchain_core.messages import AIMessage
+        
+        # Check if we need to truncate call_ids in ANY message
+        if "messages" not in state or not state["messages"]:
+            return self.tool_node.invoke(state)
+        
+        messages_modified = False
+        new_messages = []
+        
+        # Process all messages in history to truncate any long call_ids
+        for message in state["messages"]:
+            # Only process AIMessage with tool_calls
+            if isinstance(message, AIMessage) and hasattr(message, "tool_calls") and message.tool_calls:
+                needs_truncation = False
+                truncated_calls = []
+                
+                for tool_call in message.tool_calls:
+                    original_id = tool_call.get("id", "")
+                    
+                    # Log tool call for debugging
+                    logger.debug(f"Processing tool_call: name={tool_call.get('name')}, id_length={len(original_id)}")
+                    
+                    # Check if call_id exceeds OpenAI's 64-char limit
+                    if len(original_id) > 64:
+                        needs_truncation = True
+                        messages_modified = True
+                        # Create deterministic shortened ID using hash
+                        hash_suffix = hashlib.sha256(original_id.encode()).hexdigest()[:24]
+                        truncated_id = f"{original_id[:40]}_{hash_suffix}"[:64]
+                        
+                        logger.debug(f"Truncated call_id from {len(original_id)} to {len(truncated_id)} chars")
+                        
+                        # Create new tool_call dict with truncated ID (deep copy to avoid mutation)
+                        truncated_call = copy.deepcopy(tool_call)
+                        truncated_call["id"] = truncated_id
+                        truncated_calls.append(truncated_call)
+                    else:
+                        truncated_calls.append(copy.deepcopy(tool_call))
+                
+                # If any IDs were truncated in this message, create new AIMessage
+                if needs_truncation:
+                    # Create new additional_kwargs without tool_calls (if present)
+                    new_additional_kwargs = {}
+                    if hasattr(message, "additional_kwargs") and message.additional_kwargs:
+                        for key, value in message.additional_kwargs.items():
+                            if key != "tool_calls":
+                                new_additional_kwargs[key] = value
+                    
+                    # Create new AIMessage with truncated IDs
+                    new_message = AIMessage(
+                        content=message.content,
+                        tool_calls=truncated_calls,
+                        id=message.id if hasattr(message, "id") else None,
+                        additional_kwargs=new_additional_kwargs
+                    )
+                    new_messages.append(new_message)
+                else:
+                    new_messages.append(message)
+            else:
+                # Non-AIMessage or no tool_calls - keep as is
+                new_messages.append(message)
+        
+        # If any modifications were made, use new state
+        if messages_modified:
+            new_state = state.copy()
+            new_state["messages"] = new_messages
+            
+            logger.info(f"Truncated tool call IDs in conversation history to comply with OpenAI 64-char limit")
+            
+            # Use modified state
+            return self.tool_node.invoke(new_state)
+        
+        # No truncation needed, use original state
         return self.tool_node.invoke(state)
 
 

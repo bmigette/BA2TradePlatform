@@ -927,7 +927,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                 logger.info(f"{'=' * 80}")
                 logger.info(f"Tool Message")
                 logger.info(f"{'=' * 80}")
-                logger.info(f"Tool: {message.tool_calls[0]['name'] if hasattr(message, 'tool_calls') and message.tool_calls else 'Unknown'}")
+                logger.info(f"Tool: {message.name if hasattr(message, 'name') else 'Unknown'}")
                 logger.info(f"Tool ID: {message.tool_call_id if hasattr(message, 'tool_call_id') else 'N/A'}")
                 if hasattr(message, 'content') and message.content:
                     content = message.content if isinstance(message.content, str) else str(message.content)

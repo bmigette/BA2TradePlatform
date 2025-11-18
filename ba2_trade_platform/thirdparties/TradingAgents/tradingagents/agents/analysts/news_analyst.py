@@ -5,7 +5,7 @@ from typing import List
 from ...prompts import format_analyst_prompt, get_prompt
 
 
-def create_news_analyst(llm, toolkit, tools):
+def create_news_analyst(llm, toolkit, tools, parallel_tool_calls=False):
     """
     Create news analyst node with pre-defined tools.
     
@@ -13,6 +13,7 @@ def create_news_analyst(llm, toolkit, tools):
         llm: Language model for the analyst
         toolkit: Toolkit instance (kept for backward compatibility, not used)
         tools: List of pre-defined tool objects to use
+        parallel_tool_calls: Whether to enable parallel tool calls (default False)
     """
     def news_analyst_node(state):
         current_date = state["trade_date"]
@@ -36,9 +37,7 @@ def create_news_analyst(llm, toolkit, tools):
             ]
         )
 
-        # Disable parallel tool calls to avoid call_id length issues with OpenAI API
-        # OpenAI enforces max 64 char limit on call_id, but LangGraph can generate longer IDs
-        chain = prompt | llm.bind_tools(tools, parallel_tool_calls=False)
+        chain = prompt | llm.bind_tools(tools, parallel_tool_calls=parallel_tool_calls)
         result = chain.invoke(state["messages"])
 
         report = ""

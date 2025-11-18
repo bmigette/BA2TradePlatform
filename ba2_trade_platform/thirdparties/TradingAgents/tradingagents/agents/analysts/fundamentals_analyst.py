@@ -36,7 +36,7 @@ def create_fundamentals_analyst(llm, toolkit, tools):
             ]
         )
 
-        chain = prompt | llm.bind_tools(tools)
+        chain = prompt | llm.bind_tools(tools, parallel_tool_calls=parallel_tool_calls)
 
         result = chain.invoke(state["messages"])
 

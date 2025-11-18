@@ -383,6 +383,12 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                 "description": "Use memory system for context-aware analysis",
                 "tooltip": "When enabled, agents retrieve past experiences and recommendations from memory to inform current decisions. Memories are always stored but only used when this is enabled. Disabling may be useful for fresh analysis without historical bias."
             },
+            "parallel_tool_calls": {
+                "type": "bool", "required": False, "default": True,
+                "description": "TradingAgents Parallel Tool Calls",
+                "help": "Enable parallel tool calls for all TradingAgents analysts. May cause issues with some LLM providers (e.g., GPT-4.5/5.1 reasoning modes).",
+                "tooltip": "Allows analysts to call multiple tools simultaneously for faster execution. Disable if experiencing corrupted tool names or call_id errors with certain LLM models (especially GPT-4.5/5.1 with reasoning). When disabled, tools execute sequentially which is slower but more stable."
+            },
             
             # Dynamic Instrument Selection
             "max_instruments": {

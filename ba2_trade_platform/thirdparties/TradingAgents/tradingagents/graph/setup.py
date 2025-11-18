@@ -55,6 +55,9 @@ class GraphSetup:
         if len(selected_analysts) == 0:
             raise ValueError("Trading Agents Graph Setup Error: no analysts selected!")
 
+        # Get parallel_tool_calls setting from config (default False for safety)
+        parallel_tool_calls = self.config.get("parallel_tool_calls", False)
+
         # Create analyst nodes
         analyst_nodes = {}
         delete_nodes = {}
@@ -64,7 +67,8 @@ class GraphSetup:
             analyst_nodes["market"] = create_market_analyst(
                 self.quick_thinking_llm, 
                 self.toolkit,
-                list(self.tool_nodes["market"].original_tools.values())
+                list(self.tool_nodes["market"].original_tools.values()),
+                parallel_tool_calls=parallel_tool_calls
             )
             delete_nodes["market"] = create_msg_delete()
             tool_nodes["market"] = self.tool_nodes["market"]
@@ -73,7 +77,8 @@ class GraphSetup:
             analyst_nodes["social"] = create_social_media_analyst(
                 self.quick_thinking_llm, 
                 self.toolkit,
-                list(self.tool_nodes["social"].original_tools.values())
+                list(self.tool_nodes["social"].original_tools.values()),
+                parallel_tool_calls=parallel_tool_calls
             )
             delete_nodes["social"] = create_msg_delete()
             tool_nodes["social"] = self.tool_nodes["social"]
@@ -82,7 +87,8 @@ class GraphSetup:
             analyst_nodes["news"] = create_news_analyst(
                 self.quick_thinking_llm, 
                 self.toolkit,
-                list(self.tool_nodes["news"].original_tools.values())
+                list(self.tool_nodes["news"].original_tools.values()),
+                parallel_tool_calls=parallel_tool_calls
             )
             delete_nodes["news"] = create_msg_delete()
             tool_nodes["news"] = self.tool_nodes["news"]
@@ -91,7 +97,8 @@ class GraphSetup:
             analyst_nodes["fundamentals"] = create_fundamentals_analyst(
                 self.quick_thinking_llm, 
                 self.toolkit,
-                list(self.tool_nodes["fundamentals"].original_tools.values())
+                list(self.tool_nodes["fundamentals"].original_tools.values()),
+                parallel_tool_calls=parallel_tool_calls
             )
             delete_nodes["fundamentals"] = create_msg_delete()
             tool_nodes["fundamentals"] = self.tool_nodes["fundamentals"]
@@ -100,7 +107,8 @@ class GraphSetup:
             analyst_nodes["macro"] = create_macro_analyst(
                 self.quick_thinking_llm, 
                 self.toolkit,
-                list(self.tool_nodes["macro"].original_tools.values())
+                list(self.tool_nodes["macro"].original_tools.values()),
+                parallel_tool_calls=parallel_tool_calls
             )
             delete_nodes["macro"] = create_msg_delete()
             tool_nodes["macro"] = self.tool_nodes["macro"]

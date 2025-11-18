@@ -33,6 +33,36 @@ from .utils import get_expert_instance_from_id
 from .interfaces import MarketExpertInterface
 
 
+# ==================== HELPER FUNCTIONS ====================
+
+def truncate_tool_call_id(call_id: str, max_length: int = 64) -> str:
+    """
+    Truncate tool call ID to comply with OpenAI's length limit.
+    
+    OpenAI enforces a 64-character limit on tool call IDs, but LangGraph can generate
+    longer IDs when parallel tool calls are enabled. This function creates a deterministic
+    shortened ID using a hash suffix to ensure uniqueness.
+    
+    Args:
+        call_id: Original call_id from tool_call
+        max_length: Maximum allowed length (default 64 for OpenAI)
+        
+    Returns:
+        Truncated call_id if original exceeds max_length, otherwise original
+    """
+    if len(call_id) <= max_length:
+        return call_id
+    
+    import hashlib
+    # Create deterministic shortened ID using hash
+    # Use first 40 chars + hash of full ID to ensure uniqueness
+    hash_suffix = hashlib.sha256(call_id.encode()).hexdigest()[:24]
+    truncated_id = f"{call_id[:40]}_{hash_suffix}"[:max_length]
+    
+    logger.debug(f"Truncated call_id from {len(call_id)} to {len(truncated_id)} chars")
+    return truncated_id
+
+
 # ==================== DEBUG CALLBACK ====================
 
 @contextmanager
@@ -1873,7 +1903,9 @@ def initialize_research_agent(state: SmartRiskManagerState) -> Dict[str, Any]:
         
         # Create LLM and bind tools
         llm = create_llm(risk_manager_model, 0.2, backend_url, api_key)
-        llm_with_tools = llm.bind_tools(research_tools)
+        # Get parallel_tool_calls setting from expert (default False for safety)
+        parallel_tool_calls = expert.get_setting_with_interface_default("smart_risk_manager_parallel_tool_calls", log_warning=False)
+        llm_with_tools = llm.bind_tools(research_tools, parallel_tool_calls=parallel_tool_calls)
         
         # Get expert-specific instructions if available
         expert_instructions = ""
@@ -2907,7 +2939,9 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
         
         # Create LLM with tools ONCE (reused across all loop iterations)
         llm = create_llm(risk_manager_model, 0.2, backend_url, api_key)
-        llm_with_tools = llm.bind_tools(research_tools)
+        # Get parallel_tool_calls setting from expert (default False for safety)
+        parallel_tool_calls = expert.get_setting_with_interface_default("smart_risk_manager_parallel_tool_calls", log_warning=False)
+        llm_with_tools = llm.bind_tools(research_tools, parallel_tool_calls=parallel_tool_calls)
         
         detailed_cache = state["detailed_outputs_cache"].copy()
         research_complete = False
@@ -2943,7 +2977,7 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             for tool_call in response.tool_calls:
                 tool_name = tool_call.get("name")
                 tool_args = tool_call.get("args", {})
-                tool_call_id = tool_call.get("id")
+                tool_call_id = truncate_tool_call_id(tool_call.get("id"))  # Truncate to comply with OpenAI limit
                 
                 logger.debug(f"Research tool: {tool_name} with args {tool_args}")
                 
@@ -3928,7 +3962,9 @@ class SmartRiskManagerGraph:
             
             # Create LLM with tools ONCE per graph session
             llm = create_llm(risk_manager_model, 0.2, backend_url, api_key)
-            self.llm_with_tools = llm.bind_tools(self.research_tools)
+            # Get parallel_tool_calls setting from expert (default False for safety)
+            parallel_tool_calls = self.expert.get_setting_with_interface_default("smart_risk_manager_parallel_tool_calls", log_warning=False)
+            self.llm_with_tools = llm.bind_tools(self.research_tools, parallel_tool_calls=parallel_tool_calls)
             
             logger.info(f"✅ Research agent initialized with {len(self.research_tools)} tools")
             logger.info("✅ LLM with tools created ONCE - will be reused across ALL research iterations")
@@ -4005,7 +4041,7 @@ class SmartRiskManagerGraph:
                     for tool_call in response.tool_calls:
                         tool_name = tool_call.get("name")
                         tool_args = tool_call.get("args", {})
-                        tool_call_id = tool_call.get("id")
+                        tool_call_id = truncate_tool_call_id(tool_call.get("id"))  # Truncate to comply with OpenAI limit
                         
                         logger.debug(f"Research tool: {tool_name} with args {tool_args}")
                         

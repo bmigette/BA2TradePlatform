@@ -4,7 +4,7 @@ import json
 from ...prompts import format_analyst_prompt, get_prompt
 
 
-def create_market_analyst(llm, toolkit, tools):
+def create_market_analyst(llm, toolkit, tools, parallel_tool_calls=False):
     """
     Create market analyst node with pre-defined tools.
     
@@ -12,6 +12,7 @@ def create_market_analyst(llm, toolkit, tools):
         llm: Language model for the analyst
         toolkit: Toolkit instance (kept for backward compatibility, not used)
         tools: List of pre-defined tool objects to use
+        parallel_tool_calls: Whether to enable parallel tool calls (default False)
     """
     def market_analyst_node(state):
         current_date = state["trade_date"]
@@ -36,7 +37,7 @@ def create_market_analyst(llm, toolkit, tools):
             ]
         )
 
-        chain = prompt | llm.bind_tools(tools)
+        chain = prompt | llm.bind_tools(tools, parallel_tool_calls=parallel_tool_calls)
 
         result = chain.invoke(state["messages"])
 
