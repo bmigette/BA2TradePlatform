@@ -195,7 +195,7 @@ class AccountInterface(ExtendableSettingsInterface):
         
         return full_comment
 
-    def submit_order(self, trading_order: TradingOrder, tp_price: Optional[float] = None, sl_price: Optional[float] = None) -> Any:
+    def submit_order(self, trading_order: TradingOrder, tp_price: Optional[float] = None, sl_price: Optional[float] = None, is_closing_order: bool = False) -> Any:
         """
         Submit a new order to the account with validation and transaction handling.
 
@@ -206,12 +206,13 @@ class AccountInterface(ExtendableSettingsInterface):
             trading_order: A TradingOrder object containing all order details.
             tp_price: Optional take profit price. If provided, TP order will be set after successful submission.
             sl_price: Optional stop loss price. If provided, SL order will be set after successful submission.
+            is_closing_order: If True, skip position size validation (for closing existing positions).
 
         Returns:
             Any: The created order object if successful. Returns None or raises an exception if failed.
         """
         # Validate the trading order before submission
-        validation_result = self._validate_trading_order(trading_order)
+        validation_result = self._validate_trading_order(trading_order, is_closing_order=is_closing_order)
         if not validation_result['is_valid']:
             error_msg = f"Order validation failed: {', '.join(validation_result['errors'])}"
             logger.error(f"Order validation failed for order: {error_msg}")
@@ -504,12 +505,13 @@ class AccountInterface(ExtendableSettingsInterface):
         except Exception as e:
             logger.error(f"Error submitting pending TP/SL orders: {e}", exc_info=True)
 
-    def _validate_trading_order(self, trading_order: TradingOrder) -> Dict[str, Any]:
+    def _validate_trading_order(self, trading_order: TradingOrder, is_closing_order: bool = False) -> Dict[str, Any]:
         """
         Validate a trading order before submission.
         
         Args:
             trading_order: The TradingOrder object to validate
+            is_closing_order: If True, skip position size validation
             
         Returns:
             Dict[str, Any]: Validation result with 'is_valid' (bool) and 'errors' (list) keys
@@ -612,83 +614,20 @@ class AccountInterface(ExtendableSettingsInterface):
         
         # Validate position size limits for market orders with expert_id
         # This provides defense-in-depth validation at the account interface level
-        # Skip validation for closing orders (transactions that already have an entry order)
-        if (hasattr(trading_order, 'order_type') and 
+        # Skip validation for closing orders (exiting existing positions)
+        if (not is_closing_order and
+            hasattr(trading_order, 'order_type') and 
             trading_order.order_type == OrderType.MARKET and
             hasattr(trading_order, 'transaction_id') and trading_order.transaction_id):
             
-            # Check if this is a closing order by seeing if transaction already has an entry order
-            is_closing_order = self._is_closing_order(trading_order)
-            
-            if not is_closing_order:
-                position_size_errors = self._validate_position_size_limits(trading_order)
-                if position_size_errors:
-                    errors.extend(position_size_errors)
+            position_size_errors = self._validate_position_size_limits(trading_order)
+            if position_size_errors:
+                errors.extend(position_size_errors)
                 
         return {
             'is_valid': len(errors) == 0,
             'errors': errors
         }
-
-    def _is_closing_order(self, trading_order: TradingOrder) -> bool:
-        """
-        Check if a trading order is a closing order (exits an existing position).
-        
-        A closing order is identified by:
-        - Has a transaction_id
-        - Transaction already has at least one entry order (MARKET/LIMIT type)
-        - The order's side is opposite to the transaction's direction
-        
-        Args:
-            trading_order: The TradingOrder object to check
-            
-        Returns:
-            bool: True if this is a closing order, False otherwise
-        """
-        if not trading_order.transaction_id:
-            return False
-        
-        try:
-            from ..db import get_instance
-            from ..models import Transaction, TradingOrder as TradingOrderModel
-            from sqlmodel import Session, select
-            from ..db import get_db
-            
-            # Get the transaction
-            transaction = get_instance(Transaction, trading_order.transaction_id)
-            if not transaction:
-                return False
-            
-            # Check if transaction already has entry orders
-            with get_db() as session:
-                entry_orders = session.exec(
-                    select(TradingOrderModel).where(
-                        TradingOrderModel.transaction_id == transaction.id,
-                        TradingOrderModel.order_type.in_([
-                            OrderType.MARKET,
-                            OrderType.BUY_LIMIT,
-                            OrderType.SELL_LIMIT
-                        ]),
-                        TradingOrderModel.status.in_(
-                            OrderStatus.get_executed_statuses() + 
-                            OrderStatus.get_unfilled_statuses()
-                        )
-                    )
-                ).all()
-                
-                # If we have entry orders, this is a closing order
-                if entry_orders:
-                    # Double-check: closing order should have opposite side
-                    if transaction.direction == OrderDirection.BUY:
-                        return trading_order.side == OrderDirection.SELL
-                    else:
-                        return trading_order.side == OrderDirection.BUY
-                
-                return False
-                
-        except Exception as e:
-            logger.warning(f"Error checking if order is closing order: {e}")
-            return False
 
     def _validate_position_size_limits(self, trading_order: TradingOrder) -> List[str]:
         """
@@ -2636,8 +2575,8 @@ class AccountInterface(ExtendableSettingsInterface):
                             comment=f'Closing position for transaction {transaction.id}'
                         )
                         
-                        # Submit the closing order
-                        submitted_order = self.submit_order(close_order)
+                        # Submit the closing order (skip position size validation)
+                        submitted_order = self.submit_order(close_order, is_closing_order=True)
                         
                         if submitted_order:
                             result['success'] = True

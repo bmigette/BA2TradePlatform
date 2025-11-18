@@ -4,6 +4,8 @@ Test that closing orders skip position size validation.
 This verifies the fix for the issue where closing transactions were failing
 with "Position size exceeds expert's max allowed" errors, even though they're
 just exiting existing positions.
+
+The fix uses a runtime parameter (is_closing_order) instead of a heuristic.
 """
 
 import sys
@@ -11,68 +13,89 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 def test_closing_order_logic():
-    """Verify that _is_closing_order helper correctly identifies closing orders."""
+    """Verify that is_closing_order parameter correctly skips validation."""
     
     print("\n" + "="*80)
     print("Testing Closing Order Validation Skip Logic")
     print("="*80)
     
-    # Check that the helper method exists
+    # Check that submit_order accepts is_closing_order parameter
     from ba2_trade_platform.core.interfaces import AccountInterface
-    
-    has_is_closing_order = hasattr(AccountInterface, '_is_closing_order')
-    
-    print("\n[Check 1] _is_closing_order helper method exists:")
-    if has_is_closing_order:
-        print("  ✅ PASS: Helper method for identifying closing orders added")
-    else:
-        print("  ❌ FAIL: Missing _is_closing_order method")
-        return False
-    
-    # Check that validation logic uses the helper
     import inspect
-    source = inspect.getsource(AccountInterface._validate_trading_order)
     
-    uses_closing_check = "is_closing_order" in source
-    skips_validation = "if not is_closing_order:" in source
+    submit_order_sig = inspect.signature(AccountInterface.submit_order)
+    has_closing_param = 'is_closing_order' in submit_order_sig.parameters
     
-    print("\n[Check 2] Validation logic checks for closing orders:")
-    if uses_closing_check and skips_validation:
-        print("  ✅ PASS: Position size validation skipped for closing orders")
+    print("\n[Check 1] submit_order() accepts is_closing_order parameter:")
+    if has_closing_param:
+        print("  ✅ PASS: is_closing_order parameter added to submit_order()")
+        param = submit_order_sig.parameters['is_closing_order']
+        print(f"      Default value: {param.default}")
     else:
-        print(f"  ❌ FAIL: uses_closing_check={uses_closing_check}, skips_validation={skips_validation}")
+        print("  ❌ FAIL: Missing is_closing_order parameter")
         return False
     
-    # Check the _is_closing_order implementation
-    closing_source = inspect.getsource(AccountInterface._is_closing_order)
+    # Check that _validate_trading_order accepts is_closing_order parameter
+    validate_sig = inspect.signature(AccountInterface._validate_trading_order)
+    validate_has_param = 'is_closing_order' in validate_sig.parameters
     
-    checks_entry_orders = "entry_orders" in closing_source
-    checks_opposite_side = "opposite side" in closing_source or "OrderDirection.SELL" in closing_source
-    
-    print("\n[Check 3] _is_closing_order implementation:")
-    if checks_entry_orders:
-        print("  ✅ PASS: Checks for existing entry orders in transaction")
+    print("\n[Check 2] _validate_trading_order() accepts is_closing_order parameter:")
+    if validate_has_param:
+        print("  ✅ PASS: is_closing_order parameter added to validation")
     else:
-        print("  ❌ FAIL: Should check if transaction has entry orders")
+        print("  ❌ FAIL: Missing is_closing_order parameter in validation")
         return False
     
-    if checks_opposite_side:
-        print("  ✅ PASS: Verifies order side is opposite to transaction direction")
+    # Check that validation logic uses the parameter
+    validate_source = inspect.getsource(AccountInterface._validate_trading_order)
+    
+    uses_param = "not is_closing_order" in validate_source
+    
+    print("\n[Check 3] Validation logic uses is_closing_order parameter:")
+    if uses_param:
+        print("  ✅ PASS: Position size validation skipped when is_closing_order=True")
     else:
-        print("  ❌ FAIL: Should verify opposite side")
+        print(f"  ❌ FAIL: Should check 'not is_closing_order' before validation")
         return False
+    
+    # Check that close_transaction passes is_closing_order=True
+    close_txn_source = inspect.getsource(AccountInterface.close_transaction)
+    
+    passes_param = "is_closing_order=True" in close_txn_source
+    
+    print("\n[Check 4] close_transaction() passes is_closing_order=True:")
+    if passes_param:
+        print("  ✅ PASS: close_transaction sets is_closing_order=True")
+    else:
+        print("  ❌ FAIL: close_transaction should pass is_closing_order=True")
+        return False
+    
+    # Verify old heuristic method is removed
+    has_old_method = hasattr(AccountInterface, '_is_closing_order')
+    
+    print("\n[Check 5] Old heuristic _is_closing_order() method removed:")
+    if not has_old_method:
+        print("  ✅ PASS: Heuristic method removed (cleaner runtime approach)")
+    else:
+        print("  ⚠️  WARNING: Old _is_closing_order method still exists")
     
     # Summary
     print("\n" + "="*80)
-    print("✅ ALL CHECKS PASSED - Closing orders skip position size validation!")
-    print("\nFix Summary:")
-    print("  • Added _is_closing_order() helper method")
-    print("  • Identifies closing orders by checking for existing entry orders")
-    print("  • Position size validation skipped for closing orders")
-    print("  • Prevents 'Position size exceeds max' errors when closing positions")
+    all_pass = has_closing_param and validate_has_param and uses_param and passes_param
+    
+    if all_pass:
+        print("✅ ALL CHECKS PASSED - Closing orders skip position size validation!")
+        print("\nFix Summary:")
+        print("  • Added is_closing_order parameter to submit_order()")
+        print("  • Parameter passed to _validate_trading_order()")
+        print("  • Position size validation skipped when is_closing_order=True")
+        print("  • close_transaction() explicitly passes is_closing_order=True")
+        print("  • Clean runtime approach - no heuristics, no database fields")
+    else:
+        print("❌ SOME CHECKS FAILED")
     print("="*80 + "\n")
     
-    return True
+    return all_pass
 
 if __name__ == "__main__":
     try:
