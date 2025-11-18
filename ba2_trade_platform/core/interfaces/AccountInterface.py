@@ -612,18 +612,83 @@ class AccountInterface(ExtendableSettingsInterface):
         
         # Validate position size limits for market orders with expert_id
         # This provides defense-in-depth validation at the account interface level
+        # Skip validation for closing orders (transactions that already have an entry order)
         if (hasattr(trading_order, 'order_type') and 
             trading_order.order_type == OrderType.MARKET and
             hasattr(trading_order, 'transaction_id') and trading_order.transaction_id):
             
-            position_size_errors = self._validate_position_size_limits(trading_order)
-            if position_size_errors:
-                errors.extend(position_size_errors)
+            # Check if this is a closing order by seeing if transaction already has an entry order
+            is_closing_order = self._is_closing_order(trading_order)
+            
+            if not is_closing_order:
+                position_size_errors = self._validate_position_size_limits(trading_order)
+                if position_size_errors:
+                    errors.extend(position_size_errors)
                 
         return {
             'is_valid': len(errors) == 0,
             'errors': errors
         }
+
+    def _is_closing_order(self, trading_order: TradingOrder) -> bool:
+        """
+        Check if a trading order is a closing order (exits an existing position).
+        
+        A closing order is identified by:
+        - Has a transaction_id
+        - Transaction already has at least one entry order (MARKET/LIMIT type)
+        - The order's side is opposite to the transaction's direction
+        
+        Args:
+            trading_order: The TradingOrder object to check
+            
+        Returns:
+            bool: True if this is a closing order, False otherwise
+        """
+        if not trading_order.transaction_id:
+            return False
+        
+        try:
+            from ..db import get_instance
+            from ..models import Transaction, TradingOrder as TradingOrderModel
+            from sqlmodel import Session, select
+            from ..db import get_db
+            
+            # Get the transaction
+            transaction = get_instance(Transaction, trading_order.transaction_id)
+            if not transaction:
+                return False
+            
+            # Check if transaction already has entry orders
+            with get_db() as session:
+                entry_orders = session.exec(
+                    select(TradingOrderModel).where(
+                        TradingOrderModel.transaction_id == transaction.id,
+                        TradingOrderModel.order_type.in_([
+                            OrderType.MARKET,
+                            OrderType.BUY_LIMIT,
+                            OrderType.SELL_LIMIT
+                        ]),
+                        TradingOrderModel.status.in_(
+                            OrderStatus.get_executed_statuses() + 
+                            OrderStatus.get_unfilled_statuses()
+                        )
+                    )
+                ).all()
+                
+                # If we have entry orders, this is a closing order
+                if entry_orders:
+                    # Double-check: closing order should have opposite side
+                    if transaction.direction == OrderDirection.BUY:
+                        return trading_order.side == OrderDirection.SELL
+                    else:
+                        return trading_order.side == OrderDirection.BUY
+                
+                return False
+                
+        except Exception as e:
+            logger.warning(f"Error checking if order is closing order: {e}")
+            return False
 
     def _validate_position_size_limits(self, trading_order: TradingOrder) -> List[str]:
         """
