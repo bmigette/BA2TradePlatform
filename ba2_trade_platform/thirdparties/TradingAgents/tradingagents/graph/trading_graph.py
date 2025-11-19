@@ -106,7 +106,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             from ba2_trade_platform import config as ba2_config
             streaming_enabled = ba2_config.OPENAI_ENABLE_STREAMING
             
-            # Get model-specific parameters (e.g., reasoning_effort for GPT-5)
+            # Get model-specific parameters (e.g., reasoning_effort for GPT-5 and Gemini)
             deep_think_kwargs = self.config.get("deep_think_llm_kwargs", {})
             quick_think_kwargs = self.config.get("quick_think_llm_kwargs", {})
             
@@ -587,6 +587,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             self.invest_judge_memory,
             self.risk_manager_memory,
             self.conditional_logic,
+            self.config,
         )
         
         # Now create the graph with properly initialized memories

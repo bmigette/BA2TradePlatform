@@ -445,10 +445,12 @@ class LoggingToolNode:
             logger.info(f"Truncated tool call IDs in conversation history to comply with OpenAI 64-char limit")
             
             # Use modified state
-            return self.tool_node.invoke(new_state)
+            result = self.tool_node.invoke(new_state)
+        else:
+            # No truncation needed, use original state
+            result = self.tool_node.invoke(state)
         
-        # No truncation needed, use original state
-        return self.tool_node.invoke(state)
+        return result
 
 
 class DatabaseStorageMixin:

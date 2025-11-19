@@ -4,7 +4,7 @@ import json
 from ...prompts import format_analyst_prompt, get_prompt
 
 
-def create_social_media_analyst(llm, toolkit, tools):
+def create_social_media_analyst(llm, toolkit, tools, parallel_tool_calls=False):
     """
     Create social media analyst node.
     
@@ -12,6 +12,7 @@ def create_social_media_analyst(llm, toolkit, tools):
         llm: Language model
         toolkit: Toolkit instance (backward compat, not used)
         tools: List of pre-defined tool objects
+        parallel_tool_calls: Whether to enable parallel tool calling (default False)
     """
     def social_media_analyst_node(state):
         current_date = state["trade_date"]

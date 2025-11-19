@@ -129,6 +129,10 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         "NagaAI/grok-4-0709",
                         "NagaAI/grok-4-fast-non-reasoning",
                         "NagaAI/grok-4-fast-reasoning",
+                        # NagaAI Gemini 3 (latest with thinking capabilities via reasoning_effort)
+                        # "NagaAI/gemini-3-pro-preview",
+                        # "NagaAI/gemini-3-pro-preview{reasoning_effort:low}",
+                        # "NagaAI/gemini-3-pro-preview{reasoning_effort:high}",
                         # NagaAI Qwen (latest reasoning models)
                         "NagaAI/qwen3-max",
                         "NagaAI/qwen3-next-80b-a3b-instruct",
@@ -144,8 +148,8 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         "NagaAI/kimi-k2-thinking",
                     ],
                     "allow_custom": True,
-                    "help": "For more information, see [OpenAI Docs](https://platform.openai.com/docs/models) and [Naga AI Web Search](https://docs.naga.ac/features/web-search)",
-                    "tooltip": "The model used for risk management analysis with web search capabilities. Format: Provider/ModelName or Provider/ModelName{param:value}. Optimized for risk analysis: GPT-5 (best reasoning), GPT-4o-search (web-optimized), Grok-4 (real-time data). Supports reasoning_effort parameter for NagaAC GPT-5/5.1 models. You can also enter custom model names."
+                    "help": "For more information, see [OpenAI Docs](https://platform.openai.com/docs/models), [Naga AI Web Search](https://docs.naga.ac/features/web-search), and [Gemini Thinking](https://ai.google.dev/gemini-api/docs/thinking)",
+                    "tooltip": "The model used for risk management analysis with web search capabilities. Format: Provider/ModelName or Provider/ModelName{param:value}. Optimized for risk analysis: GPT-5 (best reasoning), GPT-4o-search (web-optimized), Grok-4 (real-time data), Gemini 3 Pro (advanced thinking). Supports reasoning_effort parameter for NagaAC GPT-5/5.1 and Gemini 3 models (low/medium/high). You can also enter custom model names."
                 },
                 "dynamic_instrument_selection_model": {
                     "type": "str", "required": True, "default": "NagaAI/gpt-5-2025-08-07",
@@ -173,6 +177,10 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         "NagaAI/grok-4-0709",
                         "NagaAI/grok-4-fast-non-reasoning",
                         "NagaAI/grok-4-fast-reasoning",
+                        # NagaAI Gemini 3 (latest with thinking capabilities via reasoning_effort)
+                        # "NagaAI/gemini-3-pro-preview",
+                        # "NagaAI/gemini-3-pro-preview{reasoning_effort:low}",
+                        # "NagaAI/gemini-3-pro-preview{reasoning_effort:high}",
                         # NagaAI Qwen (latest reasoning models)
                         "NagaAI/qwen3-max",
                         "NagaAI/qwen3-next-80b-a3b-instruct",
@@ -188,8 +196,8 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         "NagaAI/kimi-k2-thinking",
                     ],
                     "allow_custom": True,
-                    "help": "For more information, see [OpenAI Docs](https://platform.openai.com/docs/models) and [Naga AI Web Search](https://docs.naga.ac/features/web-search)",
-                    "tooltip": "The model used for dynamic AI-powered instrument selection with web search capabilities. Format: Provider/ModelName or Provider/ModelName{param:value}. Optimized for market research: GPT-5 (best general search), GPT-4o-search (web-optimized), Grok-4 (real-time with X/Twitter integration). Supports reasoning_effort parameter for NagaAC GPT-5/5.1 models. You can also enter custom model names."
+                    "help": "For more information, see [OpenAI Docs](https://platform.openai.com/docs/models), [Naga AI Web Search](https://docs.naga.ac/features/web-search), and [Gemini Thinking](https://ai.google.dev/gemini-api/docs/thinking)",
+                    "tooltip": "The model used for dynamic AI-powered instrument selection with web search capabilities. Format: Provider/ModelName or Provider/ModelName{param:value}. Optimized for market research: GPT-5 (best general search), GPT-4o-search (web-optimized), Grok-4 (real-time with X/Twitter integration), Gemini 3 Pro (advanced thinking). Supports reasoning_effort parameter for NagaAC GPT-5/5.1 and Gemini 3 models (low/medium/high). You can also enter custom model names."
                 },
                 "risk_manager_mode": {
                     "type": "str", "required": True, "default": "classic",

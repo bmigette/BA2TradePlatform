@@ -2987,7 +2987,8 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
                     research_complete = True
                     research_messages.append(ToolMessage(
                         content="Research complete. Proceeding to action execution.",
-                        tool_call_id=tool_call_id
+                        tool_call_id=tool_call_id,
+                        name=tool_name
                     ))
                     break
                 
@@ -3013,20 +3014,23 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
                         result_str = json.dumps(result, indent=2) if isinstance(result, dict) else str(result)
                         research_messages.append(ToolMessage(
                             content=result_str,
-                            tool_call_id=tool_call_id
+                            tool_call_id=tool_call_id,
+                            name=tool_name
                         ))
                         
                     except Exception as e:
                         logger.error(f"Error executing research tool {tool_name}: {e}", exc_info=True)
                         research_messages.append(ToolMessage(
                             content=f"Error: {str(e)}",
-                            tool_call_id=tool_call_id
+                            tool_call_id=tool_call_id,
+                            name=tool_name
                         ))
                 else:
                     logger.warning(f"Tool {tool_name} not found in research_tools")
                     research_messages.append(ToolMessage(
                         content=f"Error: Tool {tool_name} not available",
-                        tool_call_id=tool_call_id
+                        tool_call_id=tool_call_id,
+                        name=tool_name
                     ))
             
             # If research complete after tool execution, exit loop
@@ -3067,7 +3071,8 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
                     last_tool_msg = research_messages[-1]
                     research_messages[-1] = ToolMessage(
                         content=last_tool_msg.content + reminder_msg,
-                        tool_call_id=last_tool_msg.tool_call_id
+                        tool_call_id=last_tool_msg.tool_call_id,
+                        name=last_tool_msg.name if hasattr(last_tool_msg, 'name') and last_tool_msg.name else "reminder_tool"
                     )
         
         # =================== END OF ITERATION LOOP ===================
@@ -4050,7 +4055,8 @@ class SmartRiskManagerGraph:
                             research_complete = True
                             research_messages.append(ToolMessage(
                                 content="Research complete. Proceeding to action execution.",
-                                tool_call_id=tool_call_id
+                                tool_call_id=tool_call_id,
+                                name=tool_name
                             ))
                             break
                         
@@ -4073,19 +4079,22 @@ class SmartRiskManagerGraph:
                                 result_str = json.dumps(result, indent=2) if isinstance(result, dict) else str(result)
                                 research_messages.append(ToolMessage(
                                     content=result_str,
-                                    tool_call_id=tool_call_id
+                                    tool_call_id=tool_call_id,
+                                    name=tool_name
                                 ))
                             except Exception as e:
                                 logger.error(f"Error executing research tool {tool_name}: {e}", exc_info=True)
                                 research_messages.append(ToolMessage(
                                     content=f"Error: {str(e)}",
-                                    tool_call_id=tool_call_id
+                                    tool_call_id=tool_call_id,
+                                    name=tool_name
                                 ))
                         else:
                             logger.warning(f"Tool {tool_name} not found in research_tools")
                             research_messages.append(ToolMessage(
                                 content=f"Error: Tool {tool_name} not available",
-                                tool_call_id=tool_call_id
+                                tool_call_id=tool_call_id,
+                                name=tool_name
                             ))
                     
                     # Add reminder if research not complete
@@ -4119,7 +4128,8 @@ class SmartRiskManagerGraph:
                             last_tool_msg = research_messages[-1]
                             research_messages[-1] = ToolMessage(
                                 content=last_tool_msg.content + reminder_msg,
-                                tool_call_id=last_tool_msg.tool_call_id
+                                tool_call_id=last_tool_msg.tool_call_id,
+                                name=last_tool_msg.name if hasattr(last_tool_msg, 'name') and last_tool_msg.name else "reminder_tool"
                             )
                             logger.debug("✅ Reminder message appended to ToolMessage - will be sent to LLM in next iteration")
                 

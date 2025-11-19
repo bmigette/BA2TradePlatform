@@ -130,6 +130,9 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                     "NagaAI/grok-3",
                     "NagaAI/grok-3-mini",
                     # Gemini (latest from Google)
+                    # "NagaAI/gemini-3-pro-preview",
+                    # "NagaAI/gemini-3-pro-preview{reasoning_effort:low}",
+                    # "NagaAI/gemini-3-pro-preview{reasoning_effort:high}",
                     "NagaAI/gemini-2.5-flash",
                     "NagaAI/gemini-2.5-flash:free",
                     "NagaAI/gemini-2.5-pro",
@@ -151,7 +154,7 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                     "NagaAI/kimi-k2-thinking",
                 ],
                 "allow_custom": True,  # Allow users to enter custom model names not in the list
-                "tooltip": "The AI model used for in-depth analysis requiring complex reasoning, such as fundamental analysis and debate arbitration. Format: Provider/ModelName. OpenAI models provide proven performance. Naga AI provides access to multiple frontier models including GPT-5, GPT-4, O1/O3, Grok-4, Gemini 2.5, and DeepSeek v3 with free tier available. You can also enter custom model names."
+                "tooltip": "The AI model used for in-depth analysis requiring complex reasoning, such as fundamental analysis and debate arbitration. Format: Provider/ModelName. OpenAI models provide proven performance. Naga AI provides access to multiple frontier models including GPT-5, GPT-4, O1/O3, Grok-4, Gemini 3, and DeepSeek v3 with free tier available. Gemini models now fully supported with function calling. You can also enter custom model names."
             },
             "quick_think_llm": {
                 "type": "str", "required": True, "default": "OpenAI/gpt-4o-mini",
@@ -187,6 +190,8 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                     "NagaAI/grok-4-fast-reasoning",
                     "NagaAI/grok-4-0709",
                     # Gemini flash (fast, latest)
+                    # "NagaAI/gemini-3-pro-preview",
+                    # "NagaAI/gemini-3-pro-preview{reasoning_effort:low}",
                     "NagaAI/gemini-2.5-flash",
                     "NagaAI/gemini-2.5-flash:free",
                     "NagaAI/gemini-2.0-flash-001",
@@ -240,8 +245,8 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                     "NagaAI/kimi-k2-thinking",
                 ],
                 "allow_custom": True,  # Allow users to enter custom model names not in the list
-                "help": "For more information, see [OpenAI Docs](https://platform.openai.com/docs/models) and [Naga AI Web Search](https://docs.naga.ac/features/web-search)",
-                "tooltip": "The model used by data providers (news, fundamentals) for web search and data gathering. Format: Provider/ModelName. Optimized for search: GPT-5 (best general search), GPT-4o-search (web-optimized), Grok-4 (real-time with X/Twitter integration). You can also enter custom model names."
+                "help": "For more information, see [OpenAI Docs](https://platform.openai.com/docs/models), [Naga AI Web Search](https://docs.naga.ac/features/web-search), and [Gemini Thinking](https://ai.google.dev/gemini-api/docs/thinking)",
+                "tooltip": "The model used by data providers (news, fundamentals) for web search and data gathering. Format: Provider/ModelName or Provider/ModelName{param:value}. Optimized for search: GPT-5 (best general search), GPT-4o-search (web-optimized), Grok-4 (real-time with X/Twitter integration), Gemini 3 Pro (advanced thinking). Gemini models now fully supported. Supports reasoning_effort parameter for Gemini 3 models (low/high). You can also enter custom model names."
             },
             "embedding_model": {
                 "type": "str", "required": True, "default": "OpenAI/text-embedding-3-small",

@@ -39,6 +39,7 @@ def create_market_analyst(llm, toolkit, tools, parallel_tool_calls=False):
 
         chain = prompt | llm.bind_tools(tools, parallel_tool_calls=parallel_tool_calls)
 
+        
         result = chain.invoke(state["messages"])
 
         report = ""
