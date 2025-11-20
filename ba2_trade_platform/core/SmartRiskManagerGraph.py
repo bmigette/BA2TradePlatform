@@ -1609,7 +1609,17 @@ FILLED Positions (Live Trades - {num_open_positions} total):
         ])
         
         # Update scratchpad with analysis
-        scratchpad = state["agent_scratchpad"] + "\n\n## Initial Portfolio Analysis\n" + response.content
+        # Handle case where agent_scratchpad might be a list (LangGraph state issue)
+        current_scratchpad = state["agent_scratchpad"]
+        if isinstance(current_scratchpad, list):
+            current_scratchpad = "\n".join(str(item) for item in current_scratchpad)
+        
+        # Handle case where response.content might be a list
+        response_content = response.content
+        if isinstance(response_content, list):
+            response_content = "\n".join(str(item) for item in response_content)
+        
+        scratchpad = current_scratchpad + "\n\n## Initial Portfolio Analysis\n" + response_content
         
         # Store last run summary in state for research node access
         # Manually append messages to existing list (no add reducer)
@@ -1836,7 +1846,11 @@ def check_recent_analyses(state: SmartRiskManagerState) -> Dict[str, Any]:
                         # Fallback to simple format (no recommendation data available)
                         analyses_summary += f"  [{time_display}] [Analysis #{analysis['analysis_id']}] {analysis['expert_name']}\n"
         
-        scratchpad = state["agent_scratchpad"] + analyses_summary
+        # Handle case where agent_scratchpad might be a list
+        current_scratchpad = state["agent_scratchpad"]
+        if isinstance(current_scratchpad, list):
+            current_scratchpad = "\n".join(str(item) for item in current_scratchpad)
+        scratchpad = current_scratchpad + analyses_summary
         
         logger.info(f"Found {len(all_analyses)} recent analyses across {len(all_symbols)} symbols - routing to research_node")
         
@@ -3114,10 +3128,15 @@ Provide a concise 2-3 paragraph explanation.""")
                 no_action_explanation = f"Failed to get explanation: {str(e)}"
         
         # Update scratchpad with research summary
+        # Handle case where agent_scratchpad might be a list
+        current_scratchpad = state["agent_scratchpad"]
+        if isinstance(current_scratchpad, list):
+            current_scratchpad = "\n".join(str(item) for item in current_scratchpad)
+        
         if final_summary:
-            updated_scratchpad = state["agent_scratchpad"] + f"\n\n## Research Findings\n{final_summary}\n"
+            updated_scratchpad = current_scratchpad + f"\n\n## Research Findings\n{final_summary}\n"
         else:
-            updated_scratchpad = state["agent_scratchpad"] + f"\n\n## Research Findings\nResearch completed after {iteration} iterations.\n"
+            updated_scratchpad = current_scratchpad + f"\n\n## Research Findings\nResearch completed after {iteration} iterations.\n"
         
         # Add no-action explanation to scratchpad if present
         if no_action_explanation:
@@ -3606,9 +3625,19 @@ def finalize(state: SmartRiskManagerState) -> Dict[str, Any]:
         
         logger.info("Smart Risk Manager session finalized")
         
+        # Handle case where agent_scratchpad might be a list
+        current_scratchpad = state["agent_scratchpad"]
+        if isinstance(current_scratchpad, list):
+            current_scratchpad = "\n".join(str(item) for item in current_scratchpad)
+        
+        # Handle case where response.content might be a list
+        response_content = response.content
+        if isinstance(response_content, list):
+            response_content = "\n".join(str(item) for item in response_content)
+        
         return {
             "messages": state["messages"] + [HumanMessage(content=finalization_prompt), response],
-            "agent_scratchpad": state["agent_scratchpad"] + "\n\n## Final Summary\n" + response.content
+            "agent_scratchpad": current_scratchpad + "\n\n## Final Summary\n" + response_content
         }
         
     except Exception as e:
@@ -3660,6 +3689,11 @@ class SmartRiskManagerGraph:
         """Initialize the graph with toolkit and tools created once."""
         self.expert_instance_id = expert_instance_id
         self.account_id = account_id
+        
+        # Load expert instance
+        self.expert = get_expert_instance_from_id(expert_instance_id)
+        if not self.expert:
+            raise ValueError(f"Expert instance {expert_instance_id} not found")
         
         # Create toolkit once
         self.toolkit = SmartRiskManagerToolkit(expert_instance_id, account_id)
@@ -4167,7 +4201,11 @@ class SmartRiskManagerGraph:
                     except Exception as e:
                         logger.warning(f"Failed to store research findings in job: {e}")
             else:
-                updated_scratchpad = state["agent_scratchpad"]
+                # Handle case where agent_scratchpad might be a list
+                current_scratchpad = state["agent_scratchpad"]
+                if isinstance(current_scratchpad, list):
+                    current_scratchpad = "\n".join(str(item) for item in current_scratchpad)
+                updated_scratchpad = current_scratchpad
             
             return {
                 "messages": state["messages"],

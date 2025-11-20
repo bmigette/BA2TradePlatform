@@ -129,19 +129,27 @@ class ActivityMonitorPage:
                 # Format expert display
                 expert_display = ""
                 if activity.source_expert_id:
-                    expert = get_instance(ExpertInstance, activity.source_expert_id)
-                    if expert:
-                        if expert.alias:
-                            expert_display = expert.alias
-                        else:
-                            expert_display = f"{expert.expert} #{expert.id}"
+                    try:
+                        expert = get_instance(ExpertInstance, activity.source_expert_id)
+                        if expert:
+                            if expert.alias:
+                                expert_display = expert.alias
+                            else:
+                                expert_display = f"{expert.expert} #{expert.id}"
+                    except Exception:
+                        # Expert instance was deleted, show ID only
+                        expert_display = f"Expert #{activity.source_expert_id} (deleted)"
                 
                 # Format account display
                 account_display = ""
                 if activity.source_account_id:
-                    account = get_instance(AccountDefinition, activity.source_account_id)
-                    if account:
-                        account_display = account.name
+                    try:
+                        account = get_instance(AccountDefinition, activity.source_account_id)
+                        if account:
+                            account_display = account.name
+                    except Exception:
+                        # Account was deleted, show ID only
+                        account_display = f"Account #{activity.source_account_id} (deleted)"
                 
                 # Convert UTC timestamp to local time
                 timestamp_utc = activity.created_at

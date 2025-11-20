@@ -52,6 +52,11 @@ def initialize_system():
     from ba2_trade_platform.logger import logger
     import ba2_trade_platform.config as config
     
+    # Apply Gemini compatibility patch early (before any LangChain usage)
+    # DISABLED: Gemini 3 thought_signature requirement not fully compatible with LangGraph state management
+    # from ba2_trade_platform.core.gemini_patch import apply_gemini_toolmessage_patch
+    # apply_gemini_toolmessage_patch()
+    
     logger.info("Initializing BA2 Trade Platform...")
     
     # Create log folder if not exists

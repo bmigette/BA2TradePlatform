@@ -104,21 +104,22 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 },
                 # AI Model Settings
                 "risk_manager_model": {
-                    "type": "str", "required": True, "default": "NagaAI/gpt-5-2025-08-07",
+                    "type": "str", "required": True, "default": "NagaAC/gpt-5.1-2025-11-13",
                     "description": "Model for risk management analysis",
                     "valid_values": [
-                        # OpenAI GPT-5 (direct - best for analysis)
-                        "OpenAI/gpt-5", "OpenAI/gpt-5-mini", "OpenAI/gpt-5-nano",
-                        # NagaAI GPT-5 (latest, excellent analysis)
-                        "NagaAI/gpt-5-2025-08-07",
-                        "NagaAI/gpt-5-mini-2025-08-07",
-                        "NagaAI/gpt-5-chat-latest",
-                        "NagaAI/gpt-5-codex",
-                        # NagaAC GPT-5/5.1 (with reasoning effort support)
-                        "NagaAC/gpt-5-2025-11-13",
-                        "NagaAC/gpt-5-2025-11-13{reasoning=effort:low}",
-                        "NagaAC/gpt-5-2025-11-13{reasoning=effort:medium}",
-                        "NagaAC/gpt-5-2025-11-13{reasoning=effort:high}",
+                        # OpenAI GPT-5 (DISABLED - use GPT-5.1 instead)
+                        # "OpenAI/gpt-5", "OpenAI/gpt-5-mini", "OpenAI/gpt-5-nano",
+                        # NagaAI GPT-5 (DISABLED - use GPT-5.1 instead)
+                        # "NagaAI/gpt-5-2025-08-07",
+                        # "NagaAI/gpt-5-mini-2025-08-07",
+                        # "NagaAI/gpt-5-chat-latest",
+                        # "NagaAI/gpt-5-codex",
+                        # NagaAC GPT-5 (DISABLED - use GPT-5.1 instead)
+                        # "NagaAC/gpt-5-2025-11-13",
+                        # "NagaAC/gpt-5-2025-11-13{reasoning=effort:low}",
+                        # "NagaAC/gpt-5-2025-11-13{reasoning=effort:medium}",
+                        # "NagaAC/gpt-5-2025-11-13{reasoning=effort:high}",
+                        # NagaAC GPT-5.1 (with reasoning effort support)
                         "NagaAC/gpt-5.1-2025-11-13",
                         "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:low}",
                         "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:medium}",
@@ -129,7 +130,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         "NagaAI/grok-4-0709",
                         "NagaAI/grok-4-fast-non-reasoning",
                         "NagaAI/grok-4-fast-reasoning",
-                        # NagaAI Gemini 3 (latest with thinking capabilities via reasoning_effort)
+                        # NagaAI Gemini 3 (DISABLED - thought_signature incompatible with LangGraph)
                         # "NagaAI/gemini-3-pro-preview",
                         # "NagaAI/gemini-3-pro-preview{reasoning_effort:low}",
                         # "NagaAI/gemini-3-pro-preview{reasoning_effort:high}",
@@ -152,21 +153,22 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "tooltip": "The model used for risk management analysis with web search capabilities. Format: Provider/ModelName or Provider/ModelName{param:value}. Optimized for risk analysis: GPT-5 (best reasoning), GPT-4o-search (web-optimized), Grok-4 (real-time data), Gemini 3 Pro (advanced thinking). Supports reasoning_effort parameter for NagaAC GPT-5/5.1 and Gemini 3 models (low/medium/high). You can also enter custom model names."
                 },
                 "dynamic_instrument_selection_model": {
-                    "type": "str", "required": True, "default": "NagaAI/gpt-5-2025-08-07",
+                    "type": "str", "required": True, "default": "NagaAC/gpt-5.1-2025-11-13",
                     "description": "Model for dynamic AI instrument selection",
                     "valid_values": [
-                        # OpenAI GPT-5 (direct - best for search)
-                        "OpenAI/gpt-5", "OpenAI/gpt-5-mini", "OpenAI/gpt-5-nano",
-                        # NagaAI GPT-5 (latest, excellent search)
-                        "NagaAI/gpt-5-2025-08-07",
-                        "NagaAI/gpt-5-mini-2025-08-07",
-                        "NagaAI/gpt-5-chat-latest",
-                        "NagaAI/gpt-5-codex",
-                        # NagaAC GPT-5/5.1 (with reasoning effort support)
-                        "NagaAC/gpt-5-2025-11-13",
-                        "NagaAC/gpt-5-2025-11-13{reasoning=effort:low}",
-                        "NagaAC/gpt-5-2025-11-13{reasoning=effort:medium}",
-                        "NagaAC/gpt-5-2025-11-13{reasoning=effort:high}",
+                        # OpenAI GPT-5 (DISABLED - use GPT-5.1 instead)
+                        # "OpenAI/gpt-5", "OpenAI/gpt-5-mini", "OpenAI/gpt-5-nano",
+                        # NagaAI GPT-5 (DISABLED - use GPT-5.1 instead)
+                        # "NagaAI/gpt-5-2025-08-07",
+                        # "NagaAI/gpt-5-mini-2025-08-07",
+                        # "NagaAI/gpt-5-chat-latest",
+                        # "NagaAI/gpt-5-codex",
+                        # NagaAC GPT-5 (DISABLED - use GPT-5.1 instead)
+                        # "NagaAC/gpt-5-2025-11-13",
+                        # "NagaAC/gpt-5-2025-11-13{reasoning=effort:low}",
+                        # "NagaAC/gpt-5-2025-11-13{reasoning=effort:medium}",
+                        # "NagaAC/gpt-5-2025-11-13{reasoning=effort:high}",
+                        # NagaAC GPT-5.1 (with reasoning effort support)
                         "NagaAC/gpt-5.1-2025-11-13",
                         "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:low}",
                         "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:medium}",
@@ -177,7 +179,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         "NagaAI/grok-4-0709",
                         "NagaAI/grok-4-fast-non-reasoning",
                         "NagaAI/grok-4-fast-reasoning",
-                        # NagaAI Gemini 3 (latest with thinking capabilities via reasoning_effort)
+                        # NagaAI Gemini 3 (DISABLED - thought_signature incompatible with LangGraph)
                         # "NagaAI/gemini-3-pro-preview",
                         # "NagaAI/gemini-3-pro-preview{reasoning_effort:low}",
                         # "NagaAI/gemini-3-pro-preview{reasoning_effort:high}",
