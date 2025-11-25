@@ -4351,11 +4351,27 @@ class TradeSettingsTab:
             logger.warning(f'Rule with id {rule_id} not found')
             ui.notify('Rule not found', type='error')
     
-    def _on_rule_del_click(self, msg):
+    async def _on_rule_del_click(self, msg):
         """Handle delete button click for rules."""
         logger.debug(f'Delete rule table click: {msg}')
         row = msg.args['row']
         rule_id = row['id']
+        rule = get_instance(EventAction, rule_id)
+        if rule:
+            # Show confirmation dialog
+            with ui.dialog() as dialog, ui.card():
+                ui.label(f'Delete rule "{rule.name}"?')
+                ui.label('This action cannot be undone.').classes('text-grey-6')
+                with ui.row():
+                    ui.button('Cancel', on_click=dialog.close).props('flat')
+                    ui.button('Delete', on_click=lambda: self._confirm_delete_rule(dialog, rule_id)).props('flat color=negative')
+            await dialog
+        else:
+            logger.warning(f'Rule with id {rule_id} not found')
+            ui.notify('Rule not found', type='error')
+    
+    def _confirm_delete_rule(self, dialog, rule_id):
+        """Confirm deletion of a rule."""
         rule = get_instance(EventAction, rule_id)
         if rule:
             try:
@@ -4372,6 +4388,7 @@ class TradeSettingsTab:
         else:
             logger.warning(f'Rule with id {rule_id} not found')
             ui.notify('Rule not found', type='error')
+        dialog.close()
     
     def _on_rule_duplicate_click(self, msg):
         """Handle duplicate button click for rules."""
@@ -4432,11 +4449,27 @@ class TradeSettingsTab:
             logger.warning(f'Ruleset with id {ruleset_id} not found')
             ui.notify('Ruleset not found', type='error')
     
-    def _on_ruleset_del_click(self, msg):
+    async def _on_ruleset_del_click(self, msg):
         """Handle delete button click for rulesets."""
         logger.debug(f'Delete ruleset table click: {msg}')
         row = msg.args['row']
         ruleset_id = row['id']
+        ruleset = get_instance(Ruleset, ruleset_id)
+        if ruleset:
+            # Show confirmation dialog
+            with ui.dialog() as dialog, ui.card():
+                ui.label(f'Delete ruleset "{ruleset.name}"?')
+                ui.label('This will also delete all rule associations. This action cannot be undone.').classes('text-grey-6')
+                with ui.row():
+                    ui.button('Cancel', on_click=dialog.close).props('flat')
+                    ui.button('Delete', on_click=lambda: self._confirm_delete_ruleset(dialog, ruleset_id)).props('flat color=negative')
+            await dialog
+        else:
+            logger.warning(f'Ruleset with id {ruleset_id} not found')
+            ui.notify('Ruleset not found', type='error')
+    
+    def _confirm_delete_ruleset(self, dialog, ruleset_id):
+        """Confirm deletion of a ruleset."""
         ruleset = get_instance(Ruleset, ruleset_id)
         if ruleset:
             try:
@@ -4461,6 +4494,7 @@ class TradeSettingsTab:
         else:
             logger.warning(f'Ruleset with id {ruleset_id} not found')
             ui.notify('Ruleset not found', type='error')
+        dialog.close()
     
     def _on_ruleset_duplicate_click(self, msg):
         """Handle duplicate button click for rulesets."""

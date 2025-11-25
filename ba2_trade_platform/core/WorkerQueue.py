@@ -442,8 +442,11 @@ class WorkerQueue:
         """
         with self._batch_lock:
             if batch_id not in self._batch_completed_counts:
-                logger.warning(f"Batch {batch_id} not found in tracking")
-                return None
+                # Batch not found - initialize it automatically
+                logger.debug(f"Batch {batch_id} not found in tracking, initializing")
+                self._batch_completed_counts[batch_id] = 0
+                self._batch_task_counts[batch_id] = 1  # Will be updated as tasks complete
+                self._batch_start_times[batch_id] = time.time()
             
             self._batch_completed_counts[batch_id] += 1
             completed = self._batch_completed_counts[batch_id]

@@ -221,6 +221,27 @@ class AccountInterface(ExtendableSettingsInterface):
         # Handle transaction requirements based on order type
         self._handle_transaction_requirements(trading_order)
         
+        # Sync quantity with parent order if this is a dependent order
+        if trading_order.depends_on_order is not None:
+            try:
+                parent_order = get_instance(TradingOrder, trading_order.depends_on_order)
+                if parent_order and parent_order.quantity:
+                    if trading_order.quantity != parent_order.quantity:
+                        old_qty = trading_order.quantity
+                        trading_order.quantity = parent_order.quantity
+                        logger.info(
+                            f"Synced dependent order quantity with parent: "
+                            f"order {trading_order.id or 'new'} qty {old_qty} → {parent_order.quantity} "
+                            f"(parent order {parent_order.id})"
+                        )
+                else:
+                    logger.warning(
+                        f"Parent order {trading_order.depends_on_order} not found or has no quantity "
+                        f"for dependent order {trading_order.id or 'new'}"
+                    )
+            except Exception as e:
+                logger.error(f"Error syncing quantity with parent order: {e}", exc_info=True)
+        
         # Generate tracking comment and set account_id BEFORE saving to DB
         tracking_comment = self._generate_tracking_comment(trading_order)
         trading_order.comment = tracking_comment

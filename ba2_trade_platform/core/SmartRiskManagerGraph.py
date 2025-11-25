@@ -3595,6 +3595,11 @@ def finalize(state: SmartRiskManagerState) -> Dict[str, Any]:
             HumanMessage(content=finalization_prompt)
         ])
         
+        # Handle case where response.content might be a list (convert early for DB storage)
+        response_content = response.content
+        if isinstance(response_content, list):
+            response_content = "\n".join(str(item) for item in response_content)
+        
         # Update SmartRiskManagerJob
         with get_db() as session:
             job = session.get(SmartRiskManagerJob, job_id)
@@ -3603,7 +3608,7 @@ def finalize(state: SmartRiskManagerState) -> Dict[str, Any]:
                 job.final_portfolio_equity = float(final_portfolio["account_virtual_equity"])
                 job.final_available_balance = float(final_portfolio["account_available_balance"])
                 job.actions_taken_count = len(state["actions_log"])
-                job.actions_summary = response.content
+                job.actions_summary = response_content  # Use converted string
                 job.iteration_count = state["iteration_count"]
                 
                 # Store complete state including research findings and final summary
@@ -3614,7 +3619,7 @@ def finalize(state: SmartRiskManagerState) -> Dict[str, Any]:
                     "open_positions": state["open_positions"],
                     "actions_log": state["actions_log"],
                     "final_scratchpad": state["agent_scratchpad"],
-                    "final_summary": response.content
+                    "final_summary": response_content  # Use converted string
                 }
                 
                 # Reassign entire field to trigger SQLAlchemy change detection
@@ -3630,11 +3635,7 @@ def finalize(state: SmartRiskManagerState) -> Dict[str, Any]:
         if isinstance(current_scratchpad, list):
             current_scratchpad = "\n".join(str(item) for item in current_scratchpad)
         
-        # Handle case where response.content might be a list
-        response_content = response.content
-        if isinstance(response_content, list):
-            response_content = "\n".join(str(item) for item in response_content)
-        
+        # response_content already converted above, use it directly
         return {
             "messages": state["messages"] + [HumanMessage(content=finalization_prompt), response],
             "agent_scratchpad": current_scratchpad + "\n\n## Final Summary\n" + response_content

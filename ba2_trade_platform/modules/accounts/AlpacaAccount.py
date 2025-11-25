@@ -2673,9 +2673,19 @@ class AlpacaAccount(AccountInterface):
     ) -> bool:
         """Handle TP/SL adjustment when entry order is still pending (not sent to broker)."""
         
-        # Validate entry order has valid quantity before creating TP/SL orders
-        if not entry_order.quantity or entry_order.quantity <= 0:
-            logger.error(f"Cannot create TP/SL orders for transaction {transaction.id}: entry order {entry_order.id} has invalid quantity {entry_order.quantity}")
+        # Skip quantity validation for dependent orders (orders with parent_order_id)
+        # Dependent orders (TP/SL) get their quantity from the parent entry order
+        if entry_order.depends_on_order is not None:
+            logger.debug(
+                f"Skipping quantity validation for dependent order {entry_order.id} "
+                f"(parent order: {entry_order.depends_on_order})"
+            )
+        elif not entry_order.quantity or entry_order.quantity <= 0:
+            # Entry order without parent must have valid quantity
+            logger.error(
+                f"Cannot create TP/SL orders for transaction {transaction.id}: "
+                f"entry order {entry_order.id} has invalid quantity {entry_order.quantity}"
+            )
             return False
         
         if need_oco:

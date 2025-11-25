@@ -599,9 +599,9 @@ class TradeManager:
                 self.logger.info(f"Action {recommendation.recommended_action} not allowed for expert {expert_instance.id}")
                 return None
                 
-            # Check if automatic trading is enabled
-            if not trading_permissions.get('automatic_trading', False):
-                self.logger.info(f"Automatic trading disabled for expert {expert_instance.id}, recommendation logged only")
+            # Check if automated trade opening is enabled (modern setting)
+            if not trading_permissions.get('allow_automated_trade_opening', False):
+                self.logger.info(f"Automated trade opening disabled (allow_automated_trade_opening=False) for expert {expert_instance.id}, recommendation logged only")
                 return None
                 
             # Note: Ruleset evaluation is handled by TradeActionEvaluator in process_expert_recommendations_after_analysis()
