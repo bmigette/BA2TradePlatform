@@ -43,11 +43,12 @@ class BalanceUsagePerExpertChart:
             from ...core.types import TransactionStatus, OrderType
             from ...core.utils import get_account_instance_from_id
             
-            # Get all transactions with expert_id (both OPENED and WAITING status)
+            # Get all transactions with expert_id that are active (OPENED, WAITING, or CLOSING)
+            # Include CLOSING because balance is still used until close order is filled
             transactions = session.exec(
                 select(Transaction)
                 .where(Transaction.expert_id.isnot(None))
-                .where(Transaction.status.in_([TransactionStatus.OPENED, TransactionStatus.WAITING]))
+                .where(Transaction.status.in_([TransactionStatus.OPENED, TransactionStatus.WAITING, TransactionStatus.CLOSING]))
             ).all()
             
             # Prefetch prices for all symbols in bulk
