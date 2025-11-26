@@ -2517,9 +2517,52 @@ class AccountInterface(ExtendableSettingsInterface):
                     # Check if there's an existing close order
                     if existing_close_order:
                         if existing_close_order.status == OrderStatus.ERROR:
-                            # Retry the error order by resubmitting it
+                            # Before retrying, check if position still exists at broker
+                            # If position is gone, just mark transaction as CLOSED (it was already closed externally)
                             logger.info(f"Retrying close order {existing_close_order.id} which is in ERROR state")
                             try:
+                                # Check if position still exists at broker
+                                broker_positions = None
+                                try:
+                                    broker_positions = self.get_positions()
+                                    position_exists = any(
+                                        pos.get('symbol') == transaction.symbol if isinstance(pos, dict) 
+                                        else getattr(pos, 'symbol', None) == transaction.symbol
+                                        for pos in (broker_positions or [])
+                                    )
+                                    
+                                    if not position_exists:
+                                        logger.info(
+                                            f"Position {transaction.symbol} no longer exists at broker - "
+                                            f"marking transaction {transaction_id} as CLOSED without retry"
+                                        )
+                                        # Mark the ERROR order as CANCELED (not needed anymore)
+                                        existing_close_order.status = OrderStatus.CANCELED
+                                        session.add(existing_close_order)
+                                        
+                                        # Mark transaction as CLOSED
+                                        transaction.status = TransactionStatus.CLOSED
+                                        session.add(transaction)
+                                        session.commit()
+                                        
+                                        result['success'] = True
+                                        result['message'] = f'Transaction closed (position no longer at broker)'
+                                        logger.info(f"Transaction {transaction_id} marked as CLOSED - position already closed externally")
+                                        
+                                        # Skip the retry - position is already closed
+                                        if result['canceled_count'] > 0 or result['deleted_count'] > 0:
+                                            result['message'] += f' ({result["canceled_count"]} orders canceled, {result["deleted_count"]} waiting orders deleted)'
+                                        
+                                        # Continue to next transaction (don't retry order)
+                                        return result
+                                        
+                                except Exception as pos_check_err:
+                                    logger.warning(
+                                        f"Could not verify if position {transaction.symbol} exists at broker: {pos_check_err}. "
+                                        f"Proceeding with close order retry."
+                                    )
+                                    # If we can't check, proceed with retry (safer than assuming position is gone)
+                                
                                 # Resubmit the order
                                 submitted_order = self.submit_order(existing_close_order)
                                 if submitted_order:
