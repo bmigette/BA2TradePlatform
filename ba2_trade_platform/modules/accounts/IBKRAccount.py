@@ -338,7 +338,7 @@ class IBKRAccount(AccountInterface):
             
         except Exception as e:
             logger.error(f"Error submitting order to IBKR: {e}", exc_info=True)
-            order.status = OrderStatus.FAILED
+            order.status = OrderStatus.ERROR
             update_instance(order)
             raise
     

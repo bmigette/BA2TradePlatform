@@ -90,8 +90,7 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                 "valid_values": [
                     # OpenAI models (direct) - Legacy + New models
                     "OpenAI/gpt-4o", "OpenAI/gpt-4o-mini",
-                    # OpenAI GPT-5 (DISABLED - use GPT-5.1 instead)
-                    # "OpenAI/gpt-5", "OpenAI/gpt-5-mini", "OpenAI/gpt-5-nano",
+                    "OpenAI/gpt-5", "OpenAI/gpt-5-mini", "OpenAI/gpt-5-nano",
                     "OpenAI/gpt-4.1", "OpenAI/gpt-4.1-mini", "OpenAI/gpt-4.1-nano",
                     "OpenAI/o1", "OpenAI/o1-mini", "OpenAI/o3-mini",
                     "OpenAI/o4-mini", "OpenAI/o4-mini-deep-research",
@@ -106,12 +105,12 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                     "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:medium}",
                     "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:high}",
                     # NagaAI GPT-5 (DISABLED - use GPT-5.1 instead)
-                    # "NagaAI/gpt-5-2025-08-07",
-                    # "NagaAI/gpt-5-mini-2025-08-07",
-                    # "NagaAI/gpt-5-mini-2025-08-07:free",
-                    # "NagaAI/gpt-5-nano-2025-08-07",
-                    # "NagaAI/gpt-5-chat-latest",
-                    # "NagaAI/gpt-5-codex",
+                    "NagaAI/gpt-5-2025-08-07",
+                    "NagaAI/gpt-5-mini-2025-08-07",
+                    "NagaAI/gpt-5-mini-2025-08-07:free",
+                    "NagaAI/gpt-5-nano-2025-08-07",
+                    "NagaAI/gpt-5-chat-latest",
+                    "NagaAI/gpt-5-codex",
                     # GPT-4 (latest via Naga AI)
                     "NagaAI/gpt-4o-2024-11-20",
                     "NagaAI/gpt-4o-2024-11-20:free",
@@ -165,21 +164,17 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                 "valid_values": [
                     # OpenAI models (direct) - Legacy + New models
                     "OpenAI/gpt-4o", "OpenAI/gpt-4o-mini",
-                    # OpenAI GPT-5 (DISABLED - use GPT-5.1 instead)
-                    # "OpenAI/gpt-5", "OpenAI/gpt-5-mini", "OpenAI/gpt-5-nano",
+                    "OpenAI/gpt-5", "OpenAI/gpt-5-mini", "OpenAI/gpt-5-nano",
                     "OpenAI/gpt-4.1", "OpenAI/gpt-4.1-mini", "OpenAI/gpt-4.1-nano",
                     "OpenAI/o1-mini", "OpenAI/o3-mini",
                     "OpenAI/o4-mini", "OpenAI/o4-mini-deep-research",
-                    # NagaAC GPT-5 (DISABLED - use GPT-5.1 instead)
-                    # "NagaAC/gpt-5-2025-11-13",
-                    # "NagaAC/gpt-5-2025-11-13{reasoning=effort:low}",
+
                     # NagaAC GPT-5.1 with reasoning effort variants
                     "NagaAC/gpt-5.1-2025-11-13",
                     "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:low}",
-                    # NagaAI GPT-5 mini/nano (DISABLED - use GPT-5.1 instead)
-                    # "NagaAI/gpt-5-mini-2025-08-07",
-                    # "NagaAI/gpt-5-mini-2025-08-07:free",
-                    # "NagaAI/gpt-5-nano-2025-08-07",
+                    "NagaAI/gpt-5-mini-2025-08-07",
+                    "NagaAI/gpt-5-mini-2025-08-07:free",
+                    "NagaAI/gpt-5-nano-2025-08-07",
                     # GPT-4 mini/nano (latest, fast)
                     "NagaAI/gpt-4o-mini-2024-07-18",
                     "NagaAI/gpt-4o-mini-2024-07-18:free",
@@ -225,23 +220,17 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                 "type": "str", "required": True, "default": "OpenAI/gpt-4o",
                 "description": "Model for data provider web searches",
                 "valid_values": [
-                    # OpenAI GPT-5 (DISABLED - use GPT-5.1 instead)
-                    # "OpenAI/gpt-5", "OpenAI/gpt-5-mini", "OpenAI/gpt-5-nano",
-                    # NagaAC GPT-5 (DISABLED - use GPT-5.1 instead)
-                    # "NagaAC/gpt-5-2025-11-13",
-                    # "NagaAC/gpt-5-2025-11-13{reasoning=effort:low}",
-                    # "NagaAC/gpt-5-2025-11-13{reasoning=effort:medium}",
-                    # "NagaAC/gpt-5-2025-11-13{reasoning=effort:high}",
+                     "OpenAI/gpt-5", "OpenAI/gpt-5-mini", "OpenAI/gpt-5-nano",
+
                     # NagaAC GPT-5.1 with reasoning effort
                     "NagaAC/gpt-5.1-2025-11-13",
                     "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:low}",
                     "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:medium}",
                     "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:high}",
-                    # NagaAI GPT-5 (DISABLED - use GPT-5.1 instead)
-                    # "NagaAI/gpt-5-2025-08-07",
-                    # "NagaAI/gpt-5-mini-2025-08-07",
-                    # "NagaAI/gpt-5-chat-latest",
-                    # "NagaAI/gpt-5-codex",
+                    "NagaAI/gpt-5-2025-08-07",
+                    "NagaAI/gpt-5-mini-2025-08-07",
+                    "NagaAI/gpt-5-chat-latest",
+                    "NagaAI/gpt-5-codex",
                     # NagaAI GPT-4o Search (optimized for web search)
                     "NagaAI/gpt-4o-search-preview-2025-03-11",
                     # NagaAI Grok-4 (excellent for real-time search with X integration)

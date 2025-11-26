@@ -3033,6 +3033,32 @@ class AccountOverviewTab:
                                 'price_diff_pct': None,
                                 'discrepancy_type': 'Position Not at Broker'
                             })
+                            
+                            # Mark orphaned transactions as closed (position fully exited but no close order in system)
+                            # Only do this if we successfully got broker positions (to avoid closing transactions on API errors)
+                            if broker_positions is not None and len(our_data['transaction_ids']) > 0:
+                                logger.info(
+                                    f"Symbol {symbol} no longer in broker positions but has {len(our_data['transaction_ids'])} "
+                                    f"open transactions - marking as closed (orphaned)"
+                                )
+                                for txn_id in our_data['transaction_ids']:
+                                    try:
+                                        txn = session.exec(
+                                            select(Transaction).where(Transaction.id == txn_id)
+                                        ).first()
+                                        if txn and txn.status == TransactionStatus.OPENED:
+                                            txn.status = TransactionStatus.CLOSED
+                                            session.add(txn)
+                                            session.commit()
+                                            logger.info(
+                                                f"Marked orphaned transaction {txn_id} ({symbol}) as CLOSED - "
+                                                f"position no longer exists at broker"
+                                            )
+                                    except Exception as txn_err:
+                                        logger.error(
+                                            f"Error marking transaction {txn_id} as closed: {txn_err}", 
+                                            exc_info=True
+                                        )
                     
                     # Log summary for this account
                     account_discrepancies = [d for d in discrepancies if d['account'] == account.name]

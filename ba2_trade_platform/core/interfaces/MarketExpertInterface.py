@@ -107,18 +107,14 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "type": "str", "required": True, "default": "NagaAC/gpt-5.1-2025-11-13",
                     "description": "Model for risk management analysis",
                     "valid_values": [
-                        # OpenAI GPT-5 (DISABLED - use GPT-5.1 instead)
-                        # "OpenAI/gpt-5", "OpenAI/gpt-5-mini", "OpenAI/gpt-5-nano",
-                        # NagaAI GPT-5 (DISABLED - use GPT-5.1 instead)
-                        # "NagaAI/gpt-5-2025-08-07",
-                        # "NagaAI/gpt-5-mini-2025-08-07",
-                        # "NagaAI/gpt-5-chat-latest",
-                        # "NagaAI/gpt-5-codex",
-                        # NagaAC GPT-5 (DISABLED - use GPT-5.1 instead)
-                        # "NagaAC/gpt-5-2025-11-13",
-                        # "NagaAC/gpt-5-2025-11-13{reasoning=effort:low}",
-                        # "NagaAC/gpt-5-2025-11-13{reasoning=effort:medium}",
-                        # "NagaAC/gpt-5-2025-11-13{reasoning=effort:high}",
+                        "OpenAI/gpt-5", "OpenAI/gpt-5-mini", "OpenAI/gpt-5-nano",
+                        "NagaAI/gpt-5-2025-08-07",
+                        "NagaAI/gpt-5-mini-2025-08-07",
+                        "NagaAI/gpt-5-mini-2025-08-07:free",
+                        "NagaAI/gpt-5-nano-2025-08-07",
+                        "NagaAI/gpt-5-chat-latest",
+                        "NagaAI/gpt-5-codex",
+
                         # NagaAC GPT-5.1 (with reasoning effort support)
                         "NagaAC/gpt-5.1-2025-11-13",
                         "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:low}",
@@ -156,18 +152,12 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "type": "str", "required": True, "default": "NagaAC/gpt-5.1-2025-11-13",
                     "description": "Model for dynamic AI instrument selection",
                     "valid_values": [
-                        # OpenAI GPT-5 (DISABLED - use GPT-5.1 instead)
-                        # "OpenAI/gpt-5", "OpenAI/gpt-5-mini", "OpenAI/gpt-5-nano",
-                        # NagaAI GPT-5 (DISABLED - use GPT-5.1 instead)
-                        # "NagaAI/gpt-5-2025-08-07",
-                        # "NagaAI/gpt-5-mini-2025-08-07",
-                        # "NagaAI/gpt-5-chat-latest",
-                        # "NagaAI/gpt-5-codex",
-                        # NagaAC GPT-5 (DISABLED - use GPT-5.1 instead)
-                        # "NagaAC/gpt-5-2025-11-13",
-                        # "NagaAC/gpt-5-2025-11-13{reasoning=effort:low}",
-                        # "NagaAC/gpt-5-2025-11-13{reasoning=effort:medium}",
-                        # "NagaAC/gpt-5-2025-11-13{reasoning=effort:high}",
+                        "NagaAI/gpt-5-2025-08-07",
+                        "NagaAI/gpt-5-mini-2025-08-07",
+                        "NagaAI/gpt-5-mini-2025-08-07:free",
+                        "NagaAI/gpt-5-nano-2025-08-07",
+                        "NagaAI/gpt-5-chat-latest",
+                        "NagaAI/gpt-5-codex",
                         # NagaAC GPT-5.1 (with reasoning effort support)
                         "NagaAC/gpt-5.1-2025-11-13",
                         "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:low}",

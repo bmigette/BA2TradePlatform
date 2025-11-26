@@ -2498,7 +2498,7 @@ class AlpacaAccount(AccountInterface):
                             ]),
                             TradingOrder.status.notin_([
                                 OrderStatus.CANCELED, OrderStatus.EXPIRED, 
-                                OrderStatus.FAILED, OrderStatus.REJECTED
+                                OrderStatus.ERROR, OrderStatus.REJECTED
                             ])
                         )
                     ).all()
