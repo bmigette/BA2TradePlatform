@@ -3540,7 +3540,7 @@ class TransactionsTab:
             for txn in transactions:
                 # Calculate current P/L for open positions using cached/batch-fetched price
                 current_pnl = ''
-                current_pnl_numeric = 0  # Numeric value for sorting
+                current_pnl_numeric = 0  # Numeric value for sorting (percentage)
                 current_price_str = ''
                 
                 # Use batch-fetched prices for open transactions
@@ -3554,8 +3554,11 @@ class TransactionsTab:
                                 pnl_current = (current_price - txn.open_price) * abs(txn.quantity)
                             else:  # Short position
                                 pnl_current = (txn.open_price - current_price) * abs(txn.quantity)
-                            current_pnl = f"${pnl_current:+.2f}"
-                            current_pnl_numeric = pnl_current  # Store numeric value for sorting
+                            # Calculate P/L percentage based on cost basis
+                            cost_basis = txn.open_price * abs(txn.quantity)
+                            pnl_pct = (pnl_current / cost_basis * 100) if cost_basis > 0 else 0
+                            current_pnl = f"${pnl_current:+.2f} ({pnl_pct:+.1f}%)"
+                            current_pnl_numeric = pnl_pct  # Store percentage for sorting
                     except Exception as e:
                         logger.debug(f"Could not calculate P/L for {txn.symbol}: {e}")
                 
@@ -3787,8 +3790,8 @@ class TransactionsTab:
             {'name': 'close_price', 'label': 'Close Price', 'field': 'close_price', 'align': 'right'},
             {'name': 'take_profit', 'label': 'TP', 'field': 'take_profit', 'align': 'right'},
             {'name': 'stop_loss', 'label': 'SL', 'field': 'stop_loss', 'align': 'right'},
-            {'name': 'current_pnl', 'label': 'Current P/L', 'field': 'current_pnl', 'align': 'right', 'sortable': True, 'sort_by': 'current_pnl_numeric'},
-            {'name': 'closed_pnl', 'label': 'Closed P/L', 'field': 'closed_pnl', 'align': 'right', 'sortable': True, 'sort_by': 'closed_pnl_numeric'},
+            {'name': 'current_pnl', 'label': 'Current P/L', 'field': 'current_pnl_numeric', 'align': 'right', 'sortable': True},
+            {'name': 'closed_pnl', 'label': 'Closed P/L', 'field': 'closed_pnl_numeric', 'align': 'right', 'sortable': True},
             {'name': 'status', 'label': 'Status', 'field': 'status', 'align': 'center', 'sortable': True},
             {'name': 'order_count', 'label': 'Orders', 'field': 'order_count', 'align': 'center'},
             {'name': 'created_at', 'label': 'Created', 'field': 'created_at', 'align': 'left', 'sortable': True},
@@ -3863,13 +3866,13 @@ class TransactionsTab:
                             <q-badge :color="props.row.status_color" :label="col.value" />
                         </template>
                         <template v-else-if="col.name === 'current_pnl'">
-                            <span :class="col.value.startsWith('+') ? 'text-green-600 font-bold' : col.value.startsWith('-') ? 'text-red-600 font-bold' : ''">
-                                {{ col.value }}
+                            <span :class="props.row.current_pnl_numeric > 0 ? 'text-green-600 font-bold' : props.row.current_pnl_numeric < 0 ? 'text-red-600 font-bold' : ''">
+                                {{ props.row.current_pnl }}
                             </span>
                         </template>
                         <template v-else-if="col.name === 'closed_pnl'">
-                            <span :class="col.value.startsWith('+') ? 'text-green-600 font-bold' : col.value.startsWith('-') ? 'text-red-600 font-bold' : ''">
-                                {{ col.value }}
+                            <span :class="props.row.closed_pnl_numeric > 0 ? 'text-green-600 font-bold' : props.row.closed_pnl_numeric < 0 ? 'text-red-600 font-bold' : ''">
+                                {{ props.row.closed_pnl }}
                             </span>
                         </template>
                         <template v-else-if="col.name === 'actions'">

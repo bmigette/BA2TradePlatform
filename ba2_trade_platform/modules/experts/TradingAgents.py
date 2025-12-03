@@ -128,6 +128,7 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                     "NagaAI/grok-4-0709",
                     "NagaAI/grok-4-fast-non-reasoning",
                     "NagaAI/grok-4-fast-reasoning",
+                    "NagaAC/grok-4.1-fast-reasoning",
                     "NagaAI/grok-3",
                     "NagaAI/grok-3-mini",
                     # Gemini (latest from Google with thinking capabilities)
@@ -188,6 +189,7 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                     "NagaAI/grok-3-mini",
                     "NagaAI/grok-4-fast-non-reasoning",
                     "NagaAI/grok-4-fast-reasoning",
+                    "NagaAC/grok-4.1-fast-reasoning",
                     "NagaAI/grok-4-0709",
                     # Gemini flash (fast, latest with thinking)
                     # Gemini 3 DISABLED - thought_signature incompatible with LangGraph
@@ -237,6 +239,7 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                     "NagaAI/grok-4-0709",
                     "NagaAI/grok-4-fast-non-reasoning",
                     "NagaAI/grok-4-fast-reasoning",
+                    "NagaAC/grok-4.1-fast-reasoning",
                     # NagaAI Gemini 3 (DISABLED - thought_signature incompatible with LangGraph)
                     # "NagaAI/gemini-3-pro-preview",
                     # "NagaAI/gemini-3-pro-preview{reasoning_effort:low}",

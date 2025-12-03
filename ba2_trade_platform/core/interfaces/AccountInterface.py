@@ -218,6 +218,10 @@ class AccountInterface(ExtendableSettingsInterface):
             logger.error(f"Order validation failed for order: {error_msg}")
             raise ValueError(error_msg)
         
+        # Track if this order is being added to an existing transaction (for quantity recalculation)
+        was_existing_transaction = (hasattr(trading_order, 'transaction_id') and 
+                                    trading_order.transaction_id is not None)
+        
         # Handle transaction requirements based on order type
         self._handle_transaction_requirements(trading_order)
         
@@ -302,6 +306,13 @@ class AccountInterface(ExtendableSettingsInterface):
                         self.adjust_sl(transaction, sl_price)
                     except NotImplementedError:
                         logger.warning(f"Broker {self.__class__.__name__} does not implement adjust_sl - SL not set")
+        
+        # Recalculate transaction quantity if order was added to existing transaction
+        # This ensures transaction.quantity reflects sum of ALL market entry orders
+        if result and result.transaction_id and was_existing_transaction:
+            # Only recalculate for market entry orders (not TP/SL dependent orders)
+            if not trading_order.depends_on_order:
+                self._recalculate_transaction_quantity(result.transaction_id)
         
         return result
     
@@ -404,6 +415,86 @@ class AccountInterface(ExtendableSettingsInterface):
             )
             
             raise ValueError(f"Failed to create transaction for order: {e}")
+    
+    def _recalculate_transaction_quantity(self, transaction_id: int) -> None:
+        """
+        Recalculate and update transaction quantity from all its market entry orders.
+        
+        This is called after adding orders to existing transactions to ensure
+        transaction.quantity reflects the sum of all linked market entry orders.
+        
+        For BUY transactions: sum only BUY orders (not canceled/rejected/expired)
+        For SELL transactions: sum only SELL orders (not canceled/rejected/expired)
+        
+        Args:
+            transaction_id: The ID of the transaction to recalculate
+        """
+        try:
+            from sqlmodel import select
+            from ..db import get_db, update_instance, get_instance
+            from ..models import Transaction
+            
+            transaction = get_instance(Transaction, transaction_id)
+            if not transaction:
+                logger.warning(f"Transaction {transaction_id} not found for quantity recalculation")
+                return
+            
+            # Determine transaction direction from current quantity sign
+            # Positive = BUY transaction, Negative = SELL transaction
+            is_buy_transaction = (transaction.quantity or 0) >= 0
+            target_side = OrderDirection.BUY if is_buy_transaction else OrderDirection.SELL
+            
+            # Statuses to exclude from quantity calculation
+            excluded_statuses = [
+                OrderStatus.CANCELED,
+                OrderStatus.REJECTED,
+                OrderStatus.EXPIRED,
+                OrderStatus.ERROR
+            ]
+            
+            with get_db() as session:
+                # Get all market entry orders (no depends_on_order) matching transaction direction
+                statement = select(TradingOrder).where(
+                    TradingOrder.transaction_id == transaction_id,
+                    TradingOrder.account_id == self.id,
+                    TradingOrder.depends_on_order.is_(None),  # Market entry orders only
+                    TradingOrder.side == target_side  # Only orders matching transaction direction
+                )
+                market_entry_orders = session.exec(statement).all()
+                
+                if not market_entry_orders:
+                    logger.debug(f"No market entry orders found for transaction {transaction_id}")
+                    return
+                
+                # Calculate total quantity from non-canceled market entry orders
+                total_quantity = 0.0
+                valid_count = 0
+                for order in market_entry_orders:
+                    # Skip orders with excluded statuses
+                    if order.status in excluded_statuses:
+                        continue
+                    qty = float(order.quantity) if order.quantity else 0.0
+                    total_quantity += qty
+                    valid_count += 1
+                
+                # For SELL transactions, quantity is stored as negative
+                if not is_buy_transaction:
+                    total_quantity = -total_quantity
+                
+                # Only update if quantity has changed
+                if transaction.quantity != total_quantity:
+                    old_qty = transaction.quantity
+                    transaction.quantity = total_quantity
+                    update_instance(transaction)
+                    logger.info(
+                        f"Transaction {transaction_id} quantity recalculated: {old_qty} -> {total_quantity} "
+                        f"(from {valid_count} valid market entry orders)"
+                    )
+                else:
+                    logger.debug(f"Transaction {transaction_id} quantity unchanged: {total_quantity}")
+                    
+        except Exception as e:
+            logger.error(f"Error recalculating transaction quantity for {transaction_id}: {e}", exc_info=True)
     
     def _ensure_tp_sl_percent_stored(self, tp_or_sl_order: TradingOrder, parent_order: TradingOrder) -> None:
         """

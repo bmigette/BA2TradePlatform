@@ -126,6 +126,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         "NagaAI/grok-4-0709",
                         "NagaAI/grok-4-fast-non-reasoning",
                         "NagaAI/grok-4-fast-reasoning",
+                        "NagaAC/grok-4.1-fast-reasoning",
                         # NagaAI Gemini 3 (DISABLED - thought_signature incompatible with LangGraph)
                         # "NagaAI/gemini-3-pro-preview",
                         # "NagaAI/gemini-3-pro-preview{reasoning_effort:low}",
@@ -169,6 +170,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         "NagaAI/grok-4-0709",
                         "NagaAI/grok-4-fast-non-reasoning",
                         "NagaAI/grok-4-fast-reasoning",
+                        "NagaAC/grok-4.1-fast-reasoning",
                         # NagaAI Gemini 3 (DISABLED - thought_signature incompatible with LangGraph)
                         # "NagaAI/gemini-3-pro-preview",
                         # "NagaAI/gemini-3-pro-preview{reasoning_effort:low}",
