@@ -19,6 +19,7 @@ from .types import TransactionStatus, OrderStatus, OrderType, OrderDirection, Ma
 from .db import get_db, get_instance, add_instance
 from .utils import get_expert_instance_from_id, get_account_instance_from_id
 from .interfaces import MarketExpertInterface
+from .TransactionHelper import TransactionHelper
 
 
 class SmartRiskManagerToolkit:
@@ -1289,6 +1290,9 @@ class SmartRiskManagerToolkit:
         """
         Adjust position size (partial close or add to position).
         
+        This method handles Alpaca's "held_for_orders" constraint by properly sequencing
+        TP/SL order cancellations and new order creation.
+        
         Args:
             transaction_id: ID of Transaction to adjust
             new_quantity: New total quantity (can be < or > current)
@@ -1341,63 +1345,10 @@ class SmartRiskManagerToolkit:
                     }
                 
                 # Calculate quantity delta
-                quantity_delta = abs(new_quantity - old_quantity)
+                qty_change = new_quantity - old_quantity  # negative for decrease, positive for increase
                 
-                if new_quantity < old_quantity:
-                    # Partial close
-                    logger.info(f"Partial close: reducing from {old_quantity} to {new_quantity}")
-                    
-                    # Get transaction direction to determine close direction
-                    if not transaction.trading_orders:
-                        return {
-                            "success": False,
-                            "message": "Transaction has no orders - cannot determine direction",
-                            "order_id": None,
-                            "old_quantity": old_quantity,
-                            "new_quantity": new_quantity
-                        }
-                    
-                    # Direction from first trading order
-                    entry_direction = transaction.trading_orders[0].side
-                    # Close order is opposite direction
-                    close_direction = OrderDirection.SELL if entry_direction == OrderDirection.BUY else OrderDirection.BUY
-                    
-                    # Create close order
-                    close_order = self._create_trading_order(
-                        symbol=transaction.symbol,
-                        quantity=quantity_delta,
-                        side=close_direction,
-                        order_type=OrderType.MARKET,
-                        transaction_id=transaction_id,
-                        comment=f"Partial close: {reason}"
-                    )
-                    
-                    # Submit order
-                    submitted_order = self.account.submit_order(close_order)
-                    
-                    if submitted_order and submitted_order.id:
-                        # Note: Don't manually update transaction.quantity - account interface handles this
-                        logger.info(f"Successfully reduced position from {old_quantity} to {new_quantity}")
-                        
-                        return {
-                            "success": True,
-                            "message": f"Successfully reduced position from {old_quantity} to {new_quantity}",
-                            "order_id": submitted_order.id,
-                            "old_quantity": old_quantity,
-                            "new_quantity": new_quantity
-                        }
-                    else:
-                        return {
-                            "success": False,
-                            "message": f"Failed to submit partial close order",
-                            "order_id": None,
-                            "old_quantity": old_quantity,
-                            "new_quantity": new_quantity
-                        }
-                else:
-                    # Add to position
-                    logger.info(f"Adding to position: increasing from {old_quantity} to {new_quantity}")
-                    
+                # Check if adding to position is allowed based on expert settings
+                if qty_change > 0:
                     # Get transaction direction
                     if not transaction.trading_orders:
                         return {
@@ -1410,8 +1361,6 @@ class SmartRiskManagerToolkit:
                     
                     entry_direction = transaction.trading_orders[0].side
                     
-                    # Check if adding to position is allowed based on expert settings
-                    settings = self.expert.settings
                     if entry_direction == OrderDirection.BUY and not self.expert.get_setting_with_interface_default("enable_buy"):
                         return {
                             "success": False,
@@ -1428,39 +1377,34 @@ class SmartRiskManagerToolkit:
                             "old_quantity": old_quantity,
                             "new_quantity": new_quantity
                         }
-                    
-                    # Create add-to-position order (same direction as entry)
-                    add_order = self._create_trading_order(
-                        symbol=transaction.symbol,
-                        quantity=quantity_delta,
-                        side=entry_direction,
-                        order_type=OrderType.MARKET,
-                        transaction_id=transaction_id,
-                        comment=f"Add to position: {reason}"
-                    )
-                    
-                    # Submit order
-                    submitted_order = self.account.submit_order(add_order)
-                    
-                    if submitted_order and submitted_order.id:
-                        # Note: Account interface should handle updating transaction with new average price
-                        logger.info(f"Successfully increased position from {old_quantity} to {new_quantity}")
-                        
-                        return {
-                            "success": True,
-                            "message": f"Successfully increased position from {old_quantity} to {new_quantity}",
-                            "order_id": submitted_order.id,
-                            "old_quantity": old_quantity,
-                            "new_quantity": new_quantity
-                        }
-                    else:
-                        return {
-                            "success": False,
-                            "message": f"Failed to submit add-to-position order",
-                            "order_id": None,
-                            "old_quantity": old_quantity,
-                            "new_quantity": new_quantity
-                        }
+                
+                # Use TransactionHelper to handle TP/SL order sequencing
+                result = TransactionHelper.adjust_quantity_with_tpsl(
+                    account=self.account,
+                    transaction=transaction,
+                    qty_change=qty_change,
+                    expert_id=self.expert_instance_id
+                )
+                
+                if result["success"]:
+                    logger.info(f"Successfully adjusted position from {old_quantity} to {new_quantity}")
+                    return {
+                        "success": True,
+                        "message": result["message"],
+                        "order_id": result["orders_created"][0] if result["orders_created"] else None,
+                        "old_quantity": old_quantity,
+                        "new_quantity": new_quantity,
+                        "orders_created": result["orders_created"],
+                        "orders_canceled": result["orders_canceled"]
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "message": result["message"],
+                        "order_id": None,
+                        "old_quantity": old_quantity,
+                        "new_quantity": new_quantity
+                    }
                     
         except Exception as e:
             logger.error(f"Error adjusting quantity for transaction {transaction_id}: {e}", exc_info=True)

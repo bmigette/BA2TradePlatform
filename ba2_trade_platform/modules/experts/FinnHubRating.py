@@ -120,7 +120,7 @@ class FinnHubRating(MarketExpertInterface):
                 'details': 'No recommendation data available',
                 'buy_score': 0,
                 'sell_score': 0,
-                'hold_count': 0,
+                'hold_score': 0,
                 'period': None
             }
         

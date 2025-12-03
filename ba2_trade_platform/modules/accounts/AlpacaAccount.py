@@ -2671,7 +2671,12 @@ class AlpacaAccount(AccountInterface):
         existing_oco: TradingOrder | None,
         need_oco: bool
     ) -> bool:
-        """Handle TP/SL adjustment when entry order is still pending (not sent to broker)."""
+        """Handle TP/SL adjustment when entry order is still pending (not sent to broker).
+        
+        Note: Entry orders may have quantity=0 at this stage because quantity is calculated
+        later by the risk management system. TP/SL orders created here will have their
+        quantity synced from the parent order when it's submitted to the broker.
+        """
         
         # Skip quantity validation for dependent orders (orders with parent_order_id)
         # Dependent orders (TP/SL) get their quantity from the parent entry order
@@ -2681,12 +2686,12 @@ class AlpacaAccount(AccountInterface):
                 f"(parent order: {entry_order.depends_on_order})"
             )
         elif not entry_order.quantity or entry_order.quantity <= 0:
-            # Entry order without parent must have valid quantity
-            logger.error(
-                f"Cannot create TP/SL orders for transaction {transaction.id}: "
-                f"entry order {entry_order.id} has invalid quantity {entry_order.quantity}"
+            # Entry order without parent has quantity=0 - this is normal for PENDING orders
+            # The quantity will be calculated by risk management and synced to dependent orders
+            logger.debug(
+                f"Entry order {entry_order.id} has quantity {entry_order.quantity} - "
+                f"TP/SL orders will be created with quantity=0 and synced later"
             )
-            return False
         
         if need_oco:
             # Need OCO order with both TP and SL

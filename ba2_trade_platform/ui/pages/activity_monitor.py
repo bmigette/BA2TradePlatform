@@ -26,7 +26,7 @@ class ActivityMonitorPage:
         self.refresh_interval = 5  # seconds
         
         # Filter state
-        self.filter_type: Optional[ActivityLogType] = None
+        self.filter_types: list = []  # Multiple activity types
         self.filter_severity: Optional[ActivityLogSeverity] = None
         self.filter_expert_id: Optional[int] = None
         self.filter_text: str = ""
@@ -61,14 +61,11 @@ class ActivityMonitorPage:
                 format_func=self._format_activities_rows
             )
             
-            # Use async loader for progressive rendering
-            if not self.async_loader and self.activities_table:
-                self.async_loader = AsyncTableLoader(self.activities_table, batch_size=100)
-            
-            if self.async_loader:
-                await self.async_loader.load_rows_async(rows)
-            else:
+            # Update table rows directly to preserve pagination state
+            # Don't use AsyncTableLoader as it can lose pagination controls
+            if self.activities_table:
                 self.activities_table.rows = rows
+                self.activities_table.update()
             
             #logger.debug(f"[ActivityMonitor] Loaded {len(rows)} activities")
             
@@ -78,7 +75,7 @@ class ActivityMonitorPage:
     
     def _get_filter_state(self) -> tuple:
         """Get current filter state for cache invalidation."""
-        return (self.filter_type, self.filter_severity, self.filter_expert_id, self.filter_text)
+        return (tuple(self.filter_types), self.filter_severity, self.filter_expert_id, self.filter_text)
     
     def _fetch_activities_raw(self):
         """Fetch raw activities from database."""
@@ -89,8 +86,8 @@ class ActivityMonitorPage:
                 
                 filters = []
                 
-                if self.filter_type:
-                    filters.append(ActivityLog.type == self.filter_type)
+                if self.filter_types:
+                    filters.append(ActivityLog.type.in_(self.filter_types))
                     
                 if self.filter_severity:
                     severity_order = [
@@ -210,14 +207,14 @@ class ActivityMonitorPage:
     
     async def clear_filters(self):
         """Clear all filters and refresh."""
-        self.filter_type = None
+        self.filter_types = []
         self.filter_severity = None
         self.filter_expert_id = None
         self.filter_text = ""
         
         # Reset UI components
         if hasattr(self, 'type_select'):
-            self.type_select.value = None
+            self.type_select.value = []
         if hasattr(self, 'severity_select'):
             self.severity_select.value = None
         if hasattr(self, 'expert_select'):
@@ -249,14 +246,15 @@ class ActivityMonitorPage:
         # Filters
         with ui.expansion("🔍 Filters", icon="filter_list").classes("w-full"):
             with ui.grid(columns=4).classes("w-full gap-4 p-4"):
-                # Type filter
+                # Type filter (multi-select)
                 with ui.column():
-                    ui.label("Activity Type")
+                    ui.label("Activity Type(s)")
                     self.type_select = ui.select(
-                        options={None: "All Types", **{t: t.value.replace("_", " ").title() for t in ActivityLogType}},
-                        value=None,
-                        on_change=lambda e: setattr(self, 'filter_type', e.value)
-                    ).classes("w-full")
+                        options={t: t.value.replace("_", " ").title() for t in ActivityLogType},
+                        value=[],
+                        multiple=True,
+                        on_change=lambda e: setattr(self, 'filter_types', e.value if e.value else [])
+                    ).classes("w-full").props('use-chips clearable')
                 
                 # Severity filter
                 with ui.column():
