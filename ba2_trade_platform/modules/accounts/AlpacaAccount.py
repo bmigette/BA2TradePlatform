@@ -2478,7 +2478,7 @@ class AlpacaAccount(AccountInterface):
                     logger.error(f"Transaction {transaction.id} not found in database")
                     return False
                 
-                # 2. Early skip check: if values unchanged and valid orders exist, skip adjustment
+                # 2. Early skip check: if values unchanged and valid orders exist WITH CORRECT PRICES, skip adjustment
                 tp_unchanged = (new_tp_price is None or 
                                (transaction_in_session.take_profit is not None and 
                                 abs(transaction_in_session.take_profit - new_tp_price) < 0.01))
@@ -2487,7 +2487,7 @@ class AlpacaAccount(AccountInterface):
                                 abs(transaction_in_session.stop_loss - new_sl_price) < 0.01))
                 
                 if tp_unchanged and sl_unchanged:
-                    # Check if we have valid (non-error/non-canceled) TP/SL orders
+                    # Check if we have valid (non-error/non-canceled) TP/SL orders WITH MATCHING PRICES
                     valid_tpsl_orders = session.exec(
                         select(TradingOrder).where(
                             TradingOrder.transaction_id == transaction.id,
@@ -2504,9 +2504,43 @@ class AlpacaAccount(AccountInterface):
                     ).all()
                     
                     if valid_tpsl_orders:
-                        logger.info(f"Skipping TP/SL adjustment for transaction {transaction.id}: "
-                                   f"values unchanged and {len(valid_tpsl_orders)} valid order(s) already exist")
-                        return True
+                        # Verify that existing orders have correct prices
+                        orders_have_correct_prices = True
+                        for order in valid_tpsl_orders:
+                            if order.order_type == CoreOrderType.OCO:
+                                # OCO order has both TP (limit_price) and SL (stop_price)
+                                if new_tp_price is not None and order.limit_price is not None:
+                                    if abs(order.limit_price - new_tp_price) >= 0.01:
+                                        logger.debug(f"OCO order {order.id} has TP=${order.limit_price:.2f}, expected ${new_tp_price:.2f}")
+                                        orders_have_correct_prices = False
+                                        break
+                                if new_sl_price is not None and order.stop_price is not None:
+                                    if abs(order.stop_price - new_sl_price) >= 0.01:
+                                        logger.debug(f"OCO order {order.id} has SL=${order.stop_price:.2f}, expected ${new_sl_price:.2f}")
+                                        orders_have_correct_prices = False
+                                        break
+                            elif order.order_type in [CoreOrderType.SELL_LIMIT, CoreOrderType.BUY_LIMIT]:
+                                # Limit order is TP
+                                if new_tp_price is not None and order.limit_price is not None:
+                                    if abs(order.limit_price - new_tp_price) >= 0.01:
+                                        logger.debug(f"TP order {order.id} has price=${order.limit_price:.2f}, expected ${new_tp_price:.2f}")
+                                        orders_have_correct_prices = False
+                                        break
+                            elif order.order_type in [CoreOrderType.SELL_STOP, CoreOrderType.BUY_STOP]:
+                                # Stop order is SL
+                                if new_sl_price is not None and order.stop_price is not None:
+                                    if abs(order.stop_price - new_sl_price) >= 0.01:
+                                        logger.debug(f"SL order {order.id} has price=${order.stop_price:.2f}, expected ${new_sl_price:.2f}")
+                                        orders_have_correct_prices = False
+                                        break
+                        
+                        if orders_have_correct_prices:
+                            logger.info(f"Skipping TP/SL adjustment for transaction {transaction.id}: "
+                                       f"values unchanged and {len(valid_tpsl_orders)} valid order(s) already exist with correct prices")
+                            return True
+                        else:
+                            logger.info(f"Proceeding with TP/SL adjustment for transaction {transaction.id}: "
+                                       f"existing orders have incorrect prices")
                 
                 # 2. Update transaction (source of truth)
                 if new_tp_price is not None:
