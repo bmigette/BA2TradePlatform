@@ -576,6 +576,17 @@ When recommending new positions or quantity adjustments:
 ## YOUR AVAILABLE RESEARCH TOOLS
 You have full access to these research tools - use them freely and repeatedly:
 
+**Portfolio & Position Information:**
+- **get_positions_tool()** - Get current portfolio positions in structured JSON format
+  * Returns: Dict with account_virtual_equity, account_available_balance, filled_positions, pending_positions
+  * Each position includes: transaction_id, symbol, quantity, direction, entry_price, current_price, unrealized_pnl, tp_order, sl_order
+  * **Use this to look up transaction_id for a specific symbol before taking action**
+  * Use when: You need exact transaction IDs, quantities, or TP/SL levels
+
+- **get_current_price_tool(symbol: str)** - Get real-time bid price for any symbol
+  * symbol: Instrument symbol
+  * Returns: Current bid price as float
+
 **Market Analysis Research:**
 - **get_analysis_outputs_tool(analysis_id: int)** - See what output keys are available for an analysis
   * analysis_id: ID of the MarketAnalysis to inspect
@@ -602,11 +613,6 @@ You have full access to these research tools - use them freely and repeatedly:
   * limit: Maximum number of analyses to return (default: 10)
   * offset: Number of analyses to skip for pagination (default: 0)
   * Returns: List of analysis dictionaries with id, symbol, expert, created_at
-
-**Price Information:**
-- **get_current_price_tool(symbol: str)** - Get real-time bid price for any symbol
-  * symbol: Instrument symbol
-  * Returns: Current bid price as float
 
 **Action Recommendation Tools (MANDATORY - use these to recommend specific actions):**
 
@@ -1251,6 +1257,63 @@ def create_toolkit_tools(toolkit: SmartRiskManagerToolkit) -> List:
     
     @tool
     @smart_risk_manager_tool
+    def get_positions_tool() -> Dict[str, Any]:
+        """Get current portfolio positions in structured JSON format.
+        
+        Use this tool when you need to:
+        - Look up transaction IDs for specific symbols
+        - Get exact position quantities and prices
+        - Check current TP/SL levels for positions
+        - Verify position details before taking action
+        
+        Returns:
+            Dictionary with:
+                - account_virtual_equity: Total portfolio value
+                - account_available_balance: Cash available for new positions
+                - filled_positions: List of open positions, each containing:
+                    - transaction_id: ID to use for actions (IMPORTANT!)
+                    - symbol: Stock symbol
+                    - quantity: Number of shares
+                    - direction: "BUY" or "SELL"
+                    - entry_price: Average entry price
+                    - current_price: Current market price
+                    - unrealized_pnl: Dollar P&L
+                    - unrealized_pnl_pct: Percentage P&L
+                    - tp_order: Take profit details (price, order_id) or null
+                    - sl_order: Stop loss details (price, order_id) or null
+                - pending_positions: List of pending (not yet filled) positions
+                
+        Example response:
+            {
+                "account_virtual_equity": 10000.00,
+                "account_available_balance": 5000.00,
+                "filled_positions": [
+                    {
+                        "transaction_id": 334,
+                        "symbol": "DVN",
+                        "quantity": 28.0,
+                        "direction": "BUY",
+                        "entry_price": 35.22,
+                        "current_price": 37.75,
+                        "unrealized_pnl": 70.84,
+                        "unrealized_pnl_pct": 7.18,
+                        "tp_order": null,
+                        "sl_order": null
+                    }
+                ],
+                "pending_positions": []
+            }
+        """
+        portfolio = toolkit.get_portfolio_status()
+        return {
+            "account_virtual_equity": portfolio["account_virtual_equity"],
+            "account_available_balance": portfolio["account_available_balance"],
+            "filled_positions": portfolio["open_positions"],
+            "pending_positions": portfolio.get("pending_positions", [])
+        }
+    
+    @tool
+    @smart_risk_manager_tool
     def get_current_price_tool(symbol: str) -> float:
         """Get current bid price for an instrument.
         
@@ -1327,6 +1390,7 @@ def create_toolkit_tools(toolkit: SmartRiskManagerToolkit) -> List:
         get_analysis_outputs_batch_tool,
         get_historical_analyses_tool,
         get_all_recent_analyses_tool,
+        get_positions_tool,
         get_current_price_tool,
         close_position_tool,
         adjust_quantity_tool,
