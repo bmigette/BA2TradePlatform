@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, time, timezone
 from typing import List, Optional, Dict, Any
 import pandas as pd
 import os
+import threading
 from ba2_trade_platform.core.types import MarketDataPoint
 from ba2_trade_platform.logger import logger
 from ba2_trade_platform import config
@@ -28,6 +29,10 @@ class MarketDataProviderInterface(DataProviderInterface):
         - _fetch_data_from_source(): Fetch data from the actual data source
     """
     
+    # Class-level lock dictionary for per-file locking (shared across all instances)
+    _cache_locks: Dict[str, threading.Lock] = {}
+    _cache_locks_lock = threading.Lock()  # Lock to protect the locks dictionary
+    
     def __init__(self):
         """
         Initialize the market data provider.
@@ -40,6 +45,22 @@ class MarketDataProviderInterface(DataProviderInterface):
         self.cache_folder = os.path.join(config.CACHE_FOLDER, self.__class__.__name__)
         os.makedirs(self.cache_folder, exist_ok=True)
         logger.debug(f"{self.__class__.__name__} initialized with cache folder: {self.cache_folder}")
+    
+    @classmethod
+    def _get_cache_lock(cls, cache_file: str) -> threading.Lock:
+        """
+        Get or create a lock for a specific cache file.
+        
+        Args:
+            cache_file: Path to the cache file
+        
+        Returns:
+            Lock object for this cache file
+        """
+        with cls._cache_locks_lock:
+            if cache_file not in cls._cache_locks:
+                cls._cache_locks[cache_file] = threading.Lock()
+            return cls._cache_locks[cache_file]
     
     @staticmethod
     def normalize_time_to_interval(dt: datetime, interval: str) -> datetime:
@@ -167,28 +188,75 @@ class MarketDataProviderInterface(DataProviderInterface):
         
         return is_valid
     
-    def _load_cache(self, cache_file: str) -> Optional[pd.DataFrame]:
+    def _load_cache(self, cache_file: str, delete_if_corrupted: bool = True) -> Optional[pd.DataFrame]:
         """
-        Load data from cache file.
+        Load data from cache file with thread safety.
         
         Args:
             cache_file: Path to cache file
+            delete_if_corrupted: If True, delete corrupted cache files (default: True)
         
         Returns:
-            DataFrame if successful, None if failed
+            DataFrame if successful, None if failed or corrupted
+        """
+        lock = self._get_cache_lock(cache_file)
+        
+        with lock:
+            try:
+                if not os.path.exists(cache_file):
+                    return None
+                    
+                # Check file size to avoid reading empty/corrupted files
+                if os.path.getsize(cache_file) == 0:
+                    logger.warning(f"Cache file is empty, deleting: {cache_file}")
+                    self._delete_cache_file(cache_file)
+                    return None
+                
+                df = pd.read_csv(cache_file)
+                
+                # Validate that the DataFrame has expected columns
+                if df.empty or 'Date' not in df.columns:
+                    logger.warning(f"Cache file has no valid data/columns, deleting: {cache_file}")
+                    if delete_if_corrupted:
+                        self._delete_cache_file(cache_file)
+                    return None
+                    
+                df['Date'] = pd.to_datetime(df['Date'])
+                logger.debug(f"Loaded {len(df)} records from cache: {cache_file}")
+                return df
+            except Exception as e:
+                logger.error(f"Failed to load cache file {cache_file}: {e}", exc_info=True)
+                if delete_if_corrupted:
+                    logger.warning(f"Deleting corrupted cache file: {cache_file}")
+                    self._delete_cache_file(cache_file)
+                return None
+    
+    def _delete_cache_file(self, cache_file: str) -> bool:
+        """
+        Delete a cache file safely.
+        
+        Args:
+            cache_file: Path to cache file to delete
+        
+        Returns:
+            True if deleted successfully, False otherwise
         """
         try:
-            df = pd.read_csv(cache_file)
-            df['Date'] = pd.to_datetime(df['Date'])
-            logger.debug(f"Loaded {len(df)} records from cache: {cache_file}")
-            return df
+            if os.path.exists(cache_file):
+                os.remove(cache_file)
+                logger.info(f"Deleted cache file: {cache_file}")
+                return True
+            return False
         except Exception as e:
-            logger.error(f"Failed to load cache file {cache_file}: {e}", exc_info=True)
-            return None
+            logger.error(f"Failed to delete cache file {cache_file}: {e}")
+            return False
     
     def _save_cache(self, data: pd.DataFrame, cache_file: str) -> bool:
         """
-        Save data to cache file.
+        Save data to cache file with thread safety.
+        
+        Uses atomic write pattern: writes to temp file first, then renames.
+        This prevents other threads from reading partially written files.
         
         Args:
             data: DataFrame to cache
@@ -197,13 +265,31 @@ class MarketDataProviderInterface(DataProviderInterface):
         Returns:
             True if successful, False otherwise
         """
-        try:
-            data.to_csv(cache_file, index=False)
-            logger.debug(f"Saved {len(data)} records to cache: {cache_file}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to save cache file {cache_file}: {e}", exc_info=True)
-            return False
+        lock = self._get_cache_lock(cache_file)
+        
+        with lock:
+            try:
+                # Use atomic write: write to temp file, then rename
+                temp_file = cache_file + ".tmp"
+                data.to_csv(temp_file, index=False)
+                
+                # Atomic rename (on most systems)
+                if os.path.exists(cache_file):
+                    os.remove(cache_file)
+                os.rename(temp_file, cache_file)
+                
+                logger.debug(f"Saved {len(data)} records to cache: {cache_file}")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to save cache file {cache_file}: {e}", exc_info=True)
+                # Clean up temp file if it exists
+                temp_file = cache_file + ".tmp"
+                if os.path.exists(temp_file):
+                    try:
+                        os.remove(temp_file)
+                    except Exception:
+                        pass
+                return False
     
     def _dataframe_to_datapoints(
         self,
