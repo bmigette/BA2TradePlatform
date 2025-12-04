@@ -143,8 +143,9 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                     "NagaAI/gemini-2.0-flash-001:free",
                     "NagaAI/gemini-2.0-flash-lite-001",
                     # DeepSeek (latest)
-                    "NagaAI/deepseek-v3.2-exp",
-                    "NagaAI/deepseek-v3.2-exp:free",
+                    "NagaAI/deepseek-v3.2",
+                    "NagaAI/deepseek-v3.2:free",
+                    "NagaAC/deepseek-v3.2-speciale",
                     "NagaAI/deepseek-chat-v3.1",
                     "NagaAI/deepseek-chat-v3.1:free",
                     "NagaAI/deepseek-reasoner-0528",
@@ -203,8 +204,9 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                     # DeepSeek (fast)
                     "NagaAI/deepseek-chat-v3.1",
                     "NagaAI/deepseek-chat-v3.1:free",
-                    "NagaAI/deepseek-v3.2-exp",
-                    "NagaAI/deepseek-v3.2-exp:free",
+                    "NagaAI/deepseek-v3.2",
+                    "NagaAI/deepseek-v3.2:free",
+                    "NagaAC/deepseek-v3.2-speciale",
                     "NagaAI/deepseek-reasoner-0528",
                     "NagaAI/deepseek-reasoner-0528:free",
                     # Qwen (latest reasoning models)

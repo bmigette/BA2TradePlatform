@@ -2,8 +2,6 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 import time
 import json
 from ...prompts import format_analyst_prompt, get_prompt
-# Native tool call parsing for Kimi/DeepSeek models (can be removed when NagaAI fixes their API)
-from ba2_trade_platform.core.native_tool_call_parser import wrap_llm_response_with_native_parsing
 
 
 def create_fundamentals_analyst(llm, toolkit, tools, parallel_tool_calls=False):
@@ -42,8 +40,6 @@ def create_fundamentals_analyst(llm, toolkit, tools, parallel_tool_calls=False):
         chain = prompt | llm.bind_tools(tools, parallel_tool_calls=parallel_tool_calls)
 
         result = chain.invoke(state["messages"])
-        # Apply native tool call parsing for Kimi/DeepSeek models
-        result = wrap_llm_response_with_native_parsing(result, getattr(llm, 'model_name', ''))
 
         report = ""
 

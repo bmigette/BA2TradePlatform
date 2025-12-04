@@ -136,8 +136,9 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         "NagaAI/qwen3-next-80b-a3b-instruct",
                         "NagaAI/qwen3-next-80b-a3b-thinking",
                         # DeepSeek (latest)
-                        "NagaAI/deepseek-v3.2-exp",
-                        "NagaAI/deepseek-v3.2-exp:free",
+                        "NagaAI/deepseek-v3.2",
+                        "NagaAI/deepseek-v3.2:free",
+                        "NagaAC/deepseek-v3.2-speciale",
                         "NagaAI/deepseek-chat-v3.1",
                         "NagaAI/deepseek-chat-v3.1:free",
                         "NagaAI/deepseek-reasoner-0528",
@@ -180,8 +181,9 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         "NagaAI/qwen3-next-80b-a3b-instruct",
                         "NagaAI/qwen3-next-80b-a3b-thinking",
                         # DeepSeek (latest)
-                        "NagaAI/deepseek-v3.2-exp",
-                        "NagaAI/deepseek-v3.2-exp:free",
+                        "NagaAI/deepseek-v3.2",
+                        "NagaAI/deepseek-v3.2:free",
+                        "NagaAC/deepseek-v3.2-speciale",
                         "NagaAI/deepseek-chat-v3.1",
                         "NagaAI/deepseek-chat-v3.1:free",
                         "NagaAI/deepseek-reasoner-0528",

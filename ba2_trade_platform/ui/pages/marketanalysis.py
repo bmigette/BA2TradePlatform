@@ -736,11 +736,11 @@ class JobMonitoringTab:
                         {'name': 'task_id', 'label': 'Task ID', 'field': 'task_id', 'sortable': True, 'style': 'width: 200px'},
                         {'name': 'type', 'label': 'Type', 'field': 'type', 'sortable': True, 'style': 'width: 100px'},
                         {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'style': 'width: 100px'},
-                        {'name': 'expert_id', 'label': 'Expert ID', 'field': 'expert_id', 'sortable': True, 'style': 'width: 100px'},
+                        {'name': 'expert', 'label': 'Expert', 'field': 'expert_name', 'sortable': True, 'style': 'width: 150px'},
                         {'name': 'status', 'label': 'Status', 'field': 'status_display', 'sortable': True, 'style': 'width: 100px'},
                         {'name': 'priority', 'label': 'Priority', 'field': 'priority', 'sortable': True, 'style': 'width: 80px'},
                         {'name': 'created_at', 'label': 'Created', 'field': 'created_at_display', 'sortable': True, 'style': 'width: 160px'},
-                        {'name': 'batch_id', 'label': 'Batch', 'field': 'batch_id', 'sortable': True, 'style': 'width: 150px'},
+                        {'name': 'batch_id', 'label': 'Batch', 'field': 'batch_id', 'sortable': True, 'style': 'width: 220px'},
                     ]
                     
                     self.queued_tasks_table = ui.table(
@@ -755,6 +755,17 @@ class JobMonitoringTab:
                             <q-badge :color="props.row.status_color" :label="props.row.status_display" />
                         </q-td>
                     ''')
+                    
+                    # Add batch ID slot with tooltip for long IDs
+                    self.queued_tasks_table.add_slot('body-cell-batch_id', '''
+                        <q-td :props="props">
+                            <span class="cursor-help" :title="props.row.batch_id">
+                                {{ props.row.batch_id || '-' }}
+                            </span>
+                        </q-td>
+                    ''')
+                        </q-td>
+                    ''')
 
     def _get_queued_tasks_data(self) -> List[dict]:
         """Get formatted data for queued tasks table from worker queue.
@@ -765,6 +776,18 @@ class JobMonitoringTab:
             worker_queue = self._get_worker_queue()
             all_tasks_dict = worker_queue.get_all_tasks()
             all_tasks = list(all_tasks_dict.values()) if isinstance(all_tasks_dict, dict) else all_tasks_dict
+            
+            # Build a cache of expert IDs to shortnames for efficient lookup
+            expert_shortnames = {}
+            try:
+                with get_db() as session:
+                    experts = session.exec(select(ExpertInstance)).all()
+                    for expert in experts:
+                        # Use alias, or fallback to "expert_name-id"
+                        shortname = expert.alias or f"{expert.expert}-{expert.id}"
+                        expert_shortnames[expert.id] = shortname
+            except Exception as e:
+                logger.warning(f"Failed to fetch expert shortnames: {e}")
             
             formatted_tasks = []
             for task in all_tasks:
@@ -808,16 +831,24 @@ class JobMonitoringTab:
                     status_display = str(task_status)
                     status_color = 'grey'
                 
+                # Get expert shortname from cache, fallback to ID if not found
+                expert_instance_id = getattr(task, 'expert_instance_id', '')
+                expert_name = expert_shortnames.get(expert_instance_id, f"ID:{expert_instance_id}" if expert_instance_id else '')
+                
+                # Get batch_id from task
+                task_batch_id = getattr(task, 'batch_id', None) or ''
+                logger.debug(f"Task {getattr(task, 'id', 'Unknown')} batch_id: '{task_batch_id}' (type: {type(getattr(task, 'batch_id', None))})")
+                
                 formatted_tasks.append({
                     'task_id': getattr(task, 'id', 'Unknown'),
                     'type': task_type,
                     'symbol': symbol,
-                    'expert_id': getattr(task, 'expert_instance_id', ''),
+                    'expert_name': expert_name,
                     'status_display': status_display,
                     'status_color': status_color,
                     'priority': getattr(task, 'priority', 0),
                     'created_at_display': created_at_display,
-                    'batch_id': getattr(task, 'batch_id', '') or '',
+                    'batch_id': task_batch_id,
                 })
             
             # Sort by priority (lower = higher priority), then by created time

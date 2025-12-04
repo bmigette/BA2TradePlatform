@@ -1,0 +1,484 @@
+[
+  {
+    "model": "NagaAI/gpt-5-2025-08-07",
+    "method": "openai",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 7023.107051849365
+  },
+  {
+    "model": "NagaAI/gpt-5-2025-08-07",
+    "method": "langchain",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 6752.092123031616
+  },
+  {
+    "model": "NagaAI/gpt-5-mini-2025-08-07",
+    "method": "openai",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 4552.277326583862
+  },
+  {
+    "model": "NagaAI/gpt-5-mini-2025-08-07",
+    "method": "langchain",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 5699.793577194214
+  },
+  {
+    "model": "NagaAI/gpt-5-nano-2025-08-07",
+    "method": "openai",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 5068.1471824646
+  },
+  {
+    "model": "NagaAI/gpt-5-nano-2025-08-07",
+    "method": "langchain",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 6605.931997299194
+  },
+  {
+    "model": "NagaAI/gpt-5-chat-latest",
+    "method": "openai",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 4612.043380737305
+  },
+  {
+    "model": "NagaAI/gpt-5-chat-latest",
+    "method": "langchain",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 4386.499404907227
+  },
+  {
+    "model": "NagaAI/gpt-5-codex",
+    "method": "openai",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 1804.2919635772705
+  },
+  {
+    "model": "NagaAI/gpt-5-codex",
+    "method": "langchain",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 3516.120195388794
+  },
+  {
+    "model": "NagaAC/gpt-5.1-2025-11-13",
+    "method": "openai",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 1349.062204360962
+  },
+  {
+    "model": "NagaAC/gpt-5.1-2025-11-13",
+    "method": "langchain",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 1634.979248046875
+  },
+  {
+    "model": "NagaAI/gpt-4o-search-preview-2025-03-11",
+    "method": "openai",
+    "success": false,
+    "tool_called": false,
+    "tool_name": null,
+    "tool_args": null,
+    "native_tool_call_detected": false,
+    "error": "Error code: 501 - {'error': {'type': 'no_sources_available', 'message': 'No sources were found for this model.'}}",
+    "duration_ms": 1709.8054885864258
+  },
+  {
+    "model": "NagaAI/gpt-4o-search-preview-2025-03-11",
+    "method": "langchain",
+    "success": false,
+    "tool_called": false,
+    "tool_name": null,
+    "tool_args": null,
+    "native_tool_call_detected": false,
+    "error": "Error code: 501 - {'error': {'type': 'no_sources_available', 'message': 'No sources were found for this model.'}}",
+    "duration_ms": 1355.107069015503
+  },
+  {
+    "model": "NagaAI/grok-4-0709",
+    "method": "openai",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 4497.325897216797
+  },
+  {
+    "model": "NagaAI/grok-4-0709",
+    "method": "langchain",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 5403.041839599609
+  },
+  {
+    "model": "NagaAI/grok-4-fast-non-reasoning",
+    "method": "openai",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 655.1411151885986
+  },
+  {
+    "model": "NagaAI/grok-4-fast-non-reasoning",
+    "method": "langchain",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 358.6597442626953
+  },
+  {
+    "model": "NagaAI/grok-4-fast-reasoning",
+    "method": "openai",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 2240.941286087036
+  },
+  {
+    "model": "NagaAI/grok-4-fast-reasoning",
+    "method": "langchain",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 961.1494541168213
+  },
+  {
+    "model": "NagaAC/grok-4.1-fast-reasoning",
+    "method": "openai",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 1595.3383445739746
+  },
+  {
+    "model": "NagaAC/grok-4.1-fast-reasoning",
+    "method": "langchain",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 1702.6245594024658
+  },
+  {
+    "model": "NagaAI/qwen3-max",
+    "method": "openai",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 2476.78542137146
+  },
+  {
+    "model": "NagaAI/qwen3-max",
+    "method": "langchain",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 1513.0946636199951
+  },
+  {
+    "model": "NagaAI/qwen3-next-80b-a3b-instruct",
+    "method": "openai",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 1417.5784587860107
+  },
+  {
+    "model": "NagaAI/qwen3-next-80b-a3b-instruct",
+    "method": "langchain",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 703.3283710479736
+  },
+  {
+    "model": "NagaAI/qwen3-next-80b-a3b-thinking",
+    "method": "openai",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 2814.4490718841553
+  },
+  {
+    "model": "NagaAI/qwen3-next-80b-a3b-thinking",
+    "method": "langchain",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 1655.6525230407715
+  },
+  {
+    "model": "NagaAI/deepseek-v3.2",
+    "method": "openai",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 3537.8761291503906
+  },
+  {
+    "model": "NagaAI/deepseek-v3.2",
+    "method": "langchain",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 2893.8169479370117
+  },
+  {
+    "model": "NagaAC/deepseek-v3.2-speciale",
+    "method": "openai",
+    "success": true,
+    "tool_called": false,
+    "tool_name": null,
+    "tool_args": null,
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 35444.679260253906
+  },
+  {
+    "model": "NagaAC/deepseek-v3.2-speciale",
+    "method": "langchain",
+    "success": true,
+    "tool_called": false,
+    "tool_name": null,
+    "tool_args": null,
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 24915.47441482544
+  },
+  {
+    "model": "NagaAI/deepseek-chat-v3.1",
+    "method": "openai",
+    "success": true,
+    "tool_called": false,
+    "tool_name": null,
+    "tool_args": null,
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 5231.128454208374
+  },
+  {
+    "model": "NagaAI/deepseek-chat-v3.1",
+    "method": "langchain",
+    "success": true,
+    "tool_called": false,
+    "tool_name": null,
+    "tool_args": null,
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 5728.1653881073
+  },
+  {
+    "model": "NagaAI/deepseek-reasoner-0528",
+    "method": "openai",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 4763.667106628418
+  },
+  {
+    "model": "NagaAI/deepseek-reasoner-0528",
+    "method": "langchain",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 3974.12371635437
+  },
+  {
+    "model": "NagaAI/kimi-k2-thinking",
+    "method": "openai",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 2801.008939743042
+  },
+  {
+    "model": "NagaAI/kimi-k2-thinking",
+    "method": "langchain",
+    "success": true,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
+    "native_tool_call_detected": false,
+    "error": null,
+    "duration_ms": 5140.63572883606
+  }
+]
