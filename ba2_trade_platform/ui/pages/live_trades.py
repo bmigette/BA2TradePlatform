@@ -11,6 +11,7 @@ from ...core.db import get_all_instances, get_db, get_instance, update_instance
 from ...core.models import AccountDefinition, MarketAnalysis, ExpertRecommendation, ExpertInstance, AppSetting, TradingOrder, Transaction
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, OrderStatus, OrderOpenType, OrderType
 from ...core.utils import get_expert_instance_from_id, get_market_analysis_id_from_order_id, get_account_instance_from_id, get_order_status_color, get_expert_options_for_ui
+from ...core.TransactionHelper import TransactionHelper
 from ...modules.accounts import providers
 from ...logger import logger
 from ..utils.TableCacheManager import TableCacheManager, AsyncTableLoader
@@ -470,25 +471,13 @@ class LiveTradesTab:
                             order_side_display = order.side.value if hasattr(order.side, 'value') else str(order.side)
                             order_status_display = order.status.value if hasattr(order.status, 'value') else str(order.status)
 
-                            # Determine if this is a TP/SL order
+                            # Determine if this is a TP/SL order using TransactionHelper
                             order_category = 'Entry'
-                            if order.depends_on_order:
-                                # Dependent orders are TP/SL orders
-                                # Determine if it's TP or SL by checking order type and comment
-                                is_stop_order = 'stop' in order_type_display.lower()
-                                is_limit_order = 'limit' in order_type_display.lower()
-                                comment_lower = (order.comment or '').lower()
-
-                                # Check comment first for explicit indicators
-                                if 'tp' in comment_lower or 'take_profit' in comment_lower or 'take profit' in comment_lower:
+                            if TransactionHelper.is_tpsl_order(order):
+                                if TransactionHelper.is_tp_order(order):
                                     order_category = 'Take Profit'
-                                elif 'sl' in comment_lower or 'stop_loss' in comment_lower or 'stop loss' in comment_lower:
+                                elif TransactionHelper.is_sl_order(order):
                                     order_category = 'Stop Loss'
-                                # Fallback to order type heuristic
-                                elif is_stop_order:
-                                    order_category = 'Stop Loss'
-                                elif is_limit_order:
-                                    order_category = 'Take Profit'
                                 else:
                                     order_category = 'Dependent'
 
@@ -910,42 +899,29 @@ class LiveTradesTab:
                 ui.notify('No TP/SL defined for this transaction', type='negative')
                 return
 
-            # Get the entry order to find account_id
-            with get_db() as session:
-                entry_order_stmt = select(TradingOrder).where(
-                    TradingOrder.transaction_id == transaction_id,
-                    TradingOrder.depends_on_order == None  # Entry order has no dependencies
-                ).limit(1)
-                entry_order = session.exec(entry_order_stmt).first()
+            # Get the entry order to find account_id using TransactionHelper
+            entry_order = TransactionHelper.get_entry_order(txn)
+            if not entry_order:
+                ui.notify('Could not find entry order', type='negative')
+                return
 
-                if not entry_order:
-                    ui.notify('Could not find entry order', type='negative')
-                    return
+            account_id = entry_order.account_id
 
-                account_id = entry_order.account_id
+            # Get account instance
+            account_inst = get_account_instance_from_id(account_id)
+            if not account_inst:
+                ui.notify('Could not load account instance', type='negative')
+                return
 
-            # Cancel any existing TP/SL orders that are still active
-            with get_db() as session:
-                existing_tpsl_stmt = select(TradingOrder).where(
-                    TradingOrder.transaction_id == transaction_id,
-                    TradingOrder.depends_on_order != None  # TP/SL orders depend on entry
-                )
-                existing_tpsl_orders = list(session.exec(existing_tpsl_stmt).all())
+            # Cancel any existing TP/SL orders that are still active using TransactionHelper
+            existing_tpsl_orders = TransactionHelper.get_active_tpsl_orders(txn)
 
-                account_inst = get_account_instance_from_id(account_id)
-                if not account_inst:
-                    ui.notify('Could not load account instance', type='negative')
-                    return
-
-                for order in existing_tpsl_orders:
-                    # Only cancel orders that are not already in terminal state
-                    terminal_statuses = OrderStatus.get_terminal_statuses()
-                    if order.status not in terminal_statuses:
-                        try:
-                            account_inst.cancel_order(order.id)
-                            logger.info(f"Canceled existing TP/SL order {order.id} for transaction {transaction_id}")
-                        except Exception as e:
-                            logger.warning(f"Failed to cancel order {order.id}: {e}")
+            for order in existing_tpsl_orders:
+                try:
+                    account_inst.cancel_order(order.id)
+                    logger.info(f"Canceled existing TP/SL order {order.id} for transaction {transaction_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to cancel order {order.id}: {e}")
 
             # Recreate TP/SL orders using the new adjust methods (creates OCO/OTO orders)
             orders_created = []

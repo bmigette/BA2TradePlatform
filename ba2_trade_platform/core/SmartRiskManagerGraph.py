@@ -31,6 +31,7 @@ from .models import AppSetting
 from .SmartRiskManagerToolkit import SmartRiskManagerToolkit
 from .utils import get_expert_instance_from_id
 from .interfaces import MarketExpertInterface
+from .native_tool_call_parser import wrap_llm_response_with_native_parsing
 
 
 # ==================== HELPER FUNCTIONS ====================
@@ -3053,6 +3054,8 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             # Get LLM response with tool calls
             try:
                 response = llm_with_tools.invoke(research_messages)
+                # Apply native tool call parsing for Kimi/DeepSeek models (workaround for NagaAI)
+                response = wrap_llm_response_with_native_parsing(response, risk_manager_model)
             except Exception as e:
                 logger.error(f"LLM invocation error on iteration {iteration}: {e}", exc_info=True)
                 # Try to continue with error message
@@ -4132,6 +4135,8 @@ class SmartRiskManagerGraph:
                 # Get LLM response (REUSING self.llm_with_tools)
                 try:
                     response = self.llm_with_tools.invoke(research_messages)
+                    # Apply native tool call parsing for Kimi/DeepSeek models (workaround for NagaAI)
+                    response = wrap_llm_response_with_native_parsing(response, state["risk_manager_model"])
                     research_messages.append(response)
                 except Exception as llm_error:
                     # Handle LLM errors (e.g., malformed function calls from DeepSeek reasoner)

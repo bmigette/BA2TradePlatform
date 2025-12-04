@@ -232,12 +232,6 @@ class OrderOpenType(str, Enum):
     AUTOMATIC = "automatic"
     EXTERNAL = "external"
     NOTOPENED = "notopened"
-    # Order purpose types for transaction management
-    ENTRY = "entry"           # Entry order that opens a position
-    CLOSE = "close"           # Close order that closes a position
-    ADD = "add"               # Add-to-position order
-    TAKE_PROFIT = "take_profit"   # Take profit order (TP)
-    STOP_LOSS = "stop_loss"       # Stop loss order (SL)
 
 class OrderRecommendation(str, Enum):
     SELL = "SELL"

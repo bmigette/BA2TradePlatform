@@ -183,6 +183,10 @@ class JobMonitoringTab:
                 ui.label('Worker Queue Status').classes('text-md font-bold')
                 self._create_queue_status()
             
+            # Queued Tasks table (in-memory worker queue tasks)
+            self.queued_tasks_container = ui.column().classes('w-full mt-4')
+            self._create_queued_tasks_table()
+            
             ui.separator().classes('my-4')
             
             # Smart Risk Manager jobs table
@@ -708,6 +712,127 @@ class JobMonitoringTab:
                 self.queue_status_labels['pending_tasks'] = ui.label(f"Pending: {queue_info['pending_tasks']}")
                 self.queue_status_labels['total_tasks'] = ui.label(f"Total Tasks: {queue_info['total_tasks']}")
 
+    def _create_queued_tasks_table(self):
+        """Create table showing in-memory queued tasks from worker queue.
+        
+        This shows tasks that are in the worker queue but may not yet have 
+        MarketAnalysis database records (which are only created when tasks start executing).
+        """
+        self.queued_tasks_container.clear()
+        with self.queued_tasks_container:
+            with ui.card().classes('w-full'):
+                with ui.row().classes('w-full justify-between items-center mb-2'):
+                    ui.label('Queued Tasks (In-Memory Worker Queue)').classes('text-md font-bold')
+                    ui.button('Refresh', on_click=self._refresh_queued_tasks_table, icon='refresh').props('flat dense')
+                
+                queued_tasks_data = self._get_queued_tasks_data()
+                
+                if not queued_tasks_data:
+                    ui.label('No tasks currently in queue').classes('text-sm text-gray-500 italic')
+                else:
+                    ui.label(f'Showing {len(queued_tasks_data)} tasks in worker queue').classes('text-sm text-gray-600 mb-2')
+                    
+                    columns = [
+                        {'name': 'task_id', 'label': 'Task ID', 'field': 'task_id', 'sortable': True, 'style': 'width: 200px'},
+                        {'name': 'type', 'label': 'Type', 'field': 'type', 'sortable': True, 'style': 'width: 100px'},
+                        {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'style': 'width: 100px'},
+                        {'name': 'expert_id', 'label': 'Expert ID', 'field': 'expert_id', 'sortable': True, 'style': 'width: 100px'},
+                        {'name': 'status', 'label': 'Status', 'field': 'status_display', 'sortable': True, 'style': 'width: 100px'},
+                        {'name': 'priority', 'label': 'Priority', 'field': 'priority', 'sortable': True, 'style': 'width: 80px'},
+                        {'name': 'created_at', 'label': 'Created', 'field': 'created_at_display', 'sortable': True, 'style': 'width: 160px'},
+                        {'name': 'batch_id', 'label': 'Batch', 'field': 'batch_id', 'sortable': True, 'style': 'width: 150px'},
+                    ]
+                    
+                    self.queued_tasks_table = ui.table(
+                        columns=columns,
+                        rows=queued_tasks_data,
+                        row_key='task_id'
+                    ).classes('w-full')
+                    
+                    # Add status badge slot
+                    self.queued_tasks_table.add_slot('body-cell-status', '''
+                        <q-td :props="props">
+                            <q-badge :color="props.row.status_color" :label="props.row.status_display" />
+                        </q-td>
+                    ''')
+
+    def _get_queued_tasks_data(self) -> List[dict]:
+        """Get formatted data for queued tasks table from worker queue.
+        
+        Returns list of dicts with task info for all PENDING and RUNNING tasks.
+        """
+        try:
+            worker_queue = self._get_worker_queue()
+            all_tasks_dict = worker_queue.get_all_tasks()
+            all_tasks = list(all_tasks_dict.values()) if isinstance(all_tasks_dict, dict) else all_tasks_dict
+            
+            formatted_tasks = []
+            for task in all_tasks:
+                # Get task status
+                task_status = getattr(task, 'status', None) or getattr(task, 'state', None)
+                
+                # Only show pending and running tasks
+                if task_status not in [WorkerTaskStatus.PENDING, WorkerTaskStatus.RUNNING, 'pending', 'running']:
+                    continue
+                
+                # Determine task type
+                task_type = 'Analysis'
+                symbol = ''
+                if hasattr(task, 'symbol'):
+                    symbol = task.symbol
+                    task_type = 'Analysis'
+                elif hasattr(task, 'expansion_type'):
+                    task_type = f'Expansion ({task.expansion_type})'
+                elif hasattr(task, 'job_id') or 'smart_risk' in str(getattr(task, 'id', '')).lower():
+                    task_type = 'Smart Risk'
+                
+                # Format created timestamp
+                created_at = getattr(task, 'created_at', None)
+                if created_at:
+                    try:
+                        created_dt = datetime.fromtimestamp(created_at, tz=timezone.utc)
+                        created_at_display = created_dt.strftime('%Y-%m-%d %H:%M:%S')
+                    except:
+                        created_at_display = 'Unknown'
+                else:
+                    created_at_display = 'Unknown'
+                
+                # Get status display and color
+                if task_status == WorkerTaskStatus.PENDING or task_status == 'pending':
+                    status_display = 'Pending'
+                    status_color = 'orange'
+                elif task_status == WorkerTaskStatus.RUNNING or task_status == 'running':
+                    status_display = 'Running'
+                    status_color = 'blue'
+                else:
+                    status_display = str(task_status)
+                    status_color = 'grey'
+                
+                formatted_tasks.append({
+                    'task_id': getattr(task, 'id', 'Unknown'),
+                    'type': task_type,
+                    'symbol': symbol,
+                    'expert_id': getattr(task, 'expert_instance_id', ''),
+                    'status_display': status_display,
+                    'status_color': status_color,
+                    'priority': getattr(task, 'priority', 0),
+                    'created_at_display': created_at_display,
+                    'batch_id': getattr(task, 'batch_id', '') or '',
+                })
+            
+            # Sort by priority (lower = higher priority), then by created time
+            formatted_tasks.sort(key=lambda x: (x['priority'], x['created_at_display']))
+            
+            return formatted_tasks
+            
+        except Exception as e:
+            logger.error(f"Error getting queued tasks data: {e}", exc_info=True)
+            return []
+
+    def _refresh_queued_tasks_table(self):
+        """Refresh the queued tasks table."""
+        self._create_queued_tasks_table()
+
     def _get_analysis_data(self) -> tuple[List[dict], int]:
         """Get analysis jobs data for the table with pagination and filtering.
         
@@ -1174,6 +1299,10 @@ class JobMonitoringTab:
                 self.queue_status_labels['pending_tasks'].set_text(f"Pending: {queue_info['pending_tasks']}")
             if self.queue_status_labels['total_tasks']:
                 self.queue_status_labels['total_tasks'].set_text(f"Total Tasks: {queue_info['total_tasks']}")
+            
+            # Also refresh the queued tasks table
+            if hasattr(self, 'queued_tasks_container'):
+                self._create_queued_tasks_table()
         except Exception as e:
             logger.error(f"Error updating queue status display: {e}", exc_info=True)
 

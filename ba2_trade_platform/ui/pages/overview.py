@@ -11,6 +11,7 @@ from ...core.db import get_all_instances, get_db, get_instance, update_instance
 from ...core.models import AccountDefinition, MarketAnalysis, ExpertRecommendation, ExpertInstance, AppSetting, TradingOrder, Transaction
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, OrderStatus, OrderOpenType, OrderType
 from ...core.utils import get_expert_instance_from_id, get_market_analysis_id_from_order_id, get_account_instance_from_id
+from ...core.TransactionHelper import TransactionHelper
 from ...modules.accounts import providers
 from ...logger import logger
 from ..components import ProfitPerExpertChart, InstrumentDistributionChart, BalanceUsagePerExpertChart
@@ -4040,42 +4041,29 @@ class TransactionsTab:
                 ui.notify('No TP/SL defined for this transaction', type='negative')
                 return
             
-            # Get the entry order to find account_id
-            with get_db() as session:
-                entry_order_stmt = select(TradingOrder).where(
-                    TradingOrder.transaction_id == transaction_id,
-                    TradingOrder.depends_on_order == None  # Entry order has no dependencies
-                ).limit(1)
-                entry_order = session.exec(entry_order_stmt).first()
-                
-                if not entry_order:
-                    ui.notify('Could not find entry order', type='negative')
-                    return
-                
-                account_id = entry_order.account_id
-            
-            # Cancel any existing TP/SL orders that are still active
-            with get_db() as session:
-                existing_tpsl_stmt = select(TradingOrder).where(
-                    TradingOrder.transaction_id == transaction_id,
-                    TradingOrder.depends_on_order != None  # TP/SL orders depend on entry
-                )
-                existing_tpsl_orders = list(session.exec(existing_tpsl_stmt).all())
-                
-                account_inst = get_account_instance_from_id(account_id)
-                if not account_inst:
-                    ui.notify('Could not load account instance', type='negative')
-                    return
-                
-                for order in existing_tpsl_orders:
-                    # Only cancel orders that are not already in terminal state
-                    terminal_statuses = OrderStatus.get_terminal_statuses()
-                    if order.status not in terminal_statuses:
-                        try:
-                            account_inst.cancel_order(order.id)
-                            logger.info(f"Canceled existing TP/SL order {order.id} for transaction {transaction_id}")
-                        except Exception as e:
-                            logger.warning(f"Failed to cancel order {order.id}: {e}")
+            # Get the entry order to find account_id using TransactionHelper
+            entry_order = TransactionHelper.get_entry_order(txn)
+            if not entry_order:
+                ui.notify('Could not find entry order', type='negative')
+                return
+
+            account_id = entry_order.account_id
+
+            # Get account instance
+            account_inst = get_account_instance_from_id(account_id)
+            if not account_inst:
+                ui.notify('Could not load account instance', type='negative')
+                return
+
+            # Cancel any existing TP/SL orders that are still active using TransactionHelper
+            existing_tpsl_orders = TransactionHelper.get_active_tpsl_orders(txn)
+
+            for order in existing_tpsl_orders:
+                try:
+                    account_inst.cancel_order(order.id)
+                    logger.info(f"Canceled existing TP/SL order {order.id} for transaction {transaction_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to cancel order {order.id}: {e}")
             
             # Recreate TP/SL orders using the new adjust methods (creates OCO/OTO orders)
             orders_created = []
