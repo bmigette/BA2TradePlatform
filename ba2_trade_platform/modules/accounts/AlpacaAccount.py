@@ -3096,12 +3096,13 @@ class AlpacaAccount(AccountInterface):
     def _create_broker_tp_order(self, session: Session, transaction: Transaction, entry_order: TradingOrder, tp_price: float) -> bool:
         """Create new TP order at broker using OCO (both TP+SL) or simple limit order (TP only)"""
         try:
-            # Validate entry order has valid quantity
-            if not entry_order.quantity or entry_order.quantity <= 0:
-                logger.error(f"Cannot create TP order for transaction {transaction.id}: entry order {entry_order.id} has invalid quantity {entry_order.quantity}")
+            # Use transaction.quantity as source of truth (handles partial closes)
+            order_quantity = transaction.quantity
+            if not order_quantity or order_quantity <= 0:
+                logger.error(f"Cannot create TP order for transaction {transaction.id}: transaction has invalid quantity {order_quantity}")
                 return False
             
-            logger.info(f"Creating TP order at broker for transaction {transaction.id}")
+            logger.info(f"Creating TP order at broker for transaction {transaction.id} with qty={order_quantity}")
             
             # Determine if we need OCO (both TP and SL) or simple limit order (only TP)
             has_sl = transaction.stop_loss is not None and transaction.stop_loss > 0
@@ -3136,7 +3137,7 @@ class AlpacaAccount(AccountInterface):
             tp_order = TradingOrder(
                 account_id=self.id,
                 symbol=entry_order.symbol,
-                quantity=entry_order.quantity,
+                quantity=order_quantity,
                 side=tp_side,
                 order_type=order_type,
                 limit_price=tp_price,
@@ -3315,13 +3316,15 @@ class AlpacaAccount(AccountInterface):
             if not sl_price or sl_price <= 0:
                 logger.error(f"Cannot create broker OCO order for transaction {transaction.id}: invalid stop_loss {sl_price}")
                 return False
-                
-            # Validate entry order has valid quantity
-            if not entry_order.quantity or entry_order.quantity <= 0:
-                logger.error(f"Cannot create OCO order for transaction {transaction.id}: entry order {entry_order.id} has invalid quantity {entry_order.quantity}")
+            
+            # Use transaction.quantity as source of truth (handles partial closes)
+            # This is the current position size that needs TP/SL protection
+            order_quantity = transaction.quantity
+            if not order_quantity or order_quantity <= 0:
+                logger.error(f"Cannot create OCO order for transaction {transaction.id}: transaction has invalid quantity {order_quantity}")
                 return False
             
-            logger.info(f"Creating OCO order at broker for transaction {transaction.id} with TP=${tp_price:.2f}, SL=${sl_price:.2f}")
+            logger.info(f"Creating OCO order at broker for transaction {transaction.id} with TP=${tp_price:.2f}, SL=${sl_price:.2f}, qty={order_quantity}")
             
             oco_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
             oco_comment = self._generate_tpsl_comment("TPSL", self.id, transaction.id, entry_order.id)
@@ -3329,7 +3332,7 @@ class AlpacaAccount(AccountInterface):
             oco_order = TradingOrder(
                 account_id=self.id,
                 symbol=entry_order.symbol,
-                quantity=entry_order.quantity,
+                quantity=order_quantity,
                 side=oco_side,
                 order_type=CoreOrderType.OCO,
                 limit_price=tp_price,
@@ -3365,12 +3368,13 @@ class AlpacaAccount(AccountInterface):
     def _create_broker_sl_order(self, session: Session, transaction: Transaction, entry_order: TradingOrder, sl_price: float) -> bool:
         """Create new SL order at broker using OCO (both TP+SL) or simple stop order (SL only)"""
         try:
-            # Validate entry order has valid quantity
-            if not entry_order.quantity or entry_order.quantity <= 0:
-                logger.error(f"Cannot create SL order for transaction {transaction.id}: entry order {entry_order.id} has invalid quantity {entry_order.quantity}")
+            # Use transaction.quantity as source of truth (handles partial closes)
+            order_quantity = transaction.quantity
+            if not order_quantity or order_quantity <= 0:
+                logger.error(f"Cannot create SL order for transaction {transaction.id}: transaction has invalid quantity {order_quantity}")
                 return False
             
-            logger.info(f"Creating SL order at broker for transaction {transaction.id}")
+            logger.info(f"Creating SL order at broker for transaction {transaction.id} with qty={order_quantity}")
             
             has_tp = transaction.take_profit is not None and transaction.take_profit > 0
             
@@ -3403,7 +3407,7 @@ class AlpacaAccount(AccountInterface):
             sl_order = TradingOrder(
                 account_id=self.id,
                 symbol=entry_order.symbol,
-                quantity=entry_order.quantity,
+                quantity=order_quantity,
                 side=sl_side,
                 order_type=order_type,
                 stop_price=sl_price,

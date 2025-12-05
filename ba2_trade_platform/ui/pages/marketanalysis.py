@@ -764,8 +764,6 @@ class JobMonitoringTab:
                             </span>
                         </q-td>
                     ''')
-                        </q-td>
-                    ''')
 
     def _get_queued_tasks_data(self) -> List[dict]:
         """Get formatted data for queued tasks table from worker queue.
@@ -1536,6 +1534,13 @@ class JobMonitoringTab:
             # Update worker queue status display
             self._update_queue_status_display()
             
+        except RuntimeError as e:
+            # Handle client disconnection gracefully - stop auto-refresh timer
+            if "client" in str(e).lower() and "deleted" in str(e).lower():
+                logger.debug("[JobMonitoringTab] Client disconnected in refresh_data, stopping auto-refresh timer")
+                self.stop_auto_refresh()
+            else:
+                logger.error(f"Error refreshing job monitoring data: {e}", exc_info=True)
         except Exception as e:
             logger.error(f"Error refreshing job monitoring data: {e}", exc_info=True)
     
@@ -1577,6 +1582,13 @@ class JobMonitoringTab:
             self._create_pagination_controls()
             
             logger.debug(f"[JobMonitoringTab] Analysis table refreshed with {len(analysis_data)} records")
+        except RuntimeError as e:
+            # Handle client disconnection gracefully - stop auto-refresh timer
+            if "client" in str(e).lower() and "deleted" in str(e).lower():
+                logger.debug("[JobMonitoringTab] Client disconnected, stopping auto-refresh timer")
+                self.stop_auto_refresh()
+            else:
+                logger.error(f"Error in async analysis table refresh: {e}", exc_info=True)
         except Exception as e:
             logger.error(f"Error in async analysis table refresh: {e}", exc_info=True)
 

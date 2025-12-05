@@ -113,38 +113,50 @@ class FloatingPLPerAccountWidget:
                         first_order = min(all_orders, key=lambda o: o.created_at or datetime.min.replace(tzinfo=timezone.utc))
                         position_direction = first_order.side
                         
-                        # Filter for market entry orders (exclude TP/SL limit orders)
-                        # Include: MARKET, BUY_STOP, SELL_STOP (entry orders)
-                        # Exclude: BUY_LIMIT, SELL_LIMIT, TRAILING_STOP (typically TP/SL exit orders)
-                        market_entry_orders = [
-                            order for order in all_orders
-                            if order.side == position_direction  # Same direction as position
-                            and order.order_type in [OrderType.MARKET, OrderType.BUY_STOP, OrderType.SELL_STOP]  # Entry orders only
+                        # Get all FILLED orders (any type that affects position)
+                        # Exclude: OCO, OTO orders (they are TP/SL brackets, not position-affecting until triggered)
+                        filled_orders = [
+                            o for o in all_orders 
+                            if o.status in OrderStatus.get_executed_statuses()
+                            and o.order_type not in [OrderType.OCO, OrderType.OTO]
+                            and o.filled_qty and o.filled_qty > 0
                         ]
                         
-                        # Calculate P/L from FILLED market entry orders only
-                        filled_entry_orders = [o for o in market_entry_orders if o.status in OrderStatus.get_executed_statuses()]
+                        # Calculate net position and weighted average cost
+                        # BUY orders add to position (+), SELL orders reduce position (-)
+                        total_buy_cost = 0.0
+                        total_buy_qty = 0.0
+                        total_sell_qty = 0.0
                         
-                        total_cost = 0.0
-                        filled_qty = 0.0
-                        
-                        for order in filled_entry_orders:
+                        for order in filled_orders:
                             if not order.open_price or not order.filled_qty:
                                 continue
                             
-                            # All entry orders are same direction, so just sum
-                            total_cost += order.filled_qty * order.open_price
-                            filled_qty += order.filled_qty
+                            if order.side == OrderDirection.BUY:
+                                total_buy_cost += order.filled_qty * order.open_price
+                                total_buy_qty += order.filled_qty
+                            elif order.side == OrderDirection.SELL:
+                                total_sell_qty += order.filled_qty
                         
-                        if abs(filled_qty) < 0.01:  # No filled position yet
+                        # Net filled quantity = buys - sells
+                        net_filled_qty = total_buy_qty - total_sell_qty
+                        
+                        if abs(net_filled_qty) < 0.01:  # No net position (fully closed or not filled)
                             continue
                         
-                        # Calculate weighted average price
-                        avg_price = total_cost / filled_qty
+                        # Calculate weighted average price from BUY orders (entry cost basis)
+                        if total_buy_qty < 0.01:
+                            continue  # No buy orders, can't calculate avg price
+                        avg_price = total_buy_cost / total_buy_qty
                         
-                        # Calculate P/L: (current_price - avg_price) * filled_quantity
-                        # For short positions, this will be negative when price goes up (correct)
-                        pl = (current_price - avg_price) * filled_qty
+                        # Use transaction.quantity as source of truth for current position
+                        # This should match net_filled_qty, but transaction.quantity is authoritative
+                        position_qty = abs(trans.quantity)
+                        
+                        # Calculate P/L: (current_price - avg_price) * position_quantity
+                        # For long positions: profit when price > avg_price
+                        # For short positions: profit when price < avg_price
+                        pl = (current_price - avg_price) * position_qty
                         if position_direction == OrderDirection.SELL:
                             pl = -pl  # Invert for short positions
                         
@@ -152,16 +164,12 @@ class FloatingPLPerAccountWidget:
                             account_pl[account_name] = 0.0
                         account_pl[account_name] += pl
                         
-                        # Validate: Check total quantity (filled + pending market entry orders) vs transaction quantity
-                        pending_entry_orders = [o for o in market_entry_orders if o.status in [OrderStatus.PENDING, OrderStatus.OPEN]]
-                        total_order_qty = filled_qty + sum(o.quantity for o in pending_entry_orders if o.quantity)
-                        
-                        if abs(total_order_qty - abs(trans.quantity)) > 0.01:
-                            logger.error(
-                                f"Transaction {trans.id} quantity mismatch: "
-                                f"transaction.quantity={trans.quantity}, "
-                                f"total market entry orders qty={total_order_qty:.2f} "
-                                f"(filled={filled_qty:.2f} + pending={total_order_qty - filled_qty:.2f})"
+                        # Debug: Log when net filled qty differs from transaction qty
+                        if abs(net_filled_qty - abs(trans.quantity)) > 0.01:
+                            logger.debug(
+                                f"Transaction {trans.id}: net_filled_qty={net_filled_qty:.2f} "
+                                f"(buys={total_buy_qty:.2f} - sells={total_sell_qty:.2f}), "
+                                f"transaction.quantity={trans.quantity}"
                             )
                         
                 except Exception as e:

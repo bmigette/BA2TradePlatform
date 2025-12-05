@@ -1,6 +1,6 @@
 import logging
 from nicegui import ui, Client, app
-from .pages import overview, settings, marketanalysis, market_analysis_detail, rulesettest, marketanalysishistory, smart_risk_manager_detail, activity_monitor, live_trades
+from .pages import overview, settings, marketanalysis, market_analysis_detail, rulesettest, marketanalysishistory, smart_risk_manager_detail, activity_monitor, live_trades, tools
 from .layout import layout_render
 from pathlib import Path
 from ..logger import logger
@@ -115,6 +115,12 @@ def live_trades_page() -> None:
     logger.debug("[ROUTE] /livetrades - Loading live trades page")
     with layout_render('Live Trades'):
         live_trades.content()
+
+@ui.page('/tools')
+def tools_page() -> None:
+    logger.debug("[ROUTE] /tools - Loading tools page")
+    with layout_render('Tools'):
+        tools.content()
 
 STATICPATH = Path(__file__).parent / 'static'
 FAVICO = (STATICPATH / 'favicon.ico')

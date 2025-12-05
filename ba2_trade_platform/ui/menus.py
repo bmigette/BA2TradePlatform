@@ -24,6 +24,11 @@ def sidemenu() -> None:
                 ui.icon('trending_up')
             with ui.item_section():
                 ui.item_label('Live Trades')
+        with ui.item(on_click=lambda: ui.navigate.to('/tools')):
+            with ui.item_section():
+                ui.icon('build')
+            with ui.item_section():
+                ui.item_label('Tools')
         with ui.item(on_click=lambda: ui.navigate.to('/settings')).classes('w-full'):
             with ui.item_section():
                 ui.icon('settings')
