@@ -56,7 +56,7 @@ from .fundamentals import (
 )
 from .macro import FREDMacroProvider
 from .insider import FMPInsiderProvider
-from .socialmedia import AISocialMediaSentiment, OpenAISocialMediaSentiment
+from .socialmedia import AISocialMediaSentiment
 
 # Provider registries - will be populated as providers are implemented
 OHLCV_PROVIDERS: Dict[str, Type[DataProviderInterface]] = {
@@ -108,7 +108,6 @@ INSIDER_PROVIDERS: Dict[str, Type[CompanyInsiderInterface]] = {
 
 SOCIALMEDIA_PROVIDERS: Dict[str, Type[SocialMediaDataProviderInterface]] = {
     "ai": AISocialMediaSentiment,
-    "openai": OpenAISocialMediaSentiment,  # Legacy - deprecated, use 'ai' instead
 }
 
 
@@ -249,7 +248,6 @@ __all__ = [
     "FREDMacroProvider",
     "FMPInsiderProvider",
     "AISocialMediaSentiment",
-    "OpenAISocialMediaSentiment",  # Legacy - deprecated
     
     # Interfaces
     "DataProviderInterface",
