@@ -1578,7 +1578,10 @@ class AlpacaAccount(AccountInterface):
         try:
             from sqlmodel import Session, select
             
-            triggered_count = 0
+            # Phase 1: Collect orders to submit (within session, read-only)
+            # We collect IDs and necessary data, then close session before submitting
+            orders_to_submit = []  # List of (order_id, parent_id) tuples
+            orders_to_error = []   # List of (order_id, reason) tuples for invalid orders
             
             with Session(get_db().bind) as session:
                 # Find all PENDING orders with dependencies
@@ -1618,23 +1621,47 @@ class AlpacaAccount(AccountInterface):
                     if dependency_met:
                         # Verify parent order has valid quantity before submitting dependent order
                         if not parent_order.quantity or parent_order.quantity <= 0:
-                            logger.warning(f"Cannot submit dependent order {order.id}: parent order {parent_order.id} has invalid quantity {parent_order.quantity}. Marking as ERROR.")
-                            order.status = OrderStatus.ERROR
-                            session.add(order)
-                            session.commit()
+                            logger.warning(f"Cannot submit dependent order {order.id}: parent order {parent_order.id} has invalid quantity {parent_order.quantity}. Will mark as ERROR.")
+                            orders_to_error.append((order.id, f"parent order {parent_order.id} has invalid quantity {parent_order.quantity}"))
                             continue
                         
-                        # Submit the dependent order
-                        logger.info(f"Submitting dependent order {order.id} (depends on {parent_order.id})")
-                        try:
-                            self.submit_order(order)
-                            triggered_count += 1
-                        except Exception as e:
-                            logger.error(f"Failed to submit dependent order {order.id}: {e}", exc_info=True)
-                            # Mark order as ERROR status
+                        # Queue for submission (will submit outside session)
+                        orders_to_submit.append((order.id, parent_order.id))
+            
+            # Session is now closed - safe to perform database operations
+            
+            # Phase 2: Mark invalid orders as ERROR
+            for order_id, reason in orders_to_error:
+                try:
+                    order = get_instance(TradingOrder, order_id)
+                    if order:
+                        order.status = OrderStatus.ERROR
+                        update_instance(order)
+                except Exception as e:
+                    logger.error(f"Failed to mark order {order_id} as ERROR: {e}", exc_info=True)
+            
+            # Phase 3: Submit dependent orders (outside the session to avoid locks)
+            triggered_count = 0
+            for order_id, parent_id in orders_to_submit:
+                logger.info(f"Submitting dependent order {order_id} (depends on {parent_id})")
+                try:
+                    # Re-fetch the order fresh for submission
+                    order = get_instance(TradingOrder, order_id)
+                    if order and order.status == OrderStatus.PENDING:
+                        self.submit_order(order)
+                        triggered_count += 1
+                    else:
+                        logger.warning(f"Order {order_id} no longer PENDING (status={order.status if order else 'NOT FOUND'}), skipping submission")
+                except Exception as e:
+                    logger.error(f"Failed to submit dependent order {order_id}: {e}", exc_info=True)
+                    # Mark order as ERROR status
+                    try:
+                        order = get_instance(TradingOrder, order_id)
+                        if order:
                             order.status = OrderStatus.ERROR
-                            session.add(order)
-                            session.commit()
+                            update_instance(order)
+                    except Exception as e2:
+                        logger.error(f"Failed to mark order {order_id} as ERROR after submission failure: {e2}", exc_info=True)
             
             if triggered_count > 0:
                 logger.info(f"Triggered {triggered_count} dependent orders")

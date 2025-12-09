@@ -993,10 +993,16 @@ class OverviewTab:
                                 bucket_date = datetime.fromtimestamp(bucket_start_time)
                                 
                                 # Calculate daily cost from results array
-                                daily_cost = 0
+                                daily_cost = 0.0
                                 for result in cost_bucket.get('results', []):
                                     amount = result.get('amount', {})
-                                    daily_cost += amount.get('value', 0)
+                                    # API may return value as string, ensure float conversion
+                                    value = amount.get('value', 0)
+                                    try:
+                                        daily_cost += float(value) if value else 0.0
+                                    except (ValueError, TypeError):
+                                        logger.warning(f"[OpenAI Usage] Invalid amount value: {value}")
+                                        continue
                                 
                                 # Add to appropriate time periods
                                 if bucket_date >= week_ago:
