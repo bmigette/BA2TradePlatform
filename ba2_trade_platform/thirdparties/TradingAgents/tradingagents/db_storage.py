@@ -394,9 +394,6 @@ class LoggingToolNode:
                 for tool_call in message.tool_calls:
                     original_id = tool_call.get("id", "")
                     
-                    # Log tool call for debugging
-                    logger.debug(f"Processing tool_call: name={tool_call.get('name')}, id_length={len(original_id)}")
-                    
                     # Check if call_id exceeds OpenAI's 64-char limit
                     if len(original_id) > 64:
                         needs_truncation = True

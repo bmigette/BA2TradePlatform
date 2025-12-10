@@ -353,6 +353,7 @@ class ActivityLogType(str, Enum):
     ORDER_REJECTED = "order_rejected"
     EXPERT_RECOMMENDATION = "expert_recommendation"
     RULE_EXECUTED = "rule_executed"
+    TP_SL_ADJUSTED = "tp_sl_adjusted"
 
 def get_reference_value_options():
     """Return dictionary of reference value options with user-friendly labels."""

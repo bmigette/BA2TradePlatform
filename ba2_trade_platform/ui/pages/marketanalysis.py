@@ -835,7 +835,6 @@ class JobMonitoringTab:
                 
                 # Get batch_id from task
                 task_batch_id = getattr(task, 'batch_id', None) or ''
-                logger.debug(f"Task {getattr(task, 'id', 'Unknown')} batch_id: '{task_batch_id}' (type: {type(getattr(task, 'batch_id', None))})")
                 
                 formatted_tasks.append({
                     'task_id': getattr(task, 'id', 'Unknown'),

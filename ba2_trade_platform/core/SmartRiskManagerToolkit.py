@@ -1304,6 +1304,19 @@ class SmartRiskManagerToolkit:
         try:
             logger.info(f"Adjusting quantity for transaction {transaction_id} to {new_quantity}. Reason: {reason}")
             
+            # SECURITY CHECK: Validate transaction belongs to this expert
+            try:
+                self._validate_transaction_ownership(transaction_id)
+            except ValueError as e:
+                logger.error(f"Transaction ownership validation failed: {e}")
+                return {
+                    "success": False,
+                    "message": str(e),
+                    "order_id": None,
+                    "old_quantity": None,
+                    "new_quantity": new_quantity
+                }
+            
             with get_db() as session:
                 transaction = session.get(Transaction, transaction_id)
                 if not transaction:
@@ -1440,6 +1453,19 @@ class SmartRiskManagerToolkit:
         try:
             logger.info(f"Updating stop loss for transaction {transaction_id} to {new_sl_price}. Reason: {reason}")
             
+            # SECURITY CHECK: Validate transaction belongs to this expert
+            try:
+                self._validate_transaction_ownership(transaction_id)
+            except ValueError as e:
+                logger.error(f"Transaction ownership validation failed: {e}")
+                return {
+                    "success": False,
+                    "message": str(e),
+                    "order_id": None,
+                    "old_sl_price": None,
+                    "new_sl_price": new_sl_price
+                }
+            
             with get_db() as session:
                 transaction = session.get(Transaction, transaction_id)
                 if not transaction:
@@ -1570,6 +1596,19 @@ class SmartRiskManagerToolkit:
         """
         try:
             logger.info(f"Updating take profit for transaction {transaction_id} to {new_tp_price}. Reason: {reason}")
+            
+            # SECURITY CHECK: Validate transaction belongs to this expert
+            try:
+                self._validate_transaction_ownership(transaction_id)
+            except ValueError as e:
+                logger.error(f"Transaction ownership validation failed: {e}")
+                return {
+                    "success": False,
+                    "message": str(e),
+                    "order_id": None,
+                    "old_tp_price": None,
+                    "new_tp_price": new_tp_price
+                }
             
             with get_db() as session:
                 transaction = session.get(Transaction, transaction_id)

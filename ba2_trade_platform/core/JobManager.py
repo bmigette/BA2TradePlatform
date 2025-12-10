@@ -777,10 +777,10 @@ class JobManager:
         except Exception as e:
             logger.error(f"Error executing scheduled analysis for expert {expert_instance_id}, symbol {symbol}, subtype {subtype}: {e}", exc_info=True)
 
-    def _execute_dynamic_analysis(self, expert_instance_id: int, subtype: str):
+    def _execute_dynamic_analysis(self, expert_instance_id: int, subtype: str, batch_id: Optional[str] = None):
         """Execute dynamic AI-driven instrument selection and analysis."""
         try:
-            logger.info(f"Executing dynamic analysis for expert {expert_instance_id}")
+            logger.info(f"Executing dynamic analysis for expert {expert_instance_id}, batch_id={batch_id}")
             
             from .utils import get_expert_instance_from_id
             expert = get_expert_instance_from_id(expert_instance_id)
@@ -852,7 +852,8 @@ class JobManager:
                         expert_instance_id=expert_instance_id,
                         symbol=instrument,
                         subtype=subtype,
-                        priority=0  # High priority - execute expansion results ASAP
+                        priority=0,  # High priority - execute expansion results ASAP
+                        batch_id=batch_id
                     )
                     logger.debug(f"Submitted dynamic analysis for {instrument}: {task_id}")
                     
@@ -862,10 +863,10 @@ class JobManager:
         except Exception as e:
             logger.error(f"Error in dynamic analysis for expert {expert_instance_id}: {e}", exc_info=True)
 
-    def _execute_expert_driven_analysis(self, expert_instance_id: int, subtype: str):
+    def _execute_expert_driven_analysis(self, expert_instance_id: int, subtype: str, batch_id: Optional[str] = None):
         """Execute expert-driven instrument selection and analysis."""
         try:
-            logger.info(f"Executing expert-driven analysis for expert {expert_instance_id}")
+            logger.info(f"Executing expert-driven analysis for expert {expert_instance_id}, batch_id={batch_id}")
             
             from .utils import get_expert_instance_from_id
             expert = get_expert_instance_from_id(expert_instance_id)
@@ -893,7 +894,8 @@ class JobManager:
                         expert_instance_id=expert_instance_id,
                         symbol="EXPERT",
                         subtype=subtype,
-                        priority=0  # High priority - execute expansion results ASAP
+                        priority=0,  # High priority - execute expansion results ASAP
+                        batch_id=batch_id
                     )
                     logger.info(f"Submitted expert-driven analysis with EXPERT symbol directly: {task_id}")
                 except Exception as e:
@@ -941,7 +943,8 @@ class JobManager:
                         expert_instance_id=expert_instance_id,
                         symbol=instrument,
                         subtype=subtype,
-                        priority=0  # High priority - execute expansion results ASAP
+                        priority=0,  # High priority - execute expansion results ASAP
+                        batch_id=batch_id
                     )
                     logger.debug(f"Submitted expert-driven analysis for {instrument}: {task_id}")
                     
@@ -951,7 +954,7 @@ class JobManager:
         except Exception as e:
             logger.error(f"Error in expert-driven analysis for expert {expert_instance_id}: {e}", exc_info=True)
     
-    def _execute_open_positions_analysis(self, expert_instance_id: int, subtype: str):
+    def _execute_open_positions_analysis(self, expert_instance_id: int, subtype: str, batch_id: Optional[str] = None):
         """
         Execute open positions analysis by expanding into individual jobs for each open position.
         
@@ -966,9 +969,10 @@ class JobManager:
         Args:
             expert_instance_id: The expert instance ID
             subtype: The analysis subtype (should be OPEN_POSITIONS)
+            batch_id: Optional batch identifier for grouping related jobs
         """
         try:
-            logger.info(f"Executing open positions analysis for expert {expert_instance_id}")
+            logger.info(f"Executing open positions analysis for expert {expert_instance_id}, batch_id={batch_id}")
             
             from sqlmodel import select, Session
             from .db import get_db
@@ -996,7 +1000,8 @@ class JobManager:
                         expert_instance_id=expert_instance_id,
                         symbol=symbol,
                         subtype=subtype,
-                        priority=0  # High priority - execute expansion results ASAP
+                        priority=0,  # High priority - execute expansion results ASAP
+                        batch_id=batch_id
                     )
                     logger.debug(f"Submitted open positions analysis for {symbol}: {task_id}")
                     

@@ -209,7 +209,9 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         self.graph_setup = None
         self.graph = None
 
-        self.propagator = Propagator()
+        # Get recursion limit from config (default 100, can be increased for complex analyses)
+        max_recur_limit = self.config.get('max_recur_limit', 100)
+        self.propagator = Propagator(max_recur_limit=max_recur_limit)
         self.reflector = Reflector(self.quick_thinking_llm)
         self.signal_processor = SignalProcessor(self.quick_thinking_llm)
 
@@ -377,26 +379,49 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         
         # Wrap toolkit methods with @tool decorator for LangChain compatibility
         # This creates proper Tool objects from instance methods
+        # NOTE: Parameters that are Optional in the toolkit should have defaults here too
+        # to prevent "Field required" errors when AI omits optional parameters
         
         @tool
         def get_ohlcv_data(
             symbol: str,
-            start_date: str,
-            end_date: str,
+            start_date: str = None,
+            end_date: str = None,
             interval: str = None
         ) -> str:
-            """Get OHLCV stock price data."""
+            """Get OHLCV (Open, High, Low, Close, Volume) stock price data.
+            
+            Args:
+                symbol: REQUIRED. Stock ticker symbol (e.g., 'AAPL', 'NVDA', 'TSLA'). This must be provided.
+                start_date: Optional. Start date for data range. Defaults to 30 days ago if not provided.
+                end_date: Optional. End date for data range. Defaults to today if not provided.
+                interval: Optional. Data interval. Defaults to configured timeframe.
+            
+            Returns:
+                str: OHLCV price data for the specified symbol.
+            """
             return self.toolkit.get_ohlcv_data(symbol, start_date, end_date, interval)
         
         @tool
         def get_indicator_data(
             symbol: str,
             indicator: str,
-            start_date: str,
-            end_date: str,
+            start_date: str = None,
+            end_date: str = None,
             interval: str = None
         ) -> str:
-            """Get technical indicator data."""
+            """Get technical indicator data for a stock.
+            
+            Args:
+                symbol: REQUIRED. Stock ticker symbol (e.g., 'AAPL', 'NVDA', 'TSLA'). This must be provided.
+                indicator: REQUIRED. Technical indicator name (e.g., 'rsi', 'macd', 'boll', 'atr', 'close_50_sma').
+                start_date: Optional. Start date for data range. Defaults to 30 days ago if not provided.
+                end_date: Optional. End date for data range. Defaults to today if not provided.
+                interval: Optional. Data interval. Defaults to configured timeframe.
+            
+            Returns:
+                str: Technical indicator data for the specified symbol.
+            """
             return self.toolkit.get_indicator_data(symbol, indicator, start_date, end_date, interval)
         
         @tool
@@ -405,7 +430,16 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             end_date: str,
             lookback_days: int = None
         ) -> str:
-            """Get news articles about a specific company."""
+            """Get news articles about a specific company.
+            
+            Args:
+                symbol: REQUIRED. Stock ticker symbol (e.g., 'AAPL', 'NVDA', 'TSLA'). This must be provided.
+                end_date: REQUIRED. End date for news search (format: YYYY-MM-DD).
+                lookback_days: Optional. Number of days to look back. Defaults to configured value.
+            
+            Returns:
+                str: News articles about the specified company.
+            """
             return self.toolkit.get_company_news(symbol, end_date, lookback_days)
         
         @tool
@@ -431,7 +465,16 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             end_date: str,
             lookback_days: int = None
         ) -> str:
-            """Retrieve social media sentiment and discussions about a specific company."""
+            """Retrieve social media sentiment and discussions about a specific company.
+            
+            Args:
+                symbol: REQUIRED. Stock ticker symbol (e.g., 'AAPL', 'NVDA', 'TSLA'). This must be provided.
+                end_date: REQUIRED. End date for sentiment search (format: YYYY-MM-DD).
+                lookback_days: Optional. Number of days to look back. Defaults to configured value.
+            
+            Returns:
+                str: Social media sentiment data for the specified company.
+            """
             return self.toolkit.get_social_media_sentiment(symbol, end_date, lookback_days)
         
         @tool
@@ -949,7 +992,8 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                 if hasattr(message, 'tool_calls') and message.tool_calls:
                     logger.info(f"Tool Calls: {len(message.tool_calls)}")
                     for i, tc in enumerate(message.tool_calls, 1):
-                        logger.info(f"  {i}. {tc.get('name', 'Unknown')} - {tc.get('id', 'Unknown')}")
+                        tool_args = tc.get('args', {})
+                        logger.info(f"  {i}. {tc.get('name', 'Unknown')} - {tc.get('id', 'Unknown')} - args: {tool_args}")
                 logger.info(f"{'=' * 80}")
             elif isinstance(message, HumanMessage):
                 # Format Human Messages

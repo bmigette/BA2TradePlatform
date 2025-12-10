@@ -1193,13 +1193,13 @@ class WorkerQueue:
             
             # Execute appropriate expansion method based on type
             if task.expansion_type == "DYNAMIC":
-                job_manager._execute_dynamic_analysis(task.expert_instance_id, task.subtype)
+                job_manager._execute_dynamic_analysis(task.expert_instance_id, task.subtype, batch_id=task.batch_id)
                 logger.info(f"Dynamic analysis expansion completed for expert {task.expert_instance_id}")
             elif task.expansion_type == "EXPERT":
-                job_manager._execute_expert_driven_analysis(task.expert_instance_id, task.subtype)
+                job_manager._execute_expert_driven_analysis(task.expert_instance_id, task.subtype, batch_id=task.batch_id)
                 logger.info(f"Expert-driven analysis expansion completed for expert {task.expert_instance_id}")
             elif task.expansion_type == "OPEN_POSITIONS":
-                job_manager._execute_open_positions_analysis(task.expert_instance_id, task.subtype)
+                job_manager._execute_open_positions_analysis(task.expert_instance_id, task.subtype, batch_id=task.batch_id)
                 logger.info(f"Open positions analysis expansion completed for expert {task.expert_instance_id}")
             else:
                 raise ValueError(f"Unknown expansion type: {task.expansion_type}")
