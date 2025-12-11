@@ -82,7 +82,7 @@ PROVIDER_CONFIG: Dict[str, Dict[str, Any]] = {
     },
     PROVIDER_MOONSHOT: {
         "display_name": "Moonshot",
-        "base_url": None,  # MoonshotChat uses default endpoint
+        "base_url": "https://api.moonshot.ai/v1",  # International endpoint (not .cn)
         "api_key_setting": "moonshot_api_key",
         "langchain_class": "MoonshotChat",  # langchain_community.chat_models.moonshot
         "api_key_env_var": "MOONSHOT_API_KEY",
@@ -177,6 +177,33 @@ MODELS: Dict[str, Dict[str, Any]] = {
         },
         "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_TOOL_CALLING],
         "supports_parameters": ["reasoning_effort"],  # Supports {reasoning=effort:low/medium/high}
+    },
+    
+    # =========================================================================
+    # GPT-5.2 Family (latest with enhanced reasoning)
+    # =========================================================================
+    "gpt5.2": {
+        "native_provider": PROVIDER_OPENAI,
+        "display_name": "GPT-5.2",
+        "description": "Latest GPT-5.2 with enhanced reasoning and tool use",
+        "provider_names": {
+            PROVIDER_OPENAI: "gpt-5.2-2025-12-09",
+            PROVIDER_NAGAAI: "gpt-5.2-2025-12-09",
+            PROVIDER_OPENROUTER: "openai/gpt-5.2-2025-12-09",
+        },
+        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_TOOL_CALLING],
+        "supports_parameters": ["reasoning_effort"],  # Supports {reasoning_effort:low/medium/high}
+    },
+    "gpt5.2_mini": {
+        "native_provider": PROVIDER_OPENAI,
+        "display_name": "GPT-5.2 Mini",
+        "description": "Smaller, faster GPT-5.2 variant with excellent performance",
+        "provider_names": {
+            PROVIDER_OPENAI: "gpt-5.2-mini-2025-12-09",
+            PROVIDER_NAGAAI: "gpt-5.2-mini-2025-12-09",
+            PROVIDER_OPENROUTER: "openai/gpt-5.2-mini-2025-12-09",
+        },
+        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING],
     },
     
     # =========================================================================
@@ -445,6 +472,17 @@ MODELS: Dict[str, Dict[str, Any]] = {
     # =========================================================================
     # Google Gemini Family
     # =========================================================================
+    "gemini_3_pro": {
+        "native_provider": PROVIDER_GOOGLE,
+        "display_name": "Gemini 3 Pro Preview",
+        "description": "Google's latest Gemini 3 Pro model with advanced reasoning",
+        "provider_names": {
+            PROVIDER_GOOGLE: "gemini-3-pro-preview",
+            PROVIDER_NAGAAI: "gemini-3-pro-preview",
+            PROVIDER_OPENROUTER: "google/gemini-3-pro-preview",
+        },
+        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_VISION, LABEL_TOOL_CALLING],
+    },
     "gemini_2.5_pro": {
         "native_provider": PROVIDER_GOOGLE,
         "display_name": "Gemini 2.5 Pro",

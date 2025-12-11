@@ -11,7 +11,7 @@ from langgraph.prebuilt import ToolNode
 from ..agents import *
 from ..default_config import DEFAULT_CONFIG
 from ..agents.utils.memory import FinancialSituationMemory
-from ..agents.utils.agent_utils_new import Toolkit  # Use new toolkit
+from ..agents.utils.agent_utils_new import Toolkit, AllProvidersFailedError  # Use new toolkit
 from ..agents.utils.agent_states import (
     AgentState,
     InvestDebateState,
@@ -715,6 +715,26 @@ class TradingAgentsGraph(DatabaseStorageMixin):
 
             # Return decision and processed signal
             return final_state, self.process_signal(final_state["final_trade_decision"])
+            
+        except AllProvidersFailedError as e:
+            # Critical error - all configured providers for a data category failed
+            # This should stop the analysis immediately
+            logger.error(f"CRITICAL: All {e.category} providers failed for {company_name}: {e}", exc_info=True)
+            if self.market_analysis_id:
+                error_state = {
+                    "error": f"All {e.category} providers failed",
+                    "error_details": e.provider_errors,
+                    "error_timestamp": datetime.now(timezone.utc).isoformat(),
+                    "failed_step": f"data_fetch_{e.category}",
+                    "ticker": company_name
+                }
+                self._sync_state_to_market_analysis(error_state, "critical_error")
+                self.update_analysis_status("failed", {
+                    "error": str(e),
+                    "category": e.category,
+                    "provider_errors": e.provider_errors
+                })
+            raise
             
         except Exception as e:
             logger.error(f"Error during analysis for {company_name}: {str(e)}", exc_info=True)

@@ -749,7 +749,8 @@ class ModelBillingUsage:
     async def get_deepseek_usage_async(cls) -> Dict[str, Any]:
         """Fetch DeepSeek usage data from the API asynchronously.
         
-        DeepSeek provides a balance API endpoint.
+        DeepSeek provides a balance API endpoint at /user/balance.
+        Returns balance info including available balance and currency.
         
         Returns:
             Dictionary with usage status and balance
@@ -760,31 +761,73 @@ class ModelBillingUsage:
             if not api_key:
                 return {'error': 'DeepSeek API key not configured in settings'}
             
-            headers = {'Authorization': f'Bearer {api_key}'}
+            headers = {
+                'Authorization': f'Bearer {api_key}',
+                'Accept': 'application/json'
+            }
+            
+            now = datetime.now()
             
             try:
                 async with aiohttp.ClientSession() as session:
-                    # DeepSeek has a balance endpoint
+                    # DeepSeek balance endpoint: GET https://api.deepseek.com/user/balance
                     balance_url = 'https://api.deepseek.com/user/balance'
                     
-                    async with session.get(balance_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    async with session.get(balance_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                        logger.debug(f'[DeepSeek Usage] Balance API response status: {response.status}')
+                        
                         if response.status == 200:
                             data = await response.json()
-                            # DeepSeek returns balance info
-                            balance_info = data.get('balance_infos', [{}])[0] if data.get('balance_infos') else {}
+                            logger.debug(f'[DeepSeek Usage] Balance response: {data}')
+                            
+                            # DeepSeek returns:
+                            # {
+                            #   "is_available": true,
+                            #   "balance_infos": [
+                            #     {"currency": "CNY", "total_balance": "10.00", "granted_balance": "0.00", "topped_up_balance": "10.00"}
+                            #   ]
+                            # }
+                            is_available = data.get('is_available', True)
+                            balance_infos = data.get('balance_infos', [])
+                            
+                            total_balance = 0.0
+                            currency = 'CNY'
+                            granted_balance = 0.0
+                            topped_up_balance = 0.0
+                            
+                            if balance_infos:
+                                # Usually just one entry, but handle multiple
+                                for info in balance_infos:
+                                    currency = info.get('currency', 'CNY')
+                                    try:
+                                        total_balance += float(info.get('total_balance', 0))
+                                        granted_balance += float(info.get('granted_balance', 0))
+                                        topped_up_balance += float(info.get('topped_up_balance', 0))
+                                    except (ValueError, TypeError) as e:
+                                        logger.warning(f'[DeepSeek Usage] Error parsing balance: {e}')
                             
                             return {
                                 'provider': 'deepseek',
                                 'provider_display': 'DeepSeek',
-                                'remaining_credit': float(balance_info.get('total_balance', 0)),
-                                'currency': balance_info.get('currency', 'CNY'),
-                                'status': 'configured',
-                                'last_updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                'remaining_credit': total_balance,
+                                'granted_balance': granted_balance,
+                                'topped_up_balance': topped_up_balance,
+                                'currency': currency,
+                                'is_available': is_available,
+                                'status': 'configured' if is_available else 'insufficient_balance',
+                                'last_updated': now.strftime('%Y-%m-%d %H:%M:%S'),
                             }
                         elif response.status == 401:
+                            error_text = await response.text()
+                            logger.error(f'[DeepSeek Usage] Auth error: {error_text}')
                             return {'error': 'Invalid DeepSeek API key'}
+                        elif response.status == 403:
+                            return {'error': 'DeepSeek API key lacks permission to check balance'}
                         else:
-                            # Try to verify key with models endpoint
+                            error_text = await response.text()
+                            logger.error(f'[DeepSeek Usage] API error {response.status}: {error_text}')
+                            
+                            # Fallback: try to verify key with models endpoint
                             models_url = 'https://api.deepseek.com/v1/models'
                             async with session.get(models_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as models_response:
                                 if models_response.status == 200:
@@ -792,18 +835,87 @@ class ModelBillingUsage:
                                         'provider': 'deepseek',
                                         'provider_display': 'DeepSeek',
                                         'status': 'configured',
-                                        'note': 'Balance API not available',
-                                        'last_updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                        'note': 'Balance API returned error, but key is valid',
+                                        'last_updated': now.strftime('%Y-%m-%d %H:%M:%S'),
                                     }
                             return {
                                 'provider': 'deepseek',
                                 'provider_display': 'DeepSeek',
-                                'status': 'unknown',
-                                'note': 'Could not verify API key status',
-                                'last_updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                'status': 'error',
+                                'error': f'Balance API error ({response.status})',
+                                'last_updated': now.strftime('%Y-%m-%d %H:%M:%S'),
                             }
                             
             except aiohttp.ClientError as e:
+                logger.error(f'Network error calling DeepSeek API: {e}', exc_info=True)
+                return {'error': f'Network error: {str(e)}'}
+                
+        except Exception as e:
+            logger.error(f'Unexpected error checking DeepSeek API: {e}', exc_info=True)
+            return {'error': f'Unexpected error: {str(e)}'}
+    
+    @classmethod
+    def get_deepseek_usage_sync(cls) -> Dict[str, Any]:
+        """Fetch DeepSeek usage data from the API synchronously.
+        
+        Returns:
+            Dictionary with usage data (same format as async version)
+        """
+        try:
+            api_key = cls._get_app_setting('deepseek_api_key')
+            
+            if not api_key:
+                return {'error': 'DeepSeek API key not configured in settings'}
+            
+            headers = {
+                'Authorization': f'Bearer {api_key}',
+                'Accept': 'application/json'
+            }
+            
+            now = datetime.now()
+            
+            try:
+                balance_url = 'https://api.deepseek.com/user/balance'
+                response = requests.get(balance_url, headers=headers, timeout=15)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    
+                    is_available = data.get('is_available', True)
+                    balance_infos = data.get('balance_infos', [])
+                    
+                    total_balance = 0.0
+                    currency = 'CNY'
+                    granted_balance = 0.0
+                    topped_up_balance = 0.0
+                    
+                    if balance_infos:
+                        for info in balance_infos:
+                            currency = info.get('currency', 'CNY')
+                            try:
+                                total_balance += float(info.get('total_balance', 0))
+                                granted_balance += float(info.get('granted_balance', 0))
+                                topped_up_balance += float(info.get('topped_up_balance', 0))
+                            except (ValueError, TypeError):
+                                pass
+                    
+                    return {
+                        'provider': 'deepseek',
+                        'provider_display': 'DeepSeek',
+                        'remaining_credit': total_balance,
+                        'granted_balance': granted_balance,
+                        'topped_up_balance': topped_up_balance,
+                        'currency': currency,
+                        'is_available': is_available,
+                        'status': 'configured' if is_available else 'insufficient_balance',
+                        'last_updated': now.strftime('%Y-%m-%d %H:%M:%S'),
+                    }
+                elif response.status_code == 401:
+                    return {'error': 'Invalid DeepSeek API key'}
+                else:
+                    return {'error': f'DeepSeek API error ({response.status_code})'}
+                    
+            except requests.exceptions.RequestException as e:
                 logger.error(f'Network error calling DeepSeek API: {e}', exc_info=True)
                 return {'error': f'Network error: {str(e)}'}
                 
@@ -819,8 +931,11 @@ class ModelBillingUsage:
     async def get_moonshot_usage_async(cls) -> Dict[str, Any]:
         """Fetch Moonshot (Kimi) usage data from the API asynchronously.
         
+        Moonshot provides a balance API endpoint at /v1/users/me/balance.
+        Returns available_balance, voucher_balance, and cash_balance in CNY.
+        
         Returns:
-            Dictionary with usage status
+            Dictionary with usage status and balance
         """
         try:
             api_key = cls._get_app_setting('moonshot_api_key')
@@ -828,34 +943,134 @@ class ModelBillingUsage:
             if not api_key:
                 return {'error': 'Moonshot API key not configured in settings'}
             
-            headers = {'Authorization': f'Bearer {api_key}'}
+            headers = {
+                'Authorization': f'Bearer {api_key}',
+                'Accept': 'application/json'
+            }
+            
+            now = datetime.now()
             
             try:
                 async with aiohttp.ClientSession() as session:
-                    # Try to get models list to verify key
-                    test_url = 'https://api.moonshot.cn/v1/models'
+                    # Moonshot balance endpoint: GET https://api.moonshot.ai/v1/users/me/balance (international)
+                    balance_url = 'https://api.moonshot.ai/v1/users/me/balance'
                     
-                    async with session.get(test_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    async with session.get(balance_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                        logger.debug(f'[Moonshot Usage] Balance API response status: {response.status}')
+                        
                         if response.status == 200:
+                            data = await response.json()
+                            logger.debug(f'[Moonshot Usage] Balance response: {data}')
+                            
+                            # Moonshot returns:
+                            # {
+                            #   "data": {
+                            #     "available_balance": 49.58,
+                            #     "voucher_balance": 46.58,
+                            #     "cash_balance": 3.00
+                            #   }
+                            # }
+                            balance_data = data.get('data', data)
+                            
+                            available_balance = float(balance_data.get('available_balance', 0))
+                            voucher_balance = float(balance_data.get('voucher_balance', 0))
+                            cash_balance = float(balance_data.get('cash_balance', 0))
+                            
                             return {
                                 'provider': 'moonshot',
                                 'provider_display': 'Moonshot (Kimi)',
-                                'status': 'configured',
-                                'note': 'Moonshot usage details available at platform.moonshot.cn',
-                                'last_updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                'remaining_credit': available_balance,
+                                'voucher_balance': voucher_balance,
+                                'cash_balance': cash_balance,
+                                'currency': 'CNY',
+                                'status': 'configured' if available_balance > 0 else 'low_balance',
+                                'last_updated': now.strftime('%Y-%m-%d %H:%M:%S'),
                             }
                         elif response.status == 401:
+                            error_text = await response.text()
+                            logger.error(f'[Moonshot Usage] Auth error: {error_text}')
                             return {'error': 'Invalid Moonshot API key'}
+                        elif response.status == 403:
+                            return {'error': 'Moonshot API key lacks permission to check balance'}
                         else:
+                            error_text = await response.text()
+                            logger.error(f'[Moonshot Usage] API error {response.status}: {error_text}')
+                            
+                            # Fallback: try to verify key with models endpoint
+                            models_url = 'https://api.moonshot.ai/v1/models'
+                            async with session.get(models_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as models_response:
+                                if models_response.status == 200:
+                                    return {
+                                        'provider': 'moonshot',
+                                        'provider_display': 'Moonshot (Kimi)',
+                                        'status': 'configured',
+                                        'note': 'Balance API returned error, but key is valid',
+                                        'last_updated': now.strftime('%Y-%m-%d %H:%M:%S'),
+                                    }
                             return {
                                 'provider': 'moonshot',
                                 'provider_display': 'Moonshot (Kimi)',
-                                'status': 'unknown',
-                                'note': 'Could not verify API key status',
-                                'last_updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                'status': 'error',
+                                'error': f'Balance API error ({response.status})',
+                                'last_updated': now.strftime('%Y-%m-%d %H:%M:%S'),
                             }
                             
             except aiohttp.ClientError as e:
+                logger.error(f'Network error calling Moonshot API: {e}', exc_info=True)
+                return {'error': f'Network error: {str(e)}'}
+                
+        except Exception as e:
+            logger.error(f'Unexpected error checking Moonshot API: {e}', exc_info=True)
+            return {'error': f'Unexpected error: {str(e)}'}
+    
+    @classmethod
+    def get_moonshot_usage_sync(cls) -> Dict[str, Any]:
+        """Fetch Moonshot (Kimi) usage data from the API synchronously.
+        
+        Returns:
+            Dictionary with usage data (same format as async version)
+        """
+        try:
+            api_key = cls._get_app_setting('moonshot_api_key')
+            
+            if not api_key:
+                return {'error': 'Moonshot API key not configured in settings'}
+            
+            headers = {
+                'Authorization': f'Bearer {api_key}',
+                'Accept': 'application/json'
+            }
+            
+            now = datetime.now()
+            
+            try:
+                balance_url = 'https://api.moonshot.ai/v1/users/me/balance'
+                response = requests.get(balance_url, headers=headers, timeout=15)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    balance_data = data.get('data', data)
+                    
+                    available_balance = float(balance_data.get('available_balance', 0))
+                    voucher_balance = float(balance_data.get('voucher_balance', 0))
+                    cash_balance = float(balance_data.get('cash_balance', 0))
+                    
+                    return {
+                        'provider': 'moonshot',
+                        'provider_display': 'Moonshot (Kimi)',
+                        'remaining_credit': available_balance,
+                        'voucher_balance': voucher_balance,
+                        'cash_balance': cash_balance,
+                        'currency': 'CNY',
+                        'status': 'configured' if available_balance > 0 else 'low_balance',
+                        'last_updated': now.strftime('%Y-%m-%d %H:%M:%S'),
+                    }
+                elif response.status_code == 401:
+                    return {'error': 'Invalid Moonshot API key'}
+                else:
+                    return {'error': f'Moonshot API error ({response.status_code})'}
+                    
+            except requests.exceptions.RequestException as e:
                 logger.error(f'Network error calling Moonshot API: {e}', exc_info=True)
                 return {'error': f'Network error: {str(e)}'}
                 

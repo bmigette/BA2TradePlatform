@@ -5,18 +5,16 @@ Providers for high-level company fundamentals (P/E ratio, market cap, EPS, etc.)
 
 Available Providers:
     - AlphaVantage: Company overview from Alpha Vantage API
-    - OpenAI: AI-generated company fundamentals summaries
+    - AI: AI-powered company fundamentals (supports OpenAI, NagaAI, etc.)
     - FMP: Company profile from Financial Modeling Prep API
 """
 
 from .AlphaVantageCompanyOverviewProvider import AlphaVantageCompanyOverviewProvider
 from .AICompanyOverviewProvider import AICompanyOverviewProvider
-from .OpenAICompanyOverviewProvider import OpenAICompanyOverviewProvider  # Legacy - deprecated
 from .FMPCompanyOverviewProvider import FMPCompanyOverviewProvider
 
 __all__ = [
     "AlphaVantageCompanyOverviewProvider",
     "AICompanyOverviewProvider",
-    "OpenAICompanyOverviewProvider",  # Legacy - deprecated
     "FMPCompanyOverviewProvider",
 ]

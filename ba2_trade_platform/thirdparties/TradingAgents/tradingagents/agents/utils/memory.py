@@ -9,31 +9,41 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 class FinancialSituationMemory:
     def __init__(self, name, config, symbol=None, market_analysis_id=None, expert_instance_id=None):
-        # Get embedding model from config (with backward compatibility)
-        if config.get("backend_url") == "http://localhost:11434/v1":
-            self.embedding = "nomic-embed-text"
-            embedding_backend_url = config["backend_url"]
-            embedding_api_key_setting = None
+        # Get embedding model from config
+        # Format: "Provider/model_name" e.g., "OpenAI/text-embedding-3-small" or "NagaAI/text-embedding-3-small"
+        embedding_selection = config.get("embedding_model", "OpenAI/text-embedding-3-small")
+        
+        # Parse the embedding model selection to get provider and model name
+        if "/" in embedding_selection:
+            provider, model_name = embedding_selection.split("/", 1)
+            provider = provider.lower()
         else:
-            # Use embedding-specific config if available, otherwise fallback to main backend_url
-            self.embedding = config["embedding_model"]
-            embedding_backend_url = config["embedding_backend_url"]
-            embedding_api_key_setting = config["embedding_api_key_setting"]
-            
-        # Get API key from config
+            # Assume OpenAI if no provider prefix
+            provider = "openai"
+            model_name = embedding_selection
+        
+        self.embedding = model_name
+        
+        # Get provider configuration from models_registry
         try:
-            from ...dataflows.config import get_openai_api_key
-            # If we have embedding-specific API key setting, get that one
-            if embedding_api_key_setting:
-                from ba2_trade_platform.core.db import get_setting
-                api_key = get_setting(embedding_api_key_setting)
-                if not api_key:
-                    # Fallback to openai_api_key
-                    api_key = get_openai_api_key()
-            else:
-                api_key = get_openai_api_key()
+            from ba2_trade_platform.core.models_registry import PROVIDER_CONFIG
+            from ba2_trade_platform.config import get_app_setting
+            
+            provider_config = PROVIDER_CONFIG.get(provider, {})
+            embedding_backend_url = provider_config.get("base_url", "https://api.openai.com/v1")
+            api_key_setting = provider_config.get("api_key_setting", "openai_api_key")
+            
+            # Get API key from app settings
+            api_key = get_app_setting(api_key_setting)
+            if not api_key:
+                # Fallback to openai_api_key
+                api_key = get_app_setting("openai_api_key")
+                
         except ImportError:
-            api_key = None
+            # Fallback for older configurations
+            from ...dataflows.config import get_openai_api_key
+            embedding_backend_url = "https://api.openai.com/v1"
+            api_key = get_openai_api_key()
             
         self.client = OpenAI(base_url=embedding_backend_url, api_key=api_key)
         

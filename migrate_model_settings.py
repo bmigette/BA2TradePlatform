@@ -38,6 +38,7 @@ MODEL_SETTING_KEYS = [
     'deep_think_llm',
     'quick_think_llm', 
     'risk_manager_model',
+    'dataprovider_websearch_model',
 ]
 
 
@@ -103,14 +104,15 @@ def build_model_name_mapping():
         "claude-4-sonnet": "claude4_sonnet",
         
         # Gemini family
-        "gemini-1.5-pro": "gemini15_pro",
-        "gemini-1.5-flash": "gemini15_flash",
-        "gemini-2.0-pro": "gemini20_pro",
-        "gemini-2.0-flash": "gemini20_flash",
-        "gemini-2.5-pro": "gemini25_pro",
-        "gemini-2.5-flash": "gemini25_flash",
-        "gemini-3-pro-preview": "gemini3_pro",
-        "gemini-3-pro": "gemini3_pro",
+        "gemini-1.5-pro": "gemini_1.5_pro",
+        "gemini-1.5-flash": "gemini_1.5_flash",
+        "gemini-2.0-pro": "gemini_2.0_pro",
+        "gemini-2.0-flash": "gemini_2.0_flash",
+        "gemini-2.5-pro": "gemini_2.5_pro",
+        "gemini-2.5-flash": "gemini_2.5_flash",
+        "gemini-3-pro-preview": "gemini_3_pro",
+        "gemini-3-pro": "gemini_3_pro",
+        "gemini3_pro": "gemini_3_pro",  # Handle variant without underscore
         
         # Grok family
         "grok-2": "grok2",

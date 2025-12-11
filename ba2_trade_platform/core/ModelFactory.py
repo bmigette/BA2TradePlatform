@@ -25,9 +25,10 @@ from langchain_core.callbacks import BaseCallbackHandler
 from .models_registry import (
     MODELS, PROVIDER_CONFIG, 
     get_model_for_provider, get_provider_config, parse_model_selection,
-    PROVIDER_OPENAI, PROVIDER_NAGAAI, PROVIDER_GOOGLE, PROVIDER_ANTHROPIC, PROVIDER_OPENROUTER
+    PROVIDER_OPENAI, PROVIDER_NAGAAI, PROVIDER_GOOGLE, PROVIDER_ANTHROPIC, PROVIDER_OPENROUTER,
+    PROVIDER_XAI
 )
-from ..config import get_app_setting, OPENAI_ENABLE_STREAMING
+from ..config import get_app_setting, OPENAI_ENABLE_STREAMING, OPENAI_BACKEND_URL
 from ..logger import logger
 
 
@@ -448,23 +449,27 @@ class ModelFactory:
         model_kwargs: Optional[Dict[str, Any]],
         **extra_kwargs
     ) -> BaseChatModel:
-        """Create a Moonshot (Kimi) LLM."""
-        try:
-            from langchain_community.chat_models.moonshot import MoonshotChat
-        except ImportError:
-            raise ImportError(
-                "langchain-community is required for Moonshot/Kimi models. "
-                "Install it with: pip install langchain-community"
-            )
+        """Create a Moonshot (Kimi) LLM.
+        
+        Note: We use ChatOpenAI instead of MoonshotChat because MoonshotChat
+        has a bug where it doesn't respect the base_url parameter for
+        international endpoints (api.moonshot.ai vs api.moonshot.cn).
+        Since Moonshot uses OpenAI-compatible API, ChatOpenAI works fine.
+        """
+        from langchain_openai import ChatOpenAI
+        
+        # Get base_url from provider config (international vs CN endpoint)
+        from .models_registry import PROVIDER_CONFIG, PROVIDER_MOONSHOT
+        base_url = PROVIDER_CONFIG[PROVIDER_MOONSHOT].get("base_url")
         
         llm_params = {
             "model": model_name,
-            "moonshot_api_key": api_key,
+            "api_key": api_key,
             "streaming": streaming,
+            "base_url": base_url,
         }
         
-        # MoonshotChat may not support temperature directly, check docs
-        # For now, we include it if model_kwargs doesn't override
+        # Moonshot supports temperature
         if temperature != 0.7:  # Only set if non-default
             llm_params["temperature"] = temperature
         
@@ -476,8 +481,8 @@ class ModelFactory:
         
         llm_params.update(extra_kwargs)
         
-        logger.info(f"Creating MoonshotChat: model={model_name}")
-        return MoonshotChat(**llm_params)
+        logger.info(f"Creating Moonshot via ChatOpenAI: model={model_name}, base_url={base_url}")
+        return ChatOpenAI(**llm_params)
     
     @classmethod
     def _create_bedrock(
@@ -691,6 +696,230 @@ class ModelFactory:
             })
         
         return models
+    
+    @classmethod
+    def do_llm_call_with_websearch(
+        cls,
+        model_selection: str,
+        prompt: str,
+        max_tokens: int = 4096,
+        temperature: float = 1.0,
+    ) -> str:
+        """
+        Make an LLM call with web search enabled.
+        
+        This function handles provider-specific web search implementations:
+        - OpenAI: Uses Responses API with web_search_preview tool
+        - NagaAI: Uses Chat Completions API with web_search_options
+        - xAI (Grok): Uses native web search via NagaAI proxy with web_search_options
+        - Google (Gemini): Uses Google Search grounding
+        
+        Args:
+            model_selection: Model selection string (e.g., "OpenAI/gpt4o", "NagaAI/grok4")
+            prompt: The prompt to send to the model
+            max_tokens: Maximum tokens in the response (default: 4096)
+            temperature: Temperature for generation (default: 1.0)
+            
+        Returns:
+            The text response from the model
+            
+        Raises:
+            ValueError: If the model/provider doesn't support web search
+            
+        Example:
+            >>> result = ModelFactory.do_llm_call_with_websearch("OpenAI/gpt4o", "What are today's top AI news?")
+        """
+        from openai import OpenAI
+        
+        # Parse the model selection string
+        provider, friendly_name = parse_model_selection(model_selection)
+    
+        # Try to resolve friendly name to actual model name via registry
+        model_info = MODELS.get(friendly_name)
+        if model_info:
+            # Get provider-specific model name from registry
+            actual_model = get_model_for_provider(friendly_name, provider)
+            if actual_model:
+                model_name = actual_model
+                logger.debug(f"Resolved model '{friendly_name}' to '{model_name}' for provider '{provider}'")
+            else:
+                model_name = friendly_name
+                logger.warning(f"Model '{friendly_name}' not found in registry for provider '{provider}', using as-is")
+        else:
+            model_name = friendly_name
+            logger.debug(f"Model '{friendly_name}' not in registry, using as actual model name")
+        
+        # Get provider config
+        provider_config = get_provider_config(provider)
+        
+        # Determine API type and configuration based on provider
+        if provider == PROVIDER_OPENAI:
+            # OpenAI uses Responses API with web_search_preview tool
+            base_url = OPENAI_BACKEND_URL
+            api_key = get_app_setting('openai_api_key') or "dummy-key"
+            return cls._call_openai_websearch(model_name, prompt, base_url, api_key, max_tokens, temperature)
+        
+        elif provider == PROVIDER_NAGAAI:
+            # NagaAI uses Chat Completions API with web_search_options
+            base_url = provider_config.get('base_url', 'https://api.naga.ac/v1') if provider_config else 'https://api.naga.ac/v1'
+            api_key_setting = provider_config.get('api_key_setting', 'naga_ai_api_key') if provider_config else 'naga_ai_api_key'
+            api_key = get_app_setting(api_key_setting) or "dummy-key"
+            return cls._call_nagaai_websearch(model_name, prompt, base_url, api_key, max_tokens, temperature)
+        
+        elif provider == PROVIDER_XAI:
+            # xAI (Grok) - use NagaAI proxy for web search (xAI native API doesn't support web search yet)
+            # NagaAI provides Grok models with web_search_options
+            nagaai_config = get_provider_config(PROVIDER_NAGAAI)
+            base_url = nagaai_config.get('base_url', 'https://api.naga.ac/v1') if nagaai_config else 'https://api.naga.ac/v1'
+            api_key_setting = nagaai_config.get('api_key_setting', 'naga_ai_api_key') if nagaai_config else 'naga_ai_api_key'
+            api_key = get_app_setting(api_key_setting) or "dummy-key"
+            # Grok models via NagaAI use the same model name
+            return cls._call_nagaai_websearch(model_name, prompt, base_url, api_key, max_tokens, temperature)
+        
+        elif provider == PROVIDER_GOOGLE:
+            # Google Gemini uses Google Search grounding
+            api_key = get_app_setting('google_api_key') or "dummy-key"
+            return cls._call_google_websearch(model_name, prompt, api_key, max_tokens, temperature)
+        
+        else:
+            # For other providers, try NagaAI as a fallback (it supports many models)
+            logger.warning(f"Unknown provider '{provider}' for web search, trying NagaAI proxy")
+            nagaai_config = get_provider_config(PROVIDER_NAGAAI)
+            base_url = nagaai_config.get('base_url', 'https://api.naga.ac/v1') if nagaai_config else 'https://api.naga.ac/v1'
+            api_key_setting = nagaai_config.get('api_key_setting', 'naga_ai_api_key') if nagaai_config else 'naga_ai_api_key'
+            api_key = get_app_setting(api_key_setting) or "dummy-key"
+            return cls._call_nagaai_websearch(model_name, prompt, base_url, api_key, max_tokens, temperature)
+
+
+    @classmethod
+    def _call_openai_websearch(cls, model: str, prompt: str, base_url: str, api_key: str, max_tokens: int, temperature: float) -> str:
+        """Call OpenAI Responses API with web search."""
+        from openai import OpenAI
+        
+        client = OpenAI(base_url=base_url, api_key=api_key)
+        
+        try:
+            response = client.responses.create(
+                model=model,
+                input=[
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": prompt,
+                            }
+                        ],
+                    }
+                ],
+                text={"format": {"type": "text"}},
+                reasoning={},
+                tools=[
+                    {
+                        "type": "web_search_preview",
+                        "user_location": {"type": "approximate"},
+                        "search_context_size": "low",
+                    }
+                ],
+                temperature=temperature,
+                max_output_tokens=max_tokens,
+                top_p=1,
+                store=True,
+            )
+            
+            # Extract text from response
+            result_text = ""
+            if hasattr(response, 'output') and response.output:
+                for item in response.output:
+                    if hasattr(item, 'content'):
+                        if isinstance(item.content, list):
+                            for content_item in item.content:
+                                if hasattr(content_item, 'text'):
+                                    result_text += content_item.text + "\n\n"
+                        elif hasattr(item.content, 'text'):
+                            result_text += item.content.text + "\n\n"
+                    elif hasattr(item, 'text'):
+                        result_text += item.text + "\n\n"
+                    elif isinstance(item, str):
+                        result_text += item + "\n\n"
+            
+            if not result_text and hasattr(response, 'reasoning') and response.reasoning:
+                result_text = str(response.reasoning)
+            
+            return result_text.strip()
+            
+        except Exception as e:
+            logger.error(f"Error calling OpenAI Responses API with web search: {e}", exc_info=True)
+            raise
+
+
+    @classmethod
+    def _call_nagaai_websearch(cls, model: str, prompt: str, base_url: str, api_key: str, max_tokens: int, temperature: float) -> str:
+        """Call NagaAI Chat Completions API with web_search_options."""
+        from openai import OpenAI
+        
+        client = OpenAI(base_url=base_url, api_key=api_key)
+        
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                web_search_options={},  # Enable web search with default options
+                temperature=temperature,
+                max_tokens=max_tokens,
+                top_p=1.0
+            )
+            
+            # Extract text from chat completion response
+            if hasattr(response, 'choices') and response.choices:
+                choice = response.choices[0]
+                if hasattr(choice, 'message') and hasattr(choice.message, 'content'):
+                    return choice.message.content or ""
+            
+            return ""
+            
+        except Exception as e:
+            logger.error(f"Error calling NagaAI Chat API with web search: {e}", exc_info=True)
+            raise
+
+
+    @classmethod
+    def _call_google_websearch(cls, model: str, prompt: str, api_key: str, max_tokens: int, temperature: float) -> str:
+        """Call Google Gemini API with Google Search grounding."""
+        try:
+            # Use the new google-genai SDK (not google-generativeai) for proper GoogleSearch support
+            from google import genai
+            from google.genai import types
+            
+            client = genai.Client(api_key=api_key)
+            
+            # Create Google Search tool using the new SDK
+            google_search_tool = types.Tool(google_search=types.GoogleSearch())
+            
+            # Generate content with Google Search grounding
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    tools=[google_search_tool],
+                    temperature=temperature,
+                    max_output_tokens=max_tokens,
+                )
+            )
+            
+            return response.text if response.text else ""
+            
+        except ImportError:
+            logger.error("google-genai package not installed. Install with: pip install google-genai")
+            raise ValueError("Google Gemini support requires google-genai package")
+        except Exception as e:
+            logger.error(f"Error calling Google Gemini API with search: {e}", exc_info=True)
+            raise
 
 
 # Convenience function for quick LLM creation

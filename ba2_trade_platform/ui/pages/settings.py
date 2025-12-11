@@ -590,7 +590,7 @@ class AppSettingsTab:
                 with ui.column().classes('w-full gap-2'):
                     with ui.row().classes('w-full items-center gap-2'):
                         self.moonshot_input = ui.input(label='Moonshot API Key', value=moonshot.value_str if moonshot else '', password=True, password_toggle_button=True).classes('flex-1')
-                        ui.link('Get Moonshot Key', 'https://platform.moonshot.cn/console/api-keys', new_tab=True).classes('text-sm text-blue-600 underline')
+                        ui.link('Get Moonshot Key', 'https://platform.moonshot.ai/console/api-keys', new_tab=True).classes('text-sm text-blue-600 underline')
             
             with ui.expansion('DeepSeek', icon='explore').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
@@ -2767,10 +2767,13 @@ class ExpertSettingsTab:
                         if ui_editor_type == "ModelSelector":
                             # Use ModelSelectorInput component for model selection
                             value = current_value if current_value is not None else default_value or ""
+                            # Check for required_labels in setting definition (e.g., ["websearch"])
+                            required_labels = meta.get("required_labels")
                             model_selector = ModelSelectorInput(
                                 label=display_label if display_label else label,
                                 value=value,
-                                help_text=help_text
+                                help_text=help_text,
+                                required_labels=required_labels,
                             )
                             model_selector.render()
                             # Store the ModelSelectorInput instance for value retrieval

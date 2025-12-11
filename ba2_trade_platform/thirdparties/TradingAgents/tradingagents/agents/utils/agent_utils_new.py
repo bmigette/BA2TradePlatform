@@ -28,6 +28,27 @@ from ba2_trade_platform.core.interfaces import (
 )
 
 
+class AllProvidersFailedError(Exception):
+    """
+    Raised when all configured providers for a data category fail.
+    
+    This exception signals to the graph that the analysis should stop
+    because no valid data could be retrieved from any configured provider.
+    """
+    
+    def __init__(self, category: str, provider_errors: Dict[str, str]):
+        """
+        Args:
+            category: The provider category that failed (e.g., "news", "fundamentals")
+            provider_errors: Dict mapping provider names to their error messages
+        """
+        self.category = category
+        self.provider_errors = provider_errors
+        
+        error_summary = "; ".join([f"{name}: {err}" for name, err in provider_errors.items()])
+        super().__init__(f"All {category} providers failed: {error_summary}")
+
+
 class Toolkit:
     """
     New Toolkit for TradingAgents with direct BA2 provider integration.
@@ -218,6 +239,9 @@ class Toolkit:
         Returns:
             str: Aggregated markdown-formatted news from all providers, with provider attribution
         
+        Raises:
+            AllProvidersFailedError: If all configured providers fail to return data
+        
         Example:
             >>> news = get_company_news("AAPL", "2024-03-15", lookback_days=7)
             >>> # Returns news from all configured providers about Apple
@@ -234,10 +258,13 @@ class Toolkit:
                 lookback_days = self.provider_args["news_lookback_days"]
             
             results = []
+            provider_errors = {}  # Track errors for fail-fast
+            success_count = 0
+            
             for provider_class in self.provider_map["news"]:
+                provider_name = provider_class.__name__
                 try:
                     provider = self._instantiate_provider(provider_class)
-                    provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching company news from {provider_name} for {symbol}")
                     
@@ -251,17 +278,27 @@ class Toolkit:
                     )
                     
                     if markdown_data is None:
+                        provider_errors[provider_name] = "Failed to fetch news (returned None)"
                         results.append(f"## {provider_name} - Error\n\nFailed to fetch news")
                         continue
                     
+                    success_count += 1
                     results.append(f"## News from {provider_name.upper()}\n\n{markdown_data}")
                     
                 except Exception as e:
-                    logger.error(f"Error fetching company news from {provider_class.__name__}: {e}")
-                    results.append(f"## {provider_class.__name__} - Error\n\nFailed to fetch news: {str(e)}")
+                    error_msg = str(e)
+                    logger.error(f"Error fetching company news from {provider_name}: {e}")
+                    provider_errors[provider_name] = error_msg
+                    results.append(f"## {provider_name} - Error\n\nFailed to fetch news: {error_msg}")
+            
+            # If ALL providers failed, raise exception to stop the graph
+            if success_count == 0 and provider_errors:
+                raise AllProvidersFailedError("news", provider_errors)
             
             return "\n\n---\n\n".join(results) if results else "No news data available"
             
+        except AllProvidersFailedError:
+            raise  # Re-raise to propagate up
         except Exception as e:
             logger.error(f"Error in get_company_news: {e}")
             return f"Error retrieving company news: {str(e)}"
@@ -289,6 +326,9 @@ class Toolkit:
         Returns:
             str: Aggregated markdown-formatted global news from all providers
         
+        Raises:
+            AllProvidersFailedError: If all configured providers fail to return data
+        
         Example:
             >>> global_news = get_global_news("2024-03-15", lookback_days=7)
             >>> # Returns macro/market news from all configured providers
@@ -305,10 +345,13 @@ class Toolkit:
                 lookback_days = self.provider_args["news_lookback_days"]
             
             results = []
+            provider_errors = {}  # Track errors for fail-fast
+            success_count = 0
+            
             for provider_class in self.provider_map["news"]:
+                provider_name = provider_class.__name__
                 try:
                     provider = self._instantiate_provider(provider_class)
-                    provider_name = provider.__class__.__name__
                     
                     logger.debug(f"Fetching global news from {provider_name}")
                     
@@ -321,17 +364,27 @@ class Toolkit:
                     )
                     
                     if markdown_data is None:
+                        provider_errors[provider_name] = "Failed to fetch news (returned None)"
                         results.append(f"## {provider_name} - Error\n\nFailed to fetch news")
                         continue
                     
+                    success_count += 1
                     results.append(f"## Global News from {provider_name.upper()}\n\n{markdown_data}")
                     
                 except Exception as e:
-                    logger.error(f"Error fetching global news from {provider_class.__name__}: {e}")
-                    results.append(f"## {provider_class.__name__} - Error\n\nFailed to fetch global news: {str(e)}")
+                    error_msg = str(e)
+                    logger.error(f"Error fetching global news from {provider_name}: {e}")
+                    provider_errors[provider_name] = error_msg
+                    results.append(f"## {provider_name} - Error\n\nFailed to fetch global news: {error_msg}")
+            
+            # If ALL providers failed, raise exception to stop the graph
+            if success_count == 0 and provider_errors:
+                raise AllProvidersFailedError("news", provider_errors)
             
             return "\n\n---\n\n".join(results) if results else "No global news data available"
             
+        except AllProvidersFailedError:
+            raise  # Re-raise to propagate up
         except Exception as e:
             logger.error(f"Error in get_global_news: {e}")
             return f"Error retrieving global news: {str(e)}"
@@ -1200,8 +1253,11 @@ class Toolkit:
                     logger.warning(f"OHLCV provider {provider_class.__name__} failed: {e}, trying next provider...")
                     continue
             
-            return "Error: All OHLCV providers failed to retrieve data"
+            # All providers failed - raise exception to stop the graph
+            raise AllProvidersFailedError("ohlcv", {"all_providers": "All OHLCV providers failed to retrieve data"})
             
+        except AllProvidersFailedError:
+            raise  # Re-raise to propagate up
         except Exception as e:
             logger.error(f"Error in get_ohlcv_data: {e}", exc_info=True)
             return f"Error retrieving OHLCV data: {str(e)}"
@@ -1363,8 +1419,11 @@ class Toolkit:
                     logger.warning(f"Indicator provider {provider_class.__name__} failed: {e}, trying next provider...")
                     continue
             
-            return f"Error: All indicator providers failed to retrieve {indicator} data"
+            # All providers failed - raise exception to stop the graph
+            raise AllProvidersFailedError("indicators", {"all_providers": f"All indicator providers failed to retrieve {indicator} data"})
             
+        except AllProvidersFailedError:
+            raise  # Re-raise to propagate up
         except Exception as e:
             logger.error(f"Error in get_indicator_data: {e}", exc_info=True)
             return f"Error retrieving indicator data: {str(e)}"

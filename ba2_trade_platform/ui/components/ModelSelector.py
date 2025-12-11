@@ -59,6 +59,7 @@ class ModelSelector:
         show_native_option: bool = True,
         allowed_providers: Optional[List[str]] = None,
         allowed_labels: Optional[List[str]] = None,
+        required_labels: Optional[List[str]] = None,
     ):
         """
         Initialize the ModelSelector component.
@@ -68,7 +69,9 @@ class ModelSelector:
             default_provider: Default provider to use ("native", "nagaai", "openai", etc.)
             show_native_option: Whether to show "Native" as a provider option
             allowed_providers: Optional list to restrict available providers
-            allowed_labels: Optional list to restrict shown labels in filter
+            allowed_labels: Optional list to restrict shown labels in filter UI
+            required_labels: Optional list of labels that models MUST have to be shown
+                           (e.g., ["websearch"] to only show web search capable models)
         """
         logger.debug('Initializing ModelSelector component')
         self.on_selection_change = on_selection_change
@@ -76,6 +79,7 @@ class ModelSelector:
         self.show_native_option = show_native_option
         self.allowed_providers = [p.lower() for p in allowed_providers] if allowed_providers else None
         self.allowed_labels = allowed_labels
+        self.required_labels = set(required_labels) if required_labels else None
         
         # Filter state
         self.search_filter = ''
@@ -120,6 +124,12 @@ class ModelSelector:
         filtered = []
         
         for friendly_name, model_info in MODELS.items():
+            # Apply required_labels filter FIRST (hard filter - models must have these labels)
+            if self.required_labels:
+                model_labels = set(model_info.get("labels", []))
+                if not self.required_labels.issubset(model_labels):
+                    continue
+            
             # Apply search filter
             if self.search_filter:
                 search_lower = self.search_filter.lower()
@@ -140,7 +150,7 @@ class ModelSelector:
                 elif filter_provider not in available_providers:
                     continue
             
-            # Apply label filter (AND logic - model must have all selected labels)
+            # Apply label filter (AND logic - model must have all selected labels from UI checkboxes)
             if self.label_filters:
                 model_labels = set(model_info.get("labels", []))
                 if not self.label_filters.issubset(model_labels):
@@ -553,6 +563,7 @@ class ModelSelectorInput:
         show_native_option: bool = True,
         allowed_providers: Optional[List[str]] = None,
         allowed_labels: Optional[List[str]] = None,
+        required_labels: Optional[List[str]] = None,
         help_text: Optional[str] = None,
     ):
         """
@@ -565,7 +576,9 @@ class ModelSelectorInput:
             default_provider: Default provider when opening selector
             show_native_option: Whether to show "Native" as a provider option
             allowed_providers: Optional list to restrict available providers
-            allowed_labels: Optional list to restrict shown labels in filter
+            allowed_labels: Optional list to restrict shown labels in filter UI
+            required_labels: Optional list of labels that models MUST have to be shown
+                           (e.g., ["websearch"] to only show web search capable models)
             help_text: Optional help text to display below the input
         """
         self.label = label
@@ -575,6 +588,7 @@ class ModelSelectorInput:
         self.show_native_option = show_native_option
         self.allowed_providers = allowed_providers
         self.allowed_labels = allowed_labels
+        self.required_labels = required_labels
         self.help_text = help_text
         
         # UI components
@@ -645,6 +659,7 @@ class ModelSelectorInput:
                 show_native_option=self.show_native_option,
                 allowed_providers=self.allowed_providers,
                 allowed_labels=self.allowed_labels,
+                required_labels=self.required_labels,
             )
             
             # Pre-set selection BEFORE render so UI reflects current value

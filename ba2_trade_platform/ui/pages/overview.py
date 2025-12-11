@@ -603,12 +603,12 @@ class OverviewTab:
                 pass
     
     def _render_api_usage_widget(self):
-        """Widget showing API usage for OpenAI and Naga AI."""
+        """Widget showing API usage for all configured LLM providers in a compact table."""
         with ui.card().classes('p-4'):
-            ui.label('💰 API Usage').classes('text-h6 mb-4')
+            ui.label('💰 API Usage').classes('text-h6 mb-2')
             
             # Create loading placeholder and load data asynchronously
-            loading_label = ui.label('🔄 Loading usage data...').classes('text-sm text-gray-500')
+            loading_label = ui.label('🔄 Loading...').classes('text-sm text-gray-500')
             content_container = ui.column().classes('w-full')
             
             # Load data asynchronously
@@ -814,108 +814,89 @@ class OverviewTab:
     async def _load_api_usage_data(self, loading_label, content_container):
         """Load API usage data for all configured LLM providers asynchronously and update UI."""
         try:
-            # Fetch data from both primary providers concurrently using ModelBillingUsage
-            openai_data_task = asyncio.create_task(ModelBillingUsage.get_openai_usage_async())
-            naga_ai_data_task = asyncio.create_task(ModelBillingUsage.get_nagaai_usage_async())
+            # Fetch data from all configured providers concurrently
+            all_data = await ModelBillingUsage.get_all_providers_usage_async()
             
-            openai_data, naga_ai_data = await asyncio.gather(openai_data_task, naga_ai_data_task)
+            # Get list of configured providers
+            configured_providers = ModelBillingUsage.get_configured_providers()
             
             # Clear loading message - check if client still exists
             try:
                 loading_label.delete()
             except RuntimeError:
-                # Client has been deleted (user navigated away), stop processing
                 return
+            
+            # Provider display names and icons
+            provider_info = {
+                'openai': ('OpenAI', '🤖'),
+                'nagaai': ('NagaAI', '🌊'),
+                'xai': ('xAI', '🚀'),
+                'google': ('Google', '🔷'),
+                'moonshot': ('Moonshot', '🌙'),
+                'deepseek': ('DeepSeek', '🔍'),
+                'anthropic': ('Anthropic', '🧠'),
+                'openrouter': ('OpenRouter', '🔀'),
+            }
             
             # Populate content - check if client still exists
             try:
                 with content_container:
-                    # OpenAI Section
-                    ui.label('🤖 OpenAI').classes('text-subtitle2 font-bold mb-2')
+                    if not configured_providers:
+                        ui.label('No API keys configured').classes('text-xs text-gray-500')
+                        return
                     
-                    if openai_data.get('error'):
-                        ui.label('⚠️ Error fetching usage data').classes('text-sm text-red-600 mb-2')
-                        error_message = openai_data['error']
+                    # Create compact table with columns
+                    columns = [
+                        {'name': 'provider', 'label': 'Provider', 'field': 'provider', 'align': 'left'},
+                        {'name': 'balance', 'label': 'Balance', 'field': 'balance', 'align': 'right'},
+                        {'name': 'week', 'label': 'Week', 'field': 'week', 'align': 'right'},
+                        {'name': 'month', 'label': 'Month', 'field': 'month', 'align': 'right'},
+                    ]
+                    
+                    rows = []
+                    for provider in configured_providers:
+                        data = all_data.get(provider, {})
+                        display_name, icon = provider_info.get(provider, (provider.title(), '📊'))
                         
-                        # Check if this is an admin key requirement error
-                        if 'admin-keys' in error_message:
-                            # Split the error message at the URL
-                            parts = error_message.split('https://platform.openai.com/settings/organization/admin-keys')
-                            if len(parts) == 2:
-                                ui.label(parts[0]).classes('text-xs text-gray-500')
-                                ui.link('Get OpenAI Admin Key', 'https://platform.openai.com/settings/organization/admin-keys', new_tab=True).classes('text-xs text-blue-600 underline mb-2')
-                            else:
-                                ui.label(error_message).classes('text-xs text-gray-500')
+                        if data.get('error'):
+                            rows.append({
+                                'provider': f'{icon} {display_name}',
+                                'balance': '⚠️',
+                                'week': '-',
+                                'month': '-',
+                            })
                         else:
-                            ui.label(error_message).classes('text-xs text-gray-500')
-                    else:
-                        with ui.row().classes('w-full justify-between items-center mb-1'):
-                            ui.label('Last Week:').classes('text-xs')
-                            week_cost = openai_data.get('week_cost', 0)
-                            ui.label(f'${week_cost:.2f}').classes('text-xs font-bold text-orange-600')
-                        
-                        with ui.row().classes('w-full justify-between items-center mb-1'):
-                            ui.label('Last Month:').classes('text-xs')
-                            month_cost = openai_data.get('month_cost', 0)
-                            ui.label(f'${month_cost:.2f}').classes('text-xs font-bold text-red-600')
-                        
-                        # Show remaining credit only if available
-                        remaining = openai_data.get('remaining_credit')
-                        if remaining is not None:
-                            with ui.row().classes('w-full justify-between items-center mb-1'):
-                                ui.label('Remaining:').classes('text-xs')
-                                ui.label(f'${remaining:.2f}').classes('text-xs font-bold text-green-600')
+                            balance = data.get('remaining_credit')
+                            week_cost = data.get('week_cost', 0)
+                            month_cost = data.get('month_cost', 0)
+                            
+                            rows.append({
+                                'provider': f'{icon} {display_name}',
+                                'balance': f'${balance:.2f}' if balance is not None else '-',
+                                'week': f'${week_cost:.2f}',
+                                'month': f'${month_cost:.2f}',
+                            })
                     
-                    # Separator between providers
-                    ui.separator().classes('my-3')
-                    
-                    # Naga AI Section
-                    ui.label('🌊 Naga AI').classes('text-subtitle2 font-bold mb-2')
-                    
-                    if naga_ai_data.get('error'):
-                        ui.label('⚠️ Error fetching usage data').classes('text-sm text-red-600 mb-2')
-                        error_message = naga_ai_data['error']
-                        ui.label(error_message).classes('text-xs text-gray-500')
-                    else:
-                        with ui.row().classes('w-full justify-between items-center mb-1'):
-                            ui.label('Last Week:').classes('text-xs')
-                            week_cost = naga_ai_data.get('week_cost', 0)
-                            ui.label(f'${week_cost:.2f}').classes('text-xs font-bold text-orange-600')
-                        
-                        with ui.row().classes('w-full justify-between items-center mb-1'):
-                            ui.label('Last Month:').classes('text-xs')
-                            month_cost = naga_ai_data.get('month_cost', 0)
-                            ui.label(f'${month_cost:.2f}').classes('text-xs font-bold text-red-600')
-                        
-                        # Show remaining credit only if available
-                        remaining = naga_ai_data.get('remaining_credit')
-                        if remaining is not None:
-                            with ui.row().classes('w-full justify-between items-center mb-1'):
-                                ui.label('Balance:').classes('text-xs')
-                                ui.label(f'${remaining:.2f}').classes('text-xs font-bold text-green-600')
-                    
-                    # Show last updated timestamp (use most recent)
-                    ui.separator().classes('my-2')
-                    last_updated = openai_data.get('last_updated', naga_ai_data.get('last_updated', 'Unknown'))
-                    ui.label(f'Last updated: {last_updated}').classes('text-xs text-gray-500')
+                    # Create the table with compact styling
+                    ui.table(
+                        columns=columns,
+                        rows=rows,
+                        row_key='provider',
+                    ).classes('w-full text-xs').props('dense flat bordered')
                     
             except RuntimeError:
-                # Client has been deleted (user navigated away), stop processing
                 return
         except Exception as e:
-            # Clear loading message and show error - check if client still exists
             try:
                 loading_label.delete()
             except RuntimeError:
-                # Client has been deleted (user navigated away), stop processing
                 return
             
             try:
                 with content_container:
-                    ui.label('❌ Failed to load usage data').classes('text-sm text-red-600')
-                    ui.label(f'Error: {str(e)}').classes('text-xs text-gray-500')
+                    ui.label('❌ Failed to load').classes('text-sm text-red-600')
+                    ui.label(f'{str(e)[:50]}').classes('text-xs text-gray-500')
             except RuntimeError:
-                # Client has been deleted (user navigated away), ignore the error
                 pass
     
     # The following methods are kept for backward compatibility but now delegate to ModelBillingUsage

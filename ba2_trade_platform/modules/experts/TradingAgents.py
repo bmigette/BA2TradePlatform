@@ -98,11 +98,12 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                 "tooltip": "The AI model used for faster analysis tasks like technical indicators and quick data summarization. Use the model selector to browse available models."
             },
             "dataprovider_websearch_model": {
-                "type": "str", "required": True, "default": "OpenAI/gpt-4o",
+                "type": "str", "required": True, "default": "OpenAI/gpt4o",
                 "description": "Model for data provider web searches",
                 "ui_editor_type": "ModelSelector",
+                "required_labels": ["websearch"],  # Only show models with websearch capability
                 "help": "For more information, see [OpenAI Docs](https://platform.openai.com/docs/models), [Naga AI Web Search](https://docs.naga.ac/features/web-search), and [Gemini Thinking](https://ai.google.dev/gemini-api/docs/thinking)",
-                "tooltip": "The model used by data providers for web search and data gathering. Use the model selector to browse available models."
+                "tooltip": "The model used by data providers for web search and data gathering. Only models with web search capability are shown."
             },
             "embedding_model": {
                 "type": "str", "required": True, "default": "OpenAI/text-embedding-3-small",

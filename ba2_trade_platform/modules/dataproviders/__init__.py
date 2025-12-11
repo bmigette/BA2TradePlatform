@@ -43,12 +43,11 @@ from .ohlcv.AlpacaOHLCVProvider import AlpacaOHLCVProvider
 from .ohlcv.FMPOHLCVProvider import FMPOHLCVProvider
 
 # Import provider implementations
-from .news import AlpacaNewsProvider, AlphaVantageNewsProvider, GoogleNewsProvider, AINewsProvider, OpenAINewsProvider, FMPNewsProvider, FinnhubNewsProvider
+from .news import AlpacaNewsProvider, AlphaVantageNewsProvider, GoogleNewsProvider, AINewsProvider, FMPNewsProvider, FinnhubNewsProvider
 from .indicators import PandasIndicatorCalc, AlphaVantageIndicatorsProvider
 from .fundamentals import (
     AlphaVantageCompanyOverviewProvider,
     AICompanyOverviewProvider,
-    OpenAICompanyOverviewProvider,  # Legacy - deprecated
     FMPCompanyOverviewProvider,
     AlphaVantageCompanyDetailsProvider,
     YFinanceCompanyDetailsProvider,
@@ -73,7 +72,6 @@ INDICATORS_PROVIDERS: Dict[str, Type[MarketIndicatorsInterface]] = {
 FUNDAMENTALS_OVERVIEW_PROVIDERS: Dict[str, Type[CompanyFundamentalsOverviewInterface]] = {
     "alphavantage": AlphaVantageCompanyOverviewProvider,
     "ai": AICompanyOverviewProvider,
-    "openai": OpenAICompanyOverviewProvider,  # Legacy - deprecated, use 'ai' instead
     "fmp": FMPCompanyOverviewProvider,
 }
 
@@ -89,7 +87,6 @@ NEWS_PROVIDERS: Dict[str, Type[MarketNewsInterface]] = {
     "alphavantage": AlphaVantageNewsProvider,
     "google": GoogleNewsProvider,
     "ai": AINewsProvider,
-    "openai": OpenAINewsProvider,  # Legacy - deprecated, use 'ai' instead
     "fmp": FMPNewsProvider,
     "finnhub": FinnhubNewsProvider,
     # "reddit": RedditNewsProvider,
@@ -234,13 +231,11 @@ __all__ = [
     "AlphaVantageNewsProvider",
     "GoogleNewsProvider",
     "AINewsProvider",
-    "OpenAINewsProvider",  # Legacy - deprecated
     "FMPNewsProvider",
     "PandasIndicatorCalc",
     "AlphaVantageIndicatorsProvider",
     "AlphaVantageCompanyOverviewProvider",
     "AICompanyOverviewProvider",
-    "OpenAICompanyOverviewProvider",  # Legacy - deprecated
     "FMPCompanyOverviewProvider",
     "AlphaVantageCompanyDetailsProvider",
     "YFinanceCompanyDetailsProvider",

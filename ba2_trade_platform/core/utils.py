@@ -1360,7 +1360,7 @@ def parse_model_config(model_string: str) -> dict:
         },
         'moonshot': {
             'provider': 'Moonshot',
-            'base_url': 'https://api.moonshot.cn/v1',
+            'base_url': 'https://api.moonshot.ai/v1',  # International endpoint
             'api_key_setting': 'moonshot_api_key',
         },
     }
