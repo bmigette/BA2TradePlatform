@@ -41,6 +41,7 @@ MODEL_SETTING_KEYS = [
     'quick_think_llm', 
     'risk_manager_model',
     'dataprovider_websearch_model',
+    'dynamic_instrument_selection_model',
 ]
 
 
@@ -87,6 +88,41 @@ def get_native_provider_for_model(friendly_name: str) -> Optional[str]:
     return None
 
 
+# Mapping from raw API model names to friendly names
+RAW_MODEL_NAME_MAPPING = {
+    # GPT-5 family
+    "gpt-5-2025-08-07": "gpt5",
+    "gpt-5-mini-2025-08-07": "gpt5_mini",
+    "gpt-5-nano-2025-08-07": "gpt5_nano",
+    "gpt-5-chat-latest": "gpt5_chat",
+    "gpt-5-codex": "gpt5_codex",
+    "gpt-5.1-2025-11-13": "gpt5.1",
+    "gpt-5.2-2025-12-09": "gpt5.2",
+    "gpt-5.2-mini-2025-12-09": "gpt5.2_mini",
+    # GPT-4o family
+    "gpt-4o": "gpt4o",
+    "gpt-4o-mini": "gpt4o_mini",
+    # DeepSeek
+    "deepseek-v3.2": "deepseek_v3.2",
+    "deepseek-chat": "deepseek_chat",
+    "deepseek-reasoner": "deepseek_reasoner",
+    # Qwen
+    "qwen3-max": "qwen3_max",
+    "qwen3-next-80b-a3b-thinking": "qwen3_80b_thinking",
+    # Kimi
+    "kimi-k2-thinking": "kimi_k2_thinking",
+    "kimi-k2-0711-thinking-preview": "kimi_k2_thinking",
+    "kimi-k2-0711-preview": "kimi_k2",
+    # Gemini
+    "gemini-3-pro-preview": "gemini_3_pro",
+    "gemini-2.0-flash": "gemini_2.0_flash",
+    "gemini-2.5-flash": "gemini_2.5_flash",
+    # Grok
+    "grok-4-0709": "grok4",
+    "grok-4.1-fast-reasoning": "grok4.1_fast_reasoning",
+}
+
+
 def parse_model_value(value: str) -> Tuple[Optional[str], str]:
     """
     Parse a model value to extract provider and friendly name.
@@ -128,13 +164,20 @@ def migrate_model_value(old_value: str) -> Tuple[Optional[str], str]:
     new_friendly_name = friendly_name
     reasons = []
     
+    # Step 0: Convert raw API model names to friendly names
+    if friendly_name in RAW_MODEL_NAME_MAPPING:
+        old_friendly = friendly_name
+        new_friendly_name = RAW_MODEL_NAME_MAPPING[friendly_name]
+        reasons.append(f"converted {old_friendly} -> {new_friendly_name}")
+    
     # Step 1: Upgrade GPT-5 to GPT-5.2
-    if friendly_name in GPT5_TO_GPT52_MAPPING:
-        new_friendly_name = GPT5_TO_GPT52_MAPPING[friendly_name]
-        reasons.append(f"upgraded {friendly_name} -> {new_friendly_name}")
+    if new_friendly_name in GPT5_TO_GPT52_MAPPING:
+        old_friendly = new_friendly_name
+        new_friendly_name = GPT5_TO_GPT52_MAPPING[new_friendly_name]
+        reasons.append(f"upgraded {old_friendly} -> {new_friendly_name}")
     
     # Step 2: Migrate to native provider if currently on nagaai
-    if provider == PROVIDER_NAGAAI:
+    if provider.lower() == PROVIDER_NAGAAI or provider.lower() == "naga" or provider.lower() == "nagaac":
         native_provider = get_native_provider_for_model(new_friendly_name)
         if native_provider:
             # Verify the model exists for this provider
@@ -144,7 +187,7 @@ def migrate_model_value(old_value: str) -> Tuple[Optional[str], str]:
                 reasons.append(f"migrated {provider} -> {native_provider}")
     
     # Check if anything changed
-    if new_provider == provider and new_friendly_name == friendly_name:
+    if new_provider.lower() == provider.lower() and new_friendly_name == friendly_name:
         return None, "no migration needed"
     
     new_value = f"{new_provider}/{new_friendly_name}"
