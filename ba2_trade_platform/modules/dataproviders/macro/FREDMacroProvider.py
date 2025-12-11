@@ -8,8 +8,8 @@ including economic indicators, yield curves, and Federal Reserve calendar.
 from typing import Dict, Any, Literal, Optional, Annotated
 from datetime import datetime, timedelta
 import requests
-import os
 
+from ba2_trade_platform.config import get_app_setting
 from ba2_trade_platform.core.interfaces import MacroEconomicsInterface
 from ba2_trade_platform.core.provider_utils import (
     validate_date_range,
@@ -100,9 +100,9 @@ class FREDMacroProvider(MacroEconomicsInterface):
     
     def __init__(self):
         """Initialize FRED macro provider."""
-        self._api_key = os.getenv("FRED_API_KEY")
+        self._api_key = get_app_setting("fred_api_key")
         if not self._api_key:
-            logger.warning("FRED_API_KEY not set. Macro data will not be available.")
+            logger.warning("fred_api_key not set in app settings. Macro data will not be available.")
         logger.debug("Initialized FREDMacroProvider")
     
     def _get_fred_data(self, series_id: str, start_date: str, end_date: str) -> Dict:
