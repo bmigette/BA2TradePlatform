@@ -46,13 +46,15 @@ MODEL_SETTING_KEYS = [
 
 
 # GPT-5 to GPT-5.2 migration mapping
+# Note: gpt5.2_mini doesn't exist - only gpt-5-mini (from GPT-5 family)
 GPT5_TO_GPT52_MAPPING = {
     "gpt5": "gpt5.2",
-    "gpt5_mini": "gpt5.2_mini",
-    "gpt5_nano": "gpt5.2_mini",  # Map nano to mini since 5.2 doesn't have nano
-    "gpt5_chat": "gpt5.2",       # Map chat to base 5.2
-    "gpt5_codex": "gpt5.2",      # Map codex to base 5.2
-    "gpt5.1": "gpt5.2",          # Map 5.1 to 5.2
+    "gpt5_mini": "gpt5_mini",   # Keep as gpt5_mini (gpt-5-mini alias) - no 5.2 mini exists
+    "gpt5_nano": "gpt5_mini",   # Map nano to gpt5_mini since nano is deprecated
+    "gpt5_chat": "gpt5.2",      # Map chat to base 5.2
+    "gpt5_codex": "gpt5.2",     # Map codex to base 5.2
+    "gpt5.1": "gpt5.2",         # Map 5.1 to 5.2
+    "gpt5.2_mini": "gpt5_mini", # gpt5.2_mini doesn't exist, map to gpt5_mini
 }
 
 
@@ -93,12 +95,14 @@ RAW_MODEL_NAME_MAPPING = {
     # GPT-5 family
     "gpt-5-2025-08-07": "gpt5",
     "gpt-5-mini-2025-08-07": "gpt5_mini",
+    "gpt-5-mini": "gpt5_mini",
     "gpt-5-nano-2025-08-07": "gpt5_nano",
     "gpt-5-chat-latest": "gpt5_chat",
     "gpt-5-codex": "gpt5_codex",
     "gpt-5.1-2025-11-13": "gpt5.1",
     "gpt-5.2": "gpt5.2",
-    "gpt-5.2-mini": "gpt5.2_mini",
+    "gpt-5.2-pro": "gpt5.2_pro",
+    "gpt-5.2-pro-2025-12-11": "gpt5.2_pro",
     # GPT-4o family
     "gpt-4o": "gpt4o",
     "gpt-4o-mini": "gpt4o_mini",

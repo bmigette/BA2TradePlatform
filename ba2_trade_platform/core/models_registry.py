@@ -127,9 +127,9 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "display_name": "GPT-5 Mini",
         "description": "Smaller, faster GPT-5 variant with good performance",
         "provider_names": {
-            PROVIDER_OPENAI: "gpt-5-mini-2025-08-07",
+            PROVIDER_OPENAI: "gpt-5-mini",
             PROVIDER_NAGAAI: "gpt-5-mini-2025-08-07",
-            PROVIDER_OPENROUTER: "openai/gpt-5-mini-2025-08-07",
+            PROVIDER_OPENROUTER: "openai/gpt-5-mini",
         },
         "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING],
     },
@@ -194,16 +194,17 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_TOOL_CALLING],
         "supports_parameters": ["reasoning_effort"],  # Supports {reasoning_effort:low/medium/high}
     },
-    "gpt5.2_mini": {
+    "gpt5.2_pro": {
         "native_provider": PROVIDER_OPENAI,
-        "display_name": "GPT-5.2 Mini",
-        "description": "Smaller, faster GPT-5.2 variant with excellent performance",
+        "display_name": "GPT-5.2 Pro",
+        "description": "GPT-5.2 Pro that produces smarter and more precise responses",
         "provider_names": {
-            PROVIDER_OPENAI: "gpt-5.2-mini",
-            PROVIDER_NAGAAI: "gpt-5.2-mini-2025-12-11",
-            PROVIDER_OPENROUTER: "openai/gpt-5.2-mini",
+            PROVIDER_OPENAI: "gpt-5.2-pro",
+            PROVIDER_NAGAAI: "gpt-5.2-pro-2025-12-11",
+            PROVIDER_OPENROUTER: "openai/gpt-5.2-pro",
         },
-        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING],
+        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_TOOL_CALLING],
+        "supports_parameters": ["reasoning_effort"],  # Supports medium/high/xhigh
     },
     
     # =========================================================================
