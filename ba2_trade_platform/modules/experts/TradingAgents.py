@@ -87,171 +87,22 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
             "deep_think_llm": {
                 "type": "str", "required": True, "default": "OpenAI/gpt-4o-mini",
                 "description": "LLM model for complex reasoning and deep analysis",
-                "valid_values": [
-                    # OpenAI models (direct) - Legacy + New models
-                    "OpenAI/gpt-4o", "OpenAI/gpt-4o-mini",
-                    "OpenAI/gpt-5", "OpenAI/gpt-5-mini", "OpenAI/gpt-5-nano",
-                    "OpenAI/gpt-4.1", "OpenAI/gpt-4.1-mini", "OpenAI/gpt-4.1-nano",
-                    "OpenAI/o1", "OpenAI/o1-mini", "OpenAI/o3-mini",
-                    "OpenAI/o4-mini", "OpenAI/o4-mini-deep-research",
-                    # NagaAC GPT-5 (DISABLED - use GPT-5.1 instead)
-                    # "NagaAC/gpt-5-2025-11-13",
-                    # "NagaAC/gpt-5-2025-11-13{reasoning=effort:low}",
-                    # "NagaAC/gpt-5-2025-11-13{reasoning=effort:medium}",
-                    # "NagaAC/gpt-5-2025-11-13{reasoning=effort:high}",
-                    # NagaAC GPT-5.1 with reasoning effort variants
-                    "NagaAC/gpt-5.1-2025-11-13",
-                    "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:low}",
-                    "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:medium}",
-                    "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:high}",
-                    # NagaAI GPT-5 (DISABLED - use GPT-5.1 instead)
-                    "NagaAI/gpt-5-2025-08-07",
-                    "NagaAI/gpt-5-mini-2025-08-07",
-                    "NagaAI/gpt-5-mini-2025-08-07:free",
-                    "NagaAI/gpt-5-nano-2025-08-07",
-                    "NagaAI/gpt-5-chat-latest",
-                    "NagaAI/gpt-5-codex",
-                    # GPT-4 (latest via Naga AI)
-                    "NagaAI/gpt-4o-2024-11-20",
-                    "NagaAI/gpt-4o-2024-11-20:free",
-                    "NagaAI/gpt-4.1-2025-04-14",
-                    "NagaAI/gpt-4.1-mini-2025-04-14",
-                    "NagaAI/gpt-4.1-mini-2025-04-14:free",
-                    "NagaAI/gpt-4.1-nano-2025-04-14",
-                    # OpenAI O1/O3/O4 reasoning models (latest)
-                    "NagaAI/o1-2024-12-17",
-                    "NagaAI/o3-2025-04-16",
-                    "NagaAI/o3-mini-2025-01-31",
-                    "NagaAI/o4-2025-04-16",
-                    "NagaAI/o4-mini-2025-04-16",
-                    # Grok (latest from X-AI)
-                    "NagaAI/grok-4-0709",
-                    "NagaAI/grok-4-fast-non-reasoning",
-                    "NagaAI/grok-4-fast-reasoning",
-                    "NagaAC/grok-4.1-fast-reasoning",
-                    "NagaAI/grok-3",
-                    "NagaAI/grok-3-mini",
-                    # Gemini (latest from Google with thinking capabilities)
-                    # Gemini 3 DISABLED - thought_signature incompatible with LangGraph
-                    # "NagaAI/gemini-3-pro-preview",
-                    # "NagaAI/gemini-3-pro-preview{reasoning_effort:low}",
-                    # "NagaAI/gemini-3-pro-preview{reasoning_effort:high}",
-                    "NagaAI/gemini-2.5-flash",
-                    "NagaAI/gemini-2.5-flash:free",
-                    "NagaAI/gemini-2.5-pro",
-                    "NagaAI/gemini-2.0-flash-001",
-                    "NagaAI/gemini-2.0-flash-001:free",
-                    "NagaAI/gemini-2.0-flash-lite-001",
-                    # DeepSeek (latest)
-                    "NagaAI/deepseek-v3.2",
-                    "NagaAI/deepseek-v3.2:free",
-                    "NagaAC/deepseek-v3.2-speciale",
-                    "NagaAI/deepseek-chat-v3.1",
-                    "NagaAI/deepseek-chat-v3.1:free",
-                    "NagaAI/deepseek-reasoner-0528",
-                    "NagaAI/deepseek-reasoner-0528:free",
-                    # Qwen (latest reasoning models)
-                    "NagaAI/qwen3-max",
-                    "NagaAI/qwen3-next-80b-a3b-instruct",
-                    "NagaAI/qwen3-next-80b-a3b-thinking",
-                    # Kimi (NagaAC - advanced reasoning)
-                    "NagaAI/kimi-k2-thinking",
-                ],
-                "allow_custom": True,  # Allow users to enter custom model names not in the list
-                "tooltip": "The AI model used for in-depth analysis requiring complex reasoning, such as fundamental analysis and debate arbitration. Format: Provider/ModelName. OpenAI models provide proven performance. Naga AI provides access to multiple frontier models including GPT-5, GPT-4, O1/O3, Grok-4, Gemini 3, and DeepSeek v3 with free tier available. Gemini models now fully supported with function calling. You can also enter custom model names."
+                "ui_editor_type": "ModelSelector",
+                "tooltip": "The AI model used for in-depth analysis requiring complex reasoning, such as fundamental analysis and debate arbitration. Use the model selector to browse available models."
             },
             "quick_think_llm": {
                 "type": "str", "required": True, "default": "OpenAI/gpt-4o-mini",
                 "description": "LLM model for quick analysis and real-time decisions",
-                "valid_values": [
-                    # OpenAI models (direct) - Legacy + New models
-                    "OpenAI/gpt-4o", "OpenAI/gpt-4o-mini",
-                    "OpenAI/gpt-5", "OpenAI/gpt-5-mini", "OpenAI/gpt-5-nano",
-                    "OpenAI/gpt-4.1", "OpenAI/gpt-4.1-mini", "OpenAI/gpt-4.1-nano",
-                    "OpenAI/o1-mini", "OpenAI/o3-mini",
-                    "OpenAI/o4-mini", "OpenAI/o4-mini-deep-research",
-
-                    # NagaAC GPT-5.1 with reasoning effort variants
-                    "NagaAC/gpt-5.1-2025-11-13",
-                    "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:low}",
-                    "NagaAI/gpt-5-mini-2025-08-07",
-                    "NagaAI/gpt-5-mini-2025-08-07:free",
-                    "NagaAI/gpt-5-nano-2025-08-07",
-                    # GPT-4 mini/nano (latest, fast)
-                    "NagaAI/gpt-4o-mini-2024-07-18",
-                    "NagaAI/gpt-4o-mini-2024-07-18:free",
-                    "NagaAI/gpt-4.1-mini-2025-04-14",
-                    "NagaAI/gpt-4.1-mini-2025-04-14:free",
-                    "NagaAI/gpt-4.1-nano-2025-04-14",
-                    # O-series mini (reasoning, fast)
-                    "NagaAI/o3-mini-2025-01-31",
-                    "NagaAI/o4-mini-2025-04-16",
-                    # Grok mini (fast)
-                    "NagaAI/grok-3-mini",
-                    "NagaAI/grok-4-fast-non-reasoning",
-                    "NagaAI/grok-4-fast-reasoning",
-                    "NagaAC/grok-4.1-fast-reasoning",
-                    "NagaAI/grok-4-0709",
-                    # Gemini flash (fast, latest with thinking)
-                    # Gemini 3 DISABLED - thought_signature incompatible with LangGraph
-                    # "NagaAI/gemini-3-pro-preview",
-                    # "NagaAI/gemini-3-pro-preview{reasoning_effort:low}",
-                    "NagaAI/gemini-2.5-flash",
-                    "NagaAI/gemini-2.5-flash:free",
-                    "NagaAI/gemini-2.0-flash-001",
-                    "NagaAI/gemini-2.0-flash-001:free",
-                    "NagaAI/gemini-2.0-flash-lite-001",
-                    # DeepSeek (fast)
-                    "NagaAI/deepseek-chat-v3.1",
-                    "NagaAI/deepseek-chat-v3.1:free",
-                    "NagaAI/deepseek-v3.2",
-                    "NagaAI/deepseek-v3.2:free",
-                    "NagaAC/deepseek-v3.2-speciale",
-                    "NagaAI/deepseek-reasoner-0528",
-                    "NagaAI/deepseek-reasoner-0528:free",
-                    # Qwen (latest reasoning models)
-                    "NagaAI/qwen3-max",
-                    "NagaAI/qwen3-next-80b-a3b-instruct",
-                    "NagaAI/qwen3-next-80b-a3b-thinking",
-                    # Kimi (NagaAC - advanced reasoning)
-                    "NagaAI/kimi-k2-thinking",
-                ],
-                "allow_custom": True,  # Allow users to enter custom model names not in the list
+                "ui_editor_type": "ModelSelector",
                 "help": "For more information, see [OpenAI Models](https://platform.openai.com/docs/models) and [Naga AI Models](https://naga.ac/models)",
-                "tooltip": "The AI model used for faster analysis tasks like technical indicators and quick data summarization. Format: Provider/ModelName. Mini/nano/flash models are cost-effective for these simpler tasks. Includes GPT-5 nano, GPT-4 mini, Gemini flash, Grok mini, and DeepSeek with free tier options. You can also enter custom model names."
+                "tooltip": "The AI model used for faster analysis tasks like technical indicators and quick data summarization. Use the model selector to browse available models."
             },
             "dataprovider_websearch_model": {
                 "type": "str", "required": True, "default": "OpenAI/gpt-4o",
                 "description": "Model for data provider web searches",
-                "valid_values": [
-                     "OpenAI/gpt-5", "OpenAI/gpt-5-mini", "OpenAI/gpt-5-nano",
-
-                    # NagaAC GPT-5.1 with reasoning effort
-                    "NagaAC/gpt-5.1-2025-11-13",
-                    "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:low}",
-                    "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:medium}",
-                    "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:high}",
-                    "NagaAI/gpt-5-2025-08-07",
-                    "NagaAI/gpt-5-mini-2025-08-07",
-                    "NagaAI/gpt-5-chat-latest",
-                    "NagaAI/gpt-5-codex",
-                    # NagaAI GPT-4o Search (optimized for web search)
-                    "NagaAI/gpt-4o-search-preview-2025-03-11",
-                    # NagaAI Grok-4 (excellent for real-time search with X integration)
-                    "NagaAI/grok-4-0709",
-                    "NagaAI/grok-4-fast-non-reasoning",
-                    "NagaAI/grok-4-fast-reasoning",
-                    "NagaAC/grok-4.1-fast-reasoning",
-                    # NagaAI Gemini 3 (DISABLED - thought_signature incompatible with LangGraph)
-                    # "NagaAI/gemini-3-pro-preview",
-                    # "NagaAI/gemini-3-pro-preview{reasoning_effort:low}",
-                    # "NagaAI/gemini-3-pro-preview{reasoning_effort:high}",
-                    # Kimi (NagaAC - advanced reasoning)
-                    "NagaAI/kimi-k2-thinking",
-                ],
-                "allow_custom": True,  # Allow users to enter custom model names not in the list
+                "ui_editor_type": "ModelSelector",
                 "help": "For more information, see [OpenAI Docs](https://platform.openai.com/docs/models), [Naga AI Web Search](https://docs.naga.ac/features/web-search), and [Gemini Thinking](https://ai.google.dev/gemini-api/docs/thinking)",
-                "tooltip": "The model used by data providers (news, fundamentals) for web search and data gathering. Format: Provider/ModelName or Provider/ModelName{param:value}. Optimized for search: GPT-5 (best general search), GPT-4o-search (web-optimized), Grok-4 (real-time with X/Twitter integration), Gemini 3 Pro (advanced thinking). Gemini models now fully supported. Supports reasoning_effort parameter for Gemini 3 models (low/high). You can also enter custom model names."
+                "tooltip": "The model used by data providers for web search and data gathering. Use the model selector to browse available models."
             },
             "embedding_model": {
                 "type": "str", "required": True, "default": "OpenAI/text-embedding-3-small",
@@ -264,9 +115,9 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                     "NagaAI/text-embedding-3-small",
                     "NagaAI/text-embedding-3-large",
                 ],
-                "allow_custom": True,  # Allow users to enter custom embedding model names
+                "allow_custom": True,
                 "help": "For more information, see [OpenAI Embeddings](https://platform.openai.com/docs/guides/embeddings) and [Naga AI Embeddings](https://docs.naga.ac/models/embeddings)",
-                "tooltip": "The model used to generate embeddings for storing and retrieving memories in vector databases. Format: Provider/ModelName. text-embedding-3-small is faster and cheaper, text-embedding-3-large provides better accuracy. Both providers support the same models. You can also enter custom embedding model names."
+                "tooltip": "The model used to generate embeddings for storing and retrieving memories in vector databases. Format: Provider/ModelName. text-embedding-3-small is faster and cheaper, text-embedding-3-large provides better accuracy."
             },
             
             # Data Lookback Periods

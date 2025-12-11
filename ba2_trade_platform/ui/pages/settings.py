@@ -17,6 +17,7 @@ from yahooquery import Ticker, search as yq_search
 from nicegui.events import UploadEventArguments
 from ...modules.experts import experts
 from ..components.InstrumentSelector import InstrumentSelector
+from ..components.ModelSelector import ModelSelectorInput
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ...core.rules_export_import import RulesExportImportUI
 from ...core.rules_documentation import get_event_type_documentation, get_action_type_documentation
@@ -2745,6 +2746,7 @@ class ExpertSettingsTab:
                     allow_custom = meta.get("allow_custom", False)  # Check if custom values are allowed
                     help_text = meta.get("help")
                     tooltip_text = meta.get("tooltip")
+                    ui_editor_type = meta.get("ui_editor_type")  # Custom UI editor type
                     
                     # Create a container for this setting (title + input)
                     setting_container = ui.column().classes('w-full mb-4')
@@ -2761,7 +2763,19 @@ class ExpertSettingsTab:
                             display_label = label
                         
                         # Create the input field directly in the same container
-                        if meta["type"] == "str":
+                        # First check for custom ui_editor_type
+                        if ui_editor_type == "ModelSelector":
+                            # Use ModelSelectorInput component for model selection
+                            value = current_value if current_value is not None else default_value or ""
+                            model_selector = ModelSelectorInput(
+                                label=display_label if display_label else label,
+                                value=value,
+                                help_text=help_text
+                            )
+                            model_selector.render()
+                            # Store the ModelSelectorInput instance for value retrieval
+                            inp = model_selector
+                        elif meta["type"] == "str":
                             value = current_value if current_value is not None else default_value or ""
                             if valid_values:
                                 # Show as dropdown (editable if allow_custom is True)
@@ -2852,8 +2866,8 @@ class ExpertSettingsTab:
                             else:
                                 inp = ui.input(label=display_label, value=str(value)).classes('w-full')
                         
-                        # Add help text if available
-                        if help_text:
+                        # Add help text if available (skip for ModelSelector which handles its own help text)
+                        if help_text and ui_editor_type != "ModelSelector":
                             ui.markdown(help_text).classes('text-sm text-gray-600 mt-1')
                     
                     setting_container.move(self.expert_settings_container)
@@ -3432,7 +3446,11 @@ class ExpertSettingsTab:
                     
                 meta = settings_def.get(key, {})
                 
-                if meta.get("type") == "bool":
+                # Handle ModelSelector special case (ModelSelectorInput has .value property)
+                if meta.get("ui_editor_type") == "ModelSelector":
+                    # ModelSelectorInput.value returns the selected model string
+                    expert.save_setting(key, inp.value or "", setting_type="str")
+                elif meta.get("type") == "bool":
                     expert.save_setting(key, inp.value, setting_type="bool")
                 elif meta.get("type") == "int":
                     # Handle empty strings and ensure proper type
