@@ -102,7 +102,10 @@ class FREDMacroProvider(MacroEconomicsInterface):
         """Initialize FRED macro provider."""
         self._api_key = get_app_setting("fred_api_key")
         if not self._api_key:
-            logger.warning("fred_api_key not set in app settings. Macro data will not be available.")
+            raise ValueError(
+                "FRED API key not configured. "
+                "Please set 'fred_api_key' in AppSetting table."
+            )
         logger.debug("Initialized FREDMacroProvider")
     
     def _get_fred_data(self, series_id: str, start_date: str, end_date: str) -> Dict:
@@ -117,9 +120,7 @@ class FREDMacroProvider(MacroEconomicsInterface):
         Returns:
             Dictionary with FRED data
         """
-        if not self._api_key:
-            return {"error": "FRED API key not found. Please set FRED_API_KEY environment variable."}
-        
+        # API key is validated in __init__, so we can proceed directly
         params = {
             'series_id': series_id,
             'api_key': self._api_key,
