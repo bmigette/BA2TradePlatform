@@ -187,9 +187,9 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "display_name": "GPT-5.2",
         "description": "Latest GPT-5.2 with enhanced reasoning and tool use",
         "provider_names": {
-            PROVIDER_OPENAI: "gpt-5.2-2025-12-09",
-            PROVIDER_NAGAAI: "gpt-5.2-2025-12-09",
-            PROVIDER_OPENROUTER: "openai/gpt-5.2-2025-12-09",
+            PROVIDER_OPENAI: "gpt-5.2",
+            PROVIDER_NAGAAI: "gpt-5.2-2025-12-11",
+            PROVIDER_OPENROUTER: "openai/gpt-5.2",
         },
         "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_TOOL_CALLING],
         "supports_parameters": ["reasoning_effort"],  # Supports {reasoning_effort:low/medium/high}
@@ -199,9 +199,9 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "display_name": "GPT-5.2 Mini",
         "description": "Smaller, faster GPT-5.2 variant with excellent performance",
         "provider_names": {
-            PROVIDER_OPENAI: "gpt-5.2-mini-2025-12-09",
-            PROVIDER_NAGAAI: "gpt-5.2-mini-2025-12-09",
-            PROVIDER_OPENROUTER: "openai/gpt-5.2-mini-2025-12-09",
+            PROVIDER_OPENAI: "gpt-5.2-mini",
+            PROVIDER_NAGAAI: "gpt-5.2-mini-2025-12-11",
+            PROVIDER_OPENROUTER: "openai/gpt-5.2-mini",
         },
         "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING],
     },

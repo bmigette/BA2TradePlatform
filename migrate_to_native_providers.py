@@ -97,8 +97,8 @@ RAW_MODEL_NAME_MAPPING = {
     "gpt-5-chat-latest": "gpt5_chat",
     "gpt-5-codex": "gpt5_codex",
     "gpt-5.1-2025-11-13": "gpt5.1",
-    "gpt-5.2-2025-12-09": "gpt5.2",
-    "gpt-5.2-mini-2025-12-09": "gpt5.2_mini",
+    "gpt-5.2": "gpt5.2",
+    "gpt-5.2-mini": "gpt5.2_mini",
     # GPT-4o family
     "gpt-4o": "gpt4o",
     "gpt-4o-mini": "gpt4o_mini",
