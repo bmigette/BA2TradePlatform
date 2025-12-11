@@ -40,8 +40,10 @@ chainlit
 rich
 questionary
 langchain-anthropic
-langchain-google-genai
-langchain-xai  # xAI (Grok) models
+langchain-google-genai  # Google Gemini models - LangChain integration
+google-genai  # Google native SDK for Search grounding
+langchain-xai  # xAI (Grok) models - LangChain integration
+xai-sdk  # xAI native SDK for Live Search
 langchain-deepseek  # DeepSeek models
 langchain-aws  # AWS Bedrock models
 # Moonshot uses langchain_community.chat_models.moonshot (included in langchain-community)

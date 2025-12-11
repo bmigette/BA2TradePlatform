@@ -711,7 +711,7 @@ class ModelFactory:
         This function handles provider-specific web search implementations:
         - OpenAI: Uses Responses API with web_search_preview tool
         - NagaAI: Uses Chat Completions API with web_search_options
-        - xAI (Grok): Uses native web search via NagaAI proxy with web_search_options
+        - xAI (Grok): Uses native Live Search API with search_parameters
         - Google (Gemini): Uses Google Search grounding
         
         Args:
@@ -767,14 +767,12 @@ class ModelFactory:
             return cls._call_nagaai_websearch(model_name, prompt, base_url, api_key, max_tokens, temperature)
         
         elif provider == PROVIDER_XAI:
-            # xAI (Grok) - use NagaAI proxy for web search (xAI native API doesn't support web search yet)
-            # NagaAI provides Grok models with web_search_options
-            nagaai_config = get_provider_config(PROVIDER_NAGAAI)
-            base_url = nagaai_config.get('base_url', 'https://api.naga.ac/v1') if nagaai_config else 'https://api.naga.ac/v1'
-            api_key_setting = nagaai_config.get('api_key_setting', 'naga_ai_api_key') if nagaai_config else 'naga_ai_api_key'
+            # xAI (Grok) - use native Live Search API with search_parameters
+            xai_config = get_provider_config(PROVIDER_XAI)
+            base_url = xai_config.get('base_url', 'https://api.x.ai/v1') if xai_config else 'https://api.x.ai/v1'
+            api_key_setting = xai_config.get('api_key_setting', 'xai_api_key') if xai_config else 'xai_api_key'
             api_key = get_app_setting(api_key_setting) or "dummy-key"
-            # Grok models via NagaAI use the same model name
-            return cls._call_nagaai_websearch(model_name, prompt, base_url, api_key, max_tokens, temperature)
+            return cls._call_xai_websearch(model_name, prompt, base_url, api_key, max_tokens, temperature)
         
         elif provider == PROVIDER_GOOGLE:
             # Google Gemini uses Google Search grounding
@@ -885,6 +883,38 @@ class ModelFactory:
             
         except Exception as e:
             logger.error(f"Error calling NagaAI Chat API with web search: {e}", exc_info=True)
+            raise
+
+
+    @classmethod
+    def _call_xai_websearch(cls, model: str, prompt: str, base_url: str, api_key: str, max_tokens: int, temperature: float) -> str:
+        """Call xAI API with Live Search using native xai_sdk."""
+        try:
+            from xai_sdk import Client
+            from xai_sdk.chat import user
+            from xai_sdk.search import SearchParameters
+        except ImportError:
+            logger.error("xai-sdk package not installed. Install with: pip install xai-sdk")
+            raise ValueError("xAI Live Search requires xai-sdk package")
+        
+        try:
+            # Create xAI client with API key
+            client = Client(api_key=api_key)
+            
+            # Create chat with Live Search enabled
+            chat = client.chat.create(
+                model=model,
+                search_parameters=SearchParameters(mode="on"),  # Enable Live Search
+            )
+            
+            # Add user message and get response
+            chat.append(user(prompt))
+            response = chat.sample()
+            
+            return response.content if response.content else ""
+            
+        except Exception as e:
+            logger.error(f"Error calling xAI Live Search API: {e}", exc_info=True)
             raise
 
 
