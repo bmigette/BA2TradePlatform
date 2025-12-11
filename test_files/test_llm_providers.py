@@ -125,7 +125,8 @@ def get_websearch_model_for_provider(provider: str) -> Optional[str]:
     # OpenAI uses Responses API with web_search_preview
     # NagaAI uses web_search_options on any model
     # Google uses Google Search grounding
-    if provider in [PROVIDER_OPENAI, PROVIDER_NAGAAI, PROVIDER_GOOGLE]:
+    # xAI uses Live Search API with search_parameters
+    if provider in [PROVIDER_OPENAI, PROVIDER_NAGAAI, PROVIDER_GOOGLE, PROVIDER_XAI]:
         # Return the same test model - websearch is API-level, not model-level
         return get_test_model_for_provider(provider)
     
@@ -195,13 +196,16 @@ def test_native_call(provider: str, model_name: str) -> TestResult:
         
         # Special handling for different providers
         if provider == PROVIDER_GOOGLE:
-            # Google uses its own SDK
-            import google.generativeai as genai
-            genai.configure(api_key=api_key)
+            # Google uses the native google.genai SDK
+            from google import genai
+            
+            client = genai.Client(api_key=api_key)
             
             start = time.time()
-            model = genai.GenerativeModel(actual_model)
-            response = model.generate_content("What is 2+2? Reply with just the number.")
+            response = client.models.generate_content(
+                model=actual_model,
+                contents="What is 2+2? Reply with just the number."
+            )
             result.duration_ms = (time.time() - start) * 1000
             result.response = response.text[:200] if response.text else ""
             result.success = True
@@ -236,33 +240,19 @@ def test_native_call(provider: str, model_name: str) -> TestResult:
             result.success = True
             
         elif provider == PROVIDER_XAI:
-            # xAI uses its own SDK or OpenAI-compatible API
-            try:
-                from xai_sdk import Client as XAIClient
-                client = XAIClient(api_key=api_key)
-                # xAI SDK call
-                start = time.time()
-                response = client.chat.completions.create(
-                    model=actual_model,
-                    messages=[{"role": "user", "content": "What is 2+2? Reply with just the number."}],
-                    max_tokens=100
-                )
-                result.duration_ms = (time.time() - start) * 1000
-                result.response = response.choices[0].message.content[:200] if response.choices else ""
-                result.success = True
-            except ImportError:
-                # Fall back to OpenAI client with xAI endpoint
-                client = OpenAI(api_key=api_key, base_url="https://api.x.ai/v1")
-                
-                start = time.time()
-                response = client.chat.completions.create(
-                    model=actual_model,
-                    messages=[{"role": "user", "content": "What is 2+2? Reply with just the number."}],
-                    max_tokens=100
-                )
-                result.duration_ms = (time.time() - start) * 1000
-                result.response = response.choices[0].message.content[:200] if response.choices else ""
-                result.success = True
+            # xAI uses its native xai_sdk
+            from xai_sdk import Client as XAIClient
+            from xai_sdk.chat import user
+            
+            client = XAIClient(api_key=api_key)
+            
+            start = time.time()
+            chat = client.chat.create(model=actual_model)
+            chat.append(user("What is 2+2? Reply with just the number."))
+            response = chat.sample()
+            result.duration_ms = (time.time() - start) * 1000
+            result.response = response.content[:200] if response.content else ""
+            result.success = True
                 
         elif provider == PROVIDER_MOONSHOT:
             # Moonshot uses OpenAI-compatible API (international endpoint)
