@@ -374,58 +374,36 @@ def mark_job_as_failed(job_id: int, error_message: str) -> None:
         logger.error(f"Failed to update job status in database: {db_error}")
 
 
-def create_llm(model: str, temperature: float, base_url: str, api_key: str, model_kwargs: dict = None) -> ChatOpenAI:
+def create_llm(model_selection: str, temperature: float, backend_url: str = None, api_key: str = None, model_kwargs: dict = None) -> "ChatOpenAI":
     """
-    Create a ChatOpenAI instance with proper configuration and debug callback.
+    Create a ChatOpenAI instance using ModelFactory.
+    
+    This is a compatibility wrapper that routes to ModelFactory.create_llm() for centralized
+    LLM creation. The backend_url and api_key parameters are ignored as ModelFactory handles
+    provider configuration automatically.
     
     Args:
-        model: Model name (e.g., 'gpt-4o-mini' or 'gpt-5.1-2025-11-13' or 'Provider/ModelName{param:value}')
+        model_selection: Full model selection string (e.g., 'nagaai/gpt5' or 'NagaAI/gpt-5-2025-08-07')
         temperature: Temperature for generation
-        base_url: Base URL for API endpoint
-        api_key: API key for authentication
-        model_kwargs: Optional model-specific parameters (e.g., {"reasoning_effort": "low"})
+        backend_url: IGNORED - ModelFactory handles this automatically
+        api_key: IGNORED - ModelFactory handles this automatically  
+        model_kwargs: Optional model-specific parameters (e.g., {"reasoning": {"effort": "low"}})
         
     Returns:
-        Configured ChatOpenAI instance with debug callback
+        Configured LangChain chat model instance with debug callback
     """
-    from .. import config as config_module
-    from .utils import parse_model_config
+    from .ModelFactory import ModelFactory
     
-    # Parse model configuration (handles provider, model name, and parameters)
-    parsed = parse_model_config(model)
+    # Use ModelFactory to create the LLM
+    # ModelFactory handles provider detection, API keys, base URLs, etc.
+    llm = ModelFactory.create_llm(
+        model_selection=model_selection,
+        temperature=temperature,
+        callbacks=[SmartRiskManagerDebugCallback()],
+        model_kwargs=model_kwargs
+    )
     
-    # Merge any provided model_kwargs with parsed parameters
-    final_model_kwargs = parsed['model_kwargs'].copy()
-    if model_kwargs:
-        final_model_kwargs.update(model_kwargs)
-    
-    # Extract parameters that should be passed directly to ChatOpenAI (not in model_kwargs)
-    # These are special parameters that ChatOpenAI recognizes at the class level
-    direct_params = ['reasoning', 'temperature', 'max_tokens', 'top_p', 'frequency_penalty', 'presence_penalty']
-    
-    # Build ChatOpenAI initialization parameters
-    llm_params = {
-        "model": parsed['model'],
-        "temperature": temperature,
-        "base_url": base_url,
-        "api_key": api_key,
-        "streaming": config_module.OPENAI_ENABLE_STREAMING,
-        "callbacks": [SmartRiskManagerDebugCallback()]
-    }
-    
-    # Separate direct params from model_kwargs
-    remaining_model_kwargs = {}
-    for key, value in final_model_kwargs.items():
-        if key in direct_params:
-            llm_params[key] = value
-        else:
-            remaining_model_kwargs[key] = value
-    
-    # Only add model_kwargs if there are remaining parameters
-    if remaining_model_kwargs:
-        llm_params["model_kwargs"] = remaining_model_kwargs
-    
-    return ChatOpenAI(**llm_params)
+    return llm
 
 
 # ==================== PROMPTS ====================
@@ -1432,23 +1410,10 @@ def initialize_context(state: SmartRiskManagerState) -> Dict[str, Any]:
         risk_manager_model = expert.get_setting_with_interface_default(
             "risk_manager_model", log_warning=False
         )
-        backend_url = os.getenv("OPENAI_BACKEND_URL", "https://api.openai.com/v1")
-        api_key_setting_name = "openai_api_key"  # Default to OpenAI
         
         logger.info(f"Smart Risk Manager initialized with model: {risk_manager_model}")
-        
-        # If using NagaAI models, update backend URL
-        if risk_manager_model.startswith("NagaAI/"):
-            backend_url = "https://api.naga.ac/v1"
-            api_key_setting_name = "naga_ai_api_key"
-            risk_manager_model = risk_manager_model.replace("NagaAI/", "")
-            logger.info(f"Using NagaAI backend with model: {risk_manager_model}")
-        elif risk_manager_model.startswith("OpenAI/"):
-            risk_manager_model = risk_manager_model.replace("OpenAI/", "")
-            logger.info(f"Using OpenAI backend with model: {risk_manager_model}")
-        
-        # Get API key from database
-        api_key = get_api_key_from_database(api_key_setting_name)
+        # Note: ModelFactory handles provider detection, API keys, and base URLs automatically
+        # We keep risk_manager_model as the full selection string (e.g., "nagaai/gpt5" or "NagaAI/gpt-5-2025-08-07")
         
         max_iterations = int(expert.get_setting_with_interface_default("smart_risk_manager_max_iterations", log_warning=False))
         
@@ -1557,8 +1522,8 @@ def initialize_context(state: SmartRiskManagerState) -> Dict[str, Any]:
             "user_instructions": user_instructions,
             "expert_settings": expert_config,
             "risk_manager_model": risk_manager_model,
-            "backend_url": backend_url,
-            "api_key": api_key,
+            "backend_url": None,  # DEPRECATED: ModelFactory handles this automatically
+            "api_key": None,  # DEPRECATED: ModelFactory handles this automatically
             "job_id": job_id,
             "portfolio_status": portfolio_status,
             "open_positions": open_positions,

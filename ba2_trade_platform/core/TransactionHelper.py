@@ -552,13 +552,13 @@ class TransactionHelper:
                 # Get entry order to determine direction
                 entry_order = TransactionHelper.get_entry_order(transaction, session)
                 if entry_order:
-                    entry_direction = entry_order.direction
+                    entry_direction = entry_order.side
                 else:
                     # Try to infer from existing orders
                     if existing_tpsl_orders:
                         # TP/SL orders have opposite direction to position
                         entry_direction = (OrderDirection.BUY 
-                                         if existing_tpsl_orders[0].direction == OrderDirection.SELL 
+                                         if existing_tpsl_orders[0].side == OrderDirection.SELL 
                                          else OrderDirection.SELL)
                     else:
                         result["message"] = "Cannot determine position direction"

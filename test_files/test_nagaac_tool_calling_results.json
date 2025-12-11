@@ -10,7 +10,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 7023.107051849365
+    "duration_ms": 5703.138113021851
   },
   {
     "model": "NagaAI/gpt-5-2025-08-07",
@@ -23,7 +23,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 6752.092123031616
+    "duration_ms": 6366.443157196045
   },
   {
     "model": "NagaAI/gpt-5-mini-2025-08-07",
@@ -36,7 +36,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 4552.277326583862
+    "duration_ms": 4533.933401107788
   },
   {
     "model": "NagaAI/gpt-5-mini-2025-08-07",
@@ -49,7 +49,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 5699.793577194214
+    "duration_ms": 4240.201711654663
   },
   {
     "model": "NagaAI/gpt-5-nano-2025-08-07",
@@ -62,7 +62,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 5068.1471824646
+    "duration_ms": 3783.3690643310547
   },
   {
     "model": "NagaAI/gpt-5-nano-2025-08-07",
@@ -75,7 +75,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 6605.931997299194
+    "duration_ms": 4255.937576293945
   },
   {
     "model": "NagaAI/gpt-5-chat-latest",
@@ -88,7 +88,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 4612.043380737305
+    "duration_ms": 1304.7032356262207
   },
   {
     "model": "NagaAI/gpt-5-chat-latest",
@@ -101,7 +101,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 4386.499404907227
+    "duration_ms": 2564.277410507202
   },
   {
     "model": "NagaAI/gpt-5-codex",
@@ -114,7 +114,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 1804.2919635772705
+    "duration_ms": 2430.8083057403564
   },
   {
     "model": "NagaAI/gpt-5-codex",
@@ -127,7 +127,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 3516.120195388794
+    "duration_ms": 1397.2396850585938
   },
   {
     "model": "NagaAC/gpt-5.1-2025-11-13",
@@ -140,7 +140,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 1349.062204360962
+    "duration_ms": 2086.763620376587
   },
   {
     "model": "NagaAC/gpt-5.1-2025-11-13",
@@ -153,29 +153,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 1634.979248046875
-  },
-  {
-    "model": "NagaAI/gpt-4o-search-preview-2025-03-11",
-    "method": "openai",
-    "success": false,
-    "tool_called": false,
-    "tool_name": null,
-    "tool_args": null,
-    "native_tool_call_detected": false,
-    "error": "Error code: 501 - {'error': {'type': 'no_sources_available', 'message': 'No sources were found for this model.'}}",
-    "duration_ms": 1709.8054885864258
-  },
-  {
-    "model": "NagaAI/gpt-4o-search-preview-2025-03-11",
-    "method": "langchain",
-    "success": false,
-    "tool_called": false,
-    "tool_name": null,
-    "tool_args": null,
-    "native_tool_call_detected": false,
-    "error": "Error code: 501 - {'error': {'type': 'no_sources_available', 'message': 'No sources were found for this model.'}}",
-    "duration_ms": 1355.107069015503
+    "duration_ms": 1169.2564487457275
   },
   {
     "model": "NagaAI/grok-4-0709",
@@ -188,7 +166,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 4497.325897216797
+    "duration_ms": 5509.465932846069
   },
   {
     "model": "NagaAI/grok-4-0709",
@@ -201,7 +179,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 5403.041839599609
+    "duration_ms": 5394.925832748413
   },
   {
     "model": "NagaAI/grok-4-fast-non-reasoning",
@@ -214,7 +192,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 655.1411151885986
+    "duration_ms": 1840.5654430389404
   },
   {
     "model": "NagaAI/grok-4-fast-non-reasoning",
@@ -227,7 +205,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 358.6597442626953
+    "duration_ms": 559.0684413909912
   },
   {
     "model": "NagaAI/grok-4-fast-reasoning",
@@ -240,7 +218,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 2240.941286087036
+    "duration_ms": 3149.9719619750977
   },
   {
     "model": "NagaAI/grok-4-fast-reasoning",
@@ -253,7 +231,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 961.1494541168213
+    "duration_ms": 2581.7201137542725
   },
   {
     "model": "NagaAC/grok-4.1-fast-reasoning",
@@ -266,7 +244,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 1595.3383445739746
+    "duration_ms": 2808.7823390960693
   },
   {
     "model": "NagaAC/grok-4.1-fast-reasoning",
@@ -279,7 +257,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 1702.6245594024658
+    "duration_ms": 1386.8627548217773
   },
   {
     "model": "NagaAI/qwen3-max",
@@ -292,7 +270,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 2476.78542137146
+    "duration_ms": 2528.215169906616
   },
   {
     "model": "NagaAI/qwen3-max",
@@ -305,7 +283,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 1513.0946636199951
+    "duration_ms": 1520.4987525939941
   },
   {
     "model": "NagaAI/qwen3-next-80b-a3b-instruct",
@@ -318,7 +296,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 1417.5784587860107
+    "duration_ms": 921.9479560852051
   },
   {
     "model": "NagaAI/qwen3-next-80b-a3b-instruct",
@@ -331,7 +309,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 703.3283710479736
+    "duration_ms": 765.4190063476562
   },
   {
     "model": "NagaAI/qwen3-next-80b-a3b-thinking",
@@ -344,7 +322,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 2814.4490718841553
+    "duration_ms": 2231.4274311065674
   },
   {
     "model": "NagaAI/qwen3-next-80b-a3b-thinking",
@@ -357,7 +335,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 1655.6525230407715
+    "duration_ms": 1581.9158554077148
   },
   {
     "model": "NagaAI/deepseek-v3.2",
@@ -370,7 +348,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 3537.8761291503906
+    "duration_ms": 3375.286817550659
   },
   {
     "model": "NagaAI/deepseek-v3.2",
@@ -383,51 +361,33 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 2893.8169479370117
-  },
-  {
-    "model": "NagaAC/deepseek-v3.2-speciale",
-    "method": "openai",
-    "success": true,
-    "tool_called": false,
-    "tool_name": null,
-    "tool_args": null,
-    "native_tool_call_detected": false,
-    "error": null,
-    "duration_ms": 35444.679260253906
-  },
-  {
-    "model": "NagaAC/deepseek-v3.2-speciale",
-    "method": "langchain",
-    "success": true,
-    "tool_called": false,
-    "tool_name": null,
-    "tool_args": null,
-    "native_tool_call_detected": false,
-    "error": null,
-    "duration_ms": 24915.47441482544
+    "duration_ms": 2992.1584129333496
   },
   {
     "model": "NagaAI/deepseek-chat-v3.1",
     "method": "openai",
     "success": true,
-    "tool_called": false,
-    "tool_name": null,
-    "tool_args": null,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 5231.128454208374
+    "duration_ms": 3274.1990089416504
   },
   {
     "model": "NagaAI/deepseek-chat-v3.1",
     "method": "langchain",
     "success": true,
-    "tool_called": false,
-    "tool_name": null,
-    "tool_args": null,
+    "tool_called": true,
+    "tool_name": "get_stock_price",
+    "tool_args": {
+      "symbol": "AAPL"
+    },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 5728.1653881073
+    "duration_ms": 2172.8718280792236
   },
   {
     "model": "NagaAI/deepseek-reasoner-0528",
@@ -440,7 +400,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 4763.667106628418
+    "duration_ms": 4034.733533859253
   },
   {
     "model": "NagaAI/deepseek-reasoner-0528",
@@ -453,7 +413,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 3974.12371635437
+    "duration_ms": 4572.145700454712
   },
   {
     "model": "NagaAI/kimi-k2-thinking",
@@ -466,7 +426,7 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 2801.008939743042
+    "duration_ms": 1360.9340190887451
   },
   {
     "model": "NagaAI/kimi-k2-thinking",
@@ -479,6 +439,6 @@
     },
     "native_tool_call_detected": false,
     "error": null,
-    "duration_ms": 5140.63572883606
+    "duration_ms": 1062.7446174621582
   }
 ]

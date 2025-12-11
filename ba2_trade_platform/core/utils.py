@@ -1306,28 +1306,72 @@ def parse_model_config(model_string: str) -> dict:
     # Parse Provider/Model format
     provider, model = model_string.split('/', 1)
     
-    if provider == 'OpenAI':
-        result = {
+    # Normalize provider to lowercase for consistent matching
+    provider_lower = provider.lower()
+    
+    # Provider configuration mapping (supports both legacy and new formats)
+    PROVIDER_CONFIGS = {
+        'openai': {
             'provider': 'OpenAI',
-            'model': model,
             'base_url': 'https://api.openai.com/v1',
             'api_key_setting': 'openai_api_key',
-            'model_kwargs': model_kwargs
-        }
-    elif provider == 'NagaAI':
-        result = {
+        },
+        'nagaai': {
             'provider': 'NagaAI',
-            'model': model,
             'base_url': 'https://api.naga.ac/v1',
             'api_key_setting': 'naga_ai_api_key',
-            'model_kwargs': model_kwargs
-        }
-    elif provider == 'NagaAC':
-        result = {
+        },
+        'nagaac': {
             'provider': 'NagaAC',
-            'model': model,
             'base_url': 'https://api.naga.ac/v1',
             'api_key_setting': 'naga_ai_api_key',
+        },
+        'native': {
+            # Native provider - uses the new model registry format
+            # Model should be friendly_name, which ModelFactory resolves
+            'provider': 'native',
+            'base_url': None,  # Will be resolved by ModelFactory
+            'api_key_setting': None,  # Will be resolved by ModelFactory
+        },
+        'google': {
+            'provider': 'Google',
+            'base_url': None,  # Google uses direct API
+            'api_key_setting': 'google_api_key',
+        },
+        'anthropic': {
+            'provider': 'Anthropic',
+            'base_url': 'https://api.anthropic.com',
+            'api_key_setting': 'anthropic_api_key',
+        },
+        'openrouter': {
+            'provider': 'OpenRouter',
+            'base_url': 'https://openrouter.ai/api/v1',
+            'api_key_setting': 'openrouter_api_key',
+        },
+        'xai': {
+            'provider': 'xAI',
+            'base_url': 'https://api.x.ai/v1',
+            'api_key_setting': 'xai_api_key',
+        },
+        'deepseek': {
+            'provider': 'DeepSeek',
+            'base_url': 'https://api.deepseek.com',
+            'api_key_setting': 'deepseek_api_key',
+        },
+        'moonshot': {
+            'provider': 'Moonshot',
+            'base_url': 'https://api.moonshot.cn/v1',
+            'api_key_setting': 'moonshot_api_key',
+        },
+    }
+    
+    if provider_lower in PROVIDER_CONFIGS:
+        config = PROVIDER_CONFIGS[provider_lower]
+        result = {
+            'provider': config['provider'],
+            'model': model,
+            'base_url': config['base_url'],
+            'api_key_setting': config['api_key_setting'],
             'model_kwargs': model_kwargs
         }
     else:

@@ -1,11 +1,10 @@
 """
-AI-powered instrument selector using OpenAI or NagaAI to dynamically select trading instruments.
-Supports web search for both OpenAI (responses API) and NagaAI (chat completions API).
+AI-powered instrument selector using LangChain/ModelFactory for unified model access.
+Supports web search via provider-specific configurations.
 """
 
 import json
 from typing import List, Optional
-from openai import OpenAI
 from ..logger import logger
 from .db import get_instance, get_db
 from .models import AppSetting
@@ -14,182 +13,80 @@ from .. import config
 
 class AIInstrumentSelector:
     """
-    AI-powered instrument selector that uses OpenAI or NagaAI to generate curated lists 
+    AI-powered instrument selector that uses LangChain via ModelFactory to generate curated lists 
     of trading instruments based on user-defined prompts and criteria.
-    Supports web search capabilities for real-time market data.
+    Supports web search capabilities through provider-specific model configurations.
     """
 
     def __init__(self, model_string: Optional[str] = None):
         """
-        Initialize the AI instrument selector with OpenAI client.
+        Initialize the AI instrument selector with LangChain via ModelFactory.
         
         Args:
-            model_string: Model to use in format "Provider/ModelName" (e.g., "NagaAI/gpt-5-2025-08-07" or "OpenAI/gpt-5")
+            model_string: Model selection string in new format (e.g., "nagaai/gpt5" or "native/gpt5")
+                         or legacy format (e.g., "NagaAI/gpt-5-2025-08-07" or "OpenAI/gpt-5")
                          REQUIRED - no default fallback
         """
         if not model_string:
             raise ValueError("model_string is required for AIInstrumentSelector - no default fallback allowed")
         
-        self.client = None
         self.model_string = model_string
-        self.provider = None  # "openai" or "nagaai"
-        self.model = None     # Model name without provider prefix
-        self.api_type = None  # "responses" (OpenAI) or "chat" (NagaAI)
+        self.llm = None
+        self.provider = None  # Resolved provider name
         
-        self._parse_model_string()
-        self._initialize_client()
+        self._initialize_llm()
 
-    def _parse_model_string(self):
-        """Parse model string to extract provider and model name using centralized parser."""
+    def _initialize_llm(self):
+        """Initialize LangChain LLM using ModelFactory."""
         try:
-            from .utils import parse_model_config
+            from .ModelFactory import ModelFactory
             
-            parsed = parse_model_config(self.model_string)
-            self.provider = parsed['provider'].lower()
-            self.model = parsed['model']
+            # Get provider info from ModelFactory
+            model_info = ModelFactory.get_model_info(self.model_string)
+            self.provider = model_info.get('provider', 'openai').lower()
             
-            # Determine API type based on provider
-            if self.provider == "openai":
-                self.api_type = "responses"  # Use responses API with web_search_preview
-            elif self.provider in ["nagaai", "nagaac"]:
-                self.api_type = "chat"  # Use chat completions API with web_search_options
-            else:
-                logger.warning(f"Unknown provider '{self.provider}' in model string '{self.model_string}', defaulting to OpenAI")
-                self.provider = "openai"
-                self.api_type = "responses"
+            # Create LLM using ModelFactory
+            # Note: Web search requires special handling per provider
+            self.llm = ModelFactory.create_llm(
+                model_selection=self.model_string,
+                temperature=1.0,  # Higher temperature for creative selection
+            )
             
-            logger.debug(f"Parsed model string '{self.model_string}': provider={self.provider}, model={self.model}, api_type={self.api_type}")
+            logger.debug(f"LangChain LLM initialized successfully for {self.model_string}")
             
+        except ValueError as e:
+            # API key not configured or model not found
+            logger.debug(f"Could not initialize LLM for {self.model_string}: {e}")
+            self.llm = None
         except Exception as e:
-            logger.error(f"Error parsing model string '{self.model_string}': {e}")
-            self.provider = "openai"
-            self.model = "gpt-5"
-            self.api_type = "responses"
+            logger.error(f"Failed to initialize LangChain LLM for {self.model_string}: {e}")
+            self.llm = None
 
-    def _initialize_client(self):
-        """Initialize OpenAI client with API key from database settings."""
-        try:
-            from sqlmodel import select
-            session = get_db()
-            
-            # Get appropriate API key based on provider
-            if self.provider == "openai":
-                key_setting = session.exec(select(AppSetting).where(AppSetting.key == 'openai_api_key')).first()
-                base_url = None
-            elif self.provider in ["nagaai", "nagaac"]:
-                key_setting = session.exec(select(AppSetting).where(AppSetting.key == 'naga_ai_api_key')).first()
-                base_url = "https://api.naga.ac/v1"
-            else:
-                key_setting = session.exec(select(AppSetting).where(AppSetting.key == 'openai_api_key')).first()
-                base_url = None
-            
-            session.close()
-            
-            if not key_setting or not key_setting.value_str:
-                logger.debug(f"{self.provider.upper()} API key not found in settings. AI selection will not be available.")
-                return
-
-            # Initialize client with appropriate configuration
-            if base_url:
-                self.client = OpenAI(api_key=key_setting.value_str, base_url=base_url)
-            else:
-                self.client = OpenAI(api_key=key_setting.value_str)
-            
-            logger.debug(f"OpenAI client initialized successfully for {self.provider}/{self.model}")
-
-        except Exception as e:
-            logger.error(f"Failed to initialize OpenAI client for {self.provider}: {e}")
-            self.client = None
-
-    def _call_openai_responses_api(self, prompt: str) -> str:
-        """Call OpenAI Responses API with web search."""
-        response = self.client.responses.create(
-            model=self.model,
-            input=[
-                {
-                    "role": "system",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": prompt,
-                        }
-                    ],
-                }
-            ],
-            text={"format": {"type": "text"}},
-            reasoning={},
-            tools=[
-                {
-                    "type": "web_search_preview",
-                    "user_location": {"type": "approximate"},
-                    "search_context_size": "low",
-                }
-            ],
-            temperature=1,
-            max_output_tokens=65535,
-            top_p=1,
-            store=True,
-        )
+    def _call_with_web_search(self, prompt: str) -> str:
+        """
+        Call LLM with web search enabled (provider-specific handling).
         
-        # Extract text from response
-        result_text = ""
-        try:
-            if hasattr(response, 'output') and response.output:
-                for item in response.output:
-                    if hasattr(item, 'content'):
-                        if isinstance(item.content, list):
-                            for content_item in item.content:
-                                if hasattr(content_item, 'text'):
-                                    result_text += content_item.text
-                        elif hasattr(item.content, 'text'):
-                            result_text += item.content.text
-        except Exception as extract_error:
-            logger.error(f"Error extracting text from OpenAI Responses API: {extract_error}")
-            raise
+        For providers that support web search through LangChain, we pass
+        web_search_options in the model_kwargs.
+        """
+        from langchain_core.messages import HumanMessage
         
-        return result_text.strip()
-    
-    def _call_nagaai_chat_api(self, prompt: str) -> str:
-        """Call NagaAI Chat Completions API with web_search_options."""
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            web_search_options={
-                # Enable web search with default options
-                # For Grok models, optionally add: "return_citations": True
-            },
-            temperature=1.0,
-            max_tokens=65535,
-            top_p=1.0
-        )
+        # For NagaAI/NagaAC, we can use web_search through bind method
+        if self.provider in ["nagaai", "nagaac"]:
+            # Bind web_search_options to the LLM call
+            llm_with_search = self.llm.bind(
+                web_search_options={}  # Empty dict enables web search
+            )
+            response = llm_with_search.invoke([HumanMessage(content=prompt)])
+        else:
+            # For other providers, call without web search
+            # (OpenAI web_search_preview is only available via Responses API, not chat completions)
+            response = self.llm.invoke([HumanMessage(content=prompt)])
         
-        # Extract text from chat completion response
-        try:
-            if hasattr(response, 'choices') and response.choices:
-                choice = response.choices[0]
-                if hasattr(choice, 'message') and hasattr(choice.message, 'content'):
-                    return choice.message.content
-        except Exception as extract_error:
-            logger.error(f"Error extracting text from NagaAI Chat API: {extract_error}")
-            raise
-        
-        return ""
-    
-    def _call_ai_api(self, prompt: str) -> str:
-        """Call appropriate AI API based on provider type."""
-        try:
-            if self.api_type == 'responses':
-                return self._call_openai_responses_api(prompt)
-            else:  # chat
-                return self._call_nagaai_chat_api(prompt)
-        except Exception as e:
-            logger.error(f"Error calling {self.api_type} API for {self.model_string}: {e}", exc_info=True)
-            raise
+        # Extract content from response
+        if hasattr(response, 'content'):
+            return response.content
+        return str(response)
 
     def get_default_prompt(self) -> str:
         """
@@ -226,8 +123,8 @@ Your response:"""
         Returns:
             Optional[List[str]]: List of selected instrument symbols, or None if failed
         """
-        if not self.client:
-            raise Exception(f"{self.provider.upper()} API key not configured. Please set up your API key in the application settings.")
+        if not self.llm:
+            raise Exception(f"LLM not initialized for {self.model_string}. Please check your API key configuration.")
 
         try:
             # Use provided prompt or default
@@ -237,8 +134,8 @@ Your response:"""
                        (f" (Expert: {expert_instance_id})" if expert_instance_id else ""))
             logger.debug(f"Using prompt: {selection_prompt}...")
 
-            # Call appropriate API with web search enabled
-            response_content = self._call_ai_api(selection_prompt)
+            # Call LLM with web search if supported
+            response_content = self._call_with_web_search(selection_prompt)
                 
             if not response_content:
                 logger.error("AI returned empty response")
@@ -435,35 +332,17 @@ Your response:"""
         Returns:
             bool: True if connection successful, False otherwise
         """
-        if not self.client:
+        if not self.llm:
             return False
             
         try:
-            # Simple test prompt
-            test_prompt = "Hello"
+            from langchain_core.messages import HumanMessage
             
-            # Call appropriate API
-            if self.api_type == 'responses':
-                response = self.client.responses.create(
-                    model=self.model,
-                    input=[
-                        {
-                            "role": "system",
-                            "content": [{"type": "input_text", "text": test_prompt}]
-                        }
-                    ],
-                    text={"format": {"type": "text"}},
-                    max_output_tokens=10
-                )
-            else:  # chat
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[{"role": "user", "content": test_prompt}],
-                    max_tokens=10
-                )
-            return True
+            # Simple test prompt
+            response = self.llm.invoke([HumanMessage(content="Hello")])
+            return bool(response)
         except Exception as e:
-            logger.error(f"{self.provider.upper()} connection test failed: {e}")
+            logger.error(f"LLM connection test failed for {self.model_string}: {e}")
             return False
 
 

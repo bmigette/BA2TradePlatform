@@ -746,7 +746,8 @@ class JobMonitoringTab:
                     self.queued_tasks_table = ui.table(
                         columns=columns,
                         rows=queued_tasks_data,
-                        row_key='task_id'
+                        row_key='task_id',
+                        pagination={'rowsPerPage': 10, 'sortBy': 'created_at', 'descending': True}
                     ).classes('w-full')
                     
                     # Add status badge slot

@@ -5,6 +5,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph, START
 from langgraph.prebuilt import ToolNode
 
+from .. import logger
 from ..agents import *
 from ..agents.utils.agent_states import AgentState
 from ..agents.utils.agent_utils_new import Toolkit
@@ -59,6 +60,7 @@ class GraphSetup:
 
         # Get parallel_tool_calls setting from config (default False for safety)
         parallel_tool_calls = self.config.get("parallel_tool_calls", False)
+        logger.info(f"[SETUP] parallel_tool_calls setting from config: {parallel_tool_calls}")
 
         # Create analyst nodes
         analyst_nodes = {}

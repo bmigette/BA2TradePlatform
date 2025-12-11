@@ -6,10 +6,6 @@ import json
 from datetime import date, datetime, timezone
 from typing import Dict, Any, Tuple, List, Optional
 
-from langchain_openai import ChatOpenAI
-from langchain_anthropic import ChatAnthropic
-from langchain_google_genai import ChatGoogleGenerativeAI
-
 from langgraph.prebuilt import ToolNode
 
 from ..agents import *
@@ -65,6 +61,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         self.expert_instance_id = expert_instance_id
         self.provider_map = provider_map or {}  # Store provider_map
         self.provider_args = provider_args or {}  # Store provider_args
+        self.ticker = None  # Will be set in propagate() - used by tool wrappers
 
         # Initialize logger
         # Use LOG_FOLDER from BA2 platform config
@@ -95,85 +92,50 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             exist_ok=True,
         )
 
-        # Initialize LLMs
-        if self.config["llm_provider"].lower() == "openai" or self.config["llm_provider"] == "ollama" or self.config["llm_provider"] == "openrouter":
-            from ..dataflows.config import get_api_key_from_database
-            # Get API key based on the provider (defaults to openai_api_key for backward compatibility)
-            api_key_setting = self.config.get("api_key_setting", "openai_api_key")
-            api_key = get_api_key_from_database(api_key_setting)
-            
-            # Check if streaming is enabled in config
+        # Initialize LLMs using ModelFactory
+        # The config now contains full model selection strings (e.g., "nagaai/gpt5")
+        from ba2_trade_platform.core.ModelFactory import ModelFactory
+        
+        # Get streaming setting from TradingAgents config (expert setting)
+        # Falls back to global config if not set in expert settings
+        # NOTE: NagaAI/Grok has a bug with streaming - tool call arguments get lost
+        # See docs/NAGAAI_STREAMING_TOOL_CALL_BUG.md for details
+        streaming_enabled = self.config.get("enable_streaming", None)
+        if streaming_enabled is None:
+            # Fall back to global config
             from ba2_trade_platform import config as ba2_config
             streaming_enabled = ba2_config.OPENAI_ENABLE_STREAMING
-            
-            # Get model-specific parameters (e.g., reasoning_effort for GPT-5 and Gemini)
-            deep_think_kwargs = self.config.get("deep_think_llm_kwargs", {})
-            quick_think_kwargs = self.config.get("quick_think_llm_kwargs", {})
-            
-            # Extract parameters that should be passed directly to ChatOpenAI (not in model_kwargs)
-            # These are special parameters that ChatOpenAI recognizes at the class level
-            direct_params = ['reasoning', 'temperature', 'max_tokens', 'top_p', 'frequency_penalty', 'presence_penalty']
-            
-            # Build ChatOpenAI initialization parameters for deep thinking model
-            deep_think_params = {
-                "model": self.config["deep_think_llm"],
-                "base_url": self.config["backend_url"],
-                "api_key": api_key,
-                "streaming": streaming_enabled
-            }
-            
-            # Separate direct params from model_kwargs for deep_think
-            deep_think_model_kwargs = {}
-            for key, value in deep_think_kwargs.items():
-                if key in direct_params:
-                    deep_think_params[key] = value
-                else:
-                    deep_think_model_kwargs[key] = value
-            
-            if deep_think_model_kwargs:
-                deep_think_params["model_kwargs"] = deep_think_model_kwargs
-            
-            # Build ChatOpenAI initialization parameters for quick thinking model
-            quick_think_params = {
-                "model": self.config["quick_think_llm"],
-                "base_url": self.config["backend_url"],
-                "api_key": api_key,
-                "streaming": streaming_enabled
-            }
-            
-            # Separate direct params from model_kwargs for quick_think
-            quick_think_model_kwargs = {}
-            for key, value in quick_think_kwargs.items():
-                if key in direct_params:
-                    quick_think_params[key] = value
-                else:
-                    quick_think_model_kwargs[key] = value
-            
-            if quick_think_model_kwargs:
-                quick_think_params["model_kwargs"] = quick_think_model_kwargs
-            
-            self.deep_thinking_llm = ChatOpenAI(**deep_think_params)
-            self.quick_thinking_llm = ChatOpenAI(**quick_think_params)
-        elif self.config["llm_provider"].lower() == "anthropic":
-            self.deep_thinking_llm = ChatAnthropic(model=self.config["deep_think_llm"], base_url=self.config["backend_url"])
-            self.quick_thinking_llm = ChatAnthropic(model=self.config["quick_think_llm"], base_url=self.config["backend_url"])
-        elif self.config["llm_provider"].lower() == "google":
-            self.deep_thinking_llm = ChatGoogleGenerativeAI(model=self.config["deep_think_llm"])
-            self.quick_thinking_llm = ChatGoogleGenerativeAI(model=self.config["quick_think_llm"])
-        else:
-            raise ValueError(f"Unsupported LLM provider: {self.config['llm_provider']}")
+        
+        logger.info(f"[SETUP] Streaming enabled: {streaming_enabled}")
+        
+        # Get model selection strings
+        deep_think_selection = self.config["deep_think_llm"]
+        quick_think_selection = self.config["quick_think_llm"]
+        
+        # Create LLMs using ModelFactory
+        try:
+            self.deep_thinking_llm = ModelFactory.create_llm(
+                deep_think_selection,
+                streaming=streaming_enabled
+            )
+            self.quick_thinking_llm = ModelFactory.create_llm(
+                quick_think_selection,
+                streaming=streaming_enabled
+            )
+        except ValueError as e:
+            logger.error(f"Failed to create LLM: {e}")
+            raise
         
         # Log model configuration
+        deep_info = ModelFactory.get_model_info(deep_think_selection)
+        quick_info = ModelFactory.get_model_info(quick_think_selection)
+        
         logger.info("=" * 80)
         logger.info("TradingAgents Model Configuration:")
-        logger.info(f"  Provider: {self.config['llm_provider']}")
-        logger.info(f"  Backend URL: {self.config.get('backend_url', 'N/A')}")
-        logger.info(f"  Deep Think Model: {self.config['deep_think_llm']}")
-        if deep_think_kwargs:
-            logger.info(f"  Deep Think Model Parameters: {deep_think_kwargs}")
-        logger.info(f"  Quick Think Model: {self.config['quick_think_llm']}")
-        if quick_think_kwargs:
-            logger.info(f"  Quick Think Model Parameters: {quick_think_kwargs}")
+        logger.info(f"  Deep Think: {deep_think_selection}")
+        logger.info(f"    -> Provider: {deep_info.get('provider', 'N/A')}, Model: {deep_info.get('provider_model_name', 'N/A')}")
+        logger.info(f"  Quick Think: {quick_think_selection}")
+        logger.info(f"    -> Provider: {quick_info.get('provider', 'N/A')}, Model: {quick_info.get('provider_model_name', 'N/A')}")
         logger.info(f"  WebSearch Model: {self.provider_args.get('websearch_model', 'N/A')}")
         logger.info(f"  Embedding Model: {self.config.get('embedding_model', 'N/A')}")
         logger.info("=" * 80)
@@ -384,63 +346,72 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         
         @tool
         def get_ohlcv_data(
-            symbol: str,
+            symbol: str = None,
             start_date: str = None,
             end_date: str = None,
             interval: str = None
         ) -> str:
-            """Get OHLCV (Open, High, Low, Close, Volume) stock price data.
+            """Get OHLCV (Open, High, Low, Close, Volume) stock price data for the company being analyzed.
             
             Args:
-                symbol: REQUIRED. Stock ticker symbol (e.g., 'AAPL', 'NVDA', 'TSLA'). This must be provided.
-                start_date: Optional. Start date for data range. Defaults to 30 days ago if not provided.
-                end_date: Optional. End date for data range. Defaults to today if not provided.
+                symbol: Optional. Stock ticker symbol. Defaults to the company being analyzed.
+                start_date: Optional. Start date for data range. Defaults to 30 days ago.
+                end_date: Optional. End date for data range. Defaults to today.
                 interval: Optional. Data interval. Defaults to configured timeframe.
             
             Returns:
-                str: OHLCV price data for the specified symbol.
+                str: OHLCV price data for the symbol.
             """
-            return self.toolkit.get_ohlcv_data(symbol, start_date, end_date, interval)
+            actual_symbol = symbol or self.ticker
+            if not actual_symbol:
+                return "Error: No symbol provided and no ticker set in graph state."
+            return self.toolkit.get_ohlcv_data(actual_symbol, start_date, end_date, interval)
         
         @tool
         def get_indicator_data(
-            symbol: str,
             indicator: str,
+            symbol: str = None,
             start_date: str = None,
             end_date: str = None,
             interval: str = None
         ) -> str:
-            """Get technical indicator data for a stock.
+            """Get technical indicator data for the company being analyzed.
             
             Args:
-                symbol: REQUIRED. Stock ticker symbol (e.g., 'AAPL', 'NVDA', 'TSLA'). This must be provided.
                 indicator: REQUIRED. Technical indicator name (e.g., 'rsi', 'macd', 'boll', 'atr', 'close_50_sma').
-                start_date: Optional. Start date for data range. Defaults to 30 days ago if not provided.
-                end_date: Optional. End date for data range. Defaults to today if not provided.
+                symbol: Optional. Stock ticker symbol. Defaults to the company being analyzed.
+                start_date: Optional. Start date for data range. Defaults to 30 days ago.
+                end_date: Optional. End date for data range. Defaults to today.
                 interval: Optional. Data interval. Defaults to configured timeframe.
             
             Returns:
-                str: Technical indicator data for the specified symbol.
+                str: Technical indicator data for the symbol.
             """
-            return self.toolkit.get_indicator_data(symbol, indicator, start_date, end_date, interval)
+            actual_symbol = symbol or self.ticker
+            if not actual_symbol:
+                return "Error: No symbol provided and no ticker set in graph state."
+            return self.toolkit.get_indicator_data(actual_symbol, indicator, start_date, end_date, interval)
         
         @tool
         def get_company_news(
-            symbol: str,
             end_date: str,
+            symbol: str = None,
             lookback_days: int = None
         ) -> str:
-            """Get news articles about a specific company.
+            """Get news articles about the company being analyzed.
             
             Args:
-                symbol: REQUIRED. Stock ticker symbol (e.g., 'AAPL', 'NVDA', 'TSLA'). This must be provided.
                 end_date: REQUIRED. End date for news search (format: YYYY-MM-DD).
+                symbol: Optional. Stock ticker symbol. Defaults to the company being analyzed.
                 lookback_days: Optional. Number of days to look back. Defaults to configured value.
             
             Returns:
-                str: News articles about the specified company.
+                str: News articles about the company.
             """
-            return self.toolkit.get_company_news(symbol, end_date, lookback_days)
+            actual_symbol = symbol or self.ticker
+            if not actual_symbol:
+                return "Error: No symbol provided and no ticker set in graph state."
+            return self.toolkit.get_company_news(actual_symbol, end_date, lookback_days)
         
         @tool
         def get_global_news(
@@ -461,79 +432,100 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         
         @tool
         def get_social_media_sentiment(
-            symbol: str,
             end_date: str,
+            symbol: str = None,
             lookback_days: int = None
         ) -> str:
-            """Retrieve social media sentiment and discussions about a specific company.
+            """Retrieve social media sentiment and discussions about the company being analyzed.
             
             Args:
-                symbol: REQUIRED. Stock ticker symbol (e.g., 'AAPL', 'NVDA', 'TSLA'). This must be provided.
                 end_date: REQUIRED. End date for sentiment search (format: YYYY-MM-DD).
+                symbol: Optional. Stock ticker symbol. Defaults to the company being analyzed.
                 lookback_days: Optional. Number of days to look back. Defaults to configured value.
             
             Returns:
-                str: Social media sentiment data for the specified company.
+                str: Social media sentiment data for the company.
             """
-            return self.toolkit.get_social_media_sentiment(symbol, end_date, lookback_days)
+            actual_symbol = symbol or self.ticker
+            if not actual_symbol:
+                return "Error: No symbol provided and no ticker set in graph state."
+            return self.toolkit.get_social_media_sentiment(actual_symbol, end_date, lookback_days)
         
         @tool
         def get_balance_sheet(
-            symbol: str,
             frequency: str,
             end_date: str,
+            symbol: str = None,
             lookback_periods: int = 4
         ) -> str:
-            """Get company balance sheet data."""
-            return self.toolkit.get_balance_sheet(symbol, frequency, end_date, lookback_periods)
+            """Get company balance sheet data for the company being analyzed."""
+            actual_symbol = symbol or self.ticker
+            if not actual_symbol:
+                return "Error: No symbol provided and no ticker set in graph state."
+            return self.toolkit.get_balance_sheet(actual_symbol, frequency, end_date, lookback_periods)
         
         @tool
         def get_income_statement(
-            symbol: str,
             frequency: str,
             end_date: str,
+            symbol: str = None,
             lookback_periods: int = 4
         ) -> str:
-            """Get company income statement data."""
-            return self.toolkit.get_income_statement(symbol, frequency, end_date, lookback_periods)
+            """Get company income statement data for the company being analyzed."""
+            actual_symbol = symbol or self.ticker
+            if not actual_symbol:
+                return "Error: No symbol provided and no ticker set in graph state."
+            return self.toolkit.get_income_statement(actual_symbol, frequency, end_date, lookback_periods)
         
         @tool
         def get_cashflow_statement(
-            symbol: str,
             frequency: str,
             end_date: str,
+            symbol: str = None,
             lookback_periods: int = 4
         ) -> str:
-            """Get company cash flow statement data."""
-            return self.toolkit.get_cashflow_statement(symbol, frequency, end_date, lookback_periods)
+            """Get company cash flow statement data for the company being analyzed."""
+            actual_symbol = symbol or self.ticker
+            if not actual_symbol:
+                return "Error: No symbol provided and no ticker set in graph state."
+            return self.toolkit.get_cashflow_statement(actual_symbol, frequency, end_date, lookback_periods)
         
         @tool
         def get_insider_transactions(
-            symbol: str,
             end_date: str,
+            symbol: str = None,
             lookback_days: int = None
         ) -> str:
-            """Get insider trading transactions."""
-            return self.toolkit.get_insider_transactions(symbol, end_date, lookback_days)
+            """Get insider trading transactions for the company being analyzed."""
+            actual_symbol = symbol or self.ticker
+            if not actual_symbol:
+                return "Error: No symbol provided and no ticker set in graph state."
+            return self.toolkit.get_insider_transactions(actual_symbol, end_date, lookback_days)
         
         @tool
         def get_insider_sentiment(
-            symbol: str,
             end_date: str,
+            symbol: str = None,
             lookback_days: int = None
         ) -> str:
-            """Get aggregated insider sentiment metrics."""
-            return self.toolkit.get_insider_sentiment(symbol, end_date, lookback_days)
+            """Get aggregated insider sentiment metrics for the company being analyzed."""
+            actual_symbol = symbol or self.ticker
+            if not actual_symbol:
+                return "Error: No symbol provided and no ticker set in graph state."
+            return self.toolkit.get_insider_sentiment(actual_symbol, end_date, lookback_days)
         
         @tool
         def get_earnings_estimates(
-            symbol: str,
             as_of_date: str,
+            symbol: str = None,
             lookback_periods: int = 4,
             frequency: str = "quarterly"
         ) -> str:
-            """Get forward earnings estimates from analysts for the next periods."""
-            return self.toolkit.get_earnings_estimates(symbol, as_of_date, lookback_periods, frequency)
+            """Get forward earnings estimates from analysts for the company being analyzed."""
+            actual_symbol = symbol or self.ticker
+            if not actual_symbol:
+                return "Error: No symbol provided and no ticker set in graph state."
+            return self.toolkit.get_earnings_estimates(actual_symbol, as_of_date, lookback_periods, frequency)
         
         @tool
         def get_economic_indicators(

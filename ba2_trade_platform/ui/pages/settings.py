@@ -474,64 +474,171 @@ class InstrumentSettingsTab:
 # --- AppSettingsTab for static settings ---
 class AppSettingsTab:
     """
-    UI tab for editing and saving static application settings (OpenAI API Key, Finnhub API Key, Worker Count).
+    UI tab for editing and saving static application settings (API Keys, Worker Count, etc.).
     Uses the AppSetting model for persistence. Renders directly in the tab.
     """
     def __init__(self):
+        # LLM Provider API Keys
         self.openai_input = None
         self.openai_admin_input = None
         self.naga_ai_input = None
         self.naga_ai_admin_input = None
+        self.anthropic_input = None
+        self.google_input = None
+        self.openrouter_input = None
+        self.xai_input = None
+        self.moonshot_input = None
+        self.deepseek_input = None
+        self.aws_access_key_input = None
+        self.aws_secret_key_input = None
+        self.aws_region_input = None
+        
+        # Data Provider API Keys
         self.finnhub_input = None
         self.fred_input = None
         self.alpha_vantage_input = None
         self.fmp_input = None
+        
+        # Broker API Keys
         self.alpaca_key_input = None
         self.alpaca_secret_input = None
+        
+        # System Settings
         self.worker_count_input = None
         self.account_refresh_interval_input = None
         self.render()
 
     def render(self):
         session = get_db()
+        
+        # LLM Provider API Keys
         openai = session.exec(select(AppSetting).where(AppSetting.key == 'openai_api_key')).first()
         openai_admin = session.exec(select(AppSetting).where(AppSetting.key == 'openai_admin_api_key')).first()
         naga_ai = session.exec(select(AppSetting).where(AppSetting.key == 'naga_ai_api_key')).first()
         naga_ai_admin = session.exec(select(AppSetting).where(AppSetting.key == 'naga_ai_admin_api_key')).first()
+        anthropic = session.exec(select(AppSetting).where(AppSetting.key == 'anthropic_api_key')).first()
+        google = session.exec(select(AppSetting).where(AppSetting.key == 'google_api_key')).first()
+        openrouter = session.exec(select(AppSetting).where(AppSetting.key == 'openrouter_api_key')).first()
+        xai = session.exec(select(AppSetting).where(AppSetting.key == 'xai_api_key')).first()
+        moonshot = session.exec(select(AppSetting).where(AppSetting.key == 'moonshot_api_key')).first()
+        deepseek = session.exec(select(AppSetting).where(AppSetting.key == 'deepseek_api_key')).first()
+        aws_access_key = session.exec(select(AppSetting).where(AppSetting.key == 'aws_access_key_id')).first()
+        aws_secret_key = session.exec(select(AppSetting).where(AppSetting.key == 'aws_secret_access_key')).first()
+        aws_region = session.exec(select(AppSetting).where(AppSetting.key == 'aws_bedrock_region')).first()
+        
+        # Data Provider API Keys
         finnhub = session.exec(select(AppSetting).where(AppSetting.key == 'finnhub_api_key')).first()
         fred = session.exec(select(AppSetting).where(AppSetting.key == 'fred_api_key')).first()
         alpha_vantage = session.exec(select(AppSetting).where(AppSetting.key == 'alpha_vantage_api_key')).first()
         fmp = session.exec(select(AppSetting).where(AppSetting.key == 'FMP_API_KEY')).first()
+        
+        # Broker API Keys
         alpaca_key = session.exec(select(AppSetting).where(AppSetting.key == 'alpaca_api_key')).first()
         alpaca_secret = session.exec(select(AppSetting).where(AppSetting.key == 'alpaca_api_secret')).first()
+        
+        # System Settings
         worker_count = session.exec(select(AppSetting).where(AppSetting.key == 'worker_count')).first()
         account_refresh_interval = session.exec(select(AppSetting).where(AppSetting.key == 'account_refresh_interval')).first()
         
-        with ui.card().classes('w-full'):
-            ui.label('OpenAI API Keys').classes('text-lg font-semibold')
-            self.openai_input = ui.input(label='OpenAI API Key', value=openai.value_str if openai else '').classes('w-full')
-            with ui.row().classes('w-full items-center gap-2 mt-2 mb-2'):
-                self.openai_admin_input = ui.input(label='OpenAI Admin API Key (for usage data)', value=openai_admin.value_str if openai_admin else '').classes('flex-1')
-                ui.link('Get Admin Key', 'https://platform.openai.com/settings/organization/admin-keys', new_tab=True).classes('text-sm text-blue-600 underline')
+        # =================================================================
+        # LLM Provider API Keys Section
+        # =================================================================
+        with ui.card().classes('w-full mb-4'):
+            ui.label('🤖 LLM Provider API Keys').classes('text-xl font-bold mb-2')
+            ui.label('Configure API keys for AI/LLM providers used by market experts and analysis').classes('text-sm text-gray-500 mb-4')
             
-            ui.label('Naga AI API Keys').classes('text-lg font-semibold mt-4')
+            with ui.expansion('OpenAI', icon='smart_toy').classes('w-full mb-2'):
+                with ui.column().classes('w-full gap-2'):
+                    self.openai_input = ui.input(label='OpenAI API Key', value=openai.value_str if openai else '', password=True, password_toggle_button=True).classes('w-full')
+                    with ui.row().classes('w-full items-center gap-2'):
+                        self.openai_admin_input = ui.input(label='OpenAI Admin API Key (for usage data)', value=openai_admin.value_str if openai_admin else '', password=True, password_toggle_button=True).classes('flex-1')
+                        ui.link('Get Admin Key', 'https://platform.openai.com/settings/organization/admin-keys', new_tab=True).classes('text-sm text-blue-600 underline')
+            
+            with ui.expansion('NagaAI', icon='waves').classes('w-full mb-2'):
+                with ui.column().classes('w-full gap-2'):
+                    with ui.row().classes('w-full items-center gap-2'):
+                        self.naga_ai_input = ui.input(label='NagaAI API Key', value=naga_ai.value_str if naga_ai else '', password=True, password_toggle_button=True).classes('flex-1')
+                        ui.link('Get NagaAI Key', 'https://naga.ac/', new_tab=True).classes('text-sm text-blue-600 underline')
+                    self.naga_ai_admin_input = ui.input(label='NagaAI Admin API Key (for usage data)', value=naga_ai_admin.value_str if naga_ai_admin else '', password=True, password_toggle_button=True).classes('w-full')
+            
+            with ui.expansion('Anthropic (Claude)', icon='psychology').classes('w-full mb-2'):
+                with ui.column().classes('w-full gap-2'):
+                    with ui.row().classes('w-full items-center gap-2'):
+                        self.anthropic_input = ui.input(label='Anthropic API Key', value=anthropic.value_str if anthropic else '', password=True, password_toggle_button=True).classes('flex-1')
+                        ui.link('Get Anthropic Key', 'https://console.anthropic.com/settings/keys', new_tab=True).classes('text-sm text-blue-600 underline')
+            
+            with ui.expansion('Google (Gemini)', icon='auto_awesome').classes('w-full mb-2'):
+                with ui.column().classes('w-full gap-2'):
+                    with ui.row().classes('w-full items-center gap-2'):
+                        self.google_input = ui.input(label='Google API Key', value=google.value_str if google else '', password=True, password_toggle_button=True).classes('flex-1')
+                        ui.link('Get Google Key', 'https://aistudio.google.com/app/apikey', new_tab=True).classes('text-sm text-blue-600 underline')
+            
+            with ui.expansion('OpenRouter', icon='route').classes('w-full mb-2'):
+                with ui.column().classes('w-full gap-2'):
+                    with ui.row().classes('w-full items-center gap-2'):
+                        self.openrouter_input = ui.input(label='OpenRouter API Key', value=openrouter.value_str if openrouter else '', password=True, password_toggle_button=True).classes('flex-1')
+                        ui.link('Get OpenRouter Key', 'https://openrouter.ai/keys', new_tab=True).classes('text-sm text-blue-600 underline')
+            
+            with ui.expansion('xAI (Grok)', icon='bolt').classes('w-full mb-2'):
+                with ui.column().classes('w-full gap-2'):
+                    with ui.row().classes('w-full items-center gap-2'):
+                        self.xai_input = ui.input(label='xAI API Key', value=xai.value_str if xai else '', password=True, password_toggle_button=True).classes('flex-1')
+                        ui.link('Get xAI Key', 'https://console.x.ai/', new_tab=True).classes('text-sm text-blue-600 underline')
+            
+            with ui.expansion('Moonshot (Kimi)', icon='nightlight').classes('w-full mb-2'):
+                with ui.column().classes('w-full gap-2'):
+                    with ui.row().classes('w-full items-center gap-2'):
+                        self.moonshot_input = ui.input(label='Moonshot API Key', value=moonshot.value_str if moonshot else '', password=True, password_toggle_button=True).classes('flex-1')
+                        ui.link('Get Moonshot Key', 'https://platform.moonshot.cn/console/api-keys', new_tab=True).classes('text-sm text-blue-600 underline')
+            
+            with ui.expansion('DeepSeek', icon='explore').classes('w-full mb-2'):
+                with ui.column().classes('w-full gap-2'):
+                    with ui.row().classes('w-full items-center gap-2'):
+                        self.deepseek_input = ui.input(label='DeepSeek API Key', value=deepseek.value_str if deepseek else '', password=True, password_toggle_button=True).classes('flex-1')
+                        ui.link('Get DeepSeek Key', 'https://platform.deepseek.com/api_keys', new_tab=True).classes('text-sm text-blue-600 underline')
+            
+            with ui.expansion('AWS Bedrock', icon='cloud').classes('w-full mb-2'):
+                with ui.column().classes('w-full gap-2'):
+                    ui.label('AWS credentials for Amazon Bedrock models (Claude, etc.)').classes('text-sm text-gray-500')
+                    with ui.row().classes('w-full items-center gap-2'):
+                        self.aws_access_key_input = ui.input(label='AWS Access Key ID', value=aws_access_key.value_str if aws_access_key else '', password=True, password_toggle_button=True).classes('flex-1')
+                        ui.link('Get AWS Keys', 'https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html', new_tab=True).classes('text-sm text-blue-600 underline')
+                    self.aws_secret_key_input = ui.input(label='AWS Secret Access Key', value=aws_secret_key.value_str if aws_secret_key else '', password=True, password_toggle_button=True).classes('w-full')
+                    self.aws_region_input = ui.input(label='AWS Region (e.g., us-east-1)', value=aws_region.value_str if aws_region else 'us-east-1').classes('w-full')
+        
+        # =================================================================
+        # Data Provider API Keys Section
+        # =================================================================
+        with ui.card().classes('w-full mb-4'):
+            ui.label('📊 Data Provider API Keys').classes('text-xl font-bold mb-2')
+            ui.label('Configure API keys for market data providers').classes('text-sm text-gray-500 mb-4')
+            
+            self.finnhub_input = ui.input(label='Finnhub API Key', value=finnhub.value_str if finnhub else '', password=True, password_toggle_button=True).classes('w-full')
+            self.fred_input = ui.input(label='FRED API Key', value=fred.value_str if fred else '', password=True, password_toggle_button=True).classes('w-full')
+            self.alpha_vantage_input = ui.input(label='Alpha Vantage API Key', value=alpha_vantage.value_str if alpha_vantage else '', password=True, password_toggle_button=True).classes('w-full')
             with ui.row().classes('w-full items-center gap-2 mt-2'):
-                self.naga_ai_input = ui.input(label='Naga AI API Key', value=naga_ai.value_str if naga_ai else '').classes('flex-1')
-                ui.link('Get Naga AI Key', 'https://naga.ac/', new_tab=True).classes('text-sm text-blue-600 underline')
-            self.naga_ai_admin_input = ui.input(label='Naga AI Admin API Key (for usage data)', value=naga_ai_admin.value_str if naga_ai_admin else '').classes('w-full')
-            
-            ui.label('Other API Keys').classes('text-lg font-semibold mt-4')
-            self.finnhub_input = ui.input(label='Finnhub API Key', value=finnhub.value_str if finnhub else '').classes('w-full')
-            self.fred_input = ui.input(label='FRED API Key', value=fred.value_str if fred else '').classes('w-full')
-            self.alpha_vantage_input = ui.input(label='Alpha Vantage API Key', value=alpha_vantage.value_str if alpha_vantage else '').classes('w-full')
-            with ui.row().classes('w-full items-center gap-2 mt-2 mb-2'):
-                self.fmp_input = ui.input(label='Financial Modeling Prep (FMP) API Key', value=fmp.value_str if fmp else '').classes('flex-1')
+                self.fmp_input = ui.input(label='Financial Modeling Prep (FMP) API Key', value=fmp.value_str if fmp else '', password=True, password_toggle_button=True).classes('flex-1')
                 ui.link('Get FMP Key', 'https://site.financialmodelingprep.com/developer/docs', new_tab=True).classes('text-sm text-blue-600 underline')
-            ui.label('Alpaca API Keys').classes('text-lg font-semibold mt-4')
+        
+        # =================================================================
+        # Broker API Keys Section
+        # =================================================================
+        with ui.card().classes('w-full mb-4'):
+            ui.label('🏦 Broker API Keys').classes('text-xl font-bold mb-2')
+            ui.label('Configure API keys for trading brokers').classes('text-sm text-gray-500 mb-4')
+            
             with ui.row().classes('w-full items-center gap-2'):
-                self.alpaca_key_input = ui.input(label='Alpaca API Key', value=alpaca_key.value_str if alpaca_key else '').classes('flex-1')
+                self.alpaca_key_input = ui.input(label='Alpaca API Key', value=alpaca_key.value_str if alpaca_key else '', password=True, password_toggle_button=True).classes('flex-1')
                 ui.link('Get Alpaca Keys', 'https://alpaca.markets/docs/trading/getting-started/', new_tab=True).classes('text-sm text-blue-600 underline')
             self.alpaca_secret_input = ui.input(label='Alpaca API Secret', value=alpaca_secret.value_str if alpaca_secret else '', password=True, password_toggle_button=True).classes('w-full')
+        
+        # =================================================================
+        # System Settings Section
+        # =================================================================
+        with ui.card().classes('w-full mb-4'):
+            ui.label('⚙️ System Settings').classes('text-xl font-bold mb-2')
+            ui.label('Configure system-level settings').classes('text-sm text-gray-500 mb-4')
+            
             self.worker_count_input = ui.number(
                 label='Worker Count', 
                 value=int(worker_count.value_str) if worker_count and worker_count.value_str else 4,
@@ -546,7 +653,18 @@ class AppSettingsTab:
                 max=1440,  # Maximum 24 hours
                 step=1
             ).classes('w-full')
-            ui.button('Save', on_click=self.save_settings)
+        
+        ui.button('Save All Settings', on_click=self.save_settings, icon='save').classes('mt-4').props('color=primary')
+
+    def _save_app_setting(self, session, key: str, value: str):
+        """Helper method to save an app setting."""
+        setting = session.exec(select(AppSetting).where(AppSetting.key == key)).first()
+        if setting:
+            setting.value_str = value
+            update_instance(setting, session)
+        else:
+            setting = AppSetting(key=key, value_str=value)
+            add_instance(setting, session)
 
     def save_settings(self):
         try:
@@ -592,6 +710,29 @@ class AppSettingsTab:
             else:
                 naga_ai_admin = AppSetting(key='naga_ai_admin_api_key', value_str=self.naga_ai_admin_input.value)
                 add_instance(naga_ai_admin, session)
+
+            # Anthropic API Key
+            self._save_app_setting(session, 'anthropic_api_key', self.anthropic_input.value)
+            
+            # Google API Key
+            self._save_app_setting(session, 'google_api_key', self.google_input.value)
+            
+            # OpenRouter API Key
+            self._save_app_setting(session, 'openrouter_api_key', self.openrouter_input.value)
+            
+            # xAI API Key
+            self._save_app_setting(session, 'xai_api_key', self.xai_input.value)
+            
+            # Moonshot API Key
+            self._save_app_setting(session, 'moonshot_api_key', self.moonshot_input.value)
+            
+            # DeepSeek API Key
+            self._save_app_setting(session, 'deepseek_api_key', self.deepseek_input.value)
+            
+            # AWS Bedrock Credentials
+            self._save_app_setting(session, 'aws_access_key_id', self.aws_access_key_input.value)
+            self._save_app_setting(session, 'aws_secret_access_key', self.aws_secret_key_input.value)
+            self._save_app_setting(session, 'aws_bedrock_region', self.aws_region_input.value)
 
             # Finnhub
             finnhub = session.exec(select(AppSetting).where(AppSetting.key == 'finnhub_api_key')).first()
@@ -666,6 +807,21 @@ class AppSettingsTab:
                 add_instance(account_refresh_interval, session)
             
             session.commit()
+            
+            # Clear the ModelBillingUsage cache so new API keys take effect
+            try:
+                from ...core.ModelBillingUsage import ModelBillingUsage
+                ModelBillingUsage.clear_cache()
+            except Exception as e:
+                logger.warning(f"Could not clear ModelBillingUsage cache: {e}")
+            
+            # Clear the ModelFactory cache so new API keys take effect
+            try:
+                from ...core.ModelFactory import ModelFactory
+                ModelFactory.clear_cache()
+            except Exception as e:
+                logger.warning(f"Could not clear ModelFactory cache: {e}")
+            
             ui.notify('Settings saved successfully', type='positive')
             
             # Notify user that worker count changes require restart
@@ -1542,40 +1698,39 @@ class ExpertSettingsTab:
                         ui.label('AI Model Settings:').classes('text-subtitle2 mb-2')
                         ui.label('Configure AI models used by this expert for various tasks:').classes('text-body2 mb-2')
                         
-                        # Get model options from builtin settings definitions
+                        # Get model options from builtin settings definitions for defaults/descriptions
                         from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
                         MarketExpertInterface._ensure_builtin_settings()
                         
                         risk_manager_model_def = MarketExpertInterface._builtin_settings.get('risk_manager_model', {})
-                        risk_manager_model_options = risk_manager_model_def.get('valid_values', ['NagaAI/gpt-5-2025-08-07'])
-                        risk_manager_model_default = risk_manager_model_def.get('default', 'NagaAI/gpt-5-2025-08-07')
+                        risk_manager_model_default = risk_manager_model_def.get('default', 'nagaai/gpt5')
                         risk_manager_model_help = risk_manager_model_def.get('description', 'AI model used for risk management analysis and decision-making')
                         
                         dynamic_model_def = MarketExpertInterface._builtin_settings.get('dynamic_instrument_selection_model', {})
-                        dynamic_model_options = dynamic_model_def.get('valid_values', ['NagaAI/gpt-5-2025-08-07'])
-                        dynamic_model_default = dynamic_model_def.get('default', 'NagaAI/gpt-5-2025-08-07')
+                        dynamic_model_default = dynamic_model_def.get('default', 'nagaai/gpt5')
                         dynamic_model_help = dynamic_model_def.get('description', 'AI model used for dynamically selecting trading instruments based on market conditions')
                         
+                        # Import the ModelSelectorInput component
+                        from ..components.ModelSelector import ModelSelectorInput
+                        
                         with ui.column().classes('w-full gap-2'):
-                            # Risk Manager Model
-                            ui.label('Risk Manager Model:').classes('text-sm font-medium')
-                            self.risk_manager_model_select = ui.select(
-                                options=risk_manager_model_options,
-                                label='Model for risk analysis',
+                            # Risk Manager Model - using ModelSelectorInput
+                            self.risk_manager_model_input = ModelSelectorInput(
+                                label='Risk Manager Model',
                                 value=risk_manager_model_default,
-                                with_input=True
-                            ).classes('w-full')
-                            ui.label(risk_manager_model_help).classes('text-body2 text-grey-7 ml-2')
+                                default_provider='nagaai',
+                                help_text=risk_manager_model_help
+                            )
+                            self.risk_manager_model_input.render()
                             
-                            # Dynamic Instrument Selection Model
-                            ui.label('Dynamic Instrument Selection Model:').classes('text-sm font-medium mt-2')
-                            self.dynamic_instrument_selection_model_select = ui.select(
-                                options=dynamic_model_options,
-                                label='Model for dynamic instrument selection',
+                            # Dynamic Instrument Selection Model - using ModelSelectorInput
+                            self.dynamic_instrument_selection_model_input = ModelSelectorInput(
+                                label='Dynamic Instrument Selection Model',
                                 value=dynamic_model_default,
-                                with_input=True
-                            ).classes('w-full')
-                            ui.label(dynamic_model_help).classes('text-body2 text-grey-7 ml-2')
+                                default_provider='nagaai',
+                                help_text=dynamic_model_help
+                            )
+                            self.dynamic_instrument_selection_model_input.render()
                         
                         ui.separator().classes('my-4')
                         
@@ -2071,13 +2226,13 @@ class ExpertSettingsTab:
                 self.min_available_balance_pct_input.value = str(min_available_balance_pct)
             
             # Load AI model settings
-            risk_manager_model = settings_source.get('risk_manager_model', 'NagaAI/gpt-5-2025-08-07')
-            if hasattr(self, 'risk_manager_model_select'):
-                self.risk_manager_model_select.value = risk_manager_model
+            risk_manager_model = settings_source.get('risk_manager_model', 'nagaai/gpt5')
+            if hasattr(self, 'risk_manager_model_input'):
+                self.risk_manager_model_input.value = risk_manager_model
             
-            dynamic_instrument_selection_model = settings_source.get('dynamic_instrument_selection_model', 'NagaAI/gpt-5-2025-08-07')
-            if hasattr(self, 'dynamic_instrument_selection_model_select'):
-                self.dynamic_instrument_selection_model_select.value = dynamic_instrument_selection_model
+            dynamic_instrument_selection_model = settings_source.get('dynamic_instrument_selection_model', 'nagaai/gpt5')
+            if hasattr(self, 'dynamic_instrument_selection_model_input'):
+                self.dynamic_instrument_selection_model_input.value = dynamic_instrument_selection_model
             
             # Load AI instrument prompt (for dynamic instrument selection)
             ai_instrument_prompt = settings_source.get('ai_instrument_prompt')
@@ -2097,6 +2252,9 @@ class ExpertSettingsTab:
             # Load smart risk manager max iterations
             smart_risk_manager_max_iterations = settings_source.get('smart_risk_manager_max_iterations', 10)
             if hasattr(self, 'smart_risk_manager_max_iterations_input'):
+                # Handle None value gracefully (can happen if setting exists but value is None)
+                if smart_risk_manager_max_iterations is None:
+                    smart_risk_manager_max_iterations = 10
                 self.smart_risk_manager_max_iterations_input.value = int(smart_risk_manager_max_iterations)
             
             # Load ruleset assignments from ExpertInstance model or imported data
@@ -3230,13 +3388,13 @@ class ExpertSettingsTab:
             logger.debug(f'Saved risk management: min_available_balance_pct={min_balance_value}%')
         
         # Save AI model settings
-        if hasattr(self, 'risk_manager_model_select'):
-            expert.save_setting('risk_manager_model', self.risk_manager_model_select.value, setting_type="str")
-            logger.debug(f'Saved AI model setting: risk_manager_model={self.risk_manager_model_select.value}')
+        if hasattr(self, 'risk_manager_model_input'):
+            expert.save_setting('risk_manager_model', self.risk_manager_model_input.value, setting_type="str")
+            logger.debug(f'Saved AI model setting: risk_manager_model={self.risk_manager_model_input.value}')
         
-        if hasattr(self, 'dynamic_instrument_selection_model_select'):
-            expert.save_setting('dynamic_instrument_selection_model', self.dynamic_instrument_selection_model_select.value, setting_type="str")
-            logger.debug(f'Saved AI model setting: dynamic_instrument_selection_model={self.dynamic_instrument_selection_model_select.value}')
+        if hasattr(self, 'dynamic_instrument_selection_model_input'):
+            expert.save_setting('dynamic_instrument_selection_model', self.dynamic_instrument_selection_model_input.value, setting_type="str")
+            logger.debug(f'Saved AI model setting: dynamic_instrument_selection_model={self.dynamic_instrument_selection_model_input.value}')
         
         # Save risk manager mode
         if hasattr(self, 'risk_manager_mode_select'):

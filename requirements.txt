@@ -41,4 +41,8 @@ rich
 questionary
 langchain-anthropic
 langchain-google-genai
+langchain-xai  # xAI (Grok) models
+langchain-deepseek  # DeepSeek models
+langchain-aws  # AWS Bedrock models
+# Moonshot uses langchain_community.chat_models.moonshot (included in langchain-community)
 trafilatura  # Web content extraction for LLMs

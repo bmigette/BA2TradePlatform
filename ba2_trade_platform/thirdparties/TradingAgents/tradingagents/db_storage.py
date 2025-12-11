@@ -241,8 +241,19 @@ def get_market_analysis_outputs(analysis_id: int):
         return []
 
 
+class ToolCallFailureError(Exception):
+    """Exception raised when tool calls fail repeatedly after max retries."""
+    def __init__(self, tool_name: str, message: str, market_analysis_id: int = None):
+        self.tool_name = tool_name
+        self.market_analysis_id = market_analysis_id
+        super().__init__(message)
+
+
 class LoggingToolNode:
-    """Custom ToolNode wrapper that logs tool calls and stores JSON data."""
+    """Custom ToolNode wrapper that logs tool calls, stores JSON data, and handles retries with reflection."""
+    
+    # Maximum consecutive failures before failing the analysis
+    MAX_CONSECUTIVE_FAILURES = 3
     
     def __init__(self, tools, market_analysis_id=None, model_info: str = None):
         from langgraph.prebuilt import ToolNode
@@ -251,6 +262,9 @@ class LoggingToolNode:
         self.market_analysis_id = market_analysis_id
         self.model_info = model_info  # Model info for logging (e.g., "NagaAI/grok-4" or "OpenAI/gpt-5")
         self.original_tools = {t.name: t for t in tools}
+        
+        # Track consecutive failures per tool for retry logic
+        self.consecutive_failures: Dict[str, int] = {}
         
         # Wrap each tool to intercept results and store JSON
         wrapped_tools = []
@@ -366,12 +380,78 @@ class LoggingToolNode:
         
         return wrapped_tool
     
+    def _check_concatenated_tool_name(self, tool_name: str) -> None:
+        """Check for concatenated tool names caused by buggy LLM providers and raise error.
+        
+        Some LLM providers (e.g., Grok/NagaAI) can return corrupted tool names like
+        'get_ohlcv_dataget_indicator_dataget_indicator_data' when the model tries
+        to call multiple tools. This is an API-level bug where tool names get concatenated
+        instead of being returned as separate tool calls.
+        
+        Args:
+            tool_name: The tool name to check
+            
+        Raises:
+            ToolCallFailureError: If concatenated tool name is detected
+        """
+        # Valid tool names we recognize
+        valid_tools = list(self.original_tools.keys())
+        
+        # Log all tool call names for debugging (helps catch the bug early)
+        logger.debug(f"[TOOL_CHECK] Checking tool name: '{tool_name}' (len={len(tool_name)}) against valid tools: {valid_tools}")
+        
+        # If tool name is already valid, return
+        if tool_name in valid_tools:
+            return
+        
+        # Log when we detect an unknown tool name (this is where concatenation might be happening)
+        logger.warning(f"[TOOL_CHECK] Unknown tool name detected: '{tool_name}' (len={len(tool_name)})")
+        
+        # Check if the tool name is a concatenation of ANY valid tools (not just the same one)
+        # Example: "get_ohlcv_dataget_indicator_dataget_indicator_data" contains multiple valid tool names
+        for valid_tool in valid_tools:
+            # Check if the corrupted name starts with a valid tool and is longer
+            if tool_name.startswith(valid_tool) and len(tool_name) > len(valid_tool):
+                remainder = tool_name[len(valid_tool):]
+                # Check if ANY valid tool name appears in the remainder (not just the same one)
+                for other_tool in valid_tools:
+                    if remainder.startswith(other_tool) or other_tool in remainder:
+                        model_str = f" (Model: {self.model_info})" if self.model_info else ""
+                        error_msg = (
+                            f"CRITICAL: Detected concatenated/corrupted tool name from LLM provider{model_str}: '{tool_name}'. "
+                            f"This is a known BUG in the NagaAI/Grok API where multiple tool calls get concatenated "
+                            f"into a single string instead of being returned as separate tool calls. "
+                            f"Workaround: Try using a different LLM provider (OpenAI, Anthropic) or wait for NagaAI to fix this bug."
+                        )
+                        logger.error(error_msg)
+                        
+                        # Mark analysis as failed
+                        if self.market_analysis_id:
+                            update_market_analysis_status(
+                                self.market_analysis_id,
+                                "FAILED",
+                                {
+                                    "error": "NagaAI API bug: Corrupted tool name (tool names concatenated)",
+                                    "corrupted_tool_name": tool_name,
+                                    "suggestion": "Use a different LLM provider (OpenAI, Anthropic) or wait for NagaAI bug fix",
+                                    "timestamp": datetime.now(timezone.utc).isoformat()
+                                }
+                            )
+                        
+                        raise ToolCallFailureError(
+                            tool_name=tool_name,
+                            message=error_msg,
+                            market_analysis_id=self.market_analysis_id
+                        )
+    
     def __call__(self, state):
         """Execute tools via ToolNode with call_id truncation for OpenAI compatibility.
         
         OpenAI enforces a 64-character limit on tool call IDs, but LangGraph can generate
         longer IDs when parallel tool calls are enabled. This method truncates call_ids
         in ALL AIMessages in the conversation history before passing to ToolNode.
+        
+        Also fixes concatenated tool names caused by buggy LLM providers.
         """
         import hashlib
         import copy
@@ -384,35 +464,37 @@ class LoggingToolNode:
         messages_modified = False
         new_messages = []
         
-        # Process all messages in history to truncate any long call_ids
+        # Process all messages in history to truncate any long call_ids and fix concatenated tool names
         for message in state["messages"]:
             # Only process AIMessage with tool_calls
             if isinstance(message, AIMessage) and hasattr(message, "tool_calls") and message.tool_calls:
-                needs_truncation = False
-                truncated_calls = []
+                needs_modification = False
+                modified_calls = []
                 
                 for tool_call in message.tool_calls:
                     original_id = tool_call.get("id", "")
+                    original_name = tool_call.get("name", "")
+                    modified_call = copy.deepcopy(tool_call)
+                    
+                    # Check for concatenated tool names (e.g., 'get_indicator_dataget_indicator_data...')
+                    # This will raise ToolCallFailureError if detected
+                    self._check_concatenated_tool_name(original_name)
                     
                     # Check if call_id exceeds OpenAI's 64-char limit
                     if len(original_id) > 64:
-                        needs_truncation = True
+                        needs_modification = True
                         messages_modified = True
                         # Create deterministic shortened ID using hash
                         hash_suffix = hashlib.sha256(original_id.encode()).hexdigest()[:24]
                         truncated_id = f"{original_id[:40]}_{hash_suffix}"[:64]
                         
                         logger.debug(f"Truncated call_id from {len(original_id)} to {len(truncated_id)} chars")
-                        
-                        # Create new tool_call dict with truncated ID (deep copy to avoid mutation)
-                        truncated_call = copy.deepcopy(tool_call)
-                        truncated_call["id"] = truncated_id
-                        truncated_calls.append(truncated_call)
-                    else:
-                        truncated_calls.append(copy.deepcopy(tool_call))
+                        modified_call["id"] = truncated_id
+                    
+                    modified_calls.append(modified_call)
                 
-                # If any IDs were truncated in this message, create new AIMessage
-                if needs_truncation:
+                # If any modifications were made in this message, create new AIMessage
+                if needs_modification:
                     # Create new additional_kwargs without tool_calls (if present)
                     new_additional_kwargs = {}
                     if hasattr(message, "additional_kwargs") and message.additional_kwargs:
@@ -420,10 +502,10 @@ class LoggingToolNode:
                             if key != "tool_calls":
                                 new_additional_kwargs[key] = value
                     
-                    # Create new AIMessage with truncated IDs
+                    # Create new AIMessage with modified tool calls
                     new_message = AIMessage(
                         content=message.content,
-                        tool_calls=truncated_calls,
+                        tool_calls=modified_calls,
                         id=message.id if hasattr(message, "id") else None,
                         additional_kwargs=new_additional_kwargs
                     )
@@ -439,15 +521,174 @@ class LoggingToolNode:
             new_state = state.copy()
             new_state["messages"] = new_messages
             
-            logger.info(f"Truncated tool call IDs in conversation history to comply with OpenAI 64-char limit")
+            logger.info(f"Modified tool call IDs in conversation history to comply with OpenAI 64-char limit")
             
             # Use modified state
             result = self.tool_node.invoke(new_state)
         else:
-            # No truncation needed, use original state
+            # No modifications needed, use original state
             result = self.tool_node.invoke(state)
         
+        # Check result for tool errors and track consecutive failures
+        result = self._check_and_track_failures(result, state)
+        
         return result
+    
+    def _check_and_track_failures(self, result: Dict[str, Any], original_state: Dict[str, Any]) -> Dict[str, Any]:
+        """Check tool results for errors and track consecutive failures.
+        
+        If a tool fails MAX_CONSECUTIVE_FAILURES times in a row, raises ToolCallFailureError
+        to fail the analysis.
+        
+        Args:
+            result: The result from ToolNode.invoke()
+            original_state: The original state passed to __call__
+            
+        Returns:
+            The result, potentially with enhanced error messages
+            
+        Raises:
+            ToolCallFailureError: If max consecutive failures reached
+        """
+        from langchain_core.messages import ToolMessage
+        
+        if "messages" not in result:
+            return result
+        
+        enhanced_messages = []
+        
+        for message in result["messages"]:
+            if isinstance(message, ToolMessage):
+                tool_name = message.name if hasattr(message, 'name') else 'unknown'
+                content = message.content if hasattr(message, 'content') else ''
+                
+                # Check if this is an error message (Field required, validation errors, etc.)
+                is_error = (
+                    'Field required' in str(content) or
+                    'Error invoking tool' in str(content) or
+                    'validation error' in str(content).lower()
+                )
+                
+                if is_error:
+                    # Increment failure counter
+                    self.consecutive_failures[tool_name] = self.consecutive_failures.get(tool_name, 0) + 1
+                    failure_count = self.consecutive_failures[tool_name]
+                    
+                    logger.warning(f"Tool '{tool_name}' failed (attempt {failure_count}/{self.MAX_CONSECUTIVE_FAILURES}): {content[:200]}")
+                    
+                    # Check if we've exceeded max retries
+                    if failure_count >= self.MAX_CONSECUTIVE_FAILURES:
+                        error_msg = (
+                            f"CRITICAL: Tool '{tool_name}' has failed {failure_count} consecutive times. "
+                            f"Analysis cannot proceed. Last error: {content}"
+                        )
+                        logger.error(error_msg)
+                        
+                        # Mark analysis as failed in database
+                        if self.market_analysis_id:
+                            update_market_analysis_status(
+                                self.market_analysis_id,
+                                "FAILED",
+                                {
+                                    "error": f"Tool {tool_name} failed after {failure_count} retries",
+                                    "last_error": str(content)[:500],
+                                    "failed_tool": tool_name,
+                                    "timestamp": datetime.now(timezone.utc).isoformat()
+                                }
+                            )
+                        
+                        # Raise exception to stop the graph
+                        raise ToolCallFailureError(
+                            tool_name=tool_name,
+                            message=error_msg,
+                            market_analysis_id=self.market_analysis_id
+                        )
+                    
+                    # Add reflection instructions to help the model correct itself
+                    reflection_hint = self._generate_reflection_hint(tool_name, content, failure_count)
+                    enhanced_content = f"{content}\n\n{reflection_hint}"
+                    
+                    # Create new ToolMessage with enhanced content
+                    enhanced_message = ToolMessage(
+                        content=enhanced_content,
+                        tool_call_id=message.tool_call_id if hasattr(message, 'tool_call_id') else '',
+                        name=tool_name
+                    )
+                    enhanced_messages.append(enhanced_message)
+                else:
+                    # Success - reset failure counter for this tool
+                    if tool_name in self.consecutive_failures:
+                        logger.info(f"Tool '{tool_name}' succeeded after {self.consecutive_failures[tool_name]} previous failures")
+                        self.consecutive_failures[tool_name] = 0
+                    enhanced_messages.append(message)
+            else:
+                enhanced_messages.append(message)
+        
+        # Return result with enhanced messages
+        result["messages"] = enhanced_messages
+        return result
+    
+    def _generate_reflection_hint(self, tool_name: str, error_content: str, failure_count: int) -> str:
+        """Generate a reflection hint to help the model correct its tool usage.
+        
+        Args:
+            tool_name: Name of the tool that failed
+            error_content: The error message content
+            failure_count: Number of consecutive failures
+            
+        Returns:
+            Reflection hint string
+        """
+        remaining_attempts = self.MAX_CONSECUTIVE_FAILURES - failure_count
+        
+        # Parse the error to provide specific guidance
+        hints = []
+        
+        if 'Field required' in error_content:
+            # Extract which field is required
+            import re
+            field_match = re.search(r"(\w+):\s*Field required", error_content)
+            if field_match:
+                field_name = field_match.group(1)
+                hints.append(f"The '{field_name}' parameter is REQUIRED but was not provided.")
+                
+                # Provide specific guidance based on the field
+                if field_name == 'indicator':
+                    hints.append("You MUST specify which indicator to calculate. Valid indicators include: rsi, macd, macds, macdh, boll, boll_ub, boll_lb, atr, close_50_sma, close_200_sma, close_10_ema, vwma")
+                    hints.append("Example: get_indicator_data(indicator='rsi')")
+                elif field_name == 'frequency':
+                    hints.append("You MUST specify the frequency. Valid values are: 'annual' or 'quarterly'")
+                    hints.append("Example: get_balance_sheet(frequency='quarterly', end_date='2025-12-10')")
+                elif field_name == 'end_date':
+                    hints.append("You MUST specify the end_date in YYYY-MM-DD format.")
+                    hints.append("Example: get_company_news(end_date='2025-12-10')")
+        
+        if 'kwargs {}' in error_content or 'kwargs: {}' in error_content:
+            hints.append("You called the tool with NO arguments at all. Tools require specific parameters.")
+        
+        # Add urgency based on remaining attempts
+        if remaining_attempts == 1:
+            urgency = "⚠️ FINAL ATTEMPT: If you fail again, the analysis will be marked as FAILED."
+        else:
+            urgency = f"⚠️ WARNING: You have {remaining_attempts} attempts remaining before the analysis fails."
+        
+        reflection = f"""
+=== TOOL USAGE CORRECTION REQUIRED ===
+{urgency}
+
+PROBLEM: Your tool call to '{tool_name}' failed because required parameters were missing.
+
+{"".join(f"• {hint}" + chr(10) for hint in hints)}
+INSTRUCTIONS:
+1. Review the tool's required parameters carefully
+2. The symbol parameter is OPTIONAL (defaults to the company being analyzed)
+3. Other parameters like 'indicator', 'end_date', 'frequency' ARE REQUIRED
+4. Call the tool again with ALL required parameters
+
+DO NOT repeat the same mistake. Provide the required parameters in your next tool call.
+=== END CORRECTION ===
+"""
+        return reflection
 
 
 class DatabaseStorageMixin:

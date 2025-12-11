@@ -84,8 +84,9 @@ class ExtendableSettingsInterface(ABC):
             ValueError: If setting key not found in interface definitions
         """
         # Check if setting exists in current settings
+        # Also treat the string "None" as None (bug: str(None) was stored in DB)
         setting_value = self.settings.get(setting_key)
-        if setting_value is not None:
+        if setting_value is not None and setting_value != "None":
             return setting_value
         
         # Fall back to interface default
@@ -182,11 +183,17 @@ class ExtendableSettingsInterface(ABC):
                 add_instance(setting, session)
         else:
             # Default to string
+            # Handle None values - don't store as string "None"
+            if value is None:
+                str_value = None
+            else:
+                str_value = str(value)
+            
             if setting:
-                setting.value_str = str(value)
+                setting.value_str = str_value
                 update_instance(setting, session)
             else:
-                setting = setting_model(**{lk_field: self.id, "key": key, "value_str": str(value)})
+                setting = setting_model(**{lk_field: self.id, "key": key, "value_str": str_value})
                 add_instance(setting, session)
 
     def save_setting(self, key: str, value: Any, setting_type: Optional[str] = None):
@@ -342,7 +349,12 @@ class ExtendableSettingsInterface(ABC):
                 elif value_type == "float":
                     settings[setting.key] = setting.value_float
                 else:
-                    settings[setting.key] = setting.value_str
+                    # Convert string "None" (from str(None) bug) back to Python None
+                    value_str = setting.value_str
+                    if value_str == "None":
+                        settings[setting.key] = None
+                    else:
+                        settings[setting.key] = value_str
                     
             #logger.debug(f"Loaded settings for {lk_field}={self.id}: {settings}")
             

@@ -5,6 +5,7 @@ from .InstrumentDistributionChart import InstrumentDistributionChart
 from .BalanceUsagePerExpertChart import BalanceUsagePerExpertChart
 from .FloatingPLPerExpertWidget import FloatingPLPerExpertWidget
 from .FloatingPLPerAccountWidget import FloatingPLPerAccountWidget
+from .ModelSelector import ModelSelector, ModelSelectorInput
 
 __all__ = [
     'InstrumentSelector', 
@@ -13,5 +14,7 @@ __all__ = [
     'InstrumentDistributionChart', 
     'BalanceUsagePerExpertChart',
     'FloatingPLPerExpertWidget',
-    'FloatingPLPerAccountWidget'
+    'FloatingPLPerAccountWidget',
+    'ModelSelector',
+    'ModelSelectorInput'
 ]

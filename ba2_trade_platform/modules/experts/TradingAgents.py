@@ -399,6 +399,12 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                 "help": "Enable parallel tool calls for all TradingAgents analysts. May cause issues with some LLM providers (e.g., GPT-4.5/5.1 reasoning modes).",
                 "tooltip": "Allows analysts to call multiple tools simultaneously for faster execution. Disable if experiencing corrupted tool names or call_id errors with certain LLM models (especially GPT-4.5/5.1 with reasoning). When disabled, tools execute sequentially which is slower but more stable."
             },
+            "enable_streaming": {
+                "type": "bool", "required": False, "default": True,
+                "description": "Enable LLM Streaming",
+                "help": "Enable streaming responses from LLM API. Prevents Cloudflare timeouts on long operations but causes tool call bugs with NagaAI/Grok. See [NagaAI Streaming Bug](docs/NAGAAI_STREAMING_TOOL_CALL_BUG.md).",
+                "tooltip": "When enabled, LLM responses stream incrementally which prevents timeouts on long operations. DISABLE for NagaAI/Grok models as streaming causes tool call arguments to be lost and tool names to get concatenated."
+            },
             
             # Dynamic Instrument Selection
             "max_instruments": {
@@ -414,8 +420,6 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
     
     def _create_tradingagents_config(self, subtype: str) -> Dict[str, Any]:
         """Create TradingAgents configuration from expert settings."""
-        from ...core.utils import parse_model_config
-        
         config = DEFAULT_CONFIG.copy()
         
         # Get settings definitions for default values
@@ -458,41 +462,27 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
             'get_insider_transactions': _get_vendor_string('vendor_insider'),
         }
         
-        # Parse model configurations to extract provider and actual model names
+        # Get model selection strings - pass them directly to trading_graph for ModelFactory
         deep_think_model_str = self.settings.get('deep_think_llm') or settings_def['deep_think_llm']['default']
         quick_think_model_str = self.settings.get('quick_think_llm') or settings_def['quick_think_llm']['default']
         embedding_model_str = self.settings.get('embedding_model') or settings_def['embedding_model']['default']
         
-        deep_think_config = parse_model_config(deep_think_model_str)
-        quick_think_config = parse_model_config(quick_think_model_str)
-        embedding_config = parse_model_config(embedding_model_str)
-        
-        # Use the provider's base_url (they should match, but use deep_think as primary)
-        backend_url = deep_think_config['base_url']
-        
-        # Get the API key setting name for the primary provider
-        # This will be used by the graph to retrieve the correct API key
-        api_key_setting = deep_think_config['api_key_setting']
-        
         # Apply user settings with defaults from settings definitions
+        # Pass full model selection strings - ModelFactory will handle parsing
         config.update({
             'max_debate_rounds': max_debate_rounds,
             'max_risk_discuss_rounds': max_risk_discuss_rounds,
-            'deep_think_llm': deep_think_config['model'],  # Just the model name without provider prefix
-            'deep_think_llm_kwargs': deep_think_config['model_kwargs'],  # Model-specific parameters (e.g., reasoning_effort)
-            'quick_think_llm': quick_think_config['model'],  # Just the model name without provider prefix
-            'quick_think_llm_kwargs': quick_think_config['model_kwargs'],  # Model-specific parameters
-            'backend_url': backend_url,  # Dynamic base URL based on provider
-            'api_key_setting': api_key_setting,  # Store which API key setting to use
-            'embedding_model': embedding_config['model'],  # Embedding model name
-            'embedding_backend_url': embedding_config['base_url'],  # Embedding endpoint
-            'embedding_api_key_setting': embedding_config['api_key_setting'],  # Embedding API key
+            'deep_think_llm': deep_think_model_str,  # Full selection string (e.g., "nagaai/gpt5")
+            'quick_think_llm': quick_think_model_str,  # Full selection string (e.g., "nagaai/gpt5_mini")
+            'embedding_model': embedding_model_str,  # Full selection string
             'news_lookback_days': int(self.settings.get('news_lookback_days') or settings_def['news_lookback_days']['default']),
             'market_history_days': int(self.settings.get('market_history_days') or settings_def['market_history_days']['default']),
             'economic_data_days': int(self.settings.get('economic_data_days') or settings_def['economic_data_days']['default']),
             'social_sentiment_days': int(self.settings.get('social_sentiment_days') or settings_def['social_sentiment_days']['default']),
             'timeframe': self.settings.get('timeframe') or settings_def['timeframe']['default'],
             'tool_vendors': tool_vendors,  # Add tool_vendors to config
+            'parallel_tool_calls': self.settings.get('parallel_tool_calls', settings_def['parallel_tool_calls']['default']),
+            'enable_streaming': self.settings.get('enable_streaming', settings_def['enable_streaming']['default']),
         })
         
         return config
