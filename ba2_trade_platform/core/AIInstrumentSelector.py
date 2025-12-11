@@ -64,29 +64,28 @@ class AIInstrumentSelector:
 
     def _call_with_web_search(self, prompt: str) -> str:
         """
-        Call LLM with web search enabled (provider-specific handling).
+        Call LLM with web search enabled using ModelFactory.do_llm_call_with_websearch.
         
-        For providers that support web search through LangChain, we pass
-        web_search_options in the model_kwargs.
+        This method properly handles web search for all providers:
+        - OpenAI: Uses Responses API with web_search_preview tool
+        - NagaAI: Uses Chat Completions API with web_search_options
+        - xAI (Grok): Uses NagaAI proxy with web_search_options
+        - Google (Gemini): Uses Google Search grounding
         """
-        from langchain_core.messages import HumanMessage
+        from .ModelFactory import ModelFactory
         
-        # For NagaAI/NagaAC, we can use web_search through bind method
-        if self.provider in ["nagaai", "nagaac"]:
-            # Bind web_search_options to the LLM call
-            llm_with_search = self.llm.bind(
-                web_search_options={}  # Empty dict enables web search
-            )
-            response = llm_with_search.invoke([HumanMessage(content=prompt)])
-        else:
-            # For other providers, call without web search
-            # (OpenAI web_search_preview is only available via Responses API, not chat completions)
-            response = self.llm.invoke([HumanMessage(content=prompt)])
+        logger.info(f"Calling LLM with web search enabled for model: {self.model_string}")
         
-        # Extract content from response
-        if hasattr(response, 'content'):
-            return response.content
-        return str(response)
+        # Use ModelFactory's web search method which handles all providers correctly
+        response_content = ModelFactory.do_llm_call_with_websearch(
+            model_selection=self.model_string,
+            prompt=prompt,
+            max_tokens=4096,
+            temperature=1.0,  # Higher temperature for creative selection
+        )
+        
+        logger.debug(f"Web search LLM call completed, response length: {len(response_content)} chars")
+        return response_content
 
     def get_default_prompt(self) -> str:
         """
