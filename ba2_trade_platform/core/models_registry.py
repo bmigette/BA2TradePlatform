@@ -120,7 +120,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_NAGAAI: "gpt-5-2025-08-07",
             PROVIDER_OPENROUTER: "openai/gpt-5-2025-08-07",
         },
-        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_TOOL_CALLING],
+        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
     },
     "gpt5_mini": {
         "native_provider": PROVIDER_OPENAI,
@@ -131,7 +131,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_NAGAAI: "gpt-5-mini-2025-08-07",
             PROVIDER_OPENROUTER: "openai/gpt-5-mini",
         },
-        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING],
+        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
     },
     "gpt5_nano": {
         "native_provider": PROVIDER_OPENAI,
@@ -142,7 +142,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_NAGAAI: "gpt-5-nano-2025-08-07",
             PROVIDER_OPENROUTER: "openai/gpt-5-nano-2025-08-07",
         },
-        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING],
+        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
     },
     "gpt5_chat": {
         "native_provider": PROVIDER_OPENAI,
@@ -175,7 +175,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_NAGAAI: "gpt-5.1-2025-11-13",
             PROVIDER_OPENROUTER: "openai/gpt-5.1-2025-11-13",
         },
-        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_TOOL_CALLING],
+        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
         "supports_parameters": ["reasoning_effort"],  # Supports {reasoning=effort:low/medium/high}
     },
     
@@ -191,7 +191,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_NAGAAI: "gpt-5.2-2025-12-11",
             PROVIDER_OPENROUTER: "openai/gpt-5.2",
         },
-        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_TOOL_CALLING],
+        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
         "supports_parameters": ["reasoning_effort"],  # Supports {reasoning_effort:low/medium/high}
     },
     "gpt5.2_pro": {
@@ -203,7 +203,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_NAGAAI: "gpt-5.2-pro-2025-12-11",
             PROVIDER_OPENROUTER: "openai/gpt-5.2-pro",
         },
-        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_TOOL_CALLING],
+        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
         "supports_parameters": ["reasoning_effort"],  # Supports medium/high/xhigh
     },
     
@@ -348,7 +348,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_NAGAAI: "grok-3-mini",
             PROVIDER_OPENROUTER: "x-ai/grok-3-mini",
         },
-        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING],
+        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
     },
     
     # =========================================================================
@@ -482,7 +482,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_NAGAAI: "gemini-3-pro-preview",
             PROVIDER_OPENROUTER: "google/gemini-3-pro-preview",
         },
-        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_VISION, LABEL_TOOL_CALLING],
+        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_VISION, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
     },
     "gemini_2.5_pro": {
         "native_provider": PROVIDER_GOOGLE,
@@ -493,7 +493,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_NAGAAI: "gemini-2.5-pro-preview-06-05",
             PROVIDER_OPENROUTER: "google/gemini-2.5-pro-preview",
         },
-        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_VISION, LABEL_TOOL_CALLING],
+        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_VISION, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
     },
     "gemini_2.5_flash": {
         "native_provider": PROVIDER_GOOGLE,
@@ -504,7 +504,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_NAGAAI: "gemini-2.5-flash-preview-05-20",
             PROVIDER_OPENROUTER: "google/gemini-2.5-flash-preview",
         },
-        "labels": [LABEL_LOW_COST, LABEL_THINKING, LABEL_FAST, LABEL_VISION, LABEL_TOOL_CALLING],
+        "labels": [LABEL_LOW_COST, LABEL_THINKING, LABEL_FAST, LABEL_VISION, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
     },
     "gemini_2.0_flash": {
         "native_provider": PROVIDER_GOOGLE,
@@ -515,7 +515,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_NAGAAI: "gemini-2.0-flash",
             PROVIDER_OPENROUTER: "google/gemini-2.0-flash",
         },
-        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_VISION, LABEL_TOOL_CALLING],
+        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_VISION, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
     },
     
     # =========================================================================
