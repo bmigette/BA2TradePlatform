@@ -301,13 +301,63 @@ class ModelSelector:
                 {'name': 'labels_display', 'label': 'Labels', 'field': 'labels_display', 'align': 'left'},
             ]
             
+            # Define the selection handler (for checkbox clicks)
+            def handle_table_selection(e):
+                """Handle table checkbox selection."""
+                logger.debug(f'Table selection event: selection={e.selection}')
+                if e.selection:
+                    # Single selection - get the first selected row
+                    row = e.selection[0]
+                    self.selected_model = row['id']
+                    logger.debug(f'Model selected via checkbox: {self.selected_model}')
+                else:
+                    self.selected_model = None
+                    logger.debug('Model selection cleared')
+                
+                # Update displays
+                self._update_selection_displays()
+                
+                # Notify callback
+                if self.on_selection_change:
+                    selection = self.get_selected_model()
+                    self.on_selection_change(selection)
+            
+            # Define the row click handler for selection
+            def handle_row_click(e):
+                """Handle clicking anywhere on a row to select it."""
+                row_data = e.args[1]  # Second argument is the row data
+                if row_data:
+                    row_id = row_data.get('id')
+                    if row_id:
+                        self.selected_model = row_id
+                        logger.debug(f'Model selected via row click: {self.selected_model}')
+                        
+                        # Update the table's selected property for visual feedback
+                        for row in self.table.rows:
+                            if row['id'] == row_id:
+                                self.table.selected = [row]
+                                break
+                        
+                        # Update displays
+                        self._update_selection_displays()
+                        
+                        # Notify callback
+                        if self.on_selection_change:
+                            selection = self.get_selected_model()
+                            self.on_selection_change(selection)
+            
+            # Create table with single selection - clicking row OR checkbox will select it
             self.table = ui.table(
                 columns=columns,
                 rows=self._get_filtered_models(),
                 row_key='id',
                 selection='single',
-                on_select=self._on_selection_change
-            ).classes('w-full').style('max-height: 400px; overflow-y: auto')
+                on_select=handle_table_selection,
+            ).classes('w-full cursor-pointer').style('max-height: 400px; overflow-y: auto')
+            
+            # Make entire row clickable (not just checkbox)
+            self.table.props('dense')
+            self.table.on('row-click', handle_row_click)
             
             # Selection details
             ui.separator().classes('my-4')
@@ -342,6 +392,16 @@ class ModelSelector:
                     else:
                         dropdown_value = list(initial_options.keys())[0]
                 
+                # Provider dropdown change handler
+                def handle_provider_change():
+                    """Handle provider dropdown change."""
+                    logger.debug(f'Provider changed to: {self.selected_provider}')
+                    result = self.get_selected_model()
+                    if self.result_display:
+                        self.result_display.text = result if result else ''
+                    if self.on_selection_change:
+                        self.on_selection_change(result)
+                
                 with ui.column().classes('w-48'):
                     ui.label('Use Provider:').classes('text-caption')
                     # Create dropdown WITHOUT bind_value first, then bind after
@@ -353,7 +413,7 @@ class ModelSelector:
                     # Now sync the property and set up binding
                     self.selected_provider = dropdown_value
                     self.provider_dropdown.bind_value(self, 'selected_provider')
-                    self.provider_dropdown.on('update:model-value', lambda: self._on_provider_dropdown_change())
+                    self.provider_dropdown.on('update:model-value', handle_provider_change)
             
             # Result display
             with ui.row().classes('w-full mt-4 items-center'):
@@ -363,48 +423,39 @@ class ModelSelector:
                 if self.selected_model:
                     initial_result = self.get_selected_model() or ''
                 self.result_display = ui.label(initial_result).classes('text-body1 font-mono bg-grey-2 px-2 py-1 rounded')
-            
-            # Update display when selection changes
-            def update_displays():
-                if self.selected_model:
-                    model_info = MODELS.get(self.selected_model)
-                    if model_info:
-                        self.selected_display.text = model_info.get("display_name", self.selected_model)
-                        
-                        # Update provider dropdown options
-                        provider_options = self._get_providers_for_model(self.selected_model)
-                        self.provider_dropdown.options = provider_options
-                        
-                        # Set to native if available, otherwise first provider
-                        if provider_options:
-                            if "native" in provider_options and self.show_native_option:
-                                self.selected_provider = "native"
-                            else:
-                                self.selected_provider = list(provider_options.keys())[0]
-                else:
-                    self.selected_display.text = 'None selected'
-                    self.provider_dropdown.options = {"_placeholder_": "(Select a model first)"}
-                    self.selected_provider = "_placeholder_"
-                
-                # Update result display
-                result = self.get_selected_model()
-                self.result_display.text = result if result else ''
-            
-            # Hook up the display update
-            original_on_selection = self._on_selection_change
-            def enhanced_on_selection(e):
-                original_on_selection(e)
-                update_displays()
-            self._on_selection_change = enhanced_on_selection
-            
-            original_on_provider = self._on_provider_dropdown_change
-            def enhanced_on_provider():
-                original_on_provider()
-                result = self.get_selected_model()
-                self.result_display.text = result if result else ''
-            self._on_provider_dropdown_change = enhanced_on_provider
         
         logger.debug('ModelSelector component rendered')
+    
+    def _update_selection_displays(self):
+        """Update the selection display elements based on current state."""
+        if self.selected_model:
+            model_info = MODELS.get(self.selected_model)
+            if model_info:
+                if self.selected_display:
+                    self.selected_display.text = model_info.get("display_name", self.selected_model)
+                
+                # Update provider dropdown options
+                provider_options = self._get_providers_for_model(self.selected_model)
+                if self.provider_dropdown:
+                    self.provider_dropdown.options = provider_options
+                
+                # Set to native if available, otherwise first provider
+                if provider_options:
+                    if "native" in provider_options and self.show_native_option:
+                        self.selected_provider = "native"
+                    else:
+                        self.selected_provider = list(provider_options.keys())[0]
+        else:
+            if self.selected_display:
+                self.selected_display.text = 'None selected'
+            if self.provider_dropdown:
+                self.provider_dropdown.options = {"_placeholder_": "(Select a model first)"}
+            self.selected_provider = "_placeholder_"
+        
+        # Update result display
+        result = self.get_selected_model()
+        if self.result_display:
+            self.result_display.text = result if result else ''
     
     def get_selected_model(self) -> Optional[str]:
         """

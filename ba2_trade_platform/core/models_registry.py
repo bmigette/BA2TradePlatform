@@ -530,6 +530,146 @@ MODELS: Dict[str, Dict[str, Any]] = {
         },
         "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING],
     },
+    
+    # =========================================================================
+    # AWS Bedrock Native Models (Amazon Titan, Meta Llama, Mistral)
+    # =========================================================================
+    "llama3_3_70b": {
+        "native_provider": PROVIDER_BEDROCK,
+        "display_name": "Llama 3.3 70B Instruct",
+        "description": "Meta's latest Llama 3.3 70B model with strong reasoning",
+        "provider_names": {
+            PROVIDER_BEDROCK: "us.meta.llama3-3-70b-instruct-v1:0",
+            PROVIDER_OPENROUTER: "meta-llama/llama-3.3-70b-instruct",
+        },
+        "labels": [LABEL_THINKING, LABEL_CODING, LABEL_TOOL_CALLING],
+    },
+    "llama3_2_90b_vision": {
+        "native_provider": PROVIDER_BEDROCK,
+        "display_name": "Llama 3.2 90B Vision",
+        "description": "Meta's multimodal Llama model with vision capabilities",
+        "provider_names": {
+            PROVIDER_BEDROCK: "us.meta.llama3-2-90b-instruct-v1:0",
+            PROVIDER_OPENROUTER: "meta-llama/llama-3.2-90b-vision-instruct",
+        },
+        "labels": [LABEL_HIGH_COST, LABEL_VISION, LABEL_TOOL_CALLING],
+    },
+    "llama3_2_11b_vision": {
+        "native_provider": PROVIDER_BEDROCK,
+        "display_name": "Llama 3.2 11B Vision",
+        "description": "Compact multimodal Llama with vision",
+        "provider_names": {
+            PROVIDER_BEDROCK: "us.meta.llama3-2-11b-instruct-v1:0",
+            PROVIDER_OPENROUTER: "meta-llama/llama-3.2-11b-vision-instruct",
+        },
+        "labels": [LABEL_LOW_COST, LABEL_VISION, LABEL_TOOL_CALLING],
+    },
+    "llama3_1_405b": {
+        "native_provider": PROVIDER_BEDROCK,
+        "display_name": "Llama 3.1 405B Instruct",
+        "description": "Meta's largest Llama model with 405B parameters",
+        "provider_names": {
+            PROVIDER_BEDROCK: "us.meta.llama3-1-405b-instruct-v1:0",
+            PROVIDER_OPENROUTER: "meta-llama/llama-3.1-405b-instruct",
+        },
+        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_CODING, LABEL_TOOL_CALLING],
+    },
+    "llama3_1_70b": {
+        "native_provider": PROVIDER_BEDROCK,
+        "display_name": "Llama 3.1 70B Instruct",
+        "description": "Balanced Llama 3.1 model",
+        "provider_names": {
+            PROVIDER_BEDROCK: "us.meta.llama3-1-70b-instruct-v1:0",
+            PROVIDER_OPENROUTER: "meta-llama/llama-3.1-70b-instruct",
+        },
+        "labels": [LABEL_THINKING, LABEL_CODING, LABEL_TOOL_CALLING],
+    },
+    "llama3_1_8b": {
+        "native_provider": PROVIDER_BEDROCK,
+        "display_name": "Llama 3.1 8B Instruct",
+        "description": "Fast, lightweight Llama 3.1",
+        "provider_names": {
+            PROVIDER_BEDROCK: "us.meta.llama3-1-8b-instruct-v1:0",
+            PROVIDER_OPENROUTER: "meta-llama/llama-3.1-8b-instruct",
+        },
+        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING],
+    },
+    "mistral_large_2": {
+        "native_provider": PROVIDER_BEDROCK,
+        "display_name": "Mistral Large 2",
+        "description": "Mistral's flagship model with 123B parameters",
+        "provider_names": {
+            PROVIDER_BEDROCK: "mistral.mistral-large-2407-v1:0",
+            PROVIDER_OPENROUTER: "mistralai/mistral-large-2407",
+        },
+        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_CODING, LABEL_TOOL_CALLING],
+    },
+    "mistral_small": {
+        "native_provider": PROVIDER_BEDROCK,
+        "display_name": "Mistral Small",
+        "description": "Fast and efficient Mistral model",
+        "provider_names": {
+            PROVIDER_BEDROCK: "mistral.mistral-small-2402-v1:0",
+            PROVIDER_OPENROUTER: "mistralai/mistral-small-2402",
+        },
+        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING],
+    },
+    "amazon_nova_pro": {
+        "native_provider": PROVIDER_BEDROCK,
+        "display_name": "Amazon Nova Pro",
+        "description": "Amazon's capable multimodal model",
+        "provider_names": {
+            PROVIDER_BEDROCK: "amazon.nova-pro-v1:0",
+        },
+        "labels": [LABEL_VISION, LABEL_TOOL_CALLING],
+    },
+    "amazon_nova_lite": {
+        "native_provider": PROVIDER_BEDROCK,
+        "display_name": "Amazon Nova Lite",
+        "description": "Fast and cost-effective Amazon model",
+        "provider_names": {
+            PROVIDER_BEDROCK: "amazon.nova-lite-v1:0",
+        },
+        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_VISION, LABEL_TOOL_CALLING],
+    },
+    "amazon_nova_micro": {
+        "native_provider": PROVIDER_BEDROCK,
+        "display_name": "Amazon Nova Micro",
+        "description": "Text-only ultra-fast Amazon model",
+        "provider_names": {
+            PROVIDER_BEDROCK: "amazon.nova-micro-v1:0",
+        },
+        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING],
+    },
+    "amazon_titan_premier": {
+        "native_provider": PROVIDER_BEDROCK,
+        "display_name": "Amazon Titan Text Premier",
+        "description": "Amazon's advanced text generation model",
+        "provider_names": {
+            PROVIDER_BEDROCK: "amazon.titan-text-premier-v1:0",
+        },
+        "labels": [LABEL_TOOL_CALLING],
+    },
+    "cohere_command_r_plus": {
+        "native_provider": PROVIDER_BEDROCK,
+        "display_name": "Cohere Command R+",
+        "description": "Cohere's flagship model optimized for RAG",
+        "provider_names": {
+            PROVIDER_BEDROCK: "cohere.command-r-plus-v1:0",
+            PROVIDER_OPENROUTER: "cohere/command-r-plus",
+        },
+        "labels": [LABEL_THINKING, LABEL_TOOL_CALLING],
+    },
+    "cohere_command_r": {
+        "native_provider": PROVIDER_BEDROCK,
+        "display_name": "Cohere Command R",
+        "description": "Balanced Cohere model for enterprise use",
+        "provider_names": {
+            PROVIDER_BEDROCK: "cohere.command-r-v1:0",
+            PROVIDER_OPENROUTER: "cohere/command-r",
+        },
+        "labels": [LABEL_LOW_COST, LABEL_TOOL_CALLING],
+    },
 }
 
 
