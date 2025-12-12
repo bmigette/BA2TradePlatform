@@ -214,6 +214,8 @@ Format the response clearly with sections for:
 
 ## Key Takeaways
 [3-5 bullet points of most important insights for traders]
+
+IMPORTANT: Respond in English only.
 """
         return prompt
 
@@ -254,6 +256,8 @@ Format the response clearly with sections for:
 
 ## Key Takeaways
 [3-5 bullet points of most important insights for traders]
+
+IMPORTANT: Respond in English only.
 """
         return prompt
 

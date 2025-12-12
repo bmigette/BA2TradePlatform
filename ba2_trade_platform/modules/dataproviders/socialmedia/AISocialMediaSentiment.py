@@ -99,7 +99,9 @@ Provide a comprehensive sentiment analysis including:
 8. **Examples**: Quote 3-5 representative posts/comments that capture the sentiment
 
 Focus on posts and discussions that occurred within the specified date range ({start_str} to {end_str}).
-Provide specific examples with dates when possible."""
+Provide specific examples with dates when possible.
+
+IMPORTANT: Respond in English only."""
 
             # Call centralized web search function
             sentiment_text = ModelFactory.do_llm_call_with_websearch(
