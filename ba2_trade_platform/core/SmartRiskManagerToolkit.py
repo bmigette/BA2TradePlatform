@@ -1249,12 +1249,65 @@ class SmartRiskManagerToolkit:
                 "transaction_id": transaction_id
             }
 
+    def get_current_prices(
+        self, 
+        symbols: Annotated[List[str], "List of instrument symbols to get current prices for"]
+    ) -> Dict[str, Any]:
+        """
+        Get current market prices for multiple symbols at once.
+        
+        This is more efficient than calling get_current_price multiple times
+        as it batches the requests.
+        
+        Args:
+            symbols: List of instrument symbols (e.g., ["AAPL", "MSFT", "GOOGL"])
+                     Also accepts a single string symbol for convenience.
+            
+        Returns:
+            Dict with "prices" dict mapping symbol to price, and "errors" list for any failures
+        """
+        # Handle case where model passes a single symbol string instead of list
+        if isinstance(symbols, str):
+            symbols = [symbols]
+        
+        results = {
+            "prices": {},
+            "errors": []
+        }
+        
+        for symbol in symbols:
+            try:
+                logger.debug(f"Getting current price for {symbol}")
+                price = self.account.get_instrument_current_price(symbol, price_type='bid')
+                
+                # Handle case where method might return dict instead of float
+                if isinstance(price, dict):
+                    logger.error(f"get_instrument_current_price returned dict instead of float for {symbol}: {price}")
+                    results["errors"].append({"symbol": symbol, "error": f"Expected float price, got dict"})
+                    continue
+                
+                if price is None:
+                    logger.error(f"get_instrument_current_price returned None for {symbol}")
+                    results["errors"].append({"symbol": symbol, "error": "No price available"})
+                    continue
+                
+                results["prices"][symbol] = float(price)
+                logger.debug(f"Current price for {symbol}: {price}")
+            except Exception as e:
+                logger.error(f"Error getting current price for {symbol}: {e}", exc_info=True)
+                results["errors"].append({"symbol": symbol, "error": str(e)})
+        
+        logger.info(f"Got prices for {len(results['prices'])} symbols, {len(results['errors'])} errors")
+        return results
+
     def get_current_price(
         self, 
         symbol: Annotated[str, "Instrument symbol to get current price for"]
     ) -> float:
         """
-        Get current market price for a symbol.
+        Get current market price for a single symbol.
+        
+        For multiple symbols, use get_current_prices() instead for efficiency.
         
         Args:
             symbol: Instrument symbol

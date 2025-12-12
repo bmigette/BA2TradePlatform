@@ -389,24 +389,30 @@ MODELS: Dict[str, Dict[str, Any]] = {
     "deepseek_v3.2": {
         "native_provider": PROVIDER_DEEPSEEK,
         "display_name": "DeepSeek V3.2",
-        "description": "DeepSeek's latest v3.2 model",
+        "description": "DeepSeek's latest v3.2 model with thinking enabled",
         "provider_names": {
             PROVIDER_DEEPSEEK: "deepseek-chat",
             PROVIDER_NAGAAI: "deepseek-v3.2",
             PROVIDER_OPENROUTER: "deepseek/deepseek-chat",
         },
-        "labels": [LABEL_LOW_COST, LABEL_CODING, LABEL_TOOL_CALLING],
+        "labels": [LABEL_LOW_COST, LABEL_CODING, LABEL_TOOL_CALLING, LABEL_THINKING],
+        "default_model_kwargs": {
+            "thinking": {"type": "enabled"},  # Enable deep thinking mode
+        },
     },
     "deepseek_chat": {
         "native_provider": PROVIDER_DEEPSEEK,
         "display_name": "DeepSeek Chat",
-        "description": "DeepSeek chat model",
+        "description": "DeepSeek chat model with thinking enabled",
         "provider_names": {
             PROVIDER_DEEPSEEK: "deepseek-chat",
             PROVIDER_NAGAAI: "deepseek-chat-v3.1",
             PROVIDER_OPENROUTER: "deepseek/deepseek-chat",
         },
-        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING],
+        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING, LABEL_THINKING],
+        "default_model_kwargs": {
+            "thinking": {"type": "enabled"},  # Enable deep thinking mode
+        },
     },
     "deepseek_reasoner": {
         "native_provider": PROVIDER_DEEPSEEK,
@@ -749,6 +755,30 @@ def get_model_for_provider(friendly_name: str, provider: str) -> Optional[str]:
         provider = model_info["native_provider"]
     
     return model_info.get("provider_names", {}).get(provider.lower())
+
+
+def get_model_default_kwargs(friendly_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Get the default model_kwargs for a model.
+    
+    These are model-specific parameters that optimize performance for that model.
+    User-provided model_kwargs will override these defaults.
+    
+    Args:
+        friendly_name: The friendly model name (e.g., "deepseek_v3.2")
+        
+    Returns:
+        Dict of default model_kwargs or None if no defaults
+        
+    Example:
+        >>> get_model_default_kwargs("deepseek_v3.2")
+        {'max_tokens': 8192}
+    """
+    model_info = MODELS.get(friendly_name)
+    if not model_info:
+        return None
+    
+    return model_info.get("default_model_kwargs")
 
 
 def get_models_by_label(label: str) -> List[str]:

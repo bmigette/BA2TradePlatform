@@ -25,6 +25,7 @@ from langchain_core.callbacks import BaseCallbackHandler
 from .models_registry import (
     MODELS, PROVIDER_CONFIG, 
     get_model_for_provider, get_provider_config, parse_model_selection,
+    get_model_default_kwargs,
     PROVIDER_OPENAI, PROVIDER_NAGAAI, PROVIDER_GOOGLE, PROVIDER_ANTHROPIC, PROVIDER_OPENROUTER,
     PROVIDER_XAI, PROVIDER_MOONSHOT
 )
@@ -153,6 +154,14 @@ class ModelFactory:
         supports_temp = not model_info.get("no_temperature", False)
         effective_temperature = temperature if supports_temp else None
         
+        # Merge default model_kwargs with user-provided ones (user takes precedence)
+        default_kwargs = get_model_default_kwargs(friendly_name) or {}
+        if default_kwargs:
+            logger.debug(f"Model {friendly_name} has default model_kwargs: {default_kwargs}")
+        merged_model_kwargs = {**default_kwargs, **(model_kwargs or {})}
+        if merged_model_kwargs:
+            logger.debug(f"Final merged model_kwargs: {merged_model_kwargs}")
+        
         # Build LLM based on provider type
         langchain_class = provider_config.get("langchain_class", "ChatOpenAI")
         
@@ -165,7 +174,7 @@ class ModelFactory:
                 temperature=effective_temperature,
                 streaming=streaming,
                 callbacks=callbacks,
-                model_kwargs=model_kwargs,
+                model_kwargs=merged_model_kwargs if merged_model_kwargs else None,
                 **extra_kwargs
             )
         elif langchain_class == "ChatGoogleGenerativeAI":
@@ -175,7 +184,7 @@ class ModelFactory:
                 temperature=effective_temperature,
                 streaming=streaming,
                 callbacks=callbacks,
-                model_kwargs=model_kwargs,
+                model_kwargs=merged_model_kwargs if merged_model_kwargs else None,
                 **extra_kwargs
             )
         elif langchain_class == "ChatAnthropic":
@@ -186,7 +195,7 @@ class ModelFactory:
                 temperature=temperature,
                 streaming=streaming,
                 callbacks=callbacks,
-                model_kwargs=model_kwargs,
+                model_kwargs=merged_model_kwargs if merged_model_kwargs else None,
                 **extra_kwargs
             )
         elif langchain_class == "ChatXAI":
@@ -196,7 +205,7 @@ class ModelFactory:
                 temperature=temperature,
                 streaming=streaming,
                 callbacks=callbacks,
-                model_kwargs=model_kwargs,
+                model_kwargs=merged_model_kwargs if merged_model_kwargs else None,
                 **extra_kwargs
             )
         elif langchain_class == "ChatDeepSeek":
@@ -206,7 +215,7 @@ class ModelFactory:
                 temperature=temperature,
                 streaming=streaming,
                 callbacks=callbacks,
-                model_kwargs=model_kwargs,
+                model_kwargs=merged_model_kwargs if merged_model_kwargs else None,
                 **extra_kwargs
             )
         elif langchain_class == "MoonshotChat":
@@ -216,7 +225,7 @@ class ModelFactory:
                 temperature=temperature,
                 streaming=streaming,
                 callbacks=callbacks,
-                model_kwargs=model_kwargs,
+                model_kwargs=merged_model_kwargs if merged_model_kwargs else None,
                 **extra_kwargs
             )
         elif langchain_class == "ChatBedrockConverse":
@@ -225,7 +234,7 @@ class ModelFactory:
                 temperature=temperature,
                 streaming=streaming,
                 callbacks=callbacks,
-                model_kwargs=model_kwargs,
+                model_kwargs=merged_model_kwargs if merged_model_kwargs else None,
                 **extra_kwargs
             )
         else:

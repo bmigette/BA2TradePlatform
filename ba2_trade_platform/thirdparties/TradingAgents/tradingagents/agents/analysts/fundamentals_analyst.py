@@ -37,7 +37,12 @@ def create_fundamentals_analyst(llm, toolkit, tools, parallel_tool_calls=False):
             ]
         )
 
-        chain = prompt | llm.bind_tools(tools, parallel_tool_calls=parallel_tool_calls)
+        # Google models don't support parallel_tool_calls parameter
+        is_google = "google" in type(llm).__module__.lower()
+        if is_google:
+            chain = prompt | llm.bind_tools(tools)
+        else:
+            chain = prompt | llm.bind_tools(tools, parallel_tool_calls=parallel_tool_calls)
 
         result = chain.invoke(state["messages"])
 

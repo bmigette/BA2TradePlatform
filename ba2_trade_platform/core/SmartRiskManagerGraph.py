@@ -561,9 +561,15 @@ You have full access to these research tools - use them freely and repeatedly:
   * **Use this to look up transaction_id for a specific symbol before taking action**
   * Use when: You need exact transaction IDs, quantities, or TP/SL levels
 
-- **get_current_price_tool(symbol: str)** - Get real-time bid price for any symbol
+- **get_current_price_tool(symbol: str)** - Get real-time bid price for a single symbol
   * symbol: Instrument symbol
   * Returns: Current bid price as float
+  * For multiple symbols, use get_current_prices_tool() instead
+
+- **get_current_prices_tool(symbols: List[str])** - Get real-time bid prices for multiple symbols at once (RECOMMENDED)
+  * symbols: List of instrument symbols (e.g., ["AAPL", "MSFT", "GOOGL"])
+  * Returns: Dict with "prices" mapping symbol to price, and "errors" list for failures
+  * **Use this instead of calling get_current_price_tool multiple times to save iterations**
 
 **Market Analysis Research:**
 - **get_analysis_outputs_tool(analysis_id: int)** - See what output keys are available for an analysis
@@ -806,7 +812,7 @@ recommend_update_stop_loss(transaction_id=XXX, new_sl_price=150.0, reason="...",
 Example of CORRECT workflow:
 ```
 1. Research: call get_analysis_outputs_batch_tool() to fetch data
-2. Research: call get_current_price_tool() for relevant symbols  
+2. Research: call get_current_prices_tool(["AAPL", "MSFT", "GOOGL"]) for all relevant symbols at once
 3. Decide: Based on findings, identify specific trades
 4. Recommend: recommend_open_buy_position(symbol="UBER", quantity=10, reason="...", confidence=75)
 5. Recommend: recommend_close_position(transaction_id=123, reason="...", confidence=80)
@@ -1293,7 +1299,9 @@ def create_toolkit_tools(toolkit: SmartRiskManagerToolkit) -> List:
     @tool
     @smart_risk_manager_tool
     def get_current_price_tool(symbol: str) -> float:
-        """Get current bid price for an instrument.
+        """Get current bid price for a single instrument.
+        
+        For multiple symbols, use get_current_prices_tool() instead for efficiency.
         
         Args:
             symbol: Instrument symbol
@@ -1302,6 +1310,21 @@ def create_toolkit_tools(toolkit: SmartRiskManagerToolkit) -> List:
             Current bid price as float
         """
         return toolkit.get_current_price(symbol)
+    
+    @tool
+    @smart_risk_manager_tool
+    def get_current_prices_tool(symbols: List[str]) -> Dict[str, Any]:
+        """Get current bid prices for multiple instruments at once (RECOMMENDED for efficiency).
+        
+        Use this instead of calling get_current_price_tool multiple times.
+        
+        Args:
+            symbols: List of instrument symbols (e.g., ["AAPL", "MSFT", "GOOGL"])
+            
+        Returns:
+            Dict with "prices" mapping symbol to price, and "errors" list for any failures
+        """
+        return toolkit.get_current_prices(symbols)
     
     @tool
     @smart_risk_manager_tool
@@ -1370,6 +1393,7 @@ def create_toolkit_tools(toolkit: SmartRiskManagerToolkit) -> List:
         get_all_recent_analyses_tool,
         get_positions_tool,
         get_current_price_tool,
+        get_current_prices_tool,
         close_position_tool,
         adjust_quantity_tool,
         update_stop_loss_tool,
@@ -2141,7 +2165,9 @@ def create_research_tools(toolkit: SmartRiskManagerToolkit, recommended_actions_
     def get_current_price_tool(
         symbol: Annotated[str, "Instrument symbol (e.g., 'AAPL', 'MSFT')"]
     ) -> float:
-        """Get current bid price for an instrument.
+        """Get current bid price for a single instrument.
+        
+        For multiple symbols, use get_current_prices_tool() instead for efficiency.
         
         Args:
             symbol: Instrument symbol
@@ -2150,6 +2176,23 @@ def create_research_tools(toolkit: SmartRiskManagerToolkit, recommended_actions_
             Current bid price as float
         """
         return toolkit.get_current_price(symbol)
+    
+    @tool
+    @smart_risk_manager_tool
+    def get_current_prices_tool(
+        symbols: Annotated[List[str], "List of instrument symbols (e.g., ['AAPL', 'MSFT', 'GOOGL'])"]
+    ) -> Dict[str, Any]:
+        """Get current bid prices for multiple instruments at once (RECOMMENDED for efficiency).
+        
+        Use this instead of calling get_current_price_tool multiple times to save iterations.
+        
+        Args:
+            symbols: List of instrument symbols
+            
+        Returns:
+            Dict with "prices" mapping symbol to price, and "errors" list for any failures
+        """
+        return toolkit.get_current_prices(symbols)
     
     @tool
     @smart_risk_manager_tool
@@ -2572,6 +2615,7 @@ def create_research_tools(toolkit: SmartRiskManagerToolkit, recommended_actions_
         get_historical_analyses_tool,
         get_all_recent_analyses_tool,
         get_current_price_tool,
+        get_current_prices_tool,
         get_all_transactions_tool,
         get_pending_actions_tool,
         modify_pending_tp_sl_tool,
@@ -2752,7 +2796,9 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
         def get_current_price_tool(
             symbol: Annotated[str, "Instrument symbol (e.g., 'AAPL', 'MSFT')"]
         ) -> float:
-            """Get current bid price for an instrument.
+            """Get current bid price for a single instrument.
+            
+            For multiple symbols, use get_current_prices_tool() instead for efficiency.
             
             Args:
                 symbol: Instrument symbol
@@ -2761,6 +2807,23 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
                 Current bid price as float
             """
             return toolkit.get_current_price(symbol)
+        
+        @tool
+        @smart_risk_manager_tool
+        def get_current_prices_tool(
+            symbols: Annotated[List[str], "List of instrument symbols (e.g., ['AAPL', 'MSFT', 'GOOGL'])"]
+        ) -> Dict[str, Any]:
+            """Get current bid prices for multiple instruments at once (RECOMMENDED for efficiency).
+            
+            Use this instead of calling get_current_price_tool multiple times to save iterations.
+            
+            Args:
+                symbols: List of instrument symbols
+                
+            Returns:
+                Dict with "prices" mapping symbol to price, and "errors" list for any failures
+            """
+            return toolkit.get_current_prices(symbols)
         
         @tool
         @smart_risk_manager_tool
@@ -2959,6 +3022,7 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             get_historical_analyses_tool,
             get_all_recent_analyses_tool,
             get_current_price_tool,
+            get_current_prices_tool,
             recommend_close_position,
             recommend_adjust_quantity,
             recommend_update_stop_loss,
@@ -3115,8 +3179,19 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
                     actions_summary += "\n**NEXT STEP**: Call finish_research_tool to proceed with executing these actions.\n"
                 else:
                     actions_summary += "  ⚠️ No actions recommended yet.\n"
-                    actions_summary += "  - If you need more information, continue researching with available tools.\n"
-                    actions_summary += "  - If you have enough information, recommend appropriate actions (open/close/adjust positions).\n"
+                    # Add urgency if we're past iteration 5 with no actions
+                    remaining = max_iterations - iteration
+                    if remaining <= 5:
+                        actions_summary += f"\n  ⚠️ **URGENT: Only {remaining} iterations remaining!**\n"
+                        actions_summary += "  **YOU MUST NOW CALL recommend_* TOOLS** to make trading decisions:\n"
+                        actions_summary += "    - recommend_open_buy_position() for new BUY opportunities\n"
+                        actions_summary += "    - recommend_update_take_profit() to set TP on open positions\n"
+                        actions_summary += "    - recommend_update_stop_loss() to set SL on open positions\n"
+                        actions_summary += "    - recommend_close_position() to close positions\n"
+                        actions_summary += "  **STOP GATHERING DATA** - Use the analyses you already have!\n"
+                    else:
+                        actions_summary += "  - If you need more information, continue researching with available tools.\n"
+                        actions_summary += "  - If you have enough information, recommend appropriate actions (open/close/adjust positions).\n"
                     actions_summary += "  - If no actions are needed, explain why in finish_research_tool's summary.\n"
                     actions_summary += "  - Only call finish_research_tool after recommending actions OR explaining why none are needed.\n"
                 
@@ -3825,8 +3900,22 @@ class SmartRiskManagerGraph:
         def get_current_price_tool(
             symbol: Annotated[str, "Instrument symbol"]
         ) -> float:
-            """Get current bid price for an instrument."""
+            """Get current bid price for a single instrument.
+            
+            For multiple symbols, use get_current_prices_tool() instead for efficiency.
+            """
             return self.toolkit.get_current_price(symbol)
+        
+        @tool
+        @smart_risk_manager_tool
+        def get_current_prices_tool(
+            symbols: Annotated[List[str], "List of instrument symbols (e.g., ['AAPL', 'MSFT'])"]
+        ) -> Dict[str, Any]:
+            """Get current bid prices for multiple instruments at once (RECOMMENDED for efficiency).
+            
+            Use this instead of calling get_current_price_tool multiple times to save iterations.
+            """
+            return self.toolkit.get_current_prices(symbols)
         
         @tool
         @smart_risk_manager_tool
@@ -3988,6 +4077,7 @@ class SmartRiskManagerGraph:
             get_historical_analyses_tool,
             get_all_recent_analyses_tool,
             get_current_price_tool,
+            get_current_prices_tool,
             recommend_close_position,
             recommend_adjust_quantity,
             recommend_update_stop_loss,
@@ -4192,8 +4282,19 @@ class SmartRiskManagerGraph:
                             actions_summary += "\n**NEXT STEP**: Call finish_research_tool to proceed with executing these actions.\n"
                         else:
                             actions_summary += "  ⚠️ No actions recommended yet.\n"
-                            actions_summary += "  - If you need more information, continue researching with available tools.\n"
-                            actions_summary += "  - If you have enough information, recommend appropriate actions (open/close/adjust positions).\n"
+                            # Add urgency if we're past iteration 5 with no actions
+                            remaining = max_iterations - iteration_count
+                            if remaining <= 5:
+                                actions_summary += f"\n  ⚠️ **URGENT: Only {remaining} iterations remaining!**\n"
+                                actions_summary += "  **YOU MUST NOW CALL recommend_* TOOLS** to make trading decisions:\n"
+                                actions_summary += "    - recommend_open_buy_position() for new BUY opportunities\n"
+                                actions_summary += "    - recommend_update_take_profit() to set TP on open positions\n"
+                                actions_summary += "    - recommend_update_stop_loss() to set SL on open positions\n"
+                                actions_summary += "    - recommend_close_position() to close positions\n"
+                                actions_summary += "  **STOP GATHERING DATA** - Use the analyses you already have!\n"
+                            else:
+                                actions_summary += "  - If you need more information, continue researching with available tools.\n"
+                                actions_summary += "  - If you have enough information, recommend appropriate actions (open/close/adjust positions).\n"
                             actions_summary += "  - If no actions are needed, explain why in finish_research_tool's summary.\n"
                             actions_summary += "  - Only call finish_research_tool after recommending actions OR explaining why none are needed.\n"
                         

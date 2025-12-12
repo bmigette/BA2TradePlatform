@@ -531,7 +531,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         def get_economic_indicators(
             end_date: str,
             lookback_days: int = None,
-            indicators: list = None
+            indicators: list[str] = None
         ) -> str:
             """Get economic indicators (GDP, unemployment, inflation, etc.)."""
             return self.toolkit.get_economic_indicators(end_date, lookback_days, indicators)

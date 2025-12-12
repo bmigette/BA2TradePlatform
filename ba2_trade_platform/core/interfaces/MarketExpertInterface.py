@@ -209,16 +209,22 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "tooltip": "Provide high-level instructions to guide the smart risk manager's behavior. Examples: 'Maximize short term profit with medium risk taking', 'Focus on capital preservation with conservative risk', 'Aggressive growth with high risk tolerance'. Only used when risk_manager_mode is set to 'smart'."
                 },
                 "smart_risk_manager_max_iterations": {
-                    "type": "int", "required": False, "default": 10,
+                    "type": "int", "required": False, "default": 20,
                     "description": "Smart Risk Manager Maximum Iterations",
                     "help": "Maximum number of iterations the smart risk manager will run before stopping. Prevents infinite loops and controls execution time.",
-                    "tooltip": "Controls how many analysis cycles the smart risk manager can perform before being forced to stop. Higher values allow more thorough analysis but take longer to execute. Recommended: 5-15 iterations. Only used when risk_manager_mode is set to 'smart'."
+                    "tooltip": "Controls how many analysis cycles the smart risk manager can perform before being forced to stop. Higher values allow more thorough analysis but take longer to execute. Recommended: 10-25 iterations. Only used when risk_manager_mode is set to 'smart'."
                 },
                 "smart_risk_manager_parallel_tool_calls": {
                     "type": "bool", "required": False, "default": True,
                     "description": "Smart Risk Manager Parallel Tool Calls",
                     "help": "Enable parallel tool calls for smart risk manager. May cause issues with some LLM providers (e.g., GPT-4.5/5.1 reasoning modes).",
                     "tooltip": "Allows the smart risk manager to call multiple tools simultaneously for faster execution. Disable if experiencing corrupted tool names or call_id errors with certain LLM models (especially GPT-4.5/5.1 with reasoning). Only used when risk_manager_mode is set to 'smart'."
+                },
+                "smart_risk_manager_model_kwargs": {
+                    "type": "str", "required": False, "default": "",
+                    "description": "Smart Risk Manager Model Parameters (JSON)",
+                    "help": "Custom model parameters in JSON format. Example: {\"thinking\": {\"type\": \"enabled\"}} for DeepSeek thinking mode, or {\"reasoning\": {\"effort\": \"high\"}} for OpenAI O-series.",
+                    "tooltip": "Advanced JSON configuration for model-specific parameters. For DeepSeek, use {\"thinking\": {\"type\": \"enabled\"}}. For OpenAI O-series, use {\"reasoning\": {\"effort\": \"low|medium|high\"}}. Leave empty to use model defaults from registry. Only used when risk_manager_mode is set to 'smart'."
                 }
                 
             }
