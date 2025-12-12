@@ -489,8 +489,8 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "display_name": "Gemini 2.5 Pro",
         "description": "Google's most capable Gemini model with thinking",
         "provider_names": {
-            PROVIDER_GOOGLE: "gemini-2.5-pro-preview-06-05",
-            PROVIDER_NAGAAI: "gemini-2.5-pro-preview-06-05",
+            PROVIDER_GOOGLE: "gemini-2.5-pro",
+            PROVIDER_NAGAAI: "gemini-2.5-pro",
             PROVIDER_OPENROUTER: "google/gemini-2.5-pro-preview",
         },
         "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_VISION, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
@@ -500,8 +500,8 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "display_name": "Gemini 2.5 Flash",
         "description": "Fast Gemini 2.5 variant with thinking",
         "provider_names": {
-            PROVIDER_GOOGLE: "gemini-2.5-flash-preview-05-20",
-            PROVIDER_NAGAAI: "gemini-2.5-flash-preview-05-20",
+            PROVIDER_GOOGLE: "gemini-2.5-flash",
+            PROVIDER_NAGAAI: "gemini-2.5-flash",
             PROVIDER_OPENROUTER: "google/gemini-2.5-flash-preview",
         },
         "labels": [LABEL_LOW_COST, LABEL_THINKING, LABEL_FAST, LABEL_VISION, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],

@@ -817,7 +817,7 @@ class ModelFactory:
                 model=model,
                 input=[
                     {
-                        "role": "system",
+                        "role": "user",
                         "content": [
                             {
                                 "type": "input_text",
@@ -827,7 +827,6 @@ class ModelFactory:
                     }
                 ],
                 text={"format": {"type": "text"}},
-                reasoning={},
                 tools=[
                     {
                         "type": "web_search_preview",
@@ -855,9 +854,6 @@ class ModelFactory:
                         result_text += item.text + "\n\n"
                     elif isinstance(item, str):
                         result_text += item + "\n\n"
-            
-            if not result_text and hasattr(response, 'reasoning') and response.reasoning:
-                result_text = str(response.reasoning)
             
             return result_text.strip()
             
