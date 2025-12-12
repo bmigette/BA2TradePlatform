@@ -322,11 +322,22 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "display_name": "Grok-4.1 Fast Reasoning",
         "description": "Latest Grok-4.1 with fast reasoning",
         "provider_names": {
-            PROVIDER_XAI: "grok-4.1-fast-reasoning",
-            PROVIDER_NAGAAI: "grok-4.1-fast-reasoning",
-            PROVIDER_OPENROUTER: "x-ai/grok-4.1-fast-reasoning",
+            PROVIDER_XAI: "grok-4-1-fast-reasoning",
+            PROVIDER_NAGAAI: "grok-4-1-fast-reasoning",
+            PROVIDER_OPENROUTER: "x-ai/grok-4-1-fast-reasoning",
         },
         "labels": [LABEL_THINKING, LABEL_FAST, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+    },
+    "grok4.1_fast": {
+        "native_provider": PROVIDER_XAI,
+        "display_name": "Grok-4.1 Fast",
+        "description": "Latest Grok-4.1 fast model without reasoning",
+        "provider_names": {
+            PROVIDER_XAI: "grok-4-1-fast-non-reasoning",
+            PROVIDER_NAGAAI: "grok-4-1-fast-non-reasoning",
+            PROVIDER_OPENROUTER: "x-ai/grok-4-1-fast-non-reasoning",
+        },
+        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
     },
     "grok3": {
         "native_provider": PROVIDER_XAI,
@@ -427,7 +438,6 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "description": "DeepSeek's code-specialized model",
         "provider_names": {
             PROVIDER_DEEPSEEK: "deepseek-coder",
-            PROVIDER_NAGAAI: "deepseek-coder",
             PROVIDER_OPENROUTER: "deepseek/deepseek-coder",
         },
         "labels": [LABEL_LOW_COST, LABEL_CODING, LABEL_TOOL_CALLING],
@@ -464,7 +474,6 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "description": "Moonshot AI's Kimi K1.5 model",
         "provider_names": {
             PROVIDER_MOONSHOT: "moonshot-v1-128k",
-            PROVIDER_NAGAAI: "kimi-k1.5",
             PROVIDER_OPENROUTER: "moonshot/moonshot-v1-128k",
         },
         "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING],
@@ -551,7 +560,6 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "description": "Previous generation Claude Sonnet",
         "provider_names": {
             PROVIDER_ANTHROPIC: "claude-3-5-sonnet-20241022",
-            PROVIDER_NAGAAI: "claude-3-5-sonnet-20241022",
             PROVIDER_OPENROUTER: "anthropic/claude-3.5-sonnet",
             PROVIDER_BEDROCK: "anthropic.claude-3-5-sonnet-20241022-v2:0",
         },
@@ -563,7 +571,6 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "description": "Fast, lightweight Claude model",
         "provider_names": {
             PROVIDER_ANTHROPIC: "claude-3-5-haiku-20241022",
-            PROVIDER_NAGAAI: "claude-3-5-haiku-20241022",
             PROVIDER_OPENROUTER: "anthropic/claude-3.5-haiku",
             PROVIDER_BEDROCK: "anthropic.claude-3-5-haiku-20241022-v1:0",
         },
