@@ -437,6 +437,43 @@ def create_llm(model_selection: str, temperature: float, backend_url: str = None
     return llm
 
 
+def _is_google_model(llm) -> bool:
+    """
+    Check if the LLM is a Google Gemini model.
+    
+    Google's ChatGoogleGenerativeAI doesn't support certain parameters like
+    parallel_tool_calls, so we need to detect it and handle accordingly.
+    """
+    try:
+        # Check class name to avoid import dependency
+        class_name = llm.__class__.__name__
+        return class_name == "ChatGoogleGenerativeAI"
+    except Exception:
+        return False
+
+
+def bind_tools_safely(llm, tools: list, parallel_tool_calls: bool = False):
+    """
+    Bind tools to LLM, handling provider-specific limitations.
+    
+    Google Gemini models don't support the parallel_tool_calls parameter,
+    so we skip it for those models to avoid validation errors.
+    
+    Args:
+        llm: The LangChain LLM instance
+        tools: List of tools to bind
+        parallel_tool_calls: Whether to allow parallel tool calls (ignored for Google models)
+        
+    Returns:
+        LLM with tools bound
+    """
+    if _is_google_model(llm):
+        logger.debug("Google Gemini model detected - skipping parallel_tool_calls parameter")
+        return llm.bind_tools(tools)
+    else:
+        return llm.bind_tools(tools, parallel_tool_calls=parallel_tool_calls)
+
+
 # ==================== PROMPTS ====================
 # All prompts are defined here for easy maintenance and customization
 
@@ -1539,7 +1576,7 @@ def initialize_research_agent(state: SmartRiskManagerState) -> Dict[str, Any]:
         llm = create_llm(risk_manager_model, 0.2, backend_url, api_key)
         # Get parallel_tool_calls setting from expert (default False for safety)
         parallel_tool_calls = expert.get_setting_with_interface_default("smart_risk_manager_parallel_tool_calls", log_warning=False)
-        llm_with_tools = llm.bind_tools(research_tools, parallel_tool_calls=parallel_tool_calls)
+        llm_with_tools = bind_tools_safely(llm, research_tools, parallel_tool_calls=parallel_tool_calls)
         
         # Get expert-specific instructions if available
         expert_instructions = ""
@@ -2625,7 +2662,7 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
         llm = create_llm(risk_manager_model, 0.2, backend_url, api_key)
         # Get parallel_tool_calls setting from expert (default False for safety)
         parallel_tool_calls = expert.get_setting_with_interface_default("smart_risk_manager_parallel_tool_calls", log_warning=False)
-        llm_with_tools = llm.bind_tools(research_tools, parallel_tool_calls=parallel_tool_calls)
+        llm_with_tools = bind_tools_safely(llm, research_tools, parallel_tool_calls=parallel_tool_calls)
         
         detailed_cache = state["detailed_outputs_cache"].copy()
         research_complete = False
@@ -3705,7 +3742,7 @@ class SmartRiskManagerGraph:
             llm = create_llm(risk_manager_model, 0.2, backend_url, api_key)
             # Get parallel_tool_calls setting from expert (default False for safety)
             parallel_tool_calls = self.expert.get_setting_with_interface_default("smart_risk_manager_parallel_tool_calls", log_warning=False)
-            self.llm_with_tools = llm.bind_tools(self.research_tools, parallel_tool_calls=parallel_tool_calls)
+            self.llm_with_tools = bind_tools_safely(llm, self.research_tools, parallel_tool_calls=parallel_tool_calls)
             
             logger.info(f"✅ Research agent initialized with {len(self.research_tools)} tools")
             logger.info("✅ LLM with tools created ONCE - will be reused across ALL research iterations")

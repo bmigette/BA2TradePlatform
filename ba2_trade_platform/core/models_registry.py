@@ -457,6 +457,17 @@ MODELS: Dict[str, Dict[str, Any]] = {
         },
         "labels": [LABEL_LOW_COST, LABEL_THINKING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
     },
+    "kimi_k2_thinking_turbo": {
+        "native_provider": PROVIDER_MOONSHOT,
+        "display_name": "Kimi K2 Thinking Turbo",
+        "description": "Moonshot AI's Kimi K2 Thinking Turbo - faster thinking model",
+        "provider_names": {
+            PROVIDER_MOONSHOT: "kimi-k2-thinking-turbo",
+            PROVIDER_NAGAAI: "kimi-k2-thinking-turbo",
+            PROVIDER_OPENROUTER: "moonshot/kimi-k2-thinking-turbo",
+        },
+        "labels": [LABEL_LOW_COST, LABEL_THINKING, LABEL_FAST, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+    },
     "kimi_k1.5": {
         "native_provider": PROVIDER_MOONSHOT,
         "display_name": "Kimi K1.5",

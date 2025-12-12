@@ -662,6 +662,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                 trace = []
                 step_count = 0
                 accumulated_state = init_agent_state.copy()  # Start with initial state
+                logged_message_count = 0  # Track how many messages we've already logged
                 
                 for chunk in self.graph.stream(init_agent_state, **args):
                     # Check if analysis has been marked as FAILED (e.g., by tool error callback)
@@ -672,11 +673,15 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                             logger.error(f"Analysis {self.market_analysis_id} marked as FAILED, stopping graph execution")
                             raise Exception("Analysis failed due to critical tool error - stopping graph execution")
                     
-                    if len(chunk["messages"]) == 0:
-                        pass
-                    else:
-                        # Log message to logger instead of printing to console
-                        self._log_message(chunk["messages"][-1])
+                    # Get current message count in this chunk
+                    current_message_count = len(chunk.get("messages", []))
+                    
+                    # Only log NEW messages (messages we haven't logged yet)
+                    if current_message_count > logged_message_count:
+                        # Log all new messages since last chunk
+                        for msg in chunk["messages"][logged_message_count:]:
+                            self._log_message(msg)
+                        logged_message_count = current_message_count
                         trace.append(chunk)
                         step_count += 1
                         

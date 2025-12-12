@@ -264,6 +264,7 @@ class ModelFactory:
             "model": model_name,
             "api_key": api_key,
             "streaming": streaming,
+            "max_retries": 3,  # Retry on transient network errors (connection drops, timeouts)
         }
         
         # Only add temperature if model supports it (O-series models don't)
@@ -373,6 +374,7 @@ class ModelFactory:
             "temperature": temperature,
             "anthropic_api_key": api_key,
             "streaming": streaming,
+            "max_retries": 3,  # Retry on transient network errors
         }
         
         if base_url:
@@ -414,6 +416,7 @@ class ModelFactory:
             "temperature": temperature,
             "xai_api_key": api_key,
             "streaming": streaming,
+            "max_retries": 3,  # Retry on transient network errors
         }
         
         if callbacks:
@@ -452,6 +455,7 @@ class ModelFactory:
             "temperature": temperature,
             "api_key": api_key,
             "streaming": streaming,
+            "max_retries": 3,  # Retry on transient network errors
         }
         
         if callbacks:
@@ -494,6 +498,7 @@ class ModelFactory:
             "api_key": api_key,
             "streaming": streaming,
             "base_url": base_url,
+            "max_retries": 3,  # Retry on transient network errors
         }
         
         # Moonshot supports temperature
