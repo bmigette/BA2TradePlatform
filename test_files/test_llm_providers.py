@@ -126,7 +126,8 @@ def get_websearch_model_for_provider(provider: str) -> Optional[str]:
     # NagaAI uses web_search_options on any model
     # Google uses Google Search grounding
     # xAI uses Live Search API with search_parameters
-    if provider in [PROVIDER_OPENAI, PROVIDER_NAGAAI, PROVIDER_GOOGLE, PROVIDER_XAI]:
+    # Moonshot (Kimi) uses $web_search builtin tool
+    if provider in [PROVIDER_OPENAI, PROVIDER_NAGAAI, PROVIDER_GOOGLE, PROVIDER_XAI, PROVIDER_MOONSHOT]:
         # Return the same test model - websearch is API-level, not model-level
         return get_test_model_for_provider(provider)
     

@@ -26,7 +26,7 @@ from .models_registry import (
     MODELS, PROVIDER_CONFIG, 
     get_model_for_provider, get_provider_config, parse_model_selection,
     PROVIDER_OPENAI, PROVIDER_NAGAAI, PROVIDER_GOOGLE, PROVIDER_ANTHROPIC, PROVIDER_OPENROUTER,
-    PROVIDER_XAI
+    PROVIDER_XAI, PROVIDER_MOONSHOT
 )
 from ..config import get_app_setting, OPENAI_ENABLE_STREAMING, OPENAI_BACKEND_URL
 from ..logger import logger
@@ -779,6 +779,14 @@ class ModelFactory:
             api_key = get_app_setting('google_api_key') or "dummy-key"
             return cls._call_google_websearch(model_name, prompt, api_key, max_tokens, temperature)
         
+        elif provider == PROVIDER_MOONSHOT:
+            # Moonshot AI (Kimi) uses $web_search builtin tool
+            moonshot_config = get_provider_config(PROVIDER_MOONSHOT)
+            base_url = moonshot_config.get('base_url', 'https://api.moonshot.cn/v1') if moonshot_config else 'https://api.moonshot.cn/v1'
+            api_key_setting = moonshot_config.get('api_key_setting', 'moonshot_api_key') if moonshot_config else 'moonshot_api_key'
+            api_key = get_app_setting(api_key_setting) or "dummy-key"
+            return cls._call_kimi_websearch(model_name, prompt, base_url, api_key, max_tokens, temperature)
+        
         else:
             # For other providers, try NagaAI as a fallback (it supports many models)
             logger.warning(f"Unknown provider '{provider}' for web search, trying NagaAI proxy")
@@ -797,6 +805,7 @@ class ModelFactory:
         client = OpenAI(base_url=base_url, api_key=api_key)
         
         try:
+            # Note: OpenAI Responses API doesn't support temperature parameter
             response = client.responses.create(
                 model=model,
                 input=[
@@ -819,7 +828,6 @@ class ModelFactory:
                         "search_context_size": "low",
                     }
                 ],
-                temperature=temperature,
                 max_output_tokens=max_tokens,
                 top_p=1,
                 store=True,
@@ -949,6 +957,98 @@ class ModelFactory:
             raise ValueError("Google Gemini support requires google-genai package")
         except Exception as e:
             logger.error(f"Error calling Google Gemini API with search: {e}", exc_info=True)
+            raise
+
+    @classmethod
+    def _call_kimi_websearch(cls, model: str, prompt: str, base_url: str, api_key: str, max_tokens: int, temperature: float) -> str:
+        """
+        Call Kimi (Moonshot AI) API with $web_search builtin tool.
+        
+        Kimi uses a unique tool_calls pattern where the $web_search builtin function
+        is declared with type="builtin_function" and executed by the Kimi backend.
+        See: https://platform.moonshot.cn/docs/guide/use-web-search
+        """
+        from openai import OpenAI
+        import json
+        
+        client = OpenAI(base_url=base_url, api_key=api_key)
+        
+        try:
+            messages = [
+                {"role": "user", "content": prompt}
+            ]
+            
+            # Define the $web_search builtin tool
+            tools = [
+                {
+                    "type": "builtin_function",  # Special type for Kimi builtin functions
+                    "function": {
+                        "name": "$web_search",  # $ prefix indicates builtin function
+                    },
+                }
+            ]
+            
+            finish_reason = None
+            max_iterations = 5  # Prevent infinite loops
+            iteration = 0
+            
+            while finish_reason != "stop" and iteration < max_iterations:
+                iteration += 1
+                
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    tools=tools,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                
+                choice = response.choices[0]
+                finish_reason = choice.finish_reason
+                
+                if finish_reason == "tool_calls":
+                    # Model wants to use web search - add assistant message
+                    messages.append(choice.message)
+                    
+                    # Process each tool call
+                    for tool_call in choice.message.tool_calls:
+                        tool_call_name = tool_call.function.name
+                        tool_call_arguments = json.loads(tool_call.function.arguments) if tool_call.function.arguments else {}
+                        
+                        if tool_call_name == "$web_search":
+                            # For $web_search, just return the arguments back
+                            # The Kimi backend will execute the actual search
+                            tool_result = tool_call_arguments
+                        else:
+                            tool_result = {"error": f"Unknown tool: {tool_call_name}"}
+                        
+                        # Add tool result to messages
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": tool_call_name,
+                            "content": json.dumps(tool_result),
+                        })
+                
+                elif finish_reason == "stop":
+                    # Model finished generating response
+                    if hasattr(choice.message, 'content') and choice.message.content:
+                        return choice.message.content
+                    return ""
+                
+                else:
+                    # Unexpected finish reason
+                    logger.warning(f"Unexpected finish_reason from Kimi: {finish_reason}")
+                    if hasattr(choice.message, 'content') and choice.message.content:
+                        return choice.message.content
+                    return ""
+            
+            # Max iterations reached
+            logger.warning(f"Kimi websearch reached max iterations ({max_iterations})")
+            return ""
+            
+        except Exception as e:
+            logger.error(f"Error calling Kimi API with web search: {e}", exc_info=True)
             raise
 
 

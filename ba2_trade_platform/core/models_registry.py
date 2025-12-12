@@ -445,7 +445,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_NAGAAI: "kimi-k2",
             PROVIDER_OPENROUTER: "moonshot/kimi-k2",
         },
-        "labels": [LABEL_LOW_COST, LABEL_TOOL_CALLING],
+        "labels": [LABEL_LOW_COST, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
     },
     "kimi_k2_thinking": {
         "native_provider": PROVIDER_MOONSHOT,
@@ -456,7 +456,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_NAGAAI: "kimi-k2-thinking",
             PROVIDER_OPENROUTER: "moonshot/kimi-k2-thinking",
         },
-        "labels": [LABEL_LOW_COST, LABEL_THINKING, LABEL_TOOL_CALLING],
+        "labels": [LABEL_LOW_COST, LABEL_THINKING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
     },
     "kimi_k1.5": {
         "native_provider": PROVIDER_MOONSHOT,
