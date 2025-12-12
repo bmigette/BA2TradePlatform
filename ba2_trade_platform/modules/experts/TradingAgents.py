@@ -1997,6 +1997,12 @@ Please check back in a few minutes for results."""
                         raise KeyError(f"Output not found for key: {output_key}")
                     
                     content = trading_state[output_key]
+                    
+                    # Handle case where content is a list (multimodal messages)
+                    if isinstance(content, list):
+                        # Join list elements, filtering for strings
+                        content = "\n".join(str(item) for item in content if item)
+                    
                     if not content or not content.strip():
                         raise KeyError(f"Output is empty for key: {output_key}")
                     

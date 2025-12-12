@@ -884,43 +884,49 @@ class TradingAgentsGraph(DatabaseStorageMixin):
 
     def _log_state(self, trade_date, final_state):
         """Store the final state in database if MarketAnalysis is available, otherwise just log it."""
-        # Prepare the state data
+        # Helper to safely get nested dict values
+        def safe_get_debate_state(state_dict, key, default):
+            if not state_dict:
+                return default
+            return state_dict.get(key, default)
+        
+        # Get debate states safely (they're set in initial state but might be missing sub-keys)
+        investment_debate = final_state.get("investment_debate_state", {})
+        risk_debate = final_state.get("risk_debate_state", {})
+        
+        # Prepare the state data with safe access for all fields that may not be set
         state_data = {
-            "company_of_interest": final_state["company_of_interest"],
-            "trade_date": final_state["trade_date"],
-            "market_report": final_state["market_report"],
-            "sentiment_report": final_state["sentiment_report"],
-            "news_report": final_state["news_report"],
-            "fundamentals_report": final_state["fundamentals_report"],
+            "company_of_interest": final_state.get("company_of_interest", ""),
+            "trade_date": final_state.get("trade_date", str(trade_date)),
+            "market_report": final_state.get("market_report", ""),
+            "sentiment_report": final_state.get("sentiment_report", ""),
+            "news_report": final_state.get("news_report", ""),
+            "fundamentals_report": final_state.get("fundamentals_report", ""),
             "investment_debate_state": {
-                "bull_history": final_state["investment_debate_state"]["bull_history"],
-                "bear_history": final_state["investment_debate_state"]["bear_history"],
-                "bull_messages": final_state["investment_debate_state"].get("bull_messages", []),
-                "bear_messages": final_state["investment_debate_state"].get("bear_messages", []),
-                "history": final_state["investment_debate_state"]["history"],
-                "current_response": final_state["investment_debate_state"][
-                    "current_response"
-                ],
-                "judge_decision": final_state["investment_debate_state"][
-                    "judge_decision"
-                ],
-                "count": final_state["investment_debate_state"].get("count", 0),
+                "bull_history": safe_get_debate_state(investment_debate, "bull_history", ""),
+                "bear_history": safe_get_debate_state(investment_debate, "bear_history", ""),
+                "bull_messages": safe_get_debate_state(investment_debate, "bull_messages", []),
+                "bear_messages": safe_get_debate_state(investment_debate, "bear_messages", []),
+                "history": safe_get_debate_state(investment_debate, "history", ""),
+                "current_response": safe_get_debate_state(investment_debate, "current_response", ""),
+                "judge_decision": safe_get_debate_state(investment_debate, "judge_decision", ""),
+                "count": safe_get_debate_state(investment_debate, "count", 0),
             },
-            "trader_investment_decision": final_state["trader_investment_plan"],
+            "trader_investment_decision": final_state.get("trader_investment_plan", ""),
             "risk_debate_state": {
-                "risky_history": final_state["risk_debate_state"]["risky_history"],
-                "safe_history": final_state["risk_debate_state"]["safe_history"],
-                "neutral_history": final_state["risk_debate_state"]["neutral_history"],
-                "risky_messages": final_state["risk_debate_state"].get("risky_messages", []),
-                "safe_messages": final_state["risk_debate_state"].get("safe_messages", []),
-                "neutral_messages": final_state["risk_debate_state"].get("neutral_messages", []),
-                "history": final_state["risk_debate_state"]["history"],
-                "judge_decision": final_state["risk_debate_state"]["judge_decision"],
-                "count": final_state["risk_debate_state"].get("count", 0),
-                "latest_speaker": final_state["risk_debate_state"].get("latest_speaker", ""),
+                "risky_history": safe_get_debate_state(risk_debate, "risky_history", ""),
+                "safe_history": safe_get_debate_state(risk_debate, "safe_history", ""),
+                "neutral_history": safe_get_debate_state(risk_debate, "neutral_history", ""),
+                "risky_messages": safe_get_debate_state(risk_debate, "risky_messages", []),
+                "safe_messages": safe_get_debate_state(risk_debate, "safe_messages", []),
+                "neutral_messages": safe_get_debate_state(risk_debate, "neutral_messages", []),
+                "history": safe_get_debate_state(risk_debate, "history", ""),
+                "judge_decision": safe_get_debate_state(risk_debate, "judge_decision", ""),
+                "count": safe_get_debate_state(risk_debate, "count", 0),
+                "latest_speaker": safe_get_debate_state(risk_debate, "latest_speaker", ""),
             },
-            "investment_plan": final_state["investment_plan"],
-            "final_trade_decision": final_state["final_trade_decision"],
+            "investment_plan": final_state.get("investment_plan", ""),
+            "final_trade_decision": final_state.get("final_trade_decision", ""),
         }
 
         if hasattr(self, 'market_analysis_id') and self.market_analysis_id:
