@@ -737,6 +737,13 @@ class ModelFactory:
         # Try to resolve friendly name to actual model name via registry
         model_info = MODELS.get(friendly_name)
         if model_info:
+            # If provider is "native", resolve to the model's native provider
+            if provider == "native":
+                native_provider = model_info.get("native_provider")
+                if native_provider:
+                    provider = native_provider
+                    logger.debug(f"Resolved 'native' provider to '{provider}' for model '{friendly_name}'")
+            
             # Get provider-specific model name from registry
             actual_model = get_model_for_provider(friendly_name, provider)
             if actual_model:
