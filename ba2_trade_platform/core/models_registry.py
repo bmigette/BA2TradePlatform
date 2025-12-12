@@ -389,30 +389,26 @@ MODELS: Dict[str, Dict[str, Any]] = {
     "deepseek_v3.2": {
         "native_provider": PROVIDER_DEEPSEEK,
         "display_name": "DeepSeek V3.2",
-        "description": "DeepSeek's latest v3.2 model with thinking enabled",
+        "description": "DeepSeek's latest v3.2 model",
         "provider_names": {
             PROVIDER_DEEPSEEK: "deepseek-chat",
             PROVIDER_NAGAAI: "deepseek-v3.2",
             PROVIDER_OPENROUTER: "deepseek/deepseek-chat",
         },
         "labels": [LABEL_LOW_COST, LABEL_CODING, LABEL_TOOL_CALLING, LABEL_THINKING],
-        "default_model_kwargs": {
-            "thinking": {"type": "enabled"},  # Enable deep thinking mode
-        },
+        # Note: thinking parameter not supported by langchain-deepseek yet
     },
     "deepseek_chat": {
         "native_provider": PROVIDER_DEEPSEEK,
         "display_name": "DeepSeek Chat",
-        "description": "DeepSeek chat model with thinking enabled",
+        "description": "DeepSeek chat model",
         "provider_names": {
             PROVIDER_DEEPSEEK: "deepseek-chat",
             PROVIDER_NAGAAI: "deepseek-chat-v3.1",
             PROVIDER_OPENROUTER: "deepseek/deepseek-chat",
         },
         "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING, LABEL_THINKING],
-        "default_model_kwargs": {
-            "thinking": {"type": "enabled"},  # Enable deep thinking mode
-        },
+        # Note: thinking parameter not supported by langchain-deepseek yet
     },
     "deepseek_reasoner": {
         "native_provider": PROVIDER_DEEPSEEK,
