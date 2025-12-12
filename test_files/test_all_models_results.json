@@ -1,12 +1,12 @@
 {
-  "timestamp": "2025-12-12T10:16:04.895378",
+  "timestamp": "2025-12-12T11:05:03.538366",
   "providers": {
     "openai": {
       "display_name": "OpenAI",
       "api_key_configured": true,
-      "total_models": 12,
-      "passed": 7,
-      "failed": 5,
+      "total_models": 10,
+      "passed": 1,
+      "failed": 0,
       "results": [
         {
           "model": "gpt4o_mini",
@@ -15,174 +15,11 @@
           "success": true,
           "response": "4",
           "error": "",
-          "duration_ms": 2124.3512630462646,
+          "duration_ms": 1838.4418487548828,
           "labels": [
             "low_cost",
             "fast",
             "vision",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gpt4o",
-          "provider": "openai",
-          "provider_model_name": "gpt-4o",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 473.4158515930176,
-          "labels": [
-            "high_cost",
-            "vision",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gpt5_mini",
-          "provider": "openai",
-          "provider_model_name": "gpt-5-mini",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 1385.3304386138916,
-          "labels": [
-            "low_cost",
-            "fast",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gpt5",
-          "provider": "openai",
-          "provider_model_name": "gpt-5-2025-08-07",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 1240.1623725891113,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gpt5.1",
-          "provider": "openai",
-          "provider_model_name": "gpt-5.1-2025-11-13",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 877.5005340576172,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gpt5.2",
-          "provider": "openai",
-          "provider_model_name": "gpt-5.2",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 429.5504093170166,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gpt5.2_pro",
-          "provider": "openai",
-          "provider_model_name": "gpt-5.2-pro",
-          "success": false,
-          "response": "",
-          "error": "Error code: 404 - {'error': {'message': 'This is not a chat model and thus not supported in the v1/chat/completions endpoint. Did you mean to use v1/completions?', 'type': 'invalid_request_error', 'pa...",
-          "duration_ms": 0.0,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gpt5_nano",
-          "provider": "openai",
-          "provider_model_name": "gpt-5-nano-2025-08-07",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 1012.3217105865479,
-          "labels": [
-            "low_cost",
-            "fast",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "o1",
-          "provider": "openai",
-          "provider_model_name": "o1",
-          "success": false,
-          "response": "",
-          "error": "Error code: 400 - {'error': {'message': \"Unsupported parameter: 'temperature' is not supported with this model.\", 'type': 'invalid_request_error', 'param': 'temperature', 'code': 'unsupported_paramete...",
-          "duration_ms": 0.0,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "o1_mini",
-          "provider": "openai",
-          "provider_model_name": "o1-mini",
-          "success": false,
-          "response": "",
-          "error": "Error code: 404 - {'error': {'message': 'The model `o1-mini` does not exist or you do not have access to it.', 'type': 'invalid_request_error', 'param': None, 'code': 'model_not_found'}}",
-          "duration_ms": 0.0,
-          "labels": [
-            "low_cost",
-            "thinking",
-            "fast",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "o3_mini",
-          "provider": "openai",
-          "provider_model_name": "o3-mini",
-          "success": false,
-          "response": "",
-          "error": "Error code: 400 - {'error': {'message': \"Unsupported parameter: 'temperature' is not supported with this model.\", 'type': 'invalid_request_error', 'param': 'temperature', 'code': 'unsupported_paramete...",
-          "duration_ms": 0.0,
-          "labels": [
-            "low_cost",
-            "thinking",
-            "fast",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "o4_mini",
-          "provider": "openai",
-          "provider_model_name": "o4-mini",
-          "success": false,
-          "response": "",
-          "error": "Error code: 400 - {'error': {'message': \"Unsupported value: 'temperature' does not support 0.0 with this model. Only the default (1) value is supported.\", 'type': 'invalid_request_error', 'param': 'te...",
-          "duration_ms": 0.0,
-          "labels": [
-            "low_cost",
-            "thinking",
-            "fast",
             "tool_calling"
           ]
         }
@@ -191,9 +28,9 @@
     "nagaai": {
       "display_name": "NagaAI",
       "api_key_configured": true,
-      "total_models": 38,
-      "passed": 29,
-      "failed": 9,
+      "total_models": 30,
+      "passed": 1,
+      "failed": 0,
       "results": [
         {
           "model": "gpt4o_mini",
@@ -202,551 +39,11 @@
           "success": true,
           "response": "4",
           "error": "",
-          "duration_ms": 1206.059217453003,
+          "duration_ms": 1033.3728790283203,
           "labels": [
             "low_cost",
             "fast",
             "vision",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "grok3_mini",
-          "provider": "nagaai",
-          "provider_model_name": "grok-3-mini",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 2096.0190296173096,
-          "labels": [
-            "low_cost",
-            "fast",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gpt5_mini",
-          "provider": "nagaai",
-          "provider_model_name": "gpt-5-mini-2025-08-07",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 1841.6531085968018,
-          "labels": [
-            "low_cost",
-            "fast",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gpt5",
-          "provider": "nagaai",
-          "provider_model_name": "gpt-5-2025-08-07",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 1454.815149307251,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "claude_3.5_haiku",
-          "provider": "nagaai",
-          "provider_model_name": "claude-3-5-haiku-20241022",
-          "success": false,
-          "response": "",
-          "error": "Error code: 400 - {'error': {'type': 'model_not_found', 'message': \"The 'claude-3-5-haiku-20241022' model was not found.. Make sure you are using the correct endpoint and model name.\"}}",
-          "duration_ms": 0.0,
-          "labels": [
-            "low_cost",
-            "fast",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "claude_3.5_sonnet",
-          "provider": "nagaai",
-          "provider_model_name": "claude-3-5-sonnet-20241022",
-          "success": false,
-          "response": "",
-          "error": "Error code: 400 - {'error': {'type': 'model_not_found', 'message': \"The 'claude-3-5-sonnet-20241022' model was not found.. Make sure you are using the correct endpoint and model name.\"}}",
-          "duration_ms": 0.0,
-          "labels": [
-            "coding",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "claude_4_opus",
-          "provider": "nagaai",
-          "provider_model_name": "claude-opus-4-20250514",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 1899.3782997131348,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "coding",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "claude_4_sonnet",
-          "provider": "nagaai",
-          "provider_model_name": "claude-sonnet-4-20250514",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 1608.7868213653564,
-          "labels": [
-            "thinking",
-            "coding",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "deepseek_chat",
-          "provider": "nagaai",
-          "provider_model_name": "deepseek-chat-v3.1",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 1408.9069366455078,
-          "labels": [
-            "low_cost",
-            "fast",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "deepseek_coder",
-          "provider": "nagaai",
-          "provider_model_name": "deepseek-coder",
-          "success": false,
-          "response": "",
-          "error": "Error code: 400 - {'error': {'type': 'model_not_found', 'message': \"The 'deepseek-coder' model was not found.. Make sure you are using the correct endpoint and model name.\"}}",
-          "duration_ms": 0.0,
-          "labels": [
-            "low_cost",
-            "coding",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "deepseek_reasoner",
-          "provider": "nagaai",
-          "provider_model_name": "deepseek-reasoner-0528",
-          "success": true,
-          "response": "<think>\nFirst, the user asked: \"What is 2+2? Reply with just the number.\"\n\nThe question is straightf",
-          "error": "",
-          "duration_ms": 2632.9612731933594,
-          "labels": [
-            "low_cost",
-            "thinking",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "deepseek_v3.2",
-          "provider": "nagaai",
-          "provider_model_name": "deepseek-v3.2",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 1458.2479000091553,
-          "labels": [
-            "low_cost",
-            "coding",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gemini_2.0_flash",
-          "provider": "nagaai",
-          "provider_model_name": "gemini-2.0-flash",
-          "success": true,
-          "response": "4\n",
-          "error": "",
-          "duration_ms": 772.4602222442627,
-          "labels": [
-            "low_cost",
-            "fast",
-            "vision",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gemini_2.5_flash",
-          "provider": "nagaai",
-          "provider_model_name": "gemini-2.5-flash",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 1815.9849643707275,
-          "labels": [
-            "low_cost",
-            "thinking",
-            "fast",
-            "vision",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gemini_2.5_pro",
-          "provider": "nagaai",
-          "provider_model_name": "gemini-2.5-pro",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 3279.3941497802734,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "vision",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gemini_3_pro",
-          "provider": "nagaai",
-          "provider_model_name": "gemini-3-pro-preview",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 4232.55729675293,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "vision",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gpt4o",
-          "provider": "nagaai",
-          "provider_model_name": "gpt-4o",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 544.5239543914795,
-          "labels": [
-            "high_cost",
-            "vision",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gpt5.1",
-          "provider": "nagaai",
-          "provider_model_name": "gpt-5.1-2025-11-13",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 698.5077857971191,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gpt5.2",
-          "provider": "nagaai",
-          "provider_model_name": "gpt-5.2-2025-12-11",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 585.5085849761963,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gpt5.2_pro",
-          "provider": "nagaai",
-          "provider_model_name": "gpt-5.2-pro-2025-12-11",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 4096.753358840942,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gpt5_chat",
-          "provider": "nagaai",
-          "provider_model_name": "gpt-5-chat-latest",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 985.9051704406738,
-          "labels": [
-            "low_cost",
-            "fast",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gpt5_codex",
-          "provider": "nagaai",
-          "provider_model_name": "gpt-5-codex",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 980.1731109619141,
-          "labels": [
-            "coding",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gpt5_nano",
-          "provider": "nagaai",
-          "provider_model_name": "gpt-5-nano-2025-08-07",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 2703.6173343658447,
-          "labels": [
-            "low_cost",
-            "fast",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "grok3",
-          "provider": "nagaai",
-          "provider_model_name": "grok-3",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 654.9758911132812,
-          "labels": [
-            "thinking",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "grok4",
-          "provider": "nagaai",
-          "provider_model_name": "grok-4-0709",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 5780.310153961182,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "grok4.1_fast_reasoning",
-          "provider": "nagaai",
-          "provider_model_name": "grok-4.1-fast-reasoning",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 1396.1679935455322,
-          "labels": [
-            "thinking",
-            "fast",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "grok4_fast",
-          "provider": "nagaai",
-          "provider_model_name": "grok-4-fast-non-reasoning",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 778.1929969787598,
-          "labels": [
-            "low_cost",
-            "fast",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "grok4_fast_reasoning",
-          "provider": "nagaai",
-          "provider_model_name": "grok-4-fast-reasoning",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 1004.178524017334,
-          "labels": [
-            "thinking",
-            "fast",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "kimi_k1.5",
-          "provider": "nagaai",
-          "provider_model_name": "kimi-k1.5",
-          "success": false,
-          "response": "",
-          "error": "Error code: 400 - {'error': {'type': 'model_not_found', 'message': \"The 'kimi-k1.5' model was not found.. Make sure you are using the correct endpoint and model name.\"}}",
-          "duration_ms": 0.0,
-          "labels": [
-            "low_cost",
-            "fast",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "kimi_k2",
-          "provider": "nagaai",
-          "provider_model_name": "kimi-k2",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 239.95733261108398,
-          "labels": [
-            "low_cost",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "kimi_k2_thinking",
-          "provider": "nagaai",
-          "provider_model_name": "kimi-k2-thinking",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 10664.485692977905,
-          "labels": [
-            "low_cost",
-            "thinking",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "o1",
-          "provider": "nagaai",
-          "provider_model_name": "o1",
-          "success": false,
-          "response": "",
-          "error": "Error code: 400 - {'error': {'type': 'invalid_request_error', 'message': 'We got a bad response from the source. Status 400. Error message: {\\n  \"error\": {\\n    \"message\": \"Unsupported parameter: \\'te...",
-          "duration_ms": 0.0,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "o1_mini",
-          "provider": "nagaai",
-          "provider_model_name": "o1-mini",
-          "success": false,
-          "response": "",
-          "error": "Error code: 501 - {'error': {'type': 'no_sources_available', 'message': 'No sources were found for this model.'}}",
-          "duration_ms": 0.0,
-          "labels": [
-            "low_cost",
-            "thinking",
-            "fast",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "o3_mini",
-          "provider": "nagaai",
-          "provider_model_name": "o3-mini",
-          "success": false,
-          "response": "",
-          "error": "Error code: 400 - {'error': {'type': 'invalid_request_error', 'message': 'We got a bad response from the source. Status 400. Error message: {\\n  \"error\": {\\n    \"message\": \"Unsupported parameter: \\'te...",
-          "duration_ms": 0.0,
-          "labels": [
-            "low_cost",
-            "thinking",
-            "fast",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "o4_mini",
-          "provider": "nagaai",
-          "provider_model_name": "o4-mini",
-          "success": false,
-          "response": "",
-          "error": "Error code: 400 - {'error': {'type': 'invalid_request_error', 'message': 'We got a bad response from the source. Status 400. Error message: {\\n  \"error\": {\\n    \"message\": \"Unsupported parameter: \\'te...",
-          "duration_ms": 0.0,
-          "labels": [
-            "low_cost",
-            "thinking",
-            "fast",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "qwen3_80b",
-          "provider": "nagaai",
-          "provider_model_name": "qwen3-next-80b-a3b-instruct",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 1339.0052318572998,
-          "labels": [
-            "high_cost",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "qwen3_80b_thinking",
-          "provider": "nagaai",
-          "provider_model_name": "qwen3-next-80b-a3b-thinking",
-          "success": false,
-          "response": "",
-          "error": "Error code: 503 - {'error': {'type': 'server_error', 'message': 'An error occurred while executing a request to the upstream source. You can report this issue to us on our Discord: https://discord.nag...",
-          "duration_ms": 0.0,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "qwen3_max",
-          "provider": "nagaai",
-          "provider_model_name": "qwen3-max",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 1369.3811893463135,
-          "labels": [
-            "high_cost",
-            "thinking",
             "tool_calling"
           ]
         }
@@ -756,7 +53,7 @@
       "display_name": "Google",
       "api_key_configured": true,
       "total_models": 4,
-      "passed": 4,
+      "passed": 1,
       "failed": 0,
       "results": [
         {
@@ -766,59 +63,10 @@
           "success": true,
           "response": "4\n",
           "error": "",
-          "duration_ms": 2032.0024490356445,
+          "duration_ms": 2080.8815956115723,
           "labels": [
             "low_cost",
             "fast",
-            "vision",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gemini_2.5_flash",
-          "provider": "google",
-          "provider_model_name": "gemini-2.5-flash",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 1335.2832794189453,
-          "labels": [
-            "low_cost",
-            "thinking",
-            "fast",
-            "vision",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gemini_2.5_pro",
-          "provider": "google",
-          "provider_model_name": "gemini-2.5-pro",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 4328.750133514404,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "vision",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gemini_3_pro",
-          "provider": "google",
-          "provider_model_name": "gemini-3-pro-preview",
-          "success": true,
-          "response": "[{'type': 'text', 'text': '4', 'index': 0, 'extras': {'signature': 'EvMDCvADAXLI2nznt6QN0rIolEx6KNQB",
-          "error": "",
-          "duration_ms": 4089.0562534332275,
-          "labels": [
-            "high_cost",
-            "thinking",
             "vision",
             "websearch",
             "tool_calling"
@@ -845,9 +93,9 @@
     "xai": {
       "display_name": "xAI",
       "api_key_configured": true,
-      "total_models": 6,
-      "passed": 5,
-      "failed": 1,
+      "total_models": 7,
+      "passed": 1,
+      "failed": 0,
       "results": [
         {
           "model": "grok3_mini",
@@ -856,83 +104,9 @@
           "success": true,
           "response": "4",
           "error": "",
-          "duration_ms": 3110.4307174682617,
+          "duration_ms": 2862.3225688934326,
           "labels": [
             "low_cost",
-            "fast",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "grok3",
-          "provider": "xai",
-          "provider_model_name": "grok-3",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 1319.6656703948975,
-          "labels": [
-            "thinking",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "grok4_fast",
-          "provider": "xai",
-          "provider_model_name": "grok-4-fast-non-reasoning",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 1409.9464416503906,
-          "labels": [
-            "low_cost",
-            "fast",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "grok4",
-          "provider": "xai",
-          "provider_model_name": "grok-4-0709",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 6070.860147476196,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "grok4.1_fast_reasoning",
-          "provider": "xai",
-          "provider_model_name": "grok-4.1-fast-reasoning",
-          "success": false,
-          "response": "",
-          "error": "Error code: 404 - {'code': 'Some requested entity was not found', 'error': \"The model grok-4.1-fast-reasoning does not exist or your team 60a5aff1-5fa6-4078-a135-8fb36eaa06d7 does not have access to i...",
-          "duration_ms": 0.0,
-          "labels": [
-            "thinking",
-            "fast",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "grok4_fast_reasoning",
-          "provider": "xai",
-          "provider_model_name": "grok-4-fast-reasoning",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 1711.8604183197021,
-          "labels": [
-            "thinking",
             "fast",
             "websearch",
             "tool_calling"
@@ -944,7 +118,7 @@
       "display_name": "Moonshot",
       "api_key_configured": true,
       "total_models": 3,
-      "passed": 3,
+      "passed": 1,
       "failed": 0,
       "results": [
         {
@@ -954,39 +128,10 @@
           "success": true,
           "response": "4",
           "error": "",
-          "duration_ms": 938.3544921875,
+          "duration_ms": 1020.9171772003174,
           "labels": [
             "low_cost",
             "fast",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "kimi_k2",
-          "provider": "moonshot",
-          "provider_model_name": "kimi-k2-0711-preview",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 676.8033504486084,
-          "labels": [
-            "low_cost",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "kimi_k2_thinking",
-          "provider": "moonshot",
-          "provider_model_name": "kimi-k2-thinking",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 4125.064134597778,
-          "labels": [
-            "low_cost",
-            "thinking",
-            "websearch",
             "tool_calling"
           ]
         }
@@ -996,7 +141,7 @@
       "display_name": "DeepSeek",
       "api_key_configured": true,
       "total_models": 4,
-      "passed": 4,
+      "passed": 1,
       "failed": 0,
       "results": [
         {
@@ -1006,52 +151,10 @@
           "success": true,
           "response": "4",
           "error": "",
-          "duration_ms": 1931.518316268921,
+          "duration_ms": 1640.8507823944092,
           "labels": [
             "low_cost",
             "fast",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "deepseek_coder",
-          "provider": "deepseek",
-          "provider_model_name": "deepseek-coder",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 1679.0602207183838,
-          "labels": [
-            "low_cost",
-            "coding",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "deepseek_reasoner",
-          "provider": "deepseek",
-          "provider_model_name": "deepseek-reasoner",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 5076.948404312134,
-          "labels": [
-            "low_cost",
-            "thinking",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "deepseek_v3.2",
-          "provider": "deepseek",
-          "provider_model_name": "deepseek-chat",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 1673.9840507507324,
-          "labels": [
-            "low_cost",
-            "coding",
             "tool_calling"
           ]
         }

@@ -149,6 +149,10 @@ class ModelFactory:
         if streaming is None:
             streaming = OPENAI_ENABLE_STREAMING
         
+        # Check if model supports temperature (O-series models don't)
+        supports_temp = not model_info.get("no_temperature", False)
+        effective_temperature = temperature if supports_temp else None
+        
         # Build LLM based on provider type
         langchain_class = provider_config.get("langchain_class", "ChatOpenAI")
         
@@ -158,7 +162,7 @@ class ModelFactory:
                 model_name=provider_model_name,
                 base_url=provider_config.get("base_url"),
                 api_key=api_key,
-                temperature=temperature,
+                temperature=effective_temperature,
                 streaming=streaming,
                 callbacks=callbacks,
                 model_kwargs=model_kwargs,
@@ -168,7 +172,7 @@ class ModelFactory:
             return cls._create_google(
                 model_name=provider_model_name,
                 api_key=api_key,
-                temperature=temperature,
+                temperature=effective_temperature,
                 streaming=streaming,
                 callbacks=callbacks,
                 model_kwargs=model_kwargs,
@@ -234,7 +238,7 @@ class ModelFactory:
         model_name: str,
         base_url: Optional[str],
         api_key: str,
-        temperature: float,
+        temperature: Optional[float],
         streaming: bool,
         callbacks: Optional[List[BaseCallbackHandler]],
         model_kwargs: Optional[Dict[str, Any]],
@@ -249,10 +253,13 @@ class ModelFactory:
         # Build initialization parameters
         llm_params = {
             "model": model_name,
-            "temperature": temperature,
             "api_key": api_key,
             "streaming": streaming,
         }
+        
+        # Only add temperature if model supports it (O-series models don't)
+        if temperature is not None:
+            llm_params["temperature"] = temperature
         
         if base_url:
             llm_params["base_url"] = base_url

@@ -194,18 +194,6 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
         "supports_parameters": ["reasoning_effort"],  # Supports {reasoning_effort:low/medium/high}
     },
-    "gpt5.2_pro": {
-        "native_provider": PROVIDER_OPENAI,
-        "display_name": "GPT-5.2 Pro",
-        "description": "GPT-5.2 Pro that produces smarter and more precise responses",
-        "provider_names": {
-            PROVIDER_OPENAI: "gpt-5.2-pro",
-            PROVIDER_NAGAAI: "gpt-5.2-pro-2025-12-11",
-            PROVIDER_OPENROUTER: "openai/gpt-5.2-pro",
-        },
-        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
-        "supports_parameters": ["reasoning_effort"],  # Supports medium/high/xhigh
-    },
     
     # =========================================================================
     # GPT-4o Family
@@ -242,21 +230,20 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "description": "OpenAI's most capable reasoning model",
         "provider_names": {
             PROVIDER_OPENAI: "o1",
-            PROVIDER_NAGAAI: "o1",
             PROVIDER_OPENROUTER: "openai/o1",
         },
         "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_TOOL_CALLING],
+        "no_temperature": True,  # O-series models don't support temperature parameter
     },
     "o1_mini": {
-        "native_provider": PROVIDER_OPENAI,
+        "native_provider": PROVIDER_OPENROUTER,
         "display_name": "O1 Mini",
-        "description": "Smaller, faster O1 variant",
+        "description": "Smaller, faster O1 variant (deprecated on OpenAI)",
         "provider_names": {
-            PROVIDER_OPENAI: "o1-mini",
-            PROVIDER_NAGAAI: "o1-mini",
             PROVIDER_OPENROUTER: "openai/o1-mini",
         },
         "labels": [LABEL_LOW_COST, LABEL_THINKING, LABEL_FAST, LABEL_TOOL_CALLING],
+        "no_temperature": True,  # O-series models don't support temperature parameter
     },
     "o3_mini": {
         "native_provider": PROVIDER_OPENAI,
@@ -264,10 +251,10 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "description": "OpenAI's latest mini reasoning model",
         "provider_names": {
             PROVIDER_OPENAI: "o3-mini",
-            PROVIDER_NAGAAI: "o3-mini",
             PROVIDER_OPENROUTER: "openai/o3-mini",
         },
         "labels": [LABEL_LOW_COST, LABEL_THINKING, LABEL_FAST, LABEL_TOOL_CALLING],
+        "no_temperature": True,  # O-series models don't support temperature parameter
     },
     "o4_mini": {
         "native_provider": PROVIDER_OPENAI,
@@ -275,10 +262,10 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "description": "Latest O4 mini reasoning model",
         "provider_names": {
             PROVIDER_OPENAI: "o4-mini",
-            PROVIDER_NAGAAI: "o4-mini",
             PROVIDER_OPENROUTER: "openai/o4-mini",
         },
         "labels": [LABEL_LOW_COST, LABEL_THINKING, LABEL_FAST, LABEL_TOOL_CALLING],
+        "no_temperature": True,  # O-series models don't support temperature parameter
     },
     
     # =========================================================================
@@ -898,3 +885,22 @@ def get_model_display_info(friendly_name: str) -> Dict[str, Any]:
         "available_providers": list(model_info.get("provider_names", {}).keys()),
         "labels": model_info.get("labels", []),
     }
+
+
+def model_supports_temperature(friendly_name: str) -> bool:
+    """
+    Check if a model supports the temperature parameter.
+    
+    Some reasoning models (O-series) don't support temperature.
+    
+    Args:
+        friendly_name: The friendly model name (e.g., "o1", "gpt5")
+        
+    Returns:
+        True if model supports temperature, False otherwise
+    """
+    model_info = MODELS.get(friendly_name)
+    if not model_info:
+        return True  # Default to supporting temperature for unknown models
+    
+    return not model_info.get("no_temperature", False)
