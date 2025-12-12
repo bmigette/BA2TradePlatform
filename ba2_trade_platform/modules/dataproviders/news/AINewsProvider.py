@@ -30,6 +30,33 @@ class AINewsProvider(MarketNewsInterface):
         self.model_string = model
         logger.debug(f"AINewsProvider initialized with model: {model}")
 
+    def get_provider_name(self) -> str:
+        """Return the provider name."""
+        return "ai"
+    
+    def get_supported_features(self) -> list[str]:
+        """Return list of supported features."""
+        return ["company_news", "global_news"]
+    
+    def validate_config(self) -> bool:
+        """Validate provider configuration."""
+        # AI provider needs a model string to work
+        return self.model_string is not None
+    
+    def _format_as_dict(self, data: Any) -> Dict[str, Any]:
+        """Format data as a structured dictionary."""
+        # The provider methods already return structured data
+        if isinstance(data, dict):
+            return data
+        return {"raw_data": data}
+    
+    def _format_as_markdown(self, data: Any) -> str:
+        """Format data as markdown for LLM consumption."""
+        # The provider methods already return markdown when format_type="markdown"
+        if isinstance(data, str):
+            return data
+        return str(data)
+
     def get_company_news(
         self,
         symbol: Annotated[str, "Stock ticker symbol"],
