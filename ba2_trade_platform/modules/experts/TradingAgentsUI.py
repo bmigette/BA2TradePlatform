@@ -280,7 +280,13 @@ class TradingAgentsUI:
                           debate_state.get('current_neutral_response'))
         else:
             content = self.trading_state.get(state_key, '')
-            return bool(content and content.strip())
+            # Handle both string and list types
+            if isinstance(content, list):
+                return bool(content)  # List is truthy if non-empty
+            elif isinstance(content, str):
+                return bool(content and content.strip())
+            else:
+                return bool(content)  # For other types, just check truthiness
         return False
     
     def _render_summary_panel(self) -> None:

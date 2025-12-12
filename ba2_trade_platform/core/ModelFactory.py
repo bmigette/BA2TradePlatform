@@ -314,11 +314,22 @@ class ModelFactory:
                 "Install it with: pip install langchain-google-genai"
             )
         
+        # IMPORTANT: Force disable streaming for Google models
+        # LangChain has a known bug where streaming with Gemini causes
+        # "string indices must be integers, not 'str'" errors in merge_content()
+        # when the model returns mixed content types during streaming.
+        # See: https://github.com/langchain-ai/langchain/issues/
+        if streaming:
+            logger.warning(
+                f"Streaming disabled for Google model {model_name} due to LangChain "
+                "compatibility issues with Gemini's streaming content format."
+            )
+        
         llm_params = {
             "model": model_name,
             "temperature": temperature,
             "google_api_key": api_key,
-            "streaming": streaming,
+            "streaming": False,  # Always disabled - see comment above
         }
         
         if callbacks:

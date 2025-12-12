@@ -105,8 +105,9 @@ class FinancialSituationMemory:
             list: List of embeddings (one per chunk). If text is short, returns list with single embedding.
         """
         # text-embedding-3-small has a max context length of 8192 tokens
-        # Conservative estimate: ~3 characters per token for safety margin
-        max_chars = 24000  # ~8000 tokens * 3 chars/token
+        # Conservative estimate: ~2 characters per token (safe for JSON, code, special chars)
+        # Previous estimate of 3 chars/token was too generous and caused 400 errors
+        max_chars = 16000  # ~8000 tokens * 2 chars/token (conservative)
         
         if len(text) <= max_chars:
             # Text is short enough, get embedding directly
@@ -119,8 +120,9 @@ class FinancialSituationMemory:
         logger.info(f"Text length {len(text)} exceeds limit, splitting into chunks for embedding")
         
         # Use RecursiveCharacterTextSplitter for intelligent chunking
+        # chunk_size of 14000 chars ≈ 7000 tokens, leaving buffer for 8192 limit
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=max_chars - 1000,  # Leave some buffer
+            chunk_size=14000,  # Conservative: ~7000 tokens, well under 8192 limit
             chunk_overlap=500,  # Overlap to preserve context
             length_function=len,
             separators=["\n\n", "\n", ". ", " ", ""]  # Try to split at natural boundaries

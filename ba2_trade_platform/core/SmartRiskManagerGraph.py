@@ -324,6 +324,37 @@ def _format_relative_time(timestamp_str: str) -> str:
         return ""
 
 
+def _build_positions_summary(open_positions: List[Dict[str, Any]]) -> str:
+    """
+    Build a clear, prominent summary of open positions with valid transaction IDs.
+    
+    This is placed at the TOP of the research prompt to ensure the LLM always knows
+    which transaction IDs are valid before it starts making recommendations.
+    
+    Args:
+        open_positions: List of position dictionaries from portfolio status
+        
+    Returns:
+        Formatted string with transaction IDs prominently displayed
+    """
+    if not open_positions:
+        return "No open positions. You can only open new positions."
+    
+    lines = ["**ONLY these transaction IDs are valid for actions:**"]
+    for pos in open_positions:
+        tid = pos.get('transaction_id')
+        symbol = pos.get('symbol')
+        qty = pos.get('quantity')
+        direction = pos.get('direction', 'BUY')
+        lines.append(f"- **Transaction #{tid}**: {symbol} ({qty} shares, {direction})")
+    
+    lines.append("")
+    lines.append("⚠️ **CRITICAL**: Do NOT use any other transaction IDs!")
+    lines.append("⚠️ Do NOT guess IDs like 1, 2, 3 - use the EXACT IDs listed above.")
+    
+    return "\n".join(lines)
+
+
 def get_api_key_from_database(key_name: str) -> str:
     """
     Get API key from database AppSettings.
@@ -524,6 +555,9 @@ RESEARCH_PROMPT = """You are a research specialist for portfolio risk management
 ## YOUR MISSION
 Research market analyses and recommend specific trading actions. You have FULL AUTONOMY - call any tool multiple times without approval.
 
+## 🚨 YOUR OPEN POSITIONS (VALID TRANSACTION IDs) 🚨
+{current_positions_summary}
+
 ## PORTFOLIO CONTEXT
 {agent_scratchpad}
 
@@ -586,228 +620,6 @@ Research market analyses and recommend specific trading actions. You have FULL A
 Act immediately when triggers are met (SL breached, TP reached, >70% confidence signals).
 Do NOT write recommendations in text - you MUST call the recommendation tools.
 {expert_instructions}"""
-
-ACTION_PROMPT = """You are ready to execute risk management actions.
-
-## CRITICAL INSTRUCTION
-You have been directed to the action node because a decision has been made to take action.
-Your job is to EXECUTE the actions that have been determined necessary, NOT to reconsider whether to act.
-To execute actions, you must call the appropriate tool as instructed below.
-
-## CURRENT SITUATION
-{portfolio_summary}
-
-## RESEARCH FINDINGS & ACTION RATIONALE
-{agent_scratchpad}
-
-## YOUR TRADING PERMISSIONS - CRITICAL
-**Know what you can and cannot do:**
-- **BUY orders:** {buy_status}
-- **SELL orders:** {sell_status}
-- **Automated trading:** {auto_trading_status}
-- **Enabled instruments:** {enabled_instruments}
-- **Max position size:** {max_position_pct}% of equity per symbol
-
-{trading_focus_guidance}
-
-**You MUST respect these restrictions. Do not attempt actions that violate them.**
-
-## AVAILABLE TRADING TOOLS
-You have access to these trading tools. Call them directly to execute actions:
-
-**Position Management:**
-- **close_position(transaction_id: int, reason: str)** - Close an entire position {close_position_note}
-  * transaction_id: ID of the Transaction to close
-  * reason: Explanation for closing (for audit trail)
-  * Returns: Dict with success, message, order_id, transaction_id
-
-- **adjust_quantity(transaction_id: int, new_quantity: float, reason: str)** - Partial close or add to position {adjust_quantity_note}
-  * transaction_id: ID of the position to adjust
-  * new_quantity: New absolute quantity (lower = partial close, higher = add to position)
-  * reason: Explanation for adjustment (for audit trail)
-  * Returns: Dict with success, message, order_id, old_quantity, new_quantity
-
-**Stop Loss / Take Profit:**
-- **update_stop_loss(transaction_id: int, new_sl_price: float, reason: str)** - Update stop loss price {update_sl_tp_note}
-  * transaction_id: ID of the position
-  * new_sl_price: New stop loss price (must be below current price for BUY, above for SELL)
-  * reason: Explanation for change (for audit trail)
-  * Returns: Dict with success, message, old_sl_price, new_sl_price
-
-- **update_take_profit(transaction_id: int, new_tp_price: float, reason: str)** - Update take profit price {update_sl_tp_note}
-  * transaction_id: ID of the position
-  * new_tp_price: New take profit price (must be above current price for BUY, below for SELL)
-  * reason: Explanation for change (for audit trail)
-  * Returns: Dict with success, message, old_tp_price, new_tp_price
-
-**Open New Positions:**
-- **open_buy_position(symbol: str, quantity: float, tp_price: float = None, sl_price: float = None, reason: str = "")** - Open new LONG (BUY) position {open_position_note}
-  * symbol: Instrument symbol to buy
-  * quantity: Number of shares/units to buy
-  * tp_price: Optional take profit price (must be above entry price)
-  * sl_price: Optional stop loss price (must be below entry price)
-  * reason: Explanation for opening this position (for audit trail)
-  * Returns: Dict with success, message, transaction_id, order_id, symbol, quantity, direction
-  * **CRITICAL: When you provide tp_price/sl_price, TP/SL orders are created automatically. DO NOT call update_take_profit() or update_stop_loss() afterwards - this creates duplicate orders!**
-
-- **open_sell_position(symbol: str, quantity: float, tp_price: float = None, sl_price: float = None, reason: str = "")** - Open new SHORT (SELL) position {open_position_note}
-  * symbol: Instrument symbol to sell short
-  * quantity: Number of shares/units to sell short
-  * tp_price: Optional take profit price (must be below entry price)
-  * sl_price: Optional stop loss price (must be above entry price)
-  * reason: Explanation for opening this position (for audit trail)
-  * Returns: Dict with success, message, transaction_id, order_id, symbol, quantity, direction
-  * **CRITICAL: When you provide tp_price/sl_price, TP/SL orders are created automatically. DO NOT call update_take_profit() or update_stop_loss() afterwards - this creates duplicate orders!**
-
-**Price Information:**
-- **get_current_price(symbol: str)** - Get current bid price for an instrument
-  * symbol: Instrument symbol
-  * Returns: Current bid price as float
-
-## TP/SL PRICE GUIDELINES
-When setting Take Profit (TP) or Stop Loss (SL) prices:
-- **Minimum distance:** TP and SL must be at least {min_tp_sl_pct}% away from the entry/current price
-- **BUY positions:** TP must be ABOVE entry price, SL must be BELOW entry price
-- **SELL positions:** TP must be BELOW entry price, SL must be ABOVE entry price
-- **Optional parameters:** TP and SL are optional. If prices don't meet requirements, the position will still open but without that order
-- **Manual adjustment:** You can always adjust TP/SL later using update_take_profit() or update_stop_loss() tools
-
-## GUIDELINES FOR ACTIONS
-{user_instructions}
-
-## YOUR TASK
-Based on the research findings and rationale above, execute the appropriate trading actions.
-
-**CRITICAL - UNLIMITED ACTIONS:**
-- **NO LIMIT on number of tool calls** - call tools as many times as needed
-- You can execute 5, 10, 20+ actions in a single session - whatever is required
-- Address ALL recommended actions, not just a few
-- You can make multiple passes: execute some actions, then continue with more if needed
-
-**Tool execution guidelines:**
-- ✅ CORRECT: Use your tool-calling capability to execute open_buy_position(), close_position(), etc.
-- ✅ CORRECT: Call multiple tools in sequence to complete all actions
-- ✅ CORRECT: If you have 10 positions to close, call close_position() 10 times
-- ❌ WRONG: Do NOT write Python code blocks or markdown showing what to do
-- ❌ WRONG: Do NOT describe actions in text - EXECUTE them using tool calls
-- ❌ WRONG: Do NOT stop after just a few actions if more are needed
-
-DO NOT second-guess the decision to act - you are here because action is warranted.
-DO NOT defer or wait for better conditions - implement ALL risk management actions now.
-DO NOT write explanatory code - USE THE TOOLS DIRECTLY to execute trades.
-**DO NOT stop prematurely** - if you were given 15 recommended actions, execute all 15.
-
-## 🚨 CRITICAL: NEW POSITIONS HAVE NO TRANSACTION ID 🚨
-- **When opening NEW positions, there is NO transaction_id yet** - the position must be opened first!
-- **NEVER call update_take_profit() or update_stop_loss() on positions you just opened**
-- **For new positions**: Use tp_price/sl_price parameters in open_buy_position() or open_sell_position()
-- **For existing positions**: Use the transaction_id from the portfolio summary and call separate TP/SL tools
-- **Example WRONG**: open_buy_position("AAPL", 10) then update_take_profit(999, 200.0) ← transaction 999 doesn't exist!
-- **Example CORRECT**: open_buy_position("AAPL", 10, tp_price=200.0, sl_price=150.0) ← TP/SL included in position opening
-
-## AVOID DUPLICATE POSITIONS - CRITICAL
-**NEVER open a new position for a symbol that already has an open position:**
-- ❌ WRONG: If AAPL position exists, do NOT call open_buy_position("AAPL", ...)
-- ❌ WRONG: If TSLA short position exists, do NOT call open_sell_position("TSLA", ...)
-- ✅ CORRECT: Use adjust_quantity() to increase an existing position instead
-- ✅ CORRECT: Check the "FILLED Positions" list above before opening new positions
-
-**NEVER open opposite direction positions on the same symbol:**
-- ❌ WRONG: If AAPL BUY position exists, do NOT call open_sell_position("AAPL", ...)
-- ❌ WRONG: If TSLA SELL position exists, do NOT call open_buy_position("TSLA", ...)
-- ✅ CORRECT: Close existing position first, then open new position in opposite direction if needed
-
-**Before opening ANY new position:**
-1. Check if the symbol is already in the "FILLED Positions" list above (any direction)
-2. If it exists with SAME direction, use adjust_quantity(transaction_id, new_quantity, reason) to add to it
-3. If it exists with OPPOSITE direction, close it first if you want to reverse the position
-4. If it does NOT exist, then you can use open_buy_position() or open_sell_position()
-
-**Example - CORRECT workflow:**
-```
-Current positions: AAPL (transaction_id=123, quantity=10, direction=BUY)
-Want to add 5 more AAPL shares (same direction):
-✅ CORRECT: adjust_quantity(123, 15, "Adding to position based on strong signal")
-❌ WRONG: open_buy_position("AAPL", 5, ...) - This creates a duplicate!
-
-Want to short AAPL (opposite direction):
-❌ WRONG: open_sell_position("AAPL", 10, ...) - Cannot have both BUY and SELL on same symbol!
-✅ CORRECT: First close_position(123, "Reversing position"), then open_sell_position("AAPL", 10, ...)
-```
-
-**Why this matters:**
-- Multiple positions for the same symbol complicate risk management
-- Each position has separate stop loss and take profit orders
-- Harder to track total exposure to a single symbol
-- Opposite direction positions (long + short) create confusing hedged positions
-- Can lead to unexpected behavior when closing positions
-
-## 🚨 CRITICAL: AVOID DUPLICATE TP/SL CALLS 🚨
-**NEVER call separate TP/SL adjustment tools after opening a position with TP/SL parameters:**
-
-**❌ WRONG WORKFLOW - Creates Duplicate Orders:**
-```
-Step 1: open_buy_position(symbol="AAPL", quantity=10, tp_price=200.0, sl_price=150.0, ...)
-Step 2: update_take_profit(transaction_id=XXX, new_tp_price=200.0, ...)  ← DUPLICATE!
-Step 3: update_stop_loss(transaction_id=XXX, new_sl_price=150.0, ...)    ← DUPLICATE!
-```
-**This creates 3 separate TP/SL orders for the same position, causing order cancellations and confusion.**
-
-**✅ CORRECT WORKFLOW - Single TP/SL Creation:**
-```
-# Option 1: Include TP/SL in position opening (RECOMMENDED)
-open_buy_position(symbol="AAPL", quantity=10, tp_price=200.0, sl_price=150.0, reason="...")
-
-# Option 2: Open position without TP/SL, then set them separately
-open_buy_position(symbol="AAPL", quantity=10, reason="...")
-update_take_profit(transaction_id=XXX, new_tp_price=200.0, reason="...")
-update_stop_loss(transaction_id=XXX, new_sl_price=150.0, reason="...")
-```
-
-**REMEMBER**: When you specify `tp_price` and `sl_price` in `open_buy_position()` or `open_sell_position()`, the TP/SL orders are created automatically. DO NOT make additional calls to set the same levels.
-
-## HANDLING FAILED ACTIONS - CRITICAL
-**If an action fails, CONTINUE with remaining actions:**
-- ✅ CORRECT: Log the failure, note it in your response, and CONTINUE to the next action
-- ✅ CORRECT: If closing position 123 fails, still attempt to close positions 124, 125, 126, etc.
-- ✅ CORRECT: If opening a new position fails, still update stop losses on existing positions
-- ❌ WRONG: Do NOT stop the entire session because one action failed
-- ❌ WRONG: Do NOT give up on all actions if the first one fails
-
-**Failure handling pattern:**
-1. Attempt action using tool call
-2. If tool returns success=False or raises an error, note it in your response
-3. IMMEDIATELY continue to the next action on your list
-4. Complete ALL actions you can successfully execute
-5. Summarize successes and failures at the end
-
-**Example workflow with failures:**
-```
-Action 1: close_position(123) → ✅ Success
-Action 2: close_position(124) → ❌ Failed (position not found)
-Action 3: close_position(125) → ✅ Success (CONTINUE despite previous failure)
-Action 4: update_stop_loss(126) → ✅ Success
-Action 5: open_buy_position("AAPL") → ❌ Failed (insufficient balance)
-Action 6: update_take_profit(127) → ✅ Success (CONTINUE despite previous failure)
-Summary: Executed 4 out of 6 actions successfully. 2 failures noted for review.
-```
-
-**Key principle:** Maximize the number of successful actions completed, even if some fail along the way.
-
-## TOOL USAGE ISSUES
-**If you cannot use a tool due to ambiguity or other issues:**
-- **Explicitly state the problem** in your response
-- Example: "Cannot close position - transaction_id 123 not found in current portfolio"
-- Example: "Cannot open buy position for AAPL - BUY orders are disabled"
-- Example: "Cannot set take profit at $150 - current price $149 does not meet {min_tp_sl_pct}% minimum distance"
-- **Attempt alternative actions** if possible (e.g., if you can't open a position, try closing risky ones instead)
-- **Document the issue** clearly so it can be reviewed
-
-**Remember:** When you want to open a position, you must CALL THE TOOL open_buy_position() or open_sell_position() directly.
-The system will capture your tool calls and execute them. Text descriptions or code examples will NOT be executed.
-
-For EACH action, provide clear reasoning that references your research findings.
-"""
 
 FINALIZATION_PROMPT = """Summarize your risk management session.
 
@@ -1743,10 +1555,15 @@ def initialize_research_agent(state: SmartRiskManagerState) -> Dict[str, Any]:
         # Format expert instructions with newline only if present
         formatted_expert_instructions = f"\n\n{expert_instructions}" if expert_instructions else ""
         
+        # Build current positions summary with VALID transaction IDs prominently displayed
+        open_positions = state.get('open_positions', [])
+        current_positions_summary = _build_positions_summary(open_positions)
+        
         # Use global RESEARCH_PROMPT with dynamic context
         agent_scratchpad_content = state.get('agent_scratchpad', 'No prior context')
         
         research_system_prompt = RESEARCH_PROMPT.format(
+            current_positions_summary=current_positions_summary,
             agent_scratchpad=agent_scratchpad_content,
             expert_instructions=formatted_expert_instructions,
             max_position_pct=max_position_pct,
@@ -2782,10 +2599,15 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
         # Format expert instructions with newline only if present
         formatted_expert_instructions = f"\n\n{expert_instructions}" if expert_instructions else ""
         
+        # Build current positions summary with VALID transaction IDs prominently displayed
+        open_positions = state.get('open_positions', [])
+        current_positions_summary = _build_positions_summary(open_positions)
+        
         # Use global RESEARCH_PROMPT with dynamic context
         agent_scratchpad_content = state.get('agent_scratchpad', 'No prior context')
         
         research_system_prompt = RESEARCH_PROMPT.format(
+            current_positions_summary=current_positions_summary,
             agent_scratchpad=agent_scratchpad_content,
             expert_instructions=formatted_expert_instructions,
             max_position_pct=max_position_pct,
@@ -3861,7 +3683,12 @@ class SmartRiskManagerGraph:
             formatted_expert_instructions = f"\n\n{expert_instructions}" if expert_instructions else ""
             agent_scratchpad_content = state.get('agent_scratchpad', 'No prior context')
             
+            # Build current positions summary with VALID transaction IDs prominently displayed
+            open_positions = state.get('open_positions', [])
+            current_positions_summary = _build_positions_summary(open_positions)
+            
             research_system_prompt = RESEARCH_PROMPT.format(
+                current_positions_summary=current_positions_summary,
                 agent_scratchpad=agent_scratchpad_content,
                 expert_instructions=formatted_expert_instructions,
                 max_position_pct=max_position_pct,
