@@ -452,7 +452,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "display_name": "Kimi K2 Thinking",
         "description": "Moonshot AI's Kimi K2 with thinking capabilities",
         "provider_names": {
-            PROVIDER_MOONSHOT: "kimi-k2-0711-thinking-preview",
+            PROVIDER_MOONSHOT: "kimi-k2-thinking",
             PROVIDER_NAGAAI: "kimi-k2-thinking",
             PROVIDER_OPENROUTER: "moonshot/kimi-k2-thinking",
         },
