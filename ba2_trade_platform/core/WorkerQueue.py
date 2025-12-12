@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from sqlmodel import Session
 from ..logger import logger
 from .db import get_setting, add_instance, update_instance, get_db
-from .models import AppSetting
+from .models import AppSetting, PersistedQueueTask
 from .types import WorkerTaskStatus, AnalysisUseCase
 
 
@@ -263,6 +263,9 @@ class WorkerQueue:
         
         self._queue.put(queue_entry)
         
+        # Persist task for recovery after restart
+        self._persist_task(task, self._queue_counter)
+        
         logger.debug(f"Analysis task '{task_id}' submitted for expert {expert_instance_id}, symbol {symbol}, priority {priority}, batch_id={batch_id}")
         return task_id
     
@@ -320,6 +323,9 @@ class WorkerQueue:
             queue_entry = (priority, self._queue_counter, task)
         
         self._queue.put(queue_entry)
+        
+        # Persist task for recovery after restart
+        self._persist_task(task, self._queue_counter)
         
         logger.info(f"Smart Risk Manager task '{task_id}' submitted for expert {expert_instance_id}, priority {priority}")
         return task_id
@@ -382,6 +388,9 @@ class WorkerQueue:
             queue_entry = (priority, self._queue_counter, task)
         
         self._queue.put(queue_entry)
+        
+        # Persist task for recovery after restart
+        self._persist_task(task, self._queue_counter)
         
         logger.info(f"Instrument expansion task '{task_id}' ({expansion_type}) submitted for expert {expert_instance_id}, priority {priority}, batch_id={batch_id}")
         return task_id
@@ -834,6 +843,9 @@ class WorkerQueue:
         with self._task_lock:
             task.status = WorkerTaskStatus.RUNNING
             task.started_at = time.time()
+        
+        # Update persisted task status
+        self._update_persisted_task_status(task.id, "running", datetime.fromtimestamp(task.started_at, tz=timezone.utc))
             
         try:
             # Import here to avoid circular imports
@@ -1009,6 +1021,10 @@ class WorkerQueue:
                     task_key = task.get_task_key()
                     if task_key in self._task_keys and self._task_keys[task_key] == task.id:
                         del self._task_keys[task_key]
+            
+            # Remove from persistence when task completes or fails
+            if task.status in [WorkerTaskStatus.COMPLETED, WorkerTaskStatus.FAILED]:
+                self._remove_persisted_task(task.id)
     
     def _execute_smart_risk_manager_task(self, task: SmartRiskManagerTask, worker_name: str):
         """Execute a Smart Risk Manager task."""
@@ -1018,6 +1034,9 @@ class WorkerQueue:
         with self._task_lock:
             task.status = WorkerTaskStatus.RUNNING
             task.started_at = time.time()
+        
+        # Update persisted task status
+        self._update_persisted_task_status(task.id, "running", datetime.fromtimestamp(task.started_at, tz=timezone.utc))
         
         job_id = None
         try:
@@ -1174,6 +1193,10 @@ class WorkerQueue:
                     task_key = task.get_task_key()
                     if task_key in self._task_keys and self._task_keys[task_key] == task.id:
                         del self._task_keys[task_key]
+            
+            # Remove from persistence when task completes or fails
+            if task.status in [WorkerTaskStatus.COMPLETED, WorkerTaskStatus.FAILED]:
+                self._remove_persisted_task(task.id)
     
     def _execute_instrument_expansion_task(self, task: InstrumentExpansionTask, worker_name: str):
         """Execute an instrument expansion task (DYNAMIC/EXPERT/OPEN_POSITIONS)."""
@@ -1183,6 +1206,9 @@ class WorkerQueue:
         with self._task_lock:
             task.status = WorkerTaskStatus.RUNNING
             task.started_at = time.time()
+        
+        # Update persisted task status
+        self._update_persisted_task_status(task.id, "running", datetime.fromtimestamp(task.started_at, tz=timezone.utc))
         
         try:
             # Import JobManager to access expansion methods
@@ -1235,6 +1261,10 @@ class WorkerQueue:
                     task_key = task.get_task_key()
                     if task_key in self._task_keys and self._task_keys[task_key] == task.id:
                         del self._task_keys[task_key]
+            
+            # Remove from persistence when task completes or fails
+            if task.status in [WorkerTaskStatus.COMPLETED, WorkerTaskStatus.FAILED]:
+                self._remove_persisted_task(task.id)
     
     def _check_and_process_expert_recommendations(self, expert_instance_id: int, use_case: AnalysisUseCase = AnalysisUseCase.ENTER_MARKET) -> None:
         """
@@ -1543,6 +1573,393 @@ class WorkerQueue:
             logger.error(f"Error checking for open positions for expert {expert_id}: {e}", exc_info=True)
             return False  # Default to False if error occurs
 
+    # ==================== PERSISTENCE METHODS ====================
+    
+    def _persist_task(self, task, queue_counter: int) -> bool:
+        """
+        Persist a task to the database for recovery after restart.
+        
+        Args:
+            task: AnalysisTask, SmartRiskManagerTask, or InstrumentExpansionTask
+            queue_counter: The queue counter value for ordering
+            
+        Returns:
+            True if persisted successfully, False otherwise
+        """
+        try:
+            from sqlmodel import select
+            
+            # Determine task type and extract fields
+            if isinstance(task, SmartRiskManagerTask):
+                task_type = "smart_risk_manager"
+                persisted = PersistedQueueTask(
+                    task_id=task.id,
+                    task_type=task_type,
+                    status=task.status.value if hasattr(task.status, 'value') else str(task.status),
+                    priority=task.priority,
+                    expert_instance_id=task.expert_instance_id,
+                    account_id=task.account_id,
+                    queue_counter=queue_counter
+                )
+            elif isinstance(task, InstrumentExpansionTask):
+                task_type = "instrument_expansion"
+                persisted = PersistedQueueTask(
+                    task_id=task.id,
+                    task_type=task_type,
+                    status=task.status.value if hasattr(task.status, 'value') else str(task.status),
+                    priority=task.priority,
+                    expert_instance_id=task.expert_instance_id,
+                    subtype=task.subtype,
+                    expansion_type=task.expansion_type,
+                    batch_id=task.batch_id,
+                    queue_counter=queue_counter
+                )
+            elif isinstance(task, AnalysisTask):
+                task_type = "analysis"
+                persisted = PersistedQueueTask(
+                    task_id=task.id,
+                    task_type=task_type,
+                    status=task.status.value if hasattr(task.status, 'value') else str(task.status),
+                    priority=task.priority,
+                    expert_instance_id=task.expert_instance_id,
+                    symbol=task.symbol,
+                    subtype=task.subtype,
+                    market_analysis_id=task.market_analysis_id,
+                    batch_id=task.batch_id,
+                    bypass_balance_check=task.bypass_balance_check,
+                    bypass_transaction_check=task.bypass_transaction_check,
+                    queue_counter=queue_counter
+                )
+            else:
+                logger.warning(f"Unknown task type: {type(task)}")
+                return False
+            
+            # Check if task already exists and update, otherwise insert
+            with Session(get_db().bind) as session:
+                existing = session.exec(
+                    select(PersistedQueueTask).where(PersistedQueueTask.task_id == task.id)
+                ).first()
+                
+                if existing:
+                    # Update existing record
+                    existing.status = persisted.status
+                    existing.priority = persisted.priority
+                    existing.queue_counter = queue_counter
+                    session.add(existing)
+                else:
+                    session.add(persisted)
+                    
+                session.commit()
+                
+            logger.debug(f"Persisted task {task.id} (type={task_type})")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to persist task {task.id}: {e}", exc_info=True)
+            return False
+    
+    def _update_persisted_task_status(self, task_id: str, status: str, started_at: datetime = None) -> bool:
+        """
+        Update the status of a persisted task.
+        
+        Args:
+            task_id: The task ID
+            status: New status value
+            started_at: Optional timestamp when task started
+            
+        Returns:
+            True if updated successfully, False otherwise
+        """
+        try:
+            from sqlmodel import select
+            
+            with Session(get_db().bind) as session:
+                persisted = session.exec(
+                    select(PersistedQueueTask).where(PersistedQueueTask.task_id == task_id)
+                ).first()
+                
+                if persisted:
+                    persisted.status = status
+                    if started_at:
+                        persisted.started_at = started_at
+                    session.add(persisted)
+                    session.commit()
+                    logger.debug(f"Updated persisted task {task_id} status to {status}")
+                    return True
+                    
+            return False
+            
+        except Exception as e:
+            logger.error(f"Failed to update persisted task {task_id}: {e}", exc_info=True)
+            return False
+    
+    def _remove_persisted_task(self, task_id: str) -> bool:
+        """
+        Remove a task from persistence (called when task completes or fails).
+        
+        Args:
+            task_id: The task ID to remove
+            
+        Returns:
+            True if removed successfully, False otherwise
+        """
+        try:
+            from sqlmodel import select, delete
+            
+            with Session(get_db().bind) as session:
+                statement = delete(PersistedQueueTask).where(PersistedQueueTask.task_id == task_id)
+                session.exec(statement)
+                session.commit()
+                
+            logger.debug(f"Removed persisted task {task_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to remove persisted task {task_id}: {e}", exc_info=True)
+            return False
+    
+    def save_queue_state(self) -> int:
+        """
+        Save all pending and running tasks to the database.
+        Called on shutdown and periodically for safety.
+        
+        Returns:
+            Number of tasks saved
+        """
+        saved_count = 0
+        try:
+            with self._task_lock:
+                for task_id, task in self._tasks.items():
+                    if task.status in [WorkerTaskStatus.PENDING, WorkerTaskStatus.RUNNING]:
+                        # Get the queue_counter from the task (we'll use _queue_counter as fallback)
+                        queue_counter = getattr(task, '_queue_counter', self._queue_counter)
+                        if self._persist_task(task, queue_counter):
+                            saved_count += 1
+            
+            logger.info(f"Saved {saved_count} queue tasks to database")
+            return saved_count
+            
+        except Exception as e:
+            logger.error(f"Failed to save queue state: {e}", exc_info=True)
+            return saved_count
+    
+    def get_persisted_tasks_count(self) -> Dict[str, int]:
+        """
+        Get counts of persisted tasks by status.
+        
+        Returns:
+            Dict with 'pending', 'running', and 'total' counts
+        """
+        try:
+            from sqlmodel import select, func
+            
+            with Session(get_db().bind) as session:
+                pending_count = session.exec(
+                    select(func.count()).select_from(PersistedQueueTask).where(
+                        PersistedQueueTask.status == "pending"
+                    )
+                ).one()
+                
+                running_count = session.exec(
+                    select(func.count()).select_from(PersistedQueueTask).where(
+                        PersistedQueueTask.status == "running"
+                    )
+                ).one()
+                
+                return {
+                    'pending': pending_count or 0,
+                    'running': running_count or 0,
+                    'total': (pending_count or 0) + (running_count or 0)
+                }
+                
+        except Exception as e:
+            logger.error(f"Failed to get persisted tasks count: {e}", exc_info=True)
+            return {'pending': 0, 'running': 0, 'total': 0}
+    
+    def get_persisted_tasks(self) -> list:
+        """
+        Get all persisted tasks (pending and running).
+        
+        Returns:
+            List of PersistedQueueTask objects
+        """
+        try:
+            from sqlmodel import select
+            
+            with Session(get_db().bind) as session:
+                tasks = session.exec(
+                    select(PersistedQueueTask).where(
+                        PersistedQueueTask.status.in_(["pending", "running"])
+                    ).order_by(PersistedQueueTask.priority, PersistedQueueTask.queue_counter)
+                ).all()
+                
+                # Detach from session to prevent lazy loading issues
+                return [
+                    PersistedQueueTask(
+                        id=t.id,
+                        task_id=t.task_id,
+                        task_type=t.task_type,
+                        status=t.status,
+                        priority=t.priority,
+                        expert_instance_id=t.expert_instance_id,
+                        account_id=t.account_id,
+                        symbol=t.symbol,
+                        subtype=t.subtype,
+                        market_analysis_id=t.market_analysis_id,
+                        batch_id=t.batch_id,
+                        expansion_type=t.expansion_type,
+                        bypass_balance_check=t.bypass_balance_check,
+                        bypass_transaction_check=t.bypass_transaction_check,
+                        created_at=t.created_at,
+                        started_at=t.started_at,
+                        queue_counter=t.queue_counter
+                    )
+                    for t in tasks
+                ]
+                
+        except Exception as e:
+            logger.error(f"Failed to get persisted tasks: {e}", exc_info=True)
+            return []
+    
+    def restore_persisted_tasks(self) -> Dict[str, int]:
+        """
+        Restore persisted tasks to the queue.
+        Previously running tasks are treated as failed and need to be restarted.
+        
+        Returns:
+            Dict with 'restored', 'failed' counts
+        """
+        restored_count = 0
+        failed_count = 0
+        
+        try:
+            persisted_tasks = self.get_persisted_tasks()
+            
+            if not persisted_tasks:
+                logger.info("No persisted tasks to restore")
+                return {'restored': 0, 'failed': 0}
+            
+            logger.info(f"Restoring {len(persisted_tasks)} persisted tasks...")
+            
+            for pt in persisted_tasks:
+                try:
+                    # If task was running, it needs to be restarted (like a failed task)
+                    # For analysis tasks, we clear the market_analysis_id to create a new one
+                    if pt.status == "running":
+                        pt.market_analysis_id = None  # Clear to create fresh analysis
+                    
+                    if pt.task_type == "analysis":
+                        task_id = self.submit_analysis_task(
+                            expert_instance_id=pt.expert_instance_id,
+                            symbol=pt.symbol,
+                            subtype=pt.subtype or AnalysisUseCase.ENTER_MARKET,
+                            priority=pt.priority,
+                            bypass_balance_check=pt.bypass_balance_check,
+                            bypass_transaction_check=pt.bypass_transaction_check,
+                            market_analysis_id=pt.market_analysis_id,
+                            batch_id=pt.batch_id
+                        )
+                        restored_count += 1
+                        logger.debug(f"Restored analysis task {pt.task_id} as {task_id}")
+                        
+                    elif pt.task_type == "smart_risk_manager":
+                        task_id = self.submit_smart_risk_manager_task(
+                            expert_instance_id=pt.expert_instance_id,
+                            account_id=pt.account_id,
+                            priority=pt.priority
+                        )
+                        restored_count += 1
+                        logger.debug(f"Restored smart risk manager task {pt.task_id} as {task_id}")
+                        
+                    elif pt.task_type == "instrument_expansion":
+                        task_id = self.submit_instrument_expansion_task(
+                            expert_instance_id=pt.expert_instance_id,
+                            expansion_type=pt.expansion_type,
+                            subtype=pt.subtype or "ENTER_MARKET",
+                            priority=pt.priority,
+                            batch_id=pt.batch_id
+                        )
+                        restored_count += 1
+                        logger.debug(f"Restored expansion task {pt.task_id} as {task_id}")
+                    
+                    # Remove the old persisted task since we created a new one
+                    self._remove_persisted_task(pt.task_id)
+                    
+                except ValueError as e:
+                    # Task already exists (duplicate), skip and remove persisted entry
+                    logger.debug(f"Skipping duplicate task {pt.task_id}: {e}")
+                    self._remove_persisted_task(pt.task_id)
+                    
+                except Exception as e:
+                    logger.error(f"Failed to restore task {pt.task_id}: {e}", exc_info=True)
+                    failed_count += 1
+            
+            logger.info(f"Restored {restored_count} tasks, {failed_count} failed")
+            return {'restored': restored_count, 'failed': failed_count}
+            
+        except Exception as e:
+            logger.error(f"Failed to restore persisted tasks: {e}", exc_info=True)
+            return {'restored': restored_count, 'failed': failed_count}
+    
+    def clear_persisted_tasks(self) -> int:
+        """
+        Clear all persisted tasks from database.
+        
+        Returns:
+            Number of tasks cleared
+        """
+        try:
+            from sqlmodel import delete
+            
+            with Session(get_db().bind) as session:
+                result = session.exec(delete(PersistedQueueTask))
+                count = result.rowcount
+                session.commit()
+                
+            logger.info(f"Cleared {count} persisted tasks")
+            return count
+            
+        except Exception as e:
+            logger.error(f"Failed to clear persisted tasks: {e}", exc_info=True)
+            return 0
+    
+    def clear_stale_persisted_tasks(self, max_age_hours: int = 24) -> int:
+        """
+        Clear persisted tasks older than the specified age.
+        Called at startup to remove stale tasks that are unlikely to be valid.
+        
+        Args:
+            max_age_hours: Maximum age in hours before a task is considered stale (default 24)
+            
+        Returns:
+            Number of tasks cleared
+        """
+        try:
+            from sqlmodel import delete
+            from datetime import timedelta
+            
+            cutoff_time = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+            
+            with Session(get_db().bind) as session:
+                result = session.exec(
+                    delete(PersistedQueueTask).where(
+                        PersistedQueueTask.created_at < cutoff_time
+                    )
+                )
+                count = result.rowcount
+                session.commit()
+            
+            if count > 0:
+                logger.info(f"Cleared {count} stale persisted tasks older than {max_age_hours} hours")
+            else:
+                logger.debug(f"No stale persisted tasks to clear (max age: {max_age_hours} hours)")
+            
+            return count
+            
+        except Exception as e:
+            logger.error(f"Failed to clear stale persisted tasks: {e}", exc_info=True)
+            return 0
+
 
 # Global worker queue instance
 _worker_queue_instance: Optional[WorkerQueue] = None
@@ -1560,11 +1977,16 @@ def initialize_worker_queue():
     """Initialize and start the global worker queue."""
     worker_queue = get_worker_queue()
     if not worker_queue.is_running():
+        # Clear stale persisted tasks older than 24 hours
+        worker_queue.clear_stale_persisted_tasks(max_age_hours=24)
         worker_queue.start()
         
 
 def shutdown_worker_queue():
-    """Shutdown the global worker queue."""
+    """Shutdown the global worker queue and save pending tasks for later resumption."""
     global _worker_queue_instance
     if _worker_queue_instance and _worker_queue_instance.is_running():
+        # Save queue state before stopping
+        logger.info("Saving queue state before shutdown...")
+        _worker_queue_instance.save_queue_state()
         _worker_queue_instance.stop()

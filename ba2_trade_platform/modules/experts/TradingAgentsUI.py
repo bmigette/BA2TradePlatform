@@ -289,6 +289,47 @@ class TradingAgentsUI:
                 return bool(content)  # For other types, just check truthiness
         return False
     
+    def _extract_text_content(self, content: Any) -> str:
+        """
+        Extract text content from various response formats.
+        
+        Handles:
+        - Plain strings: Returns as-is
+        - List with dict items containing 'text' key (Gemini format): Extracts text from first item
+        - List with dict items containing 'type' and 'text' (structured response): Extracts text
+        - Empty/None: Returns empty string
+        
+        Args:
+            content: The content to extract text from
+            
+        Returns:
+            str: The extracted text content
+        """
+        if content is None:
+            return ''
+        
+        if isinstance(content, str):
+            return content
+        
+        if isinstance(content, list):
+            if not content:
+                return ''
+            # Try to extract text from first item (Gemini structured format)
+            first_item = content[0]
+            if isinstance(first_item, dict):
+                # Handle format: [{"type": "text", "text": "...", "extras": {...}}]
+                if 'text' in first_item:
+                    return str(first_item['text'])
+                # Handle other dict formats
+                return str(first_item)
+            # If list of strings, join them
+            if isinstance(first_item, str):
+                return '\n'.join(str(item) for item in content)
+            return str(content)
+        
+        # Fallback for other types
+        return str(content) if content else ''
+    
     def _render_summary_panel(self) -> None:
         """Render the summary panel with key insights."""
         with ui.card().classes('w-full'):
@@ -337,10 +378,13 @@ class TradingAgentsUI:
             self._render_expert_recommendation()
             
             # Final recommendation if available
-            final_decision = self.trading_state.get('final_trade_decision', '')
-            if final_decision:
+            final_decision_raw = self.trading_state.get('final_trade_decision', '')
+            if final_decision_raw:
                 ui.separator().classes('my-4')
                 ui.label('🎯 Key Recommendation').classes('text-h6 mb-2')
+                
+                # Extract text content (handles both string and Gemini's list format)
+                final_decision = self._extract_text_content(final_decision_raw)
                 
                 # Extract recommendation from final decision
                 lines = final_decision.split('\n')
@@ -385,7 +429,9 @@ class TradingAgentsUI:
     
     def _render_content_panel(self, state_key: str, title: str, description: str) -> None:
         """Render a content panel for text-based analysis results."""
-        content = self.trading_state.get(state_key, '')
+        content_raw = self.trading_state.get(state_key, '')
+        # Extract text content (handles Gemini's list format)
+        content = self._extract_text_content(content_raw)
         
         with ui.card().classes('w-full'):
             ui.label(title).classes('text-h5 mb-2')
@@ -480,8 +526,10 @@ class TradingAgentsUI:
     
     def _render_chat_message(self, speaker: str, message: str, color: str) -> None:
         """Render a single chat message in the debate."""
+        # First extract text content (handles Gemini's list format)
+        content = self._extract_text_content(message)
+        
         # Extract the message content (remove speaker prefix if present)
-        content = message
         if content.startswith(f'{speaker}:'):
             content = content[len(f'{speaker}:'):].strip()
         elif ':' in content and content.split(':', 1)[0].strip().endswith('Analyst'):
@@ -538,7 +586,7 @@ class TradingAgentsUI:
         """Legacy debate panel rendering for backward compatibility."""
         with ui.scroll_area().classes('w-full h-96'):
             # History
-            history = debate_state.get('history', '')
+            history = self._extract_text_content(debate_state.get('history', ''))
             if history:
                 ui.label('📜 Debate History').classes('text-h6 mb-2')
                 if self._looks_like_markdown(history):
@@ -548,7 +596,7 @@ class TradingAgentsUI:
                         ui.html(history, sanitize=False)  # Use html() to preserve formatting
             
             # Current responses
-            current_response = debate_state.get('current_response', '')
+            current_response = self._extract_text_content(debate_state.get('current_response', ''))
             if current_response:
                 ui.label('💬 Current Response').classes('text-h6 mb-2')
                 if self._looks_like_markdown(current_response):
@@ -559,9 +607,9 @@ class TradingAgentsUI:
             
             # Risk-specific responses
             if state_key == 'risk_debate_state':
-                risk_response = debate_state.get('current_risky_response', '')
-                safe_response = debate_state.get('current_safe_response', '')
-                neutral_response = debate_state.get('current_neutral_response', '')
+                risk_response = self._extract_text_content(debate_state.get('current_risky_response', ''))
+                safe_response = self._extract_text_content(debate_state.get('current_safe_response', ''))
+                neutral_response = self._extract_text_content(debate_state.get('current_neutral_response', ''))
                 
                 if risk_response:
                     ui.label('⚠️ Risk Assessment').classes('text-h6 mb-2')

@@ -30,8 +30,13 @@ class JobMonitoringTab:
             'worker_count': None,
             'running_tasks': None,
             'pending_tasks': None,
-            'total_tasks': None
+            'total_tasks': None,
+            'persisted_pending': None,
+            'persisted_running': None
         }
+        # Resume/clear buttons for persisted queue
+        self.resume_button = None
+        self.clear_persisted_button = None
         # Pagination and filtering state
         self.current_page = 1
         self.page_size = 25
@@ -700,6 +705,7 @@ class JobMonitoringTab:
     def _create_queue_status(self):
         """Create worker queue status display with live-updating labels."""
         queue_info = self._get_queue_info()
+        persisted_info = self._get_persisted_queue_info()
         
         with ui.row().classes('w-full'):
             with ui.card().classes('flex-1'):
@@ -711,6 +717,123 @@ class JobMonitoringTab:
                 ui.label('Queue Status')
                 self.queue_status_labels['pending_tasks'] = ui.label(f"Pending: {queue_info['pending_tasks']}")
                 self.queue_status_labels['total_tasks'] = ui.label(f"Total Tasks: {queue_info['total_tasks']}")
+            
+            # Persisted queue resume section
+            with ui.card().classes('flex-1'):
+                ui.label('Saved Queue (from previous session)')
+                self.queue_status_labels['persisted_pending'] = ui.label(f"Saved Pending: {persisted_info['pending']}")
+                self.queue_status_labels['persisted_running'] = ui.label(f"Saved Running: {persisted_info['running']}")
+                
+                # Resume button - only show if there are persisted tasks
+                with ui.row().classes('gap-2 mt-2'):
+                    self.resume_button = ui.button(
+                        'Resume Saved Queue',
+                        on_click=self._on_resume_persisted_queue,
+                        icon='play_arrow'
+                    ).props('color=positive')
+                    
+                    self.clear_persisted_button = ui.button(
+                        'Clear Saved',
+                        on_click=self._on_clear_persisted_queue,
+                        icon='delete'
+                    ).props('color=negative outline')
+                
+                # Update button visibility based on persisted task count
+                self._update_persisted_buttons_visibility(persisted_info['total'])
+    
+    def _get_persisted_queue_info(self) -> dict:
+        """Get info about persisted queue tasks."""
+        try:
+            worker_queue = self._get_worker_queue()
+            return worker_queue.get_persisted_tasks_count()
+        except Exception as e:
+            logger.error(f"Failed to get persisted queue info: {e}")
+            return {'pending': 0, 'running': 0, 'total': 0}
+    
+    def _update_persisted_buttons_visibility(self, total_persisted: int):
+        """Show/hide resume and clear buttons based on persisted task count."""
+        if hasattr(self, 'resume_button') and self.resume_button:
+            if total_persisted > 0:
+                self.resume_button.enable()
+                self.clear_persisted_button.enable()
+            else:
+                self.resume_button.disable()
+                self.clear_persisted_button.disable()
+    
+    async def _on_resume_persisted_queue(self):
+        """Handle resume button click to restore persisted queue tasks."""
+        try:
+            worker_queue = self._get_worker_queue()
+            
+            # Show confirmation dialog
+            with ui.dialog() as confirm_dialog, ui.card():
+                ui.label('Resume Saved Queue?').classes('text-lg font-bold')
+                persisted = worker_queue.get_persisted_tasks_count()
+                ui.label(f"This will restore {persisted['pending']} pending and {persisted['running']} interrupted tasks.")
+                ui.label("Interrupted tasks will be restarted from the beginning.").classes('text-sm text-gray-600')
+                
+                with ui.row().classes('w-full justify-end gap-2 mt-4'):
+                    ui.button('Cancel', on_click=confirm_dialog.close).props('flat')
+                    
+                    async def do_resume():
+                        confirm_dialog.close()
+                        ui.notify('Restoring saved queue...', type='info')
+                        
+                        result = worker_queue.restore_persisted_tasks()
+                        
+                        if result['restored'] > 0:
+                            ui.notify(f"Restored {result['restored']} tasks to queue", type='positive')
+                        else:
+                            ui.notify("No tasks were restored", type='warning')
+                        
+                        if result['failed'] > 0:
+                            ui.notify(f"{result['failed']} tasks failed to restore", type='negative')
+                        
+                        # Refresh the UI
+                        self._invalidate_cache()
+                        await self._async_load_analysis_table()
+                        self._refresh_queued_tasks_table()
+                        self._update_queue_status_display()
+                    
+                    ui.button('Resume', on_click=do_resume).props('color=positive')
+            
+            confirm_dialog.open()
+            
+        except Exception as e:
+            logger.error(f"Failed to resume persisted queue: {e}")
+            ui.notify(f"Error resuming queue: {str(e)}", type='negative')
+    
+    async def _on_clear_persisted_queue(self):
+        """Handle clear button click to remove all persisted queue tasks."""
+        try:
+            worker_queue = self._get_worker_queue()
+            
+            # Show confirmation dialog
+            with ui.dialog() as confirm_dialog, ui.card():
+                ui.label('Clear Saved Queue?').classes('text-lg font-bold')
+                persisted = worker_queue.get_persisted_tasks_count()
+                ui.label(f"This will permanently delete {persisted['total']} saved tasks.")
+                ui.label("This action cannot be undone.").classes('text-sm text-red-600')
+                
+                with ui.row().classes('w-full justify-end gap-2 mt-4'):
+                    ui.button('Cancel', on_click=confirm_dialog.close).props('flat')
+                    
+                    async def do_clear():
+                        confirm_dialog.close()
+                        count = worker_queue.clear_persisted_tasks()
+                        ui.notify(f"Cleared {count} saved tasks", type='positive')
+                        
+                        # Update button visibility
+                        self._update_persisted_buttons_visibility(0)
+                        self._update_queue_status_display()
+                    
+                    ui.button('Clear', on_click=do_clear).props('color=negative')
+            
+            confirm_dialog.open()
+            
+        except Exception as e:
+            logger.error(f"Failed to clear persisted queue: {e}")
+            ui.notify(f"Error clearing queue: {str(e)}", type='negative')
 
     def _create_queued_tasks_table(self):
         """Create table showing in-memory queued tasks from worker queue.
@@ -1318,6 +1441,7 @@ class JobMonitoringTab:
         """Update the queue status display labels with current queue info."""
         try:
             queue_info = self._get_queue_info()
+            persisted_info = self._get_persisted_queue_info()
             
             # Update labels if they exist (they are created in _create_queue_status)
             if self.queue_status_labels['worker_count']:
@@ -1328,6 +1452,15 @@ class JobMonitoringTab:
                 self.queue_status_labels['pending_tasks'].set_text(f"Pending: {queue_info['pending_tasks']}")
             if self.queue_status_labels['total_tasks']:
                 self.queue_status_labels['total_tasks'].set_text(f"Total Tasks: {queue_info['total_tasks']}")
+            
+            # Update persisted queue labels
+            if self.queue_status_labels.get('persisted_pending'):
+                self.queue_status_labels['persisted_pending'].set_text(f"Saved Pending: {persisted_info['pending']}")
+            if self.queue_status_labels.get('persisted_running'):
+                self.queue_status_labels['persisted_running'].set_text(f"Saved Running: {persisted_info['running']}")
+            
+            # Update button visibility
+            self._update_persisted_buttons_visibility(persisted_info['total'])
             
             # Also refresh the queued tasks table
             if hasattr(self, 'queued_tasks_container'):

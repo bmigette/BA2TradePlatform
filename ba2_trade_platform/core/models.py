@@ -647,3 +647,46 @@ class ActivityLog(SQLModel, table=True):
     # Content
     description: str = Field(description="Human-readable description of the activity")
     data: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict, description="Structured data related to the activity (transaction IDs, prices, recommendations, etc.)")
+
+
+class PersistedQueueTask(SQLModel, table=True):
+    """
+    Persists worker queue tasks across app restarts.
+    Tasks are saved when added to the queue and removed when completed/failed.
+    On restart, pending/running tasks can be restored via a manual resume action.
+    """
+    __tablename__ = "persistedqueuetask"
+    
+    id: int | None = Field(default=None, primary_key=True)
+    
+    # Task identification
+    task_id: str = Field(index=True, unique=True, description="Unique task ID from WorkerQueue (e.g., 'analysis_1', 'smart_risk_2')")
+    task_type: str = Field(description="Task type: 'analysis', 'smart_risk_manager', 'instrument_expansion'")
+    
+    # Task state at time of persistence
+    status: str = Field(default="pending", description="Task status: pending, running, completed, failed")
+    priority: int = Field(default=0, description="Task priority (lower = higher priority)")
+    
+    # Expert/account context
+    expert_instance_id: int = Field(foreign_key="expertinstance.id", nullable=False, ondelete="CASCADE")
+    account_id: int | None = Field(default=None, foreign_key="accountdefinition.id", nullable=True, ondelete="CASCADE")
+    
+    # Analysis-specific fields
+    symbol: str | None = Field(default=None, description="Symbol for analysis tasks")
+    subtype: str | None = Field(default=None, description="Analysis use case: ENTER_MARKET, OPEN_POSITIONS")
+    market_analysis_id: int | None = Field(default=None, description="Reference to MarketAnalysis record if created")
+    batch_id: str | None = Field(default=None, description="Batch ID for grouping related tasks")
+    
+    # Expansion task fields
+    expansion_type: str | None = Field(default=None, description="For expansion tasks: DYNAMIC, EXPERT, OPEN_POSITIONS")
+    
+    # Task options
+    bypass_balance_check: bool = Field(default=False, description="Skip balance verification")
+    bypass_transaction_check: bool = Field(default=False, description="Skip existing transaction checks")
+    
+    # Timestamps
+    created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), description="When task was created")
+    started_at: DateTime | None = Field(default=None, description="When task started executing")
+    
+    # Metadata for restoration
+    queue_counter: int = Field(default=0, description="Original queue counter for ordering restoration")
