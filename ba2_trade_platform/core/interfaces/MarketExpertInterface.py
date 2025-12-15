@@ -58,6 +58,10 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "type": "bool", "required": False, "default": False,
                     "description": "Allow sell orders for this expert"
                 },
+                "allow_hedging": {
+                    "type": "bool", "required": False, "default": False,
+                    "description": "Allow opening positions in opposite direction when a position already exists (hedging)"
+                },
                 "allow_automated_trade_opening": {
                     "type": "bool", "required": False, "default": False,
                     "description": "Allow automatic opening of new trading positions"

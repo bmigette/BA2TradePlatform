@@ -1646,6 +1646,8 @@ class ExpertSettingsTab:
                         with ui.row().classes('w-full gap-4'):
                             self.enable_buy_checkbox = ui.checkbox('Enable BUY orders', value=True)
                             self.enable_sell_checkbox = ui.checkbox('Enable SELL orders', value=False)
+                            self.allow_hedging_checkbox = ui.checkbox('Allow hedging', value=False)
+                        ui.label('Hedging allows opening opposite direction positions on same symbol').classes('text-body2 text-grey-7 ml-6')
                         
                         ui.separator().classes('my-4')
                         
@@ -2177,6 +2179,7 @@ class ExpertSettingsTab:
             # Load trading permissions - convert to booleans if they're strings
             enable_buy = settings_source.get('enable_buy', True)  # Default to True
             enable_sell = settings_source.get('enable_sell', False)  # Default to False
+            allow_hedging = settings_source.get('allow_hedging', False)  # Default to False
             
             # Handle legacy automatic_trading setting by splitting it into new settings
             legacy_automatic_trading = settings_source.get('automatic_trading', None)
@@ -2197,6 +2200,8 @@ class ExpertSettingsTab:
                 enable_buy = enable_buy.lower() == 'true'
             if isinstance(enable_sell, str):
                 enable_sell = enable_sell.lower() == 'true'
+            if isinstance(allow_hedging, str):
+                allow_hedging = allow_hedging.lower() == 'true'
             if isinstance(allow_automated_trade_opening, str):
                 allow_automated_trade_opening = allow_automated_trade_opening.lower() == 'true'
             if isinstance(allow_automated_trade_modification, str):
@@ -2206,6 +2211,8 @@ class ExpertSettingsTab:
                 self.enable_buy_checkbox.value = enable_buy
             if hasattr(self, 'enable_sell_checkbox'):
                 self.enable_sell_checkbox.value = enable_sell
+            if hasattr(self, 'allow_hedging_checkbox'):
+                self.allow_hedging_checkbox.value = allow_hedging
             if hasattr(self, 'allow_automated_trade_opening_checkbox'):
                 self.allow_automated_trade_opening_checkbox.value = allow_automated_trade_opening
             if hasattr(self, 'allow_automated_trade_modification_checkbox'):
@@ -3391,7 +3398,9 @@ class ExpertSettingsTab:
             expert.save_setting('enable_sell', self.enable_sell_checkbox.value, setting_type="bool")
             expert.save_setting('allow_automated_trade_opening', self.allow_automated_trade_opening_checkbox.value, setting_type="bool")
             expert.save_setting('allow_automated_trade_modification', self.allow_automated_trade_modification_checkbox.value, setting_type="bool")
-            logger.debug(f'Saved trading permissions: buy={self.enable_buy_checkbox.value}, sell={self.enable_sell_checkbox.value}, auto_open={self.allow_automated_trade_opening_checkbox.value}, auto_modify={self.allow_automated_trade_modification_checkbox.value}')
+            if hasattr(self, 'allow_hedging_checkbox'):
+                expert.save_setting('allow_hedging', self.allow_hedging_checkbox.value, setting_type="bool")
+            logger.debug(f'Saved trading permissions: buy={self.enable_buy_checkbox.value}, sell={self.enable_sell_checkbox.value}, hedging={getattr(self, "allow_hedging_checkbox", None) and self.allow_hedging_checkbox.value}, auto_open={self.allow_automated_trade_opening_checkbox.value}, auto_modify={self.allow_automated_trade_modification_checkbox.value}')
         
         # Save risk management settings
         if hasattr(self, 'max_virtual_equity_per_instrument_input'):

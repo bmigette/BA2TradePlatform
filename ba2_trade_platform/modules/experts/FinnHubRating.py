@@ -59,7 +59,7 @@ class FinnHubRating(MarketExpertInterface):
             }
         }
     
-    def _fetch_recommendation_trends(self, symbol: str) -> Optional[Dict[str, Any]]:
+    def _fetch_recommendation_trends(self, symbol: str) -> list:
         """
         Fetch recommendation trends from Finnhub API.
         
@@ -67,11 +67,13 @@ class FinnHubRating(MarketExpertInterface):
             symbol: Stock symbol to query
             
         Returns:
-            API response data or None if error
+            API response data (list of recommendation periods)
+            
+        Raises:
+            ValueError: If API key not configured or API returns error
         """
         if not self._api_key:
-            self.logger.error("Cannot fetch recommendations: Finnhub API key not configured")
-            return None
+            raise ValueError("Finnhub API key not configured")
         
         try:
             url = "https://finnhub.io/api/v1/stock/recommendation"
@@ -81,20 +83,33 @@ class FinnHubRating(MarketExpertInterface):
             }
             
             self.logger.debug(f"Fetching Finnhub recommendations for {symbol}")
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
+            response = requests.get(url, params=params, timeout=30)
+            
+            # Check for HTTP errors and include response body in error message
+            if response.status_code != 200:
+                try:
+                    error_body = response.json()
+                    error_msg = error_body.get('error', response.text)
+                except:
+                    error_msg = response.text
+                raise ValueError(f"Finnhub API error (HTTP {response.status_code}): {error_msg}")
             
             data = response.json()
+            
+            # Check for API-level errors in response
+            if isinstance(data, dict) and 'error' in data:
+                raise ValueError(f"Finnhub API error: {data['error']}")
+            
             self.logger.debug(f"Received {len(data) if isinstance(data, list) else 0} recommendation periods")
             
             return data
             
+        except requests.exceptions.Timeout:
+            raise ValueError(f"Finnhub API timeout for {symbol} (30s)")
+        except requests.exceptions.ConnectionError as e:
+            raise ValueError(f"Finnhub API connection error for {symbol}: {e}")
         except requests.exceptions.RequestException as e:
-            self.logger.error(f"Failed to fetch Finnhub recommendations for {symbol}: {e}", exc_info=True)
-            return None
-        except Exception as e:
-            self.logger.error(f"Unexpected error fetching recommendations for {symbol}: {e}", exc_info=True)
-            return None
+            raise ValueError(f"Finnhub API request failed for {symbol}: {e}")
     
     def _calculate_recommendation(self, trends_data: list, strong_factor: float) -> Dict[str, Any]:
         """
@@ -320,11 +335,8 @@ Confidence = Dominant Score / Total × 100 = {dominant_score:.1f} / {total_weigh
             # Get strong factor setting
             strong_factor = self.settings.get('strong_factor', 2.0)
             
-            # Fetch recommendation trends from Finnhub
+            # Fetch recommendation trends from Finnhub (raises ValueError on error)
             trends_data = self._fetch_recommendation_trends(symbol)
-            
-            if trends_data is None:
-                raise ValueError("Failed to fetch recommendation trends from Finnhub API")
             
             # Calculate recommendation
             recommendation_data = self._calculate_recommendation(trends_data, strong_factor)

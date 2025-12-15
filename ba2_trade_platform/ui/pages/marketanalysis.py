@@ -3011,9 +3011,18 @@ class ScheduledJobsTab:
         """Start all selected jobs from the scheduled jobs table."""
         try:
             selected = self.scheduled_jobs_table.selected if hasattr(self, 'scheduled_jobs_table') else []
+            
+            logger.debug(f"Selected jobs raw data: {selected}, type: {type(selected)}")
+            
             if not selected:
                 ui.notify("No jobs selected", type='warning')
                 return
+            
+            # Ensure selected is a list
+            if not isinstance(selected, list):
+                selected = [selected]
+            
+            logger.info(f"Starting {len(selected)} selected jobs")
             
             from ...core.JobManager import get_job_manager
             job_manager = get_job_manager()
@@ -3026,9 +3035,34 @@ class ScheduledJobsTab:
             # Submit each selected job
             for job in selected:
                 try:
-                    expert_instance_id = int(job['expert_instance_id'])
-                    symbol = str(job['symbol'])
-                    subtype = str(job['subtype'])
+                    logger.debug(f"Processing job: {job}, type: {type(job)}")
+                    
+                    # Handle both dict format (full row data) and string format (row key only)
+                    if isinstance(job, dict):
+                        expert_instance_id = int(job['expert_instance_id'])
+                        symbol = str(job['symbol'])
+                        subtype = str(job['subtype'])
+                    elif isinstance(job, str):
+                        # If we only got row keys, we need to look up from table rows
+                        # Find the row in the table data
+                        matching_row = None
+                        for row in self.scheduled_jobs_table.rows:
+                            if row.get('id') == job:
+                                matching_row = row
+                                break
+                        
+                        if not matching_row:
+                            logger.warning(f"Could not find row data for key: {job}")
+                            failed_submissions += 1
+                            continue
+                        
+                        expert_instance_id = int(matching_row['expert_instance_id'])
+                        symbol = str(matching_row['symbol'])
+                        subtype = str(matching_row['subtype'])
+                    else:
+                        logger.warning(f"Unexpected job data type: {type(job)}")
+                        failed_submissions += 1
+                        continue
                     
                     success = job_manager.submit_market_analysis(
                         expert_instance_id,

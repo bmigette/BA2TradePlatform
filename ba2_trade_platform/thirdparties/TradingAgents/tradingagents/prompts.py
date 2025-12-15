@@ -4,7 +4,8 @@ TradingAgents Prompts Library
 This file contains all prompts used by the TradingAgents framework.
 All prompts support variable substitution using Python's str.format() method.
 """
-
+import logging
+logger = logging.getLogger(__name__)
 # =============================================================================
 # ANALYST PROMPTS
 # =============================================================================
@@ -417,7 +418,7 @@ def format_analyst_prompt(system_prompt: str, tool_names: list, current_date: st
         timeframe=timeframe
     )
     
-    return {
+    result = {
         "system": formatted_system,
         "system_message": system_prompt,
         "tool_names": ", ".join(tool_names),
@@ -425,33 +426,49 @@ def format_analyst_prompt(system_prompt: str, tool_names: list, current_date: st
         "ticker": ticker,
         "timeframe": timeframe
     }
+    
+    logger.debug(f"\n------------------\nANALYST PROMPT\n-----------------------\n{formatted_system}")
+    
+    return result
 
 def format_bull_researcher_prompt(**kwargs) -> str:
     """Format bull researcher prompt with provided variables"""
-    return BULL_RESEARCHER_PROMPT.format(**kwargs)
+    result = BULL_RESEARCHER_PROMPT.format(**kwargs)
+    logger.debug(f"\n------------------\nBULL RESEARCHER PROMPT\n-----------------------\n{result}")
+    return result
 
 def format_bear_researcher_prompt(**kwargs) -> str:
     """Format bear researcher prompt with provided variables"""
-    return BEAR_RESEARCHER_PROMPT.format(**kwargs)
+    result = BEAR_RESEARCHER_PROMPT.format(**kwargs)
+    logger.debug(f"\n------------------\nBEAR RESEARCHER PROMPT\n-----------------------\n{result}")
+    return result
 
 def format_research_manager_prompt(**kwargs) -> str:
     """Format research manager prompt with provided variables"""
-    return RESEARCH_MANAGER_PROMPT.format(**kwargs)
+    result = RESEARCH_MANAGER_PROMPT.format(**kwargs)
+    logger.debug(f"\n------------------\nRESEARCH MANAGER PROMPT\n-----------------------\n{result}")
+    return result
 
 def format_risk_manager_prompt(**kwargs) -> str:
     """Format risk manager prompt with provided variables"""
-    return RISK_MANAGER_PROMPT.format(**kwargs)
+    result = RISK_MANAGER_PROMPT.format(**kwargs)
+    logger.debug(f"\n------------------\nRISK MANAGER PROMPT\n-----------------------\n{result}")
+    return result
 
 def format_trader_context_prompt(company_name: str, investment_plan: str) -> str:
     """Format trader context prompt"""
-    return TRADER_CONTEXT_PROMPT.format(
+    result = TRADER_CONTEXT_PROMPT.format(
         company_name=company_name,
         investment_plan=investment_plan
     )
+    logger.debug(f"\n------------------\nTRADER CONTEXT PROMPT\n-----------------------\n{result}")
+    return result
 
 def format_trader_system_prompt(past_memory_str: str) -> str:
     """Format trader system prompt"""
-    return TRADER_SYSTEM_PROMPT.format(past_memory_str=past_memory_str)
+    result = TRADER_SYSTEM_PROMPT.format(past_memory_str=past_memory_str)
+    logger.debug(f"\n------------------\nTRADER SYSTEM PROMPT\n-----------------------\n{result}")
+    return result
 
 # =============================================================================
 # PROMPT REGISTRY

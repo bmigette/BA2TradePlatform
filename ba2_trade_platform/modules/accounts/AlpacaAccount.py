@@ -148,6 +148,7 @@ class AlpacaAccount(AccountInterface):
             float: Rounded price
         """
         if price is None:
+            logger.warning(f"_round_price_for_alpaca received None price" + (f" for {symbol}" if symbol else ""))
             return None
         
         # For stocks >= $1, round to 2 decimal places (penny increments)
@@ -574,7 +575,7 @@ class AlpacaAccount(AccountInterface):
             # Extract OCO leg broker IDs from the legs array (if present in response)
             if hasattr(order, 'legs') and order.legs:
                 legs_broker_ids = [str(leg.id) for leg in order.legs if hasattr(leg, 'id') and leg.id]
-                logger.debug(f"OCO order {getattr(order, 'id', 'unknown')} has {len(legs_broker_ids)} legs: {legs_broker_ids}")
+                #logger.debug(f"OCO order {getattr(order, 'id', 'unknown')} has {len(legs_broker_ids)} legs: {legs_broker_ids}")
         else:
             pass
             #logger.debug(f"Order {getattr(order, 'id', 'unknown')}: order_class check - has attr: {hasattr(order, 'order_class')}, value: {order_class_val}, str: {str(order_class_val).lower() if order_class_val else 'none'}, is oco: {is_oco}")

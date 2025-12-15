@@ -612,6 +612,33 @@ class SmartRiskManagerToolkit:
                     except Exception:
                         pass
                     
+                    # Get price at analysis time from ExpertRecommendation
+                    price_at_analysis = None
+                    try:
+                        from .models import ExpertRecommendation
+                        recommendation = session.exec(
+                            select(ExpertRecommendation)
+                            .where(ExpertRecommendation.market_analysis_id == analysis.id)
+                            .limit(1)
+                        ).first()
+                        if recommendation and recommendation.price_at_date:
+                            price_at_analysis = recommendation.price_at_date
+                    except Exception as e:
+                        logger.debug(f"Could not get price_at_date for analysis {analysis.id}: {e}")
+                    
+                    # Calculate price delta if we have the analysis price
+                    price_delta_usd = None
+                    price_delta_pct = None
+                    current_price = None
+                    if price_at_analysis:
+                        try:
+                            current_price = self.account.get_instrument_current_price(analysis.symbol)
+                            if current_price:
+                                price_delta_usd = round(current_price - price_at_analysis, 2)
+                                price_delta_pct = round(((current_price - price_at_analysis) / price_at_analysis) * 100, 2)
+                        except Exception as e:
+                            logger.debug(f"Could not calculate price delta for {analysis.symbol}: {e}")
+                    
                     results.append({
                         "analysis_id": analysis.id,
                         "symbol": analysis.symbol,
@@ -620,7 +647,11 @@ class SmartRiskManagerToolkit:
                         "expert_name": expert_name,
                         "expert_instance_id": analysis.expert_instance_id,
                         "status": analysis.status.value if hasattr(analysis.status, 'value') else str(analysis.status),
-                        "summary": summary
+                        "summary": summary,
+                        "price_at_analysis": price_at_analysis,
+                        "current_price": current_price,
+                        "price_delta_usd": price_delta_usd,
+                        "price_delta_pct": price_delta_pct
                     })
                 
                 # Sort results by timestamp DESC
@@ -974,6 +1005,33 @@ class SmartRiskManagerToolkit:
                     except Exception:
                         pass
                     
+                    # Get price at analysis time from ExpertRecommendation
+                    price_at_analysis = None
+                    try:
+                        from .models import ExpertRecommendation
+                        recommendation = session.exec(
+                            select(ExpertRecommendation)
+                            .where(ExpertRecommendation.market_analysis_id == analysis.id)
+                            .limit(1)
+                        ).first()
+                        if recommendation and recommendation.price_at_date:
+                            price_at_analysis = recommendation.price_at_date
+                    except Exception as e:
+                        logger.debug(f"Could not get price_at_date for analysis {analysis.id}: {e}")
+                    
+                    # Calculate price delta if we have the analysis price
+                    price_delta_usd = None
+                    price_delta_pct = None
+                    current_price = None
+                    if price_at_analysis:
+                        try:
+                            current_price = self.account.get_instrument_current_price(analysis.symbol)
+                            if current_price:
+                                price_delta_usd = round(current_price - price_at_analysis, 2)
+                                price_delta_pct = round(((current_price - price_at_analysis) / price_at_analysis) * 100, 2)
+                        except Exception as e:
+                            logger.debug(f"Could not calculate price delta for {analysis.symbol}: {e}")
+                    
                     results.append({
                         "analysis_id": analysis.id,
                         "symbol": analysis.symbol,
@@ -982,7 +1040,11 @@ class SmartRiskManagerToolkit:
                         "expert_name": expert_name,
                         "expert_instance_id": analysis.expert_instance_id,
                         "status": analysis.status.value if hasattr(analysis.status, 'value') else str(analysis.status),
-                        "summary": summary
+                        "summary": summary,
+                        "price_at_analysis": price_at_analysis,
+                        "current_price": current_price,
+                        "price_delta_usd": price_delta_usd,
+                        "price_delta_pct": price_delta_pct
                     })
                 
                 logger.debug(f"Found {len(results)} completed historical analyses")
@@ -1879,16 +1941,20 @@ class SmartRiskManagerToolkit:
                             "direction": direction
                         }
                     else:
-                        # Opposite direction - reject
-                        return {
-                            "success": False,
-                            "message": f"Cannot open {direction} position: An open {existing_direction.value} position already exists for {symbol} (transaction_id={existing_transaction.id}). Cannot have both BUY and SELL positions on the same symbol. Close the existing position first if you want to reverse direction.",
-                            "transaction_id": existing_transaction.id,
-                            "order_id": None,
-                        "symbol": symbol,
-                        "quantity": quantity,
-                        "direction": direction
-                    }
+                        # Opposite direction - check if hedging is allowed
+                        allow_hedging = self.expert.get_setting_with_interface_default("allow_hedging")
+                        if not allow_hedging:
+                            return {
+                                "success": False,
+                                "message": f"Cannot open {direction} position: An open {existing_direction.value} position already exists for {symbol} (transaction_id={existing_transaction.id}). Hedging is disabled. Enable 'Allow hedging' in expert settings or close the existing position first.",
+                                "transaction_id": existing_transaction.id,
+                                "order_id": None,
+                                "symbol": symbol,
+                                "quantity": quantity,
+                                "direction": direction
+                            }
+                        # Hedging is allowed - continue with position opening
+                        self.logger.info(f"Hedging enabled: Opening {direction} position while {existing_direction.value} position exists for {symbol}")
             
             # Check if symbol is enabled in expert settings
             # Skip check for dynamic/expert instrument selection modes

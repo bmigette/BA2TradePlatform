@@ -673,22 +673,24 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                             logger.error(f"Analysis {self.market_analysis_id} marked as FAILED, stopping graph execution")
                             raise Exception("Analysis failed due to critical tool error - stopping graph execution")
                     
+                    # ALWAYS update accumulated state with chunk data
+                    # This is critical - some nodes (like Final Summarization) may not add messages
+                    # but still update important state keys like expert_recommendation
+                    accumulated_state.update(chunk)
+                    step_count += 1
+                    
                     # Get current message count in this chunk
                     current_message_count = len(chunk.get("messages", []))
                     
-                    # Only log NEW messages (messages we haven't logged yet)
+                    # Log NEW messages (messages we haven't logged yet)
                     if current_message_count > logged_message_count:
                         # Log all new messages since last chunk
                         for msg in chunk["messages"][logged_message_count:]:
                             self._log_message(msg)
                         logged_message_count = current_message_count
                         trace.append(chunk)
-                        step_count += 1
                         
-                        # Update accumulated state with chunk data
-                        accumulated_state.update(chunk)
-                        
-                        # Sync state after each step in debug mode
+                        # Sync state after each step with new messages in debug mode
                         self._sync_state_to_market_analysis(accumulated_state, f"debug_step_{step_count}")
 
                 final_state = accumulated_state  # Use accumulated state instead of just the last chunk
