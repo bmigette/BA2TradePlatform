@@ -277,8 +277,11 @@ class AccountInterface(ExtendableSettingsInterface):
         # Handle transaction requirements based on order type
         self._handle_transaction_requirements(trading_order)
         
-        # Sync quantity with parent order if this is a dependent order
-        if trading_order.depends_on_order is not None:
+        # Sync quantity with parent order ONLY for TP/SL orders (not for partial close orders)
+        # TP/SL orders should match their parent's quantity to close the full position
+        # Partial close orders have their own independent quantity
+        if (trading_order.depends_on_order is not None and 
+            trading_order.order_type in [OrderType.SELL_LIMIT, OrderType.BUY_LIMIT, OrderType.SELL_STOP, OrderType.BUY_STOP]):
             try:
                 parent_order = get_instance(TradingOrder, trading_order.depends_on_order)
                 if parent_order and parent_order.quantity:
@@ -286,17 +289,17 @@ class AccountInterface(ExtendableSettingsInterface):
                         old_qty = trading_order.quantity
                         trading_order.quantity = parent_order.quantity
                         logger.info(
-                            f"Synced dependent order quantity with parent: "
+                            f"Synced TP/SL order quantity with parent: "
                             f"order {trading_order.id or 'new'} qty {old_qty} → {parent_order.quantity} "
                             f"(parent order {parent_order.id})"
                         )
                 else:
                     logger.warning(
                         f"Parent order {trading_order.depends_on_order} not found or has no quantity "
-                        f"for dependent order {trading_order.id or 'new'}"
+                        f"for TP/SL order {trading_order.id or 'new'}"
                     )
             except Exception as e:
-                logger.error(f"Error syncing quantity with parent order: {e}", exc_info=True)
+                logger.error(f"Error syncing TP/SL quantity with parent order: {e}", exc_info=True)
         
         # Generate tracking comment and set account_id BEFORE saving to DB
         tracking_comment = self._generate_tracking_comment(trading_order)

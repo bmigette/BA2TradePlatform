@@ -172,18 +172,7 @@ class TradeManager:
                     
                     self.logger.debug(f"Checking dependent order {dependent_order.id}: parent order {parent_order_id} status is {current_status}, trigger status is {trigger_status}")
                     
-                    # Check if parent order is in a terminal status
-                    terminal_statuses = OrderStatus.get_terminal_statuses()
-                    if current_status in terminal_statuses:
-                        # If parent is in terminal state, sync the dependent order to the same terminal status
-                        self.logger.warning(
-                            f"Parent order {parent_order_id} is in terminal status {current_status}. "
-                            f"Syncing dependent order {dependent_order.id} from WAITING_TRIGGER to {current_status}"
-                        )
-                        status_updates[dependent_order.id] = current_status
-                        continue
-                    
-                    # Check if parent order has reached the trigger status
+                    # Check if parent order has reached the trigger status (check BEFORE terminal status check)
                     if current_status == trigger_status:
                         self.logger.info(f"Order {parent_order_id} is in status {trigger_status}, triggering dependent order {dependent_order.id}")
                         
@@ -233,6 +222,17 @@ class TradeManager:
                             'account_def': account_def,
                         }
                         orders_to_submit.append((dependent_order, parent_order_id))
+                    else:
+                        # Parent hasn't reached trigger status yet
+                        # Check if parent is in a different terminal status - if so, cancel dependent order
+                        terminal_statuses = OrderStatus.get_terminal_statuses()
+                        if current_status in terminal_statuses:
+                            self.logger.warning(
+                                f"Parent order {parent_order_id} is in terminal status {current_status} "
+                                f"(but dependent order {dependent_order.id} was waiting for {trigger_status}). "
+                                f"Syncing dependent order to CANCELED"
+                            )
+                            status_updates[dependent_order.id] = OrderStatus.CANCELED
                 
                 # PHASE 1 COMPLETE: Session is still open, now apply any status-only updates
                 for order_id, new_status in status_updates.items():
@@ -352,18 +352,7 @@ class TradeManager:
                         
                         self.logger.debug(f"Checking order {dependent_order.id}: parent {parent_order_id} status is {current_status}, trigger is {trigger_status}")
                         
-                        # Check if parent order is in a terminal status
-                        terminal_statuses = OrderStatus.get_terminal_statuses()
-                        if current_status in terminal_statuses:
-                            # If parent is in terminal state, sync the dependent order to the same terminal status
-                            self.logger.warning(
-                                f"Parent order {parent_order_id} is in terminal status {current_status}. "
-                                f"Syncing dependent order {dependent_order.id} from WAITING_TRIGGER to {current_status}"
-                            )
-                            status_updates[dependent_order.id] = current_status
-                            continue
-                        
-                        # Check if parent order has reached the trigger status
+                        # Check if parent order has reached the trigger status (check BEFORE terminal status check)
                         if current_status == trigger_status:
                             self.logger.info(f"Parent order {parent_order_id} is in trigger status {trigger_status}, processing dependent order {dependent_order.id}")
                             
@@ -496,6 +485,17 @@ class TradeManager:
                             
                             # Add to submit list
                             orders_to_submit.append((dependent_order, parent_order_id))
+                        else:
+                            # Parent hasn't reached trigger status yet
+                            # Check if parent is in a different terminal status - if so, cancel dependent order
+                            terminal_statuses = OrderStatus.get_terminal_statuses()
+                            if current_status in terminal_statuses:
+                                self.logger.warning(
+                                    f"Parent order {parent_order_id} is in terminal status {current_status} "
+                                    f"(but dependent order {dependent_order.id} was waiting for {trigger_status}). "
+                                    f"Syncing dependent order to CANCELED"
+                                )
+                                status_updates[dependent_order.id] = OrderStatus.CANCELED
                     
                     except Exception as order_error:
                         self.logger.error(f"Error processing waiting order {dependent_order.id}: {order_error}", exc_info=True)
