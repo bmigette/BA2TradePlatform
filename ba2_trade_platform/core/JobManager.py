@@ -816,6 +816,18 @@ class JobManager:
                 logger.warning(f"AI selection returned no instruments for expert {expert_instance_id}")
                 return
             
+            # Filter out symbols not supported by the broker
+            from .utils import get_account_instance_from_id
+            account = get_account_instance_from_id(expert.account_id)
+            if account:
+                selected_instruments = account.filter_supported_symbols(
+                    selected_instruments,
+                    log_prefix=f"AIInstrumentSelector-{expert_instance_id}"
+                )
+                if not selected_instruments:
+                    logger.warning(f"No supported symbols remain after broker filter for expert {expert_instance_id}")
+                    return
+            
             # Ensure symbols are unique and limited by max_instruments setting
             # Use get_setting_safe to handle None values stored in settings dict
             from .utils import get_setting_safe

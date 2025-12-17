@@ -33,8 +33,10 @@ Here is the current conversation history: {history} Here are the last arguments 
 Engage actively by addressing any specific concerns raised, refuting the weaknesses in their logic, and asserting the benefits of risk-taking to outpace market norms. Maintain a focus on debating and persuading, not just presenting data. Challenge each counterpoint to underscore why a high-risk approach is optimal. Output conversationally as if you are speaking without any special formatting."""
 
         response = llm.invoke(prompt)
-
-        argument = f"Risky Analyst: {response.content}"
+        
+        from ba2_trade_platform.core.utils import extract_text_from_llm_response
+        response_text = extract_text_from_llm_response(response.content)
+        argument = f"Risky Analyst: {response_text}"
 
         # Store risky messages as a list for proper conversation display
         risky_messages = risk_debate_state.get("risky_messages", [])

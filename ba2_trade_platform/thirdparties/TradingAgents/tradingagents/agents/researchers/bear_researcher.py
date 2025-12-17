@@ -39,8 +39,10 @@ def create_bear_researcher(llm, memory):
         )
 
         response = llm.invoke(prompt)
-
-        argument = f"Bear Analyst: {response.content}"
+        
+        from ba2_trade_platform.core.utils import extract_text_from_llm_response
+        response_text = extract_text_from_llm_response(response.content)
+        argument = f"Bear Analyst: {response_text}"
 
         # Store bear messages as a list for proper conversation display
         bear_messages = investment_debate_state.get("bear_messages", [])

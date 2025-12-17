@@ -30,9 +30,12 @@ def create_risk_manager(llm, memory):
         )
 
         response = llm.invoke(prompt)
+        
+        from ba2_trade_platform.core.utils import extract_text_from_llm_response
+        response_text = extract_text_from_llm_response(response.content)
 
         new_risk_debate_state = {
-            "judge_decision": response.content,
+            "judge_decision": response_text,
             "history": risk_debate_state["history"],
             "risky_history": risk_debate_state["risky_history"],
             "safe_history": risk_debate_state["safe_history"],
@@ -46,7 +49,7 @@ def create_risk_manager(llm, memory):
 
         return {
             "risk_debate_state": new_risk_debate_state,
-            "final_trade_decision": response.content,
+            "final_trade_decision": response_text,
         }
 
     return risk_manager_node

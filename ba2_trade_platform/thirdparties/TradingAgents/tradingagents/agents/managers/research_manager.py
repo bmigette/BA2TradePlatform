@@ -3,6 +3,7 @@ import json
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 import time
 from ...prompts import format_research_manager_prompt
+from ba2_trade_platform.core.utils import extract_text_from_llm_response
 
 
 def create_research_manager(llm, memory):
@@ -27,19 +28,22 @@ def create_research_manager(llm, memory):
             history=history
         )
         response = llm.invoke(prompt)
+        
+        # Extract text from response (handles Gemini's list format)
+        response_text = extract_text_from_llm_response(response.content)
 
         new_investment_debate_state = {
-            "judge_decision": response.content,
+            "judge_decision": response_text,
             "history": investment_debate_state.get("history", ""),
             "bear_history": investment_debate_state.get("bear_history", ""),
             "bull_history": investment_debate_state.get("bull_history", ""),
-            "current_response": response.content,
+            "current_response": response_text,
             "count": investment_debate_state["count"],
         }
 
         return {
             "investment_debate_state": new_investment_debate_state,
-            "investment_plan": response.content,
+            "investment_plan": response_text,
         }
 
     return research_manager_node

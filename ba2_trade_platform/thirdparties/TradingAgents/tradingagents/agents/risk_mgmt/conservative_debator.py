@@ -34,8 +34,10 @@ Here is the current conversation history: {history} Here is the last response fr
 Engage by questioning their optimism and emphasizing the potential downsides they may have overlooked. Address each of their counterpoints to showcase why a conservative stance is ultimately the safest path for the firm's assets. Focus on debating and critiquing their arguments to demonstrate the strength of a low-risk strategy over their approaches. Output conversationally as if you are speaking without any special formatting."""
 
         response = llm.invoke(prompt)
-
-        argument = f"Safe Analyst: {response.content}"
+        
+        from ba2_trade_platform.core.utils import extract_text_from_llm_response
+        response_text = extract_text_from_llm_response(response.content)
+        argument = f"Safe Analyst: {response_text}"
 
         # Store safe messages as a list for proper conversation display
         safe_messages = risk_debate_state.get("safe_messages", [])

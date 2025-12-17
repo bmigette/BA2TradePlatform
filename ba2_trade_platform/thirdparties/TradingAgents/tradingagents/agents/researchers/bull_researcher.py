@@ -39,8 +39,10 @@ def create_bull_researcher(llm, memory):
         )
 
         response = llm.invoke(prompt)
-
-        argument = f"Bull Analyst: {response.content}"
+        
+        from ba2_trade_platform.core.utils import extract_text_from_llm_response
+        response_text = extract_text_from_llm_response(response.content)
+        argument = f"Bull Analyst: {response_text}"
 
         # Store bull messages as a list for proper conversation display
         bull_messages = investment_debate_state.get("bull_messages", [])

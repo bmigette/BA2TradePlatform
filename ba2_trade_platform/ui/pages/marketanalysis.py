@@ -931,12 +931,13 @@ class JobMonitoringTab:
                 elif hasattr(task, 'job_id') or 'smart_risk' in str(getattr(task, 'id', '')).lower():
                     task_type = 'Smart Risk'
                 
-                # Format created timestamp
+                # Format created timestamp (convert UTC to local time for display)
                 created_at = getattr(task, 'created_at', None)
                 if created_at:
                     try:
+                        from ...core.date_utils import format_for_display
                         created_dt = datetime.fromtimestamp(created_at, tz=timezone.utc)
-                        created_at_display = created_dt.strftime('%Y-%m-%d %H:%M:%S')
+                        created_at_display = format_for_display(created_dt)
                     except:
                         created_at_display = 'Unknown'
                 else:

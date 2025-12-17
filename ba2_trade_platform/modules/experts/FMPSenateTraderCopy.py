@@ -1011,6 +1011,20 @@ Recommendations Generated:"""
             
             self.logger.info(f"Found copy trades for {len(trades_by_symbol)} symbols: {sorted(trades_by_symbol.keys())}")
             
+            # Filter out symbols not supported by the broker
+            from ...core.utils import get_account_instance_from_id
+            expert_instance = get_instance(ExpertInstance, self.id)
+            if expert_instance:
+                account = get_account_instance_from_id(expert_instance.account_id)
+                if account:
+                    supported_symbols = account.filter_supported_symbols(
+                        list(trades_by_symbol.keys()), 
+                        log_prefix=f"FMPSenateTraderCopy-{self.id}"
+                    )
+                    # Keep only supported symbols in trades_by_symbol
+                    trades_by_symbol = {s: trades_by_symbol[s] for s in supported_symbols if s in trades_by_symbol}
+                    self.logger.info(f"After filtering: {len(trades_by_symbol)} supported symbols")
+            
             # Create recommendations for each symbol
             recommendation_ids = []
             symbol_recommendations = {}

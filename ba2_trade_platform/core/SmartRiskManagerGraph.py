@@ -486,6 +486,7 @@ SYSTEM_INITIALIZATION_PROMPT = """You are the Smart Risk Manager, an AI assistan
 **CRITICAL - Know Your Boundaries:**
 - **BUY orders:** {buy_status}
 - **SELL orders:** {sell_status}
+- **Hedging (opposite positions on same symbol):** {hedging_status}
 - **Automated trading:** {auto_trading_status}
 
 {trading_focus_guidance}
@@ -1078,6 +1079,7 @@ def initialize_context(state: SmartRiskManagerState) -> Dict[str, Any]:
         # Prepare trading permission status messages
         enable_buy = expert_config.get("enable_buy")  # Already fetched with interface defaults above
         enable_sell = expert_config.get("enable_sell")  # Already fetched with interface defaults above
+        allow_hedging = expert.get_setting_with_interface_default("allow_hedging")
         auto_trade_opening = expert.get_setting_with_interface_default("allow_automated_trade_opening")
         auto_trade_modification = expert.get_setting_with_interface_default("allow_automated_trade_modification")
         auto_trading = auto_trade_opening and auto_trade_modification
@@ -1085,18 +1087,21 @@ def initialize_context(state: SmartRiskManagerState) -> Dict[str, Any]:
         buy_status = "✅ ENABLED" if enable_buy else "❌ DISABLED"
         sell_status = "✅ ENABLED" if enable_sell else "❌ DISABLED"
         auto_trading_status = "✅ ENABLED" if auto_trading else "❌ DISABLED"
+        hedging_status = "✅ ALLOWED" if allow_hedging else "❌ NOT ALLOWED"
         
         # Generate focused guidance based on permissions
         # Note: auto_trade_modification allows closing/modifying existing positions regardless of enable_buy/enable_sell
         # enable_buy/enable_sell only affect NEW position opening when auto_trade_opening is True
+        hedging_note = " Note: Hedging is disabled - you cannot open positions in the opposite direction on symbols where you already have positions." if not allow_hedging else ""
+        
         if auto_trade_modification and auto_trade_opening:
             # Full automation enabled
             if enable_buy and enable_sell:
-                trading_focus_guidance = "**Your Focus:** Full automation enabled. You can open new positions (both BUY and SELL), close existing positions, and modify them. Manage the full portfolio lifecycle."
+                trading_focus_guidance = f"**Your Focus:** Full automation enabled. You can open new positions (both BUY and SELL), close existing positions, and modify them. Manage the full portfolio lifecycle.{hedging_note}"
             elif enable_buy:
-                trading_focus_guidance = "**Your Focus:** You can open new LONG positions (BUY only), close any existing positions, and modify them. Focus on long entry opportunities and managing all positions."
+                trading_focus_guidance = f"**Your Focus:** You can open new LONG positions (BUY only), close any existing positions, and modify them. Focus on long entry opportunities and managing all positions.{hedging_note}"
             elif enable_sell:
-                trading_focus_guidance = "**Your Focus:** You can open new SHORT positions (SELL only), close any existing positions, and modify them. Focus on short entry opportunities and managing all positions."
+                trading_focus_guidance = f"**Your Focus:** You can open new SHORT positions (SELL only), close any existing positions, and modify them. Focus on short entry opportunities and managing all positions.{hedging_note}"
             else:
                 trading_focus_guidance = "**Your Focus:** You can close and modify existing positions, but cannot open new ones (both BUY and SELL disabled). Focus on managing existing positions only."
         elif auto_trade_modification:
@@ -1105,11 +1110,11 @@ def initialize_context(state: SmartRiskManagerState) -> Dict[str, Any]:
         elif auto_trade_opening:
             # Can open new positions but not modify existing ones
             if enable_buy and enable_sell:
-                trading_focus_guidance = "**Your Focus:** You can open new positions (both BUY and SELL), but cannot close or modify existing ones. Focus on new entry opportunities only."
+                trading_focus_guidance = f"**Your Focus:** You can open new positions (both BUY and SELL), but cannot close or modify existing ones. Focus on new entry opportunities only.{hedging_note}"
             elif enable_buy:
-                trading_focus_guidance = "**Your Focus:** You can open new LONG positions (BUY only), but cannot close or modify existing ones. Focus on long entry opportunities only."
+                trading_focus_guidance = f"**Your Focus:** You can open new LONG positions (BUY only), but cannot close or modify existing ones. Focus on long entry opportunities only.{hedging_note}"
             elif enable_sell:
-                trading_focus_guidance = "**Your Focus:** You can open new SHORT positions (SELL only), but cannot close or modify existing ones. Focus on short entry opportunities only."
+                trading_focus_guidance = f"**Your Focus:** You can open new SHORT positions (SELL only), but cannot close or modify existing ones. Focus on short entry opportunities only.{hedging_note}"
             else:
                 trading_focus_guidance = "**Your Focus:** Both BUY and SELL are disabled. You cannot perform any trading actions. Focus on analysis only."
         else:
@@ -1121,6 +1126,7 @@ def initialize_context(state: SmartRiskManagerState) -> Dict[str, Any]:
             user_instructions=user_instructions,
             buy_status=buy_status,
             sell_status=sell_status,
+            hedging_status=hedging_status,
             auto_trading_status=auto_trading_status,
             trading_focus_guidance=trading_focus_guidance
         ))
@@ -2690,7 +2696,8 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             # Check if research is complete
             if not response.tool_calls:
                 logger.info("Research agent finished without tool calls")
-                final_summary = response.content
+                from ..core.utils import extract_text_from_llm_response
+                final_summary = extract_text_from_llm_response(response.content)
                 research_complete = True
                 break
             
@@ -3313,10 +3320,9 @@ def finalize(state: SmartRiskManagerState) -> Dict[str, Any]:
             HumanMessage(content=finalization_prompt)
         ])
         
-        # Handle case where response.content might be a list (convert early for DB storage)
-        response_content = response.content
-        if isinstance(response_content, list):
-            response_content = "\n".join(str(item) for item in response_content)
+        # Extract plain text from response (handles Gemini's list format)
+        from ..core.utils import extract_text_from_llm_response
+        response_content = extract_text_from_llm_response(response.content)
         
         # Update SmartRiskManagerJob
         with get_db() as session:

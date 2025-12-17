@@ -2,7 +2,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, LimitOrderRequest, StopOrderRequest, StopLimitOrderRequest, ReplaceOrderRequest, TakeProfitRequest, StopLossRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderClass
 from alpaca.common.exceptions import APIError
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone, timedelta
 import time
 import functools
@@ -1213,6 +1213,55 @@ class AlpacaAccount(AccountInterface):
         except Exception as e:
             logger.error(f"Error fetching Alpaca account info: {e}", exc_info=True)
             return None
+
+    @alpaca_api_retry
+    def symbols_exist(self, symbols: List[str]) -> Dict[str, bool]:
+        """
+        Check if multiple symbols exist and are tradeable on Alpaca.
+        
+        Uses Alpaca's get_asset API to verify each symbol exists and is tradeable.
+        Symbols must be in the exact format Alpaca expects (e.g., BRK.B not BRK/B).
+        
+        Args:
+            symbols (List[str]): List of stock symbols to check
+        
+        Returns:
+            Dict[str, bool]: Dictionary mapping each symbol to True if tradeable, False otherwise
+        """
+        if not self._check_authentication():
+            return {symbol: False for symbol in symbols}
+        
+        results = {}
+        
+        for symbol in symbols:
+            try:
+                # Use exact symbol - don't normalize, as the symbol format matters for trading
+                # If caller provides BRK/B but Alpaca needs BRK.B, we should return False
+                symbol_upper = symbol.upper()
+                
+                # Fetch asset info from Alpaca
+                asset = self.client.get_asset(symbol_upper)
+                
+                # Check if asset exists and is tradeable
+                if asset and hasattr(asset, 'tradable') and asset.tradable:
+                    results[symbol] = True
+                    logger.debug(f"Symbol {symbol} is tradeable on Alpaca")
+                else:
+                    results[symbol] = False
+                    status = getattr(asset, 'status', 'unknown') if asset else 'not found'
+                    logger.debug(f"Symbol {symbol} exists but not tradeable (status: {status})")
+                    
+            except Exception as e:
+                # Symbol doesn't exist or API error
+                results[symbol] = False
+                error_msg = str(e)
+                # Don't log full exception for expected "not found" errors
+                if '404' in error_msg or 'not found' in error_msg.lower() or 'invalid symbol' in error_msg.lower():
+                    logger.debug(f"Symbol {symbol} not found/invalid on Alpaca: {error_msg}")
+                else:
+                    logger.warning(f"Error checking symbol {symbol} on Alpaca: {e}")
+        
+        return results
 
     @alpaca_api_retry
     def _get_instrument_current_price_impl(self, symbol_or_symbols, price_type='bid'):

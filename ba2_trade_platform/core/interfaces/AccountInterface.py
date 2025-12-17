@@ -113,6 +113,58 @@ class AccountInterface(ExtendableSettingsInterface):
         pass
 
     @abstractmethod
+    def symbols_exist(self, symbols: List[str]) -> Dict[str, bool]:
+        """
+        Check if multiple symbols exist and are tradeable on this account's broker.
+        
+        This method checks if the given symbols are valid and tradeable on the broker.
+        It should be implemented by each account provider to validate symbols
+        against the broker's available instruments.
+        
+        Args:
+            symbols (List[str]): List of stock symbols to check (e.g., ['AAPL', 'MSFT', 'BRK.B'])
+        
+        Returns:
+            Dict[str, bool]: Dictionary mapping each symbol to True if it exists and is tradeable,
+                           False otherwise. Example: {'AAPL': True, 'BRK.B': False, 'MSFT': True}
+        """
+        pass
+
+    def filter_supported_symbols(self, symbols: List[str], log_prefix: str = "") -> List[str]:
+        """
+        Filter a list of symbols to only include those supported by the broker.
+        
+        Convenience method that uses symbols_exist() to check which symbols are tradeable
+        and returns only the supported ones. Logs a warning for any unsupported symbols.
+        
+        Args:
+            symbols (List[str]): List of stock symbols to filter
+            log_prefix (str): Optional prefix for log messages (e.g., expert name)
+        
+        Returns:
+            List[str]: List of symbols that are supported/tradeable on this broker
+        """
+        if not symbols:
+            return []
+        
+        # Check all symbols at once
+        existence_map = self.symbols_exist(symbols)
+        
+        # Separate supported and unsupported
+        supported = [s for s in symbols if existence_map.get(s, False)]
+        unsupported = [s for s in symbols if not existence_map.get(s, False)]
+        
+        # Log warning for unsupported symbols
+        if unsupported:
+            prefix = f"[{log_prefix}] " if log_prefix else ""
+            logger.warning(f"{prefix}Filtered out {len(unsupported)} unsupported symbols: {unsupported}")
+        
+        if supported:
+            logger.debug(f"Keeping {len(supported)} supported symbols: {supported}")
+        
+        return supported
+
+    @abstractmethod
     def _submit_order_impl(self, trading_order, tp_price: Optional[float] = None, sl_price: Optional[float] = None) -> Any:
         """
         Internal implementation of order submission. This method should be implemented by child classes.
