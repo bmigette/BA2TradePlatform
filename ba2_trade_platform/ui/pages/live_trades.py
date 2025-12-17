@@ -997,10 +997,17 @@ class LiveTradesTab:
             return
 
         with ui.dialog() as dialog, ui.card().classes('w-96'):
-            ui.label(f'Adjust TP/SL for {txn.symbol}').classes('text-h6 mb-4')
+            ui.label(f'Adjust Position for {txn.symbol}').classes('text-h6 mb-4')
 
             with ui.column().classes('w-full gap-4'):
-                ui.label(f'Position: {txn.quantity:+.2f} @ ${txn.open_price:.2f}').classes('text-sm text-gray-600')
+                ui.label(f'Current Position: {txn.quantity:+.2f} @ ${txn.open_price:.2f}').classes('text-sm text-gray-600')
+
+                qty_input = ui.number(
+                    label='Position Quantity',
+                    value=txn.quantity,
+                    format='%.2f',
+                    step=1
+                ).classes('w-full').props('hint="Increase or decrease position size"')
 
                 tp_input = ui.number(
                     label='Take Profit Price',
@@ -1018,17 +1025,18 @@ class LiveTradesTab:
 
                 with ui.row().classes('w-full justify-end gap-2'):
                     ui.button('Cancel', on_click=dialog.close).props('flat')
-                    ui.button('Update', on_click=lambda: self._update_tp_sl(
-                        transaction_id, tp_input.value, sl_input.value, dialog
+                    ui.button('Update', on_click=lambda: self._update_position(
+                        transaction_id, qty_input.value, tp_input.value, sl_input.value, dialog
                     )).props('color=primary')
 
         dialog.open()
 
-    def _update_tp_sl(self, transaction_id, tp_price, sl_price, dialog):
-        """Update TP/SL for a transaction."""
+    def _update_position(self, transaction_id, new_quantity, tp_price, sl_price, dialog):
+        """Update position quantity and/or TP/SL for a transaction."""
         from ...core.models import Transaction, TradingOrder
         from ...core.db import update_instance, get_db
         from sqlmodel import select, Session
+        from ...core.TransactionHelper import TransactionHelper
 
         try:
             txn = get_instance(Transaction, transaction_id)
@@ -1047,7 +1055,7 @@ class LiveTradesTab:
                 ui.notify('No orders linked to this transaction or order account not found', type='negative')
                 return
 
-            # Get account to use adjust_tp/adjust_sl methods
+            # Get account to use adjust methods
             from ...modules.accounts import get_account_class
             from ...core.models import AccountDefinition
 
@@ -1062,7 +1070,42 @@ class LiveTradesTab:
                 return
 
             account = account_class(acc_def.id)
-
+            
+            # Check for quantity change
+            old_quantity = txn.quantity
+            qty_changed = new_quantity != old_quantity
+            
+            if qty_changed:
+                # Validate new quantity
+                if new_quantity <= 0:
+                    ui.notify('Quantity must be greater than 0', type='negative')
+                    return
+                
+                # Calculate quantity change
+                qty_change = new_quantity - old_quantity
+                
+                # Use TransactionHelper to adjust quantity with TP/SL handling
+                result = TransactionHelper.adjust_quantity_with_tpsl(
+                    account=account,
+                    transaction=txn,
+                    qty_change=qty_change,
+                    tp_price=tp_price if tp_price else None,
+                    sl_price=sl_price if sl_price else None
+                )
+                
+                if result["success"]:
+                    msg = f'Position adjusted from {old_quantity:.2f} to {new_quantity:.2f}'
+                    if tp_price or sl_price:
+                        msg += f' with TP/SL'
+                    ui.notify(msg, type='positive')
+                    dialog.close()
+                    self._refresh_transactions()
+                    return
+                else:
+                    ui.notify(f'Failed to adjust position: {result["message"]}', type='negative')
+                    return
+            
+            # No quantity change - just handle TP/SL updates
             # Detect changes including deletions (None/0 is a valid change)
             # Convert empty strings to None for proper comparison
             tp_value = tp_price if tp_price else None

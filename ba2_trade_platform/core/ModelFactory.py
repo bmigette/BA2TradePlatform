@@ -416,7 +416,8 @@ class ModelFactory:
             "temperature": temperature,
             "xai_api_key": api_key,
             "streaming": streaming,
-            "max_retries": 3,  # Retry on transient network errors
+            "max_retries": 5,  # Higher retry count for xAI's connection stability issues
+            "timeout": 300,  # 5 minute timeout for long responses
         }
         
         if callbacks:

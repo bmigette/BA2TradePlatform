@@ -9,6 +9,7 @@ from typing import Dict, Any, List, Annotated, TypedDict, Optional
 from datetime import datetime, timezone
 from operator import add
 import sys
+import time
 from io import StringIO
 from contextlib import contextmanager
 
@@ -2680,14 +2681,33 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             logger.info(f"RESEARCH ITERATION {iteration}/{max_iterations}")
             logger.info("=" * 70)
             
-            # Get LLM response with tool calls
-            try:
-                response = llm_with_tools.invoke(research_messages)
-            except Exception as e:
-                logger.error(f"LLM invocation error on iteration {iteration}: {e}", exc_info=True)
-                # Try to continue with error message
-                research_messages.append(HumanMessage(content=f"Error occurred: {str(e)}. Please continue with available information."))
-                continue
+            # Get LLM response with tool calls (with retry logic for network errors)
+            max_llm_retries = 3
+            response = None
+            for retry in range(max_llm_retries):
+                try:
+                    response = llm_with_tools.invoke(research_messages)
+                    break  # Success, exit retry loop
+                except Exception as e:
+                    error_str = str(e).lower()
+                    is_retryable = any(keyword in error_str for keyword in [
+                        'connection', 'timeout', 'incomplete chunked read', 
+                        'peer closed', 'remote protocol error'
+                    ])
+                    
+                    if is_retryable and retry < max_llm_retries - 1:
+                        wait_time = 2 ** retry  # Exponential backoff: 1s, 2s, 4s
+                        logger.warning(f"LLM invocation error (attempt {retry + 1}/{max_llm_retries}): {e}")
+                        logger.info(f"Retrying in {wait_time}s...")
+                        time.sleep(wait_time)
+                    else:
+                        logger.error(f"LLM invocation error on iteration {iteration}: {e}", exc_info=True)
+                        # Try to continue with error message
+                        research_messages.append(HumanMessage(content=f"Error occurred: {str(e)}. Please continue with available information."))
+                        break
+            
+            if response is None:
+                continue  # Skip this iteration if all retries failed
             
             research_messages.append(response)
             

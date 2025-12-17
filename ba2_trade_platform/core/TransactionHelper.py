@@ -592,7 +592,7 @@ class TransactionHelper:
                 
                 close_order = TradingOrder(
                     transaction_id=transaction.id,
-                    account_id=transaction.account_id,
+                    account_id=account.id,
                     symbol=symbol,
                     direction=close_direction,
                     quantity=close_qty,
@@ -629,7 +629,7 @@ class TransactionHelper:
                     tp_order_type = OrderType.SELL_LIMIT if entry_direction == OrderDirection.BUY else OrderType.BUY_LIMIT
                     tp_order = TradingOrder(
                         transaction_id=transaction.id,
-                        account_id=transaction.account_id,
+                        account_id=account.id,
                         symbol=symbol,
                         direction=close_direction,
                         quantity=remaining_qty,
@@ -652,7 +652,7 @@ class TransactionHelper:
                     sl_order_type = OrderType.SELL_STOP if entry_direction == OrderDirection.BUY else OrderType.BUY_STOP
                     sl_order = TradingOrder(
                         transaction_id=transaction.id,
-                        account_id=transaction.account_id,
+                        account_id=account.id,
                         symbol=symbol,
                         direction=close_direction,
                         quantity=remaining_qty,
@@ -693,7 +693,7 @@ class TransactionHelper:
                 # Step 1: Submit add-to-position order immediately
                 add_order = TradingOrder(
                     transaction_id=transaction.id,
-                    account_id=transaction.account_id,
+                    account_id=account.id,
                     symbol=symbol,
                     direction=entry_direction,
                     quantity=add_qty,
@@ -738,7 +738,7 @@ class TransactionHelper:
                     tp_order_type = OrderType.SELL_LIMIT if entry_direction == OrderDirection.BUY else OrderType.BUY_LIMIT
                     tp_order = TradingOrder(
                         transaction_id=transaction.id,
-                        account_id=transaction.account_id,
+                        account_id=account.id,
                         symbol=symbol,
                         direction=close_direction,
                         quantity=new_qty,
@@ -761,7 +761,7 @@ class TransactionHelper:
                     sl_order_type = OrderType.SELL_STOP if entry_direction == OrderDirection.BUY else OrderType.BUY_STOP
                     sl_order = TradingOrder(
                         transaction_id=transaction.id,
-                        account_id=transaction.account_id,
+                        account_id=account.id,
                         symbol=symbol,
                         direction=close_direction,
                         quantity=new_qty,
