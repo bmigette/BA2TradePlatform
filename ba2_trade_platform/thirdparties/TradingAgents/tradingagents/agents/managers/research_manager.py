@@ -3,7 +3,7 @@ import json
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 import time
 from ...prompts import format_research_manager_prompt
-from ba2_trade_platform.core.utils import extract_text_from_llm_response
+from ba2_trade_platform.core.text_utils import extract_text_from_llm_response
 
 
 def create_research_manager(llm, memory):

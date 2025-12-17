@@ -34,7 +34,7 @@ Engage actively by analyzing both sides critically, addressing weaknesses in the
 
         response = llm.invoke(prompt)
         
-        from ba2_trade_platform.core.utils import extract_text_from_llm_response
+        from ba2_trade_platform.core.text_utils import extract_text_from_llm_response
         response_text = extract_text_from_llm_response(response.content)
         argument = f"Neutral Analyst: {response_text}"
 

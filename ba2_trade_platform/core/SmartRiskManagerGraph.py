@@ -2716,7 +2716,7 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             # Check if research is complete
             if not response.tool_calls:
                 logger.info("Research agent finished without tool calls")
-                from ..core.utils import extract_text_from_llm_response
+                from ..core.text_utils import extract_text_from_llm_response
                 final_summary = extract_text_from_llm_response(response.content)
                 research_complete = True
                 break
@@ -3341,7 +3341,7 @@ def finalize(state: SmartRiskManagerState) -> Dict[str, Any]:
         ])
         
         # Extract plain text from response (handles Gemini's list format)
-        from ..core.utils import extract_text_from_llm_response
+        from ..core.text_utils import extract_text_from_llm_response
         response_content = extract_text_from_llm_response(response.content)
         
         # Update SmartRiskManagerJob
