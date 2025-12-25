@@ -817,8 +817,16 @@ class JobManager:
                 return
             
             # Filter out symbols not supported by the broker
+            # Get account_id from database model, not expert class
+            from .db import get_instance
+            from .models import ExpertInstance
             from .utils import get_account_instance_from_id
-            account = get_account_instance_from_id(expert.account_id)
+            expert_instance = get_instance(ExpertInstance, expert_instance_id)
+            if not expert_instance:
+                logger.error(f"Expert instance {expert_instance_id} not found in database for broker filter")
+                return
+            
+            account = get_account_instance_from_id(expert_instance.account_id)
             if account:
                 selected_instruments = account.filter_supported_symbols(
                     selected_instruments,

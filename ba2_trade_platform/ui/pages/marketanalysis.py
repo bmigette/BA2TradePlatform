@@ -15,7 +15,6 @@ from ...modules.accounts import get_account_class
 from ...core.db import add_instance
 from ...logger import logger
 from ...core.utils import get_account_instance_from_id
-from ..utils.TableCacheManager import TableCacheManager, AsyncTableLoader
 from sqlmodel import select, func, distinct
 
 
@@ -1853,21 +1852,21 @@ class ManualAnalysisTab:
             if selection_method == 'expert':
                 if can_recommend_instruments:
                     # Expert will select instruments - show message
-                    with ui.card().classes('w-full p-4 bg-blue-50 border-l-4 border-blue-400'):
+                    with ui.card().classes('w-full p-4 alert-banner info'):
                         with ui.row():
-                            ui.icon('auto_awesome').classes('text-blue-600 text-xl mr-3')
+                            ui.icon('auto_awesome').classes('text-[#4dabf7] text-xl mr-3')
                             with ui.column():
-                                ui.label('Expert-Driven Instrument Selection').classes('text-lg font-semibold text-blue-800')
-                                ui.label('This expert will automatically select the instruments for analysis. No manual selection required.').classes('text-blue-600')
+                                ui.label('Expert-Driven Instrument Selection').classes('text-lg font-semibold text-[#4dabf7]')
+                                ui.label('This expert will automatically select the instruments for analysis. No manual selection required.').classes('text-secondary-custom')
                     self.instrument_selector = None  # No manual selector needed
                 else:
                     # Expert doesn't support instrument selection - fall back to static
-                    with ui.card().classes('w-full p-4 bg-orange-50 border-l-4 border-orange-400'):
+                    with ui.card().classes('w-full p-4 alert-banner warning'):
                         with ui.row():
-                            ui.icon('warning').classes('text-orange-600 text-xl mr-3')
+                            ui.icon('warning').classes('text-[#ffd93d] text-xl mr-3')
                             with ui.column():
-                                ui.label('Expert Selection Not Supported').classes('text-lg font-semibold text-orange-800')
-                                ui.label('This expert does not support automatic instrument selection. Using manual selection instead.').classes('text-orange-600')
+                                ui.label('Expert Selection Not Supported').classes('text-lg font-semibold text-[#ffd93d]')
+                                ui.label('This expert does not support automatic instrument selection. Using manual selection instead.').classes('text-secondary-custom')
                     self._render_static_selector(expert)
                     
             elif selection_method == 'dynamic':
@@ -1875,17 +1874,17 @@ class ManualAnalysisTab:
                 from ...core.types import AnalysisUseCase
                 if self.analysis_type == AnalysisUseCase.OPEN_POSITIONS.value:
                     # For OPEN_POSITIONS, just show info that we'll use existing positions
-                    with ui.card().classes('w-full p-4 bg-purple-50 border-l-4 border-purple-400'):
+                    with ui.card().classes('w-full p-4 alert-banner info'):
                         with ui.row():
-                            ui.icon('inventory').classes('text-purple-600 text-xl mr-3')
+                            ui.icon('inventory').classes('text-[#9775fa] text-xl mr-3')
                             with ui.column():
-                                ui.label('Open Positions Analysis').classes('text-lg font-semibold text-purple-800')
-                                ui.label('Analysis will be performed on existing open positions for this expert.').classes('text-purple-600')
+                                ui.label('Open Positions Analysis').classes('text-lg font-semibold text-[#9775fa]')
+                                ui.label('Analysis will be performed on existing open positions for this expert.').classes('text-secondary-custom')
                     
                     # Add manual override option
                     with ui.column().classes('w-full mt-4'):
                         ui.label('Override Instruments (Optional):').classes('text-sm font-medium mb-2')
-                        ui.label('Enter comma-separated symbols to override automatic open position detection').classes('text-xs text-gray-500 mb-1')
+                        ui.label('Enter comma-separated symbols to override automatic open position detection').classes('text-xs text-secondary-custom mb-1')
                         self.instrument_override_input = ui.input(
                             placeholder='e.g., AAPL, GOOGL, MSFT (leave empty to use open positions)'
                         ).classes('w-full')
@@ -1894,12 +1893,12 @@ class ManualAnalysisTab:
                     self.ai_prompt_textarea = None
                 else:
                     # AI-driven dynamic selection - show prompt input
-                    with ui.card().classes('w-full p-4 bg-green-50 border-l-4 border-green-400'):
+                    with ui.card().classes('w-full p-4 alert-banner success'):
                         with ui.row():
-                            ui.icon('psychology').classes('text-green-600 text-xl mr-3')
+                            ui.icon('psychology').classes('text-[#00d4aa] text-xl mr-3')
                             with ui.column():
-                                ui.label('AI-Powered Dynamic Instrument Selection').classes('text-lg font-semibold text-green-800')
-                                ui.label('Enter a prompt to let AI select instruments based on your criteria.').classes('text-green-600')
+                                ui.label('AI-Powered Dynamic Instrument Selection').classes('text-lg font-semibold text-[#00d4aa]')
+                                ui.label('Enter a prompt to let AI select instruments based on your criteria.').classes('text-secondary-custom')
                     
                     with ui.column().classes('w-full mt-4'):
                         ui.label('AI Selection Prompt:').classes('text-sm font-medium mb-2')
@@ -1922,8 +1921,8 @@ class ManualAnalysisTab:
                         ).classes('w-full').props('rows=6')
                         
                         with ui.row().classes('w-full justify-between mt-2'):
-                            ui.button('Reset to Default', on_click=lambda: self.ai_prompt_textarea.set_value(default_prompt), icon='refresh').classes('bg-gray-500')
-                            self.ai_generate_button = ui.button('Generate AI Selection', on_click=self._generate_ai_selection, icon='auto_awesome').classes('bg-green-600')
+                            ui.button('Reset to Default', on_click=lambda: self.ai_prompt_textarea.set_value(default_prompt), icon='refresh').props('flat')
+                            self.ai_generate_button = ui.button('Generate AI Selection', on_click=self._generate_ai_selection, icon='auto_awesome').props('color=positive')
                         
                         # Container for AI-selected instruments (will be populated after AI selection)
                         self.ai_results_container = ui.column().classes('w-full mt-4')
@@ -2017,16 +2016,16 @@ class ManualAnalysisTab:
             
             if selected_symbols:
                 with self.ai_results_container:
-                    with ui.card().classes('w-full p-4 bg-blue-50 border border-blue-200'):
+                    with ui.card().classes('w-full p-4 alert-banner success'):
                         with ui.column().classes('w-full'):
                             with ui.row().classes('items-center mb-3'):
-                                ui.icon('check_circle').classes('text-green-600 mr-2')
+                                ui.icon('check_circle').classes('text-[#00d4aa] mr-2')
                                 ui.label(f'AI Selected {len(selected_symbols)} Instruments').classes('text-lg font-semibold')
                             
                             # Show selected symbols as badges
                             with ui.row().classes('flex-wrap gap-2'):
                                 for symbol in selected_symbols:
-                                    ui.badge(symbol).classes('bg-blue-100 text-blue-800 px-2 py-1')
+                                    ui.badge(symbol).props('color=primary')
                             
                             # Create traditional instrument selector with AI-selected instruments
                             from ..components.InstrumentSelector import InstrumentSelector
@@ -2047,20 +2046,20 @@ class ManualAnalysisTab:
                 ui.notify(f"AI selected {len(selected_symbols)} instruments successfully", type='positive')
             else:
                 with self.ai_results_container:
-                    with ui.card().classes('w-full p-4 bg-red-50 border border-red-200'):
+                    with ui.card().classes('w-full p-4 alert-banner danger'):
                         with ui.row():
-                            ui.icon('error').classes('text-red-600 mr-2')
-                            ui.label('AI selection failed. Please try a different prompt or check your OpenAI API key.').classes('text-red-600')
+                            ui.icon('error').classes('text-[#ff6b6b] mr-2')
+                            ui.label('AI selection failed. Please try a different prompt or check your OpenAI API key.').classes('text-[#ff6b6b]')
                 ui.notify("AI instrument selection failed", type='negative')
                 
         except Exception as e:
             logger.error(f"Error during AI instrument selection: {e}", exc_info=True)
             self.ai_results_container.clear()
             with self.ai_results_container:
-                with ui.card().classes('w-full p-4 bg-red-50 border border-red-200'):
+                with ui.card().classes('w-full p-4 alert-banner danger'):
                     with ui.row():
-                        ui.icon('error').classes('text-red-600 mr-2')
-                        ui.label(f'Error: {str(e)}').classes('text-red-600')
+                        ui.icon('error').classes('text-[#ff6b6b] mr-2')
+                        ui.label(f'Error: {str(e)}').classes('text-[#ff6b6b]')
             ui.notify(f"Error during AI selection: {str(e)}", type='negative')
         finally:
             # Re-enable button and remove spinner
@@ -2313,9 +2312,6 @@ class ScheduledJobsTab:
         self.total_records = 0
         self.expert_filter = 'all'  # Filter by expert instance ID
         self.analysis_type_filter = 'all'  # Filter by analysis type (Enter Market / Open Positions)
-        # Initialize cache manager for lazy loading
-        self.cache_manager = TableCacheManager("ScheduledJobs")
-        self.async_loader = None
         self.render()
 
     def render(self):

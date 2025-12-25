@@ -30,15 +30,50 @@ def get_user_local_timezone() -> pytz.timezone:
         pytz.timezone: The user's local timezone
     """
     try:
-        # Try to get local timezone from system
-        import time
-        if time.daylight:
-            utc_offset_sec = -time.altzone
-        else:
-            utc_offset_sec = -time.timezone
-        
-        local_tz = timezone(timedelta(seconds=utc_offset_sec))
-        return pytz.timezone(str(local_tz))
+        # Try to get local timezone using tzlocal package
+        try:
+            from tzlocal import get_localzone
+            local_tz = get_localzone()
+            # tzlocal returns a ZoneInfo or pytz timezone, ensure it's pytz
+            if hasattr(local_tz, 'zone'):
+                return pytz.timezone(local_tz.zone)
+            elif hasattr(local_tz, 'key'):
+                return pytz.timezone(local_tz.key)
+            else:
+                # Fallback if we can't get zone name
+                raise ValueError(f"Cannot get zone name from {local_tz}")
+        except ImportError:
+            # tzlocal not available, fall back to system time
+            import time
+            if time.daylight:
+                utc_offset_sec = -time.altzone
+            else:
+                utc_offset_sec = -time.timezone
+            
+            # Convert offset to hours for timezone lookup
+            offset_hours = utc_offset_sec / 3600
+            
+            # For common offsets, use fixed offset timezone
+            # This creates a timezone like Etc/GMT+X (note: sign is reversed in Etc/GMT)
+            if offset_hours == int(offset_hours):
+                # Use Etc/GMT notation (sign is reversed: Etc/GMT-2 is UTC+02:00)
+                etc_offset = -int(offset_hours)
+                if etc_offset == 0:
+                    return pytz.utc
+                elif etc_offset > 0:
+                    tz_name = f"Etc/GMT+{etc_offset}"
+                else:
+                    tz_name = f"Etc/GMT{etc_offset}"  # Negative sign already included
+                
+                try:
+                    return pytz.timezone(tz_name)
+                except:
+                    pass
+            
+            # Last resort: return UTC
+            logger.warning(f"Could not map UTC offset {offset_hours} hours to timezone, using UTC")
+            return pytz.utc
+            
     except Exception as e:
         logger.warning(f"Could not determine user local timezone: {e}, defaulting to UTC")
         return pytz.utc

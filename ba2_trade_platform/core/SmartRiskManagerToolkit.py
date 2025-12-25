@@ -2336,6 +2336,115 @@ class SmartRiskManagerToolkit:
             logger.error(f"Error calculating position metrics: {e}", exc_info=True)
             raise
     
+    def get_trade_summary_by_symbol(self) -> Dict[str, Dict[str, float]]:
+        """
+        Get aggregated buy/sell quantities per symbol across ALL experts on the account.
+        
+        This provides visibility into overall market exposure and helps identify:
+        - Excessive one-directional exposure when hedging is disabled
+        - Potential hedging conflicts when hedging is enabled
+        - Overall portfolio bias (long vs short)
+        
+        Includes both FILLED positions and PENDING orders (not yet filled).
+        
+        Returns:
+            Dictionary mapping symbol to buy/sell quantities:
+            {
+                "AAPL": {"buy_qty": 150.0, "sell_qty": 50.0},
+                "TSLA": {"buy_qty": 0.0, "sell_qty": 200.0}
+            }
+        """
+        try:
+            logger.debug(f"Getting trade summary by symbol for account {self.account_id}")
+            
+            with get_db() as session:
+                # Query all experts on this account
+                experts = session.exec(
+                    select(ExpertInstance)
+                    .where(ExpertInstance.account_id == self.account_id)
+                ).all()
+                
+                expert_ids = [expert.id for expert in experts]
+                logger.debug(f"Found {len(expert_ids)} experts on account {self.account_id}")
+                
+                # Query all OPENED transactions across all experts
+                opened_transactions = session.exec(
+                    select(Transaction)
+                    .where(Transaction.expert_id.in_(expert_ids))
+                    .where(Transaction.status == TransactionStatus.OPENED)
+                ).all()
+                
+                # Query all WAITING transactions (pending orders)
+                waiting_transactions = session.exec(
+                    select(Transaction)
+                    .where(Transaction.expert_id.in_(expert_ids))
+                    .where(Transaction.status == TransactionStatus.WAITING)
+                ).all()
+                
+                logger.debug(f"Found {len(opened_transactions)} opened and {len(waiting_transactions)} waiting transactions")
+                
+                # Aggregate quantities by symbol and direction
+                summary: Dict[str, Dict[str, float]] = {}
+                
+                # Process opened transactions
+                for trans in opened_transactions:
+                    symbol = trans.symbol
+                    quantity = trans.get_current_open_qty()
+                    
+                    if quantity == 0:
+                        continue
+                    
+                    # Determine direction from first order
+                    direction = None
+                    if trans.trading_orders:
+                        first_order = sorted(trans.trading_orders, key=lambda o: o.created_at)[0]
+                        direction = first_order.side
+                    
+                    if not direction:
+                        continue
+                    
+                    if symbol not in summary:
+                        summary[symbol] = {"buy_qty": 0.0, "sell_qty": 0.0}
+                    
+                    if direction == OrderDirection.BUY:
+                        summary[symbol]["buy_qty"] += quantity
+                    else:  # SELL
+                        summary[symbol]["sell_qty"] += quantity
+                
+                # Process waiting (pending) transactions
+                for trans in waiting_transactions:
+                    symbol = trans.symbol
+                    pending_qty = trans.get_pending_open_qty()
+                    
+                    if pending_qty == 0:
+                        continue
+                    
+                    # Determine direction from pending entry orders
+                    direction = None
+                    if trans.trading_orders:
+                        for order in trans.trading_orders:
+                            if order.status in OrderStatus.get_unfilled_statuses() and order.depends_on_order is None:
+                                direction = order.side
+                                break
+                    
+                    if not direction:
+                        continue
+                    
+                    if symbol not in summary:
+                        summary[symbol] = {"buy_qty": 0.0, "sell_qty": 0.0}
+                    
+                    if direction == OrderDirection.BUY:
+                        summary[symbol]["buy_qty"] += abs(pending_qty)
+                    else:  # SELL
+                        summary[symbol]["sell_qty"] += abs(pending_qty)
+                
+                logger.debug(f"Trade summary: {len(summary)} symbols with exposure")
+                return summary
+                
+        except Exception as e:
+            logger.error(f"Error getting trade summary by symbol: {e}", exc_info=True)
+            return {}
+    
     def get_tools(self) -> List:
         """
         Get all tools as a list for LangChain agent.

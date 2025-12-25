@@ -1713,8 +1713,9 @@ class ExpertSettingsTab:
                         dynamic_model_default = dynamic_model_def.get('default', 'nagaai/gpt5')
                         dynamic_model_help = dynamic_model_def.get('description', 'AI model used for dynamically selecting trading instruments based on market conditions')
                         
-                        # Import the ModelSelectorInput component
+                        # Import the ModelSelectorInput component and labels
                         from ..components.ModelSelector import ModelSelectorInput
+                        from ...core.models_registry import LABEL_WEBSEARCH
                         
                         with ui.column().classes('w-full gap-2'):
                             # Risk Manager Model - using ModelSelectorInput
@@ -1726,12 +1727,13 @@ class ExpertSettingsTab:
                             )
                             self.risk_manager_model_input.render()
                             
-                            # Dynamic Instrument Selection Model - using ModelSelectorInput
+                            # Dynamic Instrument Selection Model - REQUIRES web search capability
                             self.dynamic_instrument_selection_model_input = ModelSelectorInput(
                                 label='Dynamic Instrument Selection Model',
                                 value=dynamic_model_default,
                                 default_provider='nagaai',
-                                help_text=dynamic_model_help
+                                help_text=dynamic_model_help + ' (Only models with web search capability are shown)',
+                                required_labels=[LABEL_WEBSEARCH]  # Only show models with websearch label
                             )
                             self.dynamic_instrument_selection_model_input.render()
                         
@@ -2564,31 +2566,31 @@ class ExpertSettingsTab:
             if selection_method == 'expert':
                 if can_recommend_instruments:
                     # Expert will select instruments - show message
-                    with ui.card().classes('w-full p-4 bg-blue-50 border-l-4 border-blue-400'):
+                    with ui.card().classes('w-full p-4 alert-banner info'):
                         with ui.row():
-                            ui.icon('auto_awesome').classes('text-blue-600 text-xl mr-3')
+                            ui.icon('auto_awesome').classes('text-[#4dabf7] text-xl mr-3')
                             with ui.column():
-                                ui.label('Expert-Driven Instrument Selection').classes('text-lg font-semibold text-blue-800')
-                                ui.label('This expert will automatically select the instruments for analysis. No manual selection required.').classes('text-blue-600')
+                                ui.label('Expert-Driven Instrument Selection').classes('text-lg font-semibold text-[#4dabf7]')
+                                ui.label('This expert will automatically select the instruments for analysis. No manual selection required.').classes('text-secondary-custom')
                     self.instrument_selector = None  # No manual selector needed
                 else:
                     # Expert doesn't support instrument selection - fall back to static
-                    with ui.card().classes('w-full p-4 bg-orange-50 border-l-4 border-orange-400'):
+                    with ui.card().classes('w-full p-4 alert-banner warning'):
                         with ui.row():
-                            ui.icon('warning').classes('text-orange-600 text-xl mr-3')
+                            ui.icon('warning').classes('text-[#ffd93d] text-xl mr-3')
                             with ui.column():
-                                ui.label('Expert Selection Not Supported').classes('text-lg font-semibold text-orange-800')
-                                ui.label('This expert does not support automatic instrument selection. Using manual selection instead.').classes('text-orange-600')
+                                ui.label('Expert Selection Not Supported').classes('text-lg font-semibold text-[#ffd93d]')
+                                ui.label('This expert does not support automatic instrument selection. Using manual selection instead.').classes('text-secondary-custom')
                     self._render_static_instrument_selector(expert_instance, is_edit)
                     
             elif selection_method == 'dynamic':
                 # AI-driven dynamic selection - show prompt input
-                with ui.card().classes('w-full p-4 bg-green-50 border-l-4 border-green-400'):
+                with ui.card().classes('w-full p-4 alert-banner success'):
                     with ui.row():
-                        ui.icon('psychology').classes('text-green-600 text-xl mr-3')
+                        ui.icon('psychology').classes('text-[#00d4aa] text-xl mr-3')
                         with ui.column():
-                            ui.label('AI-Powered Dynamic Instrument Selection').classes('text-lg font-semibold text-green-800')
-                            ui.label('Enter a prompt to let AI select instruments based on your criteria.').classes('text-green-600')
+                            ui.label('AI-Powered Dynamic Instrument Selection').classes('text-lg font-semibold text-[#00d4aa]')
+                            ui.label('Enter a prompt to let AI select instruments based on your criteria.').classes('text-secondary-custom')
 
                 with ui.column().classes('w-full mt-4'):
                     ui.label('AI Selection Prompt:').classes('text-sm font-medium mb-2')
@@ -2617,8 +2619,8 @@ class ExpertSettingsTab:
                     ).classes('w-full').props('rows=6')
                     
                     with ui.row().classes('w-full justify-between mt-2'):
-                        ui.button('Reset to Default', on_click=lambda: self.ai_prompt_textarea.set_value(default_prompt), icon='refresh').classes('bg-gray-500')
-                        self.test_ai_button = ui.button('Test AI Selection', on_click=self._test_ai_selection, icon='auto_awesome').classes('bg-green-600')
+                        ui.button('Reset to Default', on_click=lambda: self.ai_prompt_textarea.set_value(default_prompt), icon='refresh').props('flat')
+                        self.test_ai_button = ui.button('Test AI Selection', on_click=self._test_ai_selection, icon='auto_awesome').props('color=positive')
 
                 self.instrument_selector = None  # Will be created after AI selection
                 
@@ -3998,16 +4000,16 @@ class TradeSettingsTab:
                             # Boolean events
                             ui.label('🔄 Boolean Events (True/False)').classes('text-subtitle1 mt-4 mb-2')
                             for event_key, doc in list(boolean_events.items())[:6]:  # Show first 6
-                                with ui.card().classes('w-full mb-2 p-2 bg-blue-50'):
+                                with ui.card().classes('w-full mb-2 p-2 alert-banner info'):
                                     ui.label(f"{doc['name']} ({event_key})").classes('text-sm font-medium')
-                                    ui.label(doc['description']).classes('text-xs text-gray-600 mt-1')
+                                    ui.label(doc['description']).classes('text-xs text-secondary-custom mt-1')
                             
                             # Numeric events
                             ui.label('🔢 Numeric Events (Comparisons)').classes('text-subtitle1 mt-4 mb-2')
                             for event_key, doc in numeric_events.items():
-                                with ui.card().classes('w-full mb-2 p-2 bg-green-50'):
+                                with ui.card().classes('w-full mb-2 p-2 alert-banner success'):
                                     ui.label(f"{doc['name']} ({event_key})").classes('text-sm font-medium')
-                                    ui.label(doc['description']).classes('text-xs text-gray-600 mt-1')
+                                    ui.label(doc['description']).classes('text-xs text-secondary-custom mt-1')
                             
                             # Action Types Documentation
                             ui.separator().classes('my-4')
@@ -4015,11 +4017,11 @@ class TradeSettingsTab:
                             action_docs = get_action_type_documentation()
                             
                             for action_key, doc in action_docs.items():
-                                with ui.card().classes('w-full mb-2 p-2 bg-orange-50'):
+                                with ui.card().classes('w-full mb-2 p-2 alert-banner warning'):
                                     ui.label(f"{doc['name']} ({action_key})").classes('text-sm font-medium')
-                                    ui.label(doc['description']).classes('text-xs text-gray-600 mt-1')
+                                    ui.label(doc['description']).classes('text-xs text-secondary-custom mt-1')
                                     if doc.get('use_cases'):
-                                        ui.label(f"• {doc['use_cases'][0]}").classes('text-xs text-gray-500 mt-1 italic')
+                                        ui.label(f"• {doc['use_cases'][0]}").classes('text-xs text-secondary-custom mt-1 italic')
                 
                 # Save button
                 with ui.row().classes('w-full justify-end mt-4'):
@@ -4065,11 +4067,11 @@ class TradeSettingsTab:
                         if selected_type in event_docs:
                             doc = event_docs[selected_type]
                             with docs_container:
-                                with ui.card().classes('w-full bg-blue-50 border-l-4 border-blue-400 p-3'):
-                                    ui.label(f"📘 {doc['name']}").classes('text-sm font-semibold text-blue-800')
-                                    ui.label(doc['description']).classes('text-sm text-blue-700 mt-1')
+                                with ui.card().classes('w-full alert-banner info p-3'):
+                                    ui.label(f"📘 {doc['name']}").classes('text-sm font-semibold text-[#4dabf7]')
+                                    ui.label(doc['description']).classes('text-sm text-secondary-custom mt-1')
                                     if doc.get('example'):
-                                        ui.label(f"💡 Example: {doc['example']}").classes('text-xs text-blue-600 mt-1 italic')
+                                        ui.label(f"💡 Example: {doc['example']}").classes('text-xs text-[#4dabf7] mt-1 italic')
                 
                 # Value input (for N_ types)
                 value_row = ui.row().classes('w-full')
@@ -4158,16 +4160,16 @@ class TradeSettingsTab:
                         if selected_type in action_docs:
                             doc = action_docs[selected_type]
                             with action_docs_container:
-                                with ui.card().classes('w-full bg-green-50 border-l-4 border-green-400 p-3'):
-                                    ui.label(f"⚡ {doc['name']}").classes('text-sm font-semibold text-green-800')
-                                    ui.label(doc['description']).classes('text-sm text-green-700 mt-1')
+                                with ui.card().classes('w-full alert-banner success p-3'):
+                                    ui.label(f"⚡ {doc['name']}").classes('text-sm font-semibold text-[#00d4aa]')
+                                    ui.label(doc['description']).classes('text-sm text-secondary-custom mt-1')
                                     if doc.get('example'):
-                                        ui.label(f"💡 Example: {doc['example']}").classes('text-xs text-green-600 mt-1 italic')
+                                        ui.label(f"💡 Example: {doc['example']}").classes('text-xs text-[#00d4aa] mt-1 italic')
                                     # Show use cases if available
                                     if doc.get('use_cases'):
-                                        ui.label("Common use cases:").classes('text-xs text-green-700 mt-2 font-medium')
+                                        ui.label("Common use cases:").classes('text-xs text-secondary-custom mt-2 font-medium')
                                         for use_case in doc['use_cases'][:2]:  # Show first 2 use cases
-                                            ui.label(f"• {use_case}").classes('text-xs text-green-600 ml-2')
+                                            ui.label(f"• {use_case}").classes('text-xs text-[#00d4aa] ml-2')
                 
                 # Value input (for ADJUST_ types and INCREASE/DECREASE_INSTRUMENT_SHARE)
                 value_row = ui.row().classes('w-full')

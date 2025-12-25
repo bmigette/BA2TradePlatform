@@ -277,22 +277,30 @@ class AccountInterface(ExtendableSettingsInterface):
         # Handle transaction requirements based on order type
         self._handle_transaction_requirements(trading_order)
         
-        # Sync quantity with parent order ONLY for TP/SL orders (not for partial close orders)
-        # TP/SL orders should match their parent's quantity to close the full position
-        # Partial close orders have their own independent quantity
+        # Sync quantity with parent order ONLY for TP/SL orders whose parent is also a limit/stop order
+        # TP/SL orders should match their entry order's quantity to close the full position
+        # BUT: TP/SL orders triggered by close orders (MARKET) should keep their own quantity
+        # Example: Partial close of 4 shares → new TP/SL for remaining 1 share (don't sync with close qty)
         if (trading_order.depends_on_order is not None and 
             trading_order.order_type in [OrderType.SELL_LIMIT, OrderType.BUY_LIMIT, OrderType.SELL_STOP, OrderType.BUY_STOP]):
             try:
                 parent_order = get_instance(TradingOrder, trading_order.depends_on_order)
-                if parent_order and parent_order.quantity:
+                # Only sync if parent is NOT a market order (market orders are typically close orders)
+                if (parent_order and parent_order.quantity and 
+                    parent_order.order_type != OrderType.MARKET):
                     if trading_order.quantity != parent_order.quantity:
                         old_qty = trading_order.quantity
                         trading_order.quantity = parent_order.quantity
                         logger.info(
-                            f"Synced TP/SL order quantity with parent: "
+                            f"Synced TP/SL order quantity with parent entry order: "
                             f"order {trading_order.id or 'new'} qty {old_qty} → {parent_order.quantity} "
-                            f"(parent order {parent_order.id})"
+                            f"(parent order {parent_order.id}, type {parent_order.order_type})"
                         )
+                elif parent_order and parent_order.order_type == OrderType.MARKET:
+                    logger.debug(
+                        f"TP/SL order {trading_order.id or 'new'} parent is MARKET order "
+                        f"(likely close order) - keeping independent quantity {trading_order.quantity}"
+                    )
                 else:
                     logger.warning(
                         f"Parent order {trading_order.depends_on_order} not found or has no quantity "

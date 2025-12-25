@@ -6,6 +6,8 @@ from .BalanceUsagePerExpertChart import BalanceUsagePerExpertChart
 from .FloatingPLPerExpertWidget import FloatingPLPerExpertWidget
 from .FloatingPLPerAccountWidget import FloatingPLPerAccountWidget
 from .ModelSelector import ModelSelector, ModelSelectorInput
+from .LazyTable import LazyTable, ColumnDef, LazyTableConfig, create_simple_table
+from .LiveTradesTable import LiveTradesTable, LiveTradesTableConfig
 
 __all__ = [
     'InstrumentSelector', 
@@ -16,5 +18,11 @@ __all__ = [
     'FloatingPLPerExpertWidget',
     'FloatingPLPerAccountWidget',
     'ModelSelector',
-    'ModelSelectorInput'
+    'ModelSelectorInput',
+    'LazyTable',
+    'ColumnDef',
+    'LazyTableConfig',
+    'create_simple_table',
+    'LiveTradesTable',
+    'LiveTradesTableConfig'
 ]

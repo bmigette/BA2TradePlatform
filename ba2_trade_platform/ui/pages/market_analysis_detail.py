@@ -209,7 +209,7 @@ def _render_error_state(market_analysis: MarketAnalysis) -> None:
             ui.label(f'Skipped on: {market_analysis.created_at.strftime("%Y-%m-%d %H:%M:%S") if market_analysis.created_at else "Unknown"}').classes('text-grey-7 mt-1')
             
             # Provide context and action
-            with ui.card().classes('w-full max-w-2xl mt-4 bg-orange-50 border-l-4 border-orange-500'):
+            with ui.card().classes('w-full max-w-2xl mt-4 alert-banner warning'):
                 with ui.row().classes('items-start p-4'):
                     ui.icon('lightbulb', color='orange').classes('mt-1 mr-3')
                     with ui.column().classes('flex-1'):
@@ -231,12 +231,12 @@ def _render_error_state(market_analysis: MarketAnalysis) -> None:
             # Show error details if available in state
             error_message = _extract_error_message(market_analysis.state)
             if error_message:
-                with ui.card().classes('w-full max-w-4xl mt-4 bg-red-50 border-l-4 border-red-500'):
+                with ui.card().classes('w-full max-w-4xl mt-4 alert-banner danger'):
                     with ui.row().classes('items-start p-4'):
                         ui.icon('error_outline', color='negative').classes('mt-1 mr-3')
                         with ui.column().classes('flex-1'):
-                            ui.label('Error Details:').classes('font-medium text-red-800 mb-2')
-                            with ui.element('pre').classes('bg-red-100 p-3 rounded text-sm overflow-auto max-h-48 whitespace-pre-wrap font-mono text-red-900'):
+                            ui.label('Error Details:').classes('font-medium text-[#ff6b6b] mb-2')
+                            with ui.element('pre').classes('bg-white/5 p-3 rounded text-sm overflow-auto max-h-48 whitespace-pre-wrap font-mono text-[#ff6b6b]'):
                                 ui.label(error_message)
 
 
@@ -306,17 +306,17 @@ def _render_error_banner(market_analysis: MarketAnalysis) -> None:
     """Render an error banner for failed analyses."""
     error_message = _extract_error_message(market_analysis.state)
     
-    with ui.card().classes('w-full mb-4 bg-red-50 border-l-4 border-red-500'):
+    with ui.card().classes('w-full mb-4 alert-banner danger'):
         with ui.row().classes('items-start p-4'):
             ui.icon('error_outline', color='negative', size='lg').classes('mt-1 mr-3')
             with ui.column().classes('flex-1'):
-                ui.label('Analysis Failed').classes('text-h6 font-medium text-red-800 mb-2')
+                ui.label('Analysis Failed').classes('text-h6 font-medium text-[#ff6b6b] mb-2')
                 if error_message:
-                    ui.label('Error Details:').classes('font-medium text-red-700 mb-2')
-                    with ui.element('pre').classes('bg-red-100 p-3 rounded text-sm overflow-auto max-h-32 whitespace-pre-wrap font-mono text-red-900 border'):
+                    ui.label('Error Details:').classes('font-medium text-[#ff6b6b] mb-2')
+                    with ui.element('pre').classes('bg-white/5 p-3 rounded text-sm overflow-auto max-h-32 whitespace-pre-wrap font-mono text-[#ff6b6b] border border-white/10'):
                         ui.label(error_message)
                 else:
-                    ui.label('The analysis encountered an error during execution.').classes('text-red-700')
+                    ui.label('The analysis encountered an error during execution.').classes('text-[#ff6b6b]')
 
 
 def _render_order_recommendations_tab(market_analysis: MarketAnalysis) -> None:

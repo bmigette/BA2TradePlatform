@@ -9,7 +9,7 @@ import functools
 
 from ...logger import logger
 from ...core.models import TradingOrder, Position, Transaction
-from ...core.types import OrderDirection, OrderStatus, OrderOpenType, OrderType as CoreOrderType
+from ...core.types import OrderDirection, OrderStatus, OrderOpenType, OrderType as CoreOrderType, TransactionStatus
 from ...core.interfaces import AccountInterface
 from ...core.db import get_db, get_instance, update_instance, add_instance
 from sqlmodel import Session, select
@@ -794,6 +794,39 @@ class AlpacaAccount(AccountInterface):
                 logger.info(f"Submitting order with dependency: depends on order {trading_order.depends_on_order} reaching status {trading_order.depends_order_status_trigger}")
             
             # Step 2: Submit order to Alpaca broker
+            
+            # CRITICAL CHECK: For entry orders of new transactions, verify no opposite-direction positions exist
+            # This prevents accidentally closing existing positions when trying to open new ones
+            if trading_order.transaction_id and not trading_order.depends_on_order:
+                from ...core.models import Transaction
+                transaction = get_instance(Transaction, trading_order.transaction_id)
+                
+                # Only check for entry orders (first order of new transaction)
+                if transaction and transaction.status == TransactionStatus.WAITING:
+                    try:
+                        positions = self.client.get_all_positions()
+                        broker_position = next((pos for pos in positions if pos.symbol == trading_order.symbol), None)
+                        
+                        if broker_position:
+                            position_qty = float(broker_position.qty)
+                            order_side = trading_order.side
+                            
+                            # Check for conflicting position direction
+                            # LONG position (qty > 0) conflicts with BUY entry order (would add to position instead of opening new)
+                            # SHORT position (qty < 0) conflicts with SELL entry order (would add to short instead of opening new)
+                            if position_qty > 0 and order_side == OrderDirection.SELL:
+                                logger.error(f"Cannot open SHORT position for {trading_order.symbol}: LONG position of {position_qty} shares already exists at broker")
+                                raise ValueError(f"Cannot open SHORT position for {trading_order.symbol}: Existing LONG position of {position_qty} shares would be closed instead. Close all existing positions first or enable hedging.")
+                            elif position_qty < 0 and order_side == OrderDirection.BUY:
+                                logger.error(f"Cannot open LONG position for {trading_order.symbol}: SHORT position of {position_qty} shares already exists at broker")
+                                raise ValueError(f"Cannot open LONG position for {trading_order.symbol}: Existing SHORT position of {position_qty} shares would be closed instead. Close all existing positions first or enable hedging.")
+                            
+                            logger.debug(f"Entry order check passed: {order_side.value} order compatible with existing position qty={position_qty}")
+                    except Exception as e:
+                        if "Cannot open" in str(e) or "already exists" in str(e):
+                            raise  # Re-raise position conflict errors
+                        logger.warning(f"Failed to check broker positions for entry order {trading_order.id}: {e}")
+                        # Continue anyway - let broker handle validation
             
             # Convert side to Alpaca enum
             side = OrderSide.BUY if trading_order.side == OrderDirection.BUY else OrderSide.SELL
@@ -2854,7 +2887,7 @@ class AlpacaAccount(AccountInterface):
                     limit_price=transaction.take_profit,
                     stop_price=transaction.stop_loss,
                     transaction_id=transaction.id,
-                    status=OrderStatus.PENDING,
+                    status=OrderStatus.WAITING_TRIGGER,  # Dependent order should wait for trigger
                     depends_on_order=entry_order.id,
                     depends_order_status_trigger=OrderStatus.FILLED,
                     open_type=OrderOpenType.AUTOMATIC,
@@ -2899,7 +2932,7 @@ class AlpacaAccount(AccountInterface):
                         order_type=order_type,
                         limit_price=new_tp_price,
                         transaction_id=transaction.id,
-                        status=OrderStatus.PENDING,
+                        status=OrderStatus.WAITING_TRIGGER,  # Dependent order should wait for trigger
                         depends_on_order=entry_order.id,
                         depends_order_status_trigger=OrderStatus.FILLED,
                         open_type=OrderOpenType.AUTOMATIC,
@@ -2940,7 +2973,7 @@ class AlpacaAccount(AccountInterface):
                         order_type=order_type,
                         stop_price=new_sl_price,
                         transaction_id=transaction.id,
-                        status=OrderStatus.PENDING,
+                        status=OrderStatus.WAITING_TRIGGER,  # Dependent order should wait for trigger
                         depends_on_order=entry_order.id,
                         depends_order_status_trigger=OrderStatus.FILLED,
                         open_type=OrderOpenType.AUTOMATIC,
@@ -3210,7 +3243,7 @@ class AlpacaAccount(AccountInterface):
                 limit_price=effective_tp,
                 stop_price=effective_sl,
                 transaction_id=transaction.id,
-                status=OrderStatus.PENDING,
+                status=OrderStatus.WAITING_TRIGGER,  # Dependent order should wait for trigger
                 depends_on_order=entry_order.id,
                 depends_order_status_trigger=OrderStatus.FILLED,
                 open_type=OrderOpenType.AUTOMATIC,

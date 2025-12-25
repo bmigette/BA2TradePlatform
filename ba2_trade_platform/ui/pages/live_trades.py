@@ -1,7 +1,7 @@
 from nicegui import ui
 from datetime import datetime, timedelta, timezone
 from sqlmodel import select, func, Session
-from typing import Dict, Any
+from typing import Dict, Any, List, Tuple
 import requests
 import aiohttp
 import asyncio
@@ -14,28 +14,26 @@ from ...core.utils import get_expert_instance_from_id, get_market_analysis_id_fr
 from ...core.TransactionHelper import TransactionHelper
 from ...modules.accounts import providers
 from ...logger import logger
-from ..utils.TableCacheManager import TableCacheManager, AsyncTableLoader
+from ..components import LiveTradesTable, LiveTradesTableConfig
+from ..utils.perf_logger import PerfLogger
 
 class LiveTradesTab:
     """Comprehensive transactions management tab with full control over positions."""
 
     def __init__(self):
         self.transactions_container = None
-        self.transactions_table = None
+        self.live_trades_table: LiveTradesTable = None
         self.selected_transaction = None
-        self.selected_transactions = {}  # Dictionary to track selected transaction IDs
         self.batch_operations_container = None
-        # Initialize cache manager for lazy loading
-        self.cache_manager = TableCacheManager("LiveTrades")
-        self.async_loader = None
-        self.render()
+        # Note: render() is now async and should be awaited after construction
 
     def _get_order_status_color(self, status):
         """Get color for order status badge."""
         return get_order_status_color(status)
 
-    def render(self):
+    async def render(self):
         """Render the transactions tab with filtering and control options."""
+        render_timer = PerfLogger.start(PerfLogger.PAGE, PerfLogger.RENDER, "LiveTradesTab")
         logger.debug("[RENDER] LiveTradesTab.render() - START")
 
         # Pre-populate expert options before creating the UI
@@ -113,7 +111,10 @@ class LiveTradesTab:
 
             # Transactions table container
             self.transactions_container = ui.column().classes('w-full')
-            self._render_transactions_table()
+            with self.transactions_container:
+                await self._render_transactions_table_async()
+        
+        render_timer.stop("filters_rendered")
 
     def _get_expert_options(self):
         """Get list of expert options and ID mapping."""
@@ -138,74 +139,23 @@ class LiveTradesTab:
         logger.debug(f"[POPULATE] Populated expert filter with {len(expert_options)} options")
 
     def _refresh_transactions(self):
-        """Refresh the transactions table with async loading and caching."""
+        """Refresh the transactions table."""
         logger.debug("[REFRESH] _refresh_transactions() - Updating table rows")
 
         # Refresh expert filter options (in case new experts were added)
         self._populate_expert_filter()
 
-        # Invalidate cache if filters changed
-        filter_state = self._get_filter_state()
-        if self.cache_manager.should_invalidate_cache(filter_state):
-            logger.debug("[REFRESH] Filters changed, invalidating cache")
-            self.cache_manager.invalidate_cache()
-
-        # If table doesn't exist yet, create it
-        if not self.transactions_table:
+        # Use the LiveTradesTable's built-in refresh
+        if self.live_trades_table:
+            asyncio.create_task(self.live_trades_table.refresh())
+        else:
+            # Table doesn't exist yet, create it
             logger.debug("[REFRESH] Table doesn't exist, creating new table")
             self.transactions_container.clear()
-            with self.transactions_container:
-                self._render_transactions_table()
-            return
-
-        # Otherwise, async load and update the rows data
-        try:
-            # Run async load in background
-            asyncio.create_task(self._async_refresh_transactions())
-            logger.debug("[REFRESH] Async refresh task started")
-        except Exception as e:
-            logger.error(f"Error starting async refresh: {e}", exc_info=True)
-            # Fallback to sync refresh
-            try:
-                new_rows = self._get_transactions_data()
-                logger.debug(f"[REFRESH] Updating table with {len(new_rows)} rows")
-                self.transactions_table.rows.clear()
-                self.transactions_table.rows.extend(new_rows)
-                logger.debug("[REFRESH] _refresh_transactions() - Complete")
-            except Exception as e2:
-                logger.error(f"Error in fallback refresh: {e2}", exc_info=True)
-                logger.debug("[REFRESH] Fallback failed, recreating table")
-                self.transactions_container.clear()
+            async def _create_table_in_context():
                 with self.transactions_container:
-                    self._render_transactions_table()
-    
-    async def _async_refresh_transactions(self):
-        """Async transaction refresh with cache and progressive loading."""
-        try:
-            filter_state = self._get_filter_state()
-            
-            # Use cache manager to get data (fetches only if filters changed)
-            new_rows, _ = await self.cache_manager.get_data(
-                fetch_func=self._get_transactions_data,
-                filter_state=filter_state
-            )
-            
-            if not new_rows:
-                self.transactions_table.rows = []
-                return
-            
-            # Use async loader for progressive rendering on large datasets
-            if not self.async_loader and self.transactions_table:
-                self.async_loader = AsyncTableLoader(self.transactions_table, batch_size=50)
-            
-            if self.async_loader:
-                await self.async_loader.load_rows_async(new_rows)
-            else:
-                self.transactions_table.rows = new_rows
-            
-            logger.debug(f"[ASYNC] Transaction table refreshed with {len(new_rows)} rows")
-        except Exception as e:
-            logger.error(f"Error in async refresh: {e}", exc_info=True)
+                    await self._render_transactions_table_async()
+            asyncio.create_task(_create_table_in_context())
     
     def _get_filter_state(self) -> tuple:
         """Get current filter state as hashable tuple for cache invalidation."""
@@ -293,8 +243,359 @@ class LiveTradesTab:
 
         dialog.open()
 
+    async def _transactions_data_loader(
+        self,
+        page: int,
+        page_size: int,
+        filters: Dict[str, Any],
+        sort_by: str,
+        descending: bool
+    ) -> Tuple[List[Dict], int]:
+        """
+        Async data loader callback for LiveTradesTable.
+        
+        Supports server-side pagination, sorting and filtering.
+        
+        Args:
+            page: Current page number (1-indexed)
+            page_size: Number of items per page
+            filters: Dict with '_global' for global filter and column names for column filters
+            sort_by: Column name to sort by
+            descending: Sort direction
+        
+        Returns:
+            Tuple of (rows, total_count)
+        """
+        from ...core.models import Transaction, ExpertInstance
+        from ...core.types import TransactionStatus
+        from sqlmodel import col
+        
+        # Extract global filter from filters dict
+        global_filter = filters.get('_global', '')
+
+        fetch_timer = PerfLogger.start(PerfLogger.DATA, PerfLogger.FETCH, "LiveTradesData")
+        logger.debug(f"[TRANSACTIONS] _transactions_data_loader() page={page}, page_size={page_size}")
+
+        session = get_db()
+        try:
+            # Build base query - join with ExpertInstance for expert info
+            base_query = select(Transaction, ExpertInstance).outerjoin(
+                ExpertInstance, Transaction.expert_id == ExpertInstance.id
+            )
+
+            # Apply status filter (from page filter controls)
+            status_values = self.status_filter.value if hasattr(self, 'status_filter') else ['Waiting', 'Open', 'Closing']
+            if status_values and len(status_values) > 0:
+                status_map = {
+                    'Open': TransactionStatus.OPENED,
+                    'Closed': TransactionStatus.CLOSED,
+                    'Closing': TransactionStatus.CLOSING,
+                    'Waiting': TransactionStatus.WAITING
+                }
+                selected_statuses = [status_map[s] for s in status_values if s in status_map]
+                if selected_statuses:
+                    base_query = base_query.where(Transaction.status.in_(selected_statuses))
+
+            # Apply expert filter (from page filter controls)
+            if hasattr(self, 'expert_filter') and self.expert_filter.value != 'All':
+                if hasattr(self, 'expert_id_map'):
+                    expert_id = self.expert_id_map.get(self.expert_filter.value)
+                    if expert_id and expert_id != 'All':
+                        base_query = base_query.where(Transaction.expert_id == expert_id)
+
+            # Apply symbol filter (from page filter controls)
+            if hasattr(self, 'symbol_filter') and self.symbol_filter.value:
+                base_query = base_query.where(Transaction.symbol.contains(self.symbol_filter.value.upper()))
+
+            # Apply broker order ID filter (from page filter controls)
+            if hasattr(self, 'broker_order_id_filter') and self.broker_order_id_filter.value and self.broker_order_id_filter.value.strip():
+                from ...core.models import TradingOrder
+                base_query = base_query.join(
+                    TradingOrder,
+                    Transaction.id == TradingOrder.transaction_id
+                ).where(
+                    TradingOrder.broker_order_id.contains(self.broker_order_id_filter.value.strip())
+                ).distinct()
+
+            # Apply global filter from table (symbol search)
+            if global_filter:
+                base_query = base_query.where(Transaction.symbol.contains(global_filter.upper()))
+
+            # Get total count for pagination
+            count_query = select(func.count()).select_from(base_query.subquery())
+            total_count = session.exec(count_query).one()
+
+            # Apply sorting
+            if sort_by:
+                sort_column = getattr(Transaction, sort_by, None)
+                if sort_column is not None:
+                    if descending:
+                        base_query = base_query.order_by(sort_column.desc())
+                    else:
+                        base_query = base_query.order_by(sort_column.asc())
+                else:
+                    # Default sort
+                    base_query = base_query.order_by(Transaction.created_at.desc())
+            else:
+                base_query = base_query.order_by(Transaction.created_at.desc())
+
+            # Apply pagination - LazyTable uses 1-indexed pages
+            offset = (page - 1) * page_size
+            paginated_query = base_query.offset(offset).limit(page_size)
+
+            # Execute query
+            results = list(session.exec(paginated_query).all())
+            transactions = []
+            transaction_experts = {}
+            for txn, expert in results:
+                transactions.append(txn)
+                transaction_experts[txn.id] = expert
+
+            if not transactions:
+                fetch_timer.stop(f"count=0, total={total_count}")
+                return [], total_count
+
+            # Build rows using existing logic
+            rows = self._build_transaction_rows(transactions, transaction_experts, session)
+            
+            fetch_timer.stop(f"count={len(rows)}, total={total_count}")
+            return rows, total_count
+
+        except Exception as e:
+            logger.error(f"Error loading transactions data: {e}", exc_info=True)
+            return [], 0
+        finally:
+            session.close()
+
+    def _build_transaction_rows(
+        self,
+        transactions: List[Transaction],
+        transaction_experts: Dict[int, ExpertInstance],
+        session
+    ) -> List[Dict]:
+        """Build row data from transactions for the table."""
+        from ...core.types import TransactionStatus
+        from ...core.models import TradingOrder
+        from collections import defaultdict
+
+        # BATCH PRICE FETCHING: Collect all symbols from open transactions grouped by account
+        symbols_by_account = defaultdict(set)
+        txn_to_account = {}
+
+        for txn in transactions:
+            if txn.status == TransactionStatus.OPENED and txn.open_price and txn.quantity:
+                order_stmt = select(TradingOrder).where(TradingOrder.transaction_id == txn.id).limit(1)
+                first_order = session.exec(order_stmt).first()
+                if first_order:
+                    symbols_by_account[first_order.account_id].add(txn.symbol)
+                    txn_to_account[txn.id] = first_order.account_id
+
+        # Fetch prices in batch for each account
+        current_prices = {}
+        for account_id, symbols in symbols_by_account.items():
+            try:
+                account_inst = get_account_instance_from_id(account_id)
+                if account_inst and symbols:
+                    symbols_list = list(symbols)
+                    prices_dict = account_inst.get_instrument_current_price(symbols_list)
+                    if prices_dict:
+                        current_prices.update(prices_dict)
+            except Exception as e:
+                logger.warning(f"Batch price fetch failed for account {account_id}: {e}")
+
+        # Build rows
+        rows = []
+        for txn in transactions:
+            # Calculate current P/L for open positions
+            current_pnl = ''
+            current_pnl_numeric = 0
+            current_price_str = ''
+
+            if txn.status == TransactionStatus.OPENED and txn.open_price and txn.quantity:
+                try:
+                    current_price = current_prices.get(txn.symbol)
+                    if current_price:
+                        current_price_str = f"${current_price:.2f}"
+                        if txn.quantity > 0:
+                            pnl_current = (current_price - txn.open_price) * abs(txn.quantity)
+                        else:
+                            pnl_current = (txn.open_price - current_price) * abs(txn.quantity)
+                        cost_basis = txn.open_price * abs(txn.quantity)
+                        pnl_pct = (pnl_current / cost_basis * 100) if cost_basis > 0 else 0
+                        current_pnl = f"${pnl_current:+.2f} ({pnl_pct:+.1f}%)"
+                        current_pnl_numeric = pnl_pct
+                except Exception as e:
+                    logger.debug(f"Could not calculate P/L for {txn.symbol}: {e}")
+
+            # Closed P/L
+            closed_pnl = ''
+            closed_pnl_numeric = 0
+            if txn.close_price and txn.open_price and txn.quantity:
+                if txn.quantity > 0:
+                    pnl_closed = (txn.close_price - txn.open_price) * abs(txn.quantity)
+                else:
+                    pnl_closed = (txn.open_price - txn.close_price) * abs(txn.quantity)
+                closed_pnl = f"${pnl_closed:+.2f}"
+                closed_pnl_numeric = pnl_closed
+
+            # Status styling
+            status_color = {
+                TransactionStatus.OPENED: 'green',
+                TransactionStatus.CLOSING: 'orange',
+                TransactionStatus.CLOSED: 'gray',
+                TransactionStatus.WAITING: 'orange'
+            }.get(txn.status, 'gray')
+
+            # Expert shortname
+            expert = transaction_experts.get(txn.id)
+            expert_shortname = ''
+            if expert:
+                expert_shortname = f"{expert.alias}-{expert.id}" if expert.alias else f"Expert-{expert.id}"
+
+            # Get orders for expansion
+            orders_data = []
+            txn_orders = []
+            if txn.id:
+                try:
+                    orders_statement = select(TradingOrder).where(
+                        TradingOrder.transaction_id == txn.id
+                    ).order_by(TradingOrder.created_at)
+                    txn_orders = list(session.exec(orders_statement).all())
+
+                    for order in txn_orders:
+                        order_type_display = order.order_type.value if hasattr(order.order_type, 'value') else str(order.order_type)
+                        order_side_display = order.side.value if hasattr(order.side, 'value') else str(order.side)
+                        order_status_display = order.status.value if hasattr(order.status, 'value') else str(order.status)
+
+                        order_category = 'Entry'
+                        if TransactionHelper.is_tpsl_order(order):
+                            if TransactionHelper.is_tp_order(order):
+                                order_category = 'Take Profit'
+                            elif TransactionHelper.is_sl_order(order):
+                                order_category = 'Stop Loss'
+                            else:
+                                order_category = 'Dependent'
+
+                        orders_data.append({
+                            'id': order.id,
+                            'type': order_type_display,
+                            'side': order_side_display,
+                            'category': order_category,
+                            'quantity': f"{order.quantity:.2f}" if order.quantity else '0.00',
+                            'filled_qty': f"{order.filled_qty:.2f}" if order.filled_qty else '0.00',
+                            'limit_price': f"${order.limit_price:.2f}" if order.limit_price else '',
+                            'stop_price': f"${order.stop_price:.2f}" if order.stop_price else '',
+                            'status': order_status_display,
+                            'status_color': self._get_order_status_color(order.status),
+                            'broker_order_id': order.broker_order_id or '',
+                            'created_at': order.created_at.strftime('%Y-%m-%d %H:%M') if order.created_at else '',
+                            'comment': order.comment or '',
+                            'expert_recommendation_id': order.expert_recommendation_id,
+                            'has_recommendation': order.expert_recommendation_id is not None
+                        })
+                except Exception as e:
+                    logger.error(f"Error loading orders for transaction {txn.id}: {e}")
+
+            # Check for missing TP/SL orders
+            has_missing_tpsl_orders = self._check_missing_tpsl_orders(txn, txn_orders)
+
+            row = {
+                'id': txn.id,
+                '_selected': False,  # Selection is managed by LiveTradesTable
+                'symbol': txn.symbol,
+                'expert': expert_shortname,
+                'quantity': f"{txn.quantity:+.2f}",
+                'open_price': f"${txn.open_price:.2f}" if txn.open_price else '',
+                'current_price': current_price_str,
+                'close_price': f"${txn.close_price:.2f}" if txn.close_price else '',
+                'take_profit': f"${txn.take_profit:.2f}" if txn.take_profit else '',
+                'stop_loss': f"${txn.stop_loss:.2f}" if txn.stop_loss else '',
+                'current_pnl': current_pnl,
+                'current_pnl_numeric': current_pnl_numeric,
+                'closed_pnl': closed_pnl,
+                'closed_pnl_numeric': closed_pnl_numeric,
+                'status': txn.status.value,
+                'status_color': status_color,
+                'created_at': txn.created_at.strftime('%Y-%m-%d %H:%M') if txn.created_at else '',
+                'closed_at': txn.close_date.strftime('%Y-%m-%d %H:%M') if txn.close_date else '',
+                'is_open': txn.status == TransactionStatus.OPENED,
+                'is_waiting': txn.status == TransactionStatus.WAITING,
+                'is_closing': txn.status == TransactionStatus.CLOSING,
+                'has_missing_tpsl_orders': has_missing_tpsl_orders,
+                'orders': orders_data,
+                'order_count': len(orders_data),
+                'actions': 'actions'
+            }
+            rows.append(row)
+
+        return rows
+
+    def _check_missing_tpsl_orders(self, txn, txn_orders) -> bool:
+        """Check if TP/SL are defined but have no valid orders."""
+        from ...core.types import TransactionStatus
+
+        if txn.status != TransactionStatus.OPENED:
+            return False
+
+        has_tp_defined = txn.take_profit is not None and txn.take_profit > 0
+        has_sl_defined = txn.stop_loss is not None and txn.stop_loss > 0
+
+        if not (has_tp_defined or has_sl_defined):
+            return False
+
+        has_valid_tp_order = False
+        has_valid_sl_order = False
+        invalid_statuses = {'canceled', 'rejected', 'error', 'expired'}
+        entry_order_types = {'market', 'limit'}
+
+        for order in txn_orders:
+            order_type = order.order_type.value.lower() if hasattr(order.order_type, 'value') else str(order.order_type).lower()
+
+            if order_type in entry_order_types and not order.depends_on_order:
+                continue
+
+            order_status = order.status.value.lower() if hasattr(order.status, 'value') else str(order.status).lower()
+            if order_status in invalid_statuses:
+                continue
+
+            order_limit_price = round(order.limit_price, 1) if order.limit_price else None
+            order_stop_price = round(order.stop_price, 1) if order.stop_price else None
+            txn_tp = round(txn.take_profit, 1) if txn.take_profit else None
+            txn_sl = round(txn.stop_loss, 1) if txn.stop_loss else None
+
+            # Check for OCO order
+            if has_tp_defined and has_sl_defined:
+                if order_type == 'oco':
+                    if order_limit_price == txn_tp and order_stop_price == txn_sl:
+                        has_valid_tp_order = True
+                        has_valid_sl_order = True
+                elif 'stop_limit' in order_type:
+                    if order_limit_price == txn_tp and order_stop_price == txn_sl:
+                        has_valid_tp_order = True
+                        has_valid_sl_order = True
+
+            # Check individual TP order
+            if has_tp_defined and not has_valid_tp_order:
+                if order_type == 'oco' and has_sl_defined:
+                    if order_limit_price == txn_tp and order_stop_price == txn_sl:
+                        has_valid_tp_order = True
+                elif ('limit' in order_type and 'stop' not in order_type) or order_type in ['sell_limit', 'buy_limit']:
+                    if order_limit_price == txn_tp:
+                        has_valid_tp_order = True
+
+            # Check individual SL order
+            if has_sl_defined and not has_valid_sl_order:
+                if order_type == 'oco' and has_tp_defined:
+                    if order_limit_price == txn_tp and order_stop_price == txn_sl:
+                        has_valid_sl_order = True
+                elif ('stop' in order_type and 'limit' not in order_type) or order_type in ['sell_stop', 'buy_stop']:
+                    if order_stop_price == txn_sl:
+                        has_valid_sl_order = True
+
+        return (has_tp_defined and not has_valid_tp_order) or (has_sl_defined and not has_valid_sl_order)
+
     def _get_transactions_data(self):
-        """Get transactions data for the table.
+        """Get transactions data for the table (legacy method for compatibility).
 
         Returns:
             List of row dictionaries for the table
@@ -622,257 +923,85 @@ class LiveTradesTab:
         finally:
             session.close()
 
+    async def _render_transactions_table_async(self):
+        """Render the main transactions table using LiveTradesTable component."""
+        logger.debug("[RENDER] _render_transactions_table_async() - START")
+
+        # Create LiveTradesTable with data loader and event handlers
+        self.live_trades_table = LiveTradesTable(
+            data_loader=self._transactions_data_loader,
+            config=LiveTradesTableConfig(
+                page_size=20,
+                table_name="LiveTradesTable",
+                show_global_filter=True,
+                show_selection=True
+            ),
+            on_edit=self._handle_edit_transaction,
+            on_close=self._handle_close_transaction,
+            on_retry_close=self._handle_retry_close_transaction,
+            on_recreate_tpsl=self._handle_recreate_tpsl,
+            on_view_recommendation=self._handle_view_recommendation,
+            on_selection_change=self._handle_selection_change
+        )
+
+        # Render the table
+        await self.live_trades_table.render()
+        logger.debug("[RENDER] _render_transactions_table_async() - END")
+
+    def _handle_edit_transaction(self, transaction_id: int):
+        """Handle edit button click from LiveTradesTable."""
+        # Create mock event_data for compatibility
+        class EventData:
+            args = transaction_id
+        self._show_edit_dialog(EventData())
+
+    def _handle_close_transaction(self, transaction_id: int):
+        """Handle close button click from LiveTradesTable."""
+        class EventData:
+            args = transaction_id
+        self._show_close_dialog(EventData())
+
+    def _handle_retry_close_transaction(self, transaction_id: int):
+        """Handle retry close button click from LiveTradesTable."""
+        class EventData:
+            args = transaction_id
+        self._show_retry_close_dialog(EventData())
+
+    def _handle_recreate_tpsl(self, transaction_id: int):
+        """Handle recreate TP/SL button click from LiveTradesTable."""
+        class EventData:
+            args = transaction_id
+        self._recreate_tpsl_orders(EventData())
+
+    def _handle_view_recommendation(self, rec_id: int):
+        """Handle view recommendation button click from LiveTradesTable."""
+        class EventData:
+            args = rec_id
+        self._show_recommendation_dialog(EventData())
+
+    def _handle_selection_change(self, selected_ids: List[int]):
+        """Handle selection change from LiveTradesTable."""
+        self._update_batch_buttons_for_selection(len(selected_ids))
+
+    def _update_batch_buttons_for_selection(self, count: int):
+        """Update batch operation buttons based on selection count."""
+        has_selection = count > 0
+
+        if hasattr(self, 'batch_select_all_btn'):
+            self.batch_select_all_btn.set_visibility(True)
+        if hasattr(self, 'batch_clear_btn'):
+            self.batch_clear_btn.set_visibility(has_selection)
+        if hasattr(self, 'batch_close_btn'):
+            self.batch_close_btn.set_visibility(has_selection)
+        if hasattr(self, 'batch_adjust_tp_btn'):
+            self.batch_adjust_tp_btn.set_visibility(has_selection)
+
     def _render_transactions_table(self):
-        """Render the main transactions table."""
-        logger.debug("[RENDER] _render_transactions_table() - START")
-
-        # Get transactions data
-        logger.debug("[RENDER] Calling _get_transactions_data()...")
-        rows = self._get_transactions_data()
-        logger.debug(f"[RENDER] Got {len(rows) if rows else 0} rows")
-
-        if not rows:
-            logger.debug("[RENDER] No rows, showing 'No transactions found' message")
-            ui.label('No transactions found.').classes('text-gray-500')
-            return
-
-        # Table columns
-        columns = [
-            {'name': 'select', 'label': '', 'field': 'select', 'align': 'left', 'sortable': False},  # Selection checkbox column
-            {'name': 'expand', 'label': '', 'field': 'expand', 'align': 'left'},  # Expand column
-            {'name': 'id', 'label': 'ID', 'field': 'id', 'align': 'center', 'sortable': True},
-            {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left', 'sortable': True},
-            {'name': 'expert', 'label': 'Expert', 'field': 'expert', 'align': 'left', 'sortable': True},
-            {'name': 'quantity', 'label': 'Qty', 'field': 'quantity', 'align': 'right', 'sortable': True},
-            {'name': 'open_price', 'label': 'Open Price', 'field': 'open_price', 'align': 'right', 'sortable': True},
-            {'name': 'current_price', 'label': 'Current', 'field': 'current_price', 'align': 'right'},
-            {'name': 'close_price', 'label': 'Close Price', 'field': 'close_price', 'align': 'right'},
-            {'name': 'take_profit', 'label': 'TP', 'field': 'take_profit', 'align': 'right'},
-            {'name': 'stop_loss', 'label': 'SL', 'field': 'stop_loss', 'align': 'right'},
-            {'name': 'current_pnl', 'label': 'Current P/L', 'field': 'current_pnl_numeric', 'align': 'right', 'sortable': True},
-            {'name': 'closed_pnl', 'label': 'Closed P/L', 'field': 'closed_pnl_numeric', 'align': 'right', 'sortable': True},
-            {'name': 'status', 'label': 'Status', 'field': 'status', 'align': 'center', 'sortable': True},
-            {'name': 'order_count', 'label': 'Orders', 'field': 'order_count', 'align': 'center'},
-            {'name': 'created_at', 'label': 'Created', 'field': 'created_at', 'align': 'left', 'sortable': True},
-            {'name': 'closed_at', 'label': 'Closed', 'field': 'closed_at', 'align': 'left', 'sortable': True},
-            {'name': 'actions', 'label': 'Actions', 'field': 'actions', 'align': 'center'}
-        ]
-
-        # Create table with expansion support
-        logger.debug(f"[RENDER] _render_transactions_table() - Creating table with {len(rows)} rows")
-        self.transactions_table = ui.table(
-            columns=columns,
-            rows=rows,
-            row_key='id',
-            pagination={'rowsPerPage': 20}
-        ).classes('w-full').props('flat bordered')
-
-        # Add row selection via click handler
-        # Store reference to rows for selection tracking
-        def on_row_click(row_data):
-            """Handle row clicks to toggle selection."""
-            row_id = row_data['id']
-            if row_id in self.selected_transactions:
-                del self.selected_transactions[row_id]
-            else:
-                self.selected_transactions[row_id] = True
-            self._update_batch_buttons()
-            # Refresh table to show updated styling
-            self.transactions_table.update()
-
-        # Attach click handler to table rows via Quasar's row-click event
-        self.transactions_table.props('row-key="id" @row-click="(evt, row) => {}"')
-
-        # We'll manually handle selection in the Vue template slot instead
-        # Store the click handler for reference
-        self._on_row_click = on_row_click
-
-        # Add expand button in second column
-        self.transactions_table.add_slot('body-cell-expand', '''
-            <q-td :props="props">
-                <q-btn
-                    size="sm"
-                    color="primary"
-                    round
-                    dense
-                    @click="props.expand = !props.expand"
-                    :icon="props.expand ? 'expand_less' : 'expand_more'"
-                />
-            </q-td>
-        ''')
-
-        # Add expansion details showing orders
-        self.transactions_table.add_slot('body', '''
-                <q-tr :props="props">
-                    <q-td v-for="col in props.cols" :key="col.name" :props="props">
-                        <template v-if="col.name === 'select'">
-                            <q-checkbox
-                                :model-value="props.row._selected || false"
-                                @update:model-value="(val) => $parent.$emit('toggle_row_selection', props.row.id)"
-                            />
-                        </template>
-                        <template v-else-if="col.name === 'expand'">
-                            <q-btn
-                                size="sm"
-                                color="primary"
-                                round
-                                dense
-                                @click="props.expand = !props.expand"
-                                :icon="props.expand ? 'expand_less' : 'expand_more'"
-                            />
-                        </template>
-                        <template v-else-if="col.name === 'status'">
-                            <q-badge :color="props.row.status_color" :label="col.value" />
-                        </template>
-                        <template v-else-if="col.name === 'current_pnl'">
-                            <span :class="props.row.current_pnl_numeric > 0 ? 'text-green-600 font-bold' : props.row.current_pnl_numeric < 0 ? 'text-red-600 font-bold' : ''">
-                                {{ props.row.current_pnl }}
-                            </span>
-                        </template>
-                        <template v-else-if="col.name === 'closed_pnl'">
-                            <span :class="props.row.closed_pnl_numeric > 0 ? 'text-green-600 font-bold' : props.row.closed_pnl_numeric < 0 ? 'text-red-600 font-bold' : ''">
-                                {{ props.row.closed_pnl }}
-                            </span>
-                        </template>
-                        <template v-else-if="col.name === 'actions'">
-                            <q-btn v-if="props.row.has_missing_tpsl_orders"
-                                   icon="warning"
-                                   size="sm"
-                                   flat
-                                   round
-                                   color="warning"
-                                   @click="$parent.$emit('recreate_tpsl_orders', props.row.id)"
-                                   title="TP/SL defined but no valid orders - Click to recreate"
-                            >
-                                <q-tooltip>TP/SL defined but no valid orders - Click to recreate</q-tooltip>
-                            </q-btn>
-                            <q-btn v-if="props.row.is_open"
-                                   icon="edit"
-                                   size="sm"
-                                   flat
-                                   round
-                                   color="primary"
-                                   @click="$parent.$emit('edit_transaction', props.row.id)"
-                                   title="Adjust TP/SL"
-                            />
-                            <q-btn v-if="(props.row.is_open || props.row.is_waiting) && !props.row.is_closing"
-                                   icon="close"
-                                   size="sm"
-                                   flat
-                                   round
-                                   color="negative"
-                                   @click="$parent.$emit('close_transaction', props.row.id)"
-                                   :title="props.row.is_waiting ? 'Cancel Orders' : 'Close Position'"
-                            />
-                            <q-btn v-else-if="props.row.is_closing"
-                                   icon="refresh"
-                                   size="sm"
-                                   flat
-                                   round
-                                   color="orange"
-                                   @click="$parent.$emit('retry_close_transaction', props.row.id)"
-                                   title="Retry Close (reset status and try again)"
-                            />
-                            <span v-else class="text-grey-5">—</span>
-                        </template>
-                        <template v-else>
-                            {{ col.value }}
-                        </template>
-                    </q-td>
-                </q-tr>
-                <q-tr v-show="props.expand" :props="props" class="bg-blue-50">
-                    <q-td colspan="100%">
-                        <div class="q-pa-md">
-                            <div class="text-subtitle2 q-mb-sm">📋 Related Orders ({{ props.row.order_count }})</div>
-                            <q-markup-table flat bordered dense v-if="props.row.orders.length > 0">
-                                <thead>
-                                    <tr class="bg-grey-3">
-                                        <th class="text-left">ID</th>
-                                        <th class="text-left">Category</th>
-                                        <th class="text-left">Type</th>
-                                        <th class="text-left">Side</th>
-                                        <th class="text-right">Quantity</th>
-                                        <th class="text-right">Filled</th>
-                                        <th class="text-right">Limit Price</th>
-                                        <th class="text-right">Stop Price</th>
-                                        <th class="text-center">Status</th>
-                                        <th class="text-left">Broker ID</th>
-                                        <th class="text-left">Created</th>
-                                        <th class="text-left">Comment</th>
-                                        <th class="text-center">Actions</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    <tr v-for="order in props.row.orders" :key="order.id">
-                                        <td class="text-left">{{ order.id }}</td>
-                                        <td class="text-left">
-                                            <q-badge :color="order.category === 'Entry' ? 'blue' : order.category === 'Take Profit' ? 'green' : order.category === 'Stop Loss' ? 'red' : 'grey'"
-                                                     :label="order.category" />
-                                        </td>
-                                        <td class="text-left">{{ order.type }}</td>
-                                        <td class="text-left">
-                                            <q-badge :color="order.side === 'BUY' ? 'positive' : 'negative'" :label="order.side" />
-                                        </td>
-                                        <td class="text-right">{{ order.quantity }}</td>
-                                        <td class="text-right">{{ order.filled_qty }}</td>
-                                        <td class="text-right">{{ order.limit_price }}</td>
-                                        <td class="text-right">{{ order.stop_price }}</td>
-                                        <td class="text-center">
-                                            <q-badge :color="order.status_color" :label="order.status" />
-                                        </td>
-                                        <td class="text-left text-caption">{{ order.broker_order_id }}</td>
-                                        <td class="text-left">{{ order.created_at }}</td>
-                                        <td class="text-left text-caption">{{ order.comment }}</td>
-                                        <td class="text-center">
-                                            <q-btn v-if="order.has_recommendation"
-                                                   icon="info"
-                                                   size="sm"
-                                                   flat
-                                                   round
-                                                   color="primary"
-                                                   @click="$parent.$emit('view_recommendation', order.expert_recommendation_id)"
-                                                   title="View Expert Recommendation"
-                                            />
-                                            <span v-else class="text-grey-5">—</span>
-                                        </td>
-                                    </tr>
-                                </tbody>
-                            </q-markup-table>
-                            <div v-else class="text-grey-6 text-center q-pa-md">No orders found for this transaction</div>
-                        </div>
-                    </q-td>
-                </q-tr>
-        ''')
-
-        # Handle events
-        logger.debug("[RENDER] _render_transactions_table() - Setting up event handlers")
-        self.transactions_table.on('toggle_row_selection', self._toggle_row_selection)
-        self.transactions_table.on('edit_transaction', self._show_edit_dialog)
-        self.transactions_table.on('close_transaction', self._show_close_dialog)
-        self.transactions_table.on('retry_close_transaction', self._show_retry_close_dialog)
-        self.transactions_table.on('recreate_tpsl_orders', self._recreate_tpsl_orders)
-        self.transactions_table.on('view_recommendation', self._show_recommendation_dialog)
-        logger.debug("[RENDER] _render_transactions_table() - END (success)")
-
-    def _toggle_row_selection(self, event_data):
-        """Toggle selection state for a transaction row."""
-        # Extract transaction_id from event_data
-        transaction_id = event_data.args if hasattr(event_data, 'args') else event_data
-
-        if transaction_id in self.selected_transactions:
-            del self.selected_transactions[transaction_id]
-        else:
-            self.selected_transactions[transaction_id] = True
-
-        # Update the specific row's _selected flag in the table data
-        for row in self.transactions_table.rows:
-            if row['id'] == transaction_id:
-                row['_selected'] = transaction_id in self.selected_transactions
-                break
-
-        self._update_batch_buttons()
-        # Refresh table to show updated checkbox state
-        self.transactions_table.update()
+        """Render the main transactions table (sync wrapper for compatibility)."""
+        async def _render_in_context():
+            with self.transactions_container:
+                await self._render_transactions_table_async()
+        asyncio.create_task(_render_in_context())
 
     def _recreate_tpsl_orders(self, event_data):
         """Recreate TP/SL orders for a transaction that has TP/SL defined but no valid orders."""
@@ -1626,36 +1755,21 @@ class LiveTradesTab:
 
     def _select_all_transactions(self):
         """Select all visible transactions."""
-        if not self.transactions_table:
-            return
-
-        # Select all current rows
-        for row in self.transactions_table.rows:
-            self.selected_transactions[row['id']] = True
-            row['_selected'] = True
-
-        self._update_batch_buttons()
-        # Update table to show checkboxes
-        self.transactions_table.update()
+        if self.live_trades_table:
+            self.live_trades_table.select_all_visible()
 
     def _clear_selected_transactions(self):
         """Clear all selected transactions."""
-        self.selected_transactions.clear()
-        # Update all rows to reflect cleared selection
-        if self.transactions_table:
-            for row in self.transactions_table.rows:
-                row['_selected'] = False
-        self._update_batch_buttons()
-        # Update table to hide checkboxes
-        if self.transactions_table:
-            self.transactions_table.update()
+        if self.live_trades_table:
+            self.live_trades_table.clear_selection()
 
     def _update_batch_buttons(self):
         """Show/hide batch operation buttons based on selection."""
         if not hasattr(self, 'batch_close_btn'):
             return
 
-        has_selection = len(self.selected_transactions) > 0
+        count = len(self.live_trades_table.get_selected_ids()) if self.live_trades_table else 0
+        has_selection = count > 0
 
         self.batch_select_all_btn.set_visibility(True)
         self.batch_clear_btn.set_visibility(has_selection)
@@ -1664,11 +1778,15 @@ class LiveTradesTab:
 
     def _batch_close_transactions(self):
         """Show confirmation dialog and close all selected transactions."""
-        if not self.selected_transactions:
+        if not self.live_trades_table:
+            return
+            
+        selected_ids = self.live_trades_table.get_selected_ids()
+        if not selected_ids:
             ui.notify('No transactions selected', type='warning')
             return
 
-        count = len(self.selected_transactions)
+        count = len(selected_ids)
 
         with ui.dialog() as dialog, ui.card().classes('w-full max-w-sm'):
             ui.label('Confirm Batch Close').classes('text-h6 mb-4')
@@ -1686,7 +1804,10 @@ class LiveTradesTab:
         """Execute batch close operation (async, non-blocking)."""
         dialog.close()
 
-        transaction_ids = list(self.selected_transactions.keys())
+        if not self.live_trades_table:
+            return
+            
+        transaction_ids = self.live_trades_table.get_selected_ids()
         if not transaction_ids:
             ui.notify('No transactions selected', type='warning')
             return
@@ -1764,11 +1885,15 @@ class LiveTradesTab:
 
     def _batch_adjust_tp_dialog(self):
         """Show dialog to set TP percentage for batch of transactions."""
-        if not self.selected_transactions:
+        if not self.live_trades_table:
+            return
+            
+        selected_ids = self.live_trades_table.get_selected_ids()
+        if not selected_ids:
             ui.notify('No transactions selected', type='warning')
             return
 
-        count = len(self.selected_transactions)
+        count = len(selected_ids)
 
         with ui.dialog() as dialog, ui.card().classes('w-full max-w-sm'):
             ui.label('Batch Adjust Take Profit').classes('text-h6 mb-4')
@@ -1796,7 +1921,10 @@ class LiveTradesTab:
         """Execute batch TP adjustment (async, non-blocking)."""
         dialog.close()
 
-        transaction_ids = list(self.selected_transactions.keys())
+        if not self.live_trades_table:
+            return
+            
+        transaction_ids = self.live_trades_table.get_selected_ids()
         if not transaction_ids:
             ui.notify('No transactions selected', type='warning')
             return
@@ -1922,6 +2050,7 @@ class LiveTradesTab:
         ui.notify(f'Adjusting TP for {len(transaction_ids)} transaction{"s" if len(transaction_ids) != 1 else ""}...', type='info')
 
 
-def content():
+async def content():
     """Render the live trades page content."""
-    LiveTradesTab()
+    tab = LiveTradesTab()
+    await tab.render()

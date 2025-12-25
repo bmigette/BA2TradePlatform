@@ -9,14 +9,15 @@ risk manager runs, analysis execution, and more.
 from nicegui import ui
 from sqlmodel import select, or_, and_, Session
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Dict, Any, List
 import asyncio
 
 from ...core.db import get_db, get_instance
 from ...core.models import ActivityLog, ExpertInstance, AccountDefinition
 from ...core.types import ActivityLogSeverity, ActivityLogType
 from ...logger import logger
-from ..utils.TableCacheManager import TableCacheManager, AsyncTableLoader
+from ..components.LazyTable import LazyTable, ColumnDef, LazyTableConfig
+from ..utils.perf_logger import PerfLogger
 
 
 class ActivityMonitorPage:
@@ -32,62 +33,36 @@ class ActivityMonitorPage:
         self.filter_text: str = ""
         
         # UI components (will be set during render)
-        self.activities_table = None
+        self.lazy_table: Optional[LazyTable] = None
         self.auto_refresh_switch = None
         self.refresh_interval_input = None
-        
-        # Initialize cache manager and async loader
-        self.cache_manager = TableCacheManager("ActivityMonitor")
-        self.async_loader = None
-        
-    async def refresh_activities(self):
-        """Refresh the activities table with current filters and async loading."""
-        if not self.activities_table:
-            return
-        
-        try:
-            # Get filter state
-            filter_state = self._get_filter_state()
-            
-            # Check if filters changed and invalidate cache if needed
-            if self.cache_manager.should_invalidate_cache(filter_state):
-                logger.debug("[ActivityMonitor] Filters changed, invalidating cache")
-                self.cache_manager.invalidate_cache()
-            
-            # Use cache manager for data fetching
-            rows, _ = await self.cache_manager.get_data(
-                fetch_func=self._fetch_activities_raw,
-                filter_state=filter_state,
-                format_func=self._format_activities_rows
-            )
-            
-            # Update table rows directly to preserve pagination state
-            # Don't use AsyncTableLoader as it can lose pagination controls
-            if self.activities_table:
-                self.activities_table.rows = rows
-                self.activities_table.update()
-            
-            #logger.debug(f"[ActivityMonitor] Loaded {len(rows)} activities")
-            
-        except Exception as e:
-            logger.error(f"Error refreshing activities: {e}", exc_info=True)
-            ui.notify(f"Error refreshing activities: {str(e)}", type="negative")
     
-    def _get_filter_state(self) -> tuple:
-        """Get current filter state for cache invalidation."""
-        return (tuple(self.filter_types), self.filter_severity, self.filter_expert_id, self.filter_text)
-    
-    def _fetch_activities_raw(self):
-        """Fetch raw activities from database."""
+    def _data_loader(
+        self,
+        page: int,
+        page_size: int,
+        filters: Dict[str, Any],
+        sort_by: Optional[str],
+        descending: bool
+    ) -> tuple[List[dict], int]:
+        """
+        Data loader callback for LazyTable.
+        
+        Handles server-side filtering, sorting, and pagination.
+        """
         try:
             with Session(get_db().bind) as session:
                 # Build query with filters
-                query = select(ActivityLog).order_by(ActivityLog.created_at.desc())
+                query = select(ActivityLog)
                 
-                filters = []
+                db_filters = []
                 
+                # Apply filters from LazyTable
+                global_filter = filters.get('_global', '').lower()
+                
+                # Apply activity type filter
                 if self.filter_types:
-                    filters.append(ActivityLog.type.in_(self.filter_types))
+                    db_filters.append(ActivityLog.type.in_(self.filter_types))
                     
                 if self.filter_severity:
                     severity_order = [
@@ -98,25 +73,56 @@ class ActivityMonitorPage:
                         ActivityLogSeverity.FAILURE
                     ]
                     severity_index = severity_order.index(self.filter_severity)
-                    filters.append(ActivityLog.severity.in_(severity_order[severity_index:]))
+                    db_filters.append(ActivityLog.severity.in_(severity_order[severity_index:]))
                     
                 if self.filter_expert_id and self.filter_expert_id > 0:
-                    filters.append(ActivityLog.source_expert_id == self.filter_expert_id)
+                    db_filters.append(ActivityLog.source_expert_id == self.filter_expert_id)
                     
-                if self.filter_text:
-                    filters.append(ActivityLog.description.contains(self.filter_text))
+                # Text filter from either global or specific filter
+                text_filter = filters.get('description', '') or self.filter_text or global_filter
+                if text_filter:
+                    db_filters.append(ActivityLog.description.icontains(text_filter))
                 
-                if filters:
-                    query = query.where(and_(*filters))
+                if db_filters:
+                    query = query.where(and_(*db_filters))
                 
-                # Limit to last 1000 activities for performance
-                query = query.limit(1000)
+                # Apply sorting
+                if sort_by:
+                    sort_column = getattr(ActivityLog, sort_by, None)
+                    if sort_column:
+                        if descending:
+                            query = query.order_by(sort_column.desc())
+                        else:
+                            query = query.order_by(sort_column.asc())
+                else:
+                    # Default sort by timestamp descending
+                    query = query.order_by(ActivityLog.created_at.desc())
+                
+                # Get total count first (before pagination)
+                count_query = select(ActivityLog)
+                if db_filters:
+                    count_query = count_query.where(and_(*db_filters))
+                total_count = len(session.exec(count_query).all())
+                
+                # Apply pagination
+                offset = (page - 1) * page_size
+                query = query.offset(offset).limit(page_size)
                 
                 activities = session.exec(query).all()
-                return activities
+                
+                # Format activities for display
+                rows = self._format_activities_rows(activities)
+                
+                return rows, total_count
+                
         except Exception as e:
-            logger.error(f"Error fetching activities: {e}", exc_info=True)
-            return []
+            logger.error(f"Error loading activities: {e}", exc_info=True)
+            return [], 0
+        
+    async def refresh_activities(self):
+        """Refresh the activities table."""
+        if self.lazy_table:
+            await self.lazy_table.refresh()
     
     def _format_activities_rows(self, activities) -> list:
         """Format activities into table rows."""
@@ -225,8 +231,10 @@ class ActivityMonitorPage:
         await self.refresh_activities()
         ui.notify("Filters cleared", type="info")
     
-    def render(self):
+    async def render(self):
         """Render the activity monitor page."""
+        render_timer = PerfLogger.start(PerfLogger.PAGE, PerfLogger.RENDER, "ActivityMonitor")
+        
         ui.markdown("## 📋 Activity Monitor")
         ui.markdown("Track all significant system operations in real-time")
         
@@ -297,53 +305,11 @@ class ActivityMonitorPage:
                 ui.button("Apply Filters", on_click=lambda: asyncio.create_task(self.apply_filters()), icon="check").props("color=primary")
                 ui.button("Clear Filters", on_click=lambda: asyncio.create_task(self.clear_filters()), icon="clear").props("outline")
         
-        # Activities table container
-        self.table_container = ui.column().classes("w-full")
-        with self.table_container:
-            with ui.card().classes("w-full"):
-                with ui.row().classes("w-full items-center gap-2 mb-2"):
-                    ui.label("Activity Log").classes("text-lg font-bold")
-                    ui.spinner('dots').classes('ml-auto')
-                ui.label("Loading activities...").classes("text-sm text-gray-500")
-        
-        # Initial load and start auto-refresh
-        asyncio.create_task(self._async_load_activities())
-        
-        # Start auto-refresh task since it's enabled by default
-        if self.auto_refresh and (not self.refresh_task or self.refresh_task.done()):
-            self.refresh_task = asyncio.create_task(self.auto_refresh_loop())
-
-    async def _async_load_activities(self):
-        """Load activities asynchronously on initial render."""
-        try:
-            logger.debug("[ActivityMonitor] Starting async activity load")
-            
-            # Fetch and format activities
-            activities = await asyncio.to_thread(self._fetch_activities_raw)
-            rows = self._format_activities_rows(activities)
-            
-            #logger.debug(f"[ActivityMonitor] Loaded {len(rows)} activities")
-            
-            # Update the table container with actual table
-            self.table_container.clear()
-            with self.table_container:
-                with ui.card().classes("w-full"):
-                    self.activities_table = ui.table(
-                        columns=[
-                            {"name": "timestamp", "label": "Timestamp", "field": "timestamp", "align": "left", "sortable": True},
-                            {"name": "severity", "label": "Severity", "field": "severity", "align": "center", "sortable": True},
-                            {"name": "type", "label": "Type", "field": "type", "align": "left", "sortable": True},
-                            {"name": "expert", "label": "Expert", "field": "expert", "align": "left", "sortable": True},
-                            {"name": "account", "label": "Account", "field": "account", "align": "left", "sortable": True},
-                            {"name": "description", "label": "Description", "field": "description", "align": "left"},
-                        ],
-                        rows=rows,
-                        row_key="id",
-                        pagination={"rowsPerPage": 50, "sortBy": "timestamp", "descending": True}
-                    ).classes("w-full")
-                    
-                    # Add custom styling for severity column
-                    self.activities_table.add_slot('body-cell-severity', '''
+        # Define columns for LazyTable
+        columns = [
+            ColumnDef(name='timestamp', label='Timestamp', field='timestamp', sortable=True, align='left'),
+            ColumnDef(name='severity', label='Severity', field='severity', sortable=True, align='center',
+                      slot_template='''
                         <q-td :props="props">
                             <q-badge 
                                 :color="props.value === 'success' ? 'green' : 
@@ -353,19 +319,44 @@ class ActivityMonitorPage:
                                 :label="props.value"
                             />
                         </q-td>
-                    ''')
-            
-            logger.debug("[ActivityMonitor] Activity table loaded successfully")
-        except Exception as e:
-            logger.error(f"[ActivityMonitor] Error loading activities: {e}", exc_info=True)
-            self.table_container.clear()
-            with self.table_container:
-                with ui.card().classes("w-full"):
-                    ui.label("Error Loading Activities").classes("text-md font-bold text-red-600")
-                    ui.label(f"Failed to load data: {str(e)}").classes("text-sm text-gray-600")
+                      '''),
+            ColumnDef(name='type', label='Type', field='type', sortable=True, align='left'),
+            ColumnDef(name='expert', label='Expert', field='expert', sortable=True, align='left'),
+            ColumnDef(name='account', label='Account', field='account', sortable=True, align='left'),
+            ColumnDef(name='description', label='Description', field='description', align='left', filterable=True),
+        ]
+        
+        # Configure LazyTable
+        config = LazyTableConfig(
+            page_size=50,
+            page_size_options=[25, 50, 100, 200],
+            row_key='id',
+            show_global_filter=True,
+            show_column_filters=False,  # We have custom filters above
+            default_sort_by='timestamp',
+            default_sort_descending=True,
+            auto_refresh_interval=0,  # We manage auto-refresh ourselves
+            table_name='ActivityMonitorTable'
+        )
+        
+        # Create and render LazyTable
+        with ui.card().classes("w-full"):
+            ui.label("Activity Log").classes("text-lg font-bold mb-2")
+            self.lazy_table = LazyTable(
+                columns=columns,
+                data_loader=self._data_loader,
+                config=config
+            )
+            await self.lazy_table.render()
+        
+        # Start auto-refresh task since it's enabled by default
+        if self.auto_refresh and (not self.refresh_task or self.refresh_task.done()):
+            self.refresh_task = asyncio.create_task(self.auto_refresh_loop())
+        
+        render_timer.stop()
 
 
-def render():
+async def render():
     """Entry point for the activity monitor page."""
     page = ActivityMonitorPage()
-    page.render()
+    await page.render()

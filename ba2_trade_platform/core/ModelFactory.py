@@ -27,7 +27,7 @@ from .models_registry import (
     get_model_for_provider, get_provider_config, parse_model_selection,
     get_model_default_kwargs,
     PROVIDER_OPENAI, PROVIDER_NAGAAI, PROVIDER_GOOGLE, PROVIDER_ANTHROPIC, PROVIDER_OPENROUTER,
-    PROVIDER_XAI, PROVIDER_MOONSHOT
+    PROVIDER_XAI, PROVIDER_MOONSHOT, PROVIDER_DEEPSEEK
 )
 from ..config import get_app_setting, OPENAI_ENABLE_STREAMING, OPENAI_BACKEND_URL
 from ..logger import logger
@@ -828,13 +828,27 @@ class ModelFactory:
             return cls._call_kimi_websearch(model_name, prompt, base_url, api_key, max_tokens, temperature)
         
         else:
-            # For other providers, try NagaAI as a fallback (it supports many models)
-            logger.warning(f"Unknown provider '{provider}' for web search, trying NagaAI proxy")
-            nagaai_config = get_provider_config(PROVIDER_NAGAAI)
-            base_url = nagaai_config.get('base_url', 'https://api.naga.ac/v1') if nagaai_config else 'https://api.naga.ac/v1'
-            api_key_setting = nagaai_config.get('api_key_setting', 'naga_ai_api_key') if nagaai_config else 'naga_ai_api_key'
-            api_key = get_app_setting(api_key_setting) or "dummy-key"
-            return cls._call_nagaai_websearch(model_name, prompt, base_url, api_key, max_tokens, temperature)
+            # Model does not support web search - raise error instead of fallback
+            from .models_registry import model_supports_websearch
+            
+            # Check if model has websearch label
+            if not model_supports_websearch(friendly_name):
+                error_msg = (
+                    f"Model '{friendly_name}' does not support web search. "
+                    f"Web search is only available for models with the 'websearch' label. "
+                    f"Please select a different model that supports web search in your settings."
+                )
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+            else:
+                # Model has websearch label but provider not recognized
+                error_msg = (
+                    f"Provider '{provider}' does not have web search implementation. "
+                    f"Supported providers with web search: OpenAI, NagaAI, xAI, Google, Moonshot. "
+                    f"Model '{friendly_name}' cannot be used for web search with provider '{provider}'."
+                )
+                logger.error(error_msg)
+                raise ValueError(error_msg)
 
 
     @classmethod

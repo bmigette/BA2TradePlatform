@@ -49,14 +49,14 @@ class FMPSenateTradeTab:
         """Render the FMP Senate Trade tab content."""
         with ui.card().classes('w-full'):
             ui.label('FMP Senate & House Trade Browser').classes('text-lg font-bold')
-            ui.label('Search and explore trades made by US Senators and House Representatives').classes('text-sm text-gray-600 mb-4')
+            ui.label('Search and explore trades made by US Senators and House Representatives').classes('text-sm text-secondary-custom mb-4')
             
             # API key warning
             if not self._api_key:
-                with ui.card().classes('w-full bg-yellow-100 border-yellow-500 mb-4'):
+                with ui.card().classes('w-full alert-banner warning mb-4'):
                     with ui.row().classes('items-center gap-2'):
-                        ui.icon('warning', color='orange')
-                        ui.label('FMP API key not configured. Please set FMP_API_KEY in Settings > App Settings.').classes('text-yellow-800')
+                        ui.icon('warning', color='warning')
+                        ui.label('FMP API key not configured. Please set FMP_API_KEY in Settings > App Settings.').classes('text-[#ffd93d]')
             
             # Filters row
             with ui.card().classes('w-full mb-4'):
@@ -497,10 +497,10 @@ class AnalystRatingsTab:
                 missing_keys.append('finnhub_api_key')
             
             if missing_keys:
-                with ui.card().classes('w-full bg-yellow-100 border-yellow-500 mb-4'):
+                with ui.card().classes('w-full alert-banner warning mb-4'):
                     with ui.row().classes('items-center gap-2'):
-                        ui.icon('warning', color='orange')
-                        ui.label(f'Missing API keys: {", ".join(missing_keys)}. Configure in Settings > App Settings.').classes('text-yellow-800')
+                        ui.icon('warning', color='warning')
+                        ui.label(f'Missing API keys: {", ".join(missing_keys)}. Configure in Settings > App Settings.').classes('text-[#ffd93d]')
             
             # Search section
             with ui.card().classes('w-full mb-4'):

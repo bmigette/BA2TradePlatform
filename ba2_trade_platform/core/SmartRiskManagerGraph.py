@@ -597,6 +597,9 @@ Research market analyses and recommend specific trading actions. You have FULL A
 ## 🚨 YOUR OPEN POSITIONS (VALID TRANSACTION IDs) 🚨
 {current_positions_summary}
 
+## 📊 AGGREGATE TRADE SUMMARY (ALL EXPERTS) 📊
+{trade_summary_by_symbol}
+
 ## PORTFOLIO CONTEXT
 {agent_scratchpad}
 
@@ -608,6 +611,7 @@ Research market analyses and recommend specific trading actions. You have FULL A
 
 **Research Tools:**
 - `get_positions_tool()` - Get portfolio positions with transaction_ids, quantities, TP/SL levels
+- `get_trade_summary_by_symbol_tool()` - Get aggregated BUY/SELL quantities across ALL experts (use for hedging check)
 - `get_current_price_tool(symbol)` - Get price for one symbol
 - `get_current_prices_tool(symbols: List[str])` - Get prices for multiple symbols (RECOMMENDED)
 - `get_all_recent_analyses_tool(max_age_hours=72)` - Discover all available analyses
@@ -642,6 +646,9 @@ Research market analyses and recommend specific trading actions. You have FULL A
 - If symbol has open position: use `recommend_adjust_quantity()` to add, NOT `recommend_open_*_position()`
 - To reverse direction: close existing position first, then open opposite
 - NEVER have both BUY and SELL on same symbol simultaneously
+
+**Hedging Check{hedging_check_note}:**
+{hedging_instructions}
 
 **TP/SL on New Positions:**
 - Include `tp_price`/`sl_price` in `recommend_open_*_position()` - they're set automatically
@@ -882,6 +889,49 @@ def create_toolkit_tools(toolkit: SmartRiskManagerToolkit) -> List:
             "filled_positions": portfolio["open_positions"],
             "pending_positions": portfolio.get("pending_positions", [])
         }
+    
+    @tool
+    @smart_risk_manager_tool
+    def get_trade_summary_by_symbol_tool() -> str:
+        """Get aggregated buy/sell quantities per symbol across ALL experts on the account.
+        
+        Use this tool to:
+        - Check overall market exposure (long vs short bias)
+        - Identify excessive one-directional positions when hedging is disabled
+        - Verify no hedging conflicts when hedging is enabled
+        - Assess portfolio balance before opening new positions
+        
+        This includes BOTH filled positions AND pending orders across all experts.
+        
+        Returns:
+            Formatted summary showing BUY and SELL quantities for each symbol
+            
+        Example output:
+            AAPL: BUY QTY 150, SELL QTY 50
+            TSLA: BUY QTY 0, SELL QTY 200
+            NVDA: BUY QTY 300, SELL QTY 0
+        """
+        summary = toolkit.get_trade_summary_by_symbol()
+        
+        if not summary:
+            return "No positions or pending orders found across any experts on this account."
+        
+        result = []
+        result.append("## TRADE SUMMARY BY SYMBOL (All Experts)")
+        result.append("")
+        result.append("**Format:** SYMBOL: BUY QTY X, SELL QTY Y")
+        result.append("")
+        
+        # Sort symbols alphabetically for consistency
+        for symbol in sorted(summary.keys()):
+            buy_qty = summary[symbol]["buy_qty"]
+            sell_qty = summary[symbol]["sell_qty"]
+            result.append(f"{symbol}: BUY QTY {buy_qty:.0f}, SELL QTY {sell_qty:.0f}")
+        
+        result.append("")
+        result.append(f"**Total symbols with exposure:** {len(summary)}")
+        
+        return "\n".join(result)
     
     @tool
     @smart_risk_manager_tool
@@ -1603,15 +1653,39 @@ def initialize_research_agent(state: SmartRiskManagerState) -> Dict[str, Any]:
         open_positions = state.get('open_positions', [])
         current_positions_summary = _build_positions_summary(open_positions)
         
+        # Get trade summary by symbol (aggregated across all experts)
+        trade_summary = toolkit.get_trade_summary_by_symbol()
+        if trade_summary:
+            trade_summary_lines = ["**Format:** SYMBOL: BUY QTY X, SELL QTY Y", ""]
+            for symbol in sorted(trade_summary.keys()):
+                buy_qty = trade_summary[symbol]["buy_qty"]
+                sell_qty = trade_summary[symbol]["sell_qty"]
+                trade_summary_lines.append(f"{symbol}: BUY QTY {buy_qty:.0f}, SELL QTY {sell_qty:.0f}")
+            trade_summary_by_symbol = "\n".join(trade_summary_lines)
+        else:
+            trade_summary_by_symbol = "No positions or pending orders found across any experts."
+        
+        # Build hedging instructions based on allow_hedging setting
+        allow_hedging = expert.get_setting_with_interface_default("allow_hedging")
+        if allow_hedging:
+            hedging_check_note = " (ENABLED)"
+            hedging_instructions = "- Hedging is ENABLED - You may open opposite positions on symbols where positions exist\n- Use `get_trade_summary_by_symbol_tool()` to verify aggregate exposure across all experts\n- Consider hedging opportunities when market conditions suggest opposite direction exposure"
+        else:
+            hedging_check_note = " (DISABLED - CRITICAL)"
+            hedging_instructions = "- ⚠️ Hedging is DISABLED - You CANNOT open positions in opposite direction on symbols where positions already exist\n- BEFORE recommending new positions, ALWAYS call `get_trade_summary_by_symbol_tool()` to check aggregate exposure\n- If a symbol has BUY positions, you CANNOT open SELL positions (and vice versa)\n- Review the AGGREGATE TRADE SUMMARY above to ensure no excessive one-directional exposure"
+        
         # Use global RESEARCH_PROMPT with dynamic context
         agent_scratchpad_content = state.get('agent_scratchpad', 'No prior context')
         
         research_system_prompt = RESEARCH_PROMPT.format(
             current_positions_summary=current_positions_summary,
+            trade_summary_by_symbol=trade_summary_by_symbol,
             agent_scratchpad=agent_scratchpad_content,
             expert_instructions=formatted_expert_instructions,
             max_position_pct=max_position_pct,
-            max_position_equity=max_position_equity
+            max_position_equity=max_position_equity,
+            hedging_check_note=hedging_check_note,
+            hedging_instructions=hedging_instructions
         )
 
         # Initialize conversation with system prompt
@@ -2618,6 +2692,8 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             get_analysis_outputs_batch_tool,
             get_historical_analyses_tool,
             get_all_recent_analyses_tool,
+            get_positions_tool,
+            get_trade_summary_by_symbol_tool,
             get_current_price_tool,
             get_current_prices_tool,
             recommend_close_position,
@@ -2647,15 +2723,39 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
         open_positions = state.get('open_positions', [])
         current_positions_summary = _build_positions_summary(open_positions)
         
+        # Get trade summary by symbol (aggregated across all experts)
+        trade_summary = toolkit.get_trade_summary_by_symbol()
+        if trade_summary:
+            trade_summary_lines = ["**Format:** SYMBOL: BUY QTY X, SELL QTY Y", ""]
+            for symbol in sorted(trade_summary.keys()):
+                buy_qty = trade_summary[symbol]["buy_qty"]
+                sell_qty = trade_summary[symbol]["sell_qty"]
+                trade_summary_lines.append(f"{symbol}: BUY QTY {buy_qty:.0f}, SELL QTY {sell_qty:.0f}")
+            trade_summary_by_symbol = "\n".join(trade_summary_lines)
+        else:
+            trade_summary_by_symbol = "No positions or pending orders found across any experts."
+        
+        # Build hedging instructions based on allow_hedging setting
+        allow_hedging = expert.get_setting_with_interface_default("allow_hedging")
+        if allow_hedging:
+            hedging_check_note = " (ENABLED)"
+            hedging_instructions = "- Hedging is ENABLED - You may open opposite positions on symbols where positions exist\n- Use `get_trade_summary_by_symbol_tool()` to verify aggregate exposure across all experts\n- Consider hedging opportunities when market conditions suggest opposite direction exposure"
+        else:
+            hedging_check_note = " (DISABLED - CRITICAL)"
+            hedging_instructions = "- ⚠️ Hedging is DISABLED - You CANNOT open positions in opposite direction on symbols where positions already exist\n- BEFORE recommending new positions, ALWAYS call `get_trade_summary_by_symbol_tool()` to check aggregate exposure\n- If a symbol has BUY positions, you CANNOT open SELL positions (and vice versa)\n- Review the AGGREGATE TRADE SUMMARY above to ensure no excessive one-directional exposure"
+        
         # Use global RESEARCH_PROMPT with dynamic context
         agent_scratchpad_content = state.get('agent_scratchpad', 'No prior context')
         
         research_system_prompt = RESEARCH_PROMPT.format(
             current_positions_summary=current_positions_summary,
+            trade_summary_by_symbol=trade_summary_by_symbol,
             agent_scratchpad=agent_scratchpad_content,
             expert_instructions=formatted_expert_instructions,
             max_position_pct=max_position_pct,
-            max_position_equity=max_position_equity
+            max_position_equity=max_position_equity,
+            hedging_check_note=hedging_check_note,
+            hedging_instructions=hedging_instructions
         )
 
         # Initialize conversation with system prompt
@@ -3697,6 +3797,8 @@ class SmartRiskManagerGraph:
             get_analysis_outputs_batch_tool,
             get_historical_analyses_tool,
             get_all_recent_analyses_tool,
+            get_positions_tool,
+            get_trade_summary_by_symbol_tool,
             get_current_price_tool,
             get_current_prices_tool,
             recommend_close_position,
@@ -3750,12 +3852,36 @@ class SmartRiskManagerGraph:
             open_positions = state.get('open_positions', [])
             current_positions_summary = _build_positions_summary(open_positions)
             
+            # Get trade summary by symbol (aggregated across all experts)
+            trade_summary = self.toolkit.get_trade_summary_by_symbol()
+            if trade_summary:
+                trade_summary_lines = ["**Format:** SYMBOL: BUY QTY X, SELL QTY Y", ""]
+                for symbol in sorted(trade_summary.keys()):
+                    buy_qty = trade_summary[symbol]["buy_qty"]
+                    sell_qty = trade_summary[symbol]["sell_qty"]
+                    trade_summary_lines.append(f"{symbol}: BUY QTY {buy_qty:.0f}, SELL QTY {sell_qty:.0f}")
+                trade_summary_by_symbol = "\n".join(trade_summary_lines)
+            else:
+                trade_summary_by_symbol = "No positions or pending orders found across any experts."
+            
+            # Build hedging instructions based on allow_hedging setting
+            allow_hedging = expert.get_setting_with_interface_default("allow_hedging")
+            if allow_hedging:
+                hedging_check_note = " (ENABLED)"
+                hedging_instructions = "- Hedging is ENABLED - You may open opposite positions on symbols where positions exist\n- Use `get_trade_summary_by_symbol_tool()` to verify aggregate exposure across all experts\n- Consider hedging opportunities when market conditions suggest opposite direction exposure"
+            else:
+                hedging_check_note = " (DISABLED - CRITICAL)"
+                hedging_instructions = "- ⚠️ Hedging is DISABLED - You CANNOT open positions in opposite direction on symbols where positions already exist\n- BEFORE recommending new positions, ALWAYS call `get_trade_summary_by_symbol_tool()` to check aggregate exposure\n- If a symbol has BUY positions, you CANNOT open SELL positions (and vice versa)\n- Review the AGGREGATE TRADE SUMMARY above to ensure no excessive one-directional exposure"
+            
             research_system_prompt = RESEARCH_PROMPT.format(
                 current_positions_summary=current_positions_summary,
+                trade_summary_by_symbol=trade_summary_by_symbol,
                 agent_scratchpad=agent_scratchpad_content,
                 expert_instructions=formatted_expert_instructions,
                 max_position_pct=max_position_pct,
-                max_position_equity=max_position_equity
+                max_position_equity=max_position_equity,
+                hedging_check_note=hedging_check_note,
+                hedging_instructions=hedging_instructions
             )
 
             # Initialize conversation with system prompt - SENT ONCE

@@ -924,6 +924,24 @@ def get_model_display_info(friendly_name: str) -> Dict[str, Any]:
     }
 
 
+def model_supports_websearch(friendly_name: str) -> bool:
+    """
+    Check if a model supports web search capability.
+    
+    Args:
+        friendly_name: The friendly name of the model (e.g., "gpt5", "claude3")
+        
+    Returns:
+        bool: True if the model supports web search, False otherwise
+    """
+    model_info = MODELS.get(friendly_name)
+    if not model_info:
+        return False
+    
+    labels = model_info.get("labels", [])
+    return LABEL_WEBSEARCH in labels
+
+
 def model_supports_temperature(friendly_name: str) -> bool:
     """
     Check if a model supports the temperature parameter.

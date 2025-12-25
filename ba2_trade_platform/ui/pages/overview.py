@@ -84,19 +84,19 @@ class OverviewTab:
                         ui.navigate.reload()
                 
                 # Create alert banner
-                with ui.card().classes('w-full bg-red-50 border-l-4 border-red-500 p-4 mb-4'):
+                with ui.card().classes('alert-banner danger p-4 mb-4'):
                     with ui.row().classes('w-full items-center gap-4'):
-                        ui.icon('error', size='lg').classes('text-red-600')
+                        ui.icon('error', size='lg').classes('text-[#ff6b6b]')
                         with ui.column().classes('flex-1'):
-                            ui.label(f'⚠️ {error_count} Order{"s" if error_count > 1 else ""} Failed').classes('text-lg font-bold text-red-800')
-                            ui.label(f'There {"are" if error_count > 1 else "is"} {error_count} order{"s" if error_count > 1 else ""} with ERROR status that need{"" if error_count > 1 else "s"} attention.').classes('text-sm text-red-700')
+                            ui.label(f'⚠️ {error_count} Order{"s" if error_count > 1 else ""} Failed').classes('text-lg font-bold text-[#ff6b6b]')
+                            ui.label(f'There {"are" if error_count > 1 else "is"} {error_count} order{"s" if error_count > 1 else ""} with ERROR status that need{"" if error_count > 1 else "s"} attention.').classes('text-sm text-secondary-custom')
                         
                         with ui.row().classes('gap-2'):
                             # Attempt sync from broker button
-                            sync_button = ui.button('Attempt sync from broker', on_click=attempt_broker_sync).props('outline color=orange')
+                            sync_button = ui.button('Attempt sync from broker', on_click=attempt_broker_sync).props('outline color=warning')
                             
                             # View details button
-                            ui.button('View Orders', on_click=switch_to_account_tab).props('outline color=red')
+                            ui.button('View Orders', on_click=switch_to_account_tab).props('outline color=negative')
                 
                 # Log the error orders for debugging
                 logger.warning(f"Found {error_count} orders with ERROR status on overview page")
@@ -128,19 +128,19 @@ class OverviewTab:
                         tabs_ref.set_value('account')
                 
                 # Create notification banner
-                with ui.card().classes('w-full bg-blue-50 border-l-4 border-blue-500 p-4 mb-4'):
+                with ui.card().classes('alert-banner info p-4 mb-4'):
                     with ui.row().classes('w-full items-center gap-4'):
-                        ui.icon('pending_actions', size='lg').classes('text-blue-600')
+                        ui.icon('pending_actions', size='lg').classes('text-[#4dabf7]')
                         with ui.column().classes('flex-1'):
-                            ui.label(f'📋 {pending_count} Pending Order{"s" if pending_count > 1 else ""} to Review').classes('text-lg font-bold text-blue-800')
-                            ui.label(f'There {"are" if pending_count > 1 else "is"} {pending_count} order{"s" if pending_count > 1 else ""} awaiting review and submission.').classes('text-sm text-blue-700')
+                            ui.label(f'📋 {pending_count} Pending Order{"s" if pending_count > 1 else ""} to Review').classes('text-lg font-bold text-[#4dabf7]')
+                            ui.label(f'There {"are" if pending_count > 1 else "is"} {pending_count} order{"s" if pending_count > 1 else ""} awaiting review and submission.').classes('text-sm text-secondary-custom')
                         
                         # Buttons for pending orders
                         with ui.column().classes('gap-2'):
-                            ui.button('Review Orders', on_click=switch_to_account_overview).props('outline color=blue')
+                            ui.button('Review Orders', on_click=switch_to_account_overview).props('outline color=info')
                             # Store only order IDs to avoid capturing database objects
                             order_ids = [order.id for order in pending_orders]
-                            ui.button('Run Risk Management', on_click=lambda ids=order_ids: self._handle_risk_management_from_overview_by_ids(ids)).props('outline color=green')
+                            ui.button('Run Risk Management', on_click=lambda ids=order_ids: self._handle_risk_management_from_overview_by_ids(ids)).props('outline color=positive')
                 
                 # Log the pending orders
                 logger.info(f"Found {pending_count} pending orders on overview page")
@@ -348,17 +348,17 @@ class OverviewTab:
         diff = mismatch['difference']
         account = mismatch['account']
         
-        with ui.card().classes('w-full bg-yellow-50 border-l-4 border-yellow-500 p-4 mb-4'):
+        with ui.card().classes('alert-banner warning p-4 mb-4'):
             with ui.row().classes('w-full items-center gap-4'):
-                ui.icon('warning', size='lg').classes('text-yellow-600')
+                ui.icon('warning', size='lg').classes('text-[#ffd93d]')
                 with ui.column().classes('flex-1'):
-                    ui.label(f'⚠️ Quantity Mismatch: {symbol}').classes('text-lg font-bold text-yellow-800')
+                    ui.label(f'⚠️ Quantity Mismatch: {symbol}').classes('text-lg font-bold text-[#ffd93d]')
                     ui.label(
                         f'Account: {account} | Broker: {broker_qty:+.2f} | Transactions: {txn_qty:+.2f} | Difference: {diff:+.2f}'
-                    ).classes('text-sm text-yellow-700')
+                    ).classes('text-sm text-secondary-custom')
                     ui.label(
                         'The quantity at the broker is lower than the sum of open transaction quantities. This may indicate closed positions not reflected in transactions.'
-                    ).classes('text-xs text-yellow-600')
+                    ).classes('text-xs text-secondary-custom opacity-80')
                 
                 # Button to open correction dialog
                 # Store only scalar values to avoid capturing database objects
@@ -374,7 +374,7 @@ class OverviewTab:
                 ui.button(
                     'Adjust Quantities',
                     on_click=lambda data=mismatch_data: self._show_quantity_correction_dialog_by_ids(data)
-                ).props('outline color=yellow-800')
+                ).props('outline color=warning')
     
     def _show_quantity_correction_dialog(self, mismatch):
         """Show dialog to adjust transaction quantities to match broker."""
@@ -392,11 +392,11 @@ class OverviewTab:
             
             with ui.column().classes('w-full gap-4'):
                 # Summary
-                with ui.card().classes('bg-blue-50 p-4'):
+                with ui.card().classes('alert-banner info p-4'):
                     ui.label(f'Account: {account}').classes('text-sm font-bold')
                     ui.label(f'Broker Position: {broker_qty:+.2f}').classes('text-sm')
                     ui.label(f'Transaction Total: {txn_qty:+.2f}').classes('text-sm')
-                    ui.label(f'Difference: {txn_qty - broker_qty:+.2f}').classes('text-sm text-red-600 font-bold')
+                    ui.label(f'Difference: {txn_qty - broker_qty:+.2f}').classes('text-sm text-[#ff6b6b] font-bold')
                 
                 ui.label('Open Transactions:').classes('text-subtitle2 mt-4')
                 
@@ -405,7 +405,7 @@ class OverviewTab:
                 
                 with ui.card().classes('w-full'):
                     for txn in transactions:
-                        with ui.row().classes('w-full items-center gap-4 p-2 border-b'):
+                        with ui.row().classes('w-full items-center gap-4 p-2 border-b border-white/10'):
                             ui.label(f'ID: {txn.id}').classes('w-20')
                             ui.label(f'{txn.symbol}').classes('w-24')
                             ui.label(f'Opened: {txn.open_date.strftime("%Y-%m-%d") if txn.open_date else "N/A"}').classes('w-32')
@@ -1333,14 +1333,14 @@ class AccountOverviewTab:
                 
                 total_qty, total_pl, total_mv = calculate_totals()
                 
-                with ui.row().classes('w-full justify-end items-center gap-6 px-4 py-3 bg-gray-50 border-t-2 border-gray-300'):
-                    ui.label('TOTAL:').classes('text-sm font-bold text-gray-700')
+                with ui.row().classes('w-full justify-end items-center gap-6 px-4 py-3 bg-white/5 border-t border-white/10'):
+                    ui.label('TOTAL:').classes('text-sm font-bold text-secondary-custom')
                     ui.label(f'Qty: {total_qty:.2f}').classes('text-sm font-semibold')
-                    pl_color = 'text-green-600' if total_pl >= 0 else 'text-red-600'
+                    pl_color = 'number-positive' if total_pl >= 0 else 'number-negative'
                     ui.label(f'Unrealized P/L: ${total_pl:,.2f}').classes(f'text-sm font-bold {pl_color}')
                     ui.label(f'Market Value: ${total_mv:,.2f}').classes('text-sm font-semibold')
                     
-                ui.label('Note: Total reflects all positions. Use filter to view subsets.').classes('text-xs text-gray-500 italic px-4 pb-2')
+                ui.label('Note: Total reflects all positions. Use filter to view subsets.').classes('text-xs text-secondary-custom italic px-4 pb-2')
                 
                 # Compare with Broker button
                 with ui.row().classes('w-full justify-end px-4 pb-3'):
@@ -1505,6 +1505,9 @@ class AccountOverviewTab:
                 # Format dates
                 created_at_str = order.created_at.strftime('%Y-%m-%d %H:%M:%S') if order.created_at else ''
                 
+                # Format status for better readability (capitalize and replace underscores)
+                status_display = order.status.value.replace('_', ' ').upper()
+                
                 row = {
                     'order_id': order.id,
                     'account': account.name,
@@ -1512,13 +1515,13 @@ class AccountOverviewTab:
                     'side': order.side,
                     'quantity': f"{order.quantity:.2f}" if order.quantity else '',
                     'order_type': order.order_type,
-                    'status': order.status.value,
+                    'status': status_display,
                     'limit_price': f"${order.limit_price:.2f}" if order.limit_price else '',
                     'stop_price': f"${order.stop_price:.2f}" if order.stop_price else '',
                     'comment': order.comment or '',
                     'created_at': created_at_str,
                     'expert': expert_name,
-                    'waited_status': order.depends_order_status_trigger if order.status == OrderStatus.WAITING_TRIGGER else '',
+                    'waited_status': order.depends_order_status_trigger.value.replace('_', ' ').upper() if order.status == OrderStatus.WAITING_TRIGGER and order.depends_order_status_trigger else '',
                     'can_submit': order.status == OrderStatus.PENDING and not order.broker_order_id,
                     'actions': 'actions'
                 }
@@ -2335,7 +2338,7 @@ class AccountOverviewTab:
                 # Display orphaned orders if any
                 if orphaned_orders:
                     ui.separator().classes('my-4')
-                    ui.label('⚠️ Orphaned Orders (Executed but not bound to transactions)').classes('text-h6 mb-2 text-red')
+                    ui.label('⚠️ Orphaned Orders (Executed but not bound to transactions)').classes('text-h6 mb-2 text-[#ff6b6b]')
                     
                     # Group orphaned orders by account
                     orphans_by_account = {}
@@ -2346,7 +2349,7 @@ class AccountOverviewTab:
                         orphans_by_account[acc_name].append(orphan)
                     
                     for account_name, account_orphans in orphans_by_account.items():
-                        with ui.expansion(f"{account_name} - {len(account_orphans)} orphaned order(s)", icon='warning').classes('w-full mb-2 bg-red-50'):
+                        with ui.expansion(f"{account_name} - {len(account_orphans)} orphaned order(s)", icon='warning').classes('w-full mb-2 alert-banner danger'):
                             orphan_columns = [
                                 {'name': 'order_id', 'label': 'Order ID', 'field': 'order_id', 'sortable': True, 'align': 'left'},
                                 {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'align': 'left'},
@@ -2370,16 +2373,16 @@ class AccountOverviewTab:
                                 })
                             
                             ui.table(columns=orphan_columns, rows=orphan_rows).classes('w-full')
-                            ui.label('These orders are executed but not associated with any transaction. Consider linking them or investigating why they exist.').classes('text-sm text-orange italic mt-2')
+                            ui.label('These orders are executed but not associated with any transaction. Consider linking them or investigating why they exist.').classes('text-sm text-[#ffd93d] italic mt-2')
                 
                 # Add legend
-                with ui.card().classes('w-full mt-4 bg-blue-50'):
+                with ui.card().classes('w-full mt-4 alert-banner info'):
                     ui.label('ℹ️ Legend').classes('text-subtitle2 font-bold mb-2')
                     ui.label('• Quantity Mismatch: Our transaction qty differs from broker qty').classes('text-sm')
                     ui.label('• Price Mismatch (>3%): Total cost basis differs by more than 3%').classes('text-sm')
                     ui.label('• Both: Both quantity and price mismatches detected').classes('text-sm')
                     if orphaned_orders:
-                        ui.label('• Orphaned Orders: Executed orders not bound to any transaction').classes('text-sm text-red')
+                        ui.label('• Orphaned Orders: Executed orders not bound to any transaction').classes('text-sm text-[#ff6b6b]')
                 
                 with ui.row().classes('w-full justify-end mt-4'):
                     ui.button('Close', on_click=dialog.close).props('flat')
@@ -3478,13 +3481,13 @@ class TransactionsTab:
                         </template>
                     </q-td>
                 </q-tr>
-                <q-tr v-show="props.expand" :props="props" class="bg-blue-50">
+                <q-tr v-show="props.expand" :props="props" class="bg-white/5">
                     <q-td colspan="100%">
                         <div class="q-pa-md">
-                            <div class="text-subtitle2 q-mb-sm">📋 Related Orders ({{ props.row.order_count }})</div>
-                            <q-markup-table flat bordered dense v-if="props.row.orders.length > 0">
+                            <div class="text-subtitle2 q-mb-sm text-accent">📋 Related Orders ({{ props.row.order_count }})</div>
+                            <q-markup-table flat bordered dense v-if="props.row.orders.length > 0" class="bg-transparent">
                                 <thead>
-                                    <tr class="bg-grey-3">
+                                    <tr class="bg-white/10">
                                         <th class="text-left">ID</th>
                                         <th class="text-left">Category</th>
                                         <th class="text-left">Type</th>

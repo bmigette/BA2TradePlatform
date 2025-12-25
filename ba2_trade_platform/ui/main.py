@@ -105,16 +105,16 @@ def smart_risk_manager_detail_page(job_id: int) -> None:
         smart_risk_manager_detail.content(job_id)
 
 @ui.page('/activitymonitor')
-def activity_monitor_page() -> None:
+async def activity_monitor_page() -> None:
     logger.debug("[ROUTE] /activitymonitor - Loading activity monitor page")
     with layout_render('Activity Monitor'):
-        activity_monitor.render()
+        await activity_monitor.render()
 
 @ui.page('/livetrades')
-def live_trades_page() -> None:
+async def live_trades_page() -> None:
     logger.debug("[ROUTE] /livetrades - Loading live trades page")
     with layout_render('Live Trades'):
-        live_trades.content()
+        await live_trades.content()
 
 @ui.page('/tools')
 def tools_page() -> None:
