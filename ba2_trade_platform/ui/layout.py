@@ -25,10 +25,21 @@ def layout_render(navigation_title: str):
     # Add custom CSS for modern dark theme
     ui.add_head_html('''
     <style>
-        /* Base styles */
+        /* Base styles - DEFAULT TEXT COLOR WHITE */
         body {
             background: linear-gradient(135deg, #1a1f2e 0%, #0f1419 100%) !important;
             min-height: 100vh;
+            color: #ffffff !important;
+        }
+        
+        /* Global default text color */
+        *, *::before, *::after {
+            color: inherit;
+        }
+        
+        /* Force white text on common elements */
+        p, span, div, label, h1, h2, h3, h4, h5, h6, li, td, th, a {
+            color: #ffffff;
         }
         
         /* Cards - glassmorphism effect */
@@ -38,6 +49,23 @@ def layout_render(navigation_title: str):
             border: 1px solid rgba(255, 255, 255, 0.1) !important;
             border-radius: 16px !important;
             box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3) !important;
+            color: #ffffff !important;
+        }
+        .q-card__section, .q-card__actions {
+            background: transparent !important;
+            color: #ffffff !important;
+        }
+        .q-card--dark {
+            background: rgba(37, 43, 59, 0.8) !important;
+        }
+        
+        /* Fix white backgrounds */
+        .q-field__control,
+        .q-field__native,
+        .q-select__dropdown-icon,
+        .q-field__append,
+        .q-field__prepend {
+            background: transparent !important;
         }
         
         /* Tables */
@@ -62,6 +90,26 @@ def layout_render(navigation_title: str):
         .q-table td, .q-table th {
             border-color: rgba(255, 255, 255, 0.05) !important;
         }
+        .q-table tbody td {
+            color: #ffffff !important;
+        }
+        .q-table__bottom {
+            color: #a0aec0 !important;
+        }
+        .q-table__bottom .q-btn {
+            color: #a0aec0 !important;
+        }
+        .q-table .q-table__control {
+            color: #a0aec0 !important;
+        }
+        /* Pagination */
+        .q-pagination .q-btn {
+            color: #a0aec0 !important;
+        }
+        .q-pagination .q-btn--active {
+            color: #ffffff !important;
+            background: rgba(0, 212, 170, 0.3) !important;
+        }
         
         /* Buttons */
         .q-btn {
@@ -76,11 +124,25 @@ def layout_render(navigation_title: str):
             background: rgba(255, 255, 255, 0.1) !important;
         }
         
-        /* Inputs */
+        /* Inputs - ALL variants */
+        .q-field .q-field__control {
+            background: rgba(26, 31, 46, 0.6) !important;
+            border-color: rgba(255, 255, 255, 0.1) !important;
+            border-radius: 8px !important;
+        }
         .q-field--outlined .q-field__control {
             background: rgba(26, 31, 46, 0.6) !important;
             border-color: rgba(255, 255, 255, 0.1) !important;
             border-radius: 8px !important;
+        }
+        .q-field--filled .q-field__control {
+            background: rgba(26, 31, 46, 0.6) !important;
+        }
+        .q-field--standout .q-field__control {
+            background: rgba(26, 31, 46, 0.6) !important;
+        }
+        .q-field:hover .q-field__control {
+            border-color: rgba(0, 212, 170, 0.5) !important;
         }
         .q-field--outlined:hover .q-field__control {
             border-color: rgba(0, 212, 170, 0.5) !important;
@@ -88,6 +150,55 @@ def layout_render(navigation_title: str):
         .q-field--focused .q-field__control {
             border-color: #00d4aa !important;
             box-shadow: 0 0 0 2px rgba(0, 212, 170, 0.2) !important;
+        }
+        /* Input text colors */
+        .q-field .q-field__native,
+        .q-field input,
+        .q-field textarea,
+        .q-field .q-field__prefix,
+        .q-field .q-field__suffix {
+            color: #ffffff !important;
+        }
+        .q-field .q-field__label {
+            color: #a0aec0 !important;
+        }
+        .q-field--float .q-field__label {
+            color: #a0aec0 !important;
+        }
+        
+        /* Select/Dropdown */
+        .q-select .q-field__native span,
+        .q-select .q-chip__content,
+        .q-select__dropdown-icon {
+            color: #ffffff !important;
+        }
+        .q-menu {
+            background: rgba(37, 43, 59, 0.98) !important;
+            backdrop-filter: blur(10px) !important;
+            border: 1px solid rgba(255, 255, 255, 0.1) !important;
+            border-radius: 8px !important;
+        }
+        .q-item__label {
+            color: #ffffff !important;
+        }
+        .q-item__label--caption {
+            color: #a0aec0 !important;
+        }
+        /* Multi-select chips */
+        .q-chip {
+            background: rgba(0, 212, 170, 0.2) !important;
+            color: #ffffff !important;
+        }
+        .q-chip--dense {
+            background: rgba(255, 255, 255, 0.1) !important;
+        }
+        .q-chip__icon,
+        .q-chip__content {
+            color: #ffffff !important;
+        }
+        /* Virtual scroll list items */
+        .q-virtual-scroll__content .q-item {
+            color: #ffffff !important;
         }
         
         /* Badges */
@@ -120,6 +231,96 @@ def layout_render(navigation_title: str):
         .text-bullish { color: #00d4aa !important; }
         .text-bearish { color: #ff6b6b !important; }
         
+        /* Override Tailwind gray colors for dark theme visibility */
+        .text-gray-400 { color: #b0bec5 !important; }
+        .text-gray-500 { color: #a0aec0 !important; }
+        .text-gray-600 { color: #90a4ae !important; }
+        .text-gray-700 { color: #78909c !important; }
+        
+        /* Override Tailwind colored text for better visibility on dark */
+        .text-blue-600 { color: #4dabf7 !important; }
+        .text-green-600 { color: #00d4aa !important; }
+        .text-red-600 { color: #ff6b6b !important; }
+        .text-orange-600 { color: #ffa94d !important; }
+        .text-yellow-600 { color: #ffd93d !important; }
+        
+        /* Override Quasar grey text classes for dark theme */
+        .text-grey, .text-grey-1, .text-grey-2, .text-grey-3 { color: #ffffff !important; }
+        .text-grey-4, .text-grey-5 { color: #e0e0e0 !important; }
+        .text-grey-6 { color: #b0bec5 !important; }
+        .text-grey-7 { color: #90a4ae !important; }
+        .text-grey-8 { color: #78909c !important; }
+        .text-grey-9, .text-grey-10 { color: #607d8b !important; }
+        
+        /* Quasar dark mode overrides - FORCE ALL TEXT WHITE */
+        .q-dark, body.body--dark {
+            color: #ffffff !important;
+        }
+        
+        /* All Quasar text elements */
+        .q-field__label,
+        .q-field__native,
+        .q-input__inner,
+        .q-select__dropdown-icon,
+        .q-icon,
+        .q-item,
+        .q-item__section,
+        .q-list,
+        .q-expansion-item,
+        .q-tab__label,
+        .q-toolbar__title,
+        .q-btn__content {
+            color: #ffffff !important;
+        }
+        
+        /* Form labels - slightly muted */
+        .q-field__label {
+            color: #a0aec0 !important;
+        }
+        
+        /* Textarea and input placeholder */
+        .q-field input::placeholder,
+        .q-field textarea::placeholder {
+            color: #78909c !important;
+        }
+        
+        /* Quasar page/body backgrounds */
+        .q-page, .q-layout, .q-page-container {
+            background: transparent !important;
+        }
+        
+        /* Override any white backgrounds */
+        .bg-white, .bg-grey-1, .bg-grey-2, .bg-grey-3, .bg-grey-4 {
+            background: rgba(37, 43, 59, 0.8) !important;
+        }
+        
+        /* Quasar specific white background overrides */
+        .q-field--filled .q-field__control:before,
+        .q-field--standout .q-field__control {
+            background: rgba(26, 31, 46, 0.6) !important;
+        }
+        
+        /* Tabs panel backgrounds */
+        .q-tab-panel, .q-tab-panels {
+            background: transparent !important;
+            color: #ffffff !important;
+        }
+        
+        /* Stepper backgrounds */
+        .q-stepper, .q-stepper__content {
+            background: transparent !important;
+            color: #ffffff !important;
+        }
+        
+        /* Any inline style overrides - more aggressive */
+        [style*="background-color: white"],
+        [style*="background-color: #fff"],
+        [style*="background-color: rgb(255, 255, 255)"],
+        [style*="background: white"],
+        [style*="background: #fff"] {
+            background: rgba(37, 43, 59, 0.8) !important;
+        }
+        
         /* Stat cards */
         .stat-card {
             background: linear-gradient(135deg, rgba(37, 43, 59, 0.9) 0%, rgba(26, 31, 46, 0.9) 100%) !important;
@@ -147,6 +348,17 @@ def layout_render(navigation_title: str):
             text-transform: uppercase !important;
             letter-spacing: 0.05em !important;
             margin-top: 0.5rem !important;
+        }
+        
+        /* Progress bars */
+        .q-linear-progress {
+            background: rgba(255, 255, 255, 0.1) !important;
+        }
+        .q-linear-progress__track {
+            background: rgba(255, 255, 255, 0.1) !important;
+        }
+        .q-linear-progress__model {
+            background: #00d4aa !important;
         }
         
         /* Alert banners */
@@ -250,12 +462,25 @@ def layout_render(navigation_title: str):
             background: rgba(37, 43, 59, 0.98) !important;
             backdrop-filter: blur(20px) !important;
         }
+        .q-dialog .q-card__section {
+            color: #ffffff !important;
+        }
+        .q-dialog .q-card-section--vert {
+            color: #ffffff !important;
+        }
+        .q-dialog-plugin__form {
+            color: #ffffff !important;
+        }
+        .q-dialog .q-card-actions {
+            color: #ffffff !important;
+        }
         
         /* Tooltip */
         .q-tooltip {
             background: rgba(26, 31, 46, 0.95) !important;
             border: 1px solid rgba(255, 255, 255, 0.1) !important;
             border-radius: 8px !important;
+            color: #ffffff !important;
         }
         
         /* Expansion items */
@@ -266,16 +491,51 @@ def layout_render(navigation_title: str):
             background: rgba(37, 43, 59, 0.3) !important;
             border-radius: 8px !important;
         }
-        
-        /* Select dropdown */
-        .q-menu {
-            background: rgba(37, 43, 59, 0.98) !important;
-            backdrop-filter: blur(10px) !important;
-            border: 1px solid rgba(255, 255, 255, 0.1) !important;
-            border-radius: 8px !important;
+        .q-expansion-item__content {
+            color: #ffffff !important;
+            background: rgba(37, 43, 59, 0.3) !important;
         }
-        .q-item__label {
-            color: #e2e8f0 !important;
+        .q-expansion-item .q-item {
+            background: rgba(37, 43, 59, 0.5) !important;
+            color: #ffffff !important;
+        }
+        .q-expansion-item .q-item__label {
+            color: #ffffff !important;
+        }
+        .q-expansion-item .q-icon {
+            color: #a0aec0 !important;
+        }
+        
+        /* Checkbox and Radio */
+        .q-checkbox__label,
+        .q-radio__label,
+        .q-toggle__label {
+            color: #ffffff !important;
+        }
+        
+        /* List items */
+        .q-list .q-item__section--main {
+            color: #ffffff !important;
+        }
+        
+        /* General text within cards */
+        .q-card__section {
+            color: #ffffff !important;
+        }
+        
+        /* Date picker */
+        .q-date {
+            background: rgba(37, 43, 59, 0.98) !important;
+            color: #ffffff !important;
+        }
+        .q-date__header {
+            background: rgba(0, 212, 170, 0.2) !important;
+        }
+        
+        /* Time picker */
+        .q-time {
+            background: rgba(37, 43, 59, 0.98) !important;
+            color: #ffffff !important;
         }
     </style>
     ''')
