@@ -1073,7 +1073,7 @@ class JobMonitoringTab:
                         for expert in session.scalars(stmt):
                             expert_instances[expert.id] = expert
                     
-                    # Process all records and cache them
+                    # Process all records and cache them (without has_evaluation_data - too slow)
                     self.cached_analysis_data = self._format_analysis_records(market_analyses, expert_instances)
                     self.cache_valid = True
             
@@ -1089,6 +1089,10 @@ class JobMonitoringTab:
             start_idx = (self.current_page - 1) * self.page_size
             end_idx = start_idx + self.page_size
             paginated_data = self.cached_analysis_data[start_idx:end_idx]
+            
+            # OPTIMIZATION: Fetch has_evaluation_data only for current page items
+            # This avoids N+1 queries for ALL records
+            self._populate_evaluation_data_flags(paginated_data)
             
             return paginated_data, self.total_records
                 
@@ -1222,20 +1226,8 @@ class JobMonitoringTab:
                 subtype_display = analysis.subtype.value.replace('_', ' ').title() if analysis.subtype else 'Unknown'
                 can_cancel = analysis.status in [MarketAnalysisStatus.PENDING]
                 
-                # Check if there's evaluation data for any recommendation
-                has_evaluation_data = False
-                if analysis.expert_recommendations:
-                    for rec in analysis.expert_recommendations:
-                        # Check if there's a TradeActionResult with evaluation_details
-                        # This is set when ruleset evaluation was performed
-                        # Use trade_action_results relationship (not action_results)
-                        if hasattr(rec, 'trade_action_results') and rec.trade_action_results:
-                            for ar in rec.trade_action_results:
-                                if ar.data and 'evaluation_details' in ar.data:
-                                    has_evaluation_data = True
-                                    break
-                        if has_evaluation_data:
-                            break
+                # NOTE: has_evaluation_data is populated LATER by _populate_evaluation_data_flags()
+                # for only the current page items to avoid N+1 queries on ALL records
                 
                 analysis_data.append({
                     'id': analysis.id,
@@ -1250,7 +1242,7 @@ class JobMonitoringTab:
                     'created_at_local': created_local,
                     'subtype': subtype_display,
                     'can_cancel': can_cancel,
-                    'has_evaluation_data': has_evaluation_data,
+                    'has_evaluation_data': False,  # Populated later by _populate_evaluation_data_flags()
                     'expert_instance_id': analysis.expert_instance_id,
                     'actions': 'actions'
                 })
@@ -1259,6 +1251,53 @@ class JobMonitoringTab:
                 continue
         
         return analysis_data
+
+    def _populate_evaluation_data_flags(self, paginated_data: List[dict]):
+        """Populate has_evaluation_data flags for current page items only.
+        
+        OPTIMIZATION: Uses batch queries to check for evaluation data
+        instead of N+1 lazy-loading queries for all records.
+        
+        Args:
+            paginated_data: List of formatted analysis records (current page only)
+        """
+        if not paginated_data:
+            return
+        
+        try:
+            # Get analysis IDs for current page
+            analysis_ids = [item['id'] for item in paginated_data]
+            
+            with get_db() as session:
+                from ...core.models import TradeActionResult
+                
+                # Query: Get market_analysis_id and data for all TradeActionResults
+                # related to recommendations for these analyses
+                stmt = (
+                    select(
+                        ExpertRecommendation.market_analysis_id,
+                        TradeActionResult.data
+                    )
+                    .join(ExpertRecommendation, TradeActionResult.expert_recommendation_id == ExpertRecommendation.id)
+                    .where(
+                        ExpertRecommendation.market_analysis_id.in_(analysis_ids),
+                        TradeActionResult.data.isnot(None)
+                    )
+                )
+                
+                # Build set of analysis IDs with evaluation data
+                analysis_ids_with_eval = set()
+                for market_analysis_id, data in session.execute(stmt):
+                    if data and isinstance(data, dict) and 'evaluation_details' in data:
+                        analysis_ids_with_eval.add(market_analysis_id)
+            
+            # Update the paginated data in-place
+            for item in paginated_data:
+                item['has_evaluation_data'] = item['id'] in analysis_ids_with_eval
+                
+        except Exception as e:
+            logger.warning(f"Error populating evaluation data flags: {e}")
+            # Leave all as False on error
 
     def _create_pagination_controls(self):
         """Create pagination controls."""
