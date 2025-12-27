@@ -1271,6 +1271,7 @@ class JobMonitoringTab:
         try:
             # Get analysis IDs for current page
             analysis_ids = [item['id'] for item in paginated_data]
+            logger.debug(f"[_populate_evaluation_data_flags] Checking {len(analysis_ids)} analysis IDs: {analysis_ids}")
             
             with get_db() as session:
                 from ...core.models import TradeActionResult
@@ -1294,6 +1295,8 @@ class JobMonitoringTab:
                 for market_analysis_id, data in session.execute(stmt):
                     if data and isinstance(data, dict) and 'evaluation_details' in data:
                         analysis_ids_with_eval.add(market_analysis_id)
+            
+            logger.debug(f"[_populate_evaluation_data_flags] Found {len(analysis_ids_with_eval)} IDs with evaluation data: {analysis_ids_with_eval}")
             
             # Update the paginated data in-place
             for item in paginated_data:
