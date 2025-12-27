@@ -303,6 +303,12 @@ class JobMonitoringTab:
                            @click="$parent.$emit('view_details', props.row.id)">
                         <q-tooltip>View Analysis Details</q-tooltip>
                     </q-btn>
+                    <q-btn v-if="props.row.has_evaluation_data" 
+                           flat dense icon="search" 
+                           color="secondary" 
+                           @click="$parent.$emit('view_rule_evaluation', props.row.id)">
+                        <q-tooltip>View Rule Evaluation Details</q-tooltip>
+                    </q-btn>
                     <q-btn v-if="props.row.can_cancel" 
                            flat dense icon="cancel" 
                            color="negative" 
@@ -329,6 +335,7 @@ class JobMonitoringTab:
             self.analysis_table.on('view_details', self.view_analysis_details)
             self.analysis_table.on('troubleshoot_ruleset', self.troubleshoot_ruleset)
             self.analysis_table.on('rerun_analysis', self.rerun_analysis)
+            self.analysis_table.on('view_rule_evaluation', self.view_rule_evaluation)
     
     def _create_smart_risk_manager_table(self):
         """Create the Smart Risk Manager jobs table."""
@@ -1215,6 +1222,18 @@ class JobMonitoringTab:
                 subtype_display = analysis.subtype.value.replace('_', ' ').title() if analysis.subtype else 'Unknown'
                 can_cancel = analysis.status in [MarketAnalysisStatus.PENDING]
                 
+                # Check if there's evaluation data for any recommendation
+                has_evaluation_data = False
+                if analysis.expert_recommendations:
+                    from ...core.models import TradeActionResult
+                    for rec in analysis.expert_recommendations:
+                        # Check if there's a TradeActionResult with evaluation_details
+                        # This is set when ruleset evaluation was performed
+                        action_results = [ar for ar in rec.action_results if ar.data and 'evaluation_details' in ar.data]
+                        if action_results:
+                            has_evaluation_data = True
+                            break
+                
                 analysis_data.append({
                     'id': analysis.id,
                     'symbol': symbol_display,
@@ -1228,6 +1247,7 @@ class JobMonitoringTab:
                     'created_at_local': created_local,
                     'subtype': subtype_display,
                     'can_cancel': can_cancel,
+                    'has_evaluation_data': has_evaluation_data,
                     'expert_instance_id': analysis.expert_instance_id,
                     'actions': 'actions'
                 })
@@ -1579,6 +1599,63 @@ class JobMonitoringTab:
             logger.error(f"Error navigating to ruleset test {analysis_id if analysis_id else 'unknown'}: {e}", exc_info=True)
             ui.notify(f"Error opening ruleset test: {str(e)}", type='negative')
     
+    def view_rule_evaluation(self, event_data):
+        """Show rule evaluation details from a market analysis in a dialog."""
+        analysis_id = None
+        try:
+            # Extract analysis_id from event data
+            if hasattr(event_data, 'args') and hasattr(event_data.args, '__len__') and len(event_data.args) > 0:
+                analysis_id = int(event_data.args[0])
+            elif isinstance(event_data, int):
+                analysis_id = event_data
+            elif hasattr(event_data, 'args') and isinstance(event_data.args, int):
+                analysis_id = event_data.args
+            else:
+                logger.error(f"Invalid event data for view_rule_evaluation: {event_data}", exc_info=True)
+                ui.notify("Invalid event data", type='negative')
+                return
+            
+            # Load evaluation details from the analysis
+            from ..components.RuleEvaluationDisplay import render_rule_evaluations
+            
+            with get_db() as session:
+                # Get the analysis with recommendations
+                analysis = session.get(MarketAnalysis, analysis_id)
+                if not analysis:
+                    ui.notify('Analysis not found', type='warning')
+                    return
+                
+                # Find evaluation details from any recommendation's action results
+                evaluation_data = None
+                for rec in analysis.expert_recommendations:
+                    for result in rec.action_results:
+                        if result.data and 'evaluation_details' in result.data:
+                            evaluation_data = result.data['evaluation_details']
+                            break
+                    if evaluation_data:
+                        break
+                
+                if not evaluation_data:
+                    ui.notify('No rule evaluation details found for this analysis', type='warning')
+                    return
+                
+                # Show dialog with evaluation details
+                with ui.dialog() as eval_dialog, ui.card().classes('w-full max-w-4xl'):
+                    ui.label('🔍 Rule Evaluation Details').classes('text-h6 mb-4')
+                    ui.label(f'Analysis #{analysis_id} - {analysis.symbol}').classes('text-sm text-grey-6 mb-4')
+                    
+                    # Use the reusable component to display evaluation details
+                    render_rule_evaluations(evaluation_data, show_actions=True, compact=False)
+                    
+                    with ui.row().classes('w-full justify-end mt-4'):
+                        ui.button('Close', on_click=eval_dialog.close).props('outline')
+                
+                eval_dialog.open()
+                
+        except Exception as e:
+            logger.error(f"Error viewing rule evaluation {analysis_id if analysis_id else 'unknown'}: {e}", exc_info=True)
+            ui.notify(f"Error viewing rule evaluation: {str(e)}", type='negative')
+
     def rerun_analysis(self, event_data):
         """Re-run a failed analysis by clearing outputs and re-queuing."""
         analysis_id = None

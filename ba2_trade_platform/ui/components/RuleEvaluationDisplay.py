@@ -147,7 +147,9 @@ def _render_condition(condition: Dict[str, Any], compact: bool = False):
             if cond_error:
                 ui.label(f'Error: {cond_error}').classes('text-sm text-red-500' if not compact else 'text-xs text-red-500')
         
-        ui.badge(result_text).classes(f'text-white px-2 py-1 {"bg-green-500" if result else "bg-red-500" if cond_error else "bg-orange-500"}')
+        # Use Quasar color props for consistent styling
+        badge_color = 'positive' if result else 'negative' if cond_error else 'warning'
+        ui.badge(result_text).props(f'color={badge_color}').classes('text-white px-2 py-1')
 
 
 def _render_actions(actions: List[Dict[str, Any]], compact: bool = False):
