@@ -1356,6 +1356,7 @@ class JobMonitoringTab:
             # Update table if it exists
             if self.analysis_table:
                 self.analysis_table.rows = analysis_data
+                self.analysis_table.update()  # Force UI refresh
             
             # Update pagination controls with current state
             self._create_pagination_controls()
