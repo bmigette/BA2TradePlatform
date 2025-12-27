@@ -1305,11 +1305,11 @@ All {len(trade_details)} trades shown above for transparency.
         current_price = state.get('current_price')
         
         # Main card
-        with ui.card().classes('w-full'):
+        with ui.card().classes('w-full').style('background-color: #1e2a3a'):
             # Header
-            with ui.card_section().classes('bg-purple-1'):
-                ui.label('Senate/House Trading Activity Analysis').classes('text-h5 text-weight-bold')
-                ui.label(f'{market_analysis.symbol} - Government Official Trades').classes('text-grey-7')
+            with ui.card_section().style('background: linear-gradient(135deg, #00d4aa 0%, #00b894 100%)'):
+                ui.label('Senate/House Trading Activity Analysis').classes('text-h5 text-weight-bold').style('color: white')
+                ui.label(f'{market_analysis.symbol} - Government Official Trades').style('color: rgba(255,255,255,0.8)')
             
             # Recommendation summary
             signal = rec.get('signal', 'HOLD')
@@ -1330,23 +1330,23 @@ All {len(trade_details)} trades shown above for transparency.
             with ui.card_section():
                 with ui.row().classes('w-full items-center justify-between'):
                     with ui.column():
-                        ui.label('Recommendation').classes('text-grey-6 text-caption')
+                        ui.label('Recommendation').classes('text-caption').style('color: #a0aec0')
                         with ui.row().classes('items-center gap-2'):
                             ui.icon(signal_icon, color=signal_color, size='2rem')
                             ui.label(signal).classes(f'text-h4 text-{signal_color}')
                     
                     with ui.column().classes('text-right'):
-                        ui.label('Confidence').classes('text-grey-6 text-caption')
-                        ui.label(f'{confidence:.1f}%').classes('text-h4')
+                        ui.label('Confidence').classes('text-caption').style('color: #a0aec0')
+                        ui.label(f'{confidence:.1f}%').classes('text-h4').style('color: #e2e8f0')
                     
                     with ui.column().classes('text-right'):
-                        ui.label('Expected Profit').classes('text-grey-6 text-caption')
+                        ui.label('Expected Profit').classes('text-caption').style('color: #a0aec0')
                         profit_color = 'positive' if expected_profit > 0 else 'negative' if expected_profit < 0 else 'grey'
                         ui.label(f'{expected_profit:+.1f}%').classes(f'text-h4 text-{profit_color}')
                 
                 if current_price:
                     ui.separator().classes('my-2')
-                    ui.label(f'Current Price: ${current_price:.2f}').classes('text-grey-7')
+                    ui.label(f'Current Price: ${current_price:.2f}').style('color: #a0aec0')
             
             # Trade Statistics
             total_trades = stats.get('total_trades', 0)
@@ -1356,67 +1356,68 @@ All {len(trade_details)} trades shown above for transparency.
             total_buy_amount = stats.get('total_buy_amount', 0)
             total_sell_amount = stats.get('total_sell_amount', 0)
             
-            with ui.card_section().classes('bg-grey-1'):
-                ui.label('Trade Activity Summary').classes('text-subtitle1 text-weight-medium mb-3')
+            with ui.card_section().style('background-color: #141c28'):
+                ui.label('Trade Activity Summary').classes('text-subtitle1 text-weight-medium mb-3').style('color: #e2e8f0')
                 
                 with ui.grid(columns=2).classes('w-full gap-4'):
                     # Total Trades
-                    with ui.card().classes('bg-blue-50'):
-                        ui.label('Total Trades Found').classes('text-caption text-grey-7')
-                        ui.label(str(total_trades)).classes('text-h5 text-blue-700')
-                        ui.label(f'{filtered_trades} after filtering').classes('text-xs text-blue-600')
+                    with ui.card().style('background-color: rgba(66, 153, 225, 0.15)'):
+                        ui.label('Total Trades Found').classes('text-caption').style('color: #a0aec0')
+                        ui.label(str(total_trades)).classes('text-h5').style('color: #63b3ed')
+                        ui.label(f'{filtered_trades} after filtering').classes('text-xs').style('color: #4299e1')
                     
                     # Buy Activity
-                    with ui.card().classes('bg-green-50'):
-                        ui.label('Buy Trades').classes('text-caption text-grey-7')
-                        ui.label(str(buy_count)).classes('text-h5 text-green-700')
-                        ui.label(f'${total_buy_amount:,.0f} total').classes('text-xs text-green-600')
+                    with ui.card().style('background-color: rgba(0, 212, 170, 0.15)'):
+                        ui.label('Buy Trades').classes('text-caption').style('color: #a0aec0')
+                        ui.label(str(buy_count)).classes('text-h5').style('color: #00d4aa')
+                        ui.label(f'${total_buy_amount:,.0f} total').classes('text-xs').style('color: #00b894')
                     
                     # Sell Activity
-                    with ui.card().classes('bg-red-50'):
-                        ui.label('Sell Trades').classes('text-caption text-grey-7')
-                        ui.label(str(sell_count)).classes('text-h5 text-red-700')
-                        ui.label(f'${total_sell_amount:,.0f} total').classes('text-xs text-red-600')
+                    with ui.card().style('background-color: rgba(255, 107, 107, 0.15)'):
+                        ui.label('Sell Trades').classes('text-caption').style('color: #a0aec0')
+                        ui.label(str(sell_count)).classes('text-h5').style('color: #ff6b6b')
+                        ui.label(f'${total_sell_amount:,.0f} total').classes('text-xs').style('color: #fc8181')
                     
                     # Signal Strength
-                    with ui.card().classes('bg-purple-50'):
-                        ui.label('Signal Strength').classes('text-caption text-grey-7')
+                    with ui.card().style('background-color: rgba(159, 122, 234, 0.15)'):
+                        ui.label('Signal Strength').classes('text-caption').style('color: #a0aec0')
                         consensus_pct = (max(buy_count, sell_count) / (buy_count + sell_count) * 100) if (buy_count + sell_count) > 0 else 0
-                        ui.label(f'{consensus_pct:.0f}%').classes('text-h5 text-purple-700')
-                        ui.label('consensus').classes('text-xs text-purple-600')
+                        ui.label(f'{consensus_pct:.0f}%').classes('text-h5').style('color: #9f7aea')
+                        ui.label('consensus').classes('text-xs').style('color: #b794f4')
             
             # Individual Trades
             if trades:
                 with ui.card_section():
-                    ui.label(f'Individual Trades ({len(trades)})').classes('text-subtitle1 text-weight-medium mb-3')
+                    ui.label(f'Individual Trades ({len(trades)})').classes('text-subtitle1 text-weight-medium mb-3').style('color: #e2e8f0')
                     
                     for i, trade in enumerate(trades[:5], 1):  # Show top 5
                         trade_type = trade.get('type', 'Unknown')
                         is_buy = 'purchase' in trade_type.lower() or 'buy' in trade_type.lower()
                         
-                        with ui.card().classes(f'w-full {"bg-green-50" if is_buy else "bg-red-50"}'):
+                        bg_color = 'rgba(0, 212, 170, 0.1)' if is_buy else 'rgba(255, 107, 107, 0.1)'
+                        with ui.card().classes('w-full').style(f'background-color: {bg_color}'):
                             with ui.row().classes('w-full items-start justify-between'):
                                 with ui.column().classes('flex-grow'):
-                                    ui.label(f'Trade #{i}: {trade.get("trader", "Unknown")}').classes('text-weight-medium')
-                                    ui.label(f'{trade_type} - {trade.get("amount", "N/A")}').classes('text-sm text-grey-7')
+                                    ui.label(f'Trade #{i}: {trade.get("trader", "Unknown")}').classes('text-weight-medium').style('color: #e2e8f0')
+                                    ui.label(f'{trade_type} - {trade.get("amount", "N/A")}').classes('text-sm').style('color: #a0aec0')
                                     
-                                    with ui.row().classes('gap-4 mt-2 text-xs'):
+                                    with ui.row().classes('gap-4 mt-2 text-xs').style('color: #a0aec0'):
                                         ui.label(f'Exec: {trade.get("exec_date", "N/A")} ({trade.get("days_since_exec", 0)}d ago)')
                                         ui.label(f'Disclosed: {trade.get("disclose_date", "N/A")} ({trade.get("days_since_disclose", 0)}d ago)')
                                     
                                     # Trader activity statistics
-                                    with ui.column().classes('mt-2 text-xs text-grey-6'):
+                                    with ui.column().classes('mt-2 text-xs').style('color: #718096'):
                                         ui.label(f'Recent: {trade.get("trader_recent_buys", "N/A")} buys, {trade.get("trader_recent_sells", "N/A")} sells')
                                         ui.label(f'Yearly: {trade.get("trader_yearly_buys", "N/A")} buys, {trade.get("trader_yearly_sells", "N/A")} sells')
                                 
                                 with ui.column().classes('text-right'):
-                                    ui.label(f'Confidence: {trade.get("confidence", 0):.1f}%').classes('text-sm text-weight-medium')
+                                    ui.label(f'Confidence: {trade.get("confidence", 0):.1f}%').classes('text-sm text-weight-medium').style('color: #e2e8f0')
                                     
                                     exec_price = trade.get('exec_price')
                                     price_delta = trade.get('price_delta_pct', 0)
                                     if exec_price:
                                         delta_color = 'positive' if price_delta > 0 else 'negative'
-                                        ui.label(f'${exec_price:.2f} → ${trade.get("current_price", 0):.2f}').classes('text-xs text-grey-7')
+                                        ui.label(f'${exec_price:.2f} → ${trade.get("current_price", 0):.2f}').classes('text-xs').style('color: #a0aec0')
                                         ui.label(f'{price_delta:+.1f}%').classes(f'text-sm text-{delta_color}')
                                     
                                     modifier = trade.get('trader_confidence_modifier', 0)
@@ -1425,7 +1426,7 @@ All {len(trade_details)} trades shown above for transparency.
                                         ui.label(f'Pattern: {modifier:+.1f}%').classes(f'text-xs text-{modifier_color}')
                     
                     if len(trades) > 5:
-                        ui.label(f'+ {len(trades) - 5} more trades').classes('text-sm text-grey-6 mt-2')
+                        ui.label(f'+ {len(trades) - 5} more trades').classes('text-sm mt-2').style('color: #718096')
             
             # Settings
             max_disclose = settings.get('max_disclose_date_days', 30)
@@ -1433,16 +1434,16 @@ All {len(trade_details)} trades shown above for transparency.
             max_delta = settings.get('max_trade_price_delta_pct', 10.0)
             
             with ui.card_section():
-                ui.label('Filter Settings').classes('text-subtitle1 text-weight-medium mb-2')
+                ui.label('Filter Settings').classes('text-subtitle1 text-weight-medium mb-2').style('color: #e2e8f0')
                 
                 with ui.row().classes('gap-4'):
-                    ui.label(f'Max Disclose Age: {max_disclose} days').classes('text-sm text-grey-7')
-                    ui.label(f'Max Exec Age: {max_exec} days').classes('text-sm text-grey-7')
-                    ui.label(f'Max Price Delta: {max_delta}%').classes('text-sm text-grey-7')
+                    ui.label(f'Max Disclose Age: {max_disclose} days').classes('text-sm').style('color: #a0aec0')
+                    ui.label(f'Max Exec Age: {max_exec} days').classes('text-sm').style('color: #a0aec0')
+                    ui.label(f'Max Price Delta: {max_delta}%').classes('text-sm').style('color: #a0aec0')
             
             # Methodology
-            with ui.expansion('Calculation Methodology', icon='info').classes('w-full'):
-                with ui.card_section().classes('bg-grey-1'):
+            with ui.expansion('Calculation Methodology', icon='info').classes('w-full').style('color: #e2e8f0'):
+                with ui.card_section().style('background-color: #141c28'):
                     ui.markdown('''
 **Confidence Calculation:**
 

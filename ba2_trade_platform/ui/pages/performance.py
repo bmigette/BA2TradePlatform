@@ -56,6 +56,27 @@ class PerformanceTab:
         finally:
             session.close()
     
+    def _get_monthly_transactions(self) -> List[Transaction]:
+        """Get closed transactions for up to 12 months for monthly trend charts."""
+        session = get_db()
+        try:
+            # Always get up to 12 months for monthly charts
+            cutoff_date = datetime.now() - timedelta(days=365)
+            
+            query = session.query(Transaction).filter(
+                Transaction.status == TransactionStatus.CLOSED,
+                Transaction.close_date.isnot(None),
+                Transaction.close_date >= cutoff_date
+            )
+            
+            # Filter by selected experts if any
+            if self.selected_experts:
+                query = query.filter(Transaction.expert_id.in_(self.selected_experts))
+            
+            return query.all()
+        finally:
+            session.close()
+    
     def _calculate_transaction_metrics(self, transactions: List[Transaction]) -> Dict[str, Any]:
         """Calculate comprehensive metrics from transactions."""
         if not transactions:
@@ -421,7 +442,7 @@ class PerformanceTab:
     
     def _load_and_render_content(self):
         """Load transaction data and render all charts."""
-        # Get transactions
+        # Get transactions for main metrics (filtered by date range)
         transactions = self._get_closed_transactions()
         
         if not transactions:
@@ -436,7 +457,11 @@ class PerformanceTab:
         # Render components
         self._render_summary_metrics(expert_metrics)
         self._render_expert_comparison_charts(expert_metrics)
-        self._render_monthly_trends(transactions)
+        
+        # Get up to 12 months of data for monthly trends (independent of date filter)
+        monthly_transactions = self._get_monthly_transactions()
+        self._render_monthly_trends(monthly_transactions)
+        
         self._render_detailed_table(expert_metrics)
         
         self.data_loaded = True

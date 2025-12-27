@@ -1511,11 +1511,11 @@ Recommendations Generated:"""
         symbols_analyzed = state.get('symbols_analyzed', [])
         
         # Main card
-        with ui.card().classes('w-full'):
+        with ui.card().classes('w-full').style('background-color: #1e2a3a'):
             # Header
-            with ui.card_section().classes('bg-orange-1'):
-                ui.label('Multi-Instrument Copy Trading Analysis').classes('text-h5 text-weight-bold')
-                ui.label(f'Following Specific Traders Across {len(symbols_analyzed)} Instruments').classes('text-grey-7')
+            with ui.card_section().style('background: linear-gradient(135deg, #00d4aa 0%, #00b894 100%)'):
+                ui.label('Multi-Instrument Copy Trading Analysis').classes('text-h5 text-weight-bold').style('color: white')
+                ui.label(f'Following Specific Traders Across {len(symbols_analyzed)} Instruments').style('color: rgba(255,255,255,0.8)')
             
             # Overall Statistics
             total_trades = stats.get('total_trades', 0)
@@ -1523,35 +1523,36 @@ Recommendations Generated:"""
             copy_trades_found = stats.get('copy_trades_found', 0)
             symbols_with_trades = stats.get('symbols_with_trades', 0)
             
-            with ui.card_section().classes('bg-grey-1'):
-                ui.label('Copy Trade Activity Summary').classes('text-subtitle1 text-weight-medium mb-3')
+            with ui.card_section().style('background-color: #141c28'):
+                ui.label('Copy Trade Activity Summary').classes('text-subtitle1 text-weight-medium mb-3').style('color: #e2e8f0')
                 
                 with ui.grid(columns=2).classes('w-full gap-4'):
                     # Total Trades
-                    with ui.card().classes('bg-blue-50'):
-                        ui.label('Total Trades Found').classes('text-caption text-grey-7')
-                        ui.label(str(total_trades)).classes('text-h5 text-blue-700')
-                        ui.label(f'{filtered_trades} after age filter').classes('text-xs text-blue-600')
+                    with ui.card().style('background-color: rgba(66, 153, 225, 0.15)'):
+                        ui.label('Total Trades Found').classes('text-caption').style('color: #a0aec0')
+                        ui.label(str(total_trades)).classes('text-h5').style('color: #63b3ed')
+                        ui.label(f'{filtered_trades} after age filter').classes('text-xs').style('color: #4299e1')
                     
                     # Copy Trades
-                    with ui.card().classes('bg-orange-50'):
-                        ui.label('Copy Trades Found').classes('text-caption text-grey-7')
-                        ui.label(str(copy_trades_found)).classes('text-h5 text-orange-700')
-                        ui.label('from followed traders').classes('text-xs text-orange-600')
+                    with ui.card().style('background-color: rgba(255, 169, 77, 0.15)'):
+                        ui.label('Copy Trades Found').classes('text-caption').style('color: #a0aec0')
+                        ui.label(str(copy_trades_found)).classes('text-h5').style('color: #ffa94d')
+                        ui.label('from followed traders').classes('text-xs').style('color: #ed8936')
                     
                     # Symbols
-                    with ui.card().classes('bg-purple-50'):
-                        ui.label('Instruments Analyzed').classes('text-caption text-grey-7')
-                        ui.label(str(symbols_with_trades)).classes('text-h5 text-purple-700')
-                        ui.label('with copy trades').classes('text-xs text-purple-600')
+                    with ui.card().style('background-color: rgba(159, 122, 234, 0.15)'):
+                        ui.label('Instruments Analyzed').classes('text-caption').style('color: #a0aec0')
+                        ui.label(str(symbols_with_trades)).classes('text-h5').style('color: #9f7aea')
+                        ui.label('with copy trades').classes('text-xs').style('color: #b794f4')
                     
                     # Status
-                    status_color = 'green' if copy_trades_found > 0 else 'grey'
-                    with ui.card().classes(f'bg-{status_color}-50'):
-                        ui.label('Copy Trade Status').classes('text-caption text-grey-7')
+                    status_color = '#00d4aa' if copy_trades_found > 0 else '#a0aec0'
+                    status_bg = 'rgba(0, 212, 170, 0.15)' if copy_trades_found > 0 else 'rgba(160, 174, 192, 0.15)'
+                    with ui.card().style(f'background-color: {status_bg}'):
+                        ui.label('Copy Trade Status').classes('text-caption').style('color: #a0aec0')
                         status_text = 'ACTIVE' if copy_trades_found > 0 else 'NO MATCHES'
-                        ui.label(status_text).classes(f'text-h5 text-{status_color}-700')
-                        ui.label('multi-instrument mode').classes(f'text-xs text-{status_color}-600')
+                        ui.label(status_text).classes('text-h5').style(f'color: {status_color}')
+                        ui.label('multi-instrument mode').classes('text-xs').style(f'color: {status_color}')
             
             # Recommendations by Symbol
             if symbol_recommendations:
@@ -1559,7 +1560,7 @@ Recommendations Generated:"""
                     # Get trader names from state
                     traders_by_symbol = state.get('traders_by_symbol', {})
                     
-                    ui.label(f'Recommendations Generated ({len(symbol_recommendations)})').classes('text-subtitle1 text-weight-medium mb-4')
+                    ui.label(f'Recommendations Generated ({len(symbol_recommendations)})').classes('text-subtitle1 text-weight-medium mb-4').style('color: #e2e8f0')
                     
                     # Display recommendations in a grid (3 per row - balanced size)
                     with ui.grid(columns=3).classes('w-full gap-4'):
@@ -1575,21 +1576,21 @@ Recommendations Generated:"""
                             if signal == 'BUY':
                                 signal_color = 'positive'
                                 signal_icon = 'trending_up'
-                                bg_color = 'bg-green-50'
+                                bg_color = 'rgba(0, 212, 170, 0.1)'
                             elif signal == 'SELL':
                                 signal_color = 'negative'
                                 signal_icon = 'trending_down'
-                                bg_color = 'bg-red-50'
+                                bg_color = 'rgba(255, 107, 107, 0.1)'
                             else:
                                 signal_color = 'grey'
                                 signal_icon = 'trending_flat'
-                                bg_color = 'bg-grey-50'
+                                bg_color = 'rgba(160, 174, 192, 0.1)'
                             
-                            with ui.card().classes(f'w-full {bg_color} shadow-sm'):
+                            with ui.card().classes('w-full shadow-sm').style(f'background-color: {bg_color}'):
                                 with ui.column().classes('w-full gap-3 p-4'):
                                     # Header: Symbol and Signal
                                     with ui.row().classes('w-full items-center justify-between mb-2'):
-                                        ui.label(symbol).classes('text-h5 text-weight-bold')
+                                        ui.label(symbol).classes('text-h5 text-weight-bold').style('color: #e2e8f0')
                                         ui.icon(signal_icon, color=signal_color, size='1.8rem')
                                     
                                     # Signal and Trader name(s)
@@ -1604,18 +1605,18 @@ Recommendations Generated:"""
                                         
                                         # Show trader names
                                         if num_traders == 1:
-                                            ui.label(f'by {trader_name}').classes('text-sm text-grey-7 italic mt-1')
+                                            ui.label(f'by {trader_name}').classes('text-sm italic mt-1').style('color: #a0aec0')
                                         else:
                                             # Multiple traders
                                             traders_text = ', '.join(trader_names_list[:3])
                                             if len(trader_names_list) > 3:
                                                 traders_text += f' +{len(trader_names_list) - 3}'
-                                            ui.label(f'by {traders_text}').classes('text-sm text-grey-7 italic mt-1')
+                                            ui.label(f'by {traders_text}').classes('text-sm italic mt-1').style('color: #a0aec0')
                                     
                                     # Trade count
-                                    with ui.row().classes('items-center gap-2 mb-3 pb-3 border-b border-grey-3'):
+                                    with ui.row().classes('items-center gap-2 mb-3 pb-3').style('border-bottom: 1px solid #2d3748'):
                                         ui.icon('receipt', size='sm', color='orange')
-                                        ui.label(f'{trade_count} Trade{"s" if trade_count != 1 else ""}').classes('text-sm text-orange-700 text-weight-medium')
+                                        ui.label(f'{trade_count} Trade{"s" if trade_count != 1 else ""}').classes('text-sm text-weight-medium').style('color: #ffa94d')
                                     
                                     # Get financial metrics
                                     money_spent = rec_data.get('money_spent', 0.0)
@@ -1627,55 +1628,55 @@ Recommendations Generated:"""
                                         with ui.grid(columns=3).classes('w-full gap-3'):
                                             # Confidence
                                             with ui.column().classes('text-center'):
-                                                ui.label(f'{confidence:.0f}%').classes('text-h6 text-weight-bold text-blue-700')
-                                                ui.label('Confidence').classes('text-xs text-grey-7')
+                                                ui.label(f'{confidence:.0f}%').classes('text-h6 text-weight-bold').style('color: #63b3ed')
+                                                ui.label('Confidence').classes('text-xs').style('color: #a0aec0')
                                             
                                             # Expected Profit
                                             with ui.column().classes('text-center'):
                                                 profit_color = 'positive' if expected_profit > 0 else 'negative' if expected_profit < 0 else 'grey'
                                                 ui.label(f'{expected_profit:+.1f}%').classes(f'text-h6 text-weight-bold text-{profit_color}')
-                                                ui.label('Expected').classes('text-xs text-grey-7')
+                                                ui.label('Expected').classes('text-xs').style('color: #a0aec0')
                                             
                                             # Current Price
                                             with ui.column().classes('text-center'):
                                                 price_label = f'${current_price:.2f}' if current_price > 0 else 'N/A'
-                                                ui.label(price_label).classes('text-h6 text-weight-bold')
-                                                ui.label('Price').classes('text-xs text-grey-7')
+                                                ui.label(price_label).classes('text-h6 text-weight-bold').style('color: #e2e8f0')
+                                                ui.label('Price').classes('text-xs').style('color: #a0aec0')
                                         
                                         # Row 2: Money Spent, Percent of Yearly
-                                        with ui.grid(columns=2).classes('w-full gap-3 mt-2 pt-2 border-t border-grey-3'):
+                                        with ui.grid(columns=2).classes('w-full gap-3 mt-2 pt-2').style('border-top: 1px solid #2d3748'):
                                             # Money Spent
                                             with ui.column().classes('text-center'):
                                                 money_label = f'${money_spent:,.0f}' if money_spent > 0 else '$0'
-                                                ui.label(money_label).classes('text-h6 text-weight-bold text-orange-700')
-                                                ui.label('Money Spent').classes('text-xs text-grey-7')
+                                                ui.label(money_label).classes('text-h6 text-weight-bold').style('color: #ffa94d')
+                                                ui.label('Money Spent').classes('text-xs').style('color: #a0aec0')
                                             
                                             # Percent of Yearly Trading
                                             with ui.column().classes('text-center'):
-                                                ui.label(f'{percent_yearly:.1f}%').classes('text-h6 text-weight-bold text-purple-700')
-                                                ui.label('of Yearly').classes('text-xs text-grey-7')
+                                                ui.label(f'{percent_yearly:.1f}%').classes('text-h6 text-weight-bold').style('color: #9f7aea')
+                                                ui.label('of Yearly').classes('text-xs').style('color: #a0aec0')
             
             # Followed Traders
             copy_trade_names = settings.get('copy_trade_names', '')
             if copy_trade_names:
                 with ui.card_section():
-                    ui.label('Followed Traders').classes('text-subtitle1 text-weight-medium mb-2')
-                    ui.label(copy_trade_names).classes('text-sm text-grey-7 bg-grey-2 rounded p-2')
+                    ui.label('Followed Traders').classes('text-subtitle1 text-weight-medium mb-2').style('color: #e2e8f0')
+                    ui.label(copy_trade_names).classes('text-sm rounded p-2').style('color: #a0aec0; background-color: #141c28')
             
             # Settings
             max_disclose = settings.get('max_disclose_date_days', 30)
             max_exec = settings.get('max_trade_exec_days', 60)
             
             with ui.card_section():
-                ui.label('Filter Settings').classes('text-subtitle1 text-weight-medium mb-2')
+                ui.label('Filter Settings').classes('text-subtitle1 text-weight-medium mb-2').style('color: #e2e8f0')
                 
                 with ui.row().classes('gap-4'):
-                    ui.label(f'Max Disclose Age: {max_disclose} days').classes('text-sm text-grey-7')
-                    ui.label(f'Max Exec Age: {max_exec} days').classes('text-sm text-grey-7')
+                    ui.label(f'Max Disclose Age: {max_disclose} days').classes('text-sm').style('color: #a0aec0')
+                    ui.label(f'Max Exec Age: {max_exec} days').classes('text-sm').style('color: #a0aec0')
             
             # Methodology
-            with ui.expansion('Multi-Instrument Copy Trading Methodology', icon='info').classes('w-full'):
-                with ui.card_section().classes('bg-grey-1'):
+            with ui.expansion('Multi-Instrument Copy Trading Methodology', icon='info').classes('w-full').style('color: #e2e8f0'):
+                with ui.card_section().style('background-color: #141c28'):
                     ui.markdown(f'''
 **Multi-Instrument Copy Trading Logic:**
 
@@ -1724,11 +1725,11 @@ Recommendations Generated:"""
         current_price = state.get('current_price')
         
         # Main card
-        with ui.card().classes('w-full'):
+        with ui.card().classes('w-full').style('background-color: #1e2a3a'):
             # Header
-            with ui.card_section().classes('bg-orange-1'):
-                ui.label('Senate/House Copy Trading Analysis').classes('text-h5 text-weight-bold')
-                ui.label(f'{market_analysis.symbol} - Following Specific Traders').classes('text-grey-7')
+            with ui.card_section().style('background: linear-gradient(135deg, #00d4aa 0%, #00b894 100%)'):
+                ui.label('Senate/House Copy Trading Analysis').classes('text-h5 text-weight-bold').style('color: white')
+                ui.label(f'{market_analysis.symbol} - Following Specific Traders').style('color: rgba(255,255,255,0.8)')
             
             # Recommendation summary
             signal = rec.get('signal', 'HOLD')
@@ -1749,35 +1750,35 @@ Recommendations Generated:"""
             with ui.card_section():
                 with ui.row().classes('w-full items-center justify-between'):
                     with ui.column():
-                        ui.label('Copy Trade Signal').classes('text-grey-6 text-caption')
+                        ui.label('Copy Trade Signal').classes('text-caption').style('color: #a0aec0')
                         with ui.row().classes('items-center gap-2'):
                             ui.icon(signal_icon, color=signal_color, size='2rem')
                             ui.label(signal).classes(f'text-h4 text-{signal_color}')
                     
                     with ui.column().classes('text-right'):
-                        ui.label('Confidence').classes('text-grey-6 text-caption')
-                        ui.label(f'{confidence:.1f}%').classes('text-h4')
+                        ui.label('Confidence').classes('text-caption').style('color: #a0aec0')
+                        ui.label(f'{confidence:.1f}%').classes('text-h4').style('color: #e2e8f0')
                     
                     with ui.column().classes('text-right'):
-                        ui.label('Expected Profit').classes('text-grey-6 text-caption')
+                        ui.label('Expected Profit').classes('text-caption').style('color: #a0aec0')
                         profit_color = 'positive' if expected_profit > 0 else 'negative' if expected_profit < 0 else 'grey'
                         ui.label(f'{expected_profit:+.1f}%').classes(f'text-h4 text-{profit_color}')
                 
                 # Add price and financial metrics
                 if current_price:
                     ui.separator().classes('my-2')
-                    ui.label(f'Current Price: ${current_price:.2f}').classes('text-grey-7')
+                    ui.label(f'Current Price: ${current_price:.2f}').style('color: #a0aec0')
                 
                 # Add money spent and percent of yearly if available
                 if rec.get('money_spent') or rec.get('percent_of_yearly'):
                     with ui.row().classes('gap-4 mt-2'):
                         money_spent = rec.get('money_spent', 0.0)
                         if money_spent > 0:
-                            ui.label(f'💰 Money Spent: ${money_spent:,.0f}').classes('text-sm text-orange-700 text-weight-medium')
+                            ui.label(f'💰 Money Spent: ${money_spent:,.0f}').classes('text-sm text-weight-medium').style('color: #ffa94d')
                         
                         percent_yearly = rec.get('percent_of_yearly', 0.0)
                         if percent_yearly > 0:
-                            ui.label(f'📊 {percent_yearly:.1f}% of Yearly Trading').classes('text-sm text-purple-700 text-weight-medium')
+                            ui.label(f'📊 {percent_yearly:.1f}% of Yearly Trading').classes('text-sm text-weight-medium').style('color: #9f7aea')
             
             # Trade Statistics
             total_trades = stats.get('total_trades', 0)
@@ -1785,56 +1786,58 @@ Recommendations Generated:"""
             copy_trades_found = stats.get('copy_trades_found', 0)
             symbol_trades = stats.get('symbol_trades', 0)
             
-            with ui.card_section().classes('bg-grey-1'):
-                ui.label('Copy Trade Activity Summary').classes('text-subtitle1 text-weight-medium mb-3')
+            with ui.card_section().style('background-color: #141c28'):
+                ui.label('Copy Trade Activity Summary').classes('text-subtitle1 text-weight-medium mb-3').style('color: #e2e8f0')
                 
                 with ui.grid(columns=2).classes('w-full gap-4'):
                     # Total Trades
-                    with ui.card().classes('bg-blue-50'):
-                        ui.label('Total Trades Found').classes('text-caption text-grey-7')
-                        ui.label(str(total_trades)).classes('text-h5 text-blue-700')
-                        ui.label(f'{filtered_trades} after age filter').classes('text-xs text-blue-600')
+                    with ui.card().style('background-color: rgba(66, 153, 225, 0.15)'):
+                        ui.label('Total Trades Found').classes('text-caption').style('color: #a0aec0')
+                        ui.label(str(total_trades)).classes('text-h5').style('color: #63b3ed')
+                        ui.label(f'{filtered_trades} after age filter').classes('text-xs').style('color: #4299e1')
                     
                     # Copy Trades
-                    with ui.card().classes('bg-orange-50'):
-                        ui.label('Copy Trades Found').classes('text-caption text-grey-7')
-                        ui.label(str(copy_trades_found)).classes('text-h5 text-orange-700')
-                        ui.label('from followed traders').classes('text-xs text-orange-600')
+                    with ui.card().style('background-color: rgba(255, 169, 77, 0.15)'):
+                        ui.label('Copy Trades Found').classes('text-caption').style('color: #a0aec0')
+                        ui.label(str(copy_trades_found)).classes('text-h5').style('color: #ffa94d')
+                        ui.label('from followed traders').classes('text-xs').style('color: #ed8936')
                     
                     # Symbol Trades
-                    with ui.card().classes('bg-purple-50'):
-                        ui.label(f'{market_analysis.symbol} Trades').classes('text-caption text-grey-7')
-                        ui.label(str(symbol_trades)).classes('text-h5 text-purple-700')
-                        ui.label('relevant to this symbol').classes('text-xs text-purple-600')
+                    with ui.card().style('background-color: rgba(159, 122, 234, 0.15)'):
+                        ui.label(f'{market_analysis.symbol} Trades').classes('text-caption').style('color: #a0aec0')
+                        ui.label(str(symbol_trades)).classes('text-h5').style('color: #9f7aea')
+                        ui.label('relevant to this symbol').classes('text-xs').style('color: #b794f4')
                     
                     # Status
-                    status_color = 'green' if copy_trades_found > 0 else 'grey'
-                    with ui.card().classes(f'bg-{status_color}-50'):
-                        ui.label('Copy Trade Status').classes('text-caption text-grey-7')
+                    status_color = '#00d4aa' if copy_trades_found > 0 else '#a0aec0'
+                    status_bg = 'rgba(0, 212, 170, 0.15)' if copy_trades_found > 0 else 'rgba(160, 174, 192, 0.15)'
+                    with ui.card().style(f'background-color: {status_bg}'):
+                        ui.label('Copy Trade Status').classes('text-caption').style('color: #a0aec0')
                         status_text = 'ACTIVE' if copy_trades_found > 0 else 'NO MATCHES'
-                        ui.label(status_text).classes(f'text-h5 text-{status_color}-700')
-                        ui.label('following traders').classes(f'text-xs text-{status_color}-600')
+                        ui.label(status_text).classes('text-h5').style(f'color: {status_color}')
+                        ui.label('following traders').classes('text-xs').style(f'color: {status_color}')
             
             # Individual Trades
             if trades:
                 with ui.card_section():
-                    ui.label(f'Copy Trades for {market_analysis.symbol} ({len(trades)})').classes('text-subtitle1 text-weight-medium mb-3')
+                    ui.label(f'Copy Trades for {market_analysis.symbol} ({len(trades)})').classes('text-subtitle1 text-weight-medium mb-3').style('color: #e2e8f0')
                     
                     for i, trade in enumerate(trades, 1):
                         trade_type = trade.get('type', 'Unknown')
                         is_buy = 'purchase' in trade_type.lower() or 'buy' in trade_type.lower()
                         
-                        with ui.card().classes(f'w-full {"bg-green-50" if is_buy else "bg-red-50"}'):
+                        bg_color = 'rgba(0, 212, 170, 0.1)' if is_buy else 'rgba(255, 107, 107, 0.1)'
+                        with ui.card().classes('w-full').style(f'background-color: {bg_color}'):
                             with ui.row().classes('w-full items-start justify-between'):
                                 with ui.column().classes('flex-grow'):
-                                    ui.label(f'Trade #{i}: {trade.get("trader", "Unknown")}').classes('text-weight-medium')
-                                    ui.label(f'{trade_type} - {trade.get("amount", "N/A")}').classes('text-sm text-grey-7')
-                                    ui.label(f'Matched: {trade.get("matched_target", "Unknown")}').classes('text-sm text-orange-600')
+                                    ui.label(f'Trade #{i}: {trade.get("trader", "Unknown")}').classes('text-weight-medium').style('color: #e2e8f0')
+                                    ui.label(f'{trade_type} - {trade.get("amount", "N/A")}').classes('text-sm').style('color: #a0aec0')
+                                    ui.label(f'Matched: {trade.get("matched_target", "Unknown")}').classes('text-sm').style('color: #ffa94d')
                                     
-                                    with ui.row().classes('gap-4 mt-2 text-xs'):
+                                    with ui.row().classes('gap-4 mt-2 text-xs').style('color: #a0aec0'):
                                         ui.label(f'Exec: {trade.get("exec_date", "N/A")} ({trade.get("days_since_exec", 0)}d ago)')
                                         ui.label(f'Disclosed: {trade.get("disclose_date", "N/A")} ({trade.get("days_since_disclose", 0)}d ago)')
                                 
                                 with ui.column().classes('text-right'):
                                     ui.label('100% Confidence').classes('text-sm text-weight-medium text-positive')
-                                    ui.label('Copy Trade').classes('text-xs text-orange-600')
+                                    ui.label('Copy Trade').classes('text-xs').style('color: #ffa94d')

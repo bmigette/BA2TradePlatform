@@ -508,11 +508,11 @@ Confidence = Dominant Score / Total × 100 = {dominant_score:.1f} / {total_weigh
         current_price = state.get('current_price')
         
         # Main card
-        with ui.card().classes('w-full'):
+        with ui.card().classes('w-full').style('background-color: #1e2a3a'):
             # Header with recommendation
-            with ui.card_section().classes('bg-blue-1'):
-                ui.label('FinnHub Analyst Recommendations').classes('text-h5 text-weight-bold')
-                ui.label(f'{market_analysis.symbol} - Analyst Consensus').classes('text-grey-7')
+            with ui.card_section().style('background: linear-gradient(135deg, #00d4aa 0%, #00b894 100%)'):
+                ui.label('FinnHub Analyst Recommendations').classes('text-h5 text-weight-bold').style('color: white')
+                ui.label(f'{market_analysis.symbol} - Analyst Consensus').style('color: rgba(255,255,255,0.8)')
             
             # Recommendation summary
             signal = rec.get('signal', OrderRecommendation.HOLD)
@@ -545,26 +545,26 @@ Confidence = Dominant Score / Total × 100 = {dominant_score:.1f} / {total_weigh
             with ui.card_section():
                 with ui.row().classes('w-full items-center justify-between'):
                     with ui.column():
-                        ui.label('Recommendation').classes('text-grey-6 text-caption')
+                        ui.label('Recommendation').classes('text-caption').style('color: #a0aec0')
                         with ui.row().classes('items-center gap-2'):
                             ui.icon(signal_icon, color=signal_color, size='2rem')
                             ui.label(signal_text).classes(f'text-h4 text-{signal_color}')
                     
                     with ui.column().classes('text-right'):
-                        ui.label('Confidence').classes('text-grey-6 text-caption')
-                        ui.label(f'{confidence:.1f}%').classes('text-h4')
+                        ui.label('Confidence').classes('text-caption').style('color: #a0aec0')
+                        ui.label(f'{confidence:.1f}%').classes('text-h4').style('color: #e2e8f0')
                 
                 if current_price:
                     ui.separator().classes('my-2')
-                    ui.label(f'Current Price: ${current_price:.2f}').classes('text-grey-7')
+                    ui.label(f'Current Price: ${current_price:.2f}').style('color: #a0aec0')
             
             # Ratings breakdown
             if api_data and len(api_data) > 0:
                 latest = api_data[0]
                 period = latest.get('period', 'Unknown')
                 
-                with ui.card_section().classes('bg-grey-1'):
-                    ui.label(f'Analyst Ratings - {period}').classes('text-subtitle1 text-weight-medium mb-2')
+                with ui.card_section().style('background-color: #141c28'):
+                    ui.label(f'Analyst Ratings - {period}').classes('text-subtitle1 text-weight-medium mb-2').style('color: #e2e8f0')
                     
                     strong_buy = latest.get('strongBuy', 0)
                     buy = latest.get('buy', 0)
@@ -579,49 +579,49 @@ Confidence = Dominant Score / Total × 100 = {dominant_score:.1f} / {total_weigh
                         if strong_buy > 0:
                             pct = (strong_buy / total * 100) if total > 0 else 0
                             with ui.row().classes('w-full items-center gap-2'):
-                                ui.label('Strong Buy').classes('w-24 text-right text-sm')
-                                ui.label(str(strong_buy)).classes('w-8 text-sm font-bold')
-                                with ui.element('div').classes('flex-grow bg-grey-3 rounded overflow-hidden h-6'):
-                                    ui.element('div').classes('bg-green-600 h-full').style(f'width: {pct}%')
+                                ui.label('Strong Buy').classes('w-24 text-right text-sm').style('color: #a0aec0')
+                                ui.label(str(strong_buy)).classes('w-8 text-sm font-bold').style('color: #00d4aa')
+                                with ui.element('div').classes('flex-grow rounded overflow-hidden h-6').style('background-color: #2d3748'):
+                                    ui.element('div').classes('h-full').style(f'width: {pct}%; background-color: #00d4aa')
                         
                         # Buy
                         if buy > 0:
                             pct = (buy / total * 100) if total > 0 else 0
                             with ui.row().classes('w-full items-center gap-2'):
-                                ui.label('Buy').classes('w-24 text-right text-sm')
-                                ui.label(str(buy)).classes('w-8 text-sm font-bold')
-                                with ui.element('div').classes('flex-grow bg-grey-3 rounded overflow-hidden h-6'):
-                                    ui.element('div').classes('bg-green-400 h-full').style(f'width: {pct}%')
+                                ui.label('Buy').classes('w-24 text-right text-sm').style('color: #a0aec0')
+                                ui.label(str(buy)).classes('w-8 text-sm font-bold').style('color: #48bb78')
+                                with ui.element('div').classes('flex-grow rounded overflow-hidden h-6').style('background-color: #2d3748'):
+                                    ui.element('div').classes('h-full').style(f'width: {pct}%; background-color: #48bb78')
                         
                         # Hold
                         if hold > 0:
                             pct = (hold / total * 100) if total > 0 else 0
                             with ui.row().classes('w-full items-center gap-2'):
-                                ui.label('Hold').classes('w-24 text-right text-sm')
-                                ui.label(str(hold)).classes('w-8 text-sm font-bold text-amber-700')
-                                with ui.element('div').classes('flex-grow bg-grey-3 rounded overflow-hidden h-6'):
-                                    ui.element('div').classes('bg-amber-400 h-full').style(f'width: {pct}%')
+                                ui.label('Hold').classes('w-24 text-right text-sm').style('color: #a0aec0')
+                                ui.label(str(hold)).classes('w-8 text-sm font-bold').style('color: #ffa94d')
+                                with ui.element('div').classes('flex-grow rounded overflow-hidden h-6').style('background-color: #2d3748'):
+                                    ui.element('div').classes('h-full').style(f'width: {pct}%; background-color: #ffa94d')
                         
                         # Sell
                         if sell > 0:
                             pct = (sell / total * 100) if total > 0 else 0
                             with ui.row().classes('w-full items-center gap-2'):
-                                ui.label('Sell').classes('w-24 text-right text-sm')
-                                ui.label(str(sell)).classes('w-8 text-sm font-bold')
-                                with ui.element('div').classes('flex-grow bg-grey-3 rounded overflow-hidden h-6'):
-                                    ui.element('div').classes('bg-red-400 h-full').style(f'width: {pct}%')
+                                ui.label('Sell').classes('w-24 text-right text-sm').style('color: #a0aec0')
+                                ui.label(str(sell)).classes('w-8 text-sm font-bold').style('color: #ff6b6b')
+                                with ui.element('div').classes('flex-grow rounded overflow-hidden h-6').style('background-color: #2d3748'):
+                                    ui.element('div').classes('h-full').style(f'width: {pct}%; background-color: #ff6b6b')
                         
                         # Strong Sell
                         if strong_sell > 0:
                             pct = (strong_sell / total * 100) if total > 0 else 0
                             with ui.row().classes('w-full items-center gap-2'):
-                                ui.label('Strong Sell').classes('w-24 text-right text-sm')
-                                ui.label(str(strong_sell)).classes('w-8 text-sm font-bold')
-                                with ui.element('div').classes('flex-grow bg-grey-3 rounded overflow-hidden h-6'):
-                                    ui.element('div').classes('bg-red-600 h-full').style(f'width: {pct}%')
+                                ui.label('Strong Sell').classes('w-24 text-right text-sm').style('color: #a0aec0')
+                                ui.label(str(strong_sell)).classes('w-8 text-sm font-bold').style('color: #e53e3e')
+                                with ui.element('div').classes('flex-grow rounded overflow-hidden h-6').style('background-color: #2d3748'):
+                                    ui.element('div').classes('h-full').style(f'width: {pct}%; background-color: #e53e3e')
                     
                     ui.separator().classes('my-2')
-                    ui.label(f'Total Analysts: {total}').classes('text-sm text-grey-7')
+                    ui.label(f'Total Analysts: {total}').classes('text-sm').style('color: #00d4aa')
             
             # Weighted scores
             buy_score = rec.get('buy_score', 0)
@@ -630,25 +630,25 @@ Confidence = Dominant Score / Total × 100 = {dominant_score:.1f} / {total_weigh
             strong_factor = settings.get('strong_factor', 2.0)
             
             with ui.card_section():
-                ui.label('Weighted Scoring').classes('text-subtitle1 text-weight-medium mb-2')
-                ui.label(f'Strong Factor: {strong_factor}x').classes('text-sm text-grey-7 mb-2')
+                ui.label('Weighted Scoring').classes('text-subtitle1 text-weight-medium mb-2').style('color: #e2e8f0')
+                ui.label(f'Strong Factor: {strong_factor}x').classes('text-sm mb-2').style('color: #a0aec0')
                 
                 with ui.grid(columns=3).classes('w-full gap-4'):
-                    with ui.card().classes('bg-green-50'):
-                        ui.label('Buy Score').classes('text-caption text-grey-7')
-                        ui.label(f'{buy_score:.1f}').classes('text-h5 text-green-700')
+                    with ui.card().style('background-color: rgba(0, 212, 170, 0.15)'):
+                        ui.label('Buy Score').classes('text-caption').style('color: #a0aec0')
+                        ui.label(f'{buy_score:.1f}').classes('text-h5').style('color: #00d4aa')
                     
-                    with ui.card().classes('bg-grey-50'):
-                        ui.label('Hold Score').classes('text-caption text-grey-7')
-                        ui.label(f'{hold_score:.1f}').classes('text-h5 text-grey-700')
+                    with ui.card().style('background-color: rgba(255, 169, 77, 0.15)'):
+                        ui.label('Hold Score').classes('text-caption').style('color: #a0aec0')
+                        ui.label(f'{hold_score:.1f}').classes('text-h5').style('color: #ffa94d')
                     
-                    with ui.card().classes('bg-red-50'):
-                        ui.label('Sell Score').classes('text-caption text-grey-7')
-                        ui.label(f'{sell_score:.1f}').classes('text-h5 text-red-700')
+                    with ui.card().style('background-color: rgba(255, 107, 107, 0.15)'):
+                        ui.label('Sell Score').classes('text-caption').style('color: #a0aec0')
+                        ui.label(f'{sell_score:.1f}').classes('text-h5').style('color: #ff6b6b')
             
             # Methodology
-            with ui.expansion('Calculation Methodology', icon='info').classes('w-full'):
-                with ui.card_section().classes('bg-grey-1'):
+            with ui.expansion('Calculation Methodology', icon='info').classes('w-full').style('color: #e2e8f0'):
+                with ui.card_section().style('background-color: #141c28'):
                     ui.markdown('''
 **Confidence Calculation:**
 

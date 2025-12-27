@@ -749,11 +749,11 @@ Expected Profit % = (Weighted Delta / Current) × 100 = {expected_profit_percent
         current_price = state.get('current_price')
         
         # Main card
-        with ui.card().classes('w-full'):
+        with ui.card().classes('w-full').style('background-color: #1e2a3a'):
             # Header with recommendation
-            with ui.card_section().classes('bg-blue-1'):
-                ui.label('FMP Analyst Price Target Consensus').classes('text-h5 text-weight-bold')
-                ui.label(f'{market_analysis.symbol} - Price Target Analysis').classes('text-grey-7')
+            with ui.card_section().style('background: linear-gradient(135deg, #00d4aa 0%, #00b894 100%)'):
+                ui.label('FMP Analyst Price Target Consensus').classes('text-h5 text-weight-bold').style('color: white')
+                ui.label(f'{market_analysis.symbol} - Price Target Analysis').style('color: rgba(255,255,255,0.8)')
             
             # Recommendation summary
             signal = rec.get('signal', 'HOLD')
@@ -774,23 +774,23 @@ Expected Profit % = (Weighted Delta / Current) × 100 = {expected_profit_percent
             with ui.card_section():
                 with ui.row().classes('w-full items-center justify-between'):
                     with ui.column():
-                        ui.label('Recommendation').classes('text-grey-6 text-caption')
+                        ui.label('Recommendation').classes('text-caption').style('color: #a0aec0')
                         with ui.row().classes('items-center gap-2'):
                             ui.icon(signal_icon, color=signal_color, size='2rem')
                             ui.label(signal).classes(f'text-h4 text-{signal_color}')
                     
                     with ui.column().classes('text-right'):
-                        ui.label('Confidence').classes('text-grey-6 text-caption')
-                        ui.label(f'{confidence:.1f}%').classes('text-h4')
+                        ui.label('Confidence').classes('text-caption').style('color: #a0aec0')
+                        ui.label(f'{confidence:.1f}%').classes('text-h4').style('color: #e2e8f0')
                     
                     with ui.column().classes('text-right'):
-                        ui.label('Expected Profit').classes('text-grey-6 text-caption')
+                        ui.label('Expected Profit').classes('text-caption').style('color: #a0aec0')
                         profit_color = 'positive' if expected_profit > 0 else 'negative' if expected_profit < 0 else 'grey'
                         ui.label(f'{expected_profit:+.1f}%').classes(f'text-h4 text-{profit_color}')
                 
                 if current_price:
                     ui.separator().classes('my-2')
-                    ui.label(f'Current Price: ${current_price:.2f}').classes('text-grey-7')
+                    ui.label(f'Current Price: ${current_price:.2f}').style('color: #a0aec0')
             
             # Price Targets
             consensus = targets.get('consensus')
@@ -800,40 +800,40 @@ Expected Profit % = (Weighted Delta / Current) × 100 = {expected_profit_percent
             analyst_count = targets.get('analyst_count', 0)
             
             if consensus and high and low:
-                with ui.card_section().classes('bg-grey-1'):
-                    ui.label(f'Analyst Price Targets ({analyst_count} analysts)').classes('text-subtitle1 text-weight-medium mb-3')
+                with ui.card_section().style('background-color: #141c28'):
+                    ui.label(f'Analyst Price Targets ({analyst_count} analysts)').classes('text-subtitle1 text-weight-medium mb-3').style('color: #e2e8f0')
                     
                     with ui.grid(columns=2).classes('w-full gap-4'):
                         # Consensus Target
-                        with ui.card().classes('bg-blue-50'):
-                            ui.label('Consensus Target').classes('text-caption text-grey-7')
-                            ui.label(f'${consensus:.2f}').classes('text-h5 text-blue-700')
+                        with ui.card().style('background-color: rgba(66, 153, 225, 0.15)'):
+                            ui.label('Consensus Target').classes('text-caption').style('color: #a0aec0')
+                            ui.label(f'${consensus:.2f}').classes('text-h5').style('color: #63b3ed')
                             if current_price:
                                 delta_pct = ((consensus - current_price) / current_price) * 100
                                 delta_color = 'positive' if delta_pct > 0 else 'negative'
                                 ui.label(f'{delta_pct:+.1f}% from current').classes(f'text-xs text-{delta_color}')
                         
                         # Median Target
-                        with ui.card().classes('bg-grey-50'):
-                            ui.label('Median Target').classes('text-caption text-grey-7')
-                            ui.label(f'${median:.2f}').classes('text-h5 text-grey-700')
+                        with ui.card().style('background-color: rgba(160, 174, 192, 0.15)'):
+                            ui.label('Median Target').classes('text-caption').style('color: #a0aec0')
+                            ui.label(f'${median:.2f}').classes('text-h5').style('color: #a0aec0')
                             if current_price:
                                 delta_pct = ((median - current_price) / current_price) * 100
                                 delta_color = 'positive' if delta_pct > 0 else 'negative'
                                 ui.label(f'{delta_pct:+.1f}% from current').classes(f'text-xs text-{delta_color}')
                         
                         # High Target
-                        with ui.card().classes('bg-green-50'):
-                            ui.label('High Target').classes('text-caption text-grey-7')
-                            ui.label(f'${high:.2f}').classes('text-h5 text-green-700')
+                        with ui.card().style('background-color: rgba(0, 212, 170, 0.15)'):
+                            ui.label('High Target').classes('text-caption').style('color: #a0aec0')
+                            ui.label(f'${high:.2f}').classes('text-h5').style('color: #00d4aa')
                             if current_price:
                                 delta_pct = ((high - current_price) / current_price) * 100
                                 ui.label(f'{delta_pct:+.1f}% upside').classes('text-xs text-positive')
                         
                         # Low Target
-                        with ui.card().classes('bg-red-50'):
-                            ui.label('Low Target').classes('text-caption text-grey-7')
-                            ui.label(f'${low:.2f}').classes('text-h5 text-red-700')
+                        with ui.card().style('background-color: rgba(255, 107, 107, 0.15)'):
+                            ui.label('Low Target').classes('text-caption').style('color: #a0aec0')
+                            ui.label(f'${low:.2f}').classes('text-h5').style('color: #ff6b6b')
                             if current_price:
                                 delta_pct = ((low - current_price) / current_price) * 100
                                 if delta_pct >= 0:
@@ -844,7 +844,7 @@ Expected Profit % = (Weighted Delta / Current) × 100 = {expected_profit_percent
                     # Target range visualization
                     if current_price:
                         ui.separator().classes('my-3')
-                        ui.label('Price Range').classes('text-caption text-grey-7 mb-2')
+                        ui.label('Price Range').classes('text-caption mb-2').style('color: #a0aec0')
                         
                         # Calculate positions for visualization
                         # Include current_price in scale to ensure it's always visible
@@ -854,23 +854,23 @@ Expected Profit % = (Weighted Delta / Current) × 100 = {expected_profit_percent
                         current_pos = ((current_price - scale_min) / price_range * 100) if price_range > 0 else 50
                         consensus_pos = ((consensus - scale_min) / price_range * 100) if price_range > 0 else 50
                         
-                        with ui.element('div').classes('relative w-full h-12 bg-grey-3 rounded'):
+                        with ui.element('div').classes('relative w-full h-12 rounded').style('background-color: #2d3748'):
                             # Low to High gradient background
-                            ui.element('div').classes('absolute inset-0 bg-gradient-to-r from-red-200 via-grey-200 to-green-200 rounded')
+                            ui.element('div').classes('absolute inset-0 rounded').style('background: linear-gradient(to right, rgba(255,107,107,0.3), rgba(160,174,192,0.3), rgba(0,212,170,0.3))')
                             
                             # Current price marker
-                            with ui.element('div').classes('absolute top-0 bottom-0 w-1 bg-blue-600').style(f'left: {current_pos}%'):
+                            with ui.element('div').classes('absolute top-0 bottom-0 w-1').style(f'left: {current_pos}%; background-color: #63b3ed'):
                                 with ui.element('div').classes('absolute -top-6 left-1/2 transform -translate-x-1/2'):
-                                    ui.label('Current').classes('text-xs font-bold text-blue-600')
+                                    ui.label('Current').classes('text-xs font-bold').style('color: #63b3ed')
                             
                             # Consensus marker
-                            with ui.element('div').classes('absolute top-0 bottom-0 w-1 bg-orange-600').style(f'left: {consensus_pos}%'):
+                            with ui.element('div').classes('absolute top-0 bottom-0 w-1').style(f'left: {consensus_pos}%; background-color: #ffa94d'):
                                 with ui.element('div').classes('absolute -bottom-6 left-1/2 transform -translate-x-1/2'):
-                                    ui.label('Target').classes('text-xs font-bold text-orange-600')
+                                    ui.label('Target').classes('text-xs font-bold').style('color: #ffa94d')
                         
                         with ui.row().classes('w-full justify-between mt-8'):
-                            ui.label(f'${scale_min:.2f}').classes('text-xs text-grey-6')
-                            ui.label(f'${scale_max:.2f}').classes('text-xs text-grey-6')
+                            ui.label(f'${scale_min:.2f}').classes('text-xs').style('color: #718096')
+                            ui.label(f'${scale_max:.2f}').classes('text-xs').style('color: #718096')
             
             # Analyst Recommendations Breakdown
             analyst_breakdown = state.get('analyst_breakdown', {})
@@ -881,63 +881,63 @@ Expected Profit % = (Weighted Delta / Current) × 100 = {expected_profit_percent
                 sell = analyst_breakdown.get('sell', 0)
                 strong_sell = analyst_breakdown.get('strong_sell', 0)
                 
-                with ui.card_section().classes('bg-grey-1'):
-                    ui.label('Analyst Recommendations Breakdown').classes('text-subtitle1 text-weight-medium mb-3')
+                with ui.card_section().style('background-color: #141c28'):
+                    ui.label('Analyst Recommendations Breakdown').classes('text-subtitle1 text-weight-medium mb-3').style('color: #e2e8f0')
                     
                     # Create a visual bar chart - show all categories
                     with ui.column().classes('w-full gap-2'):
                         # Strong Buy
                         pct = (strong_buy / analyst_count * 100) if analyst_count > 0 else 0
                         with ui.row().classes('w-full items-center gap-2'):
-                            ui.label('Strong Buy').classes('w-24 text-right text-sm')
-                            ui.label(str(strong_buy)).classes('w-8 text-sm font-bold text-green-700')
-                            with ui.element('div').classes('flex-grow bg-grey-3 rounded overflow-hidden h-6'):
+                            ui.label('Strong Buy').classes('w-24 text-right text-sm').style('color: #a0aec0')
+                            ui.label(str(strong_buy)).classes('w-8 text-sm font-bold').style('color: #00d4aa')
+                            with ui.element('div').classes('flex-grow rounded overflow-hidden h-6').style('background-color: #2d3748'):
                                 if pct > 0:
-                                    ui.element('div').classes('bg-green-600 h-full').style(f'width: {pct}%')
-                            ui.label(f'{pct:.0f}%').classes('w-12 text-xs text-grey-6')
+                                    ui.element('div').classes('h-full').style(f'width: {pct}%; background-color: #00d4aa')
+                            ui.label(f'{pct:.0f}%').classes('w-12 text-xs').style('color: #718096')
                         
                         # Buy
                         pct = (buy / analyst_count * 100) if analyst_count > 0 else 0
                         with ui.row().classes('w-full items-center gap-2'):
-                            ui.label('Buy').classes('w-24 text-right text-sm')
-                            ui.label(str(buy)).classes('w-8 text-sm font-bold text-green-600')
-                            with ui.element('div').classes('flex-grow bg-grey-3 rounded overflow-hidden h-6'):
+                            ui.label('Buy').classes('w-24 text-right text-sm').style('color: #a0aec0')
+                            ui.label(str(buy)).classes('w-8 text-sm font-bold').style('color: #48bb78')
+                            with ui.element('div').classes('flex-grow rounded overflow-hidden h-6').style('background-color: #2d3748'):
                                 if pct > 0:
-                                    ui.element('div').classes('bg-green-400 h-full').style(f'width: {pct}%')
-                            ui.label(f'{pct:.0f}%').classes('w-12 text-xs text-grey-6')
+                                    ui.element('div').classes('h-full').style(f'width: {pct}%; background-color: #48bb78')
+                            ui.label(f'{pct:.0f}%').classes('w-12 text-xs').style('color: #718096')
                         
                         # Hold
                         pct = (hold / analyst_count * 100) if analyst_count > 0 else 0
                         with ui.row().classes('w-full items-center gap-2'):
-                            ui.label('Hold').classes('w-24 text-right text-sm')
-                            ui.label(str(hold)).classes('w-8 text-sm font-bold text-amber-700')
-                            with ui.element('div').classes('flex-grow bg-grey-3 rounded overflow-hidden h-6'):
+                            ui.label('Hold').classes('w-24 text-right text-sm').style('color: #a0aec0')
+                            ui.label(str(hold)).classes('w-8 text-sm font-bold').style('color: #ffa94d')
+                            with ui.element('div').classes('flex-grow rounded overflow-hidden h-6').style('background-color: #2d3748'):
                                 if pct > 0:
-                                    ui.element('div').classes('bg-amber-400 h-full').style(f'width: {pct}%')
-                            ui.label(f'{pct:.0f}%').classes('w-12 text-xs text-grey-6')
+                                    ui.element('div').classes('h-full').style(f'width: {pct}%; background-color: #ffa94d')
+                            ui.label(f'{pct:.0f}%').classes('w-12 text-xs').style('color: #718096')
                         
                         # Sell
                         pct = (sell / analyst_count * 100) if analyst_count > 0 else 0
                         with ui.row().classes('w-full items-center gap-2'):
-                            ui.label('Sell').classes('w-24 text-right text-sm')
-                            ui.label(str(sell)).classes('w-8 text-sm font-bold text-red-600')
-                            with ui.element('div').classes('flex-grow bg-grey-3 rounded overflow-hidden h-6'):
+                            ui.label('Sell').classes('w-24 text-right text-sm').style('color: #a0aec0')
+                            ui.label(str(sell)).classes('w-8 text-sm font-bold').style('color: #ff6b6b')
+                            with ui.element('div').classes('flex-grow rounded overflow-hidden h-6').style('background-color: #2d3748'):
                                 if pct > 0:
-                                    ui.element('div').classes('bg-red-400 h-full').style(f'width: {pct}%')
-                            ui.label(f'{pct:.0f}%').classes('w-12 text-xs text-grey-6')
+                                    ui.element('div').classes('h-full').style(f'width: {pct}%; background-color: #ff6b6b')
+                            ui.label(f'{pct:.0f}%').classes('w-12 text-xs').style('color: #718096')
                         
                         # Strong Sell
                         pct = (strong_sell / analyst_count * 100) if analyst_count > 0 else 0
                         with ui.row().classes('w-full items-center gap-2'):
-                            ui.label('Strong Sell').classes('w-24 text-right text-sm')
-                            ui.label(str(strong_sell)).classes('w-8 text-sm font-bold text-red-700')
-                            with ui.element('div').classes('flex-grow bg-grey-3 rounded overflow-hidden h-6'):
+                            ui.label('Strong Sell').classes('w-24 text-right text-sm').style('color: #a0aec0')
+                            ui.label(str(strong_sell)).classes('w-8 text-sm font-bold').style('color: #e53e3e')
+                            with ui.element('div').classes('flex-grow rounded overflow-hidden h-6').style('background-color: #2d3748'):
                                 if pct > 0:
-                                    ui.element('div').classes('bg-red-600 h-full').style(f'width: {pct}%')
-                            ui.label(f'{pct:.0f}%').classes('w-12 text-xs text-grey-6')
+                                    ui.element('div').classes('h-full').style(f'width: {pct}%; background-color: #e53e3e')
+                            ui.label(f'{pct:.0f}%').classes('w-12 text-xs').style('color: #718096')
                     
                     ui.separator().classes('my-2')
-                    ui.label(f'Total Analysts: {analyst_count}').classes('text-sm text-grey-7')
+                    ui.label(f'Total Analysts: {analyst_count}').classes('text-sm').style('color: #00d4aa')
             
             # Confidence Breakdown
             confidence_breakdown = state.get('confidence_breakdown', {})
@@ -948,32 +948,33 @@ Expected Profit % = (Weighted Delta / Current) × 100 = {expected_profit_percent
                 boost_to_consensus = confidence_breakdown.get('boost_to_consensus', 0)
                 
                 with ui.card_section():
-                    ui.label('Confidence Score Breakdown (New Methodology)').classes('text-subtitle1 text-weight-medium mb-2')
-                    ui.label('FinnHub Analyst Rating Base + Price Target Boost').classes('text-xs text-grey-6 mb-3')
+                    ui.label('Confidence Score Breakdown (New Methodology)').classes('text-subtitle1 text-weight-medium mb-2').style('color: #e2e8f0')
+                    ui.label('FinnHub Analyst Rating Base + Price Target Boost').classes('text-xs mb-3').style('color: #718096')
                     
                     with ui.grid(columns=2).classes('w-full gap-4'):
                         # Base Confidence from Analyst Ratings
-                        with ui.card().classes('bg-blue-50'):
-                            ui.label('Base (from Analyst Ratings)').classes('text-caption text-grey-7')
-                            ui.label(f'{base_confidence:.1f}%').classes('text-h5 text-blue-700')
-                            ui.label(f'Weighted buy/sell/hold scores').classes('text-xs text-grey-6')
+                        with ui.card().style('background-color: rgba(66, 153, 225, 0.15)'):
+                            ui.label('Base (from Analyst Ratings)').classes('text-caption').style('color: #a0aec0')
+                            ui.label(f'{base_confidence:.1f}%').classes('text-h5').style('color: #63b3ed')
+                            ui.label(f'Weighted buy/sell/hold scores').classes('text-xs').style('color: #718096')
                         
                         # Price Target Boost
-                        boost_color = 'positive' if price_target_boost > 0 else 'negative' if price_target_boost < 0 else 'grey'
-                        with ui.card().classes(f'bg-{"green" if price_target_boost > 0 else "red" if price_target_boost < 0 else "grey"}-50'):
-                            ui.label('Price Target Boost').classes('text-caption text-grey-7')
-                            ui.label(f'{price_target_boost:+.1f}%').classes(f'text-h5 text-{boost_color}')
-                            ui.label(f'Avg of lower & consensus targets').classes('text-xs text-grey-6')
+                        boost_color = '#00d4aa' if price_target_boost > 0 else '#ff6b6b' if price_target_boost < 0 else '#a0aec0'
+                        boost_bg = 'rgba(0, 212, 170, 0.15)' if price_target_boost > 0 else 'rgba(255, 107, 107, 0.15)' if price_target_boost < 0 else 'rgba(160, 174, 192, 0.15)'
+                        with ui.card().style(f'background-color: {boost_bg}'):
+                            ui.label('Price Target Boost').classes('text-caption').style('color: #a0aec0')
+                            ui.label(f'{price_target_boost:+.1f}%').classes('text-h5').style(f'color: {boost_color}')
+                            ui.label(f'Avg of lower & consensus targets').classes('text-xs').style('color: #718096')
                         
                         # Boost to Lower Target
-                        with ui.card().classes('bg-grey-50'):
-                            ui.label('Boost to Lower Target').classes('text-caption text-grey-7')
-                            ui.label(f'{boost_to_lower:+.1f}%').classes('text-h6 text-grey-700')
+                        with ui.card().style('background-color: rgba(160, 174, 192, 0.15)'):
+                            ui.label('Boost to Lower Target').classes('text-caption').style('color: #a0aec0')
+                            ui.label(f'{boost_to_lower:+.1f}%').classes('text-h6').style('color: #a0aec0')
                         
                         # Boost to Consensus Target
-                        with ui.card().classes('bg-grey-50'):
-                            ui.label('Boost to Consensus Target').classes('text-caption text-grey-7')
-                            ui.label(f'{boost_to_consensus:+.1f}%').classes('text-h6 text-grey-700')
+                        with ui.card().style('background-color: rgba(160, 174, 192, 0.15)'):
+                            ui.label('Boost to Consensus Target').classes('text-caption').style('color: #a0aec0')
+                            ui.label(f'{boost_to_consensus:+.1f}%').classes('text-h6').style('color: #a0aec0')
                     
                     ui.separator().classes('my-2')
                     
@@ -982,30 +983,30 @@ Expected Profit % = (Weighted Delta / Current) × 100 = {expected_profit_percent
                     clamped_confidence = max(0.0, min(100.0, calculated_confidence))
                     
                     # Show the formula
-                    ui.label(f'Final Confidence = Base + Boost = {base_confidence:.1f}% + {price_target_boost:+.1f}% = {calculated_confidence:.1f}%').classes('text-sm text-grey-7')
+                    ui.label(f'Final Confidence = Base + Boost = {base_confidence:.1f}% + {price_target_boost:+.1f}% = {calculated_confidence:.1f}%').classes('text-sm').style('color: #a0aec0')
                     
                     # If clamping occurred, show it
                     if calculated_confidence != clamped_confidence:
-                        ui.label(f'Clamped to valid range [0-100%]: {clamped_confidence:.1f}%').classes('text-sm text-orange-600 font-medium')
+                        ui.label(f'Clamped to valid range [0-100%]: {clamped_confidence:.1f}%').classes('text-sm font-medium').style('color: #ffa94d')
                     
                     # If stored confidence doesn't match what we calculated, show warning
                     if abs(confidence - clamped_confidence) > 0.1:
-                        ui.label(f'⚠️ Stored confidence ({confidence:.1f}%) differs from calculated ({clamped_confidence:.1f}%)').classes('text-sm text-red-600 font-bold')
+                        ui.label(f'⚠️ Stored confidence ({confidence:.1f}%) differs from calculated ({clamped_confidence:.1f}%)').classes('text-sm font-bold').style('color: #ff6b6b')
             
             # Settings
             profit_ratio = float(settings.get('profit_ratio', 1.0))
             min_analysts = int(settings.get('min_analysts', 3))
             
             with ui.card_section():
-                ui.label('Analysis Settings').classes('text-subtitle1 text-weight-medium mb-2')
+                ui.label('Analysis Settings').classes('text-subtitle1 text-weight-medium mb-2').style('color: #e2e8f0')
                 
                 with ui.row().classes('gap-4'):
-                    ui.label(f'Profit Ratio: {profit_ratio}x').classes('text-sm text-grey-7')
-                    ui.label(f'Min Analysts: {min_analysts}').classes('text-sm text-grey-7')
+                    ui.label(f'Profit Ratio: {profit_ratio}x').classes('text-sm').style('color: #a0aec0')
+                    ui.label(f'Min Analysts: {min_analysts}').classes('text-sm').style('color: #a0aec0')
             
             # Methodology
-            with ui.expansion('Calculation Methodology', icon='info').classes('w-full'):
-                with ui.card_section().classes('bg-grey-1'):
+            with ui.expansion('Calculation Methodology', icon='info').classes('w-full').style('color: #e2e8f0'):
+                with ui.card_section().style('background-color: #141c28'):
                     confidence_breakdown = state.get('confidence_breakdown', {})
                     base_conf = confidence_breakdown.get('base_confidence', 0)
                     price_boost = confidence_breakdown.get('price_target_boost', 0)
