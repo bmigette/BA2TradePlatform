@@ -281,6 +281,9 @@ class LazyTable:
             # Update pagination label
             self._update_pagination_label()
             
+            # Update pagination button states
+            self._update_pagination_button_states()
+            
             # Stop timer with details
             load_timer.stop(f"rows={len(self._rows)}, total={self._total_count}")
             
@@ -303,6 +306,45 @@ class LazyTable:
             else:
                 self._pagination_label.text = f"Showing {start}-{end} of {self._total_count}"
     
+    def _update_pagination_button_states(self):
+        """Update pagination button enabled/disabled states."""
+        on_first_page = self._current_page <= 1
+        on_last_page = self._current_page >= self.total_pages
+        
+        # First and previous buttons - disabled on first page
+        if hasattr(self, '_first_page_btn') and self._first_page_btn:
+            if on_first_page:
+                self._first_page_btn.props('disable')
+            else:
+                self._first_page_btn.props(remove='disable')
+        
+        if hasattr(self, '_prev_page_btn') and self._prev_page_btn:
+            if on_first_page:
+                self._prev_page_btn.props('disable')
+            else:
+                self._prev_page_btn.props(remove='disable')
+        
+        # Next and last buttons - disabled on last page
+        if hasattr(self, '_next_page_btn') and self._next_page_btn:
+            if on_last_page:
+                self._next_page_btn.props('disable')
+            else:
+                self._next_page_btn.props(remove='disable')
+        
+        if hasattr(self, '_last_page_btn') and self._last_page_btn:
+            if on_last_page:
+                self._last_page_btn.props('disable')
+            else:
+                self._last_page_btn.props(remove='disable')
+        
+        # Update page input value
+        if hasattr(self, '_page_input') and self._page_input:
+            self._page_input.value = self._current_page
+        
+        # Update total pages label
+        if hasattr(self, '_total_pages_label') and self._total_pages_label:
+            self._total_pages_label.text = f'/ {self.total_pages}'
+
     async def _on_page_change(self, page: int):
         """Handle page change."""
         if page < 1 or page > self.total_pages:
@@ -423,18 +465,18 @@ class LazyTable:
             
             # Right side: page navigation
             with ui.row().classes('items-center gap-1'):
-                ui.button(
+                self._first_page_btn = ui.button(
                     icon='first_page',
                     on_click=lambda: asyncio.create_task(self._on_page_change(1))
-                ).props('flat dense').bind_enabled_from(self, '_current_page', lambda p: p > 1)
+                ).props('flat dense')
                 
-                ui.button(
+                self._prev_page_btn = ui.button(
                     icon='chevron_left',
                     on_click=lambda: asyncio.create_task(self._on_page_change(self._current_page - 1))
-                ).props('flat dense').bind_enabled_from(self, '_current_page', lambda p: p > 1)
+                ).props('flat dense')
                 
                 # Page input
-                page_input = ui.number(
+                self._page_input = ui.number(
                     value=self._current_page,
                     min=1,
                     format='%d'
@@ -443,19 +485,20 @@ class LazyTable:
                     lambda e: asyncio.create_task(self._on_page_change(int(e.sender.value)))
                 )
                 
-                ui.label(f'/ {self.total_pages}').classes('text-sm').bind_text_from(
-                    self, 'total_pages', lambda t: f'/ {t}'
-                )
+                self._total_pages_label = ui.label(f'/ {self.total_pages}').classes('text-sm')
                 
-                ui.button(
+                self._next_page_btn = ui.button(
                     icon='chevron_right',
                     on_click=lambda: asyncio.create_task(self._on_page_change(self._current_page + 1))
                 ).props('flat dense')
                 
-                ui.button(
+                self._last_page_btn = ui.button(
                     icon='last_page',
                     on_click=lambda: asyncio.create_task(self._on_page_change(self.total_pages))
                 ).props('flat dense')
+                
+                # Update button states initially
+                self._update_pagination_button_states()
         
         return controls
     

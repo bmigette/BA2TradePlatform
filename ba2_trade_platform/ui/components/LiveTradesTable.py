@@ -401,13 +401,13 @@ class LiveTradesTable(LazyTable):
             # Quasar columns
             quasar_columns = [col.to_quasar_column() for col in self.columns]
             
-            # Create table
+            # Create table - hide built-in pagination since we use custom dark-themed controls
             self._table = ui.table(
                 columns=quasar_columns,
                 rows=[],
                 row_key=self.config.row_key,
-                pagination={'rowsPerPage': self.config.page_size}
-            ).classes('w-full').props('flat bordered')
+                pagination={'rowsPerPage': 0}  # Disable client-side pagination, we do server-side
+            ).classes('w-full').props('flat bordered hide-pagination')
             
             # Add the body template for expansion and custom cells
             self._table.add_slot('body', self.BODY_TEMPLATE)
