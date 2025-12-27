@@ -140,7 +140,7 @@ class FMPSenateTradeTab:
                     rows=[],
                     row_key='id',
                     pagination={'rowsPerPage': self.page_size, 'sortBy': 'transaction_date', 'descending': True}
-                ).classes('w-full')
+                ).classes('w-full dark-pagination')
                 
                 # Style the table
                 self.trades_table.add_slot('body-cell-chamber', '''

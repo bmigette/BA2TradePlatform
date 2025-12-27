@@ -58,7 +58,7 @@ class InstrumentSettingsTab:
                 row_key='id',
                 selection='multiple',
                 pagination={'rowsPerPage': 50, 'sortBy': 'name'}
-            ).classes('w-full')
+            ).classes('w-full dark-pagination')
             self.table.add_slot('body-cell-actions', """
                 <q-td :props="props">
                     <q-btn @click="$parent.$emit('edit', props)" icon="edit" flat dense color='blue'/>

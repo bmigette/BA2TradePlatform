@@ -582,7 +582,7 @@ class MarketAnalysisHistoryPage:
                 rows=rows,
                 row_key='date',
                 pagination={'rowsPerPage': 20, 'sortBy': 'date', 'descending': True}
-            ).classes('w-full')
+            ).classes('w-full dark-pagination')
 
 
 def render_market_analysis_history(symbol: str):

@@ -93,15 +93,36 @@ def layout_render(navigation_title: str):
         .q-table tbody td {
             color: #ffffff !important;
         }
+        
+        /* Table pagination/bottom - dark theme */
         .q-table__bottom {
+            background: rgba(26, 31, 46, 0.9) !important;
             color: #a0aec0 !important;
+            border-top: 1px solid rgba(255, 255, 255, 0.1) !important;
         }
         .q-table__bottom .q-btn {
             color: #a0aec0 !important;
         }
+        .q-table__bottom .q-btn:hover {
+            color: #ffffff !important;
+            background: rgba(0, 212, 170, 0.2) !important;
+        }
         .q-table .q-table__control {
             color: #a0aec0 !important;
         }
+        .q-table__bottom .q-select {
+            color: #ffffff !important;
+        }
+        .q-table__bottom .q-select .q-field__native {
+            color: #ffffff !important;
+        }
+        .q-table__bottom .q-field__control {
+            background: rgba(37, 43, 59, 0.8) !important;
+        }
+        .q-table__separator {
+            background: rgba(255, 255, 255, 0.1) !important;
+        }
+        
         /* Pagination */
         .q-pagination .q-btn {
             color: #a0aec0 !important;

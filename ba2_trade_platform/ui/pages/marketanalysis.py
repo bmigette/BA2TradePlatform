@@ -874,7 +874,7 @@ class JobMonitoringTab:
                         rows=queued_tasks_data,
                         row_key='task_id',
                         pagination={'rowsPerPage': 10, 'sortBy': 'created_at', 'descending': True}
-                    ).classes('w-full')
+                    ).classes('w-full dark-pagination')
                     
                     # Add status badge slot
                     self.queued_tasks_table.add_slot('body-cell-status', '''
@@ -3267,7 +3267,7 @@ class OrderRecommendationsTab:
                         rows=recommendations_summary,
                         row_key='symbol',
                         pagination=10
-                    ).classes('w-full')
+                    ).classes('w-full dark-pagination')
                     
                     # Add action buttons
                     self.summary_table.add_slot('body-cell-actions', '''

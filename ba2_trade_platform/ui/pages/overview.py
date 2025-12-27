@@ -1266,7 +1266,7 @@ class AccountOverviewTab:
                     rows=all_positions, 
                     row_key='_row_key',  # Unique key for each position
                     pagination={'rowsPerPage': 20, 'sortBy': 'account', 'descending': False}
-                ).classes('w-full')
+                ).classes('w-full dark-pagination')
                 
                 # Bind filter to table after table is created
                 filter_input.bind_value(positions_table, 'filter')
@@ -1456,7 +1456,7 @@ class AccountOverviewTab:
                 rows=all_orders, 
                 row_key='symbol',
                 pagination={'rowsPerPage': 20, 'sortBy': 'created_at', 'descending': True}
-            ).classes('w-full')
+            ).classes('w-full dark-pagination')
         else:
             ui.label('No orders found or no accounts configured.').classes('text-gray-500')
     
@@ -3367,7 +3367,7 @@ class TransactionsTab:
             rows=rows, 
             row_key='id',
             pagination={'rowsPerPage': 20}
-        ).classes('w-full').props('flat bordered')
+        ).classes('w-full dark-pagination').props('flat bordered')
         
         # Add row selection via click handler
         # Store reference to rows for selection tracking
