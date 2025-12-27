@@ -94,6 +94,12 @@ def layout_render(navigation_title: str):
             color: #ffffff !important;
         }
         
+        /* Table top section - dark theme */
+        .q-table__top {
+            background: transparent !important;
+            color: #ffffff !important;
+        }
+        
         /* Table pagination/bottom - dark theme */
         .q-table__bottom {
             background: rgba(26, 31, 46, 0.9) !important;

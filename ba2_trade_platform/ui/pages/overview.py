@@ -1300,7 +1300,7 @@ class AccountOverviewTab:
                 # Add custom cell rendering for P/L columns with color coding
                 positions_table.add_slot('body-cell-unrealized_pl', r'''
                     <q-td :props="props">
-                        <span :style="props.value >= 0 ? 'color: green; font-weight: 500;' : 'color: red; font-weight: 500;'">
+                        <span :style="props.value >= 0 ? 'color: #4ade80; font-weight: 500;' : 'color: #f87171; font-weight: 500;'">
                             {{ props.row.unrealized_pl_display || '$' + props.value.toFixed(2) }}
                         </span>
                     </q-td>
@@ -1308,7 +1308,7 @@ class AccountOverviewTab:
                 
                 positions_table.add_slot('body-cell-unrealized_plpc', r'''
                     <q-td :props="props">
-                        <span :style="props.value >= 0 ? 'color: green; font-weight: 500;' : 'color: red; font-weight: 500;'">
+                        <span :style="props.value >= 0 ? 'color: #4ade80; font-weight: 500;' : 'color: #f87171; font-weight: 500;'">
                             {{ props.row.unrealized_plpc_display || props.value.toFixed(2) + '%' }}
                         </span>
                     </q-td>
@@ -1316,7 +1316,7 @@ class AccountOverviewTab:
                 
                 positions_table.add_slot('body-cell-change_today', r'''
                     <q-td :props="props">
-                        <span :style="props.value >= 0 ? 'color: green; font-weight: 500;' : 'color: red; font-weight: 500;'">
+                        <span :style="props.value >= 0 ? 'color: #4ade80; font-weight: 500;' : 'color: #f87171; font-weight: 500;'">
                             {{ props.row.change_today_display || props.value.toFixed(2) + '%' }}
                         </span>
                     </q-td>
@@ -1552,7 +1552,7 @@ class AccountOverviewTab:
             
             # Add buttons above table (after table is created so we can bind to it)
             with table.add_slot('top-left'):
-                with ui.row().classes('items-center gap-4'):
+                with ui.row().classes('items-center gap-4').style('background: transparent;'):
                     ui.button('Retry Selected Orders', 
                              icon='refresh', 
                              on_click=lambda: self._handle_retry_selected_orders(table.selected))\
