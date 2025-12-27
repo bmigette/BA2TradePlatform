@@ -1225,13 +1225,16 @@ class JobMonitoringTab:
                 # Check if there's evaluation data for any recommendation
                 has_evaluation_data = False
                 if analysis.expert_recommendations:
-                    from ...core.models import TradeActionResult
                     for rec in analysis.expert_recommendations:
                         # Check if there's a TradeActionResult with evaluation_details
                         # This is set when ruleset evaluation was performed
-                        action_results = [ar for ar in rec.action_results if ar.data and 'evaluation_details' in ar.data]
-                        if action_results:
-                            has_evaluation_data = True
+                        # Use trade_action_results relationship (not action_results)
+                        if hasattr(rec, 'trade_action_results') and rec.trade_action_results:
+                            for ar in rec.trade_action_results:
+                                if ar.data and 'evaluation_details' in ar.data:
+                                    has_evaluation_data = True
+                                    break
+                        if has_evaluation_data:
                             break
                 
                 analysis_data.append({
@@ -1625,13 +1628,14 @@ class JobMonitoringTab:
                     ui.notify('Analysis not found', type='warning')
                     return
                 
-                # Find evaluation details from any recommendation's action results
+                # Find evaluation details from any recommendation's trade action results
                 evaluation_data = None
                 for rec in analysis.expert_recommendations:
-                    for result in rec.action_results:
-                        if result.data and 'evaluation_details' in result.data:
-                            evaluation_data = result.data['evaluation_details']
-                            break
+                    if hasattr(rec, 'trade_action_results') and rec.trade_action_results:
+                        for result in rec.trade_action_results:
+                            if result.data and 'evaluation_details' in result.data:
+                                evaluation_data = result.data['evaluation_details']
+                                break
                     if evaluation_data:
                         break
                 
