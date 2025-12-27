@@ -295,7 +295,7 @@ class JobMonitoringTab:
                 </q-td>
             ''')
             
-            # Add action buttons - always show rule evaluation button, handle no-data case in handler
+            # Add action buttons - show rule evaluation button only when has_evaluation_data is true
             self.analysis_table.add_slot('body-cell-actions', '''
                 <q-td :props="props">
                     <q-btn flat dense icon="info" 
@@ -303,7 +303,8 @@ class JobMonitoringTab:
                            @click="$parent.$emit('view_details', props.row.id)">
                         <q-tooltip>View Analysis Details</q-tooltip>
                     </q-btn>
-                    <q-btn flat dense icon="search" 
+                    <q-btn v-if="props.row.has_evaluation_data"
+                           flat dense icon="search" 
                            color="secondary" 
                            @click="$parent.$emit('view_rule_evaluation', props.row.id)">
                         <q-tooltip>View Rule Evaluation Details</q-tooltip>
@@ -1088,16 +1089,69 @@ class JobMonitoringTab:
             end_idx = start_idx + self.page_size
             paginated_data = self.cached_analysis_data[start_idx:end_idx]
             
+            # OPTIMIZATION: Only check evaluation data for current page items (10-25 items)
+            # This is much faster than checking ALL records
+            self._populate_evaluation_data_flags(paginated_data)
+            
             return paginated_data, self.total_records
                 
         except Exception as e:
             logger.error(f"Error getting analysis data: {e}", exc_info=True)
             return [], 0
     
+    def _populate_evaluation_data_flags(self, paginated_data: List[dict]):
+        """Populate has_evaluation_data flags for current page items only.
+        
+        OPTIMIZATION: Uses batch query to check for evaluation data
+        instead of N+1 lazy-loading queries for all records.
+        Only called for current page (10-25 items), not all cached records.
+        
+        Args:
+            paginated_data: List of formatted analysis records (current page only)
+        """
+        if not paginated_data:
+            return
+        
+        try:
+            # Get analysis IDs for current page
+            analysis_ids = [item['id'] for item in paginated_data]
+            
+            with get_db() as session:
+                from ...core.models import TradeActionResult
+                
+                # Query: Get market_analysis_id and data for all TradeActionResults
+                # related to recommendations for these analyses
+                stmt = (
+                    select(
+                        ExpertRecommendation.market_analysis_id,
+                        TradeActionResult.data
+                    )
+                    .join(ExpertRecommendation, TradeActionResult.expert_recommendation_id == ExpertRecommendation.id)
+                    .where(
+                        ExpertRecommendation.market_analysis_id.in_(analysis_ids),
+                        TradeActionResult.data.isnot(None)
+                    )
+                )
+                
+                # Build set of analysis IDs with evaluation data
+                analysis_ids_with_eval = set()
+                for market_analysis_id, data in session.execute(stmt):
+                    if data and isinstance(data, dict) and 'evaluation_details' in data:
+                        analysis_ids_with_eval.add(market_analysis_id)
+            
+            # Update the paginated data in-place
+            for item in paginated_data:
+                item['has_evaluation_data'] = item['id'] in analysis_ids_with_eval
+        
+        except Exception as e:
+            logger.warning(f"Error populating evaluation data flags: {e}")
+            # Leave all as False on error
+    
     def _format_analysis_records_simple(self, market_analyses, expert_instances=None) -> List[dict]:
         """Format raw market analysis records into displayable data.
         
-        Simplified version - no longer checks has_evaluation_data since button is always shown.
+        Note: has_evaluation_data is populated LATER by _populate_evaluation_data_flags()
+        for only the current page items to keep loading fast.
         """
         analysis_data = []
         
@@ -1227,6 +1281,7 @@ class JobMonitoringTab:
                     'created_at_local': created_local,
                     'subtype': subtype_display,
                     'can_cancel': can_cancel,
+                    'has_evaluation_data': False,  # Populated later by _populate_evaluation_data_flags()
                     'expert_instance_id': analysis.expert_instance_id,
                     'actions': 'actions'
                 })
