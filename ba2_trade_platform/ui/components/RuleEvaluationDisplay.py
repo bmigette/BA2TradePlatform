@@ -58,19 +58,19 @@ def _render_single_rule(rule_eval: Dict[str, Any], compact: bool = False):
     # Color coding based on rule status
     if rule_error:
         card_color = 'bg-red-100 border-red-300'
-        status_color = 'bg-red-500'
+        status_color = 'negative'
         status_text = 'ERROR'
     elif executed:
         card_color = 'bg-green-100 border-green-300'
-        status_color = 'bg-green-500'
+        status_color = 'positive'
         status_text = 'EXECUTED'
     elif all_conditions_met:
         card_color = 'bg-blue-100 border-blue-300'
-        status_color = 'bg-blue-500'
+        status_color = 'positive'
         status_text = 'CONDITIONS MET'
     else:
         card_color = 'bg-orange-100 border-orange-300'
-        status_color = 'bg-orange-500'
+        status_color = 'warning'
         status_text = 'CONDITIONS NOT MET'
     
     with ui.card().classes(f'w-full mb-3 border {card_color}'):
@@ -82,7 +82,7 @@ def _render_single_rule(rule_eval: Dict[str, Any], compact: bool = False):
                 else:
                     ui.label(f'Conditions: {len(conditions)} total').classes('text-sm text-grey-7')
             
-            ui.badge(status_text).classes(f'{status_color} text-white px-2 py-1')
+            ui.badge(status_text).props(f'color={status_color}').classes('text-white px-2 py-1')
         
         # Show individual conditions
         if conditions:
