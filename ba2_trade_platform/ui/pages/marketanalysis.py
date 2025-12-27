@@ -16,6 +16,7 @@ from ...core.db import add_instance
 from ...logger import logger
 from ...core.utils import get_account_instance_from_id
 from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
+from ..components.SmartRiskManagerDetailDialog import SmartRiskManagerDetailDialog
 from sqlmodel import select, func, distinct
 
 
@@ -546,7 +547,7 @@ class JobMonitoringTab:
             return []
     
     def view_smart_risk_detail(self, event_data):
-        """Navigate to the Smart Risk Manager job detail page."""
+        """Open the Smart Risk Manager job detail dialog."""
         job_id = None
         try:
             # Extract job_id from event data
@@ -561,11 +562,13 @@ class JobMonitoringTab:
                 ui.notify("Invalid event data", type='negative')
                 return
             
-            # Navigate to the detail page
-            ui.navigate.to(f'/smartriskmanagerdetail/{job_id}')
+            # Open the detail dialog (lazy initialization)
+            if not hasattr(self, '_smart_risk_dialog'):
+                self._smart_risk_dialog = SmartRiskManagerDetailDialog()
+            self._smart_risk_dialog.open(job_id)
             
         except Exception as e:
-            logger.error(f"Error navigating to Smart Risk Manager detail {job_id if job_id else 'unknown'}: {e}", exc_info=True)
+            logger.error(f"Error opening Smart Risk Manager detail {job_id if job_id else 'unknown'}: {e}", exc_info=True)
             ui.notify(f"Error opening details: {str(e)}", type='negative')
     
     def _create_smart_risk_pagination_controls(self):
@@ -986,18 +989,25 @@ class JobMonitoringTab:
         """Refresh the queued tasks table."""
         self._create_queued_tasks_table()
 
-    def _get_analysis_data(self) -> tuple[List[dict], int]:
+    def _get_analysis_data(self, preserve_page: bool = False) -> tuple[List[dict], int]:
         """Get analysis jobs data for the table with pagination and filtering.
         
         OPTIMIZATION: Uses joins to avoid N+1 queries and eager-loads relationships.
         Caches the entire filtered dataset to avoid recomputing on pagination changes.
         Only recomputes when filters actually change or cache is empty.
+        
+        Args:
+            preserve_page: If True, don't reset to page 1 even if cache is invalidated.
+                          Used during auto-refresh to maintain current page.
         """
         try:
             # Check if cache needs invalidation due to filter changes OR cache is empty
-            if self._should_invalidate_cache() or not self.cache_valid:
-                logger.debug(f"Cache invalidated - {'filters changed' if self._should_invalidate_cache() else 'cache empty'}. Recomputing...")
-                self.current_page = 1  # Reset to first page when filters change
+            filters_changed = self._should_invalidate_cache()
+            if filters_changed or not self.cache_valid:
+                logger.debug(f"Cache invalidated - {'filters changed' if filters_changed else 'cache empty'}. Recomputing...")
+                # Only reset to first page when filters actually change, not during auto-refresh
+                if filters_changed and not preserve_page:
+                    self.current_page = 1
                 
                 # Fetch and format ALL matching records (no pagination in query)
                 with get_db() as session:
@@ -1689,6 +1699,7 @@ class JobMonitoringTab:
         """
         try:
             # For auto-refresh (force_fresh=True), always invalidate cache to get current job status
+            # but preserve the current page
             if force_fresh:
                 logger.debug("[JobMonitoringTab] Auto-refresh: invalidating cache to get fresh job status")
                 self._invalidate_cache()
@@ -1697,11 +1708,14 @@ class JobMonitoringTab:
             if not self._should_invalidate_cache() and self.cached_analysis_data and not force_fresh:
                 # Filters didn't change, just use cached data
                 logger.debug("[JobMonitoringTab] Using cached analysis data (no filter changes)")
-                analysis_data, total_records = self._get_analysis_data()
+                analysis_data, total_records = self._get_analysis_data(preserve_page=True)
             else:
                 # Filters changed or cache empty or force_fresh - fetch fresh data in background
+                # preserve_page=True for auto-refresh to maintain current pagination
                 logger.debug("[JobMonitoringTab] Fetching fresh analysis data")
-                analysis_data, total_records = await asyncio.to_thread(self._get_analysis_data)
+                analysis_data, total_records = await asyncio.to_thread(
+                    lambda: self._get_analysis_data(preserve_page=force_fresh)
+                )
             
             self.total_records = total_records
             self.total_pages = max(1, math.ceil(self.total_records / self.page_size))
