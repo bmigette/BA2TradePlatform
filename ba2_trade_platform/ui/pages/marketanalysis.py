@@ -295,17 +295,17 @@ class JobMonitoringTab:
                 </q-td>
             ''')
             
-            # Add action buttons - use :key to force Vue reactivity on row changes
+            # Add action buttons - use :style instead of v-if for reliable reactivity
             self.analysis_table.add_slot('body-cell-actions', '''
-                <q-td :props="props" :key="props.row.id + '-' + String(props.row.has_evaluation_data)">
+                <q-td :props="props">
                     <q-btn flat dense icon="info" 
                            color="primary" 
                            @click="$parent.$emit('view_details', props.row.id)">
                         <q-tooltip>View Analysis Details</q-tooltip>
                     </q-btn>
-                    <q-btn v-if="props.row.has_evaluation_data" 
-                           flat dense icon="search" 
+                    <q-btn flat dense icon="search" 
                            color="secondary" 
+                           :style="{ display: props.row.has_evaluation_data ? 'inline-flex' : 'none' }"
                            @click="$parent.$emit('view_rule_evaluation', props.row.id)">
                         <q-tooltip>View Rule Evaluation Details</q-tooltip>
                     </q-btn>
@@ -1305,7 +1305,7 @@ class JobMonitoringTab:
             self._update_table_data()
     
     def _update_table_data(self):
-        """Update table with fresh data from database by recreating the table."""
+        """Update table with fresh data from database."""
         try:
             # Fetch current page data from database (true lazy loading)
             analysis_data, total_records = self._get_analysis_data()
@@ -1315,10 +1315,10 @@ class JobMonitoringTab:
             eval_flags = [(item['id'], item['has_evaluation_data']) for item in analysis_data]
             logger.debug(f"[_update_table_data] Setting rows with has_evaluation_data: {eval_flags}")
             
-            # Clear and recreate table to ensure Vue properly renders all slots
-            self.analysis_table_container.clear()
-            with self.analysis_table_container:
-                self._create_analysis_table(analysis_data, total_records)
+            # Update table rows directly (faster than recreating)
+            if self.analysis_table:
+                self.analysis_table.rows = analysis_data
+                self.analysis_table.update()
             
             # Update pagination controls with current state
             self._create_pagination_controls()
