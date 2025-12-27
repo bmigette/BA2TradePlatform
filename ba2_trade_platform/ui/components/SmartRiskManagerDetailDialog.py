@@ -278,8 +278,12 @@ class SmartRiskManagerDetailDialog:
                                     except Exception:
                                         pass
                             
-                            action_name = action.get('action', 'Unknown')
-                            status = action.get('status', 'unknown')
+                            action_name = action.get('action_type') or action.get('action', 'Unknown')
+                            # Handle both 'success' boolean and 'status' string formats
+                            if 'success' in action:
+                                status = 'success' if action['success'] else 'error'
+                            else:
+                                status = action.get('status', 'unknown')
                             status_color = '#00d4aa' if status == 'success' else '#ff6b6b' if status == 'error' else '#ffa94d'
                             
                             with ui.expansion(f'Action {i+1}: {action_name}' + (f' ({symbol})' if symbol else ''), icon='play_arrow').classes('w-full mb-2').style('color: #e2e8f0;'):
@@ -289,10 +293,16 @@ class SmartRiskManagerDetailDialog:
                                         ui.label('Status:').classes('text-sm font-bold').style('color: #a0aec0;')
                                         ui.badge(status, color='positive' if status == 'success' else 'negative' if status == 'error' else 'warning')
                                     
-                                    # Reasoning
-                                    if action.get('reasoning'):
+                                    # Summary (if available)
+                                    if action.get('summary'):
+                                        ui.label('Summary:').classes('text-sm font-bold mt-2').style('color: #a0aec0;')
+                                        ui.label(action['summary']).classes('text-sm whitespace-pre-wrap').style('color: #e2e8f0;')
+                                    
+                                    # Reasoning (support both 'reason' and 'reasoning' keys)
+                                    reasoning = action.get('reason') or action.get('reasoning')
+                                    if reasoning:
                                         ui.label('Reasoning:').classes('text-sm font-bold mt-2').style('color: #a0aec0;')
-                                        ui.label(action['reasoning']).classes('text-sm whitespace-pre-wrap').style('color: #e2e8f0;')
+                                        ui.label(reasoning).classes('text-sm whitespace-pre-wrap').style('color: #e2e8f0;')
                                     
                                     # Arguments
                                     if action.get('arguments'):
