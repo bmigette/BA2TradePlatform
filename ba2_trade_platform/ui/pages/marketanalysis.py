@@ -1094,6 +1094,10 @@ class JobMonitoringTab:
             # This avoids N+1 queries for ALL records
             self._populate_evaluation_data_flags(paginated_data)
             
+            # Create fresh copies of dicts to ensure Vue reactivity detects changes
+            # This is needed because Vue doesn't detect mutations to existing objects
+            paginated_data = [dict(item) for item in paginated_data]
+            
             return paginated_data, self.total_records
                 
         except Exception as e:
