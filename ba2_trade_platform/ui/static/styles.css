@@ -47,6 +47,11 @@ p, span, div, label, h1, h2, h3, h4, h5, h6, li, td, th, a {
 .q-table {
     background: transparent !important;
 }
+.q-table__card,
+.q-table__container {
+    background: transparent !important;
+    background-color: transparent !important;
+}
 .q-table thead tr, .q-table thead th {
     background: rgba(26, 31, 46, 0.9) !important;
     color: #a0aec0 !important;
