@@ -1556,20 +1556,20 @@ class AccountOverviewTab:
                     ui.button('Retry Selected Orders', 
                              icon='refresh', 
                              on_click=lambda: self._handle_retry_selected_orders(table.selected))\
-                        .props('color=orange')\
+                        .props('color=warning')\
                         .bind_enabled_from(table, 'selected', backward=lambda val: len(val) > 0)
                     ui.button('Map to Broker Orders', 
                              icon='link', 
                              on_click=lambda: self._handle_map_selected_orders(table.selected))\
-                        .props('color=blue')\
+                        .props('color=info')\
                         .bind_enabled_from(table, 'selected', backward=lambda val: len(val) > 0)
                     ui.button('Delete Selected Orders', 
                              icon='delete', 
                              on_click=lambda: self._handle_delete_selected_orders(table.selected))\
-                        .props('color=red')\
+                        .props('color=negative')\
                         .bind_enabled_from(table, 'selected', backward=lambda val: len(val) > 0)
                     ui.label().bind_text_from(table, 'selected', backward=lambda val: f'{len(val)} order(s) selected')\
-                        .classes('text-sm text-gray-600')
+                        .classes('text-sm')
             
             # Add submit button slot for pending orders
             table.add_slot('body-cell-actions', '''
@@ -1794,7 +1794,7 @@ class AccountOverviewTab:
                 
                 with ui.row().classes('w-full justify-end gap-2'):
                     ui.button('Cancel', on_click=dialog.close).props('flat')
-                    ui.button('Retry Orders', on_click=lambda: self._confirm_retry_orders(error_order_ids, dialog)).props('color=orange')
+                    ui.button('Retry Orders', on_click=lambda: self._confirm_retry_orders(error_order_ids, dialog)).props('color=warning')
             
             dialog.open()
             
@@ -2091,7 +2091,7 @@ class AccountOverviewTab:
                     ui.button('Cancel', on_click=dialog.close).props('flat')
                     ui.button('Apply Mapping', 
                              on_click=lambda: self._apply_order_mapping(mapping_data, db_orders, dialog))\
-                        .props('color=blue')
+                        .props('color=info')
             
             dialog.open()
             
@@ -2197,7 +2197,7 @@ class AccountOverviewTab:
                 
                 with ui.row().classes('w-full justify-end gap-2'):
                     ui.button('Cancel', on_click=dialog.close).props('flat')
-                    ui.button('Delete', on_click=lambda: self._confirm_delete_orders(order_ids, dialog)).props('color=red')
+                    ui.button('Delete', on_click=lambda: self._confirm_delete_orders(order_ids, dialog)).props('color=negative')
             
             dialog.open()
             
@@ -4019,7 +4019,7 @@ class TransactionsTab:
             
             with ui.row().classes('w-full justify-end gap-2'):
                 ui.button('Cancel', on_click=dialog.close).props('flat')
-                ui.button('Reset & Retry', on_click=lambda: self._retry_close_position(transaction_id, dialog)).props('color=orange')
+                ui.button('Reset & Retry', on_click=lambda: self._retry_close_position(transaction_id, dialog)).props('color=warning')
         
         dialog.open()
     

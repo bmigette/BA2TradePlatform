@@ -40,7 +40,7 @@ class InstrumentSettingsTab:
             with ui.row():
                 filter_input = ui.input(label='Filter') #, on_change=self.on_filter_change)
                 self.fetch_info_btn = ui.button('Fetch Info', on_click=self.fetch_info)
-                self.fetch_missing_btn = ui.button('Fetch Missing', on_click=self.fetch_missing_info).props('color=orange')
+                self.fetch_missing_btn = ui.button('Fetch Missing', on_click=self.fetch_missing_info).props('color=warning')
                 ui.button('Import', on_click=self.import_instruments)
                 ui.button('Add Instrument', on_click=lambda: self.add_instrument_dialog())
             self.table = ui.table(
@@ -4992,7 +4992,7 @@ class BatchCleanupTab:
                     'Execute Cleanup',
                     icon='delete_sweep',
                     on_click=self._execute_batch_cleanup
-                ).props('color=orange')
+                ).props('color=warning')
                 self.cleanup_execute_button.set_enabled(False)  # Disabled until preview is run
     
     def _select_all_experts(self):
