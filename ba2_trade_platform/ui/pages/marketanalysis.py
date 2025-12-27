@@ -999,124 +999,117 @@ class JobMonitoringTab:
     def _get_analysis_data(self, preserve_page: bool = False) -> tuple[List[dict], int]:
         """Get analysis jobs data for the table with pagination and filtering.
         
-        OPTIMIZATION: Uses joins to avoid N+1 queries and eager-loads relationships.
-        Caches the entire filtered dataset to avoid recomputing on pagination changes.
-        Only recomputes when filters actually change or cache is empty.
+        TRUE LAZY LOADING: Fetches only the current page from database each time.
+        This avoids caching issues and ensures fresh data with proper has_evaluation_data.
         
         Args:
             preserve_page: If True, don't reset to page 1 even if cache is invalidated.
                           Used during auto-refresh to maintain current page.
         """
         try:
-            # Check if cache needs invalidation due to filter changes OR cache is empty
+            # Check if filters changed to reset page
             filters_changed = self._should_invalidate_cache()
-            if filters_changed or not self.cache_valid:
-                logger.debug(f"Cache invalidated - {'filters changed' if filters_changed else 'cache empty'}. Recomputing...")
-                # Only reset to first page when filters actually change, not during auto-refresh
-                if filters_changed and not preserve_page:
-                    self.current_page = 1
+            if filters_changed and not preserve_page:
+                self.current_page = 1
+            
+            with get_db() as session:
+                from sqlalchemy.orm import selectinload
+                from sqlalchemy import and_, func
+                from ...core.models import TradeActionResult
                 
-                # Fetch and format ALL matching records (no pagination in query)
-                with get_db() as session:
-                    from sqlalchemy.orm import joinedload, selectinload
-                    from sqlalchemy import and_
-                    
-                    # Use eager loading to avoid N+1 queries
-                    statement = select(MarketAnalysis).options(
-                        selectinload(MarketAnalysis.expert_recommendations)
+                # Build base query with filters
+                base_filters = []
+                
+                if self.status_filter != 'all':
+                    base_filters.append(MarketAnalysis.status == MarketAnalysisStatus(self.status_filter))
+                
+                if self.expert_filter != 'all':
+                    base_filters.append(MarketAnalysis.expert_instance_id == int(self.expert_filter))
+                
+                if self.type_filter != 'all':
+                    from ...core.types import AnalysisUseCase
+                    if self.type_filter == 'enter_market':
+                        base_filters.append(MarketAnalysis.subtype == AnalysisUseCase.ENTER_MARKET)
+                    elif self.type_filter == 'open_positions':
+                        base_filters.append(MarketAnalysis.subtype == AnalysisUseCase.OPEN_POSITIONS)
+                
+                if self.symbol_filter:
+                    base_filters.append(MarketAnalysis.symbol.ilike(f"%{self.symbol_filter}%"))
+                
+                # Count total records first
+                count_stmt = select(func.count(MarketAnalysis.id))
+                if self.recommendation_filter != 'all':
+                    from ...core.types import OrderRecommendation
+                    count_stmt = count_stmt.join(
+                        ExpertRecommendation,
+                        MarketAnalysis.id == ExpertRecommendation.market_analysis_id
+                    ).where(
+                        ExpertRecommendation.recommended_action == OrderRecommendation[self.recommendation_filter]
                     )
-                    
-                    # Apply all filters
-                    filters = []
-                    
-                    if self.status_filter != 'all':
-                        filters.append(MarketAnalysis.status == MarketAnalysisStatus(self.status_filter))
-                    
-                    if self.expert_filter != 'all':
-                        filters.append(MarketAnalysis.expert_instance_id == int(self.expert_filter))
-                    
-                    if self.type_filter != 'all':
-                        from ...core.types import AnalysisUseCase
-                        if self.type_filter == 'enter_market':
-                            filters.append(MarketAnalysis.subtype == AnalysisUseCase.ENTER_MARKET)
-                        elif self.type_filter == 'open_positions':
-                            filters.append(MarketAnalysis.subtype == AnalysisUseCase.OPEN_POSITIONS)
-                    
-                    if self.symbol_filter:
-                        filters.append(MarketAnalysis.symbol.ilike(f"%{self.symbol_filter}%"))
-                    
-                    if self.recommendation_filter != 'all':
-                        from ...core.types import OrderRecommendation
-                        statement = statement.join(
-                            ExpertRecommendation,
-                            MarketAnalysis.id == ExpertRecommendation.market_analysis_id
-                        )
-                        filters.append(
-                            ExpertRecommendation.recommended_action == OrderRecommendation[self.recommendation_filter]
-                        )
-                    
-                    # Apply all filters at once
-                    if filters:
-                        statement = statement.where(and_(*filters))
-                    
-                    # Order by newest first
-                    statement = statement.order_by(MarketAnalysis.created_at.desc())
-                    
-                    # Fetch ALL matching records at once using scalars() to get model objects
-                    market_analyses = list(session.scalars(statement))
-                    
-                    # Pre-fetch expert instances for all records
-                    expert_ids = set(m.expert_instance_id for m in market_analyses)
-                    expert_instances = {}
-                    if expert_ids:
-                        stmt = select(ExpertInstance).where(ExpertInstance.id.in_(expert_ids))
-                        for expert in session.scalars(stmt):
-                            expert_instances[expert.id] = expert
-                    
-                    # Process all records and cache them (without has_evaluation_data - too slow)
-                    self.cached_analysis_data = self._format_analysis_records(market_analyses, expert_instances)
-                    self.cache_valid = True
+                if base_filters:
+                    count_stmt = count_stmt.where(and_(*base_filters))
+                
+                self.total_records = session.scalar(count_stmt) or 0
+                self.total_pages = max(1, math.ceil(self.total_records / self.page_size))
+                
+                # Ensure current page is valid
+                if self.current_page > self.total_pages:
+                    self.current_page = max(1, self.total_pages)
+                
+                # Build main query with pagination
+                statement = select(MarketAnalysis).options(
+                    selectinload(MarketAnalysis.expert_recommendations).selectinload(
+                        ExpertRecommendation.trade_action_results
+                    )
+                )
+                
+                if self.recommendation_filter != 'all':
+                    from ...core.types import OrderRecommendation
+                    statement = statement.join(
+                        ExpertRecommendation,
+                        MarketAnalysis.id == ExpertRecommendation.market_analysis_id
+                    ).where(
+                        ExpertRecommendation.recommended_action == OrderRecommendation[self.recommendation_filter]
+                    )
+                
+                if base_filters:
+                    statement = statement.where(and_(*base_filters))
+                
+                # Order and paginate at database level
+                offset = (self.current_page - 1) * self.page_size
+                statement = statement.order_by(MarketAnalysis.created_at.desc()).offset(offset).limit(self.page_size)
+                
+                # Fetch only current page records
+                market_analyses = list(session.scalars(statement))
+                
+                # Pre-fetch expert instances for current page only
+                expert_ids = set(m.expert_instance_id for m in market_analyses)
+                expert_instances = {}
+                if expert_ids:
+                    stmt = select(ExpertInstance).where(ExpertInstance.id.in_(expert_ids))
+                    for expert in session.scalars(stmt):
+                        expert_instances[expert.id] = expert
+                
+                # Format records - now includes has_evaluation_data since we eager-loaded trade_action_results
+                analysis_data = self._format_analysis_records_with_evaluation(market_analyses, expert_instances)
             
-            # Use cached data and apply pagination
-            self.total_records = len(self.cached_analysis_data)
-            self.total_pages = max(1, math.ceil(self.total_records / self.page_size))
+            # Mark cache as valid (for filter change detection)
+            self.cache_valid = True
             
-            # Ensure current page is valid
-            if self.current_page > self.total_pages:
-                self.current_page = max(1, self.total_pages)
-            
-            # Apply pagination to cached data
-            start_idx = (self.current_page - 1) * self.page_size
-            end_idx = start_idx + self.page_size
-            paginated_data = self.cached_analysis_data[start_idx:end_idx]
-            
-            # OPTIMIZATION: Fetch has_evaluation_data only for current page items
-            # This avoids N+1 queries for ALL records
-            self._populate_evaluation_data_flags(paginated_data)
-            
-            # Create fresh copies of dicts to ensure Vue reactivity detects changes
-            # This is needed because Vue doesn't detect mutations to existing objects
-            paginated_data = [dict(item) for item in paginated_data]
-            
-            return paginated_data, self.total_records
+            return analysis_data, self.total_records
                 
         except Exception as e:
             logger.error(f"Error getting analysis data: {e}", exc_info=True)
             return [], 0
     
-    def _format_analysis_records(self, market_analyses, expert_instances=None) -> List[dict]:
-        """Format raw market analysis records into displayable data.
+    def _format_analysis_records_with_evaluation(self, market_analyses, expert_instances=None) -> List[dict]:
+        """Format raw market analysis records into displayable data WITH has_evaluation_data.
         
-        Args:
-            market_analyses: List of MarketAnalysis objects
-            expert_instances: Optional dict of expert_id -> ExpertInstance for avoiding N+1 queries
-        
-        Extracted to separate method so it can be called once per filter change,
-        then cached for pagination operations.
+        This version checks for evaluation data inline since trade_action_results are eager-loaded.
+        Used by the lazy loading approach where we only fetch current page from DB.
         """
         analysis_data = []
         
-        # Use provided expert instances or fetch them individually (slower)
         if expert_instances is None:
             expert_instances = {}
         
@@ -1137,7 +1130,7 @@ class JobMonitoringTab:
         
         for analysis in market_analyses:
             try:
-                # Get expert instance info - use pre-fetched if available
+                # Get expert instance info
                 try:
                     expert_instance = expert_instances.get(analysis.expert_instance_id)
                     if expert_instance:
@@ -1167,9 +1160,20 @@ class JobMonitoringTab:
                 recommendation_display = '-'
                 confidence_display = '-'
                 expected_profit_display = '-'
+                has_evaluation_data = False
                 
                 if analysis.expert_recommendations and len(analysis.expert_recommendations) > 0:
                     recommendations = analysis.expert_recommendations
+                    
+                    # Check for evaluation data while processing recommendations
+                    for rec in recommendations:
+                        if hasattr(rec, 'trade_action_results') and rec.trade_action_results:
+                            for ar in rec.trade_action_results:
+                                if ar.data and isinstance(ar.data, dict) and 'evaluation_details' in ar.data:
+                                    has_evaluation_data = True
+                                    break
+                        if has_evaluation_data:
+                            break
                     
                     if len(recommendations) == 1:
                         rec = recommendations[0]
@@ -1230,9 +1234,6 @@ class JobMonitoringTab:
                 subtype_display = analysis.subtype.value.replace('_', ' ').title() if analysis.subtype else 'Unknown'
                 can_cancel = analysis.status in [MarketAnalysisStatus.PENDING]
                 
-                # NOTE: has_evaluation_data is populated LATER by _populate_evaluation_data_flags()
-                # for only the current page items to avoid N+1 queries on ALL records
-                
                 analysis_data.append({
                     'id': analysis.id,
                     'symbol': symbol_display,
@@ -1246,7 +1247,7 @@ class JobMonitoringTab:
                     'created_at_local': created_local,
                     'subtype': subtype_display,
                     'can_cancel': can_cancel,
-                    'has_evaluation_data': False,  # Populated later by _populate_evaluation_data_flags()
+                    'has_evaluation_data': has_evaluation_data,
                     'expert_instance_id': analysis.expert_instance_id,
                     'actions': 'actions'
                 })
@@ -1255,56 +1256,6 @@ class JobMonitoringTab:
                 continue
         
         return analysis_data
-
-    def _populate_evaluation_data_flags(self, paginated_data: List[dict]):
-        """Populate has_evaluation_data flags for current page items only.
-        
-        OPTIMIZATION: Uses batch queries to check for evaluation data
-        instead of N+1 lazy-loading queries for all records.
-        
-        Args:
-            paginated_data: List of formatted analysis records (current page only)
-        """
-        if not paginated_data:
-            return
-        
-        try:
-            # Get analysis IDs for current page
-            analysis_ids = [item['id'] for item in paginated_data]
-            logger.debug(f"[_populate_evaluation_data_flags] Checking {len(analysis_ids)} analysis IDs: {analysis_ids}")
-            
-            with get_db() as session:
-                from ...core.models import TradeActionResult
-                
-                # Query: Get market_analysis_id and data for all TradeActionResults
-                # related to recommendations for these analyses
-                stmt = (
-                    select(
-                        ExpertRecommendation.market_analysis_id,
-                        TradeActionResult.data
-                    )
-                    .join(ExpertRecommendation, TradeActionResult.expert_recommendation_id == ExpertRecommendation.id)
-                    .where(
-                        ExpertRecommendation.market_analysis_id.in_(analysis_ids),
-                        TradeActionResult.data.isnot(None)
-                    )
-                )
-                
-                # Build set of analysis IDs with evaluation data
-                analysis_ids_with_eval = set()
-                for market_analysis_id, data in session.execute(stmt):
-                    if data and isinstance(data, dict) and 'evaluation_details' in data:
-                        analysis_ids_with_eval.add(market_analysis_id)
-            
-            logger.debug(f"[_populate_evaluation_data_flags] Found {len(analysis_ids_with_eval)} IDs with evaluation data: {analysis_ids_with_eval}")
-            
-            # Update the paginated data in-place
-            for item in paginated_data:
-                item['has_evaluation_data'] = item['id'] in analysis_ids_with_eval
-                
-        except Exception as e:
-            logger.warning(f"Error populating evaluation data flags: {e}")
-            # Leave all as False on error
 
     def _create_pagination_controls(self):
         """Create pagination controls."""
@@ -1348,45 +1299,40 @@ class JobMonitoringTab:
                 page_size_select.on_value_change(self._on_page_size_change)
     
     def _change_page(self, new_page: int):
-        """Change to a specific page - synchronous update using cached data."""
+        """Change to a specific page - fetches fresh data from database."""
         if 1 <= new_page <= self.total_pages:
             self.current_page = new_page
-            # Update table synchronously using cached data (no async needed for pagination)
-            self._update_table_from_cache()
+            self._update_table_data()
     
-    def _update_table_from_cache(self):
-        """Update table and pagination controls synchronously from cached data."""
+    def _update_table_data(self):
+        """Update table with fresh data from database."""
         try:
-            # Get paginated data from cache (this is synchronous)
+            # Fetch current page data from database (true lazy loading)
             analysis_data, total_records = self._get_analysis_data()
             
             # Debug: Log has_evaluation_data values
             eval_flags = [(item['id'], item['has_evaluation_data']) for item in analysis_data]
-            logger.debug(f"[_update_table_from_cache] Setting rows with has_evaluation_data: {eval_flags}")
+            logger.debug(f"[_update_table_data] Setting rows with has_evaluation_data: {eval_flags}")
             
             # Update table if it exists
             if self.analysis_table:
-                # Clear and set rows to force Vue reactivity
-                self.analysis_table.rows.clear()
-                self.analysis_table.rows.extend(analysis_data)
-                self.analysis_table.update()  # Force UI refresh
+                self.analysis_table.rows = analysis_data
+                self.analysis_table.update()
             
             # Update pagination controls with current state
             self._create_pagination_controls()
             
         except Exception as e:
-            logger.error(f"Error updating table from cache: {e}", exc_info=True)
+            logger.error(f"Error updating table data: {e}", exc_info=True)
     
     def _on_page_size_change(self, event):
-        """Handle page size change - synchronous update using cached data."""
+        """Handle page size change - fetches fresh data from database."""
         try:
             new_size = int(event.value)
             self.page_size = new_size
             self.current_page = 1  # Reset to first page
-            # Recalculate total pages based on new page size
-            self.total_pages = max(1, math.ceil(self.total_records / self.page_size))
-            # Update table synchronously using cached data (no async needed)
-            self._update_table_from_cache()
+            # Fetch fresh data with new page size
+            self._update_table_data()
         except ValueError:
             pass
     
