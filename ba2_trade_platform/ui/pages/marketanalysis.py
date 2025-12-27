@@ -295,9 +295,9 @@ class JobMonitoringTab:
                 </q-td>
             ''')
             
-            # Add action buttons
+            # Add action buttons - use :key to force Vue reactivity on row changes
             self.analysis_table.add_slot('body-cell-actions', '''
-                <q-td :props="props">
+                <q-td :props="props" :key="props.row.id + '-' + String(props.row.has_evaluation_data)">
                     <q-btn flat dense icon="info" 
                            color="primary" 
                            @click="$parent.$emit('view_details', props.row.id)">
