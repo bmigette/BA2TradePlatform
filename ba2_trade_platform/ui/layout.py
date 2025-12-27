@@ -187,6 +187,19 @@ def layout_render(navigation_title: str):
             color: #a0aec0 !important;
         }
         
+        /* Fix label/placeholder overlap - float label when placeholder present */
+        .q-field--labeled .q-field__native[placeholder]:not(:placeholder-shown) ~ .q-field__label,
+        .q-field--labeled .q-field__native[placeholder] ~ .q-field__label {
+            transform: translateY(-60%) scale(0.75) !important;
+            background: #1a1f2e !important;
+            padding: 0 4px !important;
+        }
+        /* Also fix for inputs with placeholder attribute */
+        .q-field .q-field__native::placeholder {
+            color: rgba(160, 174, 192, 0.6) !important;
+            opacity: 1 !important;
+        }
+        
         /* Select/Dropdown */
         .q-select .q-field__native span,
         .q-select .q-chip__content,

@@ -164,7 +164,7 @@ class JobMonitoringTab:
                     self.symbol_input = ui.input(
                         'Symbol Filter',
                         placeholder='e.g., AAPL, MSFT'
-                    ).classes('w-40')
+                    ).props('stack-label').classes('w-40')
                     self.symbol_input.on_value_change(self._on_symbol_filter_change)
                 
                 with ui.row().classes('gap-2'):
@@ -2459,7 +2459,7 @@ class ScheduledJobsTab:
                     self.page_size_select.on_value_change(self._on_page_size_change)
                     
                     # Text filter
-                    self.filter_input = ui.input('Search', placeholder='Filter by symbol...').classes('w-40')
+                    self.filter_input = ui.input('Search', placeholder='Filter by symbol...').props('stack-label').classes('w-40')
                 
                 with ui.row().classes('gap-2'):
                     ui.button('Clear Filters', on_click=self._clear_filters, icon='clear')

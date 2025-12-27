@@ -1474,7 +1474,7 @@ class ExpertSettingsTab:
                         self.alias_input = ui.input(
                             label='Alias (max 100 chars)',
                             placeholder='Short display name for this expert...'
-                        ).classes('flex-1').props('maxlength=100')
+                        ).props('stack-label maxlength=100').classes('flex-1')
                     
                     # Description as read-only display
                     self.description_label = ui.label('').classes('text-grey-7 mb-2')
@@ -1483,7 +1483,7 @@ class ExpertSettingsTab:
                     self.user_description_textarea = ui.textarea(
                         label='User Notes',
                         placeholder='Add your own notes about this expert instance...'
-                    ).classes('w-full')
+                    ).props('stack-label').classes('w-full')
                     
                     with ui.row().classes('w-full'):
                         self.enabled_checkbox = ui.checkbox('Enabled', value=True)
@@ -1760,7 +1760,7 @@ class ExpertSettingsTab:
                                 label='Instructions for Smart Risk Manager',
                                 value='Maximize short term profit with medium risk taking',
                                 placeholder='Enter your risk management strategy instructions...'
-                            ).classes('w-full').props('rows=3')
+                            ).props('stack-label rows=3').classes('w-full')
                             ui.label('Provide high-level instructions to guide the smart risk manager when in Smart mode (e.g., focus areas, risk tolerance, time horizon)').classes('text-body2 text-grey-7 ml-2')
                             
                             # Smart Risk Manager Max Iterations

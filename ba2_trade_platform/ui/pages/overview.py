@@ -1257,7 +1257,7 @@ class AccountOverviewTab:
                 
                 # Add built-in filter before the table
                 with ui.row().classes('w-full gap-2 mb-4'):
-                    filter_input = ui.input(label='Filter table', placeholder='Type to filter across all columns...').classes('flex-grow')
+                    filter_input = ui.input(label='Filter table', placeholder='Type to filter across all columns...').props('stack-label').classes('flex-grow')
                     ui.button('Clear', on_click=lambda: filter_input.set_value('')).props('flat')
                 
                 # Create the table with sortable columns
