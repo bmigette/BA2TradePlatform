@@ -15,6 +15,7 @@ from ...modules.accounts import get_account_class
 from ...core.db import add_instance
 from ...logger import logger
 from ...core.utils import get_account_instance_from_id
+from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
 from sqlmodel import select, func, distinct
 
 
@@ -1536,8 +1537,10 @@ class JobMonitoringTab:
                 ui.notify("Invalid event data", type='negative')
                 return
             
-            # Navigate to the detail page
-            ui.navigate.to(f'/market_analysis/{analysis_id}')
+            # Navigate to the detail page via dialog
+            if not hasattr(self, '_analysis_dialog'):
+                self._analysis_dialog = MarketAnalysisDetailDialog()
+            self._analysis_dialog.open(analysis_id)
             
         except Exception as e:
             logger.error(f"Error navigating to analysis details {analysis_id if analysis_id else 'unknown'}: {e}", exc_info=True)
@@ -3739,7 +3742,9 @@ class OrderRecommendationsTab:
         try:
             analysis_id = event_data.args if hasattr(event_data, 'args') else event_data
             if analysis_id:
-                ui.navigate.to(f'/market_analysis/{analysis_id}')
+                if not hasattr(self, '_analysis_dialog'):
+                    self._analysis_dialog = MarketAnalysisDetailDialog()
+                self._analysis_dialog.open(analysis_id)
         except Exception as e:
             logger.error(f"Error navigating to analysis detail: {e}", exc_info=True)
 

@@ -203,23 +203,32 @@ class BalanceUsagePerExpertChart:
             
             # Create echart options for stacked bar chart
             options = {
+                'backgroundColor': 'transparent',
                 'tooltip': {
                     'trigger': 'axis',
                     'axisPointer': {
                         'type': 'shadow'
+                    },
+                    'backgroundColor': 'rgba(37, 43, 59, 0.95)',
+                    'borderColor': 'rgba(255, 255, 255, 0.1)',
+                    'textStyle': {
+                        'color': '#ffffff'
                     }
                     # Note: Complex tooltip with total calculation would require JavaScript
                     # Using default tooltip which shows series values separately
                 },
                 'legend': {
                     'data': ['Filled Orders', 'Pending Orders'],
-                    'bottom': 0
+                    'bottom': 0,
+                    'textStyle': {
+                        'color': '#a0aec0'
+                    }
                 },
                 'grid': {
                     'left': '3%',
                     'right': '4%',
-                    'bottom': '15%',
-                    'top': '15%',  # Increased to make room for labels
+                    'bottom': '18%',
+                    'top': '18%',  # Increased to make room for labels
                     'containLabel': True
                 },
                 'xAxis': {
@@ -228,14 +237,32 @@ class BalanceUsagePerExpertChart:
                     'axisLabel': {
                         'rotate': 45,
                         'interval': 0,
-                        'fontSize': 10
+                        'fontSize': 9,
+                        'color': '#a0aec0',
+                        'width': 80,
+                        'overflow': 'truncate'
+                    },
+                    'axisLine': {
+                        'lineStyle': {
+                            'color': 'rgba(255, 255, 255, 0.1)'
+                        }
                     }
                 },
                 'yAxis': {
                     'type': 'value',
-                    'name': 'Balance ($)',
                     'axisLabel': {
-                        'formatter': '${value}'
+                        'formatter': '${value}',
+                        'color': '#a0aec0'
+                    },
+                    'axisLine': {
+                        'lineStyle': {
+                            'color': 'rgba(255, 255, 255, 0.1)'
+                        }
+                    },
+                    'splitLine': {
+                        'lineStyle': {
+                            'color': 'rgba(255, 255, 255, 0.05)'
+                        }
                     }
                 },
                 'series': [
@@ -243,9 +270,18 @@ class BalanceUsagePerExpertChart:
                         'name': 'Filled Orders',
                         'type': 'bar',
                         'stack': 'total',
-                        'data': [round(v, 2) for v in filled_values],
+                        'data': [
+                            {
+                                'value': round(filled_values[i], 2),
+                                'itemStyle': {
+                                    # If no pending orders above, round the top
+                                    'borderRadius': [4, 4, 0, 0] if pending_values[i] == 0 else [0, 0, 0, 0]
+                                }
+                            } for i in range(len(filled_values))
+                        ],
+                        'barMaxWidth': 40,
                         'itemStyle': {
-                            'color': '#4CAF50'  # Green for filled
+                            'color': '#00d4aa'  # Teal for filled
                         },
                         'label': {
                             'show': False
@@ -255,30 +291,24 @@ class BalanceUsagePerExpertChart:
                         'name': 'Pending Orders',
                         'type': 'bar',
                         'stack': 'total',
-                        'data': [round(v, 2) for v in pending_values],
+                        'data': [
+                            {
+                                'value': round(pending_values[i], 2),
+                                'itemStyle': {
+                                    'borderRadius': [4, 4, 0, 0]  # Always round top of pending (it's on top)
+                                },
+                                'label': {
+                                    'show': True,
+                                    'position': 'top',
+                                    'fontSize': 9,
+                                    'color': '#a0aec0',
+                                    'formatter': f'${total_per_expert[i]:,.0f}'
+                                }
+                            } for i in range(len(pending_values))
+                        ],
+                        'barMaxWidth': 40,
                         'itemStyle': {
-                            'color': '#FF9800'  # Orange for pending
-                        },
-                        'label': {
-                            'show': False  # Disable default label, use markPoint instead
-                        },
-                        'markPoint': {
-                            'symbol': 'rect',
-                            'symbolSize': [60, 20],
-                            'symbolOffset': [0, -10],
-                            'itemStyle': {
-                                'color': 'rgba(255, 255, 255, 0.9)',
-                                'borderColor': '#666',
-                                'borderWidth': 1
-                            },
-                            'label': {
-                                'show': True,
-                                'fontSize': 10,
-                                'fontWeight': 'bold',
-                                'color': '#333',
-                                'formatter': '${c}'  # ECharts template string: {c} = value
-                            },
-                            'data': [{'coord': [i, total_per_expert[i]], 'value': total_per_expert[i]} for i in range(len(expert_names))]
+                            'color': '#ffa94d'  # Orange for pending
                         }
                     }
                 ]

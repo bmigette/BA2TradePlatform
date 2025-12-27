@@ -487,7 +487,7 @@ class AnalystRatingsTab:
         """Render the Analyst Ratings tab content."""
         with ui.card().classes('w-full'):
             ui.label('Analyst Ratings Browser').classes('text-lg font-bold')
-            ui.label('View analyst ratings and price targets from Finnhub and FMP').classes('text-sm text-gray-600 mb-4')
+            ui.label('View analyst ratings and price targets from Finnhub and FMP').classes('text-sm mb-4').style('color: #a0aec0;')
             
             # API key warnings
             missing_keys = []
@@ -648,11 +648,11 @@ class AnalystRatingsTab:
                 ui.label('Finnhub Analyst Recommendations').classes('text-lg font-semibold')
             
             if not self._finnhub_api_key:
-                ui.label('API key not configured').classes('text-gray-500 italic')
+                ui.label('API key not configured').classes('italic').style('color: #a0aec0;')
                 return
             
             if not data:
-                ui.label('No data available').classes('text-gray-500 italic')
+                ui.label('No data available').classes('italic').style('color: #a0aec0;')
                 return
             
             # Use the most recent period
@@ -666,7 +666,7 @@ class AnalystRatingsTab:
             strong_sell = latest.get('strongSell', 0)
             total = strong_buy + buy + hold + sell + strong_sell
             
-            ui.label(f'Period: {period}').classes('text-sm text-gray-600 mb-2')
+            ui.label(f'Period: {period}').classes('text-sm mb-2').style('color: #a0aec0;')
             
             # Ratings summary with color-coded badges
             with ui.row().classes('gap-2 flex-wrap mb-3'):
@@ -707,7 +707,7 @@ class AnalystRatingsTab:
                 with ui.row().classes('items-center gap-2'):
                     ui.label('Consensus:').classes('font-semibold')
                     ui.badge(consensus, color=consensus_color)
-                    ui.label(f'({total} analysts)').classes('text-sm text-gray-600')
+                    ui.label(f'({total} analysts)').classes('text-sm').style('color: #a0aec0;')
             
             # Historical data table
             if len(data) > 1:
@@ -736,7 +736,7 @@ class AnalystRatingsTab:
                 ui.label('FMP Analyst Grades & Price Targets').classes('text-lg font-semibold')
             
             if not self._fmp_api_key:
-                ui.label('API key not configured').classes('text-gray-500 italic')
+                ui.label('API key not configured').classes('italic').style('color: #a0aec0;')
                 return
             
             # Price Target Consensus section
@@ -750,19 +750,19 @@ class AnalystRatingsTab:
                 
                 with ui.row().classes('gap-4 flex-wrap mb-3'):
                     with ui.column().classes('items-center'):
-                        ui.label('High').classes('text-xs text-gray-500')
-                        ui.label(f'${target_high:.2f}').classes('text-lg font-bold text-green-600')
+                        ui.label('High').classes('text-xs').style('color: #a0aec0;')
+                        ui.label(f'${target_high:.2f}').classes('text-lg font-bold').style('color: #00d4aa;')
                     with ui.column().classes('items-center'):
-                        ui.label('Consensus').classes('text-xs text-gray-500')
-                        ui.label(f'${target_consensus:.2f}').classes('text-lg font-bold text-blue-600')
+                        ui.label('Consensus').classes('text-xs').style('color: #a0aec0;')
+                        ui.label(f'${target_consensus:.2f}').classes('text-lg font-bold').style('color: #74c0fc;')
                     with ui.column().classes('items-center'):
-                        ui.label('Median').classes('text-xs text-gray-500')
-                        ui.label(f'${target_median:.2f}').classes('text-lg font-bold text-purple-600')
+                        ui.label('Median').classes('text-xs').style('color: #a0aec0;')
+                        ui.label(f'${target_median:.2f}').classes('text-lg font-bold').style('color: #b197fc;')
                     with ui.column().classes('items-center'):
-                        ui.label('Low').classes('text-xs text-gray-500')
-                        ui.label(f'${target_low:.2f}').classes('text-lg font-bold text-red-600')
+                        ui.label('Low').classes('text-xs').style('color: #a0aec0;')
+                        ui.label(f'${target_low:.2f}').classes('text-lg font-bold').style('color: #ff6b6b;')
             else:
-                ui.label('Price target data not available').classes('text-gray-500 italic text-sm')
+                ui.label('Price target data not available').classes('italic text-sm').style('color: #a0aec0;')
             
             ui.separator().classes('my-2')
             
@@ -831,7 +831,7 @@ class AnalystRatingsTab:
                     </q-td>
                 ''')
             else:
-                ui.label('No recent analyst grades available').classes('text-gray-500 italic text-sm')
+                ui.label('No recent analyst grades available').classes('italic text-sm').style('color: #a0aec0;')
 
 
 def content():

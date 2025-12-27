@@ -8,6 +8,7 @@ from .FloatingPLPerAccountWidget import FloatingPLPerAccountWidget
 from .ModelSelector import ModelSelector, ModelSelectorInput
 from .LazyTable import LazyTable, ColumnDef, LazyTableConfig, create_simple_table
 from .LiveTradesTable import LiveTradesTable, LiveTradesTableConfig
+from .MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
 
 __all__ = [
     'InstrumentSelector', 
@@ -24,5 +25,6 @@ __all__ = [
     'LazyTableConfig',
     'create_simple_table',
     'LiveTradesTable',
-    'LiveTradesTableConfig'
+    'LiveTradesTableConfig',
+    'MarketAnalysisDetailDialog'
 ]

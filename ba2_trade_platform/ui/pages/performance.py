@@ -88,7 +88,7 @@ class PerformanceTab:
             durations = []
             for txn in txns:
                 if txn.open_date and txn.close_date:
-                    duration = (txn.close_date - txn.open_date).total_seconds() / 3600  # hours
+                    duration = (txn.close_date - txn.open_date).total_seconds() / 86400  # days
                     durations.append(duration)
             
             # Calculate P&L
@@ -118,7 +118,7 @@ class PerformanceTab:
             
             expert_metrics[expert_name] = {
                 'total_transactions': len(txns),
-                'avg_duration_hours': np.mean(durations) if durations else 0,
+                'avg_duration_days': np.mean(durations) if durations else 0,
                 'total_pnl': sum(pnls) if pnls else 0,
                 'avg_pnl': np.mean(pnls) if pnls else 0,
                 'win_rate': win_rate,
@@ -165,7 +165,7 @@ class PerformanceTab:
     def _render_summary_metrics(self, expert_metrics: Dict[str, Any]):
         """Render top-level summary metric cards."""
         if not expert_metrics:
-            ui.label("No transaction data available for the selected period").classes('text-gray-500 text-center p-4')
+            ui.label("No transaction data available for the selected period").classes('text-center p-4').style('color: #a0aec0;')
             return
         
         # Calculate overall metrics
@@ -220,13 +220,13 @@ class PerformanceTab:
         
         with ui.grid(columns=2).classes('w-full gap-4 mt-6'):
             # Chart 1: Average transaction duration
-            duration_data = {name: metrics['avg_duration_hours'] 
+            duration_data = {name: metrics['avg_duration_days'] 
                            for name, metrics in expert_metrics.items()}
             chart1 = PerformanceBarChart(
                 title="Average Transaction Duration by Expert Instance",
                 data=duration_data,
                 xlabel="Expert Instance",
-                ylabel="Hours",
+                ylabel="Days",
                 height=350
             )
             chart1.render()
@@ -279,7 +279,7 @@ class PerformanceTab:
         if not monthly_data:
             return
         
-        ui.label("Monthly Performance Trends").classes('text-xl font-bold mt-8 mb-4')
+        ui.label("Monthly Performance Trends").classes('text-xl font-bold mt-8 mb-4').style('color: #e2e8f0;')
         
         # Prepare time series data
         months = sorted(monthly_data.keys())
@@ -310,7 +310,8 @@ class PerformanceTab:
                 title="Monthly P&L by Expert Instance",
                 series_data=profit_series,
                 ylabel="P&L ($)",
-                height=400
+                height=400,
+                date_format="monthly"
             )
             chart1.render()
             
@@ -319,7 +320,8 @@ class PerformanceTab:
                 title="Monthly Transaction Count by Expert Instance",
                 series_data=transaction_series,
                 ylabel="Transactions",
-                height=400
+                height=400,
+                date_format="monthly"
             )
             chart2.render()
     
@@ -328,11 +330,11 @@ class PerformanceTab:
         if not expert_metrics:
             return
         
-        ui.label("Detailed Performance Metrics").classes('text-xl font-bold mt-8 mb-4')
+        ui.label("Detailed Performance Metrics").classes('text-xl font-bold mt-8 mb-4').style('color: #e2e8f0;')
         
         # Prepare table data
         columns = [
-            'Expert Instance', 'Transactions', 'Avg Duration (hrs)', 'Total P&L', 
+            'Expert Instance', 'Transactions', 'Avg Duration (days)', 'Total P&L', 
             'Avg P&L', 'Win Rate', 'Profit Factor', 'Largest Win', 
             'Largest Loss', 'Sharpe Ratio'
         ]
@@ -342,7 +344,7 @@ class PerformanceTab:
             rows.append({
                 'Expert Instance': expert_name,
                 'Transactions': metrics['total_transactions'],
-                'Avg Duration (hrs)': f"{metrics['avg_duration_hours']:.1f}",
+                'Avg Duration (days)': f"{metrics['avg_duration_days']:.1f}",
                 'Total P&L': f"${metrics['total_pnl']:,.2f}",
                 'Avg P&L': f"${metrics['avg_pnl']:,.2f}",
                 'Win Rate': f"{metrics['win_rate']:.1f}%",
@@ -361,8 +363,8 @@ class PerformanceTab:
     
     def _render_filters(self):
         """Render filter controls."""
-        with ui.card().classes('w-full mb-4'):
-            ui.label("Filters").classes('text-lg font-bold mb-2')
+        with ui.card().classes('w-full mb-4').style('background: rgba(30, 41, 59, 0.5); border: 1px solid rgba(160, 174, 192, 0.2);'):
+            ui.label("Filters").classes('text-lg font-bold mb-2').style('color: #e2e8f0;')
             
             with ui.row().classes('w-full gap-4'):
                 # Date range selector
@@ -424,8 +426,8 @@ class PerformanceTab:
         
         if not transactions:
             ui.label("No closed transactions found for the selected period").classes(
-                'text-gray-500 text-center p-8 text-lg'
-            )
+                'text-center p-8 text-lg'
+            ).style('color: #a0aec0;')
             return
         
         # Calculate metrics
@@ -442,7 +444,7 @@ class PerformanceTab:
     def render(self):
         """Render the complete performance tab."""
         with ui.column().classes('w-full gap-4'):
-            ui.label("Trade Performance Analytics").classes('text-2xl font-bold mb-2')
+            ui.label("Trade Performance Analytics").classes('text-2xl font-bold mb-2').style('color: #e2e8f0;')
             
             # Filters
             self._render_filters()

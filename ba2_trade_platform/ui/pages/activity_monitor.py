@@ -24,7 +24,7 @@ class ActivityMonitorPage:
     def __init__(self):
         self.refresh_task: Optional[asyncio.Task] = None
         self.auto_refresh = True  # Auto-refresh enabled by default
-        self.refresh_interval = 5  # seconds
+        self.refresh_interval = 30  # seconds
         
         # Filter state
         self.filter_types: list = []  # Multiple activity types

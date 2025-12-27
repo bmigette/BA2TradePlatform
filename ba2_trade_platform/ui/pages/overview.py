@@ -18,6 +18,7 @@ from ...logger import logger
 from ..components import ProfitPerExpertChart, InstrumentDistributionChart, BalanceUsagePerExpertChart
 from ..components.FloatingPLPerExpertWidget import FloatingPLPerExpertWidget
 from ..components.FloatingPLPerAccountWidget import FloatingPLPerAccountWidget
+from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
 
 class OverviewTab:
     def __init__(self, tabs_ref=None):
@@ -4314,8 +4315,13 @@ class TransactionsTab:
             with ui.row().classes('w-full justify-between mt-4'):
                 # Navigate to analysis button (only show if market_analysis_id exists)
                 if rec.market_analysis_id:
+                    def open_analysis(aid=rec.market_analysis_id):
+                        dialog.close()
+                        if not hasattr(self, '_analysis_dialog'):
+                            self._analysis_dialog = MarketAnalysisDetailDialog()
+                        self._analysis_dialog.open(aid)
                     ui.button('View Market Analysis', 
-                             on_click=lambda: ui.navigate.to(f'/market_analysis/{rec.market_analysis_id}'),
+                             on_click=open_analysis,
                              icon='analytics').props('color=secondary')
                 else:
                     ui.space()  # Empty space if no analysis link

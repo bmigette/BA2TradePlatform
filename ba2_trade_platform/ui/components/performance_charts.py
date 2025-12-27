@@ -35,35 +35,27 @@ class MetricCard:
     
     def render(self):
         """Render the metric card."""
-        # Color mapping
-        color_map = {
-            "primary": "blue-600",
-            "positive": "green-600",
-            "negative": "red-600",
-            "neutral": "gray-600"
+        # Dark theme color mapping using inline styles
+        styles_map = {
+            "primary": ("color: #74c0fc;", "background: rgba(116, 192, 252, 0.1); border: 1px solid rgba(116, 192, 252, 0.2);"),
+            "positive": ("color: #00d4aa;", "background: rgba(0, 212, 170, 0.1); border: 1px solid rgba(0, 212, 170, 0.2);"),
+            "negative": ("color: #ff6b6b;", "background: rgba(255, 107, 107, 0.1); border: 1px solid rgba(255, 107, 107, 0.2);"),
+            "neutral": ("color: #a0aec0;", "background: rgba(160, 174, 192, 0.1); border: 1px solid rgba(160, 174, 192, 0.2);")
         }
         
-        bg_color_map = {
-            "primary": "blue-50",
-            "positive": "green-50",
-            "negative": "red-50",
-            "neutral": "gray-50"
-        }
+        text_style, bg_style = styles_map.get(self.color, styles_map["primary"])
         
-        card_color = color_map.get(self.color, "blue-600")
-        bg_color = bg_color_map.get(self.color, "blue-50")
-        
-        with ui.card().classes(f'w-full bg-{bg_color}'):
-            ui.label(self.title).classes(f'text-sm text-{card_color} font-medium')
-            ui.label(self.value).classes('text-3xl font-bold mt-1')
+        with ui.card().classes('w-full').style(f'{bg_style} border-radius: 8px;'):
+            ui.label(self.title).classes('text-sm font-medium').style(text_style)
+            ui.label(self.value).classes('text-3xl font-bold mt-1').style('color: #e2e8f0;')
             
             if self.trend is not None:
-                trend_color = 'green' if self.trend >= 0 else 'red'
+                trend_color = '#00d4aa' if self.trend >= 0 else '#ff6b6b'
                 trend_icon = '↑' if self.trend >= 0 else '↓'
-                ui.label(f'{trend_icon} {abs(self.trend):.1f}%').classes(f'text-sm text-{trend_color}-600 mt-1')
+                ui.label(f'{trend_icon} {abs(self.trend):.1f}%').classes('text-sm mt-1').style(f'color: {trend_color};')
             
             if self.subtitle:
-                ui.label(self.subtitle).classes('text-xs text-gray-600 mt-1')
+                ui.label(self.subtitle).classes('text-xs mt-1').style('color: #a0aec0;')
 
 
 class PerformanceBarChart:
@@ -88,36 +80,56 @@ class PerformanceBarChart:
     def render(self):
         """Render the bar chart."""
         if not self.data:
-            ui.label("No data available").classes('text-gray-500 text-center p-4')
+            ui.label("No data available").classes('text-gray-400 text-center p-4')
             return
         
         labels = list(self.data.keys())
         values = list(self.data.values())
         
-        # Color bars based on value (green for positive, red for negative)
-        colors = ['green' if v >= 0 else 'red' for v in values]
+        # Color bars based on value (teal for positive, red for negative)
+        colors = ['#00d4aa' if v >= 0 else '#ff6b6b' for v in values]
         
         fig = go.Figure(data=[
             go.Bar(
                 x=labels,
                 y=values,
                 marker=dict(
-                    color=values,
-                    colorscale=[[0, 'red'], [0.5, 'orange'], [1, 'green']],
-                    showscale=False
+                    color=colors,
+                    line=dict(width=0),
+                    cornerradius=6  # Rounded corners for bars
                 ),
                 text=[f'{v:.2f}' for v in values],
-                textposition='outside'
+                textposition='outside',
+                textfont=dict(color='#e2e8f0', size=11)
             )
         ])
         
         fig.update_layout(
-            title=self.title,
-            xaxis_title=self.xlabel,
-            yaxis_title=self.ylabel,
+            title=dict(text=self.title, font=dict(color='#e2e8f0', size=14)),
+            xaxis_title=dict(text=self.xlabel, font=dict(color='#a0aec0')),
+            yaxis_title=dict(text=self.ylabel, font=dict(color='#a0aec0')),
             height=self.height,
             showlegend=False,
-            hovermode='x unified'
+            hovermode='x unified',
+            plot_bgcolor='rgba(0,0,0,0)',
+            paper_bgcolor='rgba(0,0,0,0)',
+            xaxis=dict(
+                tickfont=dict(color='#a0aec0', size=10),
+                gridcolor='rgba(160,174,192,0.1)',
+                tickangle=-45
+            ),
+            yaxis=dict(
+                tickfont=dict(color='#a0aec0', size=10),
+                gridcolor='rgba(160,174,192,0.2)',
+                zerolinecolor='rgba(160,174,192,0.3)'
+            ),
+            margin=dict(l=60, r=20, t=50, b=100),
+            hoverlabel=dict(
+                bgcolor='#1a1f2e',
+                font_size=12,
+                font_color='#e2e8f0',
+                bordercolor='#3d4a5c'
+            )
         )
         
         ui.plotly(fig).classes('w-full')
@@ -127,7 +139,8 @@ class TimeSeriesChart:
     """Line chart component for time-series data."""
     
     def __init__(self, title: str, series_data: Dict[str, List[Tuple[datetime, float]]],
-                 xlabel: str = "Date", ylabel: str = "", height: int = 400):
+                 xlabel: str = "Date", ylabel: str = "", height: int = 400,
+                 date_format: str = "auto"):
         """
         Args:
             title: Chart title
@@ -135,48 +148,83 @@ class TimeSeriesChart:
             xlabel: X-axis label
             ylabel: Y-axis label
             height: Chart height in pixels
+            date_format: Date format - "auto", "monthly", "daily", or custom strftime format
         """
         self.title = title
         self.series_data = series_data
         self.xlabel = xlabel
         self.ylabel = ylabel
         self.height = height
+        self.date_format = date_format
+    
+    # Modern color palette for dark theme
+    COLORS = [
+        '#00d4aa', '#ff6b6b', '#ffa94d', '#74c0fc', '#b197fc',
+        '#63e6be', '#ffd43b', '#ff8787', '#69db7c', '#a9e34b',
+        '#4dabf7', '#da77f2', '#f783ac', '#38d9a9', '#fab005'
+    ]
     
     def render(self):
         """Render the time series chart."""
         if not self.series_data:
-            ui.label("No data available").classes('text-gray-500 text-center p-4')
+            ui.label("No data available").classes('text-gray-400 text-center p-4')
             return
         
         fig = go.Figure()
         
-        for series_name, data_points in self.series_data.items():
+        for idx, (series_name, data_points) in enumerate(self.series_data.items()):
             if not data_points:
                 continue
             
             dates = [d[0] for d in data_points]
             values = [d[1] for d in data_points]
+            color = self.COLORS[idx % len(self.COLORS)]
             
             fig.add_trace(go.Scatter(
                 x=dates,
                 y=values,
                 mode='lines+markers',
                 name=series_name,
+                line=dict(color=color, width=2),
+                marker=dict(size=6, color=color),
                 hovertemplate=f'{series_name}<br>Date: %{{x}}<br>Value: %{{y:.2f}}<extra></extra>'
             ))
         
         fig.update_layout(
-            title=self.title,
-            xaxis_title=self.xlabel,
-            yaxis_title=self.ylabel,
+            title=dict(text=self.title, font=dict(color='#e2e8f0', size=14)),
+            xaxis_title=dict(text=self.xlabel, font=dict(color='#a0aec0')),
+            yaxis_title=dict(text=self.ylabel, font=dict(color='#a0aec0')),
             height=self.height,
             hovermode='x unified',
+            plot_bgcolor='rgba(0,0,0,0)',
+            paper_bgcolor='rgba(0,0,0,0)',
+            xaxis=dict(
+                tickfont=dict(color='#a0aec0', size=10),
+                gridcolor='rgba(160,174,192,0.2)',
+                # Configure tick format based on date_format parameter
+                tickformat='%b %Y' if self.date_format == 'monthly' else None,
+                dtick='M1' if self.date_format == 'monthly' else None
+            ),
+            yaxis=dict(
+                tickfont=dict(color='#a0aec0', size=10),
+                gridcolor='rgba(160,174,192,0.2)',
+                zerolinecolor='rgba(160,174,192,0.3)'
+            ),
             legend=dict(
                 orientation="h",
                 yanchor="bottom",
                 y=1.02,
                 xanchor="right",
-                x=1
+                x=1,
+                font=dict(color='#a0aec0', size=10),
+                bgcolor='rgba(0,0,0,0)'
+            ),
+            margin=dict(l=60, r=20, t=80, b=60),
+            hoverlabel=dict(
+                bgcolor='#1a1f2e',
+                font_size=12,
+                font_color='#e2e8f0',
+                bordercolor='#3d4a5c'
             )
         )
         
@@ -200,33 +248,63 @@ class PieChartComponent:
         self.donut = donut
         self.height = height
     
+    # Modern color palette for dark theme
+    COLORS = [
+        '#00d4aa', '#ff6b6b', '#ffa94d', '#74c0fc', '#b197fc',
+        '#63e6be', '#ffd43b', '#ff8787', '#69db7c', '#a9e34b',
+        '#4dabf7', '#da77f2', '#f783ac', '#38d9a9', '#fab005'
+    ]
+    
     def render(self):
         """Render the pie/donut chart."""
         if not self.data:
-            ui.label("No data available").classes('text-gray-500 text-center p-4')
+            ui.label("No data available").classes('text-gray-400 text-center p-4')
             return
         
         labels = list(self.data.keys())
         values = list(self.data.values())
         
+        # Color wins green and losses red
+        colors = []
+        for label in labels:
+            if 'Win' in label:
+                colors.append('#00d4aa')
+            elif 'Loss' in label:
+                colors.append('#ff6b6b')
+            else:
+                colors.append(self.COLORS[len(colors) % len(self.COLORS)])
+        
         fig = go.Figure(data=[go.Pie(
             labels=labels,
             values=values,
-            hole=0.4 if self.donut else 0,
-            textinfo='label+percent',
-            hovertemplate='%{label}<br>Value: %{value:.2f}<br>Percent: %{percent}<extra></extra>'
+            hole=0.5 if self.donut else 0,
+            textinfo='percent',
+            textfont=dict(color='#e2e8f0', size=10),
+            marker=dict(colors=colors, line=dict(color='#1a1f2e', width=2)),
+            hovertemplate='%{label}<br>Value: %{value:.0f}<br>Percent: %{percent}<extra></extra>'
         )])
         
         fig.update_layout(
-            title=self.title,
+            title=dict(text=self.title, font=dict(color='#e2e8f0', size=14)),
             height=self.height,
             showlegend=True,
+            plot_bgcolor='rgba(0,0,0,0)',
+            paper_bgcolor='rgba(0,0,0,0)',
             legend=dict(
                 orientation="v",
                 yanchor="middle",
                 y=0.5,
                 xanchor="left",
-                x=1.05
+                x=1.0,
+                font=dict(color='#a0aec0', size=9),
+                bgcolor='rgba(0,0,0,0)'
+            ),
+            margin=dict(l=20, r=150, t=50, b=20),
+            hoverlabel=dict(
+                bgcolor='#1a1f2e',
+                font_size=12,
+                font_color='#e2e8f0',
+                bordercolor='#3d4a5c'
             )
         )
         
@@ -250,10 +328,10 @@ class PerformanceTable:
     def render(self):
         """Render the performance table."""
         if self.title:
-            ui.label(self.title).classes('text-lg font-bold mb-2')
+            ui.label(self.title).classes('text-lg font-bold mb-2').style('color: #e2e8f0;')
         
         if not self.rows:
-            ui.label("No data available").classes('text-gray-500 text-center p-4')
+            ui.label("No data available").classes('text-center p-4').style('color: #a0aec0;')
             return
         
         # Create table
@@ -263,7 +341,7 @@ class PerformanceTable:
             'rows': self.rows
         }
         
-        ui.table(**table_data).classes('w-full')
+        ui.table(**table_data).classes('w-full dark-table')
 
 
 class MultiMetricDashboard:
@@ -313,34 +391,80 @@ class ComboChart:
         self.line_data = line_data
         self.height = height
     
+    # Modern color palette for dark theme
+    BAR_COLORS = ['#00d4aa', '#74c0fc', '#ffa94d', '#b197fc']
+    LINE_COLORS = ['#ff6b6b', '#ffd43b', '#63e6be', '#da77f2']
+    
     def render(self):
         """Render the combo chart."""
         fig = make_subplots(specs=[[{"secondary_y": True}]])
         
         # Add bar traces
-        for series_name, values in self.bar_data.items():
+        for idx, (series_name, values) in enumerate(self.bar_data.items()):
             fig.add_trace(
-                go.Bar(name=series_name, x=self.categories, y=values),
+                go.Bar(
+                    name=series_name, 
+                    x=self.categories, 
+                    y=values,
+                    marker=dict(color=self.BAR_COLORS[idx % len(self.BAR_COLORS)])
+                ),
                 secondary_y=False
             )
         
         # Add line traces
-        for series_name, values in self.line_data.items():
+        for idx, (series_name, values) in enumerate(self.line_data.items()):
+            color = self.LINE_COLORS[idx % len(self.LINE_COLORS)]
             fig.add_trace(
-                go.Scatter(name=series_name, x=self.categories, y=values, mode='lines+markers'),
+                go.Scatter(
+                    name=series_name, 
+                    x=self.categories, 
+                    y=values, 
+                    mode='lines+markers',
+                    line=dict(color=color, width=2),
+                    marker=dict(size=6, color=color)
+                ),
                 secondary_y=True
             )
         
         fig.update_layout(
-            title=self.title,
+            title=dict(text=self.title, font=dict(color='#e2e8f0', size=14)),
             height=self.height,
             hovermode='x unified',
-            barmode='group'
+            barmode='group',
+            plot_bgcolor='rgba(0,0,0,0)',
+            paper_bgcolor='rgba(0,0,0,0)',
+            legend=dict(
+                font=dict(color='#a0aec0', size=10),
+                bgcolor='rgba(0,0,0,0)'
+            ),
+            margin=dict(l=60, r=60, t=50, b=60),
+            hoverlabel=dict(
+                bgcolor='#1a1f2e',
+                font_size=12,
+                font_color='#e2e8f0',
+                bordercolor='#3d4a5c'
+            )
         )
         
-        fig.update_xaxes(title_text="Period")
-        fig.update_yaxes(title_text="Count", secondary_y=False)
-        fig.update_yaxes(title_text="Amount", secondary_y=True)
+        fig.update_xaxes(
+            title_text="Period",
+            title_font=dict(color='#a0aec0'),
+            tickfont=dict(color='#a0aec0', size=10),
+            gridcolor='rgba(160,174,192,0.2)'
+        )
+        fig.update_yaxes(
+            title_text="Count", 
+            secondary_y=False,
+            title_font=dict(color='#a0aec0'),
+            tickfont=dict(color='#a0aec0', size=10),
+            gridcolor='rgba(160,174,192,0.2)'
+        )
+        fig.update_yaxes(
+            title_text="Amount", 
+            secondary_y=True,
+            title_font=dict(color='#a0aec0'),
+            tickfont=dict(color='#a0aec0', size=10)
+        )
         
         ui.plotly(fig).classes('w-full')
 

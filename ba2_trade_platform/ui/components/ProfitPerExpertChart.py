@@ -96,26 +96,40 @@ class ProfitPerExpertChart:
             # ECharts expects data as objects with value and itemStyle properties
             chart_data = []
             for profit in profit_values:
+                # For positive bars: round top corners [topLeft, topRight, bottomRight, bottomLeft]
+                # For negative bars: round bottom corners
+                if profit >= 0:
+                    border_radius = [4, 4, 0, 0]  # Round top
+                else:
+                    border_radius = [0, 0, 4, 4]  # Round bottom
                 chart_data.append({
                     'value': round(profit, 2),
                     'itemStyle': {
-                        'color': 'green' if profit >= 0 else 'red'
+                        'color': '#00d4aa' if profit >= 0 else '#ff6b6b',
+                        'borderRadius': border_radius
                     }
                 })
             
             # Create echart options
             options = {
+                'backgroundColor': 'transparent',
                 'tooltip': {
                     'trigger': 'axis',
                     'axisPointer': {
                         'type': 'shadow'
                     },
-                    'formatter': '{b}<br/>Profit: ${c}'
+                    'formatter': '{b}<br/>Profit: ${c}',
+                    'backgroundColor': 'rgba(37, 43, 59, 0.95)',
+                    'borderColor': 'rgba(255, 255, 255, 0.1)',
+                    'textStyle': {
+                        'color': '#ffffff'
+                    }
                 },
                 'grid': {
                     'left': '3%',
                     'right': '4%',
-                    'bottom': '15%',
+                    'bottom': '20%',
+                    'top': '15%',
                     'containLabel': True
                 },
                 'xAxis': {
@@ -124,25 +138,49 @@ class ProfitPerExpertChart:
                     'axisLabel': {
                         'rotate': 45,
                         'interval': 0,
-                        'fontSize': 10
+                        'fontSize': 9,
+                        'color': '#a0aec0',
+                        'width': 80,
+                        'overflow': 'truncate'
+                    },
+                    'axisLine': {
+                        'lineStyle': {
+                            'color': 'rgba(255, 255, 255, 0.1)'
+                        }
                     }
                 },
                 'yAxis': {
                     'type': 'value',
                     'name': 'Profit ($)',
+                    'nameTextStyle': {
+                        'color': '#a0aec0'
+                    },
                     'axisLabel': {
-                        'formatter': '${value}'
+                        'formatter': '${value}',
+                        'color': '#a0aec0'
+                    },
+                    'axisLine': {
+                        'lineStyle': {
+                            'color': 'rgba(255, 255, 255, 0.1)'
+                        }
+                    },
+                    'splitLine': {
+                        'lineStyle': {
+                            'color': 'rgba(255, 255, 255, 0.05)'
+                        }
                     }
                 },
                 'series': [{
                     'name': 'Profit',
                     'type': 'bar',
                     'data': chart_data,
+                    'barMaxWidth': 40,
                     'label': {
                         'show': True,
                         'position': 'top',
                         'formatter': '${c}',
-                        'fontSize': 10
+                        'fontSize': 9,
+                        'color': '#a0aec0'
                     }
                 }]
             }
@@ -173,10 +211,15 @@ class ProfitPerExpertChart:
                 # Create data array with individual colors for each bar
                 chart_data = []
                 for profit in profit_values:
+                    if profit >= 0:
+                        border_radius = [4, 4, 0, 0]  # Round top
+                    else:
+                        border_radius = [0, 0, 4, 4]  # Round bottom
                     chart_data.append({
                         'value': round(profit, 2),
                         'itemStyle': {
-                            'color': 'green' if profit >= 0 else 'red'
+                            'color': '#00d4aa' if profit >= 0 else '#ff6b6b',
+                            'borderRadius': border_radius
                         }
                     })
                 

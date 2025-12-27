@@ -324,13 +324,13 @@ class MarketAnalysisHistoryPage:
             # Add recommendation markers
             self._add_recommendation_markers(fig)
             
-            # Update layout
+            # Update layout - Dark theme
             fig.update_layout(
                 title={
                     'text': f'{self.symbol} - Price History with Recommendations',
                     'x': 0.5,
                     'xanchor': 'center',
-                    'font': {'size': 20, 'color': '#1f2937'}
+                    'font': {'size': 20, 'color': '#e2e8f0'}
                 },
                 height=700,
                 width=None,  # Let it auto-size to container
@@ -343,38 +343,51 @@ class MarketAnalysisHistoryPage:
                     y=0.99,
                     xanchor="left",
                     x=1.01,
-                    bgcolor="rgba(255, 255, 255, 0.9)",
-                    bordercolor="#e5e7eb",
-                    borderwidth=1
+                    bgcolor="rgba(26, 31, 46, 0.9)",
+                    bordercolor="#3d4a5c",
+                    borderwidth=1,
+                    font=dict(color='#a0aec0')
                 ),
-                template='plotly_white',
+                template='plotly_dark',
                 margin=dict(l=60, r=200, t=80, b=60),  # Reduced right margin from 220 to 200
-                paper_bgcolor='white',
-                plot_bgcolor='#fafafa',
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
                 dragmode='pan',
-                xaxis_rangeslider_visible=False
+                xaxis_rangeslider_visible=False,
+                hoverlabel=dict(
+                    bgcolor='#1a1f2e',
+                    font_size=12,
+                    font_color='#e2e8f0',
+                    bordercolor='#3d4a5c'
+                )
             )
             
-            # Update axes
+            # Update axes - Dark theme
             fig.update_xaxes(
                 title_text="Date",
+                title_font=dict(color='#a0aec0'),
                 showgrid=True,
                 gridwidth=1,
-                gridcolor='#e5e7eb',
+                gridcolor='rgba(160,174,192,0.15)',
+                tickfont=dict(color='#a0aec0'),
                 tickangle=-45,
                 rangebreaks=[dict(bounds=["sat", "mon"])]  # Remove weekends
             )
             
             fig.update_yaxes(
                 title_text="Price ($)",
+                title_font=dict(color='#a0aec0'),
                 showgrid=True,
                 gridwidth=1,
-                gridcolor='#e5e7eb',
+                gridcolor='rgba(160,174,192,0.15)',
+                tickfont=dict(color='#a0aec0'),
                 secondary_y=False
             )
             
             fig.update_yaxes(
                 title_text="Volume",
+                title_font=dict(color='#a0aec0'),
+                tickfont=dict(color='#a0aec0'),
                 showgrid=False,
                 secondary_y=True
             )

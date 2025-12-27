@@ -538,7 +538,7 @@ class InstrumentGraph:
                         text=label,
                         showarrow=False,
                         font=dict(size=12, color=color, weight='bold'),
-                        bgcolor="rgba(255, 255, 255, 0.9)",
+                        bgcolor="rgba(26, 31, 46, 0.95)",
                         bordercolor=color,
                         borderwidth=2,
                         borderpad=4,
@@ -550,13 +550,13 @@ class InstrumentGraph:
                 except Exception as e:
                     logger.error(f"Could not add recommendation date marker: {e}", exc_info=True)
             
-            # Update layout with better styling
+            # Update layout with dark theme styling
             fig.update_layout(
                 title={
                     'text': f'{self.symbol} - Price Action & Technical Indicators',
                     'x': 0.5,
                     'xanchor': 'center',
-                    'font': {'size': 20, 'color': '#1f2937'}
+                    'font': {'size': 20, 'color': '#e2e8f0'}
                 },
                 height=700,
                 autosize=True,  # Auto-size to container width
@@ -568,16 +568,23 @@ class InstrumentGraph:
                     y=0.99,
                     xanchor="left",
                     x=1.01,
-                    bgcolor="rgba(255, 255, 255, 0.9)",
-                    bordercolor="#e5e7eb",
-                    borderwidth=1
+                    bgcolor="rgba(26, 31, 46, 0.9)",
+                    bordercolor="#3d4a5c",
+                    borderwidth=1,
+                    font=dict(color='#a0aec0')
                 ),
-                template='plotly_white',
+                template='plotly_dark',
                 margin=dict(l=60, r=180, t=80, b=60),
-                paper_bgcolor='white',
-                plot_bgcolor='#fafafa',
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
                 # Enable drag mode for panning
-                dragmode='pan'
+                dragmode='pan',
+                hoverlabel=dict(
+                    bgcolor='#1a1f2e',
+                    font_size=12,
+                    font_color='#e2e8f0',
+                    bordercolor='#3d4a5c'
+                )
             )
             
             # Update axes with rangebreaks to remove gaps
@@ -607,9 +614,11 @@ class InstrumentGraph:
             
             fig.update_xaxes(
                 title_text="Date & Time",
+                title_font=dict(color='#a0aec0'),
                 showgrid=True,
                 gridwidth=1,
-                gridcolor='#e5e7eb',
+                gridcolor='rgba(160,174,192,0.15)',
+                tickfont=dict(color='#a0aec0'),
                 row=num_rows,
                 col=1,
                 tickangle=-45,  # Angle the labels for better readability with datetime
@@ -619,9 +628,11 @@ class InstrumentGraph:
             # Primary y-axis (price)
             fig.update_yaxes(
                 title_text="Price ($)",
+                title_font=dict(color='#a0aec0'),
                 showgrid=True,
                 gridwidth=1,
-                gridcolor='#e5e7eb',
+                gridcolor='rgba(160,174,192,0.15)',
+                tickfont=dict(color='#a0aec0'),
                 row=1,
                 col=1,
                 secondary_y=False
@@ -631,6 +642,8 @@ class InstrumentGraph:
             if 'Volume' in self.price_data.columns:
                 fig.update_yaxes(
                     title_text="Volume",
+                    title_font=dict(color='#a0aec0'),
+                    tickfont=dict(color='#a0aec0'),
                     showgrid=False,
                     row=1,
                     col=1,
@@ -641,10 +654,12 @@ class InstrumentGraph:
             if oscillators:
                 fig.update_yaxes(
                     title_text="Value",
+                    title_font=dict(color='#a0aec0'),
+                    tickfont=dict(color='#a0aec0'),
                     range=[-5, 105],  # Slightly wider than 0-100 for visibility
                     showgrid=True,
                     gridwidth=1,
-                    gridcolor='#e5e7eb',
+                    gridcolor='rgba(160,174,192,0.15)',
                     row=2,
                     col=1
                 )
@@ -654,9 +669,11 @@ class InstrumentGraph:
                 row_num = 3 if oscillators else 2
                 fig.update_yaxes(
                     title_text="Value",
+                    title_font=dict(color='#a0aec0'),
+                    tickfont=dict(color='#a0aec0'),
                     showgrid=True,
                     gridwidth=1,
-                    gridcolor='#e5e7eb',
+                    gridcolor='rgba(160,174,192,0.15)',
                     row=row_num,
                     col=1
                 )

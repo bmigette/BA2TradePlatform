@@ -126,63 +126,84 @@ class InstrumentDistributionChart:
             
             # Prepare data for pie chart
             pie_data = [
-                {'value': value, 'name': f"{name} (${value:,.2f})"}
+                {'value': round(value, 2), 'name': name}
                 for name, value in distribution.items()
             ]
             
             # Calculate total
             total_value = sum(distribution.values())
             
+            # Modern color palette for dark theme
+            colors = [
+                '#00d4aa', '#4dabf7', '#ffa94d', '#ff6b6b', '#9775fa',
+                '#69db7c', '#ffd43b', '#ff8787', '#74c0fc', '#a9e34b',
+                '#f783ac', '#63e6be', '#da77f2', '#fab005', '#40c057'
+            ]
+            
             # Create echart options
             options = {
+                'backgroundColor': 'transparent',
+                'color': colors,
                 'tooltip': {
                     'trigger': 'item',
-                    'formatter': '{b}<br/>{d}%'
+                    'formatter': '{b}<br/>${c:,.2f}<br/>{d}%',
+                    'backgroundColor': 'rgba(37, 43, 59, 0.95)',
+                    'borderColor': 'rgba(255, 255, 255, 0.1)',
+                    'textStyle': {
+                        'color': '#ffffff'
+                    }
                 },
                 'legend': {
-                    'orient': 'horizontal',
-                    'bottom': 0,
-                    'left': 'center',
-                    'type': 'scroll',
-                    'pageButtonItemGap': 5,
-                    'pageIconSize': 12,
-                    'textStyle': {
-                        'fontSize': 11
-                    }
+                    'show': False  # Hide legend, use labels instead
                 },
                 'series': [{
                     'name': 'Position Distribution',
                     'type': 'pie',
-                    'radius': ['40%', '70%'],
-                    'center': ['50%', '45%'],
+                    'radius': ['35%', '55%'],
+                    'center': ['50%', '50%'],
                     'avoidLabelOverlap': True,
                     'itemStyle': {
-                        'borderRadius': 10,
-                        'borderColor': '#fff',
+                        'borderRadius': 4,
+                        'borderColor': 'rgba(26, 31, 46, 0.8)',
                         'borderWidth': 2
                     },
                     'label': {
                         'show': True,
                         'position': 'outside',
-                        'fontSize': 10,
-                        'formatter': '{b}\n{d}%'
+                        'fontSize': 9,
+                        'color': '#a0aec0',
+                        'formatter': '{b}\n{d}%',
+                        'lineHeight': 12,
+                        'overflow': 'truncate',
+                        'width': 80
                     },
                     'emphasis': {
                         'label': {
                             'show': True,
-                            'fontSize': 14,
-                            'fontWeight': 'bold'
+                            'fontSize': 11,
+                            'fontWeight': 'bold',
+                            'color': '#ffffff'
+                        },
+                        'itemStyle': {
+                            'shadowBlur': 10,
+                            'shadowOffsetX': 0,
+                            'shadowColor': 'rgba(0, 0, 0, 0.5)'
                         }
                     },
                     'labelLine': {
-                        'show': True
+                        'show': True,
+                        'length': 10,
+                        'length2': 15,
+                        'lineStyle': {
+                            'color': 'rgba(255, 255, 255, 0.3)'
+                        }
                     },
                     'data': pie_data
                 }]
             }
             
-            # Create the chart - use w-full for responsive width and h-96 for consistent height
-            self.chart = ui.echart(options).classes('w-full').style('height: 400px; min-height: 400px;')
+            # Create the chart - use w-full for responsive width
+            self.chart = ui.echart(options).classes('w-full h-64')
             
             # Add summary statistics
             with ui.row().classes('w-full justify-between mt-4 text-sm'):
