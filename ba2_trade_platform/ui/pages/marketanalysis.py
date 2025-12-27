@@ -1360,6 +1360,10 @@ class JobMonitoringTab:
             # Get paginated data from cache (this is synchronous)
             analysis_data, total_records = self._get_analysis_data()
             
+            # Debug: Log has_evaluation_data values
+            eval_flags = [(item['id'], item['has_evaluation_data']) for item in analysis_data]
+            logger.debug(f"[_update_table_from_cache] Setting rows with has_evaluation_data: {eval_flags}")
+            
             # Update table if it exists
             if self.analysis_table:
                 self.analysis_table.rows = analysis_data
