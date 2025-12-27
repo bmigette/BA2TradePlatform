@@ -1366,7 +1366,9 @@ class JobMonitoringTab:
             
             # Update table if it exists
             if self.analysis_table:
-                self.analysis_table.rows = analysis_data
+                # Clear and set rows to force Vue reactivity
+                self.analysis_table.rows.clear()
+                self.analysis_table.rows.extend(analysis_data)
                 self.analysis_table.update()  # Force UI refresh
             
             # Update pagination controls with current state
