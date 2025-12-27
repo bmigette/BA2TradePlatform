@@ -68,13 +68,13 @@ class LiveTradesTab:
                         label='Symbol',
                         placeholder='Filter by symbol...',
                         on_change=lambda: self._refresh_transactions()
-                    ).classes('w-40')
+                    ).props('stack-label').classes('w-40')
 
                     self.broker_order_id_filter = ui.input(
                         label='Broker Order ID',
                         placeholder='Search by broker order ID...',
                         on_change=lambda: self._refresh_transactions()
-                    ).classes('w-48')
+                    ).props('stack-label').classes('w-48')
 
                     ui.button('Refresh', icon='refresh', on_click=lambda: self._refresh_transactions()).props('outline')
 
