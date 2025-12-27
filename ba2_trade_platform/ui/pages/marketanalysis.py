@@ -3492,7 +3492,12 @@ class OrderRecommendationsTab:
                         {'name': 'actions', 'label': 'Actions', 'field': 'actions', 'align': 'center'}
                     ]
                     
-                    rec_table = ui.table(columns=rec_columns, rows=recommendations, row_key='id').classes('w-full')
+                    rec_table = ui.table(
+                        columns=rec_columns, 
+                        rows=recommendations, 
+                        row_key='id',
+                        pagination={'rowsPerPage': 20, 'sortBy': 'created_at', 'descending': True}
+                    ).classes('w-full')
                     
                     # Add colored action badges
                     rec_table.add_slot('body-cell-action', '''
