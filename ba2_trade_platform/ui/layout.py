@@ -559,12 +559,19 @@ def layout_render(navigation_title: str):
             color: #ffffff !important;
         }
         
-        /* Hide NiceGUI documentation/help button */
+        /* Hide NiceGUI documentation/help button - aggressive selectors */
         .nicegui-documentation,
-        .q-page-sticky[style*="bottom: 0"][style*="right: 0"],
+        .q-page-sticky,
         button[title="Documentation"],
-        .q-fab[style*="right: 16px"][style*="bottom: 16px"] {
+        .q-fab,
+        .q-btn--fab,
+        [class*="q-page-sticky"],
+        div[style*="position: fixed"][style*="bottom"][style*="right"] > button,
+        div[style*="position: fixed"][style*="bottom: 0"][style*="right: 0"] {
             display: none !important;
+            visibility: hidden !important;
+            opacity: 0 !important;
+            pointer-events: none !important;
         }
         
         /* Colored buttons - ensure text is white and proper dark background blend */

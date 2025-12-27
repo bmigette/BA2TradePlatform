@@ -193,8 +193,8 @@ class RulesetTestTab:
                     
                     with ui.card().classes('flex-1 p-4'):
                         ui.label('Ruleset Description').classes('text-h6 mb-4')
-                        with ui.element('div').classes('w-full h-80 p-4 bg-grey-1 rounded border overflow-auto'):
-                            with ui.element('pre').classes('text-sm text-grey-7 whitespace-pre-wrap'):
+                        with ui.element('div').classes('w-full h-80 p-4 rounded border overflow-auto').style('background: rgba(26, 31, 46, 0.8); border-color: rgba(255, 255, 255, 0.1);'):
+                            with ui.element('pre').classes('text-sm whitespace-pre-wrap').style('color: #a0aec0;'):
                                 self.ruleset_description = ui.label('Select a ruleset to see its description.')
                 
                 # Trigger initial description load if ruleset was pre-selected
