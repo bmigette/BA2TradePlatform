@@ -1305,19 +1305,20 @@ class JobMonitoringTab:
             self._update_table_data()
     
     def _update_table_data(self):
-        """Update table with fresh data from database."""
+        """Update table with fresh data from database by recreating the table."""
         try:
             # Fetch current page data from database (true lazy loading)
             analysis_data, total_records = self._get_analysis_data()
+            self.total_records = total_records
             
             # Debug: Log has_evaluation_data values
             eval_flags = [(item['id'], item['has_evaluation_data']) for item in analysis_data]
             logger.debug(f"[_update_table_data] Setting rows with has_evaluation_data: {eval_flags}")
             
-            # Update table if it exists
-            if self.analysis_table:
-                self.analysis_table.rows = analysis_data
-                self.analysis_table.update()
+            # Clear and recreate table to ensure Vue properly renders all slots
+            self.analysis_table_container.clear()
+            with self.analysis_table_container:
+                self._create_analysis_table(analysis_data, total_records)
             
             # Update pagination controls with current state
             self._create_pagination_controls()
