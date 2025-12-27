@@ -558,6 +558,50 @@ def layout_render(navigation_title: str):
             background: rgba(37, 43, 59, 0.98) !important;
             color: #ffffff !important;
         }
+        
+        /* Hide NiceGUI documentation/help button */
+        .nicegui-documentation,
+        .q-page-sticky[style*="bottom: 0"][style*="right: 0"],
+        button[title="Documentation"],
+        .q-fab[style*="right: 16px"][style*="bottom: 16px"] {
+            display: none !important;
+        }
+        
+        /* Colored buttons - ensure text is white and proper dark background blend */
+        .q-btn[class*="bg-orange"], .q-btn.bg-orange {
+            background: rgba(255, 152, 0, 0.9) !important;
+            color: #ffffff !important;
+        }
+        .q-btn[class*="bg-orange"]:hover, .q-btn.bg-orange:hover {
+            background: rgba(255, 152, 0, 1) !important;
+        }
+        .q-btn[class*="bg-blue"], .q-btn.bg-blue {
+            background: rgba(33, 150, 243, 0.9) !important;
+            color: #ffffff !important;
+        }
+        .q-btn[class*="bg-blue"]:hover, .q-btn.bg-blue:hover {
+            background: rgba(33, 150, 243, 1) !important;
+        }
+        .q-btn[class*="bg-red"], .q-btn.bg-red {
+            background: rgba(244, 67, 54, 0.9) !important;
+            color: #ffffff !important;
+        }
+        .q-btn[class*="bg-red"]:hover, .q-btn.bg-red:hover {
+            background: rgba(244, 67, 54, 1) !important;
+        }
+        .q-btn[class*="bg-green"], .q-btn.bg-green {
+            background: rgba(76, 175, 80, 0.9) !important;
+            color: #ffffff !important;
+        }
+        .q-btn[class*="bg-green"]:hover, .q-btn.bg-green:hover {
+            background: rgba(76, 175, 80, 1) !important;
+        }
+        
+        /* Ensure button text/icons are white */
+        .q-btn .q-btn__content,
+        .q-btn .q-icon {
+            color: #ffffff !important;
+        }
     </style>
     ''')
     

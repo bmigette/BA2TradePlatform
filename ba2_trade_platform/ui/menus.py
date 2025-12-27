@@ -27,9 +27,6 @@ def sidemenu() -> None:
 def topmenu() -> None:
     """Top bar navigation actions"""
     with ui.row().classes('items-center gap-2'):
-        # Notifications button (placeholder)
-        ui.button(icon='notifications_none').props('flat round color=white size=sm').tooltip('Notifications')
-        
         # GitHub link
         with ui.link(target='https://github.com/bmigette/BA2TradePlatform').classes('max-[365px]:hidden').tooltip('GitHub'):
             svg.github().classes('fill-white scale-125 m-1')
