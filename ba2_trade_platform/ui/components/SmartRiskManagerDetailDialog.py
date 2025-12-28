@@ -47,7 +47,7 @@ class SmartRiskManagerDetailDialog:
                     self.header_label = ui.label('Smart Risk Manager Job Details').classes('text-xl font-bold').style('color: #e2e8f0;')
                     with ui.row().classes('gap-2'):
                         # Open in new tab button
-                        self.open_url_btn = ui.button(icon='open_in_new', on_click=self._open_in_new_tab).props('flat round').tooltip('Open in new tab')
+                        self.open_url_btn = ui.button(icon='open_in_new').props('flat round').tooltip('Open in new tab')
                         # Close button
                         ui.button(icon='close', on_click=self.close).props('flat round').tooltip('Close')
                 
@@ -55,10 +55,12 @@ class SmartRiskManagerDetailDialog:
                 with ui.scroll_area().classes('flex-grow w-full'):
                     self.content_container = ui.column().classes('w-full p-4')
     
-    def _open_in_new_tab(self):
-        """Open the current job in a new browser tab."""
+    def _update_open_button(self):
+        """Update the open button to link to the current job."""
         if self.current_job_id:
-            ui.run_javascript(f"window.open('/smartriskmanagerdetail/{self.current_job_id}', '_blank')")
+            # Add JavaScript onclick directly to the button element
+            self.open_url_btn._props['onclick'] = f"window.open('/smartriskmanagerdetail/{self.current_job_id}', '_blank')"
+            self.open_url_btn.update()
     
     def open(self, job_id: int):
         """
@@ -68,6 +70,7 @@ class SmartRiskManagerDetailDialog:
             job_id: The ID of the SmartRiskManagerJob to display
         """
         self.current_job_id = job_id
+        self._update_open_button()
         self._load_content(job_id)
         self.dialog.open()
     

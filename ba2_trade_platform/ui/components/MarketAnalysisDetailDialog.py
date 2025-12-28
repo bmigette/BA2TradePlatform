@@ -51,7 +51,7 @@ class MarketAnalysisDetailDialog:
                     self.header_label = ui.label('Market Analysis Details').classes('text-xl font-bold').style('color: #e2e8f0;')
                     with ui.row().classes('gap-2'):
                         # Open in new tab button
-                        self.open_url_btn = ui.button(icon='open_in_new', on_click=self._open_in_new_tab).props('flat round').tooltip('Open in new tab')
+                        self.open_url_btn = ui.button(icon='open_in_new').props('flat round').tooltip('Open in new tab')
                         # Close button
                         ui.button(icon='close', on_click=self.close).props('flat round').tooltip('Close')
                 
@@ -59,10 +59,12 @@ class MarketAnalysisDetailDialog:
                 with ui.scroll_area().classes('flex-grow w-full'):
                     self.content_container = ui.column().classes('w-full p-4')
     
-    def _open_in_new_tab(self):
-        """Open the current analysis in a new browser tab."""
+    def _update_open_button(self):
+        """Update the open button to link to the current analysis."""
         if self.current_analysis_id:
-            ui.run_javascript(f"window.open('/market_analysis/{self.current_analysis_id}', '_blank')")
+            # Add JavaScript onclick directly to the button element
+            self.open_url_btn._props['onclick'] = f"window.open('/market_analysis/{self.current_analysis_id}', '_blank')"
+            self.open_url_btn.update()
     
     def open(self, analysis_id: int):
         """
@@ -72,6 +74,7 @@ class MarketAnalysisDetailDialog:
             analysis_id: The ID of the MarketAnalysis to display
         """
         self.current_analysis_id = analysis_id
+        self._update_open_button()
         self._load_content(analysis_id)
         self.dialog.open()
     
