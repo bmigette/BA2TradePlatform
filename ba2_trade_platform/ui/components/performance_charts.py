@@ -334,9 +334,9 @@ class PerformanceTable:
             ui.label("No data available").classes('text-center p-4').style('color: #a0aec0;')
             return
         
-        # Create table
+        # Create table with sortable columns
         table_data = {
-            'columns': [{'name': col, 'label': col, 'field': col, 'align': 'left'} 
+            'columns': [{'name': col, 'label': col, 'field': col, 'align': 'left', 'sortable': True} 
                        for col in self.columns],
             'rows': self.rows
         }

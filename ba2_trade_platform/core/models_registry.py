@@ -482,6 +482,19 @@ MODELS: Dict[str, Dict[str, Any]] = {
     # =========================================================================
     # Google Gemini Family
     # =========================================================================
+    "gemini_3_flash": {
+        "native_provider": PROVIDER_GOOGLE,
+        "display_name": "Gemini 3 Flash Preview",
+        "description": "Fast Gemini 3 variant with advanced reasoning",
+        "provider_names": {
+            PROVIDER_GOOGLE: "gemini-3-flash-preview",
+            PROVIDER_NAGAAI: "gemini-3-flash-preview",
+            PROVIDER_OPENROUTER: "google/gemini-3-flash-preview",
+        },
+        "labels": [LABEL_LOW_COST, LABEL_THINKING, LABEL_FAST, LABEL_VISION, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "supports_parameters": ["reasoning_effort"],
+        "default_parameters": {"reasoning_effort": "medium"},
+    },
     "gemini_3_pro": {
         "native_provider": PROVIDER_GOOGLE,
         "display_name": "Gemini 3 Pro Preview",

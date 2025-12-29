@@ -146,8 +146,8 @@ class PerformanceTab:
                 'wins': wins,
                 'losses': losses,
                 'profit_factor': calculate_profit_factor(winning_pnls, losing_pnls),
-                'largest_win': max(pnls) if pnls else 0,
-                'largest_loss': min(pnls) if pnls else 0,
+                'largest_win': max(winning_pnls) if winning_pnls else None,
+                'largest_loss': min(losing_pnls) if losing_pnls else None,
                 'sharpe_ratio': calculate_sharpe_ratio(returns) if len(returns) >= 30 else None,
                 'transactions': txns,
                 'returns': returns
@@ -370,8 +370,8 @@ class PerformanceTab:
                 'Avg P&L': f"${metrics['avg_pnl']:,.2f}",
                 'Win Rate': f"{metrics['win_rate']:.1f}%",
                 'Profit Factor': f"{metrics['profit_factor']:.2f}" if metrics['profit_factor'] is not None else 'N/A',
-                'Largest Win': f"${metrics['largest_win']:,.2f}",
-                'Largest Loss': f"${metrics['largest_loss']:,.2f}",
+                'Largest Win': f"${metrics['largest_win']:,.2f}" if metrics['largest_win'] is not None else 'N/A',
+                'Largest Loss': f"${metrics['largest_loss']:,.2f}" if metrics['largest_loss'] is not None else 'N/A',
                 'Sharpe Ratio': f"{metrics['sharpe_ratio']:.2f}" if metrics['sharpe_ratio'] is not None else 'N/A'
             })
         

@@ -110,6 +110,9 @@ def build_model_name_mapping():
         "gemini-2.0-flash": "gemini_2.0_flash",
         "gemini-2.5-pro": "gemini_2.5_pro",
         "gemini-2.5-flash": "gemini_2.5_flash",
+        "gemini-3-flash-preview": "gemini_3_flash",
+        "gemini-3-flash": "gemini_3_flash",
+        "gemini3_flash": "gemini_3_flash",  # Handle variant without underscore
         "gemini-3-pro-preview": "gemini_3_pro",
         "gemini-3-pro": "gemini_3_pro",
         "gemini3_pro": "gemini_3_pro",  # Handle variant without underscore

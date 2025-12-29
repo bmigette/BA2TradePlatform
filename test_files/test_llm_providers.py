@@ -88,7 +88,7 @@ def get_test_model_for_provider(provider: str) -> Optional[str]:
     preferred_models = {
         PROVIDER_OPENAI: ["gpt4o_mini", "gpt4o", "gpt5_mini"],
         PROVIDER_NAGAAI: ["gpt4o_mini", "grok3_mini", "gpt5_mini"],
-        PROVIDER_GOOGLE: ["gemini_2.0_flash", "gemini_2.5_flash"],
+        PROVIDER_GOOGLE: ["gemini_3_flash", "gemini_2.0_flash", "gemini_2.5_flash"],
         PROVIDER_ANTHROPIC: ["claude_3.5_haiku", "claude_3.5_sonnet"],
         PROVIDER_XAI: ["grok3_mini", "grok4_fast"],
         PROVIDER_DEEPSEEK: ["deepseek_chat", "deepseek_coder"],

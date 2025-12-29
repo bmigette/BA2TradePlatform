@@ -118,6 +118,7 @@ RAW_MODEL_NAME_MAPPING = {
     "kimi-k2-0711-thinking-preview": "kimi_k2_thinking",
     "kimi-k2-0711-preview": "kimi_k2",
     # Gemini
+    "gemini-3-flash-preview": "gemini_3_flash",
     "gemini-3-pro-preview": "gemini_3_pro",
     "gemini-2.0-flash": "gemini_2.0_flash",
     "gemini-2.5-flash": "gemini_2.5_flash",
