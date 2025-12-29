@@ -172,7 +172,7 @@ p, span, div, label, h1, h2, h3, h4, h5, h6, li, td, th, a {
 .q-field textarea,
 .q-field .q-field__prefix,
 .q-field .q-field__suffix {
-    color: #ffffff !important;
+    color: #e2e8f0 !important;
 }
 .q-field .q-field__label {
     color: #a0aec0 !important;
@@ -192,6 +192,30 @@ p, span, div, label, h1, h2, h3, h4, h5, h6, li, td, th, a {
 .q-field .q-field__native::placeholder {
     color: rgba(160, 174, 192, 0.6) !important;
     opacity: 1 !important;
+}
+
+/* Better label positioning when input has a value or is focused */
+.q-field--focused .q-field__label,
+.q-field--filled .q-field__label,
+.q-field--highlighted .q-field__label,
+.q-field--float .q-field__label {
+    transform: translateY(-60%) scale(0.75) !important;
+    background: #1a1f2e !important;
+    padding: 0 4px !important;
+    z-index: 10 !important;
+}
+
+/* Ensure label doesn't get lost when field is filled */
+.q-field__control::before {
+    border-color: rgba(160, 174, 192, 0.3) !important;
+}
+
+/* Stack label variant - keep label above field always */
+.q-field--stack-label .q-field__label {
+    position: static !important;
+    transform: none !important;
+    margin-bottom: 4px !important;
+    background: transparent !important;
 }
 
 /* Select/Dropdown */
@@ -538,7 +562,42 @@ p, span, div, label, h1, h2, h3, h4, h5, h6, li, td, th, a {
 .q-checkbox__label,
 .q-radio__label,
 .q-toggle__label {
-    color: #ffffff !important;
+    color: #e2e8f0 !important;
+}
+
+/* Checkbox inner elements - proper dark theme styling */
+.q-checkbox__bg,
+.q-radio__bg,
+.q-toggle__track {
+    border-color: rgba(160, 174, 192, 0.5) !important;
+}
+
+.q-checkbox__svg,
+.q-radio__check,
+.q-toggle__thumb {
+    color: #00d4aa !important;
+}
+
+/* Checkbox checked state */
+.q-checkbox--truthy .q-checkbox__bg,
+.q-radio--truthy .q-radio__bg,
+.q-toggle--truthy .q-toggle__track {
+    background: rgba(0, 212, 170, 0.3) !important;
+    border-color: #00d4aa !important;
+}
+
+/* Checkbox hover states */
+.q-checkbox:hover .q-checkbox__bg,
+.q-radio:hover .q-radio__bg,
+.q-toggle:hover .q-toggle__track {
+    border-color: #00d4aa !important;
+}
+
+/* Ensure checkbox inner container is visible */
+.q-checkbox__inner,
+.q-radio__inner,
+.q-toggle__inner {
+    color: #e2e8f0 !important;
 }
 
 /* List items */

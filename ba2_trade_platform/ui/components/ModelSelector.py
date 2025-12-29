@@ -272,7 +272,7 @@ class ModelSelector:
                 self.search_input = ui.input(
                     label='Search models',
                     placeholder='Enter model name...'
-                ).classes('flex-1')
+                ).classes('flex-1').style('color: #e2e8f0;')
                 self.search_input.bind_value(self, 'search_filter')
                 self.search_input.on('update:model-value', lambda: self._on_search_change())
                 
@@ -287,7 +287,7 @@ class ModelSelector:
                     options={v: l for v, l in zip(provider_values, provider_options)},
                     label='Filter by Provider',
                     value='All'
-                ).bind_value(self, 'provider_filter').classes('w-48')
+                ).bind_value(self, 'provider_filter').classes('w-48').style('color: #e2e8f0;')
                 self.provider_select.on('update:model-value', lambda: self._on_provider_filter_change())
             
             # Label filter row
@@ -299,7 +299,7 @@ class ModelSelector:
                             cb = ui.checkbox(
                                 label_info.get("display", label),
                                 on_change=lambda e, l=label: self._on_label_filter_change(l, e.value)
-                            )
+                            ).style('color: #e2e8f0;')
                             self.label_checkboxes[label] = cb
             
             # Models table
@@ -375,14 +375,14 @@ class ModelSelector:
             with ui.row().classes('w-full gap-4 items-end'):
                 # Selected model display
                 with ui.column().classes('flex-1'):
-                    ui.label('Selected Model:').classes('text-caption')
+                    ui.label('Selected Model:').classes('text-caption').style('color: #a0aec0;')
                     # Show current model name if already selected
                     initial_display = 'None selected'
                     if self.selected_model:
                         model_info = MODELS.get(self.selected_model)
                         if model_info:
                             initial_display = model_info.get("display_name", self.selected_model)
-                    self.selected_display = ui.label(initial_display).classes('text-body1')
+                    self.selected_display = ui.label(initial_display).classes('text-body1').style('color: #e2e8f0;')
                 
                 # Provider selection for the model
                 # Build initial options based on currently selected model (if any)
@@ -413,13 +413,13 @@ class ModelSelector:
                         self.on_selection_change(result)
                 
                 with ui.column().classes('w-48'):
-                    ui.label('Use Provider:').classes('text-caption')
+                    ui.label('Use Provider:').classes('text-caption').style('color: #a0aec0;')
                     # Create dropdown WITHOUT bind_value first, then bind after
                     self.provider_dropdown = ui.select(
                         options=initial_options,
                         value=dropdown_value,
                         label=''
-                    ).classes('w-full')
+                    ).classes('w-full').style('color: #e2e8f0;')
                     # Now sync the property and set up binding
                     self.selected_provider = dropdown_value
                     self.provider_dropdown.bind_value(self, 'selected_provider')
@@ -427,12 +427,12 @@ class ModelSelector:
             
             # Result display
             with ui.row().classes('w-full mt-4 items-center'):
-                ui.label('Result:').classes('text-caption mr-2')
+                ui.label('Result:').classes('text-caption mr-2').style('color: #a0aec0;')
                 # Show current result if model is already selected
                 initial_result = ''
                 if self.selected_model:
                     initial_result = self.get_selected_model() or ''
-                self.result_display = ui.label(initial_result).classes('text-body1 font-mono bg-grey-2 px-2 py-1 rounded')
+                self.result_display = ui.label(initial_result).classes('text-body1 font-mono px-2 py-1 rounded').style('background: rgba(30, 41, 59, 0.7); color: #e2e8f0; border: 1px solid rgba(160, 174, 192, 0.2);')
         
         logger.debug('ModelSelector component rendered')
     
