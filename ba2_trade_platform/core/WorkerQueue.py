@@ -988,9 +988,52 @@ class WorkerQueue:
                 task.status = WorkerTaskStatus.FAILED
                 task.error = e
                 task.completed_at = time.time()
+            
+            # Get detailed task information for error reporting
+            expert_info = "Unknown"
+            model_info = "Unknown"
+            account_id = "Unknown"
+            try:
+                expert_instance_record = get_instance(ExpertInstance, task.expert_instance_id)
+                if expert_instance_record:
+                    expert_name = expert_instance_record.expert
+                    expert_alias = expert_instance_record.alias or f"{expert_name}-{task.expert_instance_id}"
+                    expert_info = f"{expert_alias} (ID: {task.expert_instance_id}, Type: {expert_name})"
+                    account_id = expert_instance_record.account_id
+                    
+                    # Try to get model information from settings
+                    if hasattr(expert_instance_record, 'settings') and expert_instance_record.settings:
+                        settings = expert_instance_record.settings
+                        if isinstance(settings, str):
+                            import json
+                            try:
+                                settings = json.loads(settings)
+                            except:
+                                pass
+                        
+                        if isinstance(settings, dict):
+                            # Try different possible keys for model information
+                            model_info = (
+                                settings.get('quick_think_llm') or 
+                                settings.get('deep_think_llm') or 
+                                settings.get('model') or 
+                                settings.get('llm_model') or
+                                "Not specified"
+                            )
+            except:
+                pass  # Don't fail error logging if we can't get expert details
                 
             execution_time = task.completed_at - task.started_at
-            logger.error(f"Analysis task '{task.id}' failed after {execution_time:.2f}s: {e}", exc_info=True)
+            logger.error(
+                f"Analysis task '{task.id}' failed after {execution_time:.2f}s\n"
+                f"  Symbol: {task.symbol}\n"
+                f"  Expert: {expert_info}\n"
+                f"  Account ID: {account_id}\n"
+                f"  Analysis Type: {task.subtype}\n"
+                f"  Model: {model_info}\n"
+                f"  Error: {e}",
+                exc_info=True
+            )
         
         finally:
             # Handle batch completion logging if this task belongs to a batch
