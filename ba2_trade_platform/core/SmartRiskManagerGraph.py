@@ -3618,6 +3618,46 @@ class SmartRiskManagerGraph:
         
         @tool
         @smart_risk_manager_tool
+        def get_positions_tool() -> Dict[str, Any]:
+            """Get current portfolio positions in structured JSON format.
+            
+            Use this tool when you need to:
+            - Look up transaction IDs for specific symbols
+            - Get exact position quantities and prices
+            - Check current TP/SL levels for positions
+            - Verify position details before taking action
+            
+            Returns:
+                Dictionary with:
+                    - account_virtual_equity: Total portfolio value
+                    - account_available_balance: Cash available for new positions
+                    - filled_positions: List of open positions
+                    - pending_positions: List of pending positions
+            """
+            portfolio = self.toolkit.get_portfolio_status()
+            return {
+                "account_virtual_equity": portfolio["account_virtual_equity"],
+                "account_available_balance": portfolio["account_available_balance"],
+                "filled_positions": portfolio["open_positions"],
+                "pending_positions": portfolio.get("pending_positions", [])
+            }
+        
+        @tool
+        @smart_risk_manager_tool
+        def get_trade_summary_by_symbol_tool() -> str:
+            """Get aggregated buy/sell quantities per symbol across ALL experts on the account.
+            
+            Use this tool to:
+            - Check overall market exposure (long vs short bias)
+            - Identify excessive one-directional positions when hedging is disabled
+            - Understand the full portfolio composition
+            
+            Returns a formatted table showing total buy/sell quantities for each symbol.
+            """
+            return self.toolkit.get_trade_summary_by_symbol()
+        
+        @tool
+        @smart_risk_manager_tool
         def get_current_price_tool(
             symbol: Annotated[str, "Instrument symbol"]
         ) -> float:
@@ -4217,33 +4257,33 @@ def run_smart_risk_manager(expert_instance_id: int, account_id: int, job_id: int
     langchain.debug = False
     langchain.verbose = False
     
+    # Initialize state early so it's available in exception handler
+    initial_state = {
+        "expert_instance_id": expert_instance_id,
+        "account_id": account_id,
+        "user_instructions": "",
+        "expert_settings": {},
+        "risk_manager_model": "",
+        "backend_url": "",
+        "api_key": "",
+        "job_id": job_id or 0,
+        "portfolio_status": {},
+        "open_positions": [],
+        "recent_analyses": [],
+        "detailed_outputs_cache": {},
+        "messages": [],
+        "research_messages": [],
+        "agent_scratchpad": "",
+        "research_complete": False,
+        "recommended_actions": [],
+        "actions_log": [],
+        "iteration_count": 0,
+        "max_iterations": 10
+    }
+    
     try:
         # Build graph
         graph = build_smart_risk_manager_graph(expert_instance_id, account_id)
-        
-        # Initialize state
-        initial_state = {
-            "expert_instance_id": expert_instance_id,
-            "account_id": account_id,
-            "user_instructions": "",  # Will be loaded in initialize_context
-            "expert_settings": {},  # Will be loaded in initialize_context
-            "risk_manager_model": "",  # Will be loaded in initialize_context
-            "backend_url": "",  # Will be loaded in initialize_context
-            "api_key": "",  # Will be loaded in initialize_context
-            "job_id": job_id or 0,  # Use provided job_id or create in initialize_context
-            "portfolio_status": {},
-            "open_positions": [],
-            "recent_analyses": [],
-            "detailed_outputs_cache": {},
-            "messages": [],
-            "research_messages": [],  # Research node's isolated conversation
-            "agent_scratchpad": "",
-            "research_complete": False,  # Flag set by finish_research_tool
-            "recommended_actions": [],  # Actions recommended by research node
-            "actions_log": [],
-            "iteration_count": 0,
-            "max_iterations": 10
-        }
         
         # Run graph with stdout/stderr suppression to prevent LangChain's "AI:" and "Tool:" noise
         # Our custom logger will still output properly since it writes directly to log files
@@ -4269,7 +4309,39 @@ def run_smart_risk_manager(expert_instance_id: int, account_id: int, job_id: int
         langchain.debug = False
         langchain.verbose = False
         
-        logger.error(f"Error running Smart Risk Manager: {e}", exc_info=True)
+        # Get expert and model info for error logging
+        expert_info = f"Expert {expert_instance_id}"
+        model_info = "Unknown model"
+        try:
+            from .models import ExpertInstance
+            expert_instance = get_instance(ExpertInstance, expert_instance_id)
+            if expert_instance:
+                expert_name = expert_instance.expert
+                expert_alias = expert_instance.alias or f"{expert_name}-{expert_instance_id}"
+                expert_info = f"{expert_alias} (ID: {expert_instance_id})"
+                
+                # Get model from settings
+                if hasattr(expert_instance, 'settings') and expert_instance.settings:
+                    settings = expert_instance.settings
+                    if isinstance(settings, str):
+                        import json
+                        try:
+                            settings = json.loads(settings)
+                        except:
+                            pass
+                    
+                    if isinstance(settings, dict):
+                        model_info = settings.get('risk_manager_model', 'Unknown model')
+        except:
+            pass
+        
+        logger.error(
+            f"Error running Smart Risk Manager\n"
+            f"  Expert: {expert_info}\n"
+            f"  Model: {model_info}\n"
+            f"  Error: {e}",
+            exc_info=True
+        )
         
         # Try to mark job as FAILED in database if job was created
         job_id = None

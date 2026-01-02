@@ -690,3 +690,44 @@ class PersistedQueueTask(SQLModel, table=True):
     
     # Metadata for restoration
     queue_counter: int = Field(default=0, description="Original queue counter for ordering restoration")
+
+
+class LLMUsageLog(SQLModel, table=True):
+    """
+    Tracks token usage for all LLM API calls across the platform.
+    Captures usage from LangChain, data providers, smart risk manager, etc.
+    """
+    __tablename__ = "llmusagelog"
+    
+    # Primary Key
+    id: int | None = Field(default=None, primary_key=True)
+    
+    # Context
+    expert_instance_id: int | None = Field(default=None, foreign_key="expertinstance.id", index=True, nullable=True, ondelete="SET NULL")
+    account_id: int | None = Field(default=None, foreign_key="accountdefinition.id", index=True, nullable=True, ondelete="SET NULL")
+    use_case: str = Field(index=True, description="Use case: Market Analysis, Smart Risk Manager, Data Provider, Dynamic Instrument Selection, etc.")
+    
+    # Model Information
+    model_selection: str = Field(description="Full model selection string (e.g., 'openai/gpt4o', 'xai/grok4_fast')")
+    provider: str = Field(index=True, description="Provider name (openai, xai, google, etc.)")
+    provider_model_name: str = Field(description="Native provider model name (e.g., 'gpt-4o-2024-08-06', 'grok-4-fast-reasoning')")
+    
+    # Token Usage
+    input_tokens: int = Field(default=0, description="Number of input tokens")
+    output_tokens: int = Field(default=0, description="Number of output tokens")
+    total_tokens: int = Field(default=0, description="Total tokens (input + output)")
+    
+    # Cost (optional - calculated if pricing available)
+    estimated_cost_usd: float | None = Field(default=None, description="Estimated cost in USD based on current pricing")
+    
+    # Timing
+    timestamp: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True, description="When the API call was made")
+    duration_ms: int | None = Field(default=None, description="Duration of the API call in milliseconds")
+    
+    # Additional Context (optional)
+    symbol: str | None = Field(default=None, index=True, description="Associated trading symbol if applicable")
+    market_analysis_id: int | None = Field(default=None, foreign_key="marketanalysis.id", nullable=True, ondelete="SET NULL")
+    smart_risk_manager_job_id: int | None = Field(default=None, foreign_key="smartriskmanagerjob.id", nullable=True, ondelete="SET NULL")
+    
+    # Error tracking
+    error: str | None = Field(default=None, description="Error message if the call failed")

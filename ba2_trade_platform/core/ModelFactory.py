@@ -82,6 +82,14 @@ class ModelFactory:
         streaming: Optional[bool] = None,
         callbacks: Optional[List[BaseCallbackHandler]] = None,
         model_kwargs: Optional[Dict[str, Any]] = None,
+        # Token usage tracking parameters
+        track_usage: bool = True,
+        use_case: str = "LangChain LLM Call",
+        expert_instance_id: Optional[int] = None,
+        account_id: Optional[int] = None,
+        symbol: Optional[str] = None,
+        market_analysis_id: Optional[int] = None,
+        smart_risk_manager_job_id: Optional[int] = None,
         **extra_kwargs
     ) -> BaseChatModel:
         """
@@ -94,6 +102,13 @@ class ModelFactory:
             streaming: Enable streaming (default from config.OPENAI_ENABLE_STREAMING)
             callbacks: Optional list of LangChain callbacks
             model_kwargs: Optional additional model parameters (e.g., {"reasoning_effort": "low"})
+            track_usage: Enable automatic token usage tracking (default True)
+            use_case: Description of the use case for usage tracking
+            expert_instance_id: Expert instance ID for usage tracking
+            account_id: Account ID for usage tracking
+            symbol: Trading symbol for usage tracking
+            market_analysis_id: Market analysis ID for usage tracking
+            smart_risk_manager_job_id: Smart risk manager job ID for usage tracking
             **extra_kwargs: Additional kwargs passed to the LLM constructor
             
         Returns:
@@ -149,6 +164,28 @@ class ModelFactory:
         # Determine streaming setting
         if streaming is None:
             streaming = OPENAI_ENABLE_STREAMING
+        
+        # Add usage tracking callback if enabled
+        if track_usage:
+            from .LLMUsageTracker import create_usage_callback
+            
+            usage_callback = create_usage_callback(
+                model_selection=model_selection,
+                use_case=use_case,
+                expert_instance_id=expert_instance_id,
+                account_id=account_id,
+                symbol=symbol,
+                market_analysis_id=market_analysis_id,
+                smart_risk_manager_job_id=smart_risk_manager_job_id
+            )
+            
+            # Add to callbacks list
+            if callbacks is None:
+                callbacks = [usage_callback]
+            else:
+                callbacks = list(callbacks) + [usage_callback]
+            
+            logger.debug(f"Added usage tracking callback for {model_selection}")
         
         # Check if model supports temperature (O-series models don't)
         supports_temp = not model_info.get("no_temperature", False)

@@ -19,6 +19,7 @@ from ..components import ProfitPerExpertChart, InstrumentDistributionChart, Bala
 from ..components.FloatingPLPerExpertWidget import FloatingPLPerExpertWidget
 from ..components.FloatingPLPerAccountWidget import FloatingPLPerAccountWidget
 from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
+from .llm_usage import LLMUsagePage
 
 class OverviewTab:
     def __init__(self, tabs_ref=None):
@@ -4685,7 +4686,8 @@ def content() -> None:
     tab_config = [
         ('overview', 'Overview'),
         ('account', 'Account Overview'),
-        ('performance', 'Performance')
+        ('performance', 'Performance'),
+        ('llmusage', 'LLM Usage')
     ]
     
     with ui.tabs() as tabs:
@@ -4701,6 +4703,9 @@ def content() -> None:
             AccountOverviewTab()
         with ui.tab_panel(tab_objects['performance']):
             PerformanceTab()
+        with ui.tab_panel(tab_objects['llmusage']):
+            llm_usage_page = LLMUsagePage()
+            llm_usage_page.render()
     
     # Setup HTML5 history navigation for tabs (NiceGUI 3.0 compatible)
     async def setup_tab_navigation():
@@ -4716,7 +4721,8 @@ def content() -> None:
                 const labelToName = {
                     'Overview': 'overview',
                     'Account Overview': 'account',
-                    'Performance': 'performance'
+                    'Performance': 'performance',
+                    'LLM Usage': 'llmusage'
                 };
                 
                 // Get tab name from tab element

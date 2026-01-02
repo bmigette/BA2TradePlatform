@@ -989,6 +989,13 @@ class WorkerQueue:
                 task.error = e
                 task.completed_at = time.time()
             
+            # Check if this is a network error that was already retried
+            error_str = str(e).lower()
+            is_network_error = any(keyword in error_str for keyword in [
+                'connection', 'timeout', 'incomplete chunked read', 
+                'peer closed', 'remote protocol error', 'network'
+            ])
+            
             # Get detailed task information for error reporting
             expert_info = "Unknown"
             model_info = "Unknown"
@@ -1024,8 +1031,9 @@ class WorkerQueue:
                 pass  # Don't fail error logging if we can't get expert details
                 
             execution_time = task.completed_at - task.started_at
+            retry_note = " (Transient network error - LLM retries were attempted)" if is_network_error else ""
             logger.error(
-                f"Analysis task '{task.id}' failed after {execution_time:.2f}s\n"
+                f"Analysis task '{task.id}' failed after {execution_time:.2f}s{retry_note}\n"
                 f"  Symbol: {task.symbol}\n"
                 f"  Expert: {expert_info}\n"
                 f"  Account ID: {account_id}\n"
@@ -1339,9 +1347,8 @@ class WorkerQueue:
                 pending_tasks = []
                 with self._task_lock:
                     for task in self._tasks.values():
-                        if (task.expert_instance_id == expert_instance_id and
-                            task.subtype == use_case and
-                            task.status in [WorkerTaskStatus.PENDING, WorkerTaskStatus.RUNNING]):
+                        # Only check AnalysisTask objects which have subtype attribute
+                        if isinstance(task, AnalysisTask) and task.expert_instance_id == expert_instance_id and task.subtype == use_case and task.status in [WorkerTaskStatus.PENDING, WorkerTaskStatus.RUNNING]:
                             has_pending = True
                             pending_tasks.append((task.id, task.symbol, task.status))
                 

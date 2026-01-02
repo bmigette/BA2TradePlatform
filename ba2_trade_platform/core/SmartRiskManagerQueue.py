@@ -504,8 +504,41 @@ class SmartRiskManagerQueue:
                 task.error = e
                 task.completed_at = time.time()
             
+            # Get expert and model info for error logging
+            expert_info = f"Expert {task.expert_instance_id}"
+            model_info = "Unknown model"
+            try:
+                from .models import ExpertInstance
+                from .db import get_instance
+                expert_instance = get_instance(ExpertInstance, task.expert_instance_id)
+                if expert_instance:
+                    expert_name = expert_instance.expert
+                    expert_alias = expert_instance.alias or f"{expert_name}-{task.expert_instance_id}"
+                    expert_info = f"{expert_alias} (ID: {task.expert_instance_id})"
+                    
+                    # Get model from settings
+                    if hasattr(expert_instance, 'settings') and expert_instance.settings:
+                        settings = expert_instance.settings
+                        if isinstance(settings, str):
+                            import json
+                            try:
+                                settings = json.loads(settings)
+                            except:
+                                pass
+                        
+                        if isinstance(settings, dict):
+                            model_info = settings.get('risk_manager_model', 'Unknown model')
+            except:
+                pass
+            
             execution_time = task.completed_at - task.started_at if task.started_at else 0
-            logger.error(f"{worker_name} task {task.id} failed after {execution_time:.2f}s: {e}", exc_info=True)
+            logger.error(
+                f"{worker_name} task {task.id} failed after {execution_time:.2f}s\n"
+                f"  Expert: {expert_info}\n"
+                f"  Model: {model_info}\n"
+                f"  Error: {e}",
+                exc_info=True
+            )
         
         finally:
             # Clean up task key mapping for completed/failed tasks

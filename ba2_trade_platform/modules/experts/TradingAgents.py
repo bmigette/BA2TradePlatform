@@ -703,7 +703,15 @@ Analysis completed at: {self._get_current_timestamp()}"""
             self._notify_trade_manager(recommendation_id, symbol)
 
         except Exception as e:
-            self.logger.error(f"[FAILED] TradingAgents analysis failed for {symbol}: {e}", exc_info=True)
+            # Check if this is a network error that was already retried
+            error_str = str(e).lower()
+            is_network_error = any(keyword in error_str for keyword in [
+                'connection', 'timeout', 'incomplete chunked read', 
+                'peer closed', 'remote protocol error', 'network'
+            ])
+            retry_note = " (Transient network error - LLM retries were attempted)" if is_network_error else ""
+            
+            self.logger.error(f"[FAILED] TradingAgents analysis failed for {symbol}: {e}{retry_note}", exc_info=True)
             self._handle_analysis_error(market_analysis, symbol, str(e))
             raise
     
