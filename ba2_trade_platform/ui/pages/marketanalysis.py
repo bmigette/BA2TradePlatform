@@ -2692,36 +2692,36 @@ class ScheduledJobsTab:
                     with ui.element('thead'):
                         with ui.element('tr'):
                             # Time column header
-                            with ui.element('th').classes('border border-gray-300 bg-gray-100 p-2 text-left font-bold text-sm sticky left-0 z-10'):
+                            with ui.element('th').classes('border border-gray-700 bg-gray-800 p-2 text-left font-bold text-sm sticky left-0 z-10'):
                                 ui.label('Time').classes('text-sm')
                             
                             # Day column headers
                             for day_idx, day_name in enumerate(weekdays):
                                 date = start_of_week + timedelta(days=day_idx)
                                 is_today = date.date() == today.date()
-                                header_class = 'border border-gray-300 bg-gray-100 p-2 text-center font-bold text-sm'
+                                header_class = 'border border-gray-700 bg-gray-800 p-2 text-center font-bold text-sm'
                                 if is_today:
-                                    header_class += ' bg-blue-100'
+                                    header_class += ' bg-blue-900'
                                 
                                 with ui.element('th').classes(header_class):
-                                    ui.label(day_name).classes(f'{"text-blue-600" if is_today else ""}')
-                                    ui.label(date.strftime('%m/%d')).classes('text-xs text-gray-500 block')
+                                    ui.label(day_name).classes(f'{"text-blue-400" if is_today else ""}')
+                                    ui.label(date.strftime('%m/%d')).classes('text-xs text-gray-400 block')
                     
                     # Body rows with time slots
                     with ui.element('tbody'):
                         for time_str in sorted_times:
                             with ui.element('tr'):
                                 # Time label
-                                with ui.element('td').classes('border border-gray-300 bg-gray-50 p-2 text-sm font-medium sticky left-0 z-10'):
+                                with ui.element('td').classes('border border-gray-700 bg-gray-800 p-2 text-sm font-medium sticky left-0 z-10'):
                                     ui.label(time_str)
                                 
                                 # Day cells
                                 for day_idx in range(7):
                                     date = start_of_week + timedelta(days=day_idx)
                                     is_today = date.date() == today.date()
-                                    cell_class = 'border border-gray-300 p-2 text-center'
+                                    cell_class = 'border border-gray-700 p-2 text-center bg-gray-900'
                                     if is_today:
-                                        cell_class += ' bg-blue-50'
+                                        cell_class += ' bg-blue-950'
                                     
                                     with ui.element('td').classes(cell_class):
                                         # Collect experts scheduled at this time on this day (filter hidden)
@@ -2764,15 +2764,15 @@ class ScheduledJobsTab:
             
             # Legend
             with ui.row().classes('w-full mt-3 gap-4 flex-wrap'):
-                ui.label('Legend:').classes('text-xs font-bold text-gray-600')
+                ui.label('Legend:').classes('text-xs font-bold text-gray-400')
                 with ui.row().classes('gap-1 items-center'):
-                    ui.label('EM = Enter Market').classes('text-xs text-gray-600')
+                    ui.label('EM = Enter Market').classes('text-xs text-gray-400')
                 with ui.row().classes('gap-1 items-center'):
-                    ui.label('OP = Open Positions').classes('text-xs text-gray-600')
+                    ui.label('OP = Open Positions').classes('text-xs text-gray-400')
                 
                 # Expert color legend (clickable to show/hide)
-                ui.label('|').classes('text-xs text-gray-400 mx-1')
-                ui.label('Experts (click to show/hide):').classes('text-xs font-bold text-gray-600')
+                ui.label('|').classes('text-xs text-gray-600 mx-1')
+                ui.label('Experts (click to show/hide):').classes('text-xs font-bold text-gray-400')
                 
                 def toggle_expert(expert_id):
                     """Toggle expert visibility."""
@@ -2787,12 +2787,12 @@ class ScheduledJobsTab:
                 
                 for expert_id, expert_data in expert_schedules.items():
                     is_hidden = expert_id in self.hidden_experts
-                    with ui.row().classes('gap-1 items-center cursor-pointer hover:bg-gray-100 px-2 py-1 rounded').on('click', lambda e, eid=expert_id: toggle_expert(eid)):
+                    with ui.row().classes('gap-1 items-center cursor-pointer hover:bg-gray-800 px-2 py-1 rounded').on('click', lambda e, eid=expert_id: toggle_expert(eid)):
                         # Color dot with opacity based on visibility
                         opacity = '0.3' if is_hidden else '1.0'
                         ui.html(f'<div style="width: 12px; height: 12px; border-radius: 50%; background-color: {expert_data["color"]}; opacity: {opacity};"></div>', sanitize=False)
                         # Expert name with strikethrough if hidden
-                        text_class = 'text-xs text-gray-400 line-through' if is_hidden else 'text-xs text-gray-600'
+                        text_class = 'text-xs text-gray-600 line-through' if is_hidden else 'text-xs text-gray-300'
                         ui.label(expert_data['name']).classes(text_class)
 
     def _get_expert_filter_options(self) -> dict:

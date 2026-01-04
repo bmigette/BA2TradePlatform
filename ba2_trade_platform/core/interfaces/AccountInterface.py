@@ -2694,8 +2694,14 @@ class AccountInterface(ExtendableSettingsInterface):
                                         existing_close_order.status = OrderStatus.CANCELED
                                         session.add(existing_close_order)
                                         
-                                        # Mark transaction as CLOSED
-                                        transaction.status = TransactionStatus.CLOSED
+                                        # Mark transaction as CLOSED with logging
+                                        from ..utils import close_transaction_with_logging
+                                        close_transaction_with_logging(
+                                            transaction=transaction,
+                                            account_id=self.id,
+                                            close_reason="position_not_at_broker",
+                                            session=session
+                                        )
                                         session.add(transaction)
                                         session.commit()
                                         

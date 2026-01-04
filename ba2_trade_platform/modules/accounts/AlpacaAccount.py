@@ -1626,6 +1626,28 @@ class AlpacaAccount(AccountInterface):
                                 )
                                 continue
                         
+                        # CRITICAL: Before marking as CANCELED, check directly if order is FILLED at broker
+                        # Alpaca's get_orders() API has retention limits and may not return old filled orders
+                        # If the order is actually FILLED, update it instead of marking as CANCELED
+                        try:
+                            broker_order = self.get_order(db_order.broker_order_id)
+                            if broker_order and broker_order.status == OrderStatus.FILLED:
+                                logger.info(
+                                    f"Order {db_order.id} (broker_order_id={db_order.broker_order_id}) "
+                                    f"is FILLED at broker but not in get_orders() list (old order) - updating status to FILLED"
+                                )
+                                fresh_order = get_instance(TradingOrder, db_order.id)
+                                if fresh_order:
+                                    fresh_order.status = OrderStatus.FILLED
+                                    fresh_order.filled_qty = broker_order.filled_qty
+                                    if broker_order.open_price:
+                                        fresh_order.open_price = broker_order.open_price
+                                    update_instance(fresh_order)
+                                    updated_count += 1
+                                continue
+                        except Exception as check_err:
+                            logger.debug(f"Could not verify order {db_order.broker_order_id} at broker: {check_err}")
+                        
                         logger.warning(
                             f"Order {db_order.id} (broker_order_id={db_order.broker_order_id}) "
                             f"not found in Alpaca, marking as CANCELED"

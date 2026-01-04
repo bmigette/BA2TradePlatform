@@ -2609,7 +2609,13 @@ class AccountOverviewTab:
                                             select(Transaction).where(Transaction.id == txn_id)
                                         ).first()
                                         if txn and txn.status == TransactionStatus.OPENED:
-                                            txn.status = TransactionStatus.CLOSED
+                                            from ...core.utils import close_transaction_with_logging
+                                            close_transaction_with_logging(
+                                                transaction=txn,
+                                                account_id=txn.account_id if hasattr(txn, 'account_id') else 0,
+                                                close_reason="orphaned_position",
+                                                session=session
+                                            )
                                             session.add(txn)
                                             session.commit()
                                             logger.info(

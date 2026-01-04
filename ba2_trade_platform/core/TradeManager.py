@@ -1368,8 +1368,13 @@ class TradeManager:
                                 continue
                             
                             # No other orders - safe to close
-                            txn.status = TransactionStatus.CLOSED
-                            txn.close_date = datetime.now(timezone.utc)
+                            from .utils import close_transaction_with_logging
+                            close_transaction_with_logging(
+                                transaction=txn,
+                                account_id=0,  # No specific account context in cleanup
+                                close_reason="cleanup",
+                                session=session
+                            )
                             session.add(txn)
                             self.logger.info(f"Marked transaction {txn_id} as CLOSED (no remaining orders)")
                             stats['transactions_closed'] += 1
