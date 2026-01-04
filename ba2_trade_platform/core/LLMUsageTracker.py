@@ -236,19 +236,41 @@ class LLMUsageCallback(BaseCallbackHandler):
             input_tokens = 0
             output_tokens = 0
             
+            # Method 1: Check llm_output for token_usage (OpenAI format)
             if response.llm_output and 'token_usage' in response.llm_output:
                 token_usage = response.llm_output['token_usage']
                 input_tokens = token_usage.get('prompt_tokens', 0)
                 output_tokens = token_usage.get('completion_tokens', 0)
+            
+            # Method 2: Check llm_output for usage (alternative format)
+            elif response.llm_output and 'usage' in response.llm_output:
+                usage = response.llm_output['usage']
+                input_tokens = usage.get('prompt_tokens', 0) or usage.get('input_tokens', 0)
+                output_tokens = usage.get('completion_tokens', 0) or usage.get('output_tokens', 0)
+            
+            # Method 3: Check generation_info in generations
             elif hasattr(response, 'generations') and response.generations:
-                # Try to get usage from generation metadata
                 for generation_list in response.generations:
                     for generation in generation_list:
                         if hasattr(generation, 'generation_info') and generation.generation_info:
+                            # Try 'usage' key
                             usage = generation.generation_info.get('usage', {})
                             if usage:
-                                input_tokens += usage.get('prompt_tokens', 0)
-                                output_tokens += usage.get('completion_tokens', 0)
+                                input_tokens += usage.get('prompt_tokens', 0) or usage.get('input_tokens', 0)
+                                output_tokens += usage.get('completion_tokens', 0) or usage.get('output_tokens', 0)
+                            
+                            # Try 'token_usage' key
+                            token_usage = generation.generation_info.get('token_usage', {})
+                            if token_usage:
+                                input_tokens += token_usage.get('prompt_tokens', 0) or token_usage.get('input_tokens', 0)
+                                output_tokens += token_usage.get('completion_tokens', 0) or token_usage.get('output_tokens', 0)
+            
+            # If still no tokens found, log warning for debugging
+            if input_tokens == 0 and output_tokens == 0:
+                logger.warning(
+                    f"No token usage found in LLM response for {self.model_selection}. "
+                    f"llm_output keys: {list(response.llm_output.keys()) if response.llm_output else 'None'}"
+                )
             
             # Log usage
             self._log_usage(input_tokens, output_tokens, duration_ms, error=None)
