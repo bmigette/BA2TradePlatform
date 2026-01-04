@@ -675,3 +675,39 @@ div[style*="position: fixed"][style*="bottom: 0"][style*="right: 0"] {
 .q-btn .q-icon {
     color: #ffffff !important;
 }
+
+/* NiceGUI connection lost/reconnecting popup - dark theme */
+.nicegui-connecting,
+.nicegui-disconnected,
+[class*="nicegui-connect"],
+[class*="nicegui-disconnect"] {
+    background: rgba(37, 43, 59, 0.98) !important;
+    color: #ffffff !important;
+    border: 2px solid rgba(255, 107, 107, 0.8) !important;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5) !important;
+    backdrop-filter: blur(10px) !important;
+}
+
+/* NiceGUI notification/banner styles */
+.q-notification,
+.q-banner {
+    background: rgba(37, 43, 59, 0.98) !important;
+    color: #ffffff !important;
+    border: 1px solid rgba(255, 255, 255, 0.1) !important;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5) !important;
+}
+
+/* Warning/error notifications */
+.q-notification--warning,
+.q-banner--warning {
+    background: rgba(255, 217, 61, 0.2) !important;
+    border-color: rgba(255, 217, 61, 0.8) !important;
+}
+
+.q-notification--negative,
+.q-banner--negative,
+.q-notification--error,
+.q-banner--error {
+    background: rgba(255, 107, 107, 0.2) !important;
+    border-color: rgba(255, 107, 107, 0.8) !important;
+}

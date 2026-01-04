@@ -1626,12 +1626,20 @@ class AlpacaAccount(AccountInterface):
                                 )
                                 continue
                         
-                        # CRITICAL: Before marking as CANCELED, check directly if order is FILLED at broker
-                        # Alpaca's get_orders() API has retention limits and may not return old filled orders
-                        # If the order is actually FILLED, update it instead of marking as CANCELED
+                        # CRITICAL: Before marking as CANCELED, try to verify order status at broker
+                        # Alpaca's get_orders() API has retention limits and may not return old orders
+                        # We should only mark as CANCELED if we can explicitly confirm the order is canceled
+                        broker_order = None
+                        verification_failed = False
                         try:
                             broker_order = self.get_order(db_order.broker_order_id)
-                            if broker_order and broker_order.status == OrderStatus.FILLED:
+                        except Exception as check_err:
+                            logger.debug(f"Could not verify order {db_order.broker_order_id} at broker: {check_err}")
+                            verification_failed = True
+                        
+                        # If we successfully retrieved the order from broker, update to match broker status
+                        if broker_order:
+                            if broker_order.status == OrderStatus.FILLED:
                                 logger.info(
                                     f"Order {db_order.id} (broker_order_id={db_order.broker_order_id}) "
                                     f"is FILLED at broker but not in get_orders() list (old order) - updating status to FILLED"
@@ -1645,18 +1653,61 @@ class AlpacaAccount(AccountInterface):
                                     update_instance(fresh_order)
                                     updated_count += 1
                                 continue
-                        except Exception as check_err:
-                            logger.debug(f"Could not verify order {db_order.broker_order_id} at broker: {check_err}")
+                            elif broker_order.status == OrderStatus.CANCELED:
+                                # Explicitly confirmed as CANCELED at broker
+                                logger.info(
+                                    f"Order {db_order.id} (broker_order_id={db_order.broker_order_id}) "
+                                    f"confirmed as CANCELED at broker"
+                                )
+                                fresh_order = get_instance(TradingOrder, db_order.id)
+                                if fresh_order:
+                                    fresh_order.status = OrderStatus.CANCELED
+                                    update_instance(fresh_order)
+                                    canceled_count += 1
+                                continue
+                            else:
+                                # Order exists at broker with other status - update it
+                                logger.info(
+                                    f"Order {db_order.id} (broker_order_id={db_order.broker_order_id}) "
+                                    f"has status {broker_order.status} at broker - updating"
+                                )
+                                fresh_order = get_instance(TradingOrder, db_order.id)
+                                if fresh_order:
+                                    fresh_order.status = broker_order.status
+                                    if broker_order.filled_qty:
+                                        fresh_order.filled_qty = broker_order.filled_qty
+                                    update_instance(fresh_order)
+                                    updated_count += 1
+                                continue
                         
-                        logger.warning(
-                            f"Order {db_order.id} (broker_order_id={db_order.broker_order_id}) "
-                            f"not found in Alpaca, marking as CANCELED"
-                        )
-                        fresh_order = get_instance(TradingOrder, db_order.id)
-                        if fresh_order:
-                            fresh_order.status = OrderStatus.CANCELED
-                            update_instance(fresh_order)
-                            canceled_count += 1
+                        # If verification failed or order not found at broker:
+                        # DON'T automatically mark as CANCELED - this could be an old order beyond retention period
+                        # Only mark as CANCELED if it's recent (less than 30 days old)
+                        if verification_failed or broker_order is None:
+                            if db_order.created_at:
+                                created_at = db_order.created_at
+                                if created_at.tzinfo is None:
+                                    created_at = created_at.replace(tzinfo=timezone.utc)
+                                
+                                order_age_days = (datetime.now(timezone.utc) - created_at).total_seconds() / 86400
+                                if order_age_days > 30:
+                                    # Old order - probably beyond retention period, leave it alone
+                                    logger.debug(
+                                        f"Order {db_order.id} (broker_order_id={db_order.broker_order_id}) "
+                                        f"not found at broker but is {order_age_days:.1f} days old (likely beyond retention period) - skipping"
+                                    )
+                                    continue
+                            
+                            # Recent order not found - mark as CANCELED
+                            logger.warning(
+                                f"Order {db_order.id} (broker_order_id={db_order.broker_order_id}) "
+                                f"not found in Alpaca (recent order), marking as CANCELED"
+                            )
+                            fresh_order = get_instance(TradingOrder, db_order.id)
+                            if fresh_order:
+                                fresh_order.status = OrderStatus.CANCELED
+                                update_instance(fresh_order)
+                                canceled_count += 1
             
             # Step 5: Check for dependent orders that can now be submitted
             triggered_count = self._check_and_submit_dependent_orders()

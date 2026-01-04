@@ -88,14 +88,27 @@ class ActivityMonitorPage:
                 
                 # Apply sorting
                 if sort_by:
-                    sort_column = getattr(ActivityLog, sort_by, None)
+                    # Map display field names to actual database columns
+                    column_mapping = {
+                        'timestamp': 'created_at',
+                        'severity': 'severity',
+                        'type': 'type',
+                        'expert': 'source_expert_id',
+                        'account': 'source_account_id',
+                        'description': 'description'
+                    }
+                    db_column_name = column_mapping.get(sort_by, sort_by)
+                    sort_column = getattr(ActivityLog, db_column_name, None)
                     if sort_column:
                         if descending:
                             query = query.order_by(sort_column.desc())
                         else:
                             query = query.order_by(sort_column.asc())
+                    else:
+                        # Fallback to default sort
+                        query = query.order_by(ActivityLog.created_at.desc())
                 else:
-                    # Default sort by timestamp descending
+                    # Default sort by created_at descending (most recent first)
                     query = query.order_by(ActivityLog.created_at.desc())
                 
                 # Get total count first (before pagination)
@@ -164,6 +177,7 @@ class ActivityMonitorPage:
                 rows.append({
                     "id": activity.id,
                     "timestamp": timestamp_local.strftime("%Y-%m-%d %H:%M:%S"),
+                    "timestamp_sort": int(timestamp_utc.timestamp()),  # Unix timestamp for numeric sorting
                     "severity": activity.severity.value,
                     "type": activity.type.value.replace("_", " ").title(),
                     "expert": expert_display,
