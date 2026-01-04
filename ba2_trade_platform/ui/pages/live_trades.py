@@ -504,6 +504,7 @@ class LiveTradesTab:
                 'id': txn.id,
                 '_selected': False,  # Selection is managed by LiveTradesTable
                 'symbol': txn.symbol,
+                'direction': 'BUY' if txn.quantity > 0 else 'SELL',
                 'expert': expert_shortname,
                 'quantity': f"{txn.quantity:+.2f}",
                 'open_price': f"${txn.open_price:.2f}" if txn.open_price else '',

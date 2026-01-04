@@ -110,124 +110,122 @@ class InstrumentDistributionChart:
     
     def render(self):
         """Render the instrument distribution pie chart."""
-        # Determine chart title based on grouping field
-        chart_title = '🥧 Position Distribution by Label' if self.grouping_field == 'labels' else '🥧 Position Distribution by Category'
+        # Determine category label based on grouping field
         category_label = 'Label' if self.grouping_field == 'labels' else 'Category'
         
-        with ui.card().classes('p-4'):
-            ui.label(chart_title).classes('text-h6 mb-4')
+        # Don't create a card here - parent should handle that (including title)
+        
+        # Get distribution data
+        distribution = self.calculate_position_distribution()
+        
+        if not distribution:
+            ui.label('No open positions found.').classes('text-sm text-gray-500')
+            return
+        
+        # Prepare data for pie chart
+        pie_data = [
+            {'value': round(value, 2), 'name': name}
+            for name, value in distribution.items()
+        ]
+        
+        # Calculate total
+        total_value = sum(distribution.values())
+        
+        # Modern color palette for dark theme
+        colors = [
+            '#00d4aa', '#4dabf7', '#ffa94d', '#ff6b6b', '#9775fa',
+            '#69db7c', '#ffd43b', '#ff8787', '#74c0fc', '#a9e34b',
+            '#f783ac', '#63e6be', '#da77f2', '#fab005', '#40c057'
+        ]
+        
+        # Create echart options
+        options = {
+            'backgroundColor': 'transparent',
+            'color': colors,
+            'tooltip': {
+                'trigger': 'item',
+                'formatter': '{b}<br/>${c:,.2f}<br/>{d}%',
+                'backgroundColor': 'rgba(37, 43, 59, 0.95)',
+                'borderColor': 'rgba(255, 255, 255, 0.1)',
+                'textStyle': {
+                    'color': '#ffffff'
+                }
+            },
+            'legend': {
+                'show': False  # Hide legend, use labels instead
+            },
+            'series': [{
+                'name': 'Position Distribution',
+                'type': 'pie',
+                'radius': ['35%', '55%'],
+                'center': ['50%', '50%'],
+                'avoidLabelOverlap': True,
+                'itemStyle': {
+                    'borderRadius': 4,
+                    'borderColor': 'rgba(26, 31, 46, 0.8)',
+                    'borderWidth': 2
+                },
+                'label': {
+                    'show': True,
+                    'position': 'outside',
+                    'fontSize': 9,
+                    'color': '#a0aec0',
+                    'formatter': '{b}\n{d}%',
+                    'lineHeight': 12,
+                    'overflow': 'truncate',
+                    'width': 80
+                },
+                'emphasis': {
+                    'label': {
+                        'show': True,
+                        'fontSize': 11,
+                        'fontWeight': 'bold',
+                        'color': '#ffffff'
+                    },
+                    'itemStyle': {
+                        'shadowBlur': 10,
+                        'shadowOffsetX': 0,
+                        'shadowColor': 'rgba(0, 0, 0, 0.5)'
+                    }
+                },
+                'labelLine': {
+                    'show': True,
+                    'length': 10,
+                    'length2': 15,
+                    'lineStyle': {
+                        'color': 'rgba(255, 255, 255, 0.3)'
+                    }
+                },
+                'data': pie_data
+            }]
+        }
+        
+        # Create the chart - use w-full for responsive width
+        self.chart = ui.echart(options).style('width: 100%; height: 300px;')
+        
+        # Add summary statistics
+        with ui.row().classes('w-full justify-between mt-4 text-sm'):
+            ui.label(f'Total {category_label}s: {len(distribution)}').classes('text-gray-600')
+            ui.label(f'Total Market Value: ${total_value:,.2f}').classes('font-bold text-blue-600')
+        
+        # Add detailed breakdown table
+        with ui.expansion('View Detailed Breakdown', icon='table_chart').classes('w-full mt-2'):
+            columns = [
+                {'name': 'category', 'label': category_label, 'field': 'category', 'align': 'left', 'sortable': True},
+                {'name': 'value', 'label': 'Market Value', 'field': 'value', 'align': 'right', 'sortable': True},
+                {'name': 'percentage', 'label': 'Percentage', 'field': 'percentage', 'align': 'right', 'sortable': True}
+            ]
             
-            # Get distribution data
-            distribution = self.calculate_position_distribution()
-            
-            if not distribution:
-                ui.label('No open positions found.').classes('text-sm text-gray-500')
-                return
-            
-            # Prepare data for pie chart
-            pie_data = [
-                {'value': round(value, 2), 'name': name}
+            rows = [
+                {
+                    'category': name,
+                    'value': f'${value:,.2f}',
+                    'percentage': f'{(value/total_value*100):.1f}%'
+                }
                 for name, value in distribution.items()
             ]
             
-            # Calculate total
-            total_value = sum(distribution.values())
-            
-            # Modern color palette for dark theme
-            colors = [
-                '#00d4aa', '#4dabf7', '#ffa94d', '#ff6b6b', '#9775fa',
-                '#69db7c', '#ffd43b', '#ff8787', '#74c0fc', '#a9e34b',
-                '#f783ac', '#63e6be', '#da77f2', '#fab005', '#40c057'
-            ]
-            
-            # Create echart options
-            options = {
-                'backgroundColor': 'transparent',
-                'color': colors,
-                'tooltip': {
-                    'trigger': 'item',
-                    'formatter': '{b}<br/>${c:,.2f}<br/>{d}%',
-                    'backgroundColor': 'rgba(37, 43, 59, 0.95)',
-                    'borderColor': 'rgba(255, 255, 255, 0.1)',
-                    'textStyle': {
-                        'color': '#ffffff'
-                    }
-                },
-                'legend': {
-                    'show': False  # Hide legend, use labels instead
-                },
-                'series': [{
-                    'name': 'Position Distribution',
-                    'type': 'pie',
-                    'radius': ['35%', '55%'],
-                    'center': ['50%', '50%'],
-                    'avoidLabelOverlap': True,
-                    'itemStyle': {
-                        'borderRadius': 4,
-                        'borderColor': 'rgba(26, 31, 46, 0.8)',
-                        'borderWidth': 2
-                    },
-                    'label': {
-                        'show': True,
-                        'position': 'outside',
-                        'fontSize': 9,
-                        'color': '#a0aec0',
-                        'formatter': '{b}\n{d}%',
-                        'lineHeight': 12,
-                        'overflow': 'truncate',
-                        'width': 80
-                    },
-                    'emphasis': {
-                        'label': {
-                            'show': True,
-                            'fontSize': 11,
-                            'fontWeight': 'bold',
-                            'color': '#ffffff'
-                        },
-                        'itemStyle': {
-                            'shadowBlur': 10,
-                            'shadowOffsetX': 0,
-                            'shadowColor': 'rgba(0, 0, 0, 0.5)'
-                        }
-                    },
-                    'labelLine': {
-                        'show': True,
-                        'length': 10,
-                        'length2': 15,
-                        'lineStyle': {
-                            'color': 'rgba(255, 255, 255, 0.3)'
-                        }
-                    },
-                    'data': pie_data
-                }]
-            }
-            
-            # Create the chart - use w-full for responsive width
-            self.chart = ui.echart(options).classes('w-full h-64')
-            
-            # Add summary statistics
-            with ui.row().classes('w-full justify-between mt-4 text-sm'):
-                ui.label(f'Total {category_label}s: {len(distribution)}').classes('text-gray-600')
-                ui.label(f'Total Market Value: ${total_value:,.2f}').classes('font-bold text-blue-600')
-            
-            # Add detailed breakdown table
-            with ui.expansion('View Detailed Breakdown', icon='table_chart').classes('w-full mt-2'):
-                columns = [
-                    {'name': 'category', 'label': category_label, 'field': 'category', 'align': 'left', 'sortable': True},
-                    {'name': 'value', 'label': 'Market Value', 'field': 'value', 'align': 'right', 'sortable': True},
-                    {'name': 'percentage', 'label': 'Percentage', 'field': 'percentage', 'align': 'right', 'sortable': True}
-                ]
-                
-                rows = [
-                    {
-                        'category': name,
-                        'value': f'${value:,.2f}',
-                        'percentage': f'{(value/total_value*100):.1f}%'
-                    }
-                    for name, value in distribution.items()
-                ]
-                
-                ui.table(columns=columns, rows=rows, row_key='category').classes('w-full')
+            ui.table(columns=columns, rows=rows, row_key='category').classes('w-full')
     
     def refresh(self, positions: List[Dict] = None):
         """

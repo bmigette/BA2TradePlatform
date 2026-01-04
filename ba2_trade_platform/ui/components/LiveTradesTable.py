@@ -68,6 +68,7 @@ class LiveTradesTable(LazyTable):
         ColumnDef(name='expand', label='', field='expand', align='left', sortable=False),
         ColumnDef(name='id', label='ID', field='id', align='center', sortable=True),
         ColumnDef(name='symbol', label='Symbol', field='symbol', align='left', sortable=True),
+        ColumnDef(name='direction', label='Direction', field='direction', align='center', sortable=True),
         ColumnDef(name='expert', label='Expert', field='expert', align='left', sortable=True),
         ColumnDef(name='quantity', label='Qty', field='quantity', align='right', sortable=True),
         ColumnDef(name='open_price', label='Open Price', field='open_price', align='right', sortable=True),
@@ -103,6 +104,9 @@ class LiveTradesTable(LazyTable):
                         @click="props.expand = !props.expand"
                         :icon="props.expand ? 'expand_less' : 'expand_more'"
                     />
+                </template>
+                <template v-else-if="col.name === 'direction'">
+                    <q-badge :color="col.value === 'BUY' ? 'positive' : 'negative'" :label="col.value" />
                 </template>
                 <template v-else-if="col.name === 'status'">
                     <q-badge :color="props.row.status_color" :label="col.value" />
