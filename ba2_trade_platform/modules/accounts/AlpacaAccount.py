@@ -1666,18 +1666,26 @@ class AlpacaAccount(AccountInterface):
                                     canceled_count += 1
                                 continue
                             else:
-                                # Order exists at broker with other status - update it
-                                logger.info(
-                                    f"Order {db_order.id} (broker_order_id={db_order.broker_order_id}) "
-                                    f"has status {broker_order.status} at broker - updating"
-                                )
+                                # Order exists at broker with other status - update only if changed
                                 fresh_order = get_instance(TradingOrder, db_order.id)
                                 if fresh_order:
-                                    fresh_order.status = broker_order.status
-                                    if broker_order.filled_qty:
-                                        fresh_order.filled_qty = broker_order.filled_qty
-                                    update_instance(fresh_order)
-                                    updated_count += 1
+                                    status_changed = fresh_order.status != broker_order.status
+                                    
+                                    # Compare filled_qty with type conversion (broker may return string "0" vs float 0.0)
+                                    broker_filled = float(broker_order.filled_qty) if broker_order.filled_qty else 0.0
+                                    db_filled = float(fresh_order.filled_qty) if fresh_order.filled_qty else 0.0
+                                    filled_qty_changed = broker_filled != db_filled
+                                    
+                                    if status_changed or filled_qty_changed:
+                                        logger.info(
+                                            f"Order {db_order.id} (broker_order_id={db_order.broker_order_id}) "
+                                            f"has status {broker_order.status} at broker (was {fresh_order.status}) - updating"
+                                        )
+                                        fresh_order.status = broker_order.status
+                                        if broker_order.filled_qty:
+                                            fresh_order.filled_qty = float(broker_order.filled_qty)
+                                        update_instance(fresh_order)
+                                        updated_count += 1
                                 continue
                         
                         # If verification failed or order not found at broker:
