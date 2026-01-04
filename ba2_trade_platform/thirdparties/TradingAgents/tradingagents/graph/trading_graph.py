@@ -116,11 +116,19 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         try:
             self.deep_thinking_llm = ModelFactory.create_llm(
                 deep_think_selection,
-                streaming=streaming_enabled
+                streaming=streaming_enabled,
+                track_usage=True,
+                expert_instance_id=expert_instance_id_for_logging,
+                market_analysis_id=self.market_analysis_id,
+                use_case="Market Analysis"
             )
             self.quick_thinking_llm = ModelFactory.create_llm(
                 quick_think_selection,
-                streaming=streaming_enabled
+                streaming=streaming_enabled,
+                track_usage=True,
+                expert_instance_id=expert_instance_id_for_logging,
+                market_analysis_id=self.market_analysis_id,
+                use_case="Market Analysis"
             )
         except ValueError as e:
             logger.error(f"Failed to create LLM: {e}")
