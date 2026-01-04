@@ -63,22 +63,94 @@ class LLMUsagePage:
             return ui.label('No data available').classes('text-grey-6')
         
         chart_options = {
-            'title': {'text': 'Daily Token Usage', 'left': 'center'},
-            'tooltip': {'trigger': 'axis'},
+            'backgroundColor': 'transparent',
+            'title': {
+                'text': 'Daily Token Usage',
+                'left': 'center',
+                'textStyle': {
+                    'color': '#a0aec0',
+                    'fontSize': 16,
+                    'fontWeight': 'normal'
+                }
+            },
+            'tooltip': {
+                'trigger': 'axis',
+                'backgroundColor': 'rgba(37, 43, 59, 0.95)',
+                'borderColor': 'rgba(255, 255, 255, 0.1)',
+                'textStyle': {
+                    'color': '#ffffff'
+                }
+            },
+            'grid': {
+                'left': '3%',
+                'right': '4%',
+                'bottom': '10%',
+                'top': '20%',
+                'containLabel': True
+            },
             'xAxis': {
                 'type': 'category',
-                'data': [d['date'] for d in data]
+                'data': [d['date'] for d in data],
+                'axisLabel': {
+                    'color': '#a0aec0',
+                    'fontSize': 11
+                },
+                'axisLine': {
+                    'lineStyle': {
+                        'color': 'rgba(255, 255, 255, 0.1)'
+                    }
+                }
             },
             'yAxis': {
                 'type': 'value',
-                'name': 'Tokens'
+                'name': 'Tokens',
+                'nameTextStyle': {
+                    'color': '#a0aec0'
+                },
+                'axisLabel': {
+                    'color': '#a0aec0',
+                    'formatter': '{value}'
+                },
+                'axisLine': {
+                    'lineStyle': {
+                        'color': 'rgba(255, 255, 255, 0.1)'
+                    }
+                },
+                'splitLine': {
+                    'lineStyle': {
+                        'color': 'rgba(255, 255, 255, 0.05)'
+                    }
+                }
             },
             'series': [{
                 'name': 'Total Tokens',
                 'type': 'line',
                 'smooth': True,
+                'symbol': 'circle',
+                'symbolSize': 6,
                 'data': [d['total_tokens'] for d in data],
-                'itemStyle': {'color': '#1976D2'}
+                'lineStyle': {
+                    'width': 3,
+                    'color': '#1976D2'
+                },
+                'areaStyle': {
+                    'color': {
+                        'type': 'linear',
+                        'x': 0,
+                        'y': 0,
+                        'x2': 0,
+                        'y2': 1,
+                        'colorStops': [
+                            {'offset': 0, 'color': 'rgba(25, 118, 210, 0.3)'},
+                            {'offset': 1, 'color': 'rgba(25, 118, 210, 0.05)'}
+                        ]
+                    }
+                },
+                'itemStyle': {
+                    'color': '#1976D2',
+                    'borderWidth': 2,
+                    'borderColor': '#ffffff'
+                }
             }]
         }
         
@@ -92,22 +164,92 @@ class LLMUsagePage:
             return ui.label('No data available').classes('text-grey-6')
         
         chart_options = {
-            'title': {'text': 'Token Usage by Model', 'left': 'center'},
-            'tooltip': {'trigger': 'axis'},
+            'backgroundColor': 'transparent',
+            'title': {
+                'text': 'Token Usage by Model',
+                'left': 'center',
+                'textStyle': {
+                    'color': '#a0aec0',
+                    'fontSize': 16,
+                    'fontWeight': 'normal'
+                }
+            },
+            'tooltip': {
+                'trigger': 'axis',
+                'backgroundColor': 'rgba(37, 43, 59, 0.95)',
+                'borderColor': 'rgba(255, 255, 255, 0.1)',
+                'textStyle': {
+                    'color': '#ffffff'
+                },
+                'axisPointer': {
+                    'type': 'shadow'
+                }
+            },
+            'grid': {
+                'left': '3%',
+                'right': '4%',
+                'bottom': '20%',
+                'top': '20%',
+                'containLabel': True
+            },
             'xAxis': {
                 'type': 'category',
                 'data': [d['model'] for d in data],
-                'axisLabel': {'rotate': 45, 'interval': 0}
+                'axisLabel': {
+                    'rotate': 45,
+                    'interval': 0,
+                    'color': '#a0aec0',
+                    'fontSize': 10
+                },
+                'axisLine': {
+                    'lineStyle': {
+                        'color': 'rgba(255, 255, 255, 0.1)'
+                    }
+                }
             },
             'yAxis': {
                 'type': 'value',
-                'name': 'Tokens'
+                'name': 'Tokens',
+                'nameTextStyle': {
+                    'color': '#a0aec0'
+                },
+                'axisLabel': {
+                    'color': '#a0aec0'
+                },
+                'axisLine': {
+                    'lineStyle': {
+                        'color': 'rgba(255, 255, 255, 0.1)'
+                    }
+                },
+                'splitLine': {
+                    'lineStyle': {
+                        'color': 'rgba(255, 255, 255, 0.05)'
+                    }
+                }
             },
             'series': [{
                 'name': 'Total Tokens',
                 'type': 'bar',
-                'data': [d['total_tokens'] for d in data],
-                'itemStyle': {'color': '#43A047'}
+                'data': [
+                    {
+                        'value': d['total_tokens'],
+                        'itemStyle': {
+                            'borderRadius': [4, 4, 0, 0],
+                            'color': {
+                                'type': 'linear',
+                                'x': 0,
+                                'y': 0,
+                                'x2': 0,
+                                'y2': 1,
+                                'colorStops': [
+                                    {'offset': 0, 'color': '#66BB6A'},
+                                    {'offset': 1, 'color': '#43A047'}
+                                ]
+                            }
+                        }
+                    } for d in data
+                ],
+                'barMaxWidth': 40
             }]
         }
         
@@ -120,23 +262,64 @@ class LLMUsagePage:
         if not data:
             return ui.label('No data available').classes('text-grey-6')
         
+        # Color palette for providers
+        colors = ['#5470C6', '#91CC75', '#FAC858', '#EE6666', '#73C0DE', '#3BA272', '#FC8452', '#9A60B4']
+        
         chart_options = {
-            'title': {'text': 'Token Usage by Provider', 'left': 'center'},
-            'tooltip': {'trigger': 'item', 'formatter': '{b}: {c} ({d}%)'},
+            'backgroundColor': 'transparent',
+            'title': {
+                'text': 'Token Usage by Provider',
+                'left': 'center',
+                'textStyle': {
+                    'color': '#a0aec0',
+                    'fontSize': 16,
+                    'fontWeight': 'normal'
+                }
+            },
+            'tooltip': {
+                'trigger': 'item',
+                'formatter': '{b}: {c} tokens ({d}%)',
+                'backgroundColor': 'rgba(37, 43, 59, 0.95)',
+                'borderColor': 'rgba(255, 255, 255, 0.1)',
+                'textStyle': {
+                    'color': '#ffffff'
+                }
+            },
+            'legend': {
+                'bottom': '5%',
+                'textStyle': {
+                    'color': '#a0aec0'
+                }
+            },
+            'color': colors,
             'series': [{
                 'name': 'Tokens',
                 'type': 'pie',
-                'radius': '60%',
+                'radius': ['40%', '65%'],
+                'center': ['50%', '45%'],
                 'data': [
                     {'name': d['provider'], 'value': d['total_tokens']}
                     for d in data
                 ],
+                'label': {
+                    'color': '#a0aec0',
+                    'fontSize': 12
+                },
                 'emphasis': {
                     'itemStyle': {
-                        'shadowBlur': 10,
+                        'shadowBlur': 15,
                         'shadowOffsetX': 0,
-                        'shadowColor': 'rgba(0, 0, 0, 0.5)'
+                        'shadowColor': 'rgba(0, 0, 0, 0.7)'
+                    },
+                    'label': {
+                        'fontSize': 14,
+                        'fontWeight': 'bold'
                     }
+                },
+                'itemStyle': {
+                    'borderRadius': 8,
+                    'borderColor': 'rgba(0, 0, 0, 0.3)',
+                    'borderWidth': 2
                 }
             }]
         }
@@ -151,22 +334,92 @@ class LLMUsagePage:
             return ui.label('No data available').classes('text-grey-6')
         
         chart_options = {
-            'title': {'text': 'Token Usage by Use Case', 'left': 'center'},
-            'tooltip': {'trigger': 'axis'},
+            'backgroundColor': 'transparent',
+            'title': {
+                'text': 'Token Usage by Use Case',
+                'left': 'center',
+                'textStyle': {
+                    'color': '#a0aec0',
+                    'fontSize': 16,
+                    'fontWeight': 'normal'
+                }
+            },
+            'tooltip': {
+                'trigger': 'axis',
+                'backgroundColor': 'rgba(37, 43, 59, 0.95)',
+                'borderColor': 'rgba(255, 255, 255, 0.1)',
+                'textStyle': {
+                    'color': '#ffffff'
+                },
+                'axisPointer': {
+                    'type': 'shadow'
+                }
+            },
+            'grid': {
+                'left': '3%',
+                'right': '4%',
+                'bottom': '20%',
+                'top': '20%',
+                'containLabel': True
+            },
             'xAxis': {
                 'type': 'category',
                 'data': [d['use_case'] for d in data],
-                'axisLabel': {'rotate': 45, 'interval': 0}
+                'axisLabel': {
+                    'rotate': 45,
+                    'interval': 0,
+                    'color': '#a0aec0',
+                    'fontSize': 10
+                },
+                'axisLine': {
+                    'lineStyle': {
+                        'color': 'rgba(255, 255, 255, 0.1)'
+                    }
+                }
             },
             'yAxis': {
                 'type': 'value',
-                'name': 'Tokens'
+                'name': 'Tokens',
+                'nameTextStyle': {
+                    'color': '#a0aec0'
+                },
+                'axisLabel': {
+                    'color': '#a0aec0'
+                },
+                'axisLine': {
+                    'lineStyle': {
+                        'color': 'rgba(255, 255, 255, 0.1)'
+                    }
+                },
+                'splitLine': {
+                    'lineStyle': {
+                        'color': 'rgba(255, 255, 255, 0.05)'
+                    }
+                }
             },
             'series': [{
                 'name': 'Total Tokens',
                 'type': 'bar',
-                'data': [d['total_tokens'] for d in data],
-                'itemStyle': {'color': '#FB8C00'}
+                'data': [
+                    {
+                        'value': d['total_tokens'],
+                        'itemStyle': {
+                            'borderRadius': [4, 4, 0, 0],
+                            'color': {
+                                'type': 'linear',
+                                'x': 0,
+                                'y': 0,
+                                'x2': 0,
+                                'y2': 1,
+                                'colorStops': [
+                                    {'offset': 0, 'color': '#FFB74D'},
+                                    {'offset': 1, 'color': '#FB8C00'}
+                                ]
+                            }
+                        }
+                    } for d in data
+                ],
+                'barMaxWidth': 40
             }]
         }
         
@@ -180,22 +433,92 @@ class LLMUsagePage:
             return ui.label('No data available').classes('text-grey-6')
         
         chart_options = {
-            'title': {'text': 'Token Usage by Expert', 'left': 'center'},
-            'tooltip': {'trigger': 'axis'},
+            'backgroundColor': 'transparent',
+            'title': {
+                'text': 'Token Usage by Expert',
+                'left': 'center',
+                'textStyle': {
+                    'color': '#a0aec0',
+                    'fontSize': 16,
+                    'fontWeight': 'normal'
+                }
+            },
+            'tooltip': {
+                'trigger': 'axis',
+                'backgroundColor': 'rgba(37, 43, 59, 0.95)',
+                'borderColor': 'rgba(255, 255, 255, 0.1)',
+                'textStyle': {
+                    'color': '#ffffff'
+                },
+                'axisPointer': {
+                    'type': 'shadow'
+                }
+            },
+            'grid': {
+                'left': '3%',
+                'right': '4%',
+                'bottom': '20%',
+                'top': '20%',
+                'containLabel': True
+            },
             'xAxis': {
                 'type': 'category',
                 'data': [d['expert_name'] for d in data],
-                'axisLabel': {'rotate': 45, 'interval': 0}
+                'axisLabel': {
+                    'rotate': 45,
+                    'interval': 0,
+                    'color': '#a0aec0',
+                    'fontSize': 10
+                },
+                'axisLine': {
+                    'lineStyle': {
+                        'color': 'rgba(255, 255, 255, 0.1)'
+                    }
+                }
             },
             'yAxis': {
                 'type': 'value',
-                'name': 'Tokens'
+                'name': 'Tokens',
+                'nameTextStyle': {
+                    'color': '#a0aec0'
+                },
+                'axisLabel': {
+                    'color': '#a0aec0'
+                },
+                'axisLine': {
+                    'lineStyle': {
+                        'color': 'rgba(255, 255, 255, 0.1)'
+                    }
+                },
+                'splitLine': {
+                    'lineStyle': {
+                        'color': 'rgba(255, 255, 255, 0.05)'
+                    }
+                }
             },
             'series': [{
                 'name': 'Total Tokens',
                 'type': 'bar',
-                'data': [d['total_tokens'] for d in data],
-                'itemStyle': {'color': '#E53935'}
+                'data': [
+                    {
+                        'value': d['total_tokens'],
+                        'itemStyle': {
+                            'borderRadius': [4, 4, 0, 0],
+                            'color': {
+                                'type': 'linear',
+                                'x': 0,
+                                'y': 0,
+                                'x2': 0,
+                                'y2': 1,
+                                'colorStops': [
+                                    {'offset': 0, 'color': '#EF5350'},
+                                    {'offset': 1, 'color': '#E53935'}
+                                ]
+                            }
+                        }
+                    } for d in data
+                ],
+                'barMaxWidth': 40
             }]
         }
         
@@ -259,7 +582,25 @@ class LLMUsagePage:
         if 'usage_by_model' in self.charts:
             data = get_usage_by_model(self.days_filter, 10)
             self.charts['usage_by_model'].options['xAxis']['data'] = [d['model'] for d in data]
-            self.charts['usage_by_model'].options['series'][0]['data'] = [d['total_tokens'] for d in data]
+            self.charts['usage_by_model'].options['series'][0]['data'] = [
+                {
+                    'value': d['total_tokens'],
+                    'itemStyle': {
+                        'borderRadius': [4, 4, 0, 0],
+                        'color': {
+                            'type': 'linear',
+                            'x': 0,
+                            'y': 0,
+                            'x2': 0,
+                            'y2': 1,
+                            'colorStops': [
+                                {'offset': 0, 'color': '#66BB6A'},
+                                {'offset': 1, 'color': '#43A047'}
+                            ]
+                        }
+                    }
+                } for d in data
+            ]
             self.charts['usage_by_model'].update()
         
         if 'usage_by_provider' in self.charts:
@@ -272,13 +613,49 @@ class LLMUsagePage:
         if 'usage_by_use_case' in self.charts:
             data = get_usage_by_use_case(self.days_filter)
             self.charts['usage_by_use_case'].options['xAxis']['data'] = [d['use_case'] for d in data]
-            self.charts['usage_by_use_case'].options['series'][0]['data'] = [d['total_tokens'] for d in data]
+            self.charts['usage_by_use_case'].options['series'][0]['data'] = [
+                {
+                    'value': d['total_tokens'],
+                    'itemStyle': {
+                        'borderRadius': [4, 4, 0, 0],
+                        'color': {
+                            'type': 'linear',
+                            'x': 0,
+                            'y': 0,
+                            'x2': 0,
+                            'y2': 1,
+                            'colorStops': [
+                                {'offset': 0, 'color': '#FFB74D'},
+                                {'offset': 1, 'color': '#FB8C00'}
+                            ]
+                        }
+                    }
+                } for d in data
+            ]
             self.charts['usage_by_use_case'].update()
         
         if 'usage_by_expert' in self.charts:
             data = get_usage_by_expert(self.days_filter, 10)
             self.charts['usage_by_expert'].options['xAxis']['data'] = [d['expert_name'] for d in data]
-            self.charts['usage_by_expert'].options['series'][0]['data'] = [d['total_tokens'] for d in data]
+            self.charts['usage_by_expert'].options['series'][0]['data'] = [
+                {
+                    'value': d['total_tokens'],
+                    'itemStyle': {
+                        'borderRadius': [4, 4, 0, 0],
+                        'color': {
+                            'type': 'linear',
+                            'x': 0,
+                            'y': 0,
+                            'x2': 0,
+                            'y2': 1,
+                            'colorStops': [
+                                {'offset': 0, 'color': '#EF5350'},
+                                {'offset': 1, 'color': '#E53935'}
+                            ]
+                        }
+                    }
+                } for d in data
+            ]
             self.charts['usage_by_expert'].update()
         
         if self.recent_table:

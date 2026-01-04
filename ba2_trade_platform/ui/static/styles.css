@@ -140,15 +140,23 @@ p, span, div, label, h1, h2, h3, h4, h5, h6, li, td, th, a {
 }
 
 /* Inputs - ALL variants */
+.q-field {
+    margin-bottom: 12px !important;
+    margin-right: 12px !important;
+}
 .q-field .q-field__control {
     background: rgba(26, 31, 46, 0.6) !important;
     border-color: rgba(255, 255, 255, 0.1) !important;
     border-radius: 8px !important;
+    padding-left: 12px !important;
+    padding-right: 12px !important;
 }
 .q-field--outlined .q-field__control {
     background: rgba(26, 31, 46, 0.6) !important;
     border-color: rgba(255, 255, 255, 0.1) !important;
     border-radius: 8px !important;
+    padding-left: 12px !important;
+    padding-right: 12px !important;
 }
 .q-field--filled .q-field__control {
     background: rgba(26, 31, 46, 0.6) !important;
@@ -166,13 +174,32 @@ p, span, div, label, h1, h2, h3, h4, h5, h6, li, td, th, a {
     border-color: #00d4aa !important;
     box-shadow: 0 0 0 2px rgba(0, 212, 170, 0.2) !important;
 }
-/* Input text colors */
+/* Input text colors and padding */
 .q-field .q-field__native,
 .q-field input,
 .q-field textarea,
 .q-field .q-field__prefix,
 .q-field .q-field__suffix {
     color: #e2e8f0 !important;
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+}
+
+/* Select dropdown text padding */
+.q-select .q-field__native {
+    padding-left: 0 !important;
+    padding-right: 20px !important; /* Space for dropdown icon */
+}
+
+/* Control container padding */
+.q-field__control-container {
+    padding-left: 0 !important;
+}
+
+/* Input field marginal (the bottom border indicator) */
+.q-field__marginal {
+    padding-left: 12px !important;
+    padding-right: 12px !important;
 }
 .q-field .q-field__label {
     color: #a0aec0 !important;
@@ -443,6 +470,8 @@ p, span, div, label, h1, h2, h3, h4, h5, h6, li, td, th, a {
     border-radius: 8px !important;
     margin: 4px 8px !important;
     transition: all 0.2s ease !important;
+    padding-left: 16px !important;
+    padding-right: 16px !important;
 }
 .q-item:hover {
     background: rgba(0, 212, 170, 0.15) !important;
@@ -450,6 +479,7 @@ p, span, div, label, h1, h2, h3, h4, h5, h6, li, td, th, a {
 .q-item--active {
     background: rgba(0, 212, 170, 0.2) !important;
     border-left: 3px solid #00d4aa !important;
+    padding-left: 13px !important; /* Adjust for border */
 }
 
 /* Header */
@@ -559,6 +589,13 @@ p, span, div, label, h1, h2, h3, h4, h5, h6, li, td, th, a {
 }
 
 /* Checkbox and Radio */
+.q-checkbox,
+.q-radio,
+.q-toggle {
+    margin-bottom: 8px !important;
+    margin-right: 12px !important;
+}
+
 .q-checkbox__label,
 .q-radio__label,
 .q-toggle__label {
@@ -677,15 +714,56 @@ div[style*="position: fixed"][style*="bottom: 0"][style*="right: 0"] {
 }
 
 /* NiceGUI connection lost/reconnecting popup - dark theme */
+/* Target all possible class combinations */
 .nicegui-connecting,
 .nicegui-disconnected,
 [class*="nicegui-connect"],
-[class*="nicegui-disconnect"] {
-    background: rgba(37, 43, 59, 0.98) !important;
+[class*="nicegui-disconnect"],
+div[class*="connect"],
+div[class*="disconnect"] {
+    background: rgba(26, 31, 46, 0.98) !important;
     color: #ffffff !important;
     border: 2px solid rgba(255, 107, 107, 0.8) !important;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5) !important;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.8) !important;
     backdrop-filter: blur(10px) !important;
+    padding: 12px 24px !important;
+}
+
+/* Fix connection lost icon color */
+.nicegui-connecting .q-icon,
+.nicegui-disconnected .q-icon,
+[class*="nicegui-connect"] .q-icon,
+[class*="nicegui-disconnect"] .q-icon,
+div[class*="connect"] .q-icon,
+div[class*="disconnect"] .q-icon {
+    color: #ff6b6b !important;
+}
+
+/* Fix connection lost text - all child elements */
+.nicegui-connecting *,
+.nicegui-disconnected *,
+[class*="nicegui-connect"] *,
+[class*="nicegui-disconnect"] *,
+div[class*="connect"] *,
+div[class*="disconnect"] * {
+    color: #ffffff !important;
+}
+
+/* Target the banner/notification that shows at top */
+.q-banner--dense,
+.q-notification--top,
+.q-banner.bg-orange,
+.q-banner.bg-warning {
+    background: rgba(26, 31, 46, 0.98) !important;
+    color: #ffffff !important;
+    border: 2px solid rgba(255, 107, 107, 0.8) !important;
+}
+
+.q-banner--dense *,
+.q-notification--top *,
+.q-banner.bg-orange *,
+.q-banner.bg-warning * {
+    color: #ffffff !important;
 }
 
 /* NiceGUI notification/banner styles */
@@ -700,14 +778,28 @@ div[style*="position: fixed"][style*="bottom: 0"][style*="right: 0"] {
 /* Warning/error notifications */
 .q-notification--warning,
 .q-banner--warning {
-    background: rgba(255, 217, 61, 0.2) !important;
-    border-color: rgba(255, 217, 61, 0.8) !important;
+    background: rgba(255, 152, 0, 0.95) !important;
+    border-color: rgba(255, 152, 0, 1) !important;
+    color: #000000 !important;
+}
+
+.q-notification--warning *,
+.q-banner--warning * {
+    color: #000000 !important;
 }
 
 .q-notification--negative,
 .q-banner--negative,
 .q-notification--error,
 .q-banner--error {
-    background: rgba(255, 107, 107, 0.2) !important;
-    border-color: rgba(255, 107, 107, 0.8) !important;
+    background: rgba(244, 67, 54, 0.95) !important;
+    border-color: rgba(244, 67, 54, 1) !important;
+    color: #ffffff !important;
+}
+
+.q-notification--negative *,
+.q-banner--negative *,
+.q-notification--error *,
+.q-banner--error * {
+    color: #ffffff !important;
 }
