@@ -302,6 +302,7 @@ class ModelFactory:
             "api_key": api_key,
             "streaming": streaming,
             "max_retries": 3,  # Retry on transient network errors (connection drops, timeouts)
+            "stream_usage": True,  # Enable usage tracking in streaming mode (langchain-openai 0.2+)
         }
         
         # Only add temperature if model supports it (O-series models don't)
@@ -455,6 +456,7 @@ class ModelFactory:
             "streaming": streaming,
             "max_retries": 5,  # Higher retry count for xAI's connection stability issues
             "timeout": 300,  # 5 minute timeout for long responses
+            "stream_usage": True,  # Try to enable usage tracking
         }
         
         if callbacks:
@@ -537,6 +539,7 @@ class ModelFactory:
             "streaming": streaming,
             "base_url": base_url,
             "max_retries": 3,  # Retry on transient network errors
+            "stream_usage": True,  # Enable usage tracking even in streaming mode
         }
         
         # Moonshot supports temperature

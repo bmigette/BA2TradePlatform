@@ -236,20 +236,67 @@ class LLMUsageCallback(BaseCallbackHandler):
             input_tokens = 0
             output_tokens = 0
             
-            # Method 1: Check llm_output for token_usage (OpenAI format)
+            # Debug: Log response structure
+            logger.debug(f"LLM Response structure for {self.model_selection}:")
+            logger.debug(f"  response type: {type(response)}")
+            logger.debug(f"  response.__dict__ keys: {list(response.__dict__.keys()) if hasattr(response, '__dict__') else 'N/A'}")
+            
+            # Check for run field with usage_metadata (newer LangChain)
+            if hasattr(response, 'run') and response.run:
+                logger.debug(f"  run type: {type(response.run)}")
+                if hasattr(response.run, 'usage_metadata'):
+                    logger.debug(f"  run.usage_metadata: {response.run.usage_metadata}")
+            
+            if hasattr(response, 'generations') and response.generations:
+                logger.debug(f"  generations count: {len(response.generations)}")
+                if response.generations and len(response.generations) > 0 and len(response.generations[0]) > 0:
+                    gen = response.generations[0][0]
+                    logger.debug(f"  first generation type: {type(gen)}")
+                    if hasattr(gen, 'generation_info') and gen.generation_info:
+                        logger.debug(f"  generation_info keys: {list(gen.generation_info.keys())}")
+                    if hasattr(gen, 'message'):
+                        msg = gen.message
+                        if hasattr(msg, 'response_metadata') and msg.response_metadata:
+                            logger.debug(f"  message.response_metadata keys: {list(msg.response_metadata.keys())}")
+                        if hasattr(msg, 'usage_metadata'):
+                            logger.debug(f"  message.usage_metadata: {msg.usage_metadata}")
+            
+            # Log llm_output structure
+            logger.debug(f"  llm_output type: {type(response.llm_output)}")
+            if response.llm_output:
+                logger.debug(f"  llm_output keys: {list(response.llm_output.keys())}")
+                logger.debug(f"  llm_output content: {response.llm_output}")
+            
+            # Method 1: Check llm_output for token_usage (OpenAI format - older LangChain)
             if response.llm_output and 'token_usage' in response.llm_output:
                 token_usage = response.llm_output['token_usage']
                 input_tokens = token_usage.get('prompt_tokens', 0)
                 output_tokens = token_usage.get('completion_tokens', 0)
+                logger.debug(f"  ✓ Found tokens via Method 1 (llm_output.token_usage)")
             
             # Method 2: Check llm_output for usage (alternative format)
             elif response.llm_output and 'usage' in response.llm_output:
                 usage = response.llm_output['usage']
                 input_tokens = usage.get('prompt_tokens', 0) or usage.get('input_tokens', 0)
                 output_tokens = usage.get('completion_tokens', 0) or usage.get('output_tokens', 0)
+                logger.debug(f"  ✓ Found tokens via Method 2 (llm_output.usage)")
             
-            # Method 3: Check generation_info in generations
+            # Method 3: Check message.usage_metadata (newer LangChain with langchain-openai 0.2+)
             elif hasattr(response, 'generations') and response.generations:
+                for generation_list in response.generations:
+                    for generation in generation_list:
+                        if hasattr(generation, 'message') and hasattr(generation.message, 'usage_metadata'):
+                            usage_metadata = generation.message.usage_metadata
+                            if usage_metadata:
+                                input_tokens += usage_metadata.get('input_tokens', 0)
+                                output_tokens += usage_metadata.get('output_tokens', 0)
+                                logger.debug(f"  ✓ Found tokens via Method 3 (message.usage_metadata)")
+                                break
+                    if input_tokens > 0 or output_tokens > 0:
+                        break
+            
+            # Method 4: Check generation_info in generations (fallback for older formats)
+            if input_tokens == 0 and output_tokens == 0 and hasattr(response, 'generations') and response.generations:
                 for generation_list in response.generations:
                     for generation in generation_list:
                         if hasattr(generation, 'generation_info') and generation.generation_info:
@@ -258,12 +305,14 @@ class LLMUsageCallback(BaseCallbackHandler):
                             if usage:
                                 input_tokens += usage.get('prompt_tokens', 0) or usage.get('input_tokens', 0)
                                 output_tokens += usage.get('completion_tokens', 0) or usage.get('output_tokens', 0)
+                                logger.debug(f"  ✓ Found tokens via Method 4 (generation_info.usage)")
                             
                             # Try 'token_usage' key
                             token_usage = generation.generation_info.get('token_usage', {})
                             if token_usage:
                                 input_tokens += token_usage.get('prompt_tokens', 0) or token_usage.get('input_tokens', 0)
                                 output_tokens += token_usage.get('completion_tokens', 0) or token_usage.get('output_tokens', 0)
+                                logger.debug(f"  ✓ Found tokens via Method 4 (generation_info.token_usage)")
             
             # If still no tokens found, log warning for debugging
             if input_tokens == 0 and output_tokens == 0:
