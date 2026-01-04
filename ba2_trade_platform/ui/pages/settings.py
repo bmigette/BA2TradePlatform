@@ -521,6 +521,8 @@ class AppSettingsTab:
         google = session.exec(select(AppSetting).where(AppSetting.key == 'google_api_key')).first()
         openrouter = session.exec(select(AppSetting).where(AppSetting.key == 'openrouter_api_key')).first()
         xai = session.exec(select(AppSetting).where(AppSetting.key == 'xai_api_key')).first()
+        xai_admin = session.exec(select(AppSetting).where(AppSetting.key == 'xai_admin_api_key')).first()
+        xai_team_id = session.exec(select(AppSetting).where(AppSetting.key == 'xai_team_id')).first()
         moonshot = session.exec(select(AppSetting).where(AppSetting.key == 'moonshot_api_key')).first()
         deepseek = session.exec(select(AppSetting).where(AppSetting.key == 'deepseek_api_key')).first()
         aws_access_key = session.exec(select(AppSetting).where(AppSetting.key == 'aws_access_key_id')).first()
@@ -585,6 +587,11 @@ class AppSettingsTab:
                     with ui.row().classes('w-full items-center gap-2'):
                         self.xai_input = ui.input(label='xAI API Key', value=xai.value_str if xai else '', password=True, password_toggle_button=True).classes('flex-1')
                         ui.link('Get xAI Key', 'https://console.x.ai/', new_tab=True).classes('text-sm text-blue-600 underline')
+                    with ui.row().classes('w-full items-center gap-2'):
+                        self.xai_admin_input = ui.input(label='xAI Admin API Key (for billing/usage data)', value=xai_admin.value_str if xai_admin else '', password=True, password_toggle_button=True).classes('flex-1')
+                        ui.link('Management API Docs', 'https://docs.x.ai/docs/key-information/using-management-api', new_tab=True).classes('text-sm text-blue-600 underline')
+                    self.xai_team_id_input = ui.input(label='xAI Team ID (e.g., team-xxxxx)', value=xai_team_id.value_str if xai_team_id else '').classes('w-full')
+                    ui.label('Find your Team ID in the xAI console URL or account settings').classes('text-xs text-gray-500')
             
             with ui.expansion('Moonshot (Kimi)', icon='nightlight').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
@@ -723,6 +730,12 @@ class AppSettingsTab:
             
             # xAI API Key
             self._save_app_setting(session, 'xai_api_key', self.xai_input.value)
+            
+            # xAI Admin API Key
+            self._save_app_setting(session, 'xai_admin_api_key', self.xai_admin_input.value)
+            
+            # xAI Team ID
+            self._save_app_setting(session, 'xai_team_id', self.xai_team_id_input.value)
             
             # Moonshot API Key
             self._save_app_setting(session, 'moonshot_api_key', self.moonshot_input.value)

@@ -692,49 +692,102 @@ class ModelBillingUsage:
     
     @classmethod
     async def get_xai_usage_async(cls) -> Dict[str, Any]:
-        """Fetch xAI (Grok) usage data from the API asynchronously.
+        """Fetch xAI (Grok) usage data from the Management API asynchronously.
         
-        Note: xAI's API may not provide direct usage/billing endpoints.
-        This validates the API key status.
+        Uses the Management API to get prepaid balance and current invoice.
+        Requires xai_admin_api_key and xai_team_id settings.
         
         Returns:
-            Dictionary with usage status
+            Dictionary with usage status, balance, and current month usage
         """
         try:
-            api_key = cls._get_app_setting('xai_api_key')
+            admin_key = cls._get_app_setting('xai_admin_api_key')
+            team_id = cls._get_app_setting('xai_team_id')
             
-            if not api_key:
-                return {'error': 'xAI API key not configured in settings'}
+            if not admin_key:
+                return {'error': 'xAI Admin API key not configured in settings'}
             
-            headers = {'Authorization': f'Bearer {api_key}'}
+            if not team_id:
+                return {'error': 'xAI Team ID not configured in settings'}
+            
+            headers = {
+                'Authorization': f'Bearer {admin_key}',
+                'Content-Type': 'application/json'
+            }
             
             try:
                 async with aiohttp.ClientSession() as session:
-                    # Try to get models list to verify key
-                    test_url = 'https://api.x.ai/v1/models'
+                    # Get prepaid balance
+                    balance_url = f'https://management-api.x.ai/v1/billing/teams/{team_id}/prepaid/balance'
+                    balance_data = None
                     
-                    async with session.get(test_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    async with session.get(balance_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
                         if response.status == 200:
-                            return {
-                                'provider': 'xai',
-                                'provider_display': 'xAI (Grok)',
-                                'status': 'configured',
-                                'note': 'xAI usage details available at console.x.ai',
-                                'last_updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                            }
-                        elif response.status == 401:
-                            return {'error': 'Invalid xAI API key'}
+                            balance_data = await response.json()
                         else:
-                            return {
-                                'provider': 'xai',
-                                'provider_display': 'xAI (Grok)',
-                                'status': 'unknown',
-                                'note': 'Could not verify API key status',
-                                'last_updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                            }
+                            logger.warning(f'xAI balance API returned {response.status}')
+                    
+                    # Get current invoice preview
+                    invoice_url = f'https://management-api.x.ai/v1/billing/teams/{team_id}/postpaid/invoice/preview'
+                    invoice_data = None
+                    
+                    async with session.get(invoice_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                        if response.status == 200:
+                            invoice_data = await response.json()
+                        else:
+                            logger.warning(f'xAI invoice API returned {response.status}')
+                    
+                    # Parse the data
+                    result = {
+                        'provider': 'xai',
+                        'provider_display': 'xAI (Grok)',
+                        'status': 'configured',
+                        'last_updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    }
+                    
+                    # Initialize default values for widget
+                    remaining_credit = None
+                    month_cost = 0.0
+                    total_purchased = 0.0
+                    
+                    # Get total purchased from balance endpoint
+                    if balance_data and 'total' in balance_data:
+                        # Total is in cents, negative means purchased/added credits
+                        total_cents = int(balance_data['total'].get('val', 0))
+                        total_purchased = abs(total_cents) / 100.0
+                        result['total_purchased_usd'] = total_purchased
+                    
+                    if invoice_data and 'coreInvoice' in invoice_data:
+                        core = invoice_data['coreInvoice']
+                        
+                        # Current month usage (in cents)
+                        if 'totalWithCorr' in core:
+                            month_cents = int(core['totalWithCorr'].get('val', 0))
+                            month_cost = month_cents / 100.0
+                            result['current_month_usd'] = month_cost
+                        
+                        # Calculate remaining balance from prepaidCredits and prepaidCreditsUsed
+                        # prepaidCredits = total available at start of billing cycle
+                        # prepaidCreditsUsed = used this month
+                        # Remaining = prepaidCredits - prepaidCreditsUsed
+                        if 'prepaidCredits' in core and 'prepaidCreditsUsed' in core:
+                            total_available_cents = int(core['prepaidCredits'].get('val', 0))
+                            used_this_month_cents = int(core['prepaidCreditsUsed'].get('val', 0))
+                            
+                            # Both are negative, so remaining = total - used
+                            remaining_cents = total_available_cents - used_this_month_cents
+                            remaining_credit = abs(remaining_cents) / 100.0
+                            result['remaining_balance_usd'] = remaining_credit
+                    
+                    # Add fields for widget compatibility
+                    result['remaining_credit'] = remaining_credit
+                    result['month_cost'] = month_cost
+                    result['week_cost'] = 0.0  # xAI doesn't provide week breakdown
+                    
+                    return result
                             
             except aiohttp.ClientError as e:
-                logger.error(f'Network error calling xAI API: {e}', exc_info=True)
+                logger.error(f'Network error calling xAI Management API: {e}', exc_info=True)
                 return {'error': f'Network error: {str(e)}'}
                 
         except Exception as e:
