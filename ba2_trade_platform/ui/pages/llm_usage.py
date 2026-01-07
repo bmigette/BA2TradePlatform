@@ -154,7 +154,7 @@ class LLMUsagePage:
             }]
         }
         
-        chart = ui.echart(chart_options).classes('w-full h-64')
+        chart = ui.echart(chart_options).classes('w-full h-96')
         self.charts['tokens_over_time'] = chart
         return chart
     
@@ -253,7 +253,7 @@ class LLMUsagePage:
             }]
         }
         
-        chart = ui.echart(chart_options).classes('w-full h-64')
+        chart = ui.echart(chart_options).classes('w-full h-96')
         self.charts['usage_by_model'] = chart
         return chart
     
@@ -324,7 +324,7 @@ class LLMUsagePage:
             }]
         }
         
-        chart = ui.echart(chart_options).classes('w-full h-64')
+        chart = ui.echart(chart_options).classes('w-full h-96')
         self.charts['usage_by_provider'] = chart
         return chart
     
@@ -423,7 +423,7 @@ class LLMUsagePage:
             }]
         }
         
-        chart = ui.echart(chart_options).classes('w-full h-64')
+        chart = ui.echart(chart_options).classes('w-full h-96')
         self.charts['usage_by_use_case'] = chart
         return chart
     
@@ -522,7 +522,7 @@ class LLMUsagePage:
             }]
         }
         
-        chart = ui.echart(chart_options).classes('w-full h-64')
+        chart = ui.echart(chart_options).classes('w-full h-96')
         self.charts['usage_by_expert'] = chart
         return chart
     
@@ -547,7 +547,12 @@ class LLMUsagePage:
             dt = datetime.fromisoformat(row['timestamp'])
             row['timestamp'] = dt.strftime('%Y-%m-%d %H:%M:%S')
         
-        table = ui.table(columns=columns, rows=data, row_key='id').classes('w-full')
+        table = ui.table(
+            columns=columns, 
+            rows=data, 
+            row_key='id',
+            pagination={'rowsPerPage': 50, 'sortBy': 'timestamp', 'descending': True}
+        ).classes('w-full')
         table.add_slot('body-cell-tokens', '''
             <q-td :props="props">
                 <q-badge color="primary">{{ props.value.toLocaleString() }}</q-badge>
@@ -569,8 +574,6 @@ class LLMUsagePage:
             self.summary_cards['Total Tokens'].set_text(format_number(summary['total_tokens']))
         if 'Unique Models' in self.summary_cards:
             self.summary_cards['Unique Models'].set_text(str(summary['unique_models']))
-        if 'Estimated Cost' in self.summary_cards and summary['estimated_cost_usd']:
-            self.summary_cards['Estimated Cost'].set_text(format_cost(summary['estimated_cost_usd']))
         
         # Update charts
         if 'tokens_over_time' in self.charts:
@@ -659,7 +662,7 @@ class LLMUsagePage:
             self.charts['usage_by_expert'].update()
         
         if self.recent_table:
-            data = get_recent_requests(100)
+            data = get_recent_requests(1000)
             for row in data:
                 dt = datetime.fromisoformat(row['timestamp'])
                 row['timestamp'] = dt.strftime('%Y-%m-%d %H:%M:%S')
@@ -701,8 +704,6 @@ class LLMUsagePage:
                 self.create_summary_card('Total Tokens', '0', 'data_usage', 'green')
             with ui.column().classes('flex-grow'):
                 self.create_summary_card('Unique Models', '0', 'model_training', 'orange')
-            with ui.column().classes('flex-grow'):
-                self.create_summary_card('Estimated Cost', '$0.00', 'attach_money', 'red')
         
         # Charts
         ui.label('Usage Analytics').classes('text-h6 mb-2 mt-4')
@@ -724,9 +725,9 @@ class LLMUsagePage:
                 self.create_usage_by_expert_chart(get_usage_by_expert(self.days_filter, 10))
         
         # Recent requests table
-        ui.label('Recent Requests').classes('text-h6 mb-2 mt-4')
+        ui.label('Recent Requests (Last 1000)').classes('text-h6 mb-2 mt-4')
         with ui.card().classes('w-full'):
-            self.create_recent_requests_table(get_recent_requests(100))
+            self.create_recent_requests_table(get_recent_requests(1000))
         
         # Initial data load
         asyncio.create_task(self.load_data())

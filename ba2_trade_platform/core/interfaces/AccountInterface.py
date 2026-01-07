@@ -895,19 +895,57 @@ class AccountInterface(ExtendableSettingsInterface):
                 logger.warning(f"Could not get current price for {trading_order.symbol} in position size validation")
                 return errors
             
-            position_value = current_price * trading_order.quantity
+            # For adjust operations, we need to check the NEW TOTAL position, not just the delta
+            # Get the current position size from the transaction
+            current_position_qty = abs(transaction.quantity or 0)
+            current_position_value = current_position_qty * current_price
             
-            # Check if position exceeds limit
-            if position_value > max_position_value:
-                errors.append(
-                    f"Position size ${position_value:.2f} exceeds expert's max allowed ${max_position_value:.2f} "
-                    f"({max_position_pct:.1f}% of virtual equity ${virtual_equity:.2f}). "
-                    f"Reduce quantity to {int(max_position_value / current_price)} or less."
-                )
-                logger.error(
-                    f"POSITION SIZE LIMIT EXCEEDED: Order for {trading_order.quantity} shares of {trading_order.symbol} "
-                    f"(${position_value:.2f}) exceeds expert {expert_instance.id} limit of ${max_position_value:.2f}"
-                )
+            # Check if this is adding to an existing position
+            # If the order direction matches the position direction, it's adding
+            is_adding_to_position = False
+            if transaction.trading_orders:
+                entry_order = transaction.trading_orders[0]
+                # If order side matches entry side, we're adding to position
+                if entry_order.side == trading_order.side:
+                    is_adding_to_position = True
+            
+            if is_adding_to_position:
+                # Calculate the new total position value after this order
+                new_total_qty = current_position_qty + trading_order.quantity
+                new_total_value = new_total_qty * current_price
+                
+                # Check if new total exceeds limit
+                if new_total_value > max_position_value:
+                    max_additional_value = max_position_value - current_position_value
+                    max_additional_qty = int(max_additional_value / current_price) if max_additional_value > 0 else 0
+                    
+                    errors.append(
+                        f"Adding {trading_order.quantity} shares would bring total position to ${new_total_value:.2f}, "
+                        f"exceeding expert's max allowed ${max_position_value:.2f} "
+                        f"({max_position_pct:.1f}% of virtual equity ${virtual_equity:.2f}). "
+                        f"Current position: {current_position_qty} shares (${current_position_value:.2f}). "
+                        f"Can add up to {max_additional_qty} more shares."
+                    )
+                    logger.error(
+                        f"POSITION SIZE LIMIT EXCEEDED: Adding {trading_order.quantity} shares of {trading_order.symbol} "
+                        f"to existing {current_position_qty} shares (new total ${new_total_value:.2f}) "
+                        f"exceeds expert {expert_instance.id} limit of ${max_position_value:.2f}"
+                    )
+            else:
+                # This is a new position or closing position - validate the order quantity directly
+                position_value = current_price * trading_order.quantity
+                
+                # Check if position exceeds limit
+                if position_value > max_position_value:
+                    errors.append(
+                        f"Position size ${position_value:.2f} exceeds expert's max allowed ${max_position_value:.2f} "
+                        f"({max_position_pct:.1f}% of virtual equity ${virtual_equity:.2f}). "
+                        f"Reduce quantity to {int(max_position_value / current_price)} or less."
+                    )
+                    logger.error(
+                        f"POSITION SIZE LIMIT EXCEEDED: Order for {trading_order.quantity} shares of {trading_order.symbol} "
+                        f"(${position_value:.2f}) exceeds expert {expert_instance.id} limit of ${max_position_value:.2f}"
+                    )
                 
         except Exception as e:
             # Don't fail the entire validation if position size check has an error
