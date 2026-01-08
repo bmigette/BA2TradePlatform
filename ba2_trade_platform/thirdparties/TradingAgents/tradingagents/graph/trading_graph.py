@@ -402,6 +402,17 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             Returns:
                 str: Technical indicator data for the symbol.
             """
+            # Validate indicator parameter - detect if user passed a stock symbol instead
+            VALID_INDICATORS = ['rsi', 'macd', 'macdh', 'macds', 'boll', 'boll_ub', 'boll_lb', 
+                               'atr', 'close_50_sma', 'close_200_sma', 'close_10_ema', 'vwma', 'mfi']
+            
+            if indicator not in VALID_INDICATORS:
+                return (f"ERROR: '{indicator}' is not a valid technical indicator name. "
+                       f"You likely passed a stock symbol by mistake. "
+                       f"Valid indicators are: {', '.join(VALID_INDICATORS)}. "
+                       f"To analyze a different stock, use the 'symbol' parameter instead. "
+                       f"Example: get_indicator_data(indicator='rsi', symbol='{indicator}')")
+            
             actual_symbol = symbol or self.ticker
             if not actual_symbol:
                 return "Error: No symbol provided and no ticker set in graph state."

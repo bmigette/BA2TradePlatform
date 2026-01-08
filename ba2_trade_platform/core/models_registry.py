@@ -440,7 +440,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "display_name": "Kimi K2",
         "description": "Moonshot AI's Kimi K2 flagship model",
         "provider_names": {
-            PROVIDER_MOONSHOT: "kimi-k2-0711-preview",
+            PROVIDER_MOONSHOT: "kimi-k2-0905-preview",
             PROVIDER_NAGAAI: "kimi-k2",
             PROVIDER_OPENROUTER: "moonshot/kimi-k2",
         },
