@@ -262,18 +262,19 @@ class InstrumentGraph:
                 specs=specs
             )
             
-            # Prepare x-axis data - convert to ISO strings for JSON serialization
-            # Plotly accepts datetime strings and will parse them correctly
+            # Use INTEGER indices for x-axis instead of datetime objects
+            # This creates a continuous axis regardless of time gaps (weekends, overnight, etc.)
+            x_data = list(range(len(self.price_data)))
+            
+            # Store datetime labels for axis display and hover text
             if isinstance(self.price_data.index, pd.DatetimeIndex):
-                x_data = self.price_data.index.strftime('%Y-%m-%d %H:%M:%S').tolist()
+                datetime_labels = [dt.strftime('%Y-%m-%d %H:%M') for dt in self.price_data.index]
             else:
-                x_data = self.price_data.get('Date', list(range(len(self.price_data))))
+                datetime_labels = [str(i) for i in range(len(self.price_data))]
             
-            logger.debug(f"Price data: {len(self.price_data)} rows, index type: {type(self.price_data.index)}, "
-                        f"first: {self.price_data.index[0] if len(self.price_data) > 0 else 'N/A'}, "
-                        f"last: {self.price_data.index[-1] if len(self.price_data) > 0 else 'N/A'}")
+            logger.debug(f"Price data: {len(self.price_data)} rows, using integer x-axis with {len(datetime_labels)} datetime labels")
             
-            # Add candlestick chart for price
+            # Add candlestick chart for price with datetime labels
             if all(col in self.price_data.columns for col in ['Open', 'High', 'Low', 'Close']):
                 fig.add_trace(
                     go.Candlestick(
@@ -287,7 +288,9 @@ class InstrumentGraph:
                         increasing_fillcolor='#26a69a',
                         decreasing_line_color='#ef5350',  # Red for down
                         decreasing_fillcolor='#ef5350',
-                        showlegend=True
+                        showlegend=True,
+                        text=datetime_labels,
+                        hovertext=datetime_labels
                     ),
                     row=1, col=1,
                     secondary_y=False
@@ -323,11 +326,8 @@ class InstrumentGraph:
                         break
                 
                 if value_col:
-                    # Convert indicator x-axis to same datetime string format as price data
-                    if isinstance(indicator_df.index, pd.DatetimeIndex):
-                        indicator_x = indicator_df.index.strftime('%Y-%m-%d %H:%M:%S').tolist()
-                    else:
-                        indicator_x = list(range(len(indicator_df)))
+                    # Use SAME integer x-axis as price data for perfect alignment
+                    indicator_x = x_data
                     
                     logger.debug(f"Indicator '{indicator_name}': {len(indicator_df)} rows, "
                                 f"first: {indicator_df.index[0] if len(indicator_df) > 0 else 'N/A'}")
@@ -340,6 +340,7 @@ class InstrumentGraph:
                             name=indicator_name,
                             line=dict(width=1.5, color=colors[color_idx % len(colors)]),
                             opacity=0.8,
+                            connectgaps=True,  # Ensure continuous lines across date gaps
                             showlegend=True
                         ),
                         row=1, col=1,
@@ -390,11 +391,8 @@ class InstrumentGraph:
                         logger.debug(f"Oscillator '{indicator_name}': value_col='{value_col}', non-NaN values: {non_nan_count}/{len(indicator_df)}, "
                                    f"min={indicator_df[value_col].min()}, max={indicator_df[value_col].max()}")
                         
-                        # Convert indicator x-axis to same datetime string format
-                        if isinstance(indicator_df.index, pd.DatetimeIndex):
-                            indicator_x = indicator_df.index.strftime('%Y-%m-%d %H:%M:%S').tolist()
-                        else:
-                            indicator_x = list(range(len(indicator_df)))
+                        # Use SAME integer x-axis as price data for perfect alignment
+                        indicator_x = x_data
                         
                         fig.add_trace(
                             go.Scatter(
@@ -403,6 +401,7 @@ class InstrumentGraph:
                                 mode='lines',
                                 name=indicator_name,
                                 line=dict(width=2, color=colors[color_idx % len(colors)]),
+                                connectgaps=True,  # Ensure continuous lines across date gaps
                                 showlegend=True
                             ),
                             row=current_row, col=1
@@ -437,11 +436,8 @@ class InstrumentGraph:
                             logger.debug(f"Momentum '{indicator_name}' column '{col}': non-NaN values: {non_nan_count}/{len(indicator_df)}, "
                                        f"min={indicator_df[col].min()}, max={indicator_df[col].max()}")
                             
-                            # Convert indicator x-axis to same datetime string format
-                            if isinstance(indicator_df.index, pd.DatetimeIndex):
-                                indicator_x = indicator_df.index.strftime('%Y-%m-%d %H:%M:%S').tolist()
-                            else:
-                                indicator_x = list(range(len(indicator_df)))
+                            # Use SAME integer x-axis as price data for perfect alignment
+                            indicator_x = x_data
                             
                             # Use bar chart for histogram, line for others
                             is_histogram = 'hist' in col.lower()
@@ -467,6 +463,7 @@ class InstrumentGraph:
                                         mode='lines',
                                         name=f"{indicator_name} - {col}",
                                         line=dict(width=2, color=colors[color_idx % len(colors)]),
+                                        connectgaps=True,  # Ensure continuous lines across date gaps
                                         showlegend=True
                                     ),
                                     row=current_row, col=1
@@ -479,26 +476,29 @@ class InstrumentGraph:
             # Add recommendation date marker (vertical line across all subplots)
             if self.recommendation_date:
                 try:
-                    # Convert recommendation_date to string format matching x-axis
-                    if hasattr(self.recommendation_date, 'strftime'):
-                        rec_date_str = self.recommendation_date.strftime('%Y-%m-%d %H:%M:%S')
-                    else:
-                        rec_date_str = str(self.recommendation_date)
+                    # Find the index position of the recommendation date in the price data
+                    rec_date = pd.Timestamp(self.recommendation_date)
+                    if rec_date.tz is None and self.price_data.index.tz is not None:
+                        rec_date = rec_date.tz_localize('UTC')
+                    elif rec_date.tz is not None and self.price_data.index.tz is None:
+                        rec_date = rec_date.tz_localize(None)
                     
-                    logger.info(f"Adding recommendation date marker at: {rec_date_str}")
+                    # Find closest matching timestamp in index
+                    try:
+                        rec_idx = self.price_data.index.get_loc(rec_date, method='nearest')
+                    except:
+                        # Fallback: find closest timestamp manually
+                        time_diffs = abs(self.price_data.index - rec_date)
+                        rec_idx = time_diffs.argmin()
                     
-                    # Use shapes instead of add_vline to avoid parameter issues
-                    # Add a vertical line shape for each subplot
+                    logger.info(f"Adding recommendation date marker at index {rec_idx} (date: {self.recommendation_date})")
+                    
+                    # Use shapes to add vertical line at integer x position
                     for row_idx in range(1, num_rows + 1):
-                        # Calculate y-domain for this subplot
-                        # Subplots are stacked vertically, each takes equal space
-                        y_start = 1 - (row_idx / num_rows)
-                        y_end = 1 - ((row_idx - 1) / num_rows)
-                        
                         fig.add_shape(
                             type="line",
-                            x0=rec_date_str,
-                            x1=rec_date_str,
+                            x0=rec_idx,
+                            x1=rec_idx,
                             y0=0,
                             y1=1,
                             yref=f"y{'' if row_idx == 1 else row_idx} domain",
@@ -531,7 +531,7 @@ class InstrumentGraph:
                         label = "📊 Recommendation"
                     
                     fig.add_annotation(
-                        x=rec_date_str,
+                        x=rec_idx,
                         y=1.0,
                         yref="y domain",
                         xref="x",
@@ -587,30 +587,14 @@ class InstrumentGraph:
                 )
             )
             
-            # Update axes with rangebreaks to remove gaps
-            # Determine if we're looking at intraday data (has time component)
-            if isinstance(self.price_data.index, pd.DatetimeIndex) and len(self.price_data) > 0:
-                first_date = self.price_data.index[0]
-                has_time = first_date.hour != 0 or first_date.minute != 0
-                
-                rangebreaks = []
-                # Always remove weekends
-                rangebreaks.append(dict(bounds=["sat", "mon"]))
-                
-                # For intraday data, remove overnight periods (market closed 20:00-13:30 UTC)
-                # This is approximate for US markets (9:30 AM - 4:00 PM ET = 14:30-21:00 UTC)
-                if has_time:
-                    rangebreaks.append(
-                        dict(
-                            bounds=[20, 13.5],  # 8 PM to 1:30 PM UTC (overnight)
-                            pattern="hour"
-                        )
-                    )
-            else:
-                rangebreaks = [dict(bounds=["sat", "mon"])]  # Just weekends for daily data
-            
             # Disable range slider on all x-axes (especially the main price chart)
             fig.update_xaxes(rangeslider_visible=False)
+            
+            # Configure x-axis to display datetime labels at appropriate intervals
+            # Show every 5th label for readability
+            tick_interval = max(1, len(datetime_labels) // 20)  # Show ~20 labels
+            tickvals = list(range(0, len(datetime_labels), tick_interval))
+            ticktext = [datetime_labels[i] for i in tickvals]
             
             fig.update_xaxes(
                 title_text="Date & Time",
@@ -622,7 +606,9 @@ class InstrumentGraph:
                 row=num_rows,
                 col=1,
                 tickangle=-45,  # Angle the labels for better readability with datetime
-                rangebreaks=rangebreaks  # Remove gaps
+                tickmode='array',
+                tickvals=tickvals,
+                ticktext=ticktext
             )
             
             # Primary y-axis (price)
