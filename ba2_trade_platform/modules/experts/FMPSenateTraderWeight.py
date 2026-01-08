@@ -94,6 +94,13 @@ class FMPSenateTraderWeight(MarketExpertInterface):
                 "default": 5.0,
                 "description": "Growth to confidence multiplier",
                 "tooltip": "Multiplier applied to trader's average growth on the symbol to calculate confidence. Formula: 50 + (avg_growth * multiplier). Higher values increase confidence for successful traders. Example: 10% growth * 5.0 = 50% bonus confidence."
+            },
+            "confidence_to_profit_factor": {
+                "type": "float",
+                "required": True,
+                "default": 0.15,
+                "description": "Confidence to profit factor",
+                "tooltip": "Factor to convert confidence to expected profit. Default 0.15 means 100% confidence = 15% expected profit. Formula: expected_profit = confidence * factor."
             }
         }
     
@@ -844,8 +851,10 @@ class FMPSenateTraderWeight(MarketExpertInterface):
         #   0% portfolio allocation * 5.0 = 0% bonus = 50% total confidence
         overall_confidence = min(100.0, max(0.0, 50.0 + avg_symbol_focus_pct * growth_multiplier))
         
-        # Expected Profit: Same formula (always positive regardless of BUY/SELL)
-        expected_profit = min(100.0, max(0.0, 50.0 + avg_symbol_focus_pct * growth_multiplier))
+        # Expected Profit: Confidence multiplied by profit factor (always positive regardless of BUY/SELL)
+        # Example: 80% confidence * 0.15 factor = 12% expected profit
+        confidence_to_profit_factor = self.get_setting_with_interface_default('confidence_to_profit_factor')
+        expected_profit = overall_confidence * confidence_to_profit_factor
         
         # Build detailed report
         details = f"""FMP Senate/House Trading Analysis

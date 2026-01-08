@@ -3291,21 +3291,21 @@ class OrderRecommendationsTab:
                     ).props('color=secondary').tooltip('Run risk management on pending orders and submit them to broker')
             
             # Controls Row 2: Filters
-            with ui.row().classes('w-full items-center mb-4 gap-2'):
+            with ui.row().classes('w-full items-center mb-4 gap-2 flex-wrap'):
                 # Expert filter
                 expert_options = self._get_expert_options()
                 self.expert_select = ui.select(
                     options=expert_options,
                     label='Expert Filter',
                     value='all'  # Default to 'all'
-                ).classes('w-48').props('dense outlined')
+                ).classes('w-44').props('dense outlined')
                 self.expert_select.on_value_change(self._on_expert_filter_change)
                 
                 # Symbol search filter
                 self.symbol_search = ui.input(
                     label='Symbol',
                     placeholder='Filter by symbol...'
-                ).classes('w-40').props('dense outlined')
+                ).classes('w-36').props('dense outlined')
                 self.symbol_search.on_value_change(lambda: self.refresh_data())
                 
                 # Action filter
@@ -3313,7 +3313,7 @@ class OrderRecommendationsTab:
                     options=['All', 'BUY', 'SELL', 'HOLD'],
                     label='Action',
                     value='All'
-                ).classes('w-32').props('dense outlined')
+                ).classes('w-28').props('dense outlined')
                 self.action_filter.on_value_change(lambda: self.refresh_data())
                 
                 # Show/Hide filter for orders
@@ -3321,7 +3321,7 @@ class OrderRecommendationsTab:
                     options=['All', 'With Orders', 'Without Orders'],
                     label='Order Status',
                     value='All'
-                ).classes('w-48').props('dense outlined')
+                ).classes('w-44').props('dense outlined')
                 self.order_status_filter.on_value_change(lambda: self.refresh_data())
             
             # Summary table container
@@ -3641,6 +3641,15 @@ class OrderRecommendationsTab:
                                    color="primary" 
                                    title="View Analysis"
                                    @click="$parent.$emit('view_analysis', props.row.analysis_id)" />
+                            <q-btn v-if="props.row.analysis_id" 
+                                   icon="bug_report" 
+                                   flat 
+                                   dense 
+                                   color="orange" 
+                                   title="Troubleshoot Ruleset"
+                                   @click="$parent.$emit('troubleshoot_ruleset_rec', props.row.analysis_id)">
+                                <q-tooltip>Troubleshoot Ruleset</q-tooltip>
+                            </q-btn>
                             <q-btn v-if="props.row.has_evaluation_data" 
                                    icon="search" 
                                    flat 
@@ -3653,6 +3662,7 @@ class OrderRecommendationsTab:
                     
                     rec_table.on('place_order_rec', self._handle_place_order_recommendation)
                     rec_table.on('view_analysis', self._handle_view_analysis)
+                    rec_table.on('troubleshoot_ruleset_rec', self.troubleshoot_ruleset)
                     rec_table.on('view_evaluation', self._handle_view_evaluation)
                     
         except Exception as e:

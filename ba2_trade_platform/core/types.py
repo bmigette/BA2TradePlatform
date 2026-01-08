@@ -293,6 +293,7 @@ class ExpertEventType(str, Enum):
     N_EXPECTED_PROFIT_TARGET_PERCENT = "expected_profit_target_percent"
     N_PERCENT_TO_CURRENT_TARGET = "percent_to_current_target"  # Distance from current price to current TP
     N_PERCENT_TO_NEW_TARGET = "percent_to_new_target"          # Distance from current price to new expert target
+    N_NEW_TARGET_PERCENT = "new_target_percent"                # Percent change from current TP to new target (positive if higher, negative if lower)
     N_PROFIT_LOSS_AMOUNT = "profit_loss_amount"
     N_PROFIT_LOSS_PERCENT = "profit_loss_percent"
     N_DAYS_OPENED = "days_opened"

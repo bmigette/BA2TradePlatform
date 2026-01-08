@@ -530,7 +530,8 @@ class FMPSenateTraderCopy(MarketExpertInterface):
     
     def _generate_recommendations(self, copy_trades: List[Dict[str, Any]], 
                                  symbol: str, 
-                                 current_price: float) -> Dict[str, Any]:
+                                 current_price: float,
+                                 subtype=None) -> Dict[str, Any]:
         """
         Generate recommendations from copy trades.
         
@@ -538,6 +539,7 @@ class FMPSenateTraderCopy(MarketExpertInterface):
             copy_trades: List of trades from followed traders
             symbol: Stock symbol
             current_price: Current stock price
+            subtype: AnalysisUseCase (ENTER_MARKET or OPEN_POSITION)
             
         Returns:
             Dictionary with recommendation details
@@ -612,9 +614,9 @@ class FMPSenateTraderCopy(MarketExpertInterface):
         else:
             primary_trader = 'Unknown'
         
-        # Copy trade: 100% confidence, 50% expected profit (always positive)
+        # Copy trade: 100% confidence, 0% expected profit (unknown profit potential)
         confidence = 100.0
-        expected_profit = 50.0  # Always positive regardless of BUY/SELL
+        expected_profit = 0.0
         
         # Build trade details
         trade_details = []
@@ -1039,7 +1041,7 @@ Recommendations Generated:"""
                     
                     # Generate recommendations for this symbol
                     recommendation_data = self._generate_recommendations(
-                        symbol_trades, trade_symbol, current_price
+                        symbol_trades, trade_symbol, current_price, subtype=AnalysisUseCase.ENTER_MARKET
                     )
                     
                     # Create ExpertRecommendation record for this symbol

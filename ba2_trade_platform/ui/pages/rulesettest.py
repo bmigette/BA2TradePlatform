@@ -413,6 +413,34 @@ class RulesetTestTab:
             # Get values from selections and inputs
             ruleset_id = self.ruleset_select.value
             
+            # Try to get real recommendation from market analysis if available
+            real_recommendation = None
+            if self.market_analysis_id:
+                with get_db() as session:
+                    statement = select(ExpertRecommendation).where(
+                        ExpertRecommendation.market_analysis_id == self.market_analysis_id
+                    ).order_by(ExpertRecommendation.created_at.desc()).limit(1)
+                    real_recommendation = session.exec(statement).first()
+            
+            # Get price_at_date from real recommendation or fetch current price as fallback
+            price_at_date = 100.0  # Default
+            if real_recommendation and real_recommendation.price_at_date:
+                price_at_date = real_recommendation.price_at_date
+                logger.info(f"Using price_at_date from real recommendation: ${price_at_date:.2f}")
+            else:
+                # Try to get current price from account
+                try:
+                    from ...core.utils import get_account_instance_from_id
+                    account = get_account_instance_from_id(self.account_select.value)
+                    if account:
+                        symbol = self.symbol_input.value.upper().strip()
+                        current_price = account.get_instrument_current_price(symbol)
+                        if current_price:
+                            price_at_date = current_price
+                            logger.info(f"Using current price as price_at_date: ${price_at_date:.2f}")
+                except Exception as e:
+                    logger.warning(f"Could not fetch current price, using default: {e}")
+            
             # Create test recommendation object (not saved to DB)
             from ...core.types import OrderRecommendation, RiskLevel, TimeHorizon
             test_recommendation = type('TestRecommendation', (), {
@@ -425,7 +453,7 @@ class RulesetTestTab:
                 'time_horizon': TimeHorizon(self.time_horizon_select.value),
                 'created_at': datetime.now(),
                 'instance_id': self.expert_select.value,
-                'price_at_date': 100.0,  # Default price for testing
+                'price_at_date': price_at_date,
                 'details': 'Test recommendation for ruleset evaluation',
                 'market_analysis_id': None
             })()

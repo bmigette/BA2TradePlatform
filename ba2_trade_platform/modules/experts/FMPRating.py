@@ -64,6 +64,13 @@ class FMPRating(MarketExpertInterface):
                 "default": 3,
                 "description": "Minimum number of analysts required for valid recommendation",
                 "tooltip": "Recommendations with fewer analysts than this threshold will result in HOLD with low confidence."
+            },
+            "target_price_type": {
+                "type": "str",
+                "required": True,
+                "default": "consensus",
+                "description": "Price target to use for profit calculation",
+                "tooltip": "Which analyst price target to use for expected profit calculation. Options: 'low' (conservative), 'consensus' (average), 'median' (middle value), 'high' (optimistic). Default is 'consensus'."
             }
         }
     
@@ -283,14 +290,22 @@ class FMPRating(MarketExpertInterface):
         if buy_score > sell_score and buy_score > hold_score:
             signal = OrderRecommendation.BUY
             dominant_score = buy_score
-            target_price = target_consensus  # Use consensus for expected profit calculation
         elif sell_score > buy_score and sell_score > hold_score:
             signal = OrderRecommendation.SELL
             dominant_score = sell_score
-            target_price = target_consensus  # Use consensus for expected profit calculation
         else:
             signal = OrderRecommendation.HOLD
             dominant_score = hold_score
+        
+        # Select target price based on setting
+        target_price_type = self.get_setting_with_interface_default('target_price_type')
+        if target_price_type == 'low':
+            target_price = target_low
+        elif target_price_type == 'high':
+            target_price = target_high
+        elif target_price_type == 'median':
+            target_price = target_median
+        else:  # 'consensus' is default
             target_price = target_consensus
         
         # Base confidence from analyst consensus (0-100 scale)
@@ -384,8 +399,8 @@ Avg Price Target Boost = ({boost_to_lower:.1f}% + {boost_to_consensus:.1f}%) / 2
 Step 4 - Final Confidence (clamped to 0-100%):
 Final Confidence = Base Confidence + Avg Boost = {base_confidence:.1f}% + {price_target_boost:.1f}% = {confidence:.1f}%
 
-Expected Profit Calculation:
-Price Delta = Consensus Target - Current = ${target_price:.2f} - ${current_price:.2f} = ${target_price - current_price:.2f}
+Expected Profit Calculation (using {target_price_type} target):
+Price Delta = {target_price_type.capitalize()} Target - Current = ${target_price:.2f} - ${current_price:.2f} = ${target_price - current_price:.2f}
 Weighted Delta = Price Delta × Confidence × Profit Ratio = ${target_price - current_price:.2f} × {confidence/100:.2f} × {profit_ratio} = ${(target_price - current_price) * (confidence/100) * profit_ratio:.2f}
 Expected Profit % = (Weighted Delta / Current) × 100 = {expected_profit_percent:.1f}%
 """

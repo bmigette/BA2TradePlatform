@@ -67,14 +67,14 @@ class FMPSenateTradeTab:
                     self.symbol_input = ui.input(
                         label='Symbol',
                         placeholder='e.g., AAPL, MSFT'
-                    ).classes('w-32')
+                    ).props('stack-label').classes('w-32')
                     self.symbol_input.on('keydown.enter', lambda: self._search_trades())
                     
                     # Trader name filter
                     self.trader_input = ui.input(
                         label='Trader Name',
                         placeholder='e.g., Pelosi'
-                    ).classes('w-48')
+                    ).props('stack-label').classes('w-48')
                     self.trader_input.on('keydown.enter', lambda: self._search_trades())
                     
                     # Trade type filter (Senate/House/All)
@@ -510,7 +510,7 @@ class AnalystRatingsTab:
                     self.symbol_input = ui.input(
                         label='Symbol',
                         placeholder='e.g., AAPL, MSFT, NVDA'
-                    ).classes('w-48')
+                    ).props('stack-label').classes('w-48')
                     self.symbol_input.on('keydown.enter', lambda: self._search_ratings())
                     
                     ui.button('Search', on_click=self._search_ratings, icon='search').props('color=primary')

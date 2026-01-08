@@ -7,7 +7,7 @@ def sidemenu() -> None:
     
     menu_items = [
         {'icon': 'dashboard', 'label': 'Overview', 'route': '/', 'description': 'Dashboard & Stats'},
-        {'icon': 'analytics', 'label': 'Market Analysis', 'route': '/marketanalysis', 'description': 'Charts & Indicators'},
+        {'icon': 'analytics', 'label': 'Market Analysis', 'route': '/marketanalysis', 'description': 'Experts Analysis'},
         {'icon': 'receipt_long', 'label': 'Activity Monitor', 'route': '/activitymonitor', 'description': 'System Logs'},
         {'icon': 'trending_up', 'label': 'Live Trades', 'route': '/livetrades', 'description': 'Active Positions'},
         {'icon': 'build', 'label': 'Tools', 'route': '/tools', 'description': 'Utilities'},

@@ -232,6 +232,9 @@ p, span, div, label, h1, h2, h3, h4, h5, h6, li, td, th, a {
     z-index: 10 !important;
 }
 
+/* Better label positioning when input has a value or is focused - REMOVED DUPLICATE */
+/* Already handled above with more comprehensive selectors */
+
 /* Ensure label doesn't get lost when field is filled */
 .q-field__control::before {
     border-color: rgba(160, 174, 192, 0.3) !important;
@@ -243,6 +246,9 @@ p, span, div, label, h1, h2, h3, h4, h5, h6, li, td, th, a {
     transform: none !important;
     margin-bottom: 4px !important;
     background: transparent !important;
+    font-size: 0.875rem !important;
+    padding: 0 !important;
+    color: #a0aec0 !important;
 }
 
 /* Select/Dropdown */

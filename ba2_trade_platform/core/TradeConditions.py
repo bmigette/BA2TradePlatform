@@ -745,6 +745,74 @@ class PercentToCurrentTargetCondition(CompareCondition):
         return f"Check if percent from current price to current TP for {self.instrument_name} is {self.operator_str} {self.value}%"
 
 
+class NewTargetPercentCondition(CompareCondition):
+    """Compare percent change from current TP to new expert target (positive if higher, negative if lower)."""
+    
+    def evaluate(self) -> bool:
+        try:
+            if not self.existing_order:
+                logger.debug(f"No existing order for new target percent evaluation")
+                self.calculated_value = None
+                return False
+            
+            # Get current TP price from transaction
+            current_tp_price = None
+            if self.existing_order.transaction_id:
+                from .db import get_instance
+                from .models import Transaction
+                transaction = get_instance(Transaction, self.existing_order.transaction_id)
+                if transaction and transaction.take_profit:
+                    current_tp_price = transaction.take_profit
+            
+            if current_tp_price is None:
+                logger.debug(f"No current TP price available for order {self.existing_order.id}")
+                self.calculated_value = None
+                return False
+            
+            # Calculate new expert target price
+            if not self.expert_recommendation:
+                logger.debug(f"No expert recommendation for new target evaluation")
+                self.calculated_value = None
+                return False
+            
+            if not hasattr(self.expert_recommendation, 'price_at_date') or not hasattr(self.expert_recommendation, 'expected_profit_percent'):
+                logger.error(f"Expert recommendation missing price_at_date or expected_profit_percent")
+                self.calculated_value = None
+                return False
+            
+            base_price = self.expert_recommendation.price_at_date
+            expected_profit = self.expert_recommendation.expected_profit_percent
+            
+            # Calculate new target based on recommendation direction
+            from .types import OrderRecommendation
+            if self.expert_recommendation.recommended_action == OrderRecommendation.BUY:
+                new_target_price = base_price * (1 + expected_profit / 100)
+            elif self.expert_recommendation.recommended_action == OrderRecommendation.SELL:
+                new_target_price = base_price * (1 - expected_profit / 100)
+            else:
+                logger.debug(f"Recommendation action is HOLD, cannot calculate target")
+                self.calculated_value = None
+                return False
+            
+            # Calculate percent difference: positive if new target higher, negative if lower
+            new_target_percent = ((new_target_price - current_tp_price) / current_tp_price) * 100
+            
+            self.calculated_value = new_target_percent  # Store calculated value
+            
+            logger.info(f"New target percent for {self.instrument_name}: current_TP=${current_tp_price:.2f}, new_target=${new_target_price:.2f}, change={new_target_percent:+.2f}%")
+            
+            return self.operator_func(new_target_percent, self.value)
+            
+        except Exception as e:
+            logger.error(f"Error evaluating new target percent condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+    
+    def get_description(self) -> str:
+        """Get description of new target percent condition."""
+        return f"Check if new target percent change for {self.instrument_name} is {self.operator_str} {self.value}%"
+
+
 class PercentToNewTargetCondition(CompareCondition):
     """Compare percent from current price to new expert target price."""
     
@@ -1052,6 +1120,7 @@ def create_condition(event_type: ExpertEventType, account: AccountInterface,
         ExpertEventType.N_EXPECTED_PROFIT_TARGET_PERCENT: ExpectedProfitTargetPercentCondition,
         ExpertEventType.N_PERCENT_TO_CURRENT_TARGET: PercentToCurrentTargetCondition,
         ExpertEventType.N_PERCENT_TO_NEW_TARGET: PercentToNewTargetCondition,
+        ExpertEventType.N_NEW_TARGET_PERCENT: NewTargetPercentCondition,
         ExpertEventType.N_PROFIT_LOSS_AMOUNT: ProfitLossAmountCondition,
         ExpertEventType.N_PROFIT_LOSS_PERCENT: ProfitLossPercentCondition,
         ExpertEventType.N_DAYS_OPENED: DaysOpenedCondition,
