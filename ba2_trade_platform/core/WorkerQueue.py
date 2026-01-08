@@ -9,7 +9,7 @@ through the AppSettings system.
 import threading
 import queue
 import time
-from typing import Callable, Any, Optional, Dict, Set
+from typing import Callable, Any, Optional, Dict, Set, List
 from dataclasses import dataclass
 from enum import Enum
 from datetime import datetime, timezone
@@ -18,6 +18,7 @@ from ..logger import logger
 from .db import get_setting, add_instance, update_instance, get_db
 from .models import AppSetting, PersistedQueueTask
 from .types import WorkerTaskStatus, AnalysisUseCase
+from .SmartPriorityQueue import SmartPriorityQueue
 
 
 
@@ -108,8 +109,8 @@ class WorkerQueue:
     
     def __init__(self):
         """Initialize the WorkerQueue system."""
-        self._queue = queue.PriorityQueue()
-        self._workers = []
+        self._queue = SmartPriorityQueue()  # Custom queue with expert-based round-robin
+        self._workers: Dict[int, threading.Thread] = {}  # Maps thread id to thread object
         self._worker_count = 0
         self._running = False
         self._shutdown_event = threading.Event()
@@ -150,8 +151,12 @@ class WorkerQueue:
                 name=f"Worker-{i+1}",
                 daemon=True
             )
+            worker_thread.current_task = None  # Track current task for round-robin
             worker_thread.start()
-            self._workers.append(worker_thread)
+            self._workers[id(worker_thread)] = worker_thread
+            
+        # Link the queue to workers for round-robin logic
+        self._queue.threads = self._workers
             
         self._worker_count = worker_count
         logger.info(f"WorkerQueue started successfully with {worker_count} workers")
@@ -173,18 +178,18 @@ class WorkerQueue:
         self._shutdown_event.set()
         
         # Signal all workers to stop by adding sentinel values
-        for _ in self._workers:
+        for _ in self._workers.values():
             self._queue.put((0, 0, None))  # (priority, counter, task)
             
         # Wait for workers to finish
         start_time = time.time()
-        for worker in self._workers:
+        for worker in self._workers.values():
             remaining_time = timeout - (time.time() - start_time)
             if remaining_time > 0:
                 worker.join(timeout=remaining_time)
                 
         # Check if all workers stopped
-        alive_workers = [w for w in self._workers if w.is_alive()]
+        alive_workers = [w for w in self._workers.values() if w.is_alive()]
         if alive_workers:
             logger.warning(f"{len(alive_workers)} workers did not stop within timeout")
         else:
@@ -712,17 +717,23 @@ class WorkerQueue:
     def _worker_loop(self):
         """Main loop for worker threads."""
         worker_name = threading.current_thread().name
+        current_thread = threading.current_thread()
         logger.info(f"Worker {worker_name} started")
         
         while self._running and not self._shutdown_event.is_set():
             try:
                 # Get task from queue with timeout (priority, counter, task)
+                # SmartPriorityQueue will do round-robin selection based on expert_id
                 priority, counter, task = self._queue.get(timeout=1.0)
                 
                 # Check for sentinel value (shutdown signal)
                 if task is None:
+                    current_thread.current_task = None
                     self._queue.task_done()  # Mark sentinel task as done
                     break
+                
+                # Track current task for round-robin fairness
+                current_thread.current_task = task
                 
                 # Handle different task types
                 if isinstance(task, SmartRiskManagerTask):
@@ -732,6 +743,7 @@ class WorkerQueue:
                     except Exception as e:
                         logger.error(f"Error executing Smart Risk Manager task in worker {worker_name}: {e}", exc_info=True)
                     finally:
+                        current_thread.current_task = None
                         self._queue.task_done()
                     continue
                 
@@ -742,6 +754,7 @@ class WorkerQueue:
                     except Exception as e:
                         logger.error(f"Error executing instrument expansion task in worker {worker_name}: {e}", exc_info=True)
                     finally:
+                        current_thread.current_task = None
                         self._queue.task_done()
                     continue
                 
@@ -816,6 +829,7 @@ class WorkerQueue:
                         if task_key in self._task_keys and self._task_keys[task_key] == task.id:
                             del self._task_keys[task_key]
                     
+                    current_thread.current_task = None
                     self._queue.task_done()
                     continue
                 
@@ -825,10 +839,13 @@ class WorkerQueue:
                 except Exception as e:
                     logger.error(f"Error executing task in worker {worker_name}: {e}", exc_info=True)
                 finally:
-                    # Always mark task as done after getting it from queue
+                    # Clear current task and mark as done
+                    current_thread.current_task = None
                     self._queue.task_done()
                     
             except queue.Empty:
+                # No task available, clear current task
+                current_thread.current_task = None
                 continue
             except Exception as e:
                 logger.error(f"Unexpected error in worker {worker_name}: {e}", exc_info=True)
