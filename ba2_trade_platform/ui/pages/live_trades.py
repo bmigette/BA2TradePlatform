@@ -1875,14 +1875,14 @@ class LiveTradesTab:
                         ui.label('Expert').classes('text-caption text-grey-7')
                         ui.label(expert_name).classes('text-body1 font-bold')
 
-                # Transaction Metadata
-                if txn.metadata and txn.metadata:
+                # Transaction Meta Data
+                if txn.meta_data and txn.meta_data:
                     with ui.card().classes('w-full mb-4'):
-                        ui.label('🗃️ Transaction Metadata').classes('text-h6 mb-3')
+                        ui.label('🗃️ Transaction Meta Data').classes('text-h6 mb-3')
                         
                         # Show TradeConditionsData if available
-                        if 'TradeConditionsData' in txn.metadata:
-                            trade_conditions = txn.metadata['TradeConditionsData']
+                        if 'TradeConditionsData' in txn.meta_data:
+                            trade_conditions = txn.meta_data['TradeConditionsData']
                             with ui.card().classes('bg-yellow/10'):
                                 ui.label('Trade Conditions Data').classes('text-subtitle2 font-bold mb-2')
                                 if 'current_target_price' in trade_conditions:
@@ -1890,9 +1890,9 @@ class LiveTradesTab:
                                         ui.label('Current Target Price:').classes('text-body2 font-bold')
                                         ui.label(f"${trade_conditions['current_target_price']:.2f}").classes('text-body2 text-green')
                         
-                        # Show all metadata in JSON format
-                        with ui.expansion('Raw Metadata (JSON)', icon='code').classes('w-full mt-2'):
-                            ui.json_editor({'content': {'json': txn.metadata}}).classes('w-full').props('read-only')
+                        # Show all meta_data in JSON format
+                        with ui.expansion('Raw Meta Data (JSON)', icon='code').classes('w-full mt-2'):
+                            ui.json_editor({'content': {'json': txn.meta_data}}).classes('w-full').props('read-only')
 
                 # Related Orders
                 with ui.card().classes('w-full mb-4'):

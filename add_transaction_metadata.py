@@ -1,11 +1,11 @@
 """
-Migration script to add metadata JSON column to Transaction table.
+Migration script to add meta_data JSON column to Transaction table.
 
-This script adds a nullable metadata JSON field to the Transaction model
+This script adds a nullable meta_data JSON field to the Transaction model
 for storing additional data like TradeConditionsData.
 
 Usage:
-    .venv\Scripts\python.exe add_transaction_metadata.py
+    .venv\Scripts\python.exe add_transaction_meta_data.py
 """
 
 from sqlalchemy import text, inspect
@@ -26,43 +26,43 @@ def check_column_exists(table_name: str, column_name: str) -> bool:
         return False
 
 
-def add_metadata_column():
-    """Add metadata column to transaction table."""
+def add_meta_data_column():
+    """Add meta_data column to transaction table."""
     try:
         engine = get_db().bind
         
         # Check if column already exists
-        if check_column_exists('transaction', 'metadata'):
-            logger.info("✅ Column 'metadata' already exists in 'transaction' table - skipping migration")
+        if check_column_exists('transaction', 'meta_data'):
+            logger.info("✅ Column 'meta_data' already exists in 'transaction' table - skipping migration")
             return True
         
-        logger.info("Adding 'metadata' column to 'transaction' table...")
+        logger.info("Adding 'meta_data' column to 'transaction' table...")
         
         with Session(engine) as session:
-            # Add the metadata column as JSON type, nullable
+            # Add the meta_data column as JSON type, nullable
             # Note: "transaction" is a reserved word in SQLite, so we must quote it
             session.exec(text("""
                 ALTER TABLE "transaction" 
-                ADD COLUMN metadata JSON NULL
+                ADD COLUMN meta_data JSON NULL
             """))
             session.commit()
             
-        logger.info("✅ Successfully added 'metadata' column to 'transaction' table")
+        logger.info("✅ Successfully added 'meta_data' column to 'transaction' table")
         return True
         
     except Exception as e:
-        logger.error(f"❌ Failed to add metadata column: {e}", exc_info=True)
+        logger.error(f"❌ Failed to add meta_data column: {e}", exc_info=True)
         return False
 
 
 def verify_migration():
     """Verify the migration was successful."""
     try:
-        if check_column_exists('transaction', 'metadata'):
-            logger.info("✅ Migration verification successful - 'metadata' column exists")
+        if check_column_exists('transaction', 'meta_data'):
+            logger.info("✅ Migration verification successful - 'meta_data' column exists")
             return True
         else:
-            logger.error("❌ Migration verification failed - 'metadata' column not found")
+            logger.error("❌ Migration verification failed - 'meta_data' column not found")
             return False
     except Exception as e:
         logger.error(f"❌ Migration verification error: {e}", exc_info=True)
@@ -76,7 +76,7 @@ def main():
     logger.info("=" * 80)
     
     # Run migration
-    if add_metadata_column():
+    if add_meta_data_column():
         # Verify migration
         if verify_migration():
             logger.info("=" * 80)

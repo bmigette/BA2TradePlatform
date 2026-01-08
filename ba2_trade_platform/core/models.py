@@ -173,8 +173,9 @@ class Transaction(SQLModel, table=True):
     status: TransactionStatus = Field(default=TransactionStatus.WAITING)
     created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc))
     
-    # Metadata JSON field for storing additional data (e.g., TradeConditionsData)
-    metadata: dict | None = Field(default=None, sa_column=Column(JSON))
+    # JSON field for storing additional data (e.g., TradeConditionsData)
+    # Named 'meta_data' to avoid conflict with SQLAlchemy's reserved 'metadata' attribute
+    meta_data: dict | None = Field(default=None, sa_column=Column(JSON))
     
     # Optional reference to expert instance for tracking which expert initiated this transaction
     expert_id: int | None = Field(foreign_key="expertinstance.id", nullable=True, ondelete="SET NULL")

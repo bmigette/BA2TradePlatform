@@ -441,8 +441,8 @@ class NewTargetHigherCondition(FlagCondition):
                 transaction = get_instance(Transaction, self.existing_order.transaction_id)
                 if transaction:
                     # Try to get current_target_price from metadata first
-                    if transaction.metadata and "TradeConditionsData" in transaction.metadata:
-                        current_tp_price = transaction.metadata["TradeConditionsData"].get("current_target_price")
+                    if transaction.meta_data and "TradeConditionsData" in transaction.meta_data:
+                        current_tp_price = transaction.meta_data["TradeConditionsData"].get("current_target_price")
                         if current_tp_price is not None:
                             logger.debug(f"Using current_target_price from transaction metadata: ${current_tp_price:.2f}")
                     
@@ -531,8 +531,8 @@ class NewTargetLowerCondition(FlagCondition):
                 transaction = get_instance(Transaction, self.existing_order.transaction_id)
                 if transaction:
                     # Try to get current_target_price from metadata first
-                    if transaction.metadata and "TradeConditionsData" in transaction.metadata:
-                        current_tp_price = transaction.metadata["TradeConditionsData"].get("current_target_price")
+                    if transaction.meta_data and "TradeConditionsData" in transaction.meta_data:
+                        current_tp_price = transaction.meta_data["TradeConditionsData"].get("current_target_price")
                         if current_tp_price is not None:
                             logger.debug(f"Using current_target_price from transaction metadata: ${current_tp_price:.2f}")
                     
@@ -787,8 +787,8 @@ class NewTargetPercentCondition(CompareCondition):
                 transaction = get_instance(Transaction, self.existing_order.transaction_id)
                 if transaction:
                     # Try to get current_target_price from metadata first
-                    if transaction.metadata and "TradeConditionsData" in transaction.metadata:
-                        current_tp_price = transaction.metadata["TradeConditionsData"].get("current_target_price")
+                    if transaction.meta_data and "TradeConditionsData" in transaction.meta_data:
+                        current_tp_price = transaction.meta_data["TradeConditionsData"].get("current_target_price")
                         if current_tp_price is not None:
                             logger.debug(f"Using current_target_price from transaction metadata: ${current_tp_price:.2f}")
                     
