@@ -943,6 +943,7 @@ class LiveTradesTab:
             on_retry_close=self._handle_retry_close_transaction,
             on_recreate_tpsl=self._handle_recreate_tpsl,
             on_view_recommendation=self._handle_view_recommendation,
+            on_view_transaction_details=self._handle_view_transaction_details,
             on_selection_change=self._handle_selection_change
         )
 
@@ -980,6 +981,10 @@ class LiveTradesTab:
         class EventData:
             args = rec_id
         self._show_recommendation_dialog(EventData())
+
+    def _handle_view_transaction_details(self, transaction_id: int):
+        """Handle view transaction details button click from LiveTradesTable."""
+        self._show_transaction_details_dialog(transaction_id)
 
     def _handle_selection_change(self, selected_ids: List[int]):
         """Handle selection change from LiveTradesTable."""
@@ -1759,6 +1764,240 @@ class LiveTradesTab:
                 ui.button('Close', on_click=dialog.close).props('flat color=primary')
 
         dialog.open()
+
+    def _show_transaction_details_dialog(self, transaction_id: int):
+        """Show comprehensive transaction details in a dialog."""
+        from ...core.models import ExpertRecommendation, ExpertInstance
+        from ...core.types import TransactionStatus
+
+        if not transaction_id:
+            ui.notify('No transaction ID provided', type='warning')
+            return
+
+        # Get the transaction
+        txn = get_instance(Transaction, transaction_id)
+        if not txn:
+            ui.notify('Transaction not found', type='negative')
+            return
+
+        # Get expert instance
+        expert = get_instance(ExpertInstance, txn.expert_id) if txn.expert_id else None
+        expert_name = f"{expert.expert} (ID: {expert.id})" if expert else "No Expert"
+
+        # Get all orders for this transaction
+        with Session(get_db().bind) as session:
+            stmt = select(TradingOrder).where(TradingOrder.transaction_id == transaction_id).order_by(TradingOrder.created_at)
+            orders = session.exec(stmt).all()
+
+        with ui.dialog().props('maximized') as dialog, ui.card().classes('w-full h-full overflow-auto'):
+            # Header
+            with ui.row().classes('w-full items-center justify-between mb-4 bg-primary/10 p-4 rounded'):
+                ui.label(f'🔍 Transaction Details - ID {transaction_id}').classes('text-h5')
+                ui.button(icon='close', on_click=dialog.close).props('flat round')
+
+            with ui.scroll_area().classes('w-full h-full'):
+                # Transaction Overview
+                with ui.card().classes('w-full mb-4'):
+                    ui.label('📊 Transaction Overview').classes('text-h6 mb-3')
+                    
+                    with ui.grid(columns=4).classes('w-full gap-4'):
+                        # Symbol
+                        with ui.card().classes('bg-primary/5'):
+                            ui.label('Symbol').classes('text-caption text-grey-7')
+                            ui.label(txn.symbol).classes('text-h6 font-bold')
+                        
+                        # Direction
+                        with ui.card().classes('bg-primary/5'):
+                            ui.label('Direction').classes('text-caption text-grey-7')
+                            direction = 'BUY (LONG)' if txn.quantity > 0 else 'SELL (SHORT)'
+                            dir_color = 'green' if txn.quantity > 0 else 'red'
+                            ui.badge(direction, color=dir_color).classes('text-body1')
+                        
+                        # Quantity
+                        with ui.card().classes('bg-primary/5'):
+                            ui.label('Quantity').classes('text-caption text-grey-7')
+                            ui.label(f'{txn.quantity:+.2f}').classes('text-body1 font-bold')
+                        
+                        # Status
+                        with ui.card().classes('bg-primary/5'):
+                            ui.label('Status').classes('text-caption text-grey-7')
+                            status_color = self._get_transaction_status_color(txn.status)
+                            ui.badge(txn.status.value, color=status_color).classes('text-body1')
+
+                    # Prices and P/L
+                    with ui.grid(columns=4).classes('w-full gap-4 mt-4'):
+                        # Open Price
+                        with ui.card().classes('bg-primary/5'):
+                            ui.label('Open Price').classes('text-caption text-grey-7')
+                            open_price_str = f'${txn.open_price:.2f}' if txn.open_price else 'N/A'
+                            ui.label(open_price_str).classes('text-body1')
+                        
+                        # Take Profit
+                        with ui.card().classes('bg-primary/5'):
+                            ui.label('Take Profit').classes('text-caption text-grey-7')
+                            tp_str = f'${txn.take_profit:.2f}' if txn.take_profit else 'Not Set'
+                            ui.label(tp_str).classes('text-body1')
+                        
+                        # Stop Loss
+                        with ui.card().classes('bg-primary/5'):
+                            ui.label('Stop Loss').classes('text-caption text-grey-7')
+                            sl_str = f'${txn.stop_loss:.2f}' if txn.stop_loss else 'Not Set'
+                            ui.label(sl_str).classes('text-body1')
+                        
+                        # Close Price
+                        with ui.card().classes('bg-primary/5'):
+                            ui.label('Close Price').classes('text-caption text-grey-7')
+                            close_price_str = f'${txn.close_price:.2f}' if txn.close_price else 'Not Closed'
+                            ui.label(close_price_str).classes('text-body1')
+
+                    # Dates
+                    with ui.grid(columns=3).classes('w-full gap-4 mt-4'):
+                        # Created
+                        with ui.card().classes('bg-primary/5'):
+                            ui.label('Created').classes('text-caption text-grey-7')
+                            created_str = txn.created_at.strftime('%Y-%m-%d %H:%M:%S') if txn.created_at else 'N/A'
+                            ui.label(created_str).classes('text-body2')
+                        
+                        # Opened
+                        with ui.card().classes('bg-primary/5'):
+                            ui.label('Opened').classes('text-caption text-grey-7')
+                            opened_str = txn.open_date.strftime('%Y-%m-%d %H:%M:%S') if txn.open_date else 'Not Opened'
+                            ui.label(opened_str).classes('text-body2')
+                        
+                        # Closed
+                        with ui.card().classes('bg-primary/5'):
+                            ui.label('Closed').classes('text-caption text-grey-7')
+                            closed_str = txn.close_date.strftime('%Y-%m-%d %H:%M:%S') if txn.close_date else 'Not Closed'
+                            ui.label(closed_str).classes('text-body2')
+                    
+                    # Expert
+                    with ui.card().classes('bg-primary/5 mt-4'):
+                        ui.label('Expert').classes('text-caption text-grey-7')
+                        ui.label(expert_name).classes('text-body1 font-bold')
+
+                # Transaction Metadata
+                if txn.metadata and txn.metadata:
+                    with ui.card().classes('w-full mb-4'):
+                        ui.label('🗃️ Transaction Metadata').classes('text-h6 mb-3')
+                        
+                        # Show TradeConditionsData if available
+                        if 'TradeConditionsData' in txn.metadata:
+                            trade_conditions = txn.metadata['TradeConditionsData']
+                            with ui.card().classes('bg-yellow/10'):
+                                ui.label('Trade Conditions Data').classes('text-subtitle2 font-bold mb-2')
+                                if 'current_target_price' in trade_conditions:
+                                    with ui.row().classes('gap-2'):
+                                        ui.label('Current Target Price:').classes('text-body2 font-bold')
+                                        ui.label(f"${trade_conditions['current_target_price']:.2f}").classes('text-body2 text-green')
+                        
+                        # Show all metadata in JSON format
+                        with ui.expansion('Raw Metadata (JSON)', icon='code').classes('w-full mt-2'):
+                            ui.json_editor({'content': {'json': txn.metadata}}).classes('w-full').props('read-only')
+
+                # Related Orders
+                with ui.card().classes('w-full mb-4'):
+                    ui.label(f'📋 Related Orders ({len(orders)})').classes('text-h6 mb-3')
+                    
+                    if orders:
+                        for idx, order in enumerate(orders):
+                            with ui.expansion(f'Order #{order.id} - {order.type.value if order.type else "N/A"} {order.side.value if order.side else "N/A"}', 
+                                            icon='receipt').classes('w-full').props('dense'):
+                                
+                                with ui.grid(columns=3).classes('w-full gap-4 mt-2'):
+                                    # Basic Info
+                                    with ui.card():
+                                        ui.label('Order ID').classes('text-caption text-grey-7')
+                                        ui.label(str(order.id)).classes('text-body2 font-bold')
+                                    
+                                    with ui.card():
+                                        ui.label('Type / Side').classes('text-caption text-grey-7')
+                                        type_str = f"{order.type.value if order.type else 'N/A'} / {order.side.value if order.side else 'N/A'}"
+                                        ui.label(type_str).classes('text-body2')
+                                    
+                                    with ui.card():
+                                        ui.label('Status').classes('text-caption text-grey-7')
+                                        status_color = self._get_order_status_color(order.status)
+                                        ui.badge(order.status.value if order.status else 'UNKNOWN', color=status_color)
+                                    
+                                    # Quantities
+                                    with ui.card():
+                                        ui.label('Quantity').classes('text-caption text-grey-7')
+                                        qty_str = f'{order.quantity:.2f}' if order.quantity else 'N/A'
+                                        ui.label(qty_str).classes('text-body2')
+                                    
+                                    with ui.card():
+                                        ui.label('Filled').classes('text-caption text-grey-7')
+                                        filled_str = f'{order.filled_qty:.2f}' if order.filled_qty else '0.00'
+                                        ui.label(filled_str).classes('text-body2')
+                                    
+                                    with ui.card():
+                                        ui.label('Open Price').classes('text-caption text-grey-7')
+                                        open_str = f'${order.open_price:.2f}' if order.open_price else 'N/A'
+                                        ui.label(open_str).classes('text-body2')
+                                    
+                                    # Prices
+                                    with ui.card():
+                                        ui.label('Limit Price').classes('text-caption text-grey-7')
+                                        limit_str = f'${order.limit_price:.2f}' if order.limit_price else 'N/A'
+                                        ui.label(limit_str).classes('text-body2')
+                                    
+                                    with ui.card():
+                                        ui.label('Stop Price').classes('text-caption text-grey-7')
+                                        stop_str = f'${order.stop_price:.2f}' if order.stop_price else 'N/A'
+                                        ui.label(stop_str).classes('text-body2')
+                                    
+                                    with ui.card():
+                                        ui.label('Account ID').classes('text-caption text-grey-7')
+                                        ui.label(str(order.account_id)).classes('text-body2')
+                                
+                                # Broker Info
+                                if order.broker_order_id:
+                                    with ui.card().classes('mt-2 bg-blue/10'):
+                                        ui.label('Broker Order ID').classes('text-caption text-grey-7')
+                                        ui.label(order.broker_order_id).classes('text-body2 font-mono')
+                                
+                                # Comment
+                                if order.comment:
+                                    with ui.card().classes('mt-2'):
+                                        ui.label('Comment').classes('text-caption text-grey-7')
+                                        ui.label(order.comment).classes('text-body2')
+                                
+                                # Created date
+                                with ui.card().classes('mt-2'):
+                                    ui.label('Created').classes('text-caption text-grey-7')
+                                    created_str = order.created_at.strftime('%Y-%m-%d %H:%M:%S') if order.created_at else 'N/A'
+                                    ui.label(created_str).classes('text-body2')
+                                
+                                # Expert Recommendation
+                                if order.expert_recommendation_id:
+                                    with ui.card().classes('mt-2 bg-green/10'):
+                                        with ui.row().classes('items-center justify-between w-full'):
+                                            ui.label(f'Expert Recommendation ID: {order.expert_recommendation_id}').classes('text-body2 font-bold')
+                                            
+                                            def show_rec_details(rec_id=order.expert_recommendation_id):
+                                                dialog.close()
+                                                class EventData:
+                                                    args = rec_id
+                                                self._show_recommendation_dialog(EventData())
+                                            
+                                            ui.button('View Details', icon='info', on_click=show_rec_details).props('size=sm color=primary')
+                    else:
+                        ui.label('No orders found for this transaction').classes('text-grey-6 text-center q-pa-md')
+
+        dialog.open()
+
+    def _get_transaction_status_color(self, status):
+        """Get color for transaction status badge."""
+        from ...core.types import TransactionStatus
+        
+        status_colors = {
+            TransactionStatus.WAITING: 'blue',
+            TransactionStatus.OPENED: 'green',
+            TransactionStatus.CLOSING: 'orange',
+            TransactionStatus.CLOSED: 'grey',
+            TransactionStatus.ERROR: 'red',
+        }
+        return status_colors.get(status, 'grey')
 
     def _select_all_transactions(self):
         """Select all visible transactions."""

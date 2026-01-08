@@ -182,70 +182,17 @@ class AccountInterface(ExtendableSettingsInterface):
 
     def _generate_tracking_comment(self, trading_order: TradingOrder) -> str:
         """
-        Generate a tracking comment for the order with epoch time and metadata prefix.
-        Format: {epoch}-[ACC:X/EXP:Y/TR:Z/ORD:W] original_comment
+        Preserve the original comment without modification.
+        No longer needs to generate unique tracking prefixes since we use order ID as client_order_id.
         
         Args:
             trading_order: The TradingOrder object
             
         Returns:
-            str: The formatted comment with epoch time and tracking metadata, truncated to 128 characters if needed
+            str: The original comment as-is (no length limit, no epoch prepending)
         """
-        import re
-        import time
-        
-        # Get epoch time (microseconds precision) for uniqueness
-        epoch = int(time.time() * 1000000)
-        
-        # Get account_id
-        account_id = trading_order.account_id or self.id
-        
-        # Get expert_id if available through recommendation
-        expert_id = None
-        if trading_order.expert_recommendation_id:
-            try:
-                recommendation = get_instance(ExpertRecommendation, trading_order.expert_recommendation_id)
-                if recommendation:
-                    expert_instance = get_instance(ExpertInstance, recommendation.instance_id)
-                    if expert_instance:
-                        expert_id = expert_instance.id
-            except Exception as e:
-                logger.debug(f"Could not retrieve expert_id for order: {e}")
-        
-        # Get transaction_id
-        transaction_id = trading_order.transaction_id or "NONE"
-        
-        # Get order_id (will be None for new orders)
-        order_id = trading_order.id or "NEW"
-        
-        # Build tracking prefix with epoch time at the beginning
-        exp_part = f"/EXP:{expert_id}" if expert_id else ""
-        tracking_prefix = f"{epoch}-[ACC:{account_id}{exp_part}/TR:{transaction_id}/ORD:{order_id}]"
-        
-        # Get original comment and clean any existing automated comment prefix
-        original_comment = trading_order.comment or ""
-        # Remove any existing epoch-[ACC:...] prefix using regex
-        original_comment = re.sub(r'^\d+-\[ACC:\d+(?:/EXP:\d+)?/TR:\w+/ORD:\w+\]\s*', '', original_comment).strip()
-        
-        # Combine prefix with original comment
-        if original_comment:
-            full_comment = f"{tracking_prefix} {original_comment}"
-        else:
-            full_comment = tracking_prefix
-        
-        # Truncate to 128 characters if needed
-        max_length = 128
-        if len(full_comment) > max_length:
-            # Try to preserve the tracking prefix and truncate the original comment
-            available_space = max_length - len(tracking_prefix) - 1  # -1 for space
-            if available_space > 0:
-                truncated_comment = original_comment[:available_space - 3] + "..."
-                full_comment = f"{tracking_prefix} {truncated_comment}"
-            else:
-                # If tracking prefix itself is too long, just truncate everything
-                full_comment = full_comment[:max_length]
-        
-        return full_comment
+        # Simply return the original comment, or empty string if None
+        return trading_order.comment or ""
 
     def submit_order(self, trading_order: TradingOrder, tp_price: Optional[float] = None, sl_price: Optional[float] = None, is_closing_order: bool = False) -> Any:
         """
@@ -309,9 +256,7 @@ class AccountInterface(ExtendableSettingsInterface):
             except Exception as e:
                 logger.error(f"Error syncing TP/SL quantity with parent order: {e}", exc_info=True)
         
-        # Generate tracking comment and set account_id BEFORE saving to DB
-        tracking_comment = self._generate_tracking_comment(trading_order)
-        trading_order.comment = tracking_comment
+        # Set account_id BEFORE saving to DB
         trading_order.account_id = self.id
         
         # Capture values for logging BEFORE saving (to avoid detached instance errors)

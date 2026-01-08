@@ -2100,6 +2100,13 @@ class SmartRiskManagerToolkit:
                             session.add(trans)
                             session.commit()
                     
+                    # Get actual error from order comment if available
+                    error_detail = "Failed to submit entry order"
+                    if entry_order.id:
+                        fresh_order = get_instance(TradingOrder, entry_order.id)
+                        if fresh_order and fresh_order.comment:
+                            error_detail = fresh_order.comment
+                    
                     # Log failed transaction creation
                     from .utils import log_transaction_created_activity
                     log_transaction_created_activity(
@@ -2109,7 +2116,7 @@ class SmartRiskManagerToolkit:
                         expert_id=self.expert_instance_id,
                         current_price=current_price,
                         success=False,
-                        error_message="Failed to submit entry order"
+                        error_message=error_detail
                     )
                     
                     return {

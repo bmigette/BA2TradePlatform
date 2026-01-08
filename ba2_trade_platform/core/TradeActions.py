@@ -796,6 +796,21 @@ class AdjustTakeProfitAction(TradeAction):
                 
                 if success:
                     logger.info(f"✅ Successfully adjusted take profit for {self.instrument_name}: OCO/OTO order created/updated")
+                    
+                    # Store current target price in transaction metadata for TradeConditions comparison
+                    # This allows comparing new analysis target against the actual adjusted TP value
+                    if not transaction.metadata:
+                        transaction.metadata = {}
+                    
+                    if "TradeConditionsData" not in transaction.metadata:
+                        transaction.metadata["TradeConditionsData"] = {}
+                    
+                    transaction.metadata["TradeConditionsData"]["current_target_price"] = round(self.take_profit_price, 2)
+                    
+                    from .db import update_instance
+                    update_instance(transaction)
+                    logger.info(f"Stored current_target_price=${self.take_profit_price:.2f} in transaction {transaction.id} metadata for TradeConditions")
+                    
                 else:
                     logger.warning(f"Failed to adjust take profit for {self.instrument_name}")
                     return self.create_and_save_action_result(

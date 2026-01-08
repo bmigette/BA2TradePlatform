@@ -383,14 +383,21 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             end_date: str = None,
             interval: str = None
         ) -> str:
-            """Get technical indicator data for the company being analyzed.
+            """Calculate and retrieve technical indicator values (like RSI, MACD, Bollinger Bands) for a stock.
+            
+            This tool computes technical analysis indicators from price data. The 'indicator' parameter
+            specifies WHICH indicator to calculate (e.g., 'rsi' for Relative Strength Index).
             
             Args:
-                indicator: REQUIRED. Technical indicator name (e.g., 'rsi', 'macd', 'boll', 'atr', 'close_50_sma').
-                symbol: Optional. Stock ticker symbol. Defaults to the company being analyzed.
-                start_date: Optional. Start date for data range. Defaults to 30 days ago.
-                end_date: Optional. End date for data range. Defaults to today.
-                interval: Optional. Data interval. Defaults to configured timeframe.
+                indicator: REQUIRED. The name of the technical indicator to calculate. 
+                          Must be one of: 'rsi', 'macd', 'macdh', 'macds', 'boll', 'boll_ub', 'boll_lb', 
+                          'atr', 'close_50_sma', 'close_200_sma', 'close_10_ema', 'vwma', 'mfi'.
+                          DO NOT use stock ticker symbols here - this is for indicator names only.
+                symbol: Optional. Stock ticker symbol to analyze (e.g., 'AAPL', 'GOOGL'). 
+                        If not provided, uses the current stock being analyzed.
+                start_date: Optional. Start date for data range in YYYY-MM-DD format. Defaults to 30 days ago.
+                end_date: Optional. End date for data range in YYYY-MM-DD format. Defaults to today.
+                interval: Optional. Data interval (e.g., '1h', '1d'). Defaults to configured timeframe.
             
             Returns:
                 str: Technical indicator data for the symbol.

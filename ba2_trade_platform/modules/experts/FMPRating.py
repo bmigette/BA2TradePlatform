@@ -70,6 +70,7 @@ class FMPRating(MarketExpertInterface):
                 "required": True,
                 "default": "consensus",
                 "description": "Price target to use for profit calculation",
+                "valid_values": ["low", "consensus", "median", "high"],
                 "tooltip": "Which analyst price target to use for expected profit calculation. Options: 'low' (conservative), 'consensus' (average), 'median' (middle value), 'high' (optimistic). Default is 'consensus'."
             }
         }

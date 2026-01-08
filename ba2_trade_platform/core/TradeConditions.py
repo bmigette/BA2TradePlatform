@@ -432,13 +432,24 @@ class NewTargetHigherCondition(FlagCondition):
                 return False
             
             # Get current TP price from transaction
+            # First check metadata for current_target_price (set by adjust_tp TradeAction)
+            # Fallback to transaction.take_profit if metadata not available
             current_tp_price = None
             if self.existing_order.transaction_id:
                 from .db import get_instance
                 from .models import Transaction
                 transaction = get_instance(Transaction, self.existing_order.transaction_id)
-                if transaction and transaction.take_profit:
-                    current_tp_price = transaction.take_profit
+                if transaction:
+                    # Try to get current_target_price from metadata first
+                    if transaction.metadata and "TradeConditionsData" in transaction.metadata:
+                        current_tp_price = transaction.metadata["TradeConditionsData"].get("current_target_price")
+                        if current_tp_price is not None:
+                            logger.debug(f"Using current_target_price from transaction metadata: ${current_tp_price:.2f}")
+                    
+                    # Fallback to take_profit field if metadata not available
+                    if current_tp_price is None and transaction.take_profit:
+                        current_tp_price = transaction.take_profit
+                        logger.debug(f"Using take_profit from transaction field (metadata not available): ${current_tp_price:.2f}")
             
             if current_tp_price is None:
                 logger.debug(f"No current TP price available for order {self.existing_order.id}")
@@ -511,13 +522,24 @@ class NewTargetLowerCondition(FlagCondition):
                 return False
             
             # Get current TP price from transaction
+            # First check metadata for current_target_price (set by adjust_tp TradeAction)
+            # Fallback to transaction.take_profit if metadata not available
             current_tp_price = None
             if self.existing_order.transaction_id:
                 from .db import get_instance
                 from .models import Transaction
                 transaction = get_instance(Transaction, self.existing_order.transaction_id)
-                if transaction and transaction.take_profit:
-                    current_tp_price = transaction.take_profit
+                if transaction:
+                    # Try to get current_target_price from metadata first
+                    if transaction.metadata and "TradeConditionsData" in transaction.metadata:
+                        current_tp_price = transaction.metadata["TradeConditionsData"].get("current_target_price")
+                        if current_tp_price is not None:
+                            logger.debug(f"Using current_target_price from transaction metadata: ${current_tp_price:.2f}")
+                    
+                    # Fallback to take_profit field if metadata not available
+                    if current_tp_price is None and transaction.take_profit:
+                        current_tp_price = transaction.take_profit
+                        logger.debug(f"Using take_profit from transaction field (metadata not available): ${current_tp_price:.2f}")
             
             if current_tp_price is None:
                 logger.debug(f"No current TP price available for order {self.existing_order.id}")
@@ -756,13 +778,24 @@ class NewTargetPercentCondition(CompareCondition):
                 return False
             
             # Get current TP price from transaction
+            # First check metadata for current_target_price (set by adjust_tp TradeAction)
+            # Fallback to transaction.take_profit if metadata not available
             current_tp_price = None
             if self.existing_order.transaction_id:
                 from .db import get_instance
                 from .models import Transaction
                 transaction = get_instance(Transaction, self.existing_order.transaction_id)
-                if transaction and transaction.take_profit:
-                    current_tp_price = transaction.take_profit
+                if transaction:
+                    # Try to get current_target_price from metadata first
+                    if transaction.metadata and "TradeConditionsData" in transaction.metadata:
+                        current_tp_price = transaction.metadata["TradeConditionsData"].get("current_target_price")
+                        if current_tp_price is not None:
+                            logger.debug(f"Using current_target_price from transaction metadata: ${current_tp_price:.2f}")
+                    
+                    # Fallback to take_profit field if metadata not available
+                    if current_tp_price is None and transaction.take_profit:
+                        current_tp_price = transaction.take_profit
+                        logger.debug(f"Using take_profit from transaction field (metadata not available): ${current_tp_price:.2f}")
             
             if current_tp_price is None:
                 logger.debug(f"No current TP price available for order {self.existing_order.id}")

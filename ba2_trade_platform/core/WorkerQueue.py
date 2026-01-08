@@ -1876,6 +1876,8 @@ class WorkerQueue:
         Restore persisted tasks to the queue.
         Previously running tasks are treated as failed and need to be restarted.
         
+        First saves the current queue state, then clears persisted tasks and restores them.
+        
         Returns:
             Dict with 'restored', 'failed' counts
         """
@@ -1888,6 +1890,14 @@ class WorkerQueue:
             if not persisted_tasks:
                 logger.info("No persisted tasks to restore")
                 return {'restored': 0, 'failed': 0}
+            
+            # Save current queue state before restoring saved queue
+            saved_count = self.save_queue_state()
+            logger.info(f"Saved {saved_count} current tasks before restoring persisted queue")
+            
+            # Clear the old persisted tasks (they'll be restored below)
+            cleared_count = self.clear_persisted_tasks()
+            logger.info(f"Cleared {cleared_count} old persisted tasks")
             
             logger.info(f"Restoring {len(persisted_tasks)} persisted tasks...")
             
@@ -1932,13 +1942,9 @@ class WorkerQueue:
                         restored_count += 1
                         logger.debug(f"Restored expansion task {pt.task_id} as {task_id}")
                     
-                    # Remove the old persisted task since we created a new one
-                    self._remove_persisted_task(pt.task_id)
-                    
                 except ValueError as e:
-                    # Task already exists (duplicate), skip and remove persisted entry
+                    # Task already exists (duplicate), skip
                     logger.debug(f"Skipping duplicate task {pt.task_id}: {e}")
-                    self._remove_persisted_task(pt.task_id)
                     
                 except Exception as e:
                     logger.error(f"Failed to restore task {pt.task_id}: {e}", exc_info=True)

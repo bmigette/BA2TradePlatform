@@ -858,17 +858,25 @@ class AlpacaAccount(AccountInterface):
             
             # Create the appropriate order request based on order type
             if order_type_value == CoreOrderType.MARKET.value.lower():
+                # Validate order has ID before submission
+                if not trading_order.id:
+                    raise ValueError(f"Order must be saved to database before broker submission (missing ID)")
+                
                 order_request = MarketOrderRequest(
                     symbol=trading_order.symbol,
                     qty=trading_order.quantity,
                     side=side,
                     time_in_force=time_in_force,
-                    client_order_id=trading_order.comment
+                    client_order_id=str(trading_order.id)
                 )
             elif order_type_value in [CoreOrderType.BUY_LIMIT.value.lower(), 
                                       CoreOrderType.SELL_LIMIT.value.lower()]:
                 if not trading_order.limit_price:
                     raise ValueError("Limit price is required for limit orders")
+                
+                # Validate order has ID before submission
+                if not trading_order.id:
+                    raise ValueError(f"Order must be saved to database before broker submission (missing ID)")
                 
                 # Round limit price using Alpaca pricing rules
                 rounded_limit_price = self._round_price(trading_order.limit_price, trading_order.symbol)
@@ -879,12 +887,16 @@ class AlpacaAccount(AccountInterface):
                     side=side,
                     time_in_force=time_in_force,
                     limit_price=rounded_limit_price,
-                    client_order_id=trading_order.comment
+                    client_order_id=str(trading_order.id)
                 )
             elif order_type_value in [CoreOrderType.BUY_STOP.value.lower(), 
                                       CoreOrderType.SELL_STOP.value.lower()]:
                 if not trading_order.stop_price:
                     raise ValueError("Stop price is required for stop orders")
+                
+                # Validate order has ID before submission
+                if not trading_order.id:
+                    raise ValueError(f"Order must be saved to database before broker submission (missing ID)")
                 
                 # Round stop price using Alpaca pricing rules
                 rounded_stop_price = self._round_price(trading_order.stop_price, trading_order.symbol)
@@ -895,7 +907,7 @@ class AlpacaAccount(AccountInterface):
                     side=side,
                     time_in_force=time_in_force,
                     stop_price=rounded_stop_price,
-                    client_order_id=trading_order.comment
+                    client_order_id=str(trading_order.id)
                 )
             elif order_type_value in [CoreOrderType.BUY_STOP_LIMIT.value.lower(), 
                                       CoreOrderType.SELL_STOP_LIMIT.value.lower()]:
@@ -936,6 +948,10 @@ class AlpacaAccount(AccountInterface):
                     trading_order.symbol
                 )
                 
+                # Validate order has ID before submission
+                if not trading_order.id:
+                    raise ValueError(f"Order must be saved to database before broker submission (missing ID)")
+                
                 # OCO order: MarketOrderRequest (no limit_price) with take_profit and stop_loss legs
                 order_request = LimitOrderRequest(
                     symbol=trading_order.symbol,
@@ -945,14 +961,14 @@ class AlpacaAccount(AccountInterface):
                     order_class=OrderClass.OCO,
                     take_profit=TakeProfitRequest(limit_price=rounded_tp_price),
                     stop_loss=StopLossRequest(stop_price=rounded_sl_stop_price, limit_price=rounded_sl_limit_price),
-                    client_order_id=trading_order.comment
+                    client_order_id=str(trading_order.id)
                 )
                 logger.info(f"Submitting OCO order: TP=${rounded_tp_price:.4f}, SL stop=${rounded_sl_stop_price:.4f} limit=${rounded_sl_limit_price:.4f}")
                 
             else:
                 raise ValueError(f"Unsupported order type: {trading_order.order_type} (value: {order_type_value})")
             
-            logger.debug(f"Submitting Alpaca order: {order_request} (client_order_id={trading_order.comment})")
+            logger.debug(f"Submitting Alpaca order: {order_request} (client_order_id={trading_order.id})")
             alpaca_order = self.client.submit_order(order_request)
             logger.info(f"Successfully submitted order to Alpaca: broker_order_id={alpaca_order.id}")
 
@@ -1026,6 +1042,43 @@ class AlpacaAccount(AccountInterface):
         except Exception as e:
             logger.error(f"Error submitting order {trading_order} to Alpaca: {e}", exc_info=True)
             
+            # Log activity with actual error details
+            try:
+                from ...core.db import log_activity
+                from ...core.types import ActivityLogSeverity, ActivityLogType
+                
+                error_message = str(e)
+                activity_data = {
+                    "order_id": trading_order.id,
+                    "symbol": trading_order.symbol,
+                    "side": trading_order.side.value if hasattr(trading_order.side, 'value') else str(trading_order.side),
+                    "quantity": trading_order.quantity,
+                    "order_type": trading_order.order_type.value if hasattr(trading_order.order_type, 'value') else str(trading_order.order_type),
+                    "error": error_message
+                }
+                
+                if trading_order.transaction_id:
+                    activity_data["transaction_id"] = trading_order.transaction_id
+                
+                # Get expert_id from transaction if available
+                expert_id = None
+                if trading_order.transaction_id:
+                    from ...core.models import Transaction
+                    transaction = get_instance(Transaction, trading_order.transaction_id)
+                    if transaction:
+                        expert_id = transaction.expert_id
+                
+                log_activity(
+                    severity=ActivityLogSeverity.FAILURE,
+                    activity_type=ActivityLogType.ORDER_SUBMITTED,
+                    description=f"Failed to submit {trading_order.side.value if hasattr(trading_order.side, 'value') else str(trading_order.side)} order for {trading_order.symbol}: {error_message[:100]}",
+                    data=activity_data,
+                    source_account_id=self.id,
+                    source_expert_id=expert_id
+                )
+            except Exception as log_error:
+                logger.warning(f"Failed to log order submission error to activity log: {log_error}")
+            
             # Step 4: Mark order as ERROR in database using thread-safe function
             try:
                 if trading_order.id:
@@ -1087,17 +1140,17 @@ class AlpacaAccount(AccountInterface):
                 }
                 time_in_force = tif_map.get(good_for_value, TimeInForce.GTC)
             
-            # Regenerate tracking comment with new epoch time to ensure unique client_order_id
-            # This prevents Alpaca's "client_order_id must be unique" error when modifying orders
-            new_tracking_comment = self._generate_tracking_comment(trading_order)
+            # Validate order has ID
+            if not trading_order.id:
+                raise ValueError(f"Order must be saved to database before modification (missing ID)")
             
-            # Create ReplaceOrderRequest
+            # Create ReplaceOrderRequest using order ID (already unique, no need to regenerate)
             replace_request = ReplaceOrderRequest(
                 qty=trading_order.quantity,
                 time_in_force=time_in_force,
                 limit_price=limit_price,
                 stop_price=stop_price,
-                client_order_id=new_tracking_comment
+                client_order_id=str(trading_order.id)
             )
             
             # Alpaca uses replace_order_by_id() method
@@ -1105,9 +1158,6 @@ class AlpacaAccount(AccountInterface):
                 order_id=order_id,
                 order_data=replace_request
             )
-            
-            # Update the trading_order comment with the new tracking comment
-            trading_order.comment = new_tracking_comment
             
             logger.info(f"Modified Alpaca order: {order.id}")
             return self.alpaca_order_to_tradingorder(order)
@@ -1487,17 +1537,28 @@ class AlpacaAccount(AccountInterface):
                         if result:
                             db_order = get_instance(TradingOrder, result.id)
                 
-                # Step 2: If not found and heuristic_mapping enabled, try comment matching
-                if not db_order and heuristic_mapping and alpaca_order.comment:
-                    if alpaca_order.comment in comment_map:
-                        candidate = comment_map[alpaca_order.comment]
-                        # Only map if broker_order_id is empty (avoid overwriting valid mappings)
-                        if not candidate.broker_order_id:
-                            db_order = get_instance(TradingOrder, candidate.id)
-                            db_order.broker_order_id = alpaca_order.broker_order_id
-                            update_instance(db_order)
-                            mapped_count += 1
-                            logger.info(f"Heuristic mapping: Linked database order {db_order.id} to broker order {alpaca_order.broker_order_id} via comment '{alpaca_order.comment}'")
+                # Step 2: If not found and heuristic_mapping enabled, try client_order_id matching to our order ID
+                if not db_order and heuristic_mapping and alpaca_order.client_order_id:
+                    try:
+                        # client_order_id should be our database order ID
+                        order_id_from_client = int(alpaca_order.client_order_id)
+                        with get_db() as session:
+                            statement = select(TradingOrder).where(
+                                TradingOrder.id == order_id_from_client,
+                                TradingOrder.account_id == self.id
+                            )
+                            result = session.exec(statement).first()
+                            if result:
+                                candidate = get_instance(TradingOrder, result.id)
+                                # Only map if broker_order_id is empty (avoid overwriting valid mappings)
+                                if not candidate.broker_order_id:
+                                    db_order = candidate
+                                    db_order.broker_order_id = alpaca_order.broker_order_id
+                                    update_instance(db_order)
+                                    mapped_count += 1
+                                    logger.info(f"Heuristic mapping: Linked database order {db_order.id} to broker order {alpaca_order.broker_order_id} via client_order_id '{alpaca_order.client_order_id}'")
+                    except (ValueError, TypeError) as e:
+                        logger.debug(f"Could not parse client_order_id '{alpaca_order.client_order_id}' as order ID: {e}")
                 
                 # Step 3: Update order state if we found a match
                 if db_order:

@@ -122,6 +122,16 @@ class LiveTradesTable(LazyTable):
                     </span>
                 </template>
                 <template v-else-if="col.name === 'actions'">
+                    <q-btn icon="search"
+                           size="sm"
+                           flat
+                           round
+                           color="blue-grey"
+                           @click="$parent.$emit('view_transaction_details', props.row.id)"
+                           title="View Transaction Details"
+                    >
+                        <q-tooltip>View Transaction Details</q-tooltip>
+                    </q-btn>
                     <q-btn v-if="props.row.has_missing_tpsl_orders"
                            icon="warning"
                            size="sm"
@@ -160,7 +170,7 @@ class LiveTradesTable(LazyTable):
                            @click="$parent.$emit('retry_close', props.row.id)"
                            title="Retry Close (reset status and try again)"
                     />
-                    <span v-else class="text-grey-5">—</span>
+                    <span v-if="!props.row.is_open && !props.row.is_waiting && !props.row.is_closing && !props.row.has_missing_tpsl_orders" class="text-grey-5">—</span>
                 </template>
                 <template v-else>
                     {{ col.value }}
@@ -240,6 +250,7 @@ class LiveTradesTable(LazyTable):
         on_retry_close: Optional[Callable[[int], None]] = None,
         on_recreate_tpsl: Optional[Callable[[int], None]] = None,
         on_view_recommendation: Optional[Callable[[int], None]] = None,
+        on_view_transaction_details: Optional[Callable[[int], None]] = None,
         on_selection_change: Optional[Callable[[List[int]], None]] = None,
     ):
         """
@@ -253,6 +264,7 @@ class LiveTradesTable(LazyTable):
             on_retry_close: Callback when retry close button is clicked (receives transaction_id)
             on_recreate_tpsl: Callback when recreate TP/SL button is clicked (receives transaction_id)
             on_view_recommendation: Callback when view recommendation button is clicked (receives rec_id)
+            on_view_transaction_details: Callback when view transaction details button is clicked (receives transaction_id)
             on_selection_change: Callback when selection changes (receives list of selected ids)
         """
         self._config = config or LiveTradesTableConfig()
@@ -263,6 +275,7 @@ class LiveTradesTable(LazyTable):
         self.on_retry_close = on_retry_close
         self.on_recreate_tpsl = on_recreate_tpsl
         self.on_view_recommendation = on_view_recommendation
+        self.on_view_transaction_details = on_view_transaction_details
         self._on_selection_change = on_selection_change
         
         # Selection tracking
@@ -356,6 +369,11 @@ class LiveTradesTable(LazyTable):
         
         if self.on_view_recommendation:
             self._table.on('view_recommendation', lambda e: self.on_view_recommendation(
+                e.args if hasattr(e, 'args') else e
+            ))
+        
+        if self.on_view_transaction_details:
+            self._table.on('view_transaction_details', lambda e: self.on_view_transaction_details(
                 e.args if hasattr(e, 'args') else e
             ))
     
