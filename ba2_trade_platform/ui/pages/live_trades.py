@@ -1900,7 +1900,7 @@ class LiveTradesTab:
                     
                     if orders:
                         for idx, order in enumerate(orders):
-                            with ui.expansion(f'Order #{order.id} - {order.type.value if order.type else "N/A"} {order.side.value if order.side else "N/A"}', 
+                            with ui.expansion(f'Order #{order.id} - {order.order_type.value if order.order_type else "N/A"} {order.side.value if order.side else "N/A"}', 
                                             icon='receipt').classes('w-full').props('dense'):
                                 
                                 with ui.grid(columns=3).classes('w-full gap-4 mt-2'):
@@ -1911,7 +1911,7 @@ class LiveTradesTab:
                                     
                                     with ui.card():
                                         ui.label('Type / Side').classes('text-caption text-grey-7')
-                                        type_str = f"{order.type.value if order.type else 'N/A'} / {order.side.value if order.side else 'N/A'}"
+                                        type_str = f"{order.order_type.value if order.order_type else 'N/A'} / {order.side.value if order.side else 'N/A'}"
                                         ui.label(type_str).classes('text-body2')
                                     
                                     with ui.card():
@@ -1995,7 +1995,7 @@ class LiveTradesTab:
             TransactionStatus.OPENED: 'green',
             TransactionStatus.CLOSING: 'orange',
             TransactionStatus.CLOSED: 'grey',
-            TransactionStatus.ERROR: 'red',
+            TransactionStatus.FAILED: 'red',
         }
         return status_colors.get(status, 'grey')
 
