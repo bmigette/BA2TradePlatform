@@ -3118,12 +3118,13 @@ class TransactionsTab:
                         if current_price:
                             current_price_str = f"${current_price:.2f}"
                             # Calculate P/L: (current_price - open_price) * quantity
-                            if txn.quantity > 0:  # Long position
-                                pnl_current = (current_price - txn.open_price) * abs(txn.quantity)
+                            # Use side field: BUY=LONG, SELL=SHORT
+                            if txn.side == OrderDirection.BUY:  # Long position
+                                pnl_current = (current_price - txn.open_price) * txn.quantity
                             else:  # Short position
-                                pnl_current = (txn.open_price - current_price) * abs(txn.quantity)
+                                pnl_current = (txn.open_price - current_price) * txn.quantity
                             # Calculate P/L percentage based on cost basis
-                            cost_basis = txn.open_price * abs(txn.quantity)
+                            cost_basis = txn.open_price * txn.quantity
                             pnl_pct = (pnl_current / cost_basis * 100) if cost_basis > 0 else 0
                             current_pnl = f"${pnl_current:+.2f} ({pnl_pct:+.1f}%)"
                             current_pnl_numeric = pnl_pct  # Store percentage for sorting
@@ -3134,10 +3135,11 @@ class TransactionsTab:
                 closed_pnl = ''
                 closed_pnl_numeric = 0  # Numeric value for sorting
                 if txn.close_price and txn.open_price and txn.quantity:
-                    if txn.quantity > 0:  # Long position
-                        pnl_closed = (txn.close_price - txn.open_price) * abs(txn.quantity)
+                    # Use side field: BUY=LONG, SELL=SHORT
+                    if txn.side == OrderDirection.BUY:  # Long position
+                        pnl_closed = (txn.close_price - txn.open_price) * txn.quantity
                     else:  # Short position
-                        pnl_closed = (txn.open_price - txn.close_price) * abs(txn.quantity)
+                        pnl_closed = (txn.open_price - txn.close_price) * txn.quantity
                     closed_pnl = f"${pnl_closed:+.2f}"
                     closed_pnl_numeric = pnl_closed  # Store numeric value for sorting
                 

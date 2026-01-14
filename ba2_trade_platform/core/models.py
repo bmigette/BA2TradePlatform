@@ -163,7 +163,8 @@ class AnalysisOutput(SQLModel, table=True):
 class Transaction(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     symbol: str
-    quantity: float
+    quantity: float  # Always positive - use side field to determine LONG/SHORT
+    side: OrderDirection  # BUY for LONG positions, SELL for SHORT positions
     open_price: float | None = Field(default=None)
     close_price: float | None = Field(default=None)
     stop_loss: float | None = Field(default=None)

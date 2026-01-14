@@ -385,7 +385,8 @@ class AccountInterface(ExtendableSettingsInterface):
             # Create new transaction
             transaction = Transaction(
                 symbol=trading_order.symbol,
-                quantity=trading_order.quantity if trading_order.side == OrderDirection.BUY else -trading_order.quantity,
+                quantity=trading_order.quantity,  # Always positive
+                side=trading_order.side,  # BUY for LONG, SELL for SHORT
                 open_price=current_price,  # Estimated open price
                 status=TransactionStatus.WAITING,
                 created_at=datetime.now(timezone.utc),
@@ -447,10 +448,9 @@ class AccountInterface(ExtendableSettingsInterface):
                 logger.warning(f"Transaction {transaction_id} not found for quantity recalculation")
                 return
             
-            # Determine transaction direction from current quantity sign
-            # Positive = BUY transaction, Negative = SELL transaction
-            is_buy_transaction = (transaction.quantity or 0) >= 0
-            target_side = OrderDirection.BUY if is_buy_transaction else OrderDirection.SELL
+            # Get transaction side from side field
+            # BUY = LONG transaction, SELL = SHORT transaction
+            target_side = transaction.side
             
             # Statuses to exclude from quantity calculation
             excluded_statuses = [
@@ -485,9 +485,8 @@ class AccountInterface(ExtendableSettingsInterface):
                     total_quantity += qty
                     valid_count += 1
                 
-                # For SELL transactions, quantity is stored as negative
-                if not is_buy_transaction:
-                    total_quantity = -total_quantity
+                # Quantity is always positive - direction field indicates LONG/SHORT
+                # No need to negate for SELL transactions
                 
                 # Only update if quantity has changed
                 if transaction.quantity != total_quantity:
@@ -2769,13 +2768,14 @@ class AccountInterface(ExtendableSettingsInterface):
                     else:
                         # No existing close order - create a new one
                         logger.info(f"Creating new closing order for transaction {transaction_id}")
-                        # Determine closing side (opposite of position)
-                        close_side = OrderDirection.SELL if transaction.quantity > 0 else OrderDirection.BUY
+                        # Determine closing side (opposite of position side)
+                        # BUY position closes with SELL, SELL position closes with BUY
+                        close_side = OrderDirection.SELL if transaction.side == OrderDirection.BUY else OrderDirection.BUY
                         
                         close_order = TradingOrder(
                             account_id=self.id,
                             symbol=transaction.symbol,
-                            quantity=abs(transaction.quantity),
+                            quantity=transaction.quantity,  # Already positive
                             side=close_side,
                             order_type=OrderType.MARKET,
                             transaction_id=transaction.id,
@@ -2801,7 +2801,7 @@ class AccountInterface(ExtendableSettingsInterface):
                                 account_id=self.id,
                                 success=True,
                                 close_order_id=result['close_order_id'],
-                                quantity=abs(transaction.quantity),
+                                quantity=transaction.quantity,  # Already positive
                                 side=close_side,
                                 canceled_count=result['canceled_count'],
                                 deleted_count=result['deleted_count']

@@ -313,10 +313,11 @@ def close_transaction_with_logging(
         # Calculate P&L if available
         profit_loss = None
         if transaction.close_price and transaction.open_price and transaction.quantity:
-            if transaction.quantity > 0:  # Long position
+            # Use side field: BUY=LONG, SELL=SHORT
+            if transaction.side == OrderDirection.BUY:  # Long position
                 profit_loss = (transaction.close_price - transaction.open_price) * transaction.quantity
             else:  # Short position
-                profit_loss = (transaction.open_price - transaction.close_price) * abs(transaction.quantity)
+                profit_loss = (transaction.open_price - transaction.close_price) * transaction.quantity
         
         # Build activity description
         description = f"Closed {transaction.symbol} transaction #{transaction.id}"

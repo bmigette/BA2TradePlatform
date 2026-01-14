@@ -57,6 +57,7 @@ def create_transaction_with_legacy_orders(account_id: int, symbol: str = "TSLA")
     transaction = Transaction(
         symbol=symbol,
         quantity=10,
+        side=OrderDirection.BUY,  # LONG position
         open_price=250.0,
         status=TransactionStatus.WAITING,
         created_at=datetime.now(timezone.utc),

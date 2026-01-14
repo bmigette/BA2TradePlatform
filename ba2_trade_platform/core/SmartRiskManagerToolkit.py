@@ -2066,7 +2066,8 @@ class SmartRiskManagerToolkit:
             # Create transaction BEFORE submitting orders
             transaction = Transaction(
                 symbol=symbol,
-                quantity=quantity if order_direction == OrderDirection.BUY else -quantity,
+                quantity=quantity,  # Always positive
+                side=order_direction,  # BUY for LONG, SELL for SHORT
                 open_price=current_price,  # Estimated open price
                 status=TransactionStatus.WAITING,
                 created_at=datetime.now(timezone.utc),

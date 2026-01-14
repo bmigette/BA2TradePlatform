@@ -109,9 +109,9 @@ class FloatingPLPerAccountWidget:
                         if not all_orders:
                             continue
                         
-                        # Determine position direction from first order
-                        first_order = min(all_orders, key=lambda o: o.created_at or datetime.min.replace(tzinfo=timezone.utc))
-                        position_direction = first_order.side
+                        # Get position side from transaction.side field
+                        # BUY = LONG position, SELL = SHORT position
+                        position_direction = trans.side
                         
                         # Get all FILLED orders (any type that affects position)
                         # Exclude: OCO, OTO orders (they are TP/SL brackets, not position-affecting until triggered)
@@ -144,14 +144,22 @@ class FloatingPLPerAccountWidget:
                         if abs(net_filled_qty) < 0.01:  # No net position (fully closed or not filled)
                             continue
                         
-                        # Calculate weighted average price from BUY orders (entry cost basis)
-                        if total_buy_qty < 0.01:
-                            continue  # No buy orders, can't calculate avg price
-                        avg_price = total_buy_cost / total_buy_qty
+                        # Calculate weighted average entry price based on position direction
+                        if position_direction == OrderDirection.BUY:
+                            # Long position: entry price is avg BUY price
+                            if total_buy_qty < 0.01:
+                                continue
+                            avg_price = total_buy_cost / total_buy_qty
+                        else:
+                            # Short position: entry price is avg SELL price
+                            total_sell_cost = sum(o.filled_qty * o.open_price for o in filled_orders if o.side == OrderDirection.SELL and o.open_price)
+                            if total_sell_qty < 0.01:
+                                continue
+                            avg_price = total_sell_cost / total_sell_qty
                         
                         # Use transaction.quantity as source of truth for current position
-                        # This should match net_filled_qty, but transaction.quantity is authoritative
-                        position_qty = abs(trans.quantity)
+                        # Quantity is always positive - direction field indicates LONG/SHORT
+                        position_qty = trans.quantity
                         
                         # Calculate P/L: (current_price - avg_price) * position_quantity
                         # For long positions: profit when price > avg_price

@@ -46,6 +46,8 @@ class FloatingPLPerExpertWidget:
                 .where(Transaction.status.in_([TransactionStatus.OPENED, TransactionStatus.WAITING]))
             ).all()
             
+            logger.debug(f"FloatingPLPerExpertWidget: Found {len(transactions)} open/waiting transactions with expert_id")
+            
             # Group transactions by account to batch price fetching
             account_transactions = {}  # account_id -> [(transaction, expert_name), ...]
             
@@ -54,9 +56,11 @@ class FloatingPLPerExpertWidget:
                     # Get expert info
                     expert = session.get(ExpertInstance, trans.expert_id)
                     if not expert:
+                        logger.warning(f"Transaction {trans.id} (symbol={trans.symbol}, expert_id={trans.expert_id}) expert not found in database")
                         continue
                     
                     expert_name = f"{expert.alias or expert.expert}-{expert.id}"
+                    logger.debug(f"Processing transaction {trans.id} (symbol={trans.symbol}, status={trans.status.value}, expert={expert_name})")
                     
                     # Get account ID from first order
                     first_order = session.exec(
@@ -66,6 +70,7 @@ class FloatingPLPerExpertWidget:
                     ).first()
                     
                     if not first_order or not first_order.account_id:
+                        logger.warning(f"Transaction {trans.id} (symbol={trans.symbol}, expert={expert_name}) has no orders or account_id")
                         continue
                     
                     account_id = first_order.account_id
@@ -111,9 +116,9 @@ class FloatingPLPerExpertWidget:
                         if not all_orders:
                             continue
                         
-                        # Determine position direction from first order
-                        first_order = min(all_orders, key=lambda o: o.created_at or datetime.min.replace(tzinfo=timezone.utc))
-                        position_direction = first_order.side
+                        # Get position side from transaction.side field
+                        # BUY = LONG position, SELL = SHORT position
+                        position_direction = trans.side
                         
                         # Get all FILLED orders (any type that affects position)
                         # Exclude: OCO, OTO orders (they are TP/SL brackets, not position-affecting until triggered)
@@ -125,9 +130,11 @@ class FloatingPLPerExpertWidget:
                         ]
                         
                         # Calculate net position and weighted average cost
-                        # BUY orders add to position (+), SELL orders reduce position (-)
+                        # For LONG positions (BUY first): BUY orders add to position (+), SELL orders reduce position (-)
+                        # For SHORT positions (SELL first): SELL orders open position, BUY orders close position
                         total_buy_cost = 0.0
                         total_buy_qty = 0.0
+                        total_sell_cost = 0.0
                         total_sell_qty = 0.0
                         
                         for order in filled_orders:
@@ -138,22 +145,33 @@ class FloatingPLPerExpertWidget:
                                 total_buy_cost += order.filled_qty * order.open_price
                                 total_buy_qty += order.filled_qty
                             elif order.side == OrderDirection.SELL:
+                                total_sell_cost += order.filled_qty * order.open_price
                                 total_sell_qty += order.filled_qty
                         
-                        # Net filled quantity = buys - sells
+                        # Net filled quantity = buys - sells (positive = long, negative = short)
                         net_filled_qty = total_buy_qty - total_sell_qty
                         
                         if abs(net_filled_qty) < 0.01:  # No net position (fully closed or not filled)
+                            logger.debug(f"Transaction {trans.id} ({trans.symbol}, expert={expert_name}): No net position (buys={total_buy_qty:.2f}, sells={total_sell_qty:.2f})")
                             continue
                         
-                        # Calculate weighted average price from BUY orders (entry cost basis)
-                        if total_buy_qty < 0.01:
-                            continue  # No buy orders, can't calculate avg price
-                        avg_price = total_buy_cost / total_buy_qty
+                        # Calculate weighted average entry price based on position direction
+                        if position_direction == OrderDirection.BUY:
+                            # Long position: entry price is avg BUY price
+                            if total_buy_qty < 0.01:
+                                logger.debug(f"Transaction {trans.id} ({trans.symbol}, expert={expert_name}): Long position but no buy orders")
+                                continue
+                            avg_price = total_buy_cost / total_buy_qty
+                        else:
+                            # Short position: entry price is avg SELL price
+                            if total_sell_qty < 0.01:
+                                logger.debug(f"Transaction {trans.id} ({trans.symbol}, expert={expert_name}): Short position but no sell orders")
+                                continue
+                            avg_price = total_sell_cost / total_sell_qty
                         
                         # Use transaction.quantity as source of truth for current position
-                        # This should match net_filled_qty, but transaction.quantity is authoritative
-                        position_qty = abs(trans.quantity)
+                        # Quantity is always positive - direction field indicates LONG/SHORT
+                        position_qty = trans.quantity
                         
                         # Calculate P/L: (current_price - avg_price) * position_quantity
                         # For long positions: profit when price > avg_price

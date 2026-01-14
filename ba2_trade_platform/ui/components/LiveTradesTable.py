@@ -73,6 +73,7 @@ class LiveTradesTable(LazyTable):
         ColumnDef(name='quantity', label='Qty', field='quantity', align='right', sortable=True),
         ColumnDef(name='open_price', label='Open Price', field='open_price', align='right', sortable=True),
         ColumnDef(name='current_price', label='Current', field='current_price', align='right'),
+        ColumnDef(name='value', label='Value', field='value', align='right', sortable=True),
         ColumnDef(name='close_price', label='Close Price', field='close_price', align='right'),
         ColumnDef(name='take_profit', label='TP', field='take_profit', align='right'),
         ColumnDef(name='stop_loss', label='SL', field='stop_loss', align='right'),

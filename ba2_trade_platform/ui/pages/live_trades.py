@@ -417,11 +417,12 @@ class LiveTradesTab:
                     current_price = current_prices.get(txn.symbol)
                     if current_price:
                         current_price_str = f"${current_price:.2f}"
-                        if txn.quantity > 0:
-                            pnl_current = (current_price - txn.open_price) * abs(txn.quantity)
+                        # Use side field: BUY=LONG, SELL=SHORT
+                        if txn.side == OrderDirection.BUY:
+                            pnl_current = (current_price - txn.open_price) * txn.quantity
                         else:
-                            pnl_current = (txn.open_price - current_price) * abs(txn.quantity)
-                        cost_basis = txn.open_price * abs(txn.quantity)
+                            pnl_current = (txn.open_price - current_price) * txn.quantity
+                        cost_basis = txn.open_price * txn.quantity
                         pnl_pct = (pnl_current / cost_basis * 100) if cost_basis > 0 else 0
                         current_pnl = f"${pnl_current:+.2f} ({pnl_pct:+.1f}%)"
                         current_pnl_numeric = pnl_pct
@@ -432,10 +433,11 @@ class LiveTradesTab:
             closed_pnl = ''
             closed_pnl_numeric = 0
             if txn.close_price and txn.open_price and txn.quantity:
-                if txn.quantity > 0:
-                    pnl_closed = (txn.close_price - txn.open_price) * abs(txn.quantity)
+                # Use side field: BUY=LONG, SELL=SHORT
+                if txn.side == OrderDirection.BUY:
+                    pnl_closed = (txn.close_price - txn.open_price) * txn.quantity
                 else:
-                    pnl_closed = (txn.open_price - txn.close_price) * abs(txn.quantity)
+                    pnl_closed = (txn.open_price - txn.close_price) * txn.quantity
                 closed_pnl = f"${pnl_closed:+.2f}"
                 closed_pnl_numeric = pnl_closed
 
@@ -500,15 +502,27 @@ class LiveTradesTab:
             # Check for missing TP/SL orders
             has_missing_tpsl_orders = self._check_missing_tpsl_orders(txn, txn_orders)
 
+            # Calculate value (qty * current_price)
+            value_str = ''
+            if txn.quantity and current_price_str:
+                try:
+                    current_price = current_prices.get(txn.symbol)
+                    if current_price:
+                        value = txn.quantity * current_price
+                        value_str = f"${value:,.2f}"
+                except Exception as e:
+                    logger.debug(f"Could not calculate value for {txn.symbol}: {e}")
+
             row = {
                 'id': txn.id,
                 '_selected': False,  # Selection is managed by LiveTradesTable
                 'symbol': txn.symbol,
-                'direction': 'BUY' if txn.quantity > 0 else 'SELL',
+                'direction': txn.side.value,
                 'expert': expert_shortname,
-                'quantity': f"{txn.quantity:+.2f}",
+                'quantity': f"{txn.quantity:.2f}",
                 'open_price': f"${txn.open_price:.2f}" if txn.open_price else '',
                 'current_price': current_price_str,
+                'value': value_str,
                 'close_price': f"${txn.close_price:.2f}" if txn.close_price else '',
                 'take_profit': f"${txn.take_profit:.2f}" if txn.take_profit else '',
                 'stop_loss': f"${txn.stop_loss:.2f}" if txn.stop_loss else '',
@@ -723,12 +737,13 @@ class LiveTradesTab:
                         if current_price:
                             current_price_str = f"${current_price:.2f}"
                             # Calculate P/L: (current_price - open_price) * quantity
-                            if txn.quantity > 0:  # Long position
-                                pnl_current = (current_price - txn.open_price) * abs(txn.quantity)
+                            # Use side field: BUY=LONG, SELL=SHORT
+                            if txn.side == OrderDirection.BUY:  # Long position
+                                pnl_current = (current_price - txn.open_price) * txn.quantity
                             else:  # Short position
-                                pnl_current = (txn.open_price - current_price) * abs(txn.quantity)
+                                pnl_current = (txn.open_price - current_price) * txn.quantity
                             # Calculate P/L percentage based on cost basis
-                            cost_basis = txn.open_price * abs(txn.quantity)
+                            cost_basis = txn.open_price * txn.quantity
                             pnl_pct = (pnl_current / cost_basis * 100) if cost_basis > 0 else 0
                             current_pnl = f"${pnl_current:+.2f} ({pnl_pct:+.1f}%)"
                             current_pnl_numeric = pnl_pct  # Store percentage for sorting
@@ -739,10 +754,11 @@ class LiveTradesTab:
                 closed_pnl = ''
                 closed_pnl_numeric = 0  # Numeric value for sorting
                 if txn.close_price and txn.open_price and txn.quantity:
-                    if txn.quantity > 0:  # Long position
-                        pnl_closed = (txn.close_price - txn.open_price) * abs(txn.quantity)
+                    # Use side field: BUY=LONG, SELL=SHORT
+                    if txn.side == OrderDirection.BUY:  # Long position
+                        pnl_closed = (txn.close_price - txn.open_price) * txn.quantity
                     else:  # Short position
-                        pnl_closed = (txn.open_price - txn.close_price) * abs(txn.quantity)
+                        pnl_closed = (txn.open_price - txn.close_price) * txn.quantity
                     closed_pnl = f"${pnl_closed:+.2f}"
                     closed_pnl_numeric = pnl_closed  # Store numeric value for sorting
 
@@ -1809,14 +1825,15 @@ class LiveTradesTab:
                         # Direction
                         with ui.card().classes('bg-primary/5'):
                             ui.label('Direction').classes('text-caption text-grey-7')
-                            direction = 'BUY (LONG)' if txn.quantity > 0 else 'SELL (SHORT)'
-                            dir_color = 'green' if txn.quantity > 0 else 'red'
+                            # Use side field: BUY=LONG, SELL=SHORT
+                            direction = 'BUY (LONG)' if txn.side == OrderDirection.BUY else 'SELL (SHORT)'
+                            dir_color = 'green' if txn.side == OrderDirection.BUY else 'red'
                             ui.badge(direction, color=dir_color).classes('text-body1')
                         
                         # Quantity
                         with ui.card().classes('bg-primary/5'):
                             ui.label('Quantity').classes('text-caption text-grey-7')
-                            ui.label(f'{txn.quantity:+.2f}').classes('text-body1 font-bold')
+                            ui.label(f'{txn.quantity:.2f}').classes('text-body1 font-bold')
                         
                         # Status
                         with ui.card().classes('bg-primary/5'):

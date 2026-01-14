@@ -561,20 +561,21 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     logger.warning(f"Could not get current price for {transaction.symbol}, using open_price")
                     current_price = transaction.open_price
                 
-                # Calculate profit/loss
-                if transaction.quantity > 0:  # Long position
+                # Calculate profit/loss based on side field
+                # BUY = LONG, SELL = SHORT
+                if transaction.side == OrderDirection.BUY:  # Long position
                     profit_loss = (current_price - transaction.open_price) * transaction.quantity
                 else:  # Short position  
-                    profit_loss = (transaction.open_price - current_price) * abs(transaction.quantity)
+                    profit_loss = (transaction.open_price - current_price) * transaction.quantity
                 
                 # Calculate used balance for this transaction
                 if profit_loss >= 0:
                     # Transaction is profitable, use open_price
-                    transaction_used = transaction.open_price * abs(transaction.quantity)
+                    transaction_used = transaction.open_price * transaction.quantity
                 else:
                     # Transaction is losing money, use open_price + loss
                     loss_amount = abs(profit_loss)
-                    transaction_used = (transaction.open_price * abs(transaction.quantity)) + loss_amount
+                    transaction_used = (transaction.open_price * transaction.quantity) + loss_amount
                 
                 used_balance += transaction_used
                 
