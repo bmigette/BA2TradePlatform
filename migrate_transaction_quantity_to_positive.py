@@ -7,6 +7,31 @@ Migration script to update Transaction model:
 Run this ONCE after updating code to the new Transaction model.
 """
 
+import argparse
+import os
+import sys
+
+# Parse command-line arguments FIRST before any imports
+parser = argparse.ArgumentParser(description="Migrate Transaction model to use side column")
+parser.add_argument(
+    "--db-file",
+    type=str,
+    help="Path to custom SQLite database file (overrides default)"
+)
+args = parser.parse_args()
+
+# Set custom database path if provided - MUST be done before any ba2_trade_platform imports
+if args.db_file:
+    if not os.path.exists(args.db_file):
+        print(f"❌ Database file not found: {args.db_file}")
+        sys.exit(1)
+    
+    # Override the DB_FILE in config module BEFORE it's used
+    import ba2_trade_platform.config as config
+    config.DB_FILE = args.db_file
+    print(f"Using custom database: {args.db_file}")
+
+# NOW import the rest after config is set
 from ba2_trade_platform.core.db import get_db
 from ba2_trade_platform.core.types import OrderDirection
 from ba2_trade_platform.logger import logger

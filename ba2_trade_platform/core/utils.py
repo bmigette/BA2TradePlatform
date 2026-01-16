@@ -307,6 +307,7 @@ def close_transaction_with_logging(
     try:
         # Update transaction status
         transaction.status = TransactionStatus.CLOSED
+        transaction.close_reason = close_reason  # Store the close reason
         if not transaction.close_date:
             transaction.close_date = datetime.now(timezone.utc)
         
@@ -325,11 +326,14 @@ def close_transaction_with_logging(
         # Add close reason to description
         reason_descriptions = {
             "tp_sl_filled": "(TP/SL filled)",
+            "oco_leg_filled": "(TP/SL OCO filled)",
             "all_orders_terminal": "(all orders terminal)",
             "position_balanced": "(position balanced)",
             "entry_orders_terminal_no_execution": "(entry orders canceled/rejected)",
             "entry_orders_terminal_after_opening": "(entry orders terminal)",
+            "position_not_at_broker": "(closed at broker)",
             "manual_close": "(manual close)",
+            "smart_risk_manager": "(closed by Smart Risk Manager)",
             "cleanup": "(cleanup)"
         }
         

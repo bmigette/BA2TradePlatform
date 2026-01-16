@@ -171,6 +171,7 @@ class Transaction(SQLModel, table=True):
     take_profit: float | None = Field(default=None)
     open_date: DateTime | None = Field(default=None)
     close_date: DateTime | None = Field(default=None)
+    close_reason: str | None = Field(default=None, description="Reason for closing (tp_sl_filled, manual_close, smart_risk_manager, broker_closed, etc.)")
     status: TransactionStatus = Field(default=TransactionStatus.WAITING)
     created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc))
     
