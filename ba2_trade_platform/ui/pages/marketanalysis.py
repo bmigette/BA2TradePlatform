@@ -3009,7 +3009,17 @@ class ScheduledJobsTab:
                     for acc in session.scalars(stmt):
                         account_names[acc.id] = acc.name
             
-            # Filter by expert instance if specified
+            # Apply global account filter from header dropdown
+            selected_account_id = get_selected_account_id()
+            account_expert_ids = get_expert_ids_for_account(selected_account_id)
+            if account_expert_ids is not None:
+                if account_expert_ids:
+                    expert_instances = [ei for ei in expert_instances if ei.id in account_expert_ids]
+                else:
+                    # No experts for selected account - return empty
+                    return [], 0
+            
+            # Filter by expert instance if specified (from local filter dropdown)
             if self.expert_filter != 'all':
                 expert_instance_id = int(self.expert_filter)
                 expert_instances = [ei for ei in expert_instances if ei.id == expert_instance_id]

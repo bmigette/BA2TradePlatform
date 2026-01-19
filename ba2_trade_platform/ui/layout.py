@@ -92,15 +92,22 @@ def _render_account_filter_dropdown():
     account_options = get_accounts_for_filter()
     
     # Build options dict for ui.select: {value: label}
-    options_dict = {acc_id: label for label, acc_id in account_options}
+    # Use "all" string instead of None for the "All" option (None doesn't work well with ui.select)
+    options_dict = {}
+    for label, acc_id in account_options:
+        key = "all" if acc_id is None else acc_id
+        options_dict[key] = label
     
-    # Get current selection
+    # Get current selection - convert None to "all" for ui.select
     current_selection = get_selected_account_id()
+    current_value = "all" if current_selection is None else current_selection
     
     async def on_account_change(e):
         """Handle account selection change."""
         new_value = e.value
-        set_selected_account_id(new_value)
+        # Convert "all" back to None for storage
+        account_id = None if new_value == "all" else new_value
+        set_selected_account_id(account_id)
         # Force refresh the current page by navigating to current path
         await ui.run_javascript('window.location.reload()')
     
@@ -108,6 +115,6 @@ def _render_account_filter_dropdown():
         ui.icon('account_circle', size='xs').classes('text-secondary-custom')
         ui.select(
             options=options_dict,
-            value=current_selection,
+            value=current_value,
             on_change=on_account_change
         ).props('dense outlined dark color=white').classes('text-xs min-w-32').style('font-size: 0.75rem;')
