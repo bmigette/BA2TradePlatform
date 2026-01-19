@@ -2658,6 +2658,17 @@ class ScheduledJobsTab:
         
         # Get all enabled expert instances
         expert_instances = get_all_instances(ExpertInstance)
+        
+        # Apply global account filter from header dropdown
+        selected_account_id = get_selected_account_id()
+        account_expert_ids = get_expert_ids_for_account(selected_account_id)
+        if account_expert_ids is not None:
+            if account_expert_ids:
+                expert_instances = [ei for ei in expert_instances if ei.id in account_expert_ids]
+            else:
+                # No experts for selected account - render empty overview
+                expert_instances = []
+        
         enabled_experts = [ei for ei in expert_instances if ei.enabled]
         
         # Generate colors for experts (use hashing for consistent colors)
