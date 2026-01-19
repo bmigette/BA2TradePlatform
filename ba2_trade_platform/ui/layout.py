@@ -1,8 +1,10 @@
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Optional
 
 from .menus import topmenu, sidemenu
 from .theme import COLORS
+from .account_filter_context import get_accounts_for_filter, get_selected_account_id, set_selected_account_id
 
 from nicegui import ui, app
 
@@ -74,8 +76,38 @@ def layout_render(navigation_title: str):
                 ui.icon('fiber_manual_record', size='xs').classes('text-accent pulse')
                 ui.label('LIVE').classes('text-xs font-medium text-accent')
             
+            # Account filter dropdown
+            _render_account_filter_dropdown()
+            
             topmenu()
     
     # Main content area with padding
     with ui.column().classes('w-full p-6 text-white'):
         yield
+
+
+def _render_account_filter_dropdown():
+    """Render the account filter dropdown in the header."""
+    # Get accounts for dropdown options
+    account_options = get_accounts_for_filter()
+    
+    # Build options dict for ui.select: {value: label}
+    options_dict = {acc_id: label for label, acc_id in account_options}
+    
+    # Get current selection
+    current_selection = get_selected_account_id()
+    
+    async def on_account_change(e):
+        """Handle account selection change."""
+        new_value = e.value
+        set_selected_account_id(new_value)
+        # Force refresh the current page by navigating to current path
+        await ui.run_javascript('window.location.reload()')
+    
+    with ui.row().classes('items-center gap-1 mr-4'):
+        ui.icon('account_circle', size='xs').classes('text-secondary-custom')
+        ui.select(
+            options=options_dict,
+            value=current_selection,
+            on_change=on_account_change
+        ).props('dense outlined dark color=white').classes('text-xs min-w-32').style('font-size: 0.75rem;')

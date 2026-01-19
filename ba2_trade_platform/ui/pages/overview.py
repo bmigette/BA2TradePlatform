@@ -1,7 +1,7 @@
 from nicegui import ui
 from datetime import datetime, timedelta, timezone
 from sqlmodel import select, func
-from typing import Dict, Any
+from typing import Dict, Any, Optional, List
 import requests
 import aiohttp
 import asyncio
@@ -19,6 +19,7 @@ from ..components import ProfitPerExpertChart, InstrumentDistributionChart, Bala
 from ..components.FloatingPLPerExpertWidget import FloatingPLPerExpertWidget
 from ..components.FloatingPLPerAccountWidget import FloatingPLPerAccountWidget
 from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
+from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
 from .llm_usage import LLMUsagePage
 
 class OverviewTab:
@@ -557,8 +558,16 @@ class OverviewTab:
     async def _load_position_distribution_async(self, loading_label, chart_container, grouping_field):
         """Load position distribution data asynchronously."""
         try:
-            # Fetch positions from all accounts
-            accounts = get_all_instances(AccountDefinition)
+            # Get selected account filter
+            selected_account_id = get_selected_account_id()
+            
+            # Fetch positions from accounts (filtered if account selected)
+            all_accounts = get_all_instances(AccountDefinition)
+            if selected_account_id is not None:
+                accounts = [acc for acc in all_accounts if acc.id == selected_account_id]
+            else:
+                accounts = all_accounts
+            
             all_positions_raw = []
             
             for acc in accounts:
@@ -621,26 +630,38 @@ class OverviewTab:
         with ui.card().classes('p-4'):
             ui.label('📊 Analysis Jobs').classes('text-h6 mb-4')
             
+            # Get selected account filter
+            selected_account_id = get_selected_account_id()
+            expert_ids = get_expert_ids_for_account(selected_account_id)
+            
             # Get actual data from database
             session = get_db()
             try:
+                # Build base query with optional account filter
+                def build_count_query(status):
+                    query = select(func.count(MarketAnalysis.id)).where(MarketAnalysis.status == status)
+                    if expert_ids is not None:
+                        if expert_ids:
+                            query = query.where(MarketAnalysis.expert_instance_id.in_(expert_ids))
+                        else:
+                            # No experts for this account - return 0
+                            return None
+                    return query
+                
                 # Count successful analyses
-                successful_count = session.exec(
-                    select(func.count(MarketAnalysis.id))
-                    .where(MarketAnalysis.status == MarketAnalysisStatus.COMPLETED)
-                ).first() or 0
+                query = build_count_query(MarketAnalysisStatus.COMPLETED)
+                successful_count = session.exec(query).first() if query is not None else 0
+                successful_count = successful_count or 0
                 
                 # Count failed analyses
-                failed_count = session.exec(
-                    select(func.count(MarketAnalysis.id))
-                    .where(MarketAnalysis.status == MarketAnalysisStatus.FAILED)
-                ).first() or 0
+                query = build_count_query(MarketAnalysisStatus.FAILED)
+                failed_count = session.exec(query).first() if query is not None else 0
+                failed_count = failed_count or 0
                 
                 # Count running analyses
-                running_count = session.exec(
-                    select(func.count(MarketAnalysis.id))
-                    .where(MarketAnalysis.status == MarketAnalysisStatus.RUNNING)
-                ).first() or 0
+                query = build_count_query(MarketAnalysisStatus.RUNNING)
+                running_count = session.exec(query).first() if query is not None else 0
+                running_count = running_count or 0
                 
             finally:
                 session.close()
@@ -662,8 +683,15 @@ class OverviewTab:
         with ui.card().classes('p-4'):
             ui.label('📋 Orders by Account').classes('text-h6 mb-4')
             
-            # Get all accounts
-            accounts = get_all_instances(AccountDefinition)
+            # Get selected account filter
+            selected_account_id = get_selected_account_id()
+            
+            # Get accounts to display (filtered if account selected)
+            all_accounts = get_all_instances(AccountDefinition)
+            if selected_account_id is not None:
+                accounts = [acc for acc in all_accounts if acc.id == selected_account_id]
+            else:
+                accounts = all_accounts
             
             if not accounts:
                 ui.label('No accounts configured').classes('text-sm text-gray-500')
@@ -734,6 +762,10 @@ class OverviewTab:
         with ui.card().classes('p-4'):
             ui.label('📈 Trade Recommendations').classes('text-h6 mb-4')
             
+            # Get account filter
+            selected_account_id = get_selected_account_id()
+            expert_ids = get_expert_ids_for_account(selected_account_id)
+            
             # Calculate date ranges
             now = datetime.now()
             week_ago = now - timedelta(days=7)
@@ -741,9 +773,9 @@ class OverviewTab:
             
             session = get_db()
             try:
-                # Get recommendations for last week
-                week_recs = self._get_recommendation_counts(session, week_ago)
-                month_recs = self._get_recommendation_counts(session, month_ago)
+                # Get recommendations for last week and month, filtered by account
+                week_recs = self._get_recommendation_counts(session, week_ago, expert_ids)
+                month_recs = self._get_recommendation_counts(session, month_ago, expert_ids)
                 
             finally:
                 session.close()
@@ -781,31 +813,40 @@ class OverviewTab:
                         ui.label('🟡 HOLD:').classes('text-sm')
                         ui.label(str(month_recs['HOLD'])).classes('text-sm font-bold text-orange-600')
     
-    def _get_recommendation_counts(self, session, since_date: datetime) -> Dict[str, int]:
-        """Get recommendation counts since a specific date."""
+    def _get_recommendation_counts(self, session, since_date: datetime, expert_ids: Optional[List[int]] = None) -> Dict[str, int]:
+        """Get recommendation counts since a specific date.
+        
+        Args:
+            session: Database session
+            since_date: Count recommendations since this date
+            expert_ids: Optional list of expert IDs to filter by (for account filtering)
+        """
         counts = {'BUY': 0, 'SELL': 0, 'HOLD': 0}
         
+        # If expert_ids is empty list (account has no experts), return zeros
+        if expert_ids is not None and not expert_ids:
+            return counts
+        
         try:
+            # Build base query conditions
+            def build_query(action):
+                query = (
+                    select(func.count(ExpertRecommendation.id))
+                    .where(ExpertRecommendation.recommended_action == action)
+                    .where(ExpertRecommendation.created_at >= since_date)
+                )
+                if expert_ids is not None:
+                    query = query.where(ExpertRecommendation.instance_id.in_(expert_ids))
+                return query
+            
             # Count BUY recommendations
-            buy_count = session.exec(
-                select(func.count(ExpertRecommendation.id))
-                .where(ExpertRecommendation.recommended_action == OrderRecommendation.BUY)
-                .where(ExpertRecommendation.created_at >= since_date)
-            ).first() or 0
+            buy_count = session.exec(build_query(OrderRecommendation.BUY)).first() or 0
             
             # Count SELL recommendations
-            sell_count = session.exec(
-                select(func.count(ExpertRecommendation.id))
-                .where(ExpertRecommendation.recommended_action == OrderRecommendation.SELL)
-                .where(ExpertRecommendation.created_at >= since_date)
-            ).first() or 0
+            sell_count = session.exec(build_query(OrderRecommendation.SELL)).first() or 0
             
             # Count HOLD recommendations
-            hold_count = session.exec(
-                select(func.count(ExpertRecommendation.id))
-                .where(ExpertRecommendation.recommended_action == OrderRecommendation.HOLD)
-                .where(ExpertRecommendation.created_at >= since_date)
-            ).first() or 0
+            hold_count = session.exec(build_query(OrderRecommendation.HOLD)).first() or 0
             
             counts = {'BUY': buy_count, 'SELL': sell_count, 'HOLD': hold_count}
         except Exception as e:
@@ -1201,7 +1242,16 @@ class AccountOverviewTab:
             with ui.row().classes('w-full justify-end mb-2'):
                 ui.button('🔄 Refresh', on_click=lambda: self.render()).props('flat color=primary')
             
-            accounts = get_all_instances(AccountDefinition)
+            # Get selected account filter
+            selected_account_id = get_selected_account_id()
+            
+            # Get accounts to display (filtered if account selected)
+            all_accounts = get_all_instances(AccountDefinition)
+            if selected_account_id is not None:
+                accounts = [acc for acc in all_accounts if acc.id == selected_account_id]
+            else:
+                accounts = all_accounts
+                
             all_positions = []
             # Keep unformatted positions for chart calculations
             all_positions_raw = []

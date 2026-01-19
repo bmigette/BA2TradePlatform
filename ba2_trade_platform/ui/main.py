@@ -126,7 +126,7 @@ STATICPATH = Path(__file__).parent / 'static'
 FAVICO = (STATICPATH / 'favicon.ico')
 
 # Get HTTP port from config
-from ..config import HTTP_PORT
+from ..config import HTTP_PORT, STORAGE_SECRET
 
 # Register shutdown handler to log application stop
 def on_shutdown():
@@ -166,5 +166,7 @@ ui.run(
     reconnect_timeout=5.0,
     # Increase binding refresh interval to reduce pressure
     binding_refresh_interval=0.5,
+    # Storage secret for app.storage.user (account filter persistence)
+    storage_secret=STORAGE_SECRET,
     #uvicorn_logging_level=logging.DEBUG,
 )

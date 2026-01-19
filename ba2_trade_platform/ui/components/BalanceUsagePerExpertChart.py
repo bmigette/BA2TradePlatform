@@ -7,12 +7,13 @@ split into pending orders and filled orders.
 
 from nicegui import ui
 from sqlmodel import select
-from typing import Dict, List
+from typing import Dict, List, Optional
 import asyncio
 from ...core.db import get_db
 from ...core.models import TradingOrder, ExpertInstance, Transaction
 from ...core.types import OrderStatus
 from ...logger import logger
+from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
 
 
 class BalanceUsagePerExpertChart:
@@ -39,17 +40,30 @@ class BalanceUsagePerExpertChart:
         """
         balance_usage = {}
         
+        # Get global account filter
+        selected_account_id = get_selected_account_id()
+        account_expert_ids = get_expert_ids_for_account(selected_account_id)
+        
         with get_db() as session:
             from ...core.types import TransactionStatus, OrderType
             from ...core.utils import get_account_instance_from_id
             
-            # Get all transactions with expert_id that are active (OPENED, WAITING, or CLOSING)
-            # Include CLOSING because balance is still used until close order is filled
-            transactions = session.exec(
+            # Build query for transactions with expert_id that are active
+            query = (
                 select(Transaction)
                 .where(Transaction.expert_id.isnot(None))
                 .where(Transaction.status.in_([TransactionStatus.OPENED, TransactionStatus.WAITING, TransactionStatus.CLOSING]))
-            ).all()
+            )
+            
+            # Apply account filter if selected
+            if account_expert_ids is not None:
+                if account_expert_ids:
+                    query = query.where(Transaction.expert_id.in_(account_expert_ids))
+                else:
+                    # No experts for selected account - return empty
+                    return {}
+            
+            transactions = session.exec(query).all()
             
             # Prefetch prices for all symbols in bulk
             if transactions:

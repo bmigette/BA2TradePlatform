@@ -4,7 +4,7 @@ Displays unrealized profit/loss for open positions grouped by account.
 """
 from nicegui import ui
 import asyncio
-from typing import Dict
+from typing import Dict, Optional, List
 from datetime import datetime, timezone
 from sqlmodel import select
 from ...logger import logger
@@ -12,6 +12,7 @@ from ...core.db import get_db
 from ...core.models import Transaction, AccountDefinition, TradingOrder
 from ...core.types import TransactionStatus
 from ...core.utils import get_account_instance_from_id
+from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
 
 
 class FloatingPLPerAccountWidget:
@@ -33,17 +34,32 @@ class FloatingPLPerAccountWidget:
             # Load data asynchronously (non-blocking)
             asyncio.create_task(self._load_data_async(loading_label, content_container))
     
-    def _calculate_pl_sync(self) -> Dict[str, float]:
-        """Synchronous P/L calculation (runs in thread pool to avoid blocking). Uses bulk price fetching."""
+    def _calculate_pl_sync(self, selected_account_id: Optional[int], account_expert_ids: Optional[List[int]]) -> Dict[str, float]:
+        """Synchronous P/L calculation (runs in thread pool to avoid blocking). Uses bulk price fetching.
+        
+        Args:
+            selected_account_id: The selected account ID from filter, or None for all
+            account_expert_ids: List of expert IDs belonging to selected account, or None for all
+        """
         account_pl = {}
         
         session = get_db()
         try:
-            # Get all open transactions
-            transactions = session.exec(
+            # Build query for open transactions
+            query = (
                 select(Transaction)
                 .where(Transaction.status.in_([TransactionStatus.OPENED, TransactionStatus.WAITING]))
-            ).all()
+            )
+            
+            # Apply account filter if selected (filter by expert_id which belongs to account)
+            if account_expert_ids is not None:
+                if account_expert_ids:
+                    query = query.where(Transaction.expert_id.in_(account_expert_ids))
+                else:
+                    # No experts for selected account - return empty
+                    return {}
+            
+            transactions = session.exec(query).all()
             
             # Group transactions by account to batch price fetching
             account_transactions = {}  # account_id -> [(transaction, account_name), ...]
@@ -58,6 +74,10 @@ class FloatingPLPerAccountWidget:
                     ).first()
                     
                     if not first_order or not first_order.account_id:
+                        continue
+                    
+                    # If account filter is active, skip transactions from other accounts
+                    if selected_account_id is not None and first_order.account_id != selected_account_id:
                         continue
                     
                     # Get account info
@@ -192,9 +212,17 @@ class FloatingPLPerAccountWidget:
     async def _load_data_async(self, loading_label, content_container):
         """Calculate and display floating P/L per account (async wrapper for thread pool execution)."""
         try:
+            # Capture account filter values BEFORE running in thread pool
+            # (app.storage.user is request-context bound and not available in thread pool)
+            selected_account_id = get_selected_account_id()
+            account_expert_ids = get_expert_ids_for_account(selected_account_id)
+            
             # Run database queries in thread pool to avoid blocking UI
             loop = asyncio.get_event_loop()
-            account_pl = await loop.run_in_executor(None, self._calculate_pl_sync)
+            account_pl = await loop.run_in_executor(
+                None,
+                lambda: self._calculate_pl_sync(selected_account_id, account_expert_ids)
+            )
             
             # Clear loading message
             try:

@@ -17,6 +17,7 @@ from ...logger import logger
 from ...core.utils import get_account_instance_from_id
 from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
 from ..components.SmartRiskManagerDetailDialog import SmartRiskManagerDetailDialog
+from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
 from sqlmodel import select, func, distinct
 
 
@@ -84,7 +85,8 @@ class JobMonitoringTab:
             self.expert_filter,
             self.type_filter,
             self.recommendation_filter,
-            self.symbol_filter
+            self.symbol_filter,
+            get_selected_account_id()  # Include global account filter
         )
     
     def _should_invalidate_cache(self) -> bool:
@@ -252,6 +254,7 @@ class JobMonitoringTab:
         """Create the analysis jobs table."""
         columns = [
             {'name': 'id', 'label': 'ID', 'field': 'id', 'sortable': True, 'style': 'width: 80px'},
+            {'name': 'account', 'label': 'Account', 'field': 'account_name', 'sortable': True, 'style': 'width: 120px'},
             {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'style': 'width: 100px'},
             {'name': 'expert', 'label': 'Expert', 'field': 'expert_name', 'sortable': True, 'style': 'width: 150px'},
             {'name': 'status', 'label': 'Status', 'field': 'status_display', 'sortable': True, 'style': 'width: 120px'},
@@ -341,6 +344,7 @@ class JobMonitoringTab:
         """Create the Smart Risk Manager jobs table."""
         columns = [
             {'name': 'id', 'label': 'Job ID', 'field': 'id', 'sortable': True, 'style': 'width: 80px'},
+            {'name': 'account', 'label': 'Account', 'field': 'account_name', 'sortable': True, 'style': 'width: 120px'},
             {'name': 'expert', 'label': 'Expert', 'field': 'expert_name', 'sortable': True, 'style': 'width: 150px'},
             {'name': 'status', 'label': 'Status', 'field': 'status_display', 'sortable': True, 'style': 'width: 120px'},
             {'name': 'run_date', 'label': 'Run Date', 'field': 'run_date_local', 'sortable': True, 'style': 'width: 160px'},
@@ -437,7 +441,8 @@ class JobMonitoringTab:
             # Check if cache is valid (filter state hasn't changed)
             current_filter_state = (
                 self.smart_risk_status_filter,
-                self.smart_risk_expert_filter
+                self.smart_risk_expert_filter,
+                get_selected_account_id()  # Include global account filter
             )
             
             if not self.smart_risk_cache_valid or self.last_smart_risk_filter_state != current_filter_state:
@@ -478,6 +483,17 @@ class JobMonitoringTab:
                 
                 # Apply filters
                 filters = []
+                
+                # Apply global account filter from header dropdown
+                selected_account_id = get_selected_account_id()
+                account_expert_ids = get_expert_ids_for_account(selected_account_id)
+                if account_expert_ids is not None:
+                    if account_expert_ids:
+                        filters.append(SmartRiskManagerJob.expert_instance_id.in_(account_expert_ids))
+                    else:
+                        # No experts for selected account - return empty
+                        return []
+                
                 if self.smart_risk_status_filter != 'all':
                     filters.append(SmartRiskManagerJob.status == self.smart_risk_status_filter)
                 
@@ -492,18 +508,39 @@ class JobMonitoringTab:
                 
                 jobs = session.exec(statement).all()
                 
+                # Pre-fetch expert instances and account names for efficient lookup
+                expert_ids = set(job.expert_instance_id for job in jobs)
+                expert_instances = {}
+                account_names = {}
+                if expert_ids:
+                    stmt = select(ExpertInstance).where(ExpertInstance.id.in_(expert_ids))
+                    for expert in session.scalars(stmt):
+                        expert_instances[expert.id] = expert
+                    
+                    # Pre-fetch account names
+                    account_ids = set(e.account_id for e in expert_instances.values() if e.account_id)
+                    if account_ids:
+                        from ...core.models import AccountDefinition
+                        stmt = select(AccountDefinition).where(AccountDefinition.id.in_(account_ids))
+                        for acc in session.scalars(stmt):
+                            account_names[acc.id] = acc.name
+                
                 rows = []
                 for job in jobs:
                     # Get expert name (alias with fallback to classname + ID)
                     expert_name = "Unknown"
+                    account_name = ""
                     try:
-                        expert_instance = session.get(ExpertInstance, job.expert_instance_id)
+                        expert_instance = expert_instances.get(job.expert_instance_id)
                         if expert_instance:
                             # Use alias if available, otherwise fallback to "classname (ID: expert_id)"
                             if expert_instance.alias:
                                 expert_name = expert_instance.alias
                             else:
                                 expert_name = f"{expert_instance.expert} (ID: {expert_instance.id})"
+                            # Get account name
+                            if expert_instance.account_id:
+                                account_name = account_names.get(expert_instance.account_id, '')
                     except Exception:
                         pass
                     
@@ -535,6 +572,7 @@ class JobMonitoringTab:
                     
                     rows.append({
                         'id': job.id,
+                        'account_name': account_name,
                         'expert_name': expert_name,
                         'expert_instance_id': job.expert_instance_id,
                         'status': job.status,
@@ -868,6 +906,7 @@ class JobMonitoringTab:
                     columns = [
                         {'name': 'task_id', 'label': 'Task ID', 'field': 'task_id', 'sortable': True, 'style': 'width: 200px'},
                         {'name': 'type', 'label': 'Type', 'field': 'type', 'sortable': True, 'style': 'width: 100px'},
+                        {'name': 'account', 'label': 'Account', 'field': 'account_name', 'sortable': True, 'style': 'width: 120px'},
                         {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'style': 'width: 100px'},
                         {'name': 'expert', 'label': 'Expert', 'field': 'expert_name', 'sortable': True, 'style': 'width: 150px'},
                         {'name': 'status', 'label': 'Status', 'field': 'status_display', 'sortable': True, 'style': 'width: 100px'},
@@ -909,8 +948,10 @@ class JobMonitoringTab:
             all_tasks_dict = worker_queue.get_all_tasks()
             all_tasks = list(all_tasks_dict.values()) if isinstance(all_tasks_dict, dict) else all_tasks_dict
             
-            # Build a cache of expert IDs to shortnames for efficient lookup
+            # Build a cache of expert IDs to shortnames and account names for efficient lookup
             expert_shortnames = {}
+            expert_account_ids = {}
+            account_names = {}
             try:
                 with get_db() as session:
                     experts = session.exec(select(ExpertInstance)).all()
@@ -918,6 +959,16 @@ class JobMonitoringTab:
                         # Use alias, or fallback to "expert_name-id"
                         shortname = expert.alias or f"{expert.expert}-{expert.id}"
                         expert_shortnames[expert.id] = shortname
+                        if expert.account_id:
+                            expert_account_ids[expert.id] = expert.account_id
+                    
+                    # Fetch account names
+                    account_ids = set(expert_account_ids.values())
+                    if account_ids:
+                        from ...core.models import AccountDefinition
+                        stmt = select(AccountDefinition).where(AccountDefinition.id.in_(account_ids))
+                        for acc in session.scalars(stmt):
+                            account_names[acc.id] = acc.name
             except Exception as e:
                 logger.warning(f"Failed to fetch expert shortnames: {e}")
             
@@ -968,12 +1019,17 @@ class JobMonitoringTab:
                 expert_instance_id = getattr(task, 'expert_instance_id', '')
                 expert_name = expert_shortnames.get(expert_instance_id, f"ID:{expert_instance_id}" if expert_instance_id else '')
                 
+                # Get account name from cache
+                account_id = expert_account_ids.get(expert_instance_id) if expert_instance_id else None
+                account_name = account_names.get(account_id, '') if account_id else ''
+                
                 # Get batch_id from task
                 task_batch_id = getattr(task, 'batch_id', None) or ''
                 
                 formatted_tasks.append({
                     'task_id': getattr(task, 'id', 'Unknown'),
                     'type': task_type,
+                    'account_name': account_name,
                     'symbol': symbol,
                     'expert_name': expert_name,
                     'status_display': status_display,
@@ -1028,6 +1084,18 @@ class JobMonitoringTab:
                     # Apply all filters
                     filters = []
                     
+                    # Apply global account filter from header dropdown
+                    selected_account_id = get_selected_account_id()
+                    account_expert_ids = get_expert_ids_for_account(selected_account_id)
+                    if account_expert_ids is not None:
+                        if account_expert_ids:
+                            filters.append(MarketAnalysis.expert_instance_id.in_(account_expert_ids))
+                        else:
+                            # No experts for selected account - return empty
+                            self.cached_analysis_data = []
+                            self.cache_valid = True
+                            return [], 0
+                    
                     if self.status_filter != 'all':
                         filters.append(MarketAnalysis.status == MarketAnalysisStatus(self.status_filter))
                     
@@ -1072,8 +1140,17 @@ class JobMonitoringTab:
                         for expert in session.scalars(stmt):
                             expert_instances[expert.id] = expert
                     
+                    # Pre-fetch account names for all expert instances
+                    account_ids = set(e.account_id for e in expert_instances.values() if e.account_id)
+                    account_names = {}
+                    if account_ids:
+                        from ...core.models import AccountDefinition
+                        stmt = select(AccountDefinition).where(AccountDefinition.id.in_(account_ids))
+                        for acc in session.scalars(stmt):
+                            account_names[acc.id] = acc.name
+                    
                     # Process all records and cache them
-                    self.cached_analysis_data = self._format_analysis_records_simple(market_analyses, expert_instances)
+                    self.cached_analysis_data = self._format_analysis_records_simple(market_analyses, expert_instances, account_names)
                     self.cache_valid = True
             
             # Use cached data and apply pagination
@@ -1147,7 +1224,7 @@ class JobMonitoringTab:
             logger.warning(f"Error populating evaluation data flags: {e}")
             # Leave all as False on error
     
-    def _format_analysis_records_simple(self, market_analyses, expert_instances=None) -> List[dict]:
+    def _format_analysis_records_simple(self, market_analyses, expert_instances=None, account_names=None) -> List[dict]:
         """Format raw market analysis records into displayable data.
         
         Note: has_evaluation_data is populated LATER by _populate_evaluation_data_flags()
@@ -1157,6 +1234,8 @@ class JobMonitoringTab:
         
         if expert_instances is None:
             expert_instances = {}
+        if account_names is None:
+            account_names = {}
         
         status_icons = {
             'pending': '⏳',
@@ -1175,12 +1254,16 @@ class JobMonitoringTab:
         
         for analysis in market_analyses:
             try:
-                # Get expert instance info
+                # Get expert instance info and account name
+                account_name = ''
                 try:
                     expert_instance = expert_instances.get(analysis.expert_instance_id)
                     if expert_instance:
                         expert_alias = expert_instance.alias or expert_instance.expert
                         expert_name = f"{expert_alias}-{analysis.expert_instance_id}"
+                        # Get account name from account_id
+                        if expert_instance.account_id:
+                            account_name = account_names.get(expert_instance.account_id, '')
                     else:
                         expert_name = f"Unknown-{analysis.expert_instance_id}"
                 except Exception as e:
@@ -1270,6 +1353,7 @@ class JobMonitoringTab:
                 
                 analysis_data.append({
                     'id': analysis.id,
+                    'account_name': account_name,
                     'symbol': symbol_display,
                     'expert_name': expert_name,
                     'status': status_value,
@@ -2847,6 +2931,7 @@ class ScheduledJobsTab:
     def _create_scheduled_jobs_table(self, scheduled_data=None, total_records=None):
         """Create the scheduled jobs table."""
         columns = [
+            {'name': 'account', 'label': 'Account', 'field': 'account_name', 'sortable': True},
             {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True},
             {'name': 'expert', 'label': 'Expert', 'field': 'expert_name', 'sortable': True},
             {'name': 'instance_id', 'label': 'Instance ID', 'field': 'expert_instance_id', 'sortable': True},
@@ -2910,9 +2995,19 @@ class ScheduledJobsTab:
             from datetime import datetime, timedelta
             import json
             from ...core.types import AnalysisUseCase
+            from ...core.models import AccountDefinition
             
             # Get all enabled expert instances
             expert_instances = get_all_instances(ExpertInstance)
+            
+            # Pre-fetch account names for all expert instances
+            with get_db() as session:
+                account_ids = set(ei.account_id for ei in expert_instances if ei.account_id)
+                account_names = {}
+                if account_ids:
+                    stmt = select(AccountDefinition).where(AccountDefinition.id.in_(account_ids))
+                    for acc in session.scalars(stmt):
+                        account_names[acc.id] = acc.name
             
             # Filter by expert instance if specified
             if self.expert_filter != 'all':
@@ -2980,6 +3075,9 @@ class ScheduledJobsTab:
                             if days.get(day_name, False):
                                 enabled_weekdays.append(short_weekday_names[i])
                         
+                        # Get account name for this expert instance
+                        account_name = account_names.get(expert_instance.account_id, '') if expert_instance.account_id else ''
+                        
                         # For OPEN_POSITIONS schedule, create single job entry with OPEN_POSITIONS symbol
                         # (will expand to individual symbols at execution time)
                         if schedule_key == 'execution_schedule_open_positions':
@@ -2987,6 +3085,7 @@ class ScheduledJobsTab:
                             
                             jobs_by_combination[combination_key] = {
                                 'id': combination_key,
+                                'account_name': account_name,
                                 'symbol': 'OPEN_POSITIONS',
                                 'expert_name': expert_instance.alias or expert_instance.expert,
                                 'expert_instance_id': expert_instance.id,
@@ -3004,6 +3103,7 @@ class ScheduledJobsTab:
                                 
                                 jobs_by_combination[combination_key] = {
                                     'id': combination_key,
+                                    'account_name': account_name,
                                     'symbol': symbol,
                                     'expert_name': expert_instance.alias or expert_instance.expert,
                                     'expert_instance_id': expert_instance.id,
@@ -3439,6 +3539,16 @@ class OrderRecommendationsTab:
                     )
                 )
                 
+                # Apply global account filter from header dropdown
+                selected_account_id = get_selected_account_id()
+                account_expert_ids = get_expert_ids_for_account(selected_account_id)
+                if account_expert_ids is not None:
+                    if account_expert_ids:
+                        statement = statement.where(ExpertRecommendation.instance_id.in_(account_expert_ids))
+                    else:
+                        # No experts for selected account - return empty
+                        return []
+                
                 # Apply expert filter if not 'all'
                 if self.expert_filter and self.expert_filter != 'all':
                     # expert_filter is already the expert ID (string) from the select options
@@ -3472,6 +3582,10 @@ class OrderRecommendationsTab:
                         select(ExpertRecommendation)
                         .where(ExpertRecommendation.symbol == symbol)
                     )
+                    
+                    # Apply global account filter to latest recommendation
+                    if account_expert_ids is not None and account_expert_ids:
+                        latest_rec_statement = latest_rec_statement.where(ExpertRecommendation.instance_id.in_(account_expert_ids))
                     
                     # Apply expert filter to latest recommendation if not 'all'
                     if self.expert_filter and self.expert_filter != 'all':

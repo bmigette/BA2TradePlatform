@@ -1,7 +1,7 @@
 from nicegui import ui
 from datetime import datetime, timedelta, timezone
 from sqlmodel import select, func, Session
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 import requests
 import aiohttp
 import asyncio
@@ -16,6 +16,7 @@ from ...modules.accounts import providers
 from ...logger import logger
 from ..components import LiveTradesTable, LiveTradesTableConfig
 from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
+from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
 from ..utils.perf_logger import PerfLogger
 
 class LiveTradesTab:
@@ -283,6 +284,17 @@ class LiveTradesTab:
             base_query = select(Transaction, ExpertInstance).outerjoin(
                 ExpertInstance, Transaction.expert_id == ExpertInstance.id
             )
+            
+            # Apply global account filter from header dropdown
+            selected_account_id = get_selected_account_id()
+            account_expert_ids = get_expert_ids_for_account(selected_account_id)
+            if account_expert_ids is not None:
+                if account_expert_ids:
+                    base_query = base_query.where(Transaction.expert_id.in_(account_expert_ids))
+                else:
+                    # No experts for selected account - return empty
+                    fetch_timer.stop(f"count=0, total=0 (no experts for account)")
+                    return [], 0
 
             # Apply status filter (from page filter controls)
             status_values = self.status_filter.value if hasattr(self, 'status_filter') else ['Waiting', 'Open', 'Closing']
@@ -376,22 +388,32 @@ class LiveTradesTab:
     ) -> List[Dict]:
         """Build row data from transactions for the table."""
         from ...core.types import TransactionStatus
-        from ...core.models import TradingOrder
+        from ...core.models import TradingOrder, AccountDefinition
         from collections import defaultdict
 
         # BATCH PRICE FETCHING: Collect all symbols from open transactions grouped by account
         symbols_by_account = defaultdict(set)
         txn_to_account = {}
 
+        # Pre-fetch account_id for ALL transactions (needed for account name column)
         for txn in transactions:
-            if txn.status == TransactionStatus.OPENED and txn.open_price and txn.quantity:
-                order_stmt = select(TradingOrder).where(TradingOrder.transaction_id == txn.id).limit(1)
-                first_order = session.exec(order_stmt).first()
-                if first_order:
+            order_stmt = select(TradingOrder).where(TradingOrder.transaction_id == txn.id).limit(1)
+            first_order = session.exec(order_stmt).first()
+            if first_order:
+                txn_to_account[txn.id] = first_order.account_id
+                # Also collect symbols for open transactions
+                if txn.status == TransactionStatus.OPENED and txn.open_price and txn.quantity:
                     symbols_by_account[first_order.account_id].add(txn.symbol)
-                    txn_to_account[txn.id] = first_order.account_id
-                else:
-                    logger.warning(f"Transaction {txn.id} ({txn.symbol}) has no orders - cannot fetch price")
+
+        # Build account ID to name mapping
+        account_names = {}
+        unique_account_ids = set(txn_to_account.values())
+        if unique_account_ids:
+            accounts = session.exec(
+                select(AccountDefinition).where(AccountDefinition.id.in_(unique_account_ids))
+            ).all()
+            for acc in accounts:
+                account_names[acc.id] = acc.name
 
         # Fetch prices in batch for each account
         current_prices = {}
@@ -521,9 +543,14 @@ class LiveTradesTab:
                 except Exception as e:
                     logger.debug(f"Could not calculate value for {txn.symbol}: {e}")
 
+            # Get account name for this transaction
+            account_id = txn_to_account.get(txn.id)
+            account_name = account_names.get(account_id, '') if account_id else ''
+
             row = {
                 'id': txn.id,
                 '_selected': False,  # Selection is managed by LiveTradesTable
+                'account_name': account_name,
                 'symbol': txn.symbol,
                 'direction': txn.side.value,
                 'expert': expert_shortname,
@@ -638,6 +665,16 @@ class LiveTradesTab:
             ).order_by(Transaction.created_at.desc())
 
             logger.debug(f"[TRANSACTIONS] Initial query built")
+            
+            # Apply global account filter from header dropdown
+            selected_account_id = get_selected_account_id()
+            account_expert_ids = get_expert_ids_for_account(selected_account_id)
+            if account_expert_ids is not None:
+                if account_expert_ids:
+                    statement = statement.where(Transaction.expert_id.in_(account_expert_ids))
+                else:
+                    # No experts for selected account - return empty
+                    return []
 
             # Apply status filter (multi-select)
             status_values = self.status_filter.value if hasattr(self, 'status_filter') else ['Waiting', 'Open', 'Closing']

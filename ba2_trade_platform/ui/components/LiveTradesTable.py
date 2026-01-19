@@ -67,6 +67,7 @@ class LiveTradesTable(LazyTable):
         ColumnDef(name='select', label='', field='select', align='left', sortable=False),
         ColumnDef(name='expand', label='', field='expand', align='left', sortable=False),
         ColumnDef(name='id', label='ID', field='id', align='center', sortable=True),
+        ColumnDef(name='account', label='Account', field='account_name', align='left', sortable=True),
         ColumnDef(name='symbol', label='Symbol', field='symbol', align='left', sortable=True),
         ColumnDef(name='direction', label='Direction', field='direction', align='center', sortable=True),
         ColumnDef(name='expert', label='Expert', field='expert', align='left', sortable=True),

@@ -6,11 +6,12 @@ A histogram chart showing profit/loss for each expert instance based on complete
 
 from nicegui import ui
 from sqlmodel import select, func
-from typing import Dict, List
+from typing import Dict, List, Optional
 from ...core.db import get_db
 from ...core.models import Transaction, ExpertInstance
 from ...core.types import TransactionStatus
 from ...logger import logger
+from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
 
 
 class ProfitPerExpertChart:
@@ -29,15 +30,29 @@ class ProfitPerExpertChart:
         """
         profits = {}
         
+        # Get global account filter
+        selected_account_id = get_selected_account_id()
+        account_expert_ids = get_expert_ids_for_account(selected_account_id)
+        
         with get_db() as session:
-            # Get all closed transactions with expert_id
-            closed_transactions = session.exec(
+            # Build query for closed transactions
+            query = (
                 select(Transaction)
                 .where(Transaction.status == TransactionStatus.CLOSED)
                 .where(Transaction.expert_id.isnot(None))
                 .where(Transaction.open_price.isnot(None))
                 .where(Transaction.close_price.isnot(None))
-            ).all()
+            )
+            
+            # Apply account filter if selected
+            if account_expert_ids is not None:
+                if account_expert_ids:
+                    query = query.where(Transaction.expert_id.in_(account_expert_ids))
+                else:
+                    # No experts for selected account - return empty
+                    return {}
+            
+            closed_transactions = session.exec(query).all()
             
             logger.debug(f"Found {len(closed_transactions)} closed transactions with experts")
             
