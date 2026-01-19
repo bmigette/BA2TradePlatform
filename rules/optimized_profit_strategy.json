@@ -1,0 +1,818 @@
+{
+  "export_version": "1.0",
+  "export_type": "rulesets",
+  "export_timestamp": "2026-01-18T10:00:00.000000",
+  "description": "Profit maximization strategy - optimized entry and position management rules based on risk/reward optimization principles.",
+  "rulesets": [
+    {
+      "name": "Optimized Entry - High Conviction",
+      "description": "Enter positions only with high confidence (>=75%), strong expected profit (>=8%), and conservative initial TP at -5% of expert target",
+      "type": "trading_recommendation_rule",
+      "subtype": "enter_market",
+      "rules": [
+        {
+          "name": "BUY_HighConfidence_LowRisk_LongTerm",
+          "type": "trading_recommendation_rule",
+          "subtype": "enter_market",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "bullish"
+            },
+            "trigger_1": {
+              "event_type": "confidence",
+              "operator": ">=",
+              "value": 80.0
+            },
+            "trigger_2": {
+              "event_type": "expected_profit_target_percent",
+              "operator": ">=",
+              "value": 10.0
+            },
+            "trigger_3": {
+              "event_type": "long_term"
+            },
+            "trigger_4": {
+              "event_type": "lowrisk"
+            },
+            "trigger_5": {
+              "event_type": "has_no_position"
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "buy"
+            },
+            "action_1": {
+              "action_type": "adjust_take_profit",
+              "value": -5.0,
+              "reference_value": "expert_target_price"
+            },
+            "action_2": {
+              "action_type": "adjust_stop_loss",
+              "value": -8.0,
+              "reference_value": "order_open_price"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 0
+        },
+        {
+          "name": "BUY_HighConfidence_MedRisk_MedTerm",
+          "type": "trading_recommendation_rule",
+          "subtype": "enter_market",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "bullish"
+            },
+            "trigger_1": {
+              "event_type": "confidence",
+              "operator": ">=",
+              "value": 78.0
+            },
+            "trigger_2": {
+              "event_type": "expected_profit_target_percent",
+              "operator": ">=",
+              "value": 8.0
+            },
+            "trigger_3": {
+              "event_type": "medium_term"
+            },
+            "trigger_4": {
+              "event_type": "mediumrisk"
+            },
+            "trigger_5": {
+              "event_type": "has_no_position"
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "buy"
+            },
+            "action_1": {
+              "action_type": "adjust_take_profit",
+              "value": -5.0,
+              "reference_value": "expert_target_price"
+            },
+            "action_2": {
+              "action_type": "adjust_stop_loss",
+              "value": -6.0,
+              "reference_value": "order_open_price"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 1
+        },
+        {
+          "name": "BUY_VeryHighConfidence_ShortTerm",
+          "type": "trading_recommendation_rule",
+          "subtype": "enter_market",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "bullish"
+            },
+            "trigger_1": {
+              "event_type": "confidence",
+              "operator": ">=",
+              "value": 85.0
+            },
+            "trigger_2": {
+              "event_type": "expected_profit_target_percent",
+              "operator": ">=",
+              "value": 5.0
+            },
+            "trigger_3": {
+              "event_type": "short_term"
+            },
+            "trigger_4": {
+              "event_type": "has_no_position"
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "buy"
+            },
+            "action_1": {
+              "action_type": "adjust_take_profit",
+              "value": 0.0,
+              "reference_value": "expert_target_price"
+            },
+            "action_2": {
+              "action_type": "adjust_stop_loss",
+              "value": -4.0,
+              "reference_value": "order_open_price"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 2
+        },
+        {
+          "name": "BUY_Fallback_StrongSignal",
+          "type": "trading_recommendation_rule",
+          "subtype": "enter_market",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "bullish"
+            },
+            "trigger_1": {
+              "event_type": "confidence",
+              "operator": ">=",
+              "value": 75.0
+            },
+            "trigger_2": {
+              "event_type": "expected_profit_target_percent",
+              "operator": ">=",
+              "value": 12.0
+            },
+            "trigger_3": {
+              "event_type": "has_no_position"
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "buy"
+            },
+            "action_1": {
+              "action_type": "adjust_take_profit",
+              "value": -8.0,
+              "reference_value": "expert_target_price"
+            },
+            "action_2": {
+              "action_type": "adjust_stop_loss",
+              "value": -7.0,
+              "reference_value": "order_open_price"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 3
+        },
+        {
+          "name": "SELL_HighConfidence_LowRisk_LongTerm",
+          "type": "trading_recommendation_rule",
+          "subtype": "enter_market",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "bearish"
+            },
+            "trigger_1": {
+              "event_type": "confidence",
+              "operator": ">=",
+              "value": 80.0
+            },
+            "trigger_2": {
+              "event_type": "expected_profit_target_percent",
+              "operator": ">=",
+              "value": 10.0
+            },
+            "trigger_3": {
+              "event_type": "long_term"
+            },
+            "trigger_4": {
+              "event_type": "lowrisk"
+            },
+            "trigger_5": {
+              "event_type": "has_no_position"
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "sell"
+            },
+            "action_1": {
+              "action_type": "adjust_take_profit",
+              "value": -5.0,
+              "reference_value": "expert_target_price"
+            },
+            "action_2": {
+              "action_type": "adjust_stop_loss",
+              "value": -8.0,
+              "reference_value": "order_open_price"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 4
+        },
+        {
+          "name": "SELL_HighConfidence_MedRisk_MedTerm",
+          "type": "trading_recommendation_rule",
+          "subtype": "enter_market",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "bearish"
+            },
+            "trigger_1": {
+              "event_type": "confidence",
+              "operator": ">=",
+              "value": 78.0
+            },
+            "trigger_2": {
+              "event_type": "expected_profit_target_percent",
+              "operator": ">=",
+              "value": 8.0
+            },
+            "trigger_3": {
+              "event_type": "medium_term"
+            },
+            "trigger_4": {
+              "event_type": "mediumrisk"
+            },
+            "trigger_5": {
+              "event_type": "has_no_position"
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "sell"
+            },
+            "action_1": {
+              "action_type": "adjust_take_profit",
+              "value": -5.0,
+              "reference_value": "expert_target_price"
+            },
+            "action_2": {
+              "action_type": "adjust_stop_loss",
+              "value": -6.0,
+              "reference_value": "order_open_price"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 5
+        },
+        {
+          "name": "SELL_VeryHighConfidence_ShortTerm",
+          "type": "trading_recommendation_rule",
+          "subtype": "enter_market",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "bearish"
+            },
+            "trigger_1": {
+              "event_type": "confidence",
+              "operator": ">=",
+              "value": 85.0
+            },
+            "trigger_2": {
+              "event_type": "expected_profit_target_percent",
+              "operator": ">=",
+              "value": 5.0
+            },
+            "trigger_3": {
+              "event_type": "short_term"
+            },
+            "trigger_4": {
+              "event_type": "has_no_position"
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "sell"
+            },
+            "action_1": {
+              "action_type": "adjust_take_profit",
+              "value": 0.0,
+              "reference_value": "expert_target_price"
+            },
+            "action_2": {
+              "action_type": "adjust_stop_loss",
+              "value": -4.0,
+              "reference_value": "order_open_price"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 6
+        },
+        {
+          "name": "SELL_Fallback_StrongSignal",
+          "type": "trading_recommendation_rule",
+          "subtype": "enter_market",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "bearish"
+            },
+            "trigger_1": {
+              "event_type": "confidence",
+              "operator": ">=",
+              "value": 75.0
+            },
+            "trigger_2": {
+              "event_type": "expected_profit_target_percent",
+              "operator": ">=",
+              "value": 12.0
+            },
+            "trigger_3": {
+              "event_type": "has_no_position"
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "sell"
+            },
+            "action_1": {
+              "action_type": "adjust_take_profit",
+              "value": -8.0,
+              "reference_value": "expert_target_price"
+            },
+            "action_2": {
+              "action_type": "adjust_stop_loss",
+              "value": -7.0,
+              "reference_value": "order_open_price"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 7
+        }
+      ]
+    },
+    {
+      "name": "Optimized Exit - Profit Protection",
+      "description": "Smart exit rules: Lock in profits, trail stops, cut losses early on sentiment change, and time-decay adjustments",
+      "type": "trading_recommendation_rule",
+      "subtype": "open_positions",
+      "rules": [
+        {
+          "name": "Trail_Stop_When_Profit_10pct",
+          "type": "trading_recommendation_rule",
+          "subtype": "open_positions",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "has_position"
+            },
+            "trigger_1": {
+              "event_type": "profit_loss_percent",
+              "operator": ">=",
+              "value": 10.0
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "adjust_stop_loss",
+              "value": 5.0,
+              "reference_value": "order_open_price"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": true,
+          "order_index": 0
+        },
+        {
+          "name": "Trail_Stop_When_Profit_15pct",
+          "type": "trading_recommendation_rule",
+          "subtype": "open_positions",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "has_position"
+            },
+            "trigger_1": {
+              "event_type": "profit_loss_percent",
+              "operator": ">=",
+              "value": 15.0
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "adjust_stop_loss",
+              "value": 8.0,
+              "reference_value": "order_open_price"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": true,
+          "order_index": 1
+        },
+        {
+          "name": "Trail_Stop_When_Profit_20pct",
+          "type": "trading_recommendation_rule",
+          "subtype": "open_positions",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "has_position"
+            },
+            "trigger_1": {
+              "event_type": "profit_loss_percent",
+              "operator": ">=",
+              "value": 20.0
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "adjust_stop_loss",
+              "value": 12.0,
+              "reference_value": "order_open_price"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": true,
+          "order_index": 2
+        },
+        {
+          "name": "Raise_TP_When_Target_Higher",
+          "type": "trading_recommendation_rule",
+          "subtype": "open_positions",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "has_position"
+            },
+            "trigger_1": {
+              "event_type": "new_target_higher"
+            },
+            "trigger_2": {
+              "event_type": "current_rating_positive"
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "adjust_take_profit",
+              "value": -5.0,
+              "reference_value": "expert_target_price"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": true,
+          "order_index": 3
+        },
+        {
+          "name": "Early_Exit_Sentiment_Reversal_Profitable",
+          "type": "trading_recommendation_rule",
+          "subtype": "open_positions",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "has_position"
+            },
+            "trigger_1": {
+              "event_type": "rating_positive_to_negative"
+            },
+            "trigger_2": {
+              "event_type": "profit_loss_percent",
+              "operator": ">=",
+              "value": 3.0
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "close"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 4
+        },
+        {
+          "name": "Early_Exit_Sentiment_Reversal_Small_Loss",
+          "type": "trading_recommendation_rule",
+          "subtype": "open_positions",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "has_position"
+            },
+            "trigger_1": {
+              "event_type": "rating_positive_to_negative"
+            },
+            "trigger_2": {
+              "event_type": "profit_loss_percent",
+              "operator": ">=",
+              "value": -3.0
+            },
+            "trigger_3": {
+              "event_type": "days_opened",
+              "operator": "<",
+              "value": 14.0
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "close"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 5
+        },
+        {
+          "name": "Exit_Neutral_Rating_With_Profit",
+          "type": "trading_recommendation_rule",
+          "subtype": "open_positions",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "has_position"
+            },
+            "trigger_1": {
+              "event_type": "rating_positive_to_neutral"
+            },
+            "trigger_2": {
+              "event_type": "profit_loss_percent",
+              "operator": ">=",
+              "value": 5.0
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "close"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 6
+        },
+        {
+          "name": "Move_SL_BreakEven_After_5pct_Profit",
+          "type": "trading_recommendation_rule",
+          "subtype": "open_positions",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "has_position"
+            },
+            "trigger_1": {
+              "event_type": "profit_loss_percent",
+              "operator": ">=",
+              "value": 5.0
+            },
+            "trigger_2": {
+              "event_type": "days_opened",
+              "operator": ">=",
+              "value": 7.0
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "adjust_stop_loss",
+              "value": 0.5,
+              "reference_value": "order_open_price"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": true,
+          "order_index": 7
+        },
+        {
+          "name": "Time_Decay_30Days_Tighten_TP",
+          "type": "trading_recommendation_rule",
+          "subtype": "open_positions",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "has_position"
+            },
+            "trigger_1": {
+              "event_type": "days_opened",
+              "operator": ">=",
+              "value": 30.0
+            },
+            "trigger_2": {
+              "event_type": "days_opened",
+              "operator": "<",
+              "value": 60.0
+            },
+            "trigger_3": {
+              "event_type": "profit_loss_percent",
+              "operator": "<",
+              "value": 5.0
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "adjust_take_profit",
+              "value": -7.0,
+              "reference_value": "expert_target_price"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": true,
+          "order_index": 8
+        },
+        {
+          "name": "Time_Decay_60Days_BreakEven_TP",
+          "type": "trading_recommendation_rule",
+          "subtype": "open_positions",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "has_position"
+            },
+            "trigger_1": {
+              "event_type": "days_opened",
+              "operator": ">=",
+              "value": 60.0
+            },
+            "trigger_2": {
+              "event_type": "profit_loss_percent",
+              "operator": "<",
+              "value": 5.0
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "adjust_take_profit",
+              "value": 1.0,
+              "reference_value": "order_open_price"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": true,
+          "order_index": 9
+        },
+        {
+          "name": "Long_Term_Exit_90Days_No_Progress",
+          "type": "trading_recommendation_rule",
+          "subtype": "open_positions",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "has_position"
+            },
+            "trigger_1": {
+              "event_type": "days_opened",
+              "operator": ">=",
+              "value": 90.0
+            },
+            "trigger_2": {
+              "event_type": "profit_loss_percent",
+              "operator": ">=",
+              "value": 0.0
+            },
+            "trigger_3": {
+              "event_type": "profit_loss_percent",
+              "operator": "<",
+              "value": 3.0
+            },
+            "trigger_4": {
+              "event_type": "current_rating_neutral"
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "close"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 10
+        },
+        {
+          "name": "Cut_Loss_Negative_Rating_Under_10pct",
+          "type": "trading_recommendation_rule",
+          "subtype": "open_positions",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "has_position"
+            },
+            "trigger_1": {
+              "event_type": "current_rating_negative"
+            },
+            "trigger_2": {
+              "event_type": "profit_loss_percent",
+              "operator": ">=",
+              "value": -10.0
+            },
+            "trigger_3": {
+              "event_type": "profit_loss_percent",
+              "operator": "<",
+              "value": 0.0
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "close"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 11
+        },
+        {
+          "name": "Exit_120Days_Still_Negative",
+          "type": "trading_recommendation_rule",
+          "subtype": "open_positions",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "has_position"
+            },
+            "trigger_1": {
+              "event_type": "days_opened",
+              "operator": ">=",
+              "value": 120.0
+            },
+            "trigger_2": {
+              "event_type": "current_rating_negative"
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "close"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 12
+        },
+        {
+          "name": "Lower_Target_Reduce_Exposure",
+          "type": "trading_recommendation_rule",
+          "subtype": "open_positions",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "has_position"
+            },
+            "trigger_1": {
+              "event_type": "new_target_lower"
+            },
+            "trigger_2": {
+              "event_type": "instrument_account_share",
+              "operator": ">",
+              "value": 10.0
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "decrease_instrument_share",
+              "target_percent": 8.0
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": true,
+          "order_index": 13
+        },
+        {
+          "name": "Scale_Into_Winner",
+          "type": "trading_recommendation_rule",
+          "subtype": "open_positions",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "has_position"
+            },
+            "trigger_1": {
+              "event_type": "new_target_higher"
+            },
+            "trigger_2": {
+              "event_type": "profit_loss_percent",
+              "operator": ">=",
+              "value": 8.0
+            },
+            "trigger_3": {
+              "event_type": "confidence",
+              "operator": ">=",
+              "value": 80.0
+            },
+            "trigger_4": {
+              "event_type": "instrument_account_share",
+              "operator": "<",
+              "value": 12.0
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "increase_instrument_share",
+              "target_percent": 12.0
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": true,
+          "order_index": 14
+        }
+      ]
+    }
+  ]
+}

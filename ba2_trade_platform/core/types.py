@@ -355,6 +355,8 @@ class ActivityLogType(str, Enum):
     EXPERT_RECOMMENDATION = "expert_recommendation"
     RULE_EXECUTED = "rule_executed"
     TP_SL_ADJUSTED = "tp_sl_adjusted"
+    TRADE_ACTION_OPEN = "trade_action_open"
+    TRADE_ACTION_NEW = "trade_action_new"
 
 def get_reference_value_options():
     """Return dictionary of reference value options with user-friendly labels."""

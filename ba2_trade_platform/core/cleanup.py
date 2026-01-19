@@ -14,7 +14,8 @@ from ba2_trade_platform.core.models import (
     ExpertRecommendation,
     TradingOrder,
     Transaction,
-    TradeActionResult
+    TradeActionResult,
+    ActivityLog
 )
 from ba2_trade_platform.core.types import MarketAnalysisStatus, TransactionStatus
 from ba2_trade_platform.core.db import get_db
@@ -460,4 +461,123 @@ def get_cleanup_statistics(expert_instance_id: Optional[int] = None) -> Dict[str
             'analyses_by_age': analyses_by_age,
             'total_outputs': total_outputs,
             'total_recommendations': total_recommendations
+        }
+
+
+def cleanup_activity_logs(days_to_keep: int = 60) -> Dict[str, Any]:
+    """
+    Delete activity logs older than specified days.
+    
+    Args:
+        days_to_keep: Number of days to keep. Logs older than this will be deleted.
+                     Default is 60 days.
+    
+    Returns:
+        Dictionary with cleanup results:
+        {
+            'deleted_count': int,
+            'error': Optional[str]
+        }
+    """
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_to_keep)
+    
+    try:
+        with get_db() as session:
+            # Find old activity logs
+            old_logs_query = select(ActivityLog).where(ActivityLog.timestamp < cutoff_date)
+            old_logs = session.exec(old_logs_query).all()
+            
+            deleted_count = len(old_logs)
+            
+            # Delete old logs
+            for log in old_logs:
+                session.delete(log)
+            
+            session.commit()
+            
+            logger.info(f"Deleted {deleted_count} activity logs older than {days_to_keep} days")
+            
+            return {
+                'deleted_count': deleted_count,
+                'error': None
+            }
+            
+    except Exception as e:
+        logger.error(f"Error cleaning up activity logs: {e}", exc_info=True)
+        return {
+            'deleted_count': 0,
+            'error': str(e)
+        }
+
+
+def get_activity_log_statistics() -> Dict[str, Any]:
+    """
+    Get statistics about activity logs in the database.
+    
+    Returns:
+        Dictionary with statistics:
+        {
+            'total_logs': int,
+            'logs_by_age': {age_bucket: count},
+            'logs_by_type': {type: count},
+            'logs_by_severity': {severity: count}
+        }
+    """
+    now = datetime.now(timezone.utc)
+    age_buckets = {
+        '7_days': now - timedelta(days=7),
+        '30_days': now - timedelta(days=30),
+        '60_days': now - timedelta(days=60),
+        '90_days': now - timedelta(days=90),
+        '180_days': now - timedelta(days=180)
+    }
+    
+    with get_db() as session:
+        # Get all activity logs
+        all_logs = session.exec(select(ActivityLog)).all()
+        
+        # Count by age
+        logs_by_age = {
+            '7_days': 0,
+            '30_days': 0,
+            '60_days': 0,
+            '90_days': 0,
+            '180_days': 0,
+            'older': 0
+        }
+        
+        for log in all_logs:
+            # Ensure timestamp is timezone-aware for comparison
+            timestamp = _ensure_timezone_aware(log.timestamp)
+            
+            if timestamp > age_buckets['7_days']:
+                logs_by_age['7_days'] += 1
+            elif timestamp > age_buckets['30_days']:
+                logs_by_age['30_days'] += 1
+            elif timestamp > age_buckets['60_days']:
+                logs_by_age['60_days'] += 1
+            elif timestamp > age_buckets['90_days']:
+                logs_by_age['90_days'] += 1
+            elif timestamp > age_buckets['180_days']:
+                logs_by_age['180_days'] += 1
+            else:
+                logs_by_age['older'] += 1
+        
+        # Count by type
+        logs_by_type = {}
+        for log in all_logs:
+            log_type = log.activity_type
+            logs_by_type[log_type] = logs_by_type.get(log_type, 0) + 1
+        
+        # Count by severity
+        logs_by_severity = {}
+        for log in all_logs:
+            severity = log.severity
+            logs_by_severity[severity] = logs_by_severity.get(severity, 0) + 1
+        
+        return {
+            'total_logs': len(all_logs),
+            'logs_by_age': logs_by_age,
+            'logs_by_type': logs_by_type,
+            'logs_by_severity': logs_by_severity
         }

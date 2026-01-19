@@ -1,0 +1,96 @@
+{
+  "export_version": "1.0",
+  "export_type": "rulesets",
+  "export_timestamp": "2026-01-18T10:00:00.000000",
+  "description": "Time-based TP adjustment ruleset. Gradually moves TP closer to break-even as position ages to reduce risk on stale positions.",
+  "rulesets": [
+    {
+      "name": "Time-Based TP Adjustment",
+      "description": "Adjust TP over time: Start at -5% of expert target, after 30 days -7%, after 60 days set TP to break-even (order open price)",
+      "type": "trading_recommendation_rule",
+      "subtype": "open_positions",
+      "rules": [
+        {
+          "name": "TP_Initial_Minus5pct_Expert_Target",
+          "type": "trading_recommendation_rule",
+          "subtype": "open_positions",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "has_position"
+            },
+            "trigger_1": {
+              "event_type": "days_opened",
+              "operator": "<",
+              "value": 30.0
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "adjust_take_profit",
+              "value": -5.0,
+              "reference_value": "expert_target_price"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 0
+        },
+        {
+          "name": "TP_30Days_Minus7pct_Expert_Target",
+          "type": "trading_recommendation_rule",
+          "subtype": "open_positions",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "has_position"
+            },
+            "trigger_1": {
+              "event_type": "days_opened",
+              "operator": ">=",
+              "value": 30.0
+            },
+            "trigger_2": {
+              "event_type": "days_opened",
+              "operator": "<",
+              "value": 60.0
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "adjust_take_profit",
+              "value": -7.0,
+              "reference_value": "expert_target_price"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 1
+        },
+        {
+          "name": "TP_60Days_BreakEven",
+          "type": "trading_recommendation_rule",
+          "subtype": "open_positions",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "has_position"
+            },
+            "trigger_1": {
+              "event_type": "days_opened",
+              "operator": ">=",
+              "value": 60.0
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "adjust_take_profit",
+              "value": 0.0,
+              "reference_value": "order_open_price"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 2
+        }
+      ]
+    }
+  ]
+}

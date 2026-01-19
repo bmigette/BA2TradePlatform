@@ -882,7 +882,7 @@ class WorkerQueue:
                 if not expert.has_sufficient_balance_for_entry():
                     # Skip analysis due to insufficient balance
                     logger.info(f"Skipping ENTER_MARKET analysis for expert {task.expert_instance_id}, symbol {task.symbol}: "
-                              f"Insufficient available balance below threshold")
+                              f"Insufficient available balance: below threshold")
                     
                     # Create analysis record marked as skipped
                     market_analysis = MarketAnalysis(
@@ -892,7 +892,7 @@ class WorkerQueue:
                         subtype=AnalysisUseCase(task.subtype),
                         state={
                             "skipped": True,
-                            "skip_reason": "Insufficient available balance below threshold",
+                            "skip_reason": "Insufficient available balance: below threshold",
                             "skip_type": "insufficient_balance"
                         }
                     )

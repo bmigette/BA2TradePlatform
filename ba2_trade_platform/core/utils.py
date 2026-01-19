@@ -2,7 +2,7 @@
 Utility functions for the BA2 Trade Platform core functionality.
 """
 
-from typing import Optional, List, TYPE_CHECKING
+from typing import Optional, List, TYPE_CHECKING, Dict, Any
 from datetime import datetime, timezone
 from .db import get_instance, get_db
 from .models import ExpertInstance, TradingOrder, ExpertRecommendation, MarketAnalysis, Transaction
@@ -323,24 +323,24 @@ def close_transaction_with_logging(
         # Build activity description
         description = f"Closed {transaction.symbol} transaction #{transaction.id}"
         
-        # Add close reason to description
+        # Add close reason to description with detailed explanations
         reason_descriptions = {
-            "tp_sl_filled": "(TP/SL filled)",
-            "oco_leg_filled": "(TP/SL OCO filled)",
-            "all_orders_terminal": "(all orders terminal)",
-            "position_balanced": "(position balanced)",
-            "entry_orders_terminal_no_execution": "(entry orders canceled/rejected)",
-            "entry_orders_terminal_after_opening": "(entry orders terminal)",
-            "position_not_at_broker": "(closed at broker)",
-            "manual_close": "(manual close)",
-            "smart_risk_manager": "(closed by Smart Risk Manager)",
-            "cleanup": "(cleanup)"
+            "tp_sl_filled": "- Take Profit/Stop Loss limit order was filled by broker",
+            "oco_leg_filled": "- Take Profit/Stop Loss OCO order was filled by broker",
+            "all_orders_terminal": "- All orders reached terminal status (no active orders remaining)",
+            "position_balanced": "- Position balanced (buy/sell orders equal)",
+            "entry_orders_terminal_no_execution": "- Entry orders canceled/rejected before execution",
+            "entry_orders_terminal_after_opening": "- Entry orders reached terminal status after opening",
+            "position_not_at_broker": "- Position closed directly at broker (external close)",
+            "manual_close": "- Manual close initiated by user",
+            "smart_risk_manager": "- Automatically closed by Smart Risk Manager",
+            "cleanup": "- Closed during database cleanup operation"
         }
         
         if close_reason in reason_descriptions:
             description += f" {reason_descriptions[close_reason]}"
         else:
-            description += f" ({close_reason})"
+            description += f" (reason: {close_reason})"
         
         # Add P&L to description if available
         if profit_loss is not None:
@@ -532,6 +532,72 @@ def log_transaction_created_activity(
         
     except Exception as e:
         logger.warning(f"Failed to log transaction creation activity: {e}")
+
+
+def log_trade_action_activity(
+    action_type: str,
+    symbol: str,
+    account_id: int,
+    expert_id: Optional[int],
+    success: bool,
+    message: str,
+    is_open_position: bool = False,
+    additional_data: Optional[Dict[str, Any]] = None
+) -> None:
+    """
+    Log activity for trade action execution (success or failure).
+    
+    This centralized function should be used by all code paths that execute trade actions
+    to ensure consistent activity logging.
+    
+    Args:
+        action_type: The type of action (buy, sell, close, adjust_take_profit, etc.)
+        symbol: The instrument symbol
+        account_id: The account ID for activity logging
+        expert_id: The expert ID that executed the action
+        success: Whether the action execution was successful
+        message: Status message from execution
+        is_open_position: If True, logs as TRADE_ACTION_OPEN, else TRADE_ACTION_NEW
+        additional_data: Optional additional data to include in activity log
+    """
+    try:
+        from .db import log_activity
+        
+        # Determine activity type based on context
+        activity_type = ActivityLogType.TRADE_ACTION_OPEN if is_open_position else ActivityLogType.TRADE_ACTION_NEW
+        
+        # Build description
+        action_display = action_type.replace("_", " ").title()
+        status = "✓ Successfully executed" if success else "✗ Failed to execute"
+        context = "on open position" if is_open_position else "for new entry"
+        description = f"{status} {action_display} for {symbol} {context}"
+        
+        # Build activity data
+        activity_data = {
+            "symbol": symbol,
+            "action_type": action_type,
+            "message": message
+        }
+        
+        # Merge additional data if provided
+        if additional_data:
+            activity_data.update(additional_data)
+        
+        # Determine severity
+        severity = ActivityLogSeverity.SUCCESS if success else ActivityLogSeverity.FAILURE
+        
+        # Log activity
+        log_activity(
+            severity=severity,
+            activity_type=activity_type,
+            description=description,
+            data=activity_data,
+            source_expert_id=expert_id,
+            source_account_id=account_id
+        )
+        
+    except Exception as e:
+        logger.warning(f"Failed to log trade action activity: {e}")
 
 
 def is_transaction_orphaned(transaction_id: int, session: Optional[Session] = None) -> bool:

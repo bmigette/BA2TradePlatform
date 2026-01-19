@@ -247,6 +247,20 @@ class TradeActionEvaluator:
                     
                     action_results.append(result_dict)
                     
+                    # Log trade action activity (entering markets = new entry)
+                    from ..utils import log_trade_action_activity
+                    expert_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
+                    log_trade_action_activity(
+                        action_type=str(action_type),
+                        symbol=self.instrument_name,
+                        account_id=self.account.id,
+                        expert_id=expert_id,
+                        success=result_dict['success'],
+                        message=result_dict['message'],
+                        is_open_position=False,  # New entry
+                        additional_data=result_dict.get('data', {})
+                    )
+                    
                     # Capture created order ID for use in phase 2
                     if result_dict['success'] and result_dict.get('data', {}).get('order_id'):
                         created_order_ids.append(result_dict['data']['order_id'])
@@ -339,6 +353,20 @@ class TradeActionEvaluator:
                             }
                             
                             action_results.append(result_dict)
+                            
+                            # Log trade action activity (on open positions)
+                            from ..utils import log_trade_action_activity
+                            expert_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
+                            log_trade_action_activity(
+                                action_type=str(action_type),
+                                symbol=self.instrument_name,
+                                account_id=self.account.id,
+                                expert_id=expert_id,
+                                success=result_dict['success'],
+                                message=result_dict['message'],
+                                is_open_position=True,  # Adjustment on open position
+                                additional_data=result_dict.get('data', {})
+                            )
                             
                             logger.info(f"Adjustment result: {result_dict['success']} - {result_dict['message']}")
                             

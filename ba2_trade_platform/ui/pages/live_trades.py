@@ -9,7 +9,7 @@ import json
 
 from ...core.db import get_all_instances, get_db, get_instance, update_instance
 from ...core.models import AccountDefinition, MarketAnalysis, ExpertRecommendation, ExpertInstance, AppSetting, TradingOrder, Transaction
-from ...core.types import MarketAnalysisStatus, OrderRecommendation, OrderStatus, OrderOpenType, OrderType
+from ...core.types import MarketAnalysisStatus, OrderRecommendation, OrderStatus, OrderOpenType, OrderType, OrderDirection
 from ...core.utils import get_expert_instance_from_id, get_market_analysis_id_from_order_id, get_account_instance_from_id, get_order_status_color, get_expert_options_for_ui
 from ...core.TransactionHelper import TransactionHelper
 from ...modules.accounts import providers
@@ -390,19 +390,27 @@ class LiveTradesTab:
                 if first_order:
                     symbols_by_account[first_order.account_id].add(txn.symbol)
                     txn_to_account[txn.id] = first_order.account_id
+                else:
+                    logger.warning(f"Transaction {txn.id} ({txn.symbol}) has no orders - cannot fetch price")
 
         # Fetch prices in batch for each account
         current_prices = {}
+        logger.debug(f"Fetching prices for {len(symbols_by_account)} accounts: {dict(symbols_by_account)}")
+        
         for account_id, symbols in symbols_by_account.items():
             try:
                 account_inst = get_account_instance_from_id(account_id)
                 if account_inst and symbols:
                     symbols_list = list(symbols)
+                    logger.debug(f"Fetching prices for account {account_id}, symbols: {symbols_list}")
                     prices_dict = account_inst.get_instrument_current_price(symbols_list)
+                    logger.debug(f"Got prices: {prices_dict}")
                     if prices_dict:
                         current_prices.update(prices_dict)
+                else:
+                    logger.warning(f"Account {account_id} not found or no symbols to fetch")
             except Exception as e:
-                logger.warning(f"Batch price fetch failed for account {account_id}: {e}")
+                logger.warning(f"Batch price fetch failed for account {account_id}: {e}", exc_info=True)
 
         # Build rows
         rows = []
@@ -422,7 +430,7 @@ class LiveTradesTab:
                             pnl_current = (current_price - txn.open_price) * txn.quantity
                         else:
                             pnl_current = (txn.open_price - current_price) * txn.quantity
-                        cost_basis = txn.open_price * txn.quantity
+                        cost_basis = txn.open_price * abs(txn.quantity)
                         pnl_pct = (pnl_current / cost_basis * 100) if cost_basis > 0 else 0
                         current_pnl = f"${pnl_current:+.2f} ({pnl_pct:+.1f}%)"
                         current_pnl_numeric = pnl_pct
@@ -743,7 +751,7 @@ class LiveTradesTab:
                             else:  # Short position
                                 pnl_current = (txn.open_price - current_price) * txn.quantity
                             # Calculate P/L percentage based on cost basis
-                            cost_basis = txn.open_price * txn.quantity
+                            cost_basis = txn.open_price * abs(txn.quantity)
                             pnl_pct = (pnl_current / cost_basis * 100) if cost_basis > 0 else 0
                             current_pnl = f"${pnl_current:+.2f} ({pnl_pct:+.1f}%)"
                             current_pnl_numeric = pnl_pct  # Store percentage for sorting

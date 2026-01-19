@@ -4986,6 +4986,41 @@ class BatchCleanupTab:
             
             ui.label('⚠️ Analyses with open transactions will never be deleted.').classes('text-caption text-orange mb-2')
             
+            # Activity Log Cleanup Section
+            with ui.card().classes('w-full mb-4'):
+                ui.label('Activity Log Cleanup').classes('text-subtitle2 mb-2')
+                ui.label('Clean up old activity log entries to reduce database size.').classes('text-body2 mb-4')
+                
+                # Activity log statistics
+                self.activity_log_stats_container = ui.column().classes('w-full mb-4')
+                with self.activity_log_stats_container:
+                    ui.label('Click "Refresh Activity Log Stats" to see current data.').classes('text-body2 text-grey')
+                
+                ui.button(
+                    'Refresh Activity Log Stats',
+                    icon='refresh',
+                    on_click=self._refresh_activity_log_stats
+                ).props('outlined').classes('mb-4')
+                
+                # Days to keep input for activity logs
+                ui.label('Delete activity logs older than:').classes('text-body2 mb-2')
+                self.activity_log_days_input = ui.number(
+                    label='Days to Keep',
+                    value=60,
+                    min=1,
+                    max=365,
+                    step=1,
+                    format='%.0f'
+                ).classes('w-full mb-4').props('outlined')
+                
+                # Action button for activity log cleanup
+                with ui.row().classes('w-full gap-2 justify-end'):
+                    ui.button(
+                        'Clean Activity Logs',
+                        icon='delete',
+                        on_click=self._execute_activity_log_cleanup
+                    ).props('color=warning outlined')
+            
             # Preview results container
             with ui.card().classes('w-full mb-4'):
                 ui.label('Preview').classes('text-subtitle2 mb-2')
@@ -5425,6 +5460,120 @@ class BatchCleanupTab:
             with self.cleanup_preview_container:
                 ui.label(f'❌ Error: {str(e)}').classes('text-negative')
             self.cleanup_execute_button.set_enabled(False)
+    
+    def _refresh_activity_log_stats(self):
+        """Refresh activity log statistics."""
+        from ...core.cleanup import get_activity_log_statistics
+        
+        self.activity_log_stats_container.clear()
+        
+        try:
+            stats = get_activity_log_statistics()
+            
+            with self.activity_log_stats_container:
+                ui.label(f'Activity Log Statistics').classes('text-body2 mb-2')
+                
+                with ui.grid(columns=2).classes('w-full gap-4 mb-4'):
+                    # Total logs
+                    with ui.card().classes('p-4'):
+                        ui.label('Total Activity Logs').classes('text-caption text-grey')
+                        ui.label(str(stats['total_logs'])).classes('text-h6')
+                    
+                    # Recent logs
+                    with ui.card().classes('p-4'):
+                        ui.label('Last 7 Days').classes('text-caption text-grey')
+                        ui.label(str(stats['logs_by_age']['7_days'])).classes('text-h6')
+                
+                # By age
+                ui.label('Activity Logs by Age:').classes('text-body2 mt-4 mb-2')
+                with ui.grid(columns=6).classes('w-full gap-2'):
+                    age_labels = {
+                        '7_days': '< 7 days',
+                        '30_days': '7-30 days',
+                        '60_days': '30-60 days',
+                        '90_days': '60-90 days',
+                        '180_days': '90-180 days',
+                        'older': '> 180 days'
+                    }
+                    for age_key, label in age_labels.items():
+                        with ui.card().classes('p-2'):
+                            ui.label(label).classes('text-caption text-grey')
+                            ui.label(str(stats['logs_by_age'][age_key])).classes('text-subtitle2')
+                
+                # By severity
+                if stats['logs_by_severity']:
+                    ui.label('Activity Logs by Severity:').classes('text-body2 mt-4 mb-2')
+                    with ui.grid(columns=5).classes('w-full gap-2'):
+                        for severity, count in sorted(stats['logs_by_severity'].items()):
+                            with ui.card().classes('p-2'):
+                                ui.label(severity.upper()).classes('text-caption text-grey')
+                                ui.label(str(count)).classes('text-subtitle2')
+                
+                # By type (top 10)
+                if stats['logs_by_type']:
+                    ui.label('Top Activity Log Types:').classes('text-body2 mt-4 mb-2')
+                    sorted_types = sorted(stats['logs_by_type'].items(), key=lambda x: x[1], reverse=True)[:10]
+                    with ui.grid(columns=5).classes('w-full gap-2'):
+                        for log_type, count in sorted_types:
+                            with ui.card().classes('p-2'):
+                                ui.label(log_type.replace('_', ' ').title()).classes('text-caption text-grey')
+                                ui.label(str(count)).classes('text-subtitle2')
+        
+        except Exception as e:
+            logger.error(f'Error refreshing activity log statistics: {e}', exc_info=True)
+            with self.activity_log_stats_container:
+                ui.label(f'❌ Error: {str(e)}').classes('text-negative')
+    
+    def _execute_activity_log_cleanup(self):
+        """Execute activity log cleanup with confirmation."""
+        days_to_keep = int(self.activity_log_days_input.value)
+        
+        # Create confirmation dialog
+        with ui.dialog() as dialog, ui.card():
+            ui.label('⚠️ Confirm Activity Log Cleanup').classes('text-h6 mb-4')
+            
+            ui.label(f'This will permanently delete activity logs older than {days_to_keep} days.').classes('text-body1 mb-4')
+            ui.label('Are you sure you want to continue?').classes('text-body2 mb-4')
+            
+            with ui.row().classes('w-full justify-end gap-2'):
+                ui.button('Cancel', on_click=dialog.close).props('flat')
+                ui.button('Delete', on_click=lambda: self._perform_activity_log_cleanup(dialog, days_to_keep)).props('color=negative')
+        
+        dialog.open()
+    
+    def _perform_activity_log_cleanup(self, dialog, days_to_keep):
+        """Perform the actual activity log cleanup operation."""
+        from ...core.cleanup import cleanup_activity_logs
+        
+        dialog.close()
+        
+        try:
+            # Show progress
+            with ui.dialog() as progress_dialog, ui.card():
+                ui.label('Cleaning Activity Logs...').classes('text-h6 mb-4')
+                progress_bar = ui.linear_progress(value=0).classes('w-full')
+            
+            progress_dialog.open()
+            
+            # Execute cleanup
+            result = cleanup_activity_logs(days_to_keep=days_to_keep)
+            
+            progress_bar.set_value(1.0)
+            progress_dialog.close()
+            
+            # Show result
+            if result.get('error'):
+                ui.notify(f'Error cleaning activity logs: {result["error"]}', type='negative')
+            else:
+                ui.notify(f'Successfully deleted {result["deleted_count"]} activity log entries', type='positive')
+                # Refresh statistics
+                self._refresh_activity_log_stats()
+            
+            logger.info(f"Activity log cleanup completed: {result['deleted_count']} logs deleted")
+        
+        except Exception as e:
+            logger.error(f'Error during activity log cleanup: {e}', exc_info=True)
+            ui.notify(f'Error: {str(e)}', type='negative')
 
 
 def content() -> None:

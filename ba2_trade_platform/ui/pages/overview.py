@@ -3124,7 +3124,7 @@ class TransactionsTab:
                             else:  # Short position
                                 pnl_current = (txn.open_price - current_price) * txn.quantity
                             # Calculate P/L percentage based on cost basis
-                            cost_basis = txn.open_price * txn.quantity
+                            cost_basis = txn.open_price * abs(txn.quantity)
                             pnl_pct = (pnl_current / cost_basis * 100) if cost_basis > 0 else 0
                             current_pnl = f"${pnl_current:+.2f} ({pnl_pct:+.1f}%)"
                             current_pnl_numeric = pnl_pct  # Store percentage for sorting
