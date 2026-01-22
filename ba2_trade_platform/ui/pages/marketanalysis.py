@@ -570,6 +570,17 @@ class JobMonitoringTab:
                     # Status badge color
                     status_color = 'positive' if job.status == 'COMPLETED' else ('negative' if job.status == 'FAILED' else 'warning')
                     
+                    # Format actions taken with failed count
+                    total_actions = job.actions_taken_count or 0
+                    actions_display = str(total_actions)
+                    
+                    # Count failed actions from graph_state if available
+                    if job.graph_state and "actions_log" in job.graph_state:
+                        actions_log = job.graph_state["actions_log"]
+                        failed = sum(1 for action in actions_log if not action.get("success", False))
+                        if failed > 0:
+                            actions_display = f"{total_actions} ({failed} Failed)"
+                    
                     rows.append({
                         'id': job.id,
                         'account_name': account_name,
@@ -581,7 +592,7 @@ class JobMonitoringTab:
                         'run_date_local': run_date_local,
                         'duration_display': duration_display,
                         'iteration_count': job.iteration_count or 0,
-                        'actions_taken_count': job.actions_taken_count or 0,
+                        'actions_taken_count': actions_display,
                         'detail': 'detail'  # Placeholder for detail slot (NiceGUI 3.2 requires all columns to have values)
                     })
                 

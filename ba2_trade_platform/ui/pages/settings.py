@@ -1288,36 +1288,45 @@ class ExpertSettingsTab:
             instances = get_all_instances(ExpertInstance)
             rows = []
             for instance in instances:
-                row = dict(instance)
-                
-                # Ensure alias is displayed (no truncation needed, max 100 chars)
-                row['alias'] = instance.alias or ''
-                
-                # Check if risk manager is in Smart mode
-                expert = get_expert_instance_from_id(instance.id)
-                from ...core.utils import get_risk_manager_mode
-                risk_manager_mode = get_risk_manager_mode(expert.settings) if expert else 'classic'
-                is_smart_mode = risk_manager_mode == 'smart'
-                
-                # Fetch and add ruleset names
-                if instance.enter_market_ruleset_id:
-                    enter_market_ruleset = get_instance(Ruleset, instance.enter_market_ruleset_id)
-                    ruleset_name = enter_market_ruleset.name if enter_market_ruleset else '(Not found)'
-                    row['enter_market_ruleset_name'] = f"{ruleset_name} (Smart)" if is_smart_mode else ruleset_name
-                else:
-                    row['enter_market_ruleset_name'] = 'Smart' if is_smart_mode else '(None)'
-                
-                if instance.open_positions_ruleset_id:
-                    open_positions_ruleset = get_instance(Ruleset, instance.open_positions_ruleset_id)
-                    ruleset_name = open_positions_ruleset.name if open_positions_ruleset else '(Not found)'
-                    row['open_positions_ruleset_name'] = f"{ruleset_name} (Smart)" if is_smart_mode else ruleset_name
-                else:
-                    row['open_positions_ruleset_name'] = 'Smart' if is_smart_mode else '(None)'
-                
-                # Add actions field for NiceGUI 3.2 compatibility
-                row['actions'] = 'actions'
-                
-                rows.append(row)
+                try:
+                    row = dict(instance)
+                    
+                    # Ensure alias is displayed (no truncation needed, max 100 chars)
+                    row['alias'] = instance.alias or ''
+                    
+                    # Check if risk manager is in Smart mode
+                    try:
+                        expert = get_expert_instance_from_id(instance.id)
+                        from ...core.utils import get_risk_manager_mode
+                        risk_manager_mode = get_risk_manager_mode(expert.settings) if expert else 'classic'
+                        is_smart_mode = risk_manager_mode == 'smart'
+                    except Exception as e:
+                        logger.warning(f'Error getting risk manager mode for expert {instance.id}: {e}')
+                        is_smart_mode = False
+                    
+                    # Fetch and add ruleset names
+                    if instance.enter_market_ruleset_id:
+                        enter_market_ruleset = get_instance(Ruleset, instance.enter_market_ruleset_id)
+                        ruleset_name = enter_market_ruleset.name if enter_market_ruleset else '(Not found)'
+                        row['enter_market_ruleset_name'] = f"{ruleset_name} (Smart)" if is_smart_mode else ruleset_name
+                    else:
+                        row['enter_market_ruleset_name'] = 'Smart' if is_smart_mode else '(None)'
+                    
+                    if instance.open_positions_ruleset_id:
+                        open_positions_ruleset = get_instance(Ruleset, instance.open_positions_ruleset_id)
+                        ruleset_name = open_positions_ruleset.name if open_positions_ruleset else '(Not found)'
+                        row['open_positions_ruleset_name'] = f"{ruleset_name} (Smart)" if is_smart_mode else ruleset_name
+                    else:
+                        row['open_positions_ruleset_name'] = 'Smart' if is_smart_mode else '(None)'
+                    
+                    # Add actions field for NiceGUI 3.2 compatibility
+                    row['actions'] = 'actions'
+                    
+                    rows.append(row)
+                except Exception as e:
+                    logger.error(f'Error processing expert instance {instance.id}: {e}', exc_info=True)
+                    # Continue with next instance instead of failing entire list
+                    continue
             logger.debug(f'Fetched {len(rows)} expert instances')
             return rows
         except Exception as e:

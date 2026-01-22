@@ -482,9 +482,7 @@ class AccountInterface(ExtendableSettingsInterface):
                     if order.status in excluded_statuses:
                         continue
                     qty = float(order.quantity) if order.quantity else 0.0
-                    # CRITICAL: Ensure quantity is always positive (use abs)
-                    # Transaction.quantity should ALWAYS be positive - direction is indicated by side field
-                    total_quantity += abs(qty)
+                    total_quantity += qty
                     valid_count += 1
                 
                 # Quantity is always positive - direction field indicates LONG/SHORT
@@ -750,6 +748,180 @@ class AccountInterface(ExtendableSettingsInterface):
             'errors': errors
         }
 
+    def _get_expert_settings_for_validation(self, expert_instance) -> Optional[Dict[str, Any]]:
+        """
+        Load expert settings from database for validation.
+        
+        Args:
+            expert_instance: The ExpertInstance object
+            
+        Returns:
+            Optional[Dict[str, Any]]: Settings dictionary or None if error
+        """
+        try:
+            import importlib
+            from ..models import ExpertSetting
+            from sqlmodel import select
+            from ..db import get_db
+            
+            expert_module_name = f"ba2_trade_platform.modules.experts.{expert_instance.expert}"
+            expert_module = importlib.import_module(expert_module_name)
+            expert_class = getattr(expert_module, expert_instance.expert)
+            
+            # Manually load expert settings from database
+            with get_db() as session:
+                expert_settings_rows = session.exec(
+                    select(ExpertSetting).where(ExpertSetting.instance_id == expert_instance.id)
+                ).all()
+                
+                # Build settings dict
+                settings = {}
+                for setting_row in expert_settings_rows:
+                    if setting_row.value_float is not None:
+                        settings[setting_row.key] = setting_row.value_float
+                    elif setting_row.value_str is not None:
+                        settings[setting_row.key] = setting_row.value_str
+                    elif setting_row.value_json:
+                        settings[setting_row.key] = setting_row.value_json
+                
+                return settings
+                
+        except (ImportError, AttributeError) as e:
+            logger.warning(f"Could not load expert {expert_instance.expert} for position size validation: {e}")
+            return None
+    
+    def _validate_single_position_size(self, trading_order: TradingOrder, transaction, expert_instance,
+                                       current_price: float, max_position_pct: float, 
+                                       virtual_equity: float) -> List[str]:
+        """
+        Validate that position size doesn't exceed expert's per-instrument limit.
+        
+        Args:
+            trading_order: The order to validate
+            transaction: The transaction associated with the order
+            expert_instance: The expert instance
+            current_price: Current market price
+            max_position_pct: Maximum position percentage setting
+            virtual_equity: Expert's virtual equity
+            
+        Returns:
+            List[str]: List of error messages (empty if valid)
+        """
+        errors = []
+        max_position_value = virtual_equity * (max_position_pct / 100.0)
+        
+        # Get current position size from the transaction
+        current_position_qty = abs(transaction.quantity or 0)
+        current_position_value = current_position_qty * current_price
+        
+        # Check if this is adding to an existing position
+        is_adding_to_position = False
+        if transaction.trading_orders:
+            entry_order = transaction.trading_orders[0]
+            if entry_order.side == trading_order.side:
+                is_adding_to_position = True
+        
+        if is_adding_to_position:
+            # Calculate the new total position value after this order
+            new_total_qty = current_position_qty + trading_order.quantity
+            new_total_value = new_total_qty * current_price
+            
+            if new_total_value > max_position_value:
+                max_additional_value = max_position_value - current_position_value
+                max_additional_qty = int(max_additional_value / current_price) if max_additional_value > 0 else 0
+                
+                errors.append(
+                    f"Adding {trading_order.quantity} shares would bring total position to ${new_total_value:.2f}, "
+                    f"exceeding expert's max allowed ${max_position_value:.2f} "
+                    f"({max_position_pct:.1f}% of virtual equity ${virtual_equity:.2f}). "
+                    f"Current position: {current_position_qty} shares (${current_position_value:.2f}). "
+                    f"Can add up to {max_additional_qty} more shares."
+                )
+                logger.error(
+                    f"POSITION SIZE LIMIT EXCEEDED: Adding {trading_order.quantity} shares of {trading_order.symbol} "
+                    f"to existing {current_position_qty} shares (new total ${new_total_value:.2f}) "
+                    f"exceeds expert {expert_instance.id} limit of ${max_position_value:.2f}"
+                )
+        else:
+            # This is a new position - validate the order quantity directly
+            position_value = current_price * trading_order.quantity
+            
+            if position_value > max_position_value:
+                errors.append(
+                    f"Position size ${position_value:.2f} exceeds expert's max allowed ${max_position_value:.2f} "
+                    f"({max_position_pct:.1f}% of virtual equity ${virtual_equity:.2f}). "
+                    f"Reduce quantity to {int(max_position_value / current_price)} or less."
+                )
+                logger.error(
+                    f"POSITION SIZE LIMIT EXCEEDED: Order for {trading_order.quantity} shares of {trading_order.symbol} "
+                    f"(${position_value:.2f}) exceeds expert {expert_instance.id} limit of ${max_position_value:.2f}"
+                )
+        
+        return errors
+    
+    def _validate_expert_available_balance(self, trading_order: TradingOrder, transaction,
+                                           expert_instance, current_price: float) -> List[str]:
+        """
+        Validate that order doesn't exceed expert's available virtual balance (defense-in-depth).
+        
+        Args:
+            trading_order: The order to validate
+            transaction: The transaction associated with the order
+            expert_instance: The expert instance
+            current_price: Current market price
+            
+        Returns:
+            List[str]: List of error messages (empty if valid)
+        """
+        errors = []
+        
+        try:
+            from ..utils import get_expert_instance_from_id
+            
+            expert_interface = get_expert_instance_from_id(transaction.expert_id)
+            if not expert_interface:
+                return errors
+            
+            available_balance = expert_interface.get_available_balance()
+            if available_balance is None:
+                return errors
+            
+            # Check if adding to existing position
+            is_adding_to_position = False
+            if transaction.trading_orders:
+                entry_order = transaction.trading_orders[0]
+                if entry_order.side == trading_order.side:
+                    is_adding_to_position = True
+            
+            if not is_adding_to_position:
+                # New position - check if order value exceeds available balance
+                order_value = current_price * trading_order.quantity
+                if order_value > available_balance:
+                    errors.append(
+                        f"Order value ${order_value:.2f} exceeds expert's available balance ${available_balance:.2f}. "
+                        f"Close existing positions or increase virtual equity percentage to allow this trade."
+                    )
+                    logger.error(
+                        f"EXPERT BALANCE EXCEEDED: Order for {trading_order.quantity} shares of {trading_order.symbol} "
+                        f"(${order_value:.2f}) exceeds expert {expert_instance.id} available balance ${available_balance:.2f}"
+                    )
+            else:
+                # Adding to position - check if additional value exceeds available balance
+                additional_value = trading_order.quantity * current_price
+                if additional_value > available_balance:
+                    errors.append(
+                        f"Adding ${additional_value:.2f} exceeds expert's available balance ${available_balance:.2f}. "
+                        f"Close existing positions or increase virtual equity percentage."
+                    )
+                    logger.error(
+                        f"EXPERT BALANCE EXCEEDED: Adding {trading_order.quantity} shares of {trading_order.symbol} "
+                        f"(${additional_value:.2f}) exceeds expert {expert_instance.id} available balance ${available_balance:.2f}"
+                    )
+        except Exception as balance_error:
+            logger.warning(f"Error checking expert available balance: {balance_error}")
+        
+        return errors
+
     def _validate_position_size_limits(self, trading_order: TradingOrder) -> List[str]:
         """
         Validate that the order respects expert position size limits (defense-in-depth).
@@ -768,7 +940,7 @@ class AccountInterface(ExtendableSettingsInterface):
         try:
             # Get the transaction to find the expert_id
             from ..db import get_instance
-            from ..models import Transaction, ExpertInstance, ExpertSetting
+            from ..models import Transaction, ExpertInstance
             
             transaction = get_instance(Transaction, trading_order.transaction_id)
             if not transaction or not transaction.expert_id:
@@ -782,38 +954,8 @@ class AccountInterface(ExtendableSettingsInterface):
                 return errors
             
             # Get expert settings
-            # Load expert class to access settings
-            expert_module_name = f"ba2_trade_platform.modules.experts.{expert_instance.expert}"
-            try:
-                import importlib
-                expert_module = importlib.import_module(expert_module_name)
-                expert_class = getattr(expert_module, expert_instance.expert)
-                
-                # Get settings using the ExtendableSettingsInterface pattern
-                # Note: We can't use self.get_settings() because self is the AccountInterface
-                # We need to instantiate a temporary helper to access expert settings
-                from ..models import ExpertSetting
-                from sqlmodel import Session, select
-                from ..db import get_db
-                
-                # Manually load expert settings from database
-                with get_db() as session:
-                    expert_settings_rows = session.exec(
-                        select(ExpertSetting).where(ExpertSetting.instance_id == expert_instance.id)
-                    ).all()
-                    
-                    # Build settings dict
-                    settings = {}
-                    for setting_row in expert_settings_rows:
-                        if setting_row.value_float is not None:
-                            settings[setting_row.key] = setting_row.value_float
-                        elif setting_row.value_str is not None:
-                            settings[setting_row.key] = setting_row.value_str
-                        elif setting_row.value_json:
-                            settings[setting_row.key] = setting_row.value_json
-                
-            except (ImportError, AttributeError) as e:
-                logger.warning(f"Could not load expert {expert_instance.expert} for position size validation: {e}")
+            settings = self._get_expert_settings_for_validation(expert_instance)
+            if not settings:
                 return errors
             
             # Get position size limit setting
@@ -832,66 +974,24 @@ class AccountInterface(ExtendableSettingsInterface):
             virtual_equity_pct = expert_instance.virtual_equity_pct
             virtual_equity = account_equity * (virtual_equity_pct / 100.0)
             
-            # Calculate max position value
-            max_position_value = virtual_equity * (max_position_pct / 100.0)
-            
-            # Calculate order position value
+            # Get current price
             current_price = self.get_instrument_current_price(trading_order.symbol)
             if current_price is None:
                 logger.warning(f"Could not get current price for {trading_order.symbol} in position size validation")
                 return errors
             
-            # For adjust operations, we need to check the NEW TOTAL position, not just the delta
-            # Get the current position size from the transaction
-            current_position_qty = abs(transaction.quantity or 0)
-            current_position_value = current_position_qty * current_price
+            # Validate position size limits
+            position_size_errors = self._validate_single_position_size(
+                trading_order, transaction, expert_instance,
+                current_price, max_position_pct, virtual_equity
+            )
+            errors.extend(position_size_errors)
             
-            # Check if this is adding to an existing position
-            # If the order direction matches the position direction, it's adding
-            is_adding_to_position = False
-            if transaction.trading_orders:
-                entry_order = transaction.trading_orders[0]
-                # If order side matches entry side, we're adding to position
-                if entry_order.side == trading_order.side:
-                    is_adding_to_position = True
-            
-            if is_adding_to_position:
-                # Calculate the new total position value after this order
-                new_total_qty = current_position_qty + trading_order.quantity
-                new_total_value = new_total_qty * current_price
-                
-                # Check if new total exceeds limit
-                if new_total_value > max_position_value:
-                    max_additional_value = max_position_value - current_position_value
-                    max_additional_qty = int(max_additional_value / current_price) if max_additional_value > 0 else 0
-                    
-                    errors.append(
-                        f"Adding {trading_order.quantity} shares would bring total position to ${new_total_value:.2f}, "
-                        f"exceeding expert's max allowed ${max_position_value:.2f} "
-                        f"({max_position_pct:.1f}% of virtual equity ${virtual_equity:.2f}). "
-                        f"Current position: {current_position_qty} shares (${current_position_value:.2f}). "
-                        f"Can add up to {max_additional_qty} more shares."
-                    )
-                    logger.error(
-                        f"POSITION SIZE LIMIT EXCEEDED: Adding {trading_order.quantity} shares of {trading_order.symbol} "
-                        f"to existing {current_position_qty} shares (new total ${new_total_value:.2f}) "
-                        f"exceeds expert {expert_instance.id} limit of ${max_position_value:.2f}"
-                    )
-            else:
-                # This is a new position or closing position - validate the order quantity directly
-                position_value = current_price * trading_order.quantity
-                
-                # Check if position exceeds limit
-                if position_value > max_position_value:
-                    errors.append(
-                        f"Position size ${position_value:.2f} exceeds expert's max allowed ${max_position_value:.2f} "
-                        f"({max_position_pct:.1f}% of virtual equity ${virtual_equity:.2f}). "
-                        f"Reduce quantity to {int(max_position_value / current_price)} or less."
-                    )
-                    logger.error(
-                        f"POSITION SIZE LIMIT EXCEEDED: Order for {trading_order.quantity} shares of {trading_order.symbol} "
-                        f"(${position_value:.2f}) exceeds expert {expert_instance.id} limit of ${max_position_value:.2f}"
-                    )
+            # Validate expert available balance (defense-in-depth)
+            balance_errors = self._validate_expert_available_balance(
+                trading_order, transaction, expert_instance, current_price
+            )
+            errors.extend(balance_errors)
                 
         except Exception as e:
             # Don't fail the entire validation if position size check has an error
@@ -2281,22 +2381,7 @@ class AccountInterface(ExtendableSettingsInterface):
                     # Check if we have a filled closing order (dependent order that closes position)
                     filled_closing_orders = [o for o in dependent_orders if o.status == OrderStatus.FILLED]
                     
-                    # Calculate transaction quantity from filled market entry orders
-                    # Sum all filled quantities from market entry orders
-                    calculated_quantity = 0.0
-                    for order in market_entry_orders:
-                        if order.status in executed_statuses:
-                            # Use filled_qty if available, otherwise use order quantity
-                            qty = order.filled_qty if order.filled_qty else order.quantity
-                            if qty:
-                                # Add for BUY orders, subtract for SELL orders (for short positions)
-                                if order.side == OrderDirection.BUY:
-                                    calculated_quantity += float(qty)
-                                elif order.side == OrderDirection.SELL:
-                                    calculated_quantity -= float(qty)
-                    
-                    # Sum ALL filled buy and sell orders (including limit orders, market orders, TP/SL, etc.)
-                    # If quantities match, the position is balanced and transaction should be closed
+                    # Sum ALL filled buy and sell orders to determine position quantity
                     total_filled_buy = 0.0
                     total_filled_sell = 0.0
                     for order in orders:
@@ -2308,11 +2393,29 @@ class AccountInterface(ExtendableSettingsInterface):
                                 elif order.side == OrderDirection.SELL:
                                     total_filled_sell += float(qty)
                     
+                    # Calculate remaining quantity based on transaction side
+                    # For SELL (SHORT) positions: remaining = filled SELL - filled BUY
+                    # For BUY (LONG) positions: remaining = filled BUY - filled SELL
+                    if transaction.side == OrderDirection.SELL:
+                        calculated_quantity = total_filled_sell - total_filled_buy
+                    else:  # BUY (LONG)
+                        calculated_quantity = total_filled_buy - total_filled_sell
+                    
                     # If buy and sell orders match (within a small tolerance for floating point), position is closed
                     position_balanced = abs(total_filled_buy - total_filled_sell) < 0.0001
                     
                     # Update transaction quantity if different
                     if calculated_quantity != 0 and transaction.quantity != calculated_quantity:
+                        # Safety check: calculated_quantity should always be positive for filled orders
+                        if calculated_quantity < 0:
+                            logger.error(
+                                f"NEGATIVE calculated_quantity in sync_transaction_orders: {calculated_quantity} "
+                                f"for transaction {transaction.id} ({transaction.symbol}, side={transaction.side}), "
+                                f"total_filled_buy={total_filled_buy}, total_filled_sell={total_filled_sell}. "
+                                f"Using abs() as safety measure.",
+                                exc_info=True
+                            )
+                            calculated_quantity = abs(calculated_quantity)
                         transaction.quantity = calculated_quantity
                         has_changes = True
                         logger.debug(f"Transaction {transaction.id} quantity updated to {calculated_quantity}")

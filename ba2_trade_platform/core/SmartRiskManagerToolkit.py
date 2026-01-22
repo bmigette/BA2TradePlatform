@@ -1993,14 +1993,31 @@ class SmartRiskManagerToolkit:
                     "direction": direction
                 }
             
-            # Check account balance
-            account_info = self.account.get_account_info()
-            available_balance = float(account_info.cash) if account_info else 0.0
+            # Check expert's available balance (virtual equity minus used balance)
+            available_balance = self.expert.get_available_balance()
+            if available_balance is None:
+                return {
+                    "success": False,
+                    "message": "Could not calculate expert's available balance",
+                    "transaction_id": None,
+                    "order_id": None,
+                    "symbol": symbol,
+                    "quantity": quantity,
+                    "direction": direction
+                }
             
             # Get expert's virtual equity (percentage of total account equity)
-            account_equity = float(account_info.equity) if account_info else 0.0
-            virtual_equity_pct = self.expert.instance.virtual_equity_pct
-            virtual_equity = account_equity * (virtual_equity_pct / 100.0)
+            virtual_equity = self.expert.get_virtual_balance()
+            if virtual_equity is None:
+                return {
+                    "success": False,
+                    "message": "Could not calculate expert's virtual balance",
+                    "transaction_id": None,
+                    "order_id": None,
+                    "symbol": symbol,
+                    "quantity": quantity,
+                    "direction": direction
+                }
             
             current_price = self.account.get_instrument_current_price(symbol)
             if current_price is None:
@@ -2016,10 +2033,11 @@ class SmartRiskManagerToolkit:
             
             position_value = current_price * quantity
             
+            # Check if expert has enough available balance for this position
             if position_value > available_balance:
                 return {
                     "success": False,
-                    "message": f"Insufficient balance: position value {position_value:.2f} > available {available_balance:.2f}",
+                    "message": f"Insufficient expert balance: position value ${position_value:.2f} > available ${available_balance:.2f}. Close existing positions or increase virtual equity %.",
                     "transaction_id": None,
                     "order_id": None,
                     "symbol": symbol,
@@ -2064,9 +2082,18 @@ class SmartRiskManagerToolkit:
                 logger.info(f"Automatically adjusted quantity from {original_quantity} to {quantity} to respect max position size limit ({max_position_pct}% of equity = ${max_position_value:.2f})")
             
             # Create transaction BEFORE submitting orders
+            # Safety check: ensure quantity is positive
+            if quantity < 0:
+                logger.error(
+                    f"NEGATIVE QUANTITY DETECTED in SmartRiskManager._open_position_internal: {quantity} "
+                    f"for {symbol} {order_direction}. Using abs() as safety measure.",
+                    exc_info=True
+                )
+                quantity = abs(quantity)
+            
             transaction = Transaction(
                 symbol=symbol,
-                quantity=quantity,  # Always positive
+                quantity=abs(float(quantity)),  # Always positive, with abs() safety
                 side=order_direction,  # BUY for LONG, SELL for SHORT
                 open_price=current_price,  # Estimated open price
                 status=TransactionStatus.WAITING,

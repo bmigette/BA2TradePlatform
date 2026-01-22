@@ -106,9 +106,13 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                 "tooltip": "The model used by data providers for web search and data gathering. Only models with web search capability are shown."
             },
             "embedding_model": {
-                "type": "str", "required": True, "default": "OpenAI/text-embedding-3-small",
+                "type": "str", "required": True, "default": "Local/all-mpnet-base-v2",
                 "description": "Model for generating embeddings for memories/vector storage",
                 "valid_values": [
+                    # Local embeddings (no API calls, runs on CPU/GPU)
+                    "Local/all-MiniLM-L6-v2",  # Fast, small (80MB), 384 dimensions
+                    "Local/all-mpnet-base-v2",  # Better quality, larger (420MB), 768 dimensions (DEFAULT)
+                    "Local/paraphrase-multilingual-MiniLM-L12-v2",  # Multilingual support
                     # OpenAI embeddings (direct)
                     "OpenAI/text-embedding-3-small",
                     "OpenAI/text-embedding-3-large",
@@ -117,8 +121,8 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                     "NagaAI/text-embedding-3-large",
                 ],
                 "allow_custom": True,
-                "help": "For more information, see [OpenAI Embeddings](https://platform.openai.com/docs/guides/embeddings) and [Naga AI Embeddings](https://docs.naga.ac/models/embeddings)",
-                "tooltip": "The model used to generate embeddings for storing and retrieving memories in vector databases. Format: Provider/ModelName. text-embedding-3-small is faster and cheaper, text-embedding-3-large provides better accuracy."
+                "help": "**Local models** (prefix: Local/) run on your machine with no API calls or costs. Requires `sentence-transformers` package. **API models** (OpenAI/NagaAI) require API keys. For more info: [sentence-transformers](https://www.sbert.net/), [OpenAI Embeddings](https://platform.openai.com/docs/guides/embeddings)",
+                "tooltip": "Embedding model for vector storage. Local models are free and private but run on your CPU/GPU. API models are faster but cost money. all-mpnet-base-v2 is the default (best quality/performance balance)."
             },
             
             # Data Lookback Periods

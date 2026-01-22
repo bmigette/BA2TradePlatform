@@ -64,8 +64,13 @@ class TransactionHelper:
             
             logger.info(f"Adjusting transaction {transaction.id} quantity from {transaction.quantity} to {new_quantity}")
             
-            # Update transaction quantity
-            transaction.quantity = new_quantity
+            # Update transaction quantity with abs() safety
+            if new_quantity < 0:
+                logger.error(
+                    f"NEGATIVE QUANTITY DETECTED in adjust_transaction_quantity: {new_quantity}",
+                    exc_info=True
+                )
+            transaction.quantity = abs(float(new_quantity))
             
             # Find all orders for this transaction
             statement = select(TradingOrder).where(
@@ -671,8 +676,13 @@ class TransactionHelper:
                         f"will trigger when order {close_order_id} is FILLED"
                     )
                 
-                # Update transaction
-                transaction.quantity = remaining_qty
+                # Update transaction with abs() safety
+                if remaining_qty < 0:
+                    logger.error(
+                        f"NEGATIVE QUANTITY DETECTED in partial close (remaining_qty): {remaining_qty}",
+                        exc_info=True
+                    )
+                transaction.quantity = abs(float(remaining_qty))
                 if tp_price:
                     transaction.take_profit = tp_price
                 if sl_price:
@@ -780,8 +790,13 @@ class TransactionHelper:
                         f"will trigger when order {trigger_order_id} is CANCELED"
                     )
                 
-                # Update transaction
-                transaction.quantity = new_qty
+                # Update transaction with abs() safety
+                if new_qty < 0:
+                    logger.error(
+                        f"NEGATIVE QUANTITY DETECTED in bulk_modify_tp_sl (new_qty): {new_qty}",
+                        exc_info=True
+                    )
+                transaction.quantity = abs(float(new_qty))
                 if tp_price:
                     transaction.take_profit = tp_price
                 if sl_price:

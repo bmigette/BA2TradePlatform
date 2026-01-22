@@ -174,7 +174,23 @@ class SmartRiskManagerContentRenderer:
                     
                     with ui.row().classes('items-center gap-2'):
                         ui.icon('trending_up').classes(self._text_class("secondary")).style(self._text_style("secondary"))
-                        ui.label(f"Actions Taken: {job.actions_taken_count or 0}").classes(f'text-sm {self._text_class("primary")}').style(self._text_style("primary"))
+                        actions_text = self._format_actions_taken(job)
+                        ui.label(actions_text).classes(f'text-sm {self._text_class("primary")}').style(self._text_style("primary"))
+    
+    def _format_actions_taken(self, job: SmartRiskManagerJob) -> str:
+        """Format actions taken count with failed count if any."""
+        total = job.actions_taken_count or 0
+        
+        # Count failed actions from graph_state if available
+        failed = 0
+        if job.graph_state and "actions_log" in job.graph_state:
+            actions_log = job.graph_state["actions_log"]
+            failed = sum(1 for action in actions_log if not action.get("success", False))
+        
+        if failed > 0:
+            return f"Actions Taken: {total} ({failed} Failed)"
+        else:
+            return f"Actions Taken: {total}"
     
     def _render_portfolio_snapshot(self, job: SmartRiskManagerJob) -> None:
         """Render the portfolio snapshot card."""

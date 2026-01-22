@@ -474,7 +474,13 @@ class OverviewTab:
                 if txn.id in transaction_inputs:
                     new_qty = transaction_inputs[txn.id].value
                     if new_qty != txn.quantity:
-                        txn.quantity = new_qty
+                        # Add abs() safety for manual edits
+                        if new_qty < 0:
+                            logger.error(
+                                f"NEGATIVE QUANTITY DETECTED in manual edit for transaction {txn.id}: {new_qty}",
+                                exc_info=True
+                            )
+                        txn.quantity = abs(float(new_qty))
                         update_instance(txn)
                         updated_count += 1
             
@@ -1751,7 +1757,13 @@ class AccountOverviewTab:
                     
                     if transaction:
                         logger.info(f"Updating linked transaction {transaction.id} quantity from {transaction.quantity} to {new_quantity}")
-                        transaction.quantity = new_quantity
+                        # Add abs() safety when updating from order quantity change
+                        if new_quantity < 0:
+                            logger.error(
+                                f"NEGATIVE QUANTITY DETECTED when updating transaction from order change: {new_quantity}",
+                                exc_info=True
+                            )
+                        transaction.quantity = abs(float(new_quantity))
                         update_instance(transaction)
                     else:
                         logger.warning(f"Transaction {order.transaction_id} not found for order {order.id}")

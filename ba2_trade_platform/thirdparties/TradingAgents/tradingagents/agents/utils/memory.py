@@ -10,7 +10,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 class FinancialSituationMemory:
     def __init__(self, name, config, symbol=None, market_analysis_id=None, expert_instance_id=None):
         # Get embedding model from config
-        # Format: "Provider/model_name" e.g., "OpenAI/text-embedding-3-small" or "NagaAI/text-embedding-3-small"
+        # Format: "Provider/model_name" e.g., "OpenAI/text-embedding-3-small", "NagaAI/text-embedding-3-small", or "Local/all-MiniLM-L6-v2"
         embedding_selection = config.get("embedding_model", "OpenAI/text-embedding-3-small")
         
         # Parse the embedding model selection to get provider and model name
@@ -23,42 +23,62 @@ class FinancialSituationMemory:
             model_name = embedding_selection
         
         self.embedding = model_name
+        self.embedding_provider = provider
         
-        # Get provider configuration from models_registry
-        try:
-            from ba2_trade_platform.core.models_registry import PROVIDER_CONFIG
-            from ba2_trade_platform.config import get_app_setting
+        # Initialize embedding client based on provider
+        if provider == "local":
+            # Use local sentence-transformers model (no API calls)
+            try:
+                from sentence_transformers import SentenceTransformer
+                self.local_embedding_model = SentenceTransformer(model_name)
+                self.client = None  # No OpenAI client needed
+                logger.info(f"Initialized local embedding model: {model_name}")
+            except ImportError:
+                logger.error("sentence-transformers not installed. Install with: pip install sentence-transformers")
+                raise ImportError("sentence-transformers package required for local embeddings. Install with: pip install sentence-transformers")
+        else:
+            # Use OpenAI-compatible API provider
+            self.local_embedding_model = None
             
-            provider_config = PROVIDER_CONFIG.get(provider, {})
-            embedding_backend_url = provider_config.get("base_url", "https://api.openai.com/v1")
-            api_key_setting = provider_config.get("api_key_setting", "openai_api_key")
-            
-            # Get API key from app settings
-            api_key = get_app_setting(api_key_setting)
-            if not api_key:
-                # Fallback to openai_api_key
-                api_key = get_app_setting("openai_api_key")
+            # Get provider configuration from models_registry
+            try:
+                from ba2_trade_platform.core.models_registry import PROVIDER_CONFIG
+                from ba2_trade_platform.config import get_app_setting
                 
-        except ImportError:
-            # Fallback for older configurations
-            from ...dataflows.config import get_openai_api_key
-            embedding_backend_url = "https://api.openai.com/v1"
-            api_key = get_openai_api_key()
-            
-        self.client = OpenAI(base_url=embedding_backend_url, api_key=api_key)
+                provider_config = PROVIDER_CONFIG.get(provider, {})
+                embedding_backend_url = provider_config.get("base_url", "https://api.openai.com/v1")
+                api_key_setting = provider_config.get("api_key_setting", "openai_api_key")
+                
+                # Get API key from app settings
+                api_key = get_app_setting(api_key_setting)
+                if not api_key:
+                    # Fallback to openai_api_key
+                    api_key = get_app_setting("openai_api_key")
+                    
+            except ImportError:
+                # Fallback for older configurations
+                from ...dataflows.config import get_openai_api_key
+                embedding_backend_url = "https://api.openai.com/v1"
+                api_key = get_openai_api_key()
+                
+            self.client = OpenAI(base_url=embedding_backend_url, api_key=api_key)
         
         # Use persistent client with expert-specific subdirectory
         from ba2_trade_platform.config import CACHE_FOLDER
         
+        # Sanitize model name for use in filesystem path (replace / with _)
+        model_path_name = model_name.replace("/", "_").replace("\\", "_")
+        
         if expert_instance_id:
-            # Include symbol in path to avoid ChromaDB instance conflicts when same expert analyzes different symbols
+            # Include symbol and embedding model in path to avoid ChromaDB instance conflicts
+            # This ensures different embedding models have separate databases
             if symbol:
-                persist_directory = os.path.join(CACHE_FOLDER, "chromadb", f"expert_{expert_instance_id}", symbol)
+                persist_directory = os.path.join(CACHE_FOLDER, "chromadb", f"expert_{expert_instance_id}", model_path_name, symbol)
             else:
-                persist_directory = os.path.join(CACHE_FOLDER, "chromadb", f"expert_{expert_instance_id}")
+                persist_directory = os.path.join(CACHE_FOLDER, "chromadb", f"expert_{expert_instance_id}", model_path_name)
         else:
             # Fallback for backward compatibility
-            persist_directory = os.path.join(CACHE_FOLDER, "chromadb", "default")
+            persist_directory = os.path.join(CACHE_FOLDER, "chromadb", "default", model_path_name)
         
         # Create directory if it doesn't exist
         os.makedirs(persist_directory, exist_ok=True)
@@ -99,49 +119,87 @@ class FinancialSituationMemory:
             logger.debug(f"Created new ChromaDB collection: {collection_name}")
 
     def get_embedding(self, text):
-        """Get OpenAI embeddings for a text, using RecursiveCharacterTextSplitter for long texts.
+        """Get embeddings for a text, using RecursiveCharacterTextSplitter for long texts.
+        
+        Supports both API-based (OpenAI, etc.) and local (sentence-transformers) embedding models.
         
         Returns:
             list: List of embeddings (one per chunk). If text is short, returns list with single embedding.
         """
-        # text-embedding-3-small has a max context length of 8192 tokens
-        # Conservative estimate: ~2 characters per token (safe for JSON, code, special chars)
-        # Previous estimate of 3 chars/token was too generous and caused 400 errors
-        max_chars = 16000  # ~8000 tokens * 2 chars/token (conservative)
-        
-        if len(text) <= max_chars:
-            # Text is short enough, get embedding directly
-            response = self.client.embeddings.create(
-                model=self.embedding, input=text
+        if self.embedding_provider == "local":
+            # Use local sentence-transformers model
+            # Most sentence-transformer models have a max length of 256-512 tokens
+            max_chars = 1500  # ~500 tokens * 3 chars/token (conservative for local models)
+            
+            if len(text) <= max_chars:
+                # Text is short enough, get embedding directly
+                embedding = self.local_embedding_model.encode(text, convert_to_numpy=True)
+                return [embedding.tolist()]
+            
+            # Text is too long, use RecursiveCharacterTextSplitter
+            logger.info(f"Text length {len(text)} exceeds limit, splitting into chunks for local embedding")
+            
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1200,  # ~400 tokens, well under most model limits
+                chunk_overlap=200,
+                length_function=len,
+                separators=["\n\n", "\n", ". ", " ", ""]
             )
-            return [response.data[0].embedding]
+            
+            chunks = text_splitter.split_text(text)
+            logger.info(f"Split text into {len(chunks)} chunks for local embedding")
+            
+            # Get embeddings for all chunks
+            chunk_embeddings = []
+            for chunk in chunks:
+                try:
+                    embedding = self.local_embedding_model.encode(chunk, convert_to_numpy=True)
+                    chunk_embeddings.append(embedding.tolist())
+                except Exception as e:
+                    logger.error(f"Failed to get local embedding for chunk: {e}", exc_info=True)
+                    continue
+            
+            return chunk_embeddings
         
-        # Text is too long, use RecursiveCharacterTextSplitter
-        logger.info(f"Text length {len(text)} exceeds limit, splitting into chunks for embedding")
-        
-        # Use RecursiveCharacterTextSplitter for intelligent chunking
-        # chunk_size of 14000 chars ≈ 7000 tokens, leaving buffer for 8192 limit
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=14000,  # Conservative: ~7000 tokens, well under 8192 limit
-            chunk_overlap=500,  # Overlap to preserve context
-            length_function=len,
-            separators=["\n\n", "\n", ". ", " ", ""]  # Try to split at natural boundaries
-        )
-        
-        chunks = text_splitter.split_text(text)
-        logger.info(f"Split text into {len(chunks)} chunks for embedding")
-        
-        # Get embeddings for all chunks
-        chunk_embeddings = []
-        for i, chunk in enumerate(chunks):
-            try:
+        else:
+            # Use API-based embeddings (OpenAI, NagaAI, etc.)
+            # text-embedding-3-small has a max context length of 8192 tokens
+            # Conservative estimate: ~2 characters per token (safe for JSON, code, special chars)
+            max_chars = 16000  # ~8000 tokens * 2 chars/token (conservative)
+            
+            if len(text) <= max_chars:
+                # Text is short enough, get embedding directly
                 response = self.client.embeddings.create(
-                    model=self.embedding, input=chunk
+                    model=self.embedding, input=text
                 )
-                chunk_embeddings.append(response.data[0].embedding)
-            except Exception as e:
-                logger.error(f"Failed to get embedding for chunk {i}: {e}", exc_info=True)
-                continue
+                return [response.data[0].embedding]
+            
+            # Text is too long, use RecursiveCharacterTextSplitter
+            logger.info(f"Text length {len(text)} exceeds limit, splitting into chunks for embedding")
+            
+            # Use RecursiveCharacterTextSplitter for intelligent chunking
+            # chunk_size of 14000 chars ≈ 7000 tokens, leaving buffer for 8192 limit
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=14000,  # Conservative: ~7000 tokens, well under 8192 limit
+                chunk_overlap=500,  # Overlap to preserve context
+                length_function=len,
+                separators=["\n\n", "\n", ". ", " ", ""]  # Try to split at natural boundaries
+            )
+            
+            chunks = text_splitter.split_text(text)
+            logger.info(f"Split text into {len(chunks)} chunks for embedding")
+            
+            # Get embeddings for all chunks
+            chunk_embeddings = []
+            for i, chunk in enumerate(chunks):
+                try:
+                    response = self.client.embeddings.create(
+                        model=self.embedding, input=chunk
+                    )
+                    chunk_embeddings.append(response.data[0].embedding)
+                except Exception as e:
+                    logger.error(f"Failed to get embedding for chunk {i}: {e}", exc_info=True)
+                    continue
         
         if not chunk_embeddings:
             raise ValueError("Failed to get embeddings for any chunks")

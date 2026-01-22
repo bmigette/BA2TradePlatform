@@ -129,33 +129,30 @@ class BalanceUsagePerExpertChart:
                     if not market_price:
                         continue
                     
-                    # Get all MARKET orders for this transaction
-                    market_orders = session.exec(
-                        select(TradingOrder)
-                        .where(TradingOrder.transaction_id == transaction.id)
-                        .where(TradingOrder.order_type == OrderType.MARKET)
-                    ).all()
-                    
-                    # Calculate pending and filled equity from MARKET orders only
-                    for order in market_orders:
-                        if order.status in OrderStatus.get_unfilled_statuses():
-                            # Unfilled MARKET order - count as pending
-                            remaining_qty = order.quantity
-                            if order.filled_qty:
-                                remaining_qty -= order.filled_qty
-                            
-                            if remaining_qty > 0:
-                                equity = abs(remaining_qty) * market_price
-                                balance_usage[expert_name]['pending'] += equity
+                    # For OPENED/CLOSING transactions, use current transaction quantity
+                    # For WAITING transactions, sum pending MARKET orders
+                    if transaction.status in [TransactionStatus.OPENED, TransactionStatus.CLOSING]:
+                        # Current position - use transaction quantity
+                        equity = abs(transaction.quantity) * market_price
+                        balance_usage[expert_name]['filled'] += equity
+                        
+                    elif transaction.status == TransactionStatus.WAITING:
+                        # Pending entry - sum unfilled MARKET orders
+                        market_orders = session.exec(
+                            select(TradingOrder)
+                            .where(TradingOrder.transaction_id == transaction.id)
+                            .where(TradingOrder.order_type == OrderType.MARKET)
+                        ).all()
+                        
+                        for order in market_orders:
+                            if order.status in OrderStatus.get_unfilled_statuses():
+                                remaining_qty = order.quantity
+                                if order.filled_qty:
+                                    remaining_qty -= order.filled_qty
                                 
-                        elif order.status in OrderStatus.get_executed_statuses():
-                            # Executed MARKET order - count as filled/used balance
-                            filled_qty = order.filled_qty if order.filled_qty else order.quantity
-                            
-                            if filled_qty > 0:
-                                equity = abs(filled_qty) * market_price
-                                balance_usage[expert_name]['filled'] += equity
-                        # Other statuses (terminal, error, etc.) are not counted
+                                if remaining_qty > 0:
+                                    equity = abs(remaining_qty) * market_price
+                                    balance_usage[expert_name]['pending'] += equity
                     
                 except Exception as e:
                     logger.error(f"Error calculating balance usage for transaction {transaction.id}: {e}")
