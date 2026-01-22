@@ -482,7 +482,9 @@ class AccountInterface(ExtendableSettingsInterface):
                     if order.status in excluded_statuses:
                         continue
                     qty = float(order.quantity) if order.quantity else 0.0
-                    total_quantity += qty
+                    # CRITICAL: Ensure quantity is always positive (use abs)
+                    # Transaction.quantity should ALWAYS be positive - direction is indicated by side field
+                    total_quantity += abs(qty)
                     valid_count += 1
                 
                 # Quantity is always positive - direction field indicates LONG/SHORT

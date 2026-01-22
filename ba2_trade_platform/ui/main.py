@@ -168,5 +168,7 @@ ui.run(
     binding_refresh_interval=0.5,
     # Storage secret for app.storage.user (account filter persistence)
     storage_secret=STORAGE_SECRET,
+    # Enable dark mode by default
+    dark=True,
     #uvicorn_logging_level=logging.DEBUG,
 )

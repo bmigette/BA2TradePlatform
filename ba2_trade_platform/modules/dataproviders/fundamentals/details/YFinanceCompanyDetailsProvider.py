@@ -9,6 +9,7 @@ from typing import Dict, Any, Literal, Optional
 from datetime import datetime
 import yfinance as yf
 import pandas as pd
+import time
 
 from ba2_trade_platform.core.interfaces import CompanyFundamentalsDetailsInterface
 from ba2_trade_platform.core.provider_utils import log_provider_call
@@ -30,6 +31,8 @@ class YFinanceCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
     def __init__(self):
         """Initialize YFinance company details provider."""
         super().__init__()
+        self.max_retries = 3
+        self.base_delay = 2.0  # Base delay in seconds
         logger.info("YFinanceCompanyDetailsProvider initialized successfully")
     
     def get_provider_name(self) -> str:
@@ -661,6 +664,41 @@ class YFinanceCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             return f"Error retrieving past earnings for {symbol}: {str(e)}"
     
     @log_provider_call
+    def _retry_with_backoff(self, func, *args, **kwargs):
+        """Execute function with exponential backoff retry on rate limit errors.
+        
+        Args:
+            func: Function to execute
+            *args: Positional arguments for func
+            **kwargs: Keyword arguments for func
+            
+        Returns:
+            Result of func execution
+            
+        Raises:
+            Exception: If all retries are exhausted
+        """
+        last_exception = None
+        for attempt in range(self.max_retries):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                last_exception = e
+                error_msg = str(e).lower()
+                
+                # Check if it's a rate limit error
+                if 'rate limit' in error_msg or 'too many requests' in error_msg:
+                    if attempt < self.max_retries - 1:  # Don't sleep on last attempt
+                        delay = self.base_delay * (2 ** attempt)  # Exponential backoff: 2s, 4s, 8s
+                        logger.warning(f"Rate limited, retrying in {delay}s (attempt {attempt + 1}/{self.max_retries})")
+                        time.sleep(delay)
+                        continue
+                # For non-rate-limit errors, raise immediately
+                raise
+        
+        # All retries exhausted
+        raise last_exception
+    
     def get_earnings_estimates(
         self,
         symbol: str,
@@ -689,12 +727,15 @@ class YFinanceCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
         try:
             ticker_obj = yf.Ticker(symbol.upper())
             
-            # Get earnings estimates
-            if frequency.lower() == "quarterly":
-                data = ticker_obj.get_earnings_estimate()
-            else:
-                # For annual, we use the earnings estimate with yearly aggregation
-                data = ticker_obj.get_earnings_estimate()
+            # Get earnings estimates with retry logic
+            def get_estimate_data():
+                if frequency.lower() == "quarterly":
+                    return ticker_obj.get_earnings_estimate()
+                else:
+                    # For annual, we use the earnings estimate with yearly aggregation
+                    return ticker_obj.get_earnings_estimate()
+            
+            data = self._retry_with_backoff(get_estimate_data)
             
             if data is None or data.empty:
                 error_msg = f"No earnings estimates found for symbol '{symbol}'"
