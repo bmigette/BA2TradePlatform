@@ -1,8 +1,9 @@
 from nicegui import ui
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import math
 import asyncio
+import time
 
 from ...core.WorkerQueue import get_worker_queue
 from ...core.db import get_all_instances, get_instance, get_db
@@ -19,6 +20,62 @@ from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
 from ..components.SmartRiskManagerDetailDialog import SmartRiskManagerDetailDialog
 from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
 from sqlmodel import select, func, distinct
+
+
+# ========== Module-level cache for expert options ==========
+# Shared across all tabs to avoid redundant database queries
+_expert_options_cache: Dict[str, Any] = {
+    'data': None,
+    'timestamp': 0,
+    'ttl': 60  # Cache for 60 seconds
+}
+
+
+def get_cached_expert_options(enabled_only: bool = False) -> dict:
+    """Get expert options with caching to avoid redundant DB queries.
+
+    Args:
+        enabled_only: If True, only return enabled experts.
+
+    Returns:
+        Dict mapping expert ID strings to display names, with 'all' key.
+    """
+    cache_key = 'enabled' if enabled_only else 'all'
+    current_time = time.time()
+
+    # Check if cache is valid
+    if (_expert_options_cache['data'] is not None and
+        cache_key in _expert_options_cache['data'] and
+        current_time - _expert_options_cache['timestamp'] < _expert_options_cache['ttl']):
+        return _expert_options_cache['data'][cache_key]
+
+    # Fetch from database
+    try:
+        with get_db() as session:
+            expert_instances = session.exec(select(ExpertInstance)).all()
+
+            # Build options for both enabled-only and all experts
+            all_options = {'all': 'All Experts'}
+            enabled_options = {'all': 'All Experts'}
+
+            for expert in expert_instances:
+                base_name = expert.alias or expert.expert
+                display_name = f"{base_name}-{expert.id}"
+                all_options[str(expert.id)] = display_name
+                if expert.enabled:
+                    enabled_options[str(expert.id)] = f"{base_name} (ID: {expert.id})"
+
+            # Update cache
+            _expert_options_cache['data'] = {
+                'all': all_options,
+                'enabled': enabled_options
+            }
+            _expert_options_cache['timestamp'] = current_time
+
+            return _expert_options_cache['data'][cache_key]
+    except Exception as e:
+        logger.error(f"Error getting expert options: {e}", exc_info=True)
+        return {'all': 'All Experts'}
 
 
 class JobMonitoringTab:
@@ -50,11 +107,8 @@ class JobMonitoringTab:
         self.recommendation_filter = 'all'  # Filter by recommendation (BUY, SELL, HOLD)
         self.symbol_filter = ''  # Filter by symbol - filters at database level, not client-side
         
-        # ===== CACHING for performance =====
-        # Cache entire filtered dataset to avoid recomputing on pagination/page size changes
-        self.cached_analysis_data = []  # Full filtered result set
-        self.cache_valid = False  # Whether cache matches current filters
-        self.last_filter_state = None  # Track filter state to detect changes
+        # Track filter state for detecting when to reset pagination
+        self.last_filter_state = None
         
         # Smart Risk Manager Jobs pagination and filtering state
         self.smart_risk_current_page = 1
@@ -89,18 +143,13 @@ class JobMonitoringTab:
             get_selected_account_id()  # Include global account filter
         )
     
-    def _should_invalidate_cache(self) -> bool:
-        """Check if filters have changed, requiring cache invalidation."""
+    def _have_filters_changed(self) -> bool:
+        """Check if filters have changed since last check (updates tracking state)."""
         current_state = self._get_filter_state()
         if self.last_filter_state != current_state:
             self.last_filter_state = current_state
             return True
         return False
-    
-    def _invalidate_cache(self):
-        """Invalidate the analysis data cache."""
-        self.cached_analysis_data = []
-        self.cache_valid = False
 
 
     def render(self):
@@ -849,7 +898,6 @@ class JobMonitoringTab:
                             ui.notify(f"{result['failed']} tasks failed to restore", type='negative')
                         
                         # Refresh the UI
-                        self._invalidate_cache()
                         await self._async_load_analysis_table()
                         self._refresh_queued_tasks_table()
                         self._update_queue_status_display()
@@ -1064,125 +1112,133 @@ class JobMonitoringTab:
         self._create_queued_tasks_table()
 
     def _get_analysis_data(self, preserve_page: bool = False) -> tuple[List[dict], int]:
-        """Get analysis jobs data for the table with pagination and filtering.
-        
-        Caches the entire filtered dataset to avoid recomputing on pagination changes.
-        Only recomputes when filters actually change or cache is empty.
-        
+        """Get analysis jobs data for the table with database-level pagination.
+
+        Uses LIMIT/OFFSET for efficient database-level pagination instead of
+        loading all records into memory. Only fetches the current page's data.
+
         Args:
-            preserve_page: If True, don't reset to page 1 even if cache is invalidated.
+            preserve_page: If True, don't reset to page 1 even if filters changed.
                           Used during auto-refresh to maintain current page.
         """
         try:
-            # Check if cache needs invalidation due to filter changes OR cache is empty
-            filters_changed = self._should_invalidate_cache()
-            if filters_changed or not self.cache_valid:
-                logger.debug(f"Cache invalidated - {'filters changed' if filters_changed else 'cache empty'}. Recomputing...")
-                # Only reset to first page when filters actually change, not during auto-refresh
-                if filters_changed and not preserve_page:
-                    self.current_page = 1
-                
-                # Fetch and format ALL matching records (no pagination in query)
-                with get_db() as session:
-                    from sqlalchemy.orm import selectinload
-                    from sqlalchemy import and_
-                    
-                    # Use eager loading to avoid N+1 queries
-                    statement = select(MarketAnalysis).options(
-                        selectinload(MarketAnalysis.expert_recommendations)
+            from sqlalchemy.orm import selectinload
+            from sqlalchemy import and_
+
+            # Check if filters changed - reset to page 1 if so (unless preserving)
+            filters_changed = self._have_filters_changed()
+            if filters_changed and not preserve_page:
+                self.current_page = 1
+
+            with get_db() as session:
+                # Build base filters list
+                filters = []
+
+                # Apply global account filter from header dropdown
+                selected_account_id = get_selected_account_id()
+                account_expert_ids = get_expert_ids_for_account(selected_account_id)
+                if account_expert_ids is not None:
+                    if account_expert_ids:
+                        filters.append(MarketAnalysis.expert_instance_id.in_(account_expert_ids))
+                    else:
+                        # No experts for selected account - return empty
+                        self.total_records = 0
+                        self.total_pages = 1
+                        return [], 0
+
+                if self.status_filter != 'all':
+                    filters.append(MarketAnalysis.status == MarketAnalysisStatus(self.status_filter))
+
+                if self.expert_filter != 'all':
+                    filters.append(MarketAnalysis.expert_instance_id == int(self.expert_filter))
+
+                if self.type_filter != 'all':
+                    from ...core.types import AnalysisUseCase
+                    if self.type_filter == 'enter_market':
+                        filters.append(MarketAnalysis.subtype == AnalysisUseCase.ENTER_MARKET)
+                    elif self.type_filter == 'open_positions':
+                        filters.append(MarketAnalysis.subtype == AnalysisUseCase.OPEN_POSITIONS)
+
+                if self.symbol_filter:
+                    filters.append(MarketAnalysis.symbol.ilike(f"%{self.symbol_filter}%"))
+
+                # Handle recommendation filter (requires join)
+                needs_recommendation_join = self.recommendation_filter != 'all'
+
+                # === COUNT QUERY (efficient - no data transfer) ===
+                if needs_recommendation_join:
+                    from ...core.types import OrderRecommendation
+                    count_stmt = (
+                        select(func.count(distinct(MarketAnalysis.id)))
+                        .join(ExpertRecommendation, MarketAnalysis.id == ExpertRecommendation.market_analysis_id)
+                        .where(ExpertRecommendation.recommended_action == OrderRecommendation[self.recommendation_filter])
                     )
-                    
-                    # Apply all filters
-                    filters = []
-                    
-                    # Apply global account filter from header dropdown
-                    selected_account_id = get_selected_account_id()
-                    account_expert_ids = get_expert_ids_for_account(selected_account_id)
-                    if account_expert_ids is not None:
-                        if account_expert_ids:
-                            filters.append(MarketAnalysis.expert_instance_id.in_(account_expert_ids))
-                        else:
-                            # No experts for selected account - return empty
-                            self.cached_analysis_data = []
-                            self.cache_valid = True
-                            return [], 0
-                    
-                    if self.status_filter != 'all':
-                        filters.append(MarketAnalysis.status == MarketAnalysisStatus(self.status_filter))
-                    
-                    if self.expert_filter != 'all':
-                        filters.append(MarketAnalysis.expert_instance_id == int(self.expert_filter))
-                    
-                    if self.type_filter != 'all':
-                        from ...core.types import AnalysisUseCase
-                        if self.type_filter == 'enter_market':
-                            filters.append(MarketAnalysis.subtype == AnalysisUseCase.ENTER_MARKET)
-                        elif self.type_filter == 'open_positions':
-                            filters.append(MarketAnalysis.subtype == AnalysisUseCase.OPEN_POSITIONS)
-                    
-                    if self.symbol_filter:
-                        filters.append(MarketAnalysis.symbol.ilike(f"%{self.symbol_filter}%"))
-                    
-                    if self.recommendation_filter != 'all':
-                        from ...core.types import OrderRecommendation
-                        statement = statement.join(
-                            ExpertRecommendation,
-                            MarketAnalysis.id == ExpertRecommendation.market_analysis_id
-                        )
-                        filters.append(
-                            ExpertRecommendation.recommended_action == OrderRecommendation[self.recommendation_filter]
-                        )
-                    
-                    # Apply all filters at once
-                    if filters:
-                        statement = statement.where(and_(*filters))
-                    
-                    # Order by newest first
-                    statement = statement.order_by(MarketAnalysis.created_at.desc())
-                    
-                    # Fetch ALL matching records at once
-                    market_analyses = list(session.scalars(statement))
-                    
-                    # Pre-fetch expert instances for all records
-                    expert_ids = set(m.expert_instance_id for m in market_analyses)
-                    expert_instances = {}
-                    if expert_ids:
-                        stmt = select(ExpertInstance).where(ExpertInstance.id.in_(expert_ids))
-                        for expert in session.scalars(stmt):
-                            expert_instances[expert.id] = expert
-                    
-                    # Pre-fetch account names for all expert instances
-                    account_ids = set(e.account_id for e in expert_instances.values() if e.account_id)
-                    account_names = {}
-                    if account_ids:
-                        from ...core.models import AccountDefinition
-                        stmt = select(AccountDefinition).where(AccountDefinition.id.in_(account_ids))
-                        for acc in session.scalars(stmt):
-                            account_names[acc.id] = acc.name
-                    
-                    # Process all records and cache them
-                    self.cached_analysis_data = self._format_analysis_records_simple(market_analyses, expert_instances, account_names)
-                    self.cache_valid = True
-            
-            # Use cached data and apply pagination
-            self.total_records = len(self.cached_analysis_data)
-            self.total_pages = max(1, math.ceil(self.total_records / self.page_size))
-            
-            # Ensure current page is valid
-            if self.current_page > self.total_pages:
-                self.current_page = max(1, self.total_pages)
-            
-            # Apply pagination to cached data
-            start_idx = (self.current_page - 1) * self.page_size
-            end_idx = start_idx + self.page_size
-            paginated_data = self.cached_analysis_data[start_idx:end_idx]
-            
-            # OPTIMIZATION: Only check evaluation data for current page items (10-25 items)
-            # This is much faster than checking ALL records
+                else:
+                    count_stmt = select(func.count()).select_from(MarketAnalysis)
+
+                if filters:
+                    count_stmt = count_stmt.where(and_(*filters))
+
+                self.total_records = session.execute(count_stmt).scalar() or 0
+                self.total_pages = max(1, math.ceil(self.total_records / self.page_size))
+
+                # Ensure current page is valid
+                if self.current_page > self.total_pages:
+                    self.current_page = max(1, self.total_pages)
+
+                # === DATA QUERY (with LIMIT/OFFSET for pagination) ===
+                statement = select(MarketAnalysis).options(
+                    selectinload(MarketAnalysis.expert_recommendations)
+                )
+
+                if needs_recommendation_join:
+                    from ...core.types import OrderRecommendation
+                    statement = statement.join(
+                        ExpertRecommendation,
+                        MarketAnalysis.id == ExpertRecommendation.market_analysis_id
+                    ).where(
+                        ExpertRecommendation.recommended_action == OrderRecommendation[self.recommendation_filter]
+                    )
+
+                if filters:
+                    statement = statement.where(and_(*filters))
+
+                # Order and paginate at database level
+                offset = (self.current_page - 1) * self.page_size
+                statement = (
+                    statement
+                    .order_by(MarketAnalysis.created_at.desc())
+                    .limit(self.page_size)
+                    .offset(offset)
+                )
+
+                market_analyses = list(session.scalars(statement))
+
+                # Pre-fetch expert instances for current page only (much smaller set)
+                expert_ids = set(m.expert_instance_id for m in market_analyses)
+                expert_instances = {}
+                if expert_ids:
+                    stmt = select(ExpertInstance).where(ExpertInstance.id.in_(expert_ids))
+                    for expert in session.scalars(stmt):
+                        expert_instances[expert.id] = expert
+
+                # Pre-fetch account names for current page's expert instances
+                account_ids = set(e.account_id for e in expert_instances.values() if e.account_id)
+                account_names = {}
+                if account_ids:
+                    from ...core.models import AccountDefinition
+                    stmt = select(AccountDefinition).where(AccountDefinition.id.in_(account_ids))
+                    for acc in session.scalars(stmt):
+                        account_names[acc.id] = acc.name
+
+                # Format only current page records
+                paginated_data = self._format_analysis_records_simple(market_analyses, expert_instances, account_names)
+
+            # Populate evaluation data flags for current page
             self._populate_evaluation_data_flags(paginated_data)
-            
+
             return paginated_data, self.total_records
-                
+
         except Exception as e:
             logger.error(f"Error getting analysis data: {e}", exc_info=True)
             return [], 0
@@ -1463,25 +1519,8 @@ class JobMonitoringTab:
             pass
     
     def _get_expert_options(self) -> dict:
-        """Get available expert instances for filtering."""
-        try:
-            with get_db() as session:
-                # Get all expert instances
-                expert_instances = session.exec(select(ExpertInstance)).all()
-                
-                # Build options dictionary
-                options = {'all': 'All Experts'}
-                for expert in expert_instances:
-                    # Use alias if available, otherwise expert type
-                    # Format: alias-ID or expertType-ID
-                    base_name = expert.alias or expert.expert
-                    display_name = f"{base_name}-{expert.id}"
-                    options[str(expert.id)] = display_name
-                
-                return options
-        except Exception as e:
-            logger.error(f"Error getting expert options: {e}", exc_info=True)
-            return {'all': 'All Experts'}
+        """Get available expert instances for filtering (uses module-level cache)."""
+        return get_cached_expert_options(enabled_only=False)
     
     def _on_status_filter_change(self, event):
         """Handle status filter change."""
@@ -1898,46 +1937,34 @@ class JobMonitoringTab:
     
     async def _async_refresh_analysis_table(self, force_fresh: bool = False):
         """Asynchronously refresh analysis table data without blocking UI.
-        
+
         Args:
-            force_fresh: If True, always fetch fresh data from database (ignore cache).
-                        Used by auto-refresh timer to show current job status.
+            force_fresh: If True, preserve current page during refresh.
+                        Used by auto-refresh timer to maintain pagination state.
         """
         try:
-            # For auto-refresh (force_fresh=True), always invalidate cache to get current job status
-            # but preserve the current page
-            if force_fresh:
-                logger.debug("[JobMonitoringTab] Auto-refresh: invalidating cache to get fresh job status")
-                self._invalidate_cache()
-            
-            # Check if filters changed - if not and cache valid, just re-paginate the cached data
-            if not self._should_invalidate_cache() and self.cached_analysis_data and not force_fresh:
-                # Filters didn't change, just use cached data
-                logger.debug("[JobMonitoringTab] Using cached analysis data (no filter changes)")
-                analysis_data, total_records = self._get_analysis_data(preserve_page=True)
-            else:
-                # Filters changed or cache empty or force_fresh - fetch fresh data in background
-                # preserve_page=True for auto-refresh to maintain current pagination
-                logger.debug("[JobMonitoringTab] Fetching fresh analysis data")
-                analysis_data, total_records = await asyncio.to_thread(
-                    lambda: self._get_analysis_data(preserve_page=force_fresh)
-                )
-            
+            # Fetch fresh data in background thread (non-blocking)
+            # preserve_page=True for auto-refresh to maintain current pagination
+            logger.debug("[JobMonitoringTab] Fetching fresh analysis data with filters applied")
+            analysis_data, total_records = await asyncio.to_thread(
+                lambda: self._get_analysis_data(preserve_page=force_fresh)
+            )
+
             self.total_records = total_records
             self.total_pages = max(1, math.ceil(self.total_records / self.page_size))
-            
+
             # Ensure current page is valid
             if self.current_page > self.total_pages:
                 self.current_page = max(1, self.total_pages)
-            
+
             # Update table if it exists
             if self.analysis_table:
                 self.analysis_table.rows = analysis_data
-            
+
             # Re-create pagination controls to update button states
             self._create_pagination_controls()
-            
-            logger.debug(f"[JobMonitoringTab] Analysis table refreshed with {len(analysis_data)} records")
+
+            logger.debug(f"[JobMonitoringTab] Analysis table refreshed with {len(analysis_data)} records (filters: status={self.status_filter}, expert={self.expert_filter}, type={self.type_filter})")
         except RuntimeError as e:
             # Handle client disconnection gracefully - stop auto-refresh timer
             if "client" in str(e).lower() and "deleted" in str(e).lower():
@@ -1960,7 +1987,7 @@ class JobMonitoringTab:
         if self.refresh_timer:
             self.refresh_timer.cancel()
         
-        self.refresh_timer = ui.timer(30.0, self.refresh_data)  # Refresh every 30 seconds
+        self.refresh_timer = ui.timer(60.0, self.refresh_data)  # Refresh every 60 seconds
 
     def stop_auto_refresh(self):
         """Stop auto-refresh timer."""
@@ -3380,7 +3407,7 @@ class ScheduledJobsTab:
         if self.refresh_timer:
             self.refresh_timer.cancel()
         
-        self.refresh_timer = ui.timer(30.0, self.refresh_data)  # Refresh every 30 seconds
+        self.refresh_timer = ui.timer(60.0, self.refresh_data)  # Refresh every 60 seconds
 
     def stop_auto_refresh(self):
         """Stop auto-refresh timer."""
@@ -3465,8 +3492,8 @@ class OrderRecommendationsTab:
             # Initial load
             self.refresh_data()
             
-            # Auto-refresh every 30 seconds
-            self.refresh_timer = ui.timer(30.0, self.refresh_data)
+            # Auto-refresh every 60 seconds
+            self.refresh_timer = ui.timer(60.0, self.refresh_data)
 
     def _on_expert_filter_change(self, event):
         """Handle expert filter change."""
@@ -4200,28 +4227,8 @@ class OrderRecommendationsTab:
             ui.notify(f'Error placing order: {str(e)}', type='negative')
 
     def _get_expert_options(self):
-        """Get list of enabled expert instances for dropdown."""
-        try:
-            from ...core.models import ExpertInstance
-            from ...core.db import get_all_instances
-            
-            experts = get_all_instances(ExpertInstance)
-            enabled_experts = [e for e in experts if e.enabled]
-
-            # Build mapping for select: key -> label
-            options = {'all': 'All Experts'}
-
-            # Create options: key is expert id string, value is display name
-            for expert in enabled_experts:
-                base_name = expert.alias or expert.expert
-                display_name = f"{base_name} (ID: {expert.id})"
-                options[str(expert.id)] = display_name
-
-            return options
-            
-        except Exception as e:
-            logger.error(f"Error getting expert options: {e}", exc_info=True)
-            return ['all']
+        """Get list of enabled expert instances for dropdown (uses module-level cache)."""
+        return get_cached_expert_options(enabled_only=True)
 
     def _handle_process_recommendations(self):
         """Process all recommendations for the selected expert."""

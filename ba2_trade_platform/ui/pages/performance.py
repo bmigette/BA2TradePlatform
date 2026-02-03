@@ -81,29 +81,38 @@ class PerformanceTab:
         """Calculate comprehensive metrics from transactions."""
         if not transactions:
             return {}
-        
+
         # Group by expert instance ID
         expert_transactions = defaultdict(list)
         for txn in transactions:
             expert_transactions[txn.expert_id].append(txn)
-        
+
+        # Pre-fetch all expert instances in a single query (fixes N+1 query issue)
+        expert_ids = set(expert_transactions.keys())
+        experts_map = {}
+        if expert_ids:
+            session = get_db()
+            try:
+                from sqlmodel import select
+                stmt = select(ExpertInstance).where(ExpertInstance.id.in_(expert_ids))
+                for expert in session.scalars(stmt):
+                    experts_map[expert.id] = expert
+            finally:
+                session.close()
+
         # Calculate metrics per expert instance
         expert_metrics = {}
         for expert_id, txns in expert_transactions.items():
-            # Get expert instance display name (use alias if available, otherwise class-id format)
-            session = get_db()
-            try:
-                expert = session.get(ExpertInstance, expert_id)
-                if expert:
-                    # Use alias if available, otherwise "ClassName-ID"
-                    if expert.alias:
-                        expert_name = expert.alias
-                    else:
-                        expert_name = f"{expert.expert}-{expert.id}"
+            # Get expert instance display name from pre-fetched map
+            expert = experts_map.get(expert_id)
+            if expert:
+                # Use alias if available, otherwise "ClassName-ID"
+                if expert.alias:
+                    expert_name = expert.alias
                 else:
-                    expert_name = f"Expert-{expert_id}"
-            finally:
-                session.close()
+                    expert_name = f"{expert.expert}-{expert.id}"
+            else:
+                expert_name = f"Expert-{expert_id}"
             
             # Calculate transaction duration
             durations = []
@@ -158,29 +167,42 @@ class PerformanceTab:
     def _calculate_monthly_metrics(self, transactions: List[Transaction]) -> Dict[str, Dict[str, float]]:
         """Calculate monthly metrics per expert instance."""
         monthly_data = defaultdict(lambda: defaultdict(lambda: {'pnl': 0, 'count': 0}))
-        
+
+        if not transactions:
+            return monthly_data
+
+        # Pre-fetch all expert instances in a single query (fixes N+1 query issue)
+        expert_ids = set(txn.expert_id for txn in transactions if txn.expert_id)
+        experts_map = {}
+        if expert_ids:
+            session = get_db()
+            try:
+                from sqlmodel import select
+                stmt = select(ExpertInstance).where(ExpertInstance.id.in_(expert_ids))
+                for expert in session.scalars(stmt):
+                    experts_map[expert.id] = expert
+            finally:
+                session.close()
+
         for txn in transactions:
             if txn.close_date and txn.open_price and txn.close_price and txn.quantity:
                 month_key = txn.close_date.strftime('%Y-%m')
                 pnl = (txn.close_price - txn.open_price) * txn.quantity
-                
-                session = get_db()
-                try:
-                    expert = session.get(ExpertInstance, txn.expert_id)
-                    if expert:
-                        # Use alias if available, otherwise "ClassName-ID"
-                        if expert.alias:
-                            expert_name = expert.alias
-                        else:
-                            expert_name = f"{expert.expert}-{expert.id}"
+
+                # Get expert instance display name from pre-fetched map
+                expert = experts_map.get(txn.expert_id)
+                if expert:
+                    # Use alias if available, otherwise "ClassName-ID"
+                    if expert.alias:
+                        expert_name = expert.alias
                     else:
-                        expert_name = f"Expert-{txn.expert_id}"
-                finally:
-                    session.close()
-                
+                        expert_name = f"{expert.expert}-{expert.id}"
+                else:
+                    expert_name = f"Expert-{txn.expert_id}"
+
                 monthly_data[month_key][expert_name]['pnl'] += pnl
                 monthly_data[month_key][expert_name]['count'] += 1
-        
+
         return monthly_data
     
     def _render_summary_metrics(self, expert_metrics: Dict[str, Any]):
@@ -428,7 +450,7 @@ class PerformanceTab:
                             options=expert_options,
                             multiple=True,
                             label="Filter by expert instance (empty = all)"
-                        ).bind_value_to(self, 'selected_experts').on_value_change(
+                        ).style('min-width: 250px').bind_value_to(self, 'selected_experts').on_value_change(
                             lambda e: update_expert_filter(e.value)
                         )
                 finally:

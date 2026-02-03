@@ -173,13 +173,28 @@ def _render_pending_state(market_analysis: MarketAnalysis) -> None:
     """Render UI for pending analysis."""
     with ui.card().classes('w-full p-8 text-center'):
         ui.spinner(size='lg').classes('mb-4')
-        ui.label('Analysis is pending...').classes('text-h5')
-        ui.label('Please check back in a few minutes.').classes('text-grey-7')
-        
-        # Auto-refresh for pending analyses
-        async def reload_page():
-            await ui.navigate.reload()
-        ui.timer(10.0, reload_page)
+        status_label = ui.label('Analysis is pending...').classes('text-h5')
+        ui.label('The page will refresh when analysis completes.').classes('text-grey-7')
+
+        # Smart auto-refresh: only reload when status changes from PENDING
+        analysis_id = market_analysis.id
+
+        async def check_status_and_reload():
+            """Check if analysis status changed, only reload if no longer pending."""
+            try:
+                # Quick status check without loading full analysis
+                with get_db() as session:
+                    stmt = select(MarketAnalysis.status).where(MarketAnalysis.id == analysis_id)
+                    current_status = session.execute(stmt).scalar()
+
+                if current_status and current_status != MarketAnalysisStatus.PENDING:
+                    # Status changed - reload to show results
+                    await ui.navigate.reload()
+            except Exception as e:
+                logger.warning(f"Error checking analysis status: {e}")
+
+        # Check every 15 seconds (lighter than 10s full reload, smarter check)
+        ui.timer(15.0, check_status_and_reload)
 
 
 def _render_cancelled_state(market_analysis: MarketAnalysis) -> None:

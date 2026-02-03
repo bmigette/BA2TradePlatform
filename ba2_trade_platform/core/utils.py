@@ -4,6 +4,7 @@ Utility functions for the BA2 Trade Platform core functionality.
 
 from typing import Optional, List, TYPE_CHECKING, Dict, Any
 from datetime import datetime, timezone
+import time
 from .db import get_instance, get_db
 from .models import ExpertInstance, TradingOrder, ExpertRecommendation, MarketAnalysis, Transaction
 from .types import OrderStatus, TransactionStatus, ActivityLogSeverity, ActivityLogType, OrderDirection
@@ -869,31 +870,49 @@ def get_order_status_color(status: OrderStatus) -> str:
     return color_map.get(status, 'grey')
 
 
+# Cache for get_expert_options_for_ui (60-second TTL)
+_expert_options_ui_cache: Dict[str, Any] = {
+    'data': None,
+    'timestamp': 0,
+    'ttl': 60
+}
+
+
 def get_expert_options_for_ui() -> tuple[list[str], dict[str, int]]:
     """
     Get list of expert options and ID mapping for UI dropdowns.
-    
+
+    Uses caching to avoid redundant database queries (60-second TTL).
+
     Used in transaction filtering and other UI components that need to display
     expert selection dropdowns.
-    
+
     Returns:
         Tuple of (expert_options_list, expert_id_map)
         - expert_options_list: List of display names like ['All', 'TradingAgents-1', 'SmartRisk-2']
         - expert_id_map: Dict mapping display names to expert instance IDs
-        
+
     Example:
         >>> options, id_map = get_expert_options_for_ui()
         >>> # options = ['All', 'TradingAgents-1', 'SmartRisk-2']
         >>> # id_map = {'All': 'All', 'TradingAgents-1': 1, 'SmartRisk-2': 2}
     """
+    global _expert_options_ui_cache
+    current_time = time.time()
+
+    # Check if cache is valid
+    if (_expert_options_ui_cache['data'] is not None and
+        current_time - _expert_options_ui_cache['timestamp'] < _expert_options_ui_cache['ttl']):
+        return _expert_options_ui_cache['data']
+
     from .models import ExpertInstance
-    
+
     session = get_db()
     try:
         # Get ALL expert instances
         expert_statement = select(ExpertInstance)
         experts = list(session.exec(expert_statement).all())
-        
+
         # Build expert options list with shortnames
         expert_options = ['All']
         expert_map = {'All': 'All'}
@@ -902,10 +921,15 @@ def get_expert_options_for_ui() -> tuple[list[str], dict[str, int]]:
             shortname = expert.alias or expert.user_description or f"{expert.expert}-{expert.id}"
             expert_options.append(shortname)
             expert_map[shortname] = expert.id
-        
+
         logger.debug(f"[GET_EXPERT_OPTIONS] Built {len(expert_options)} expert options")
+
+        # Update cache
+        _expert_options_ui_cache['data'] = (expert_options, expert_map)
+        _expert_options_ui_cache['timestamp'] = current_time
+
         return expert_options, expert_map
-        
+
     except Exception as e:
         logger.error(f"Error getting expert options: {e}", exc_info=True)
         return ['All'], {'All': 'All'}

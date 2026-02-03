@@ -10,7 +10,7 @@ import json
 from ...core.db import get_all_instances, get_db, get_instance, update_instance
 from ...core.models import AccountDefinition, MarketAnalysis, ExpertRecommendation, ExpertInstance, AppSetting, TradingOrder, Transaction
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, OrderStatus, OrderOpenType, OrderType
-from ...core.utils import get_expert_instance_from_id, get_market_analysis_id_from_order_id, get_account_instance_from_id
+from ...core.utils import get_expert_instance_from_id, get_market_analysis_id_from_order_id, get_account_instance_from_id, get_expert_options_for_ui
 from ...core.TransactionHelper import TransactionHelper
 from ...core.ModelBillingUsage import ModelBillingUsage
 from ...modules.accounts import providers
@@ -2895,32 +2895,8 @@ class TransactionsTab:
             self._render_transactions_table()
     
     def _get_expert_options(self):
-        """Get list of expert options and ID mapping."""
-        from ...core.models import ExpertInstance
-        
-        session = get_db()
-        try:
-            # Get ALL expert instances
-            expert_statement = select(ExpertInstance)
-            experts = list(session.exec(expert_statement).all())
-            
-            # Build expert options list with shortnames
-            expert_options = ['All']
-            expert_map = {'All': 'All'}
-            for expert in experts:
-                # Create shortname: use alias, user_description, or fallback to "expert_name-id"
-                shortname = expert.alias or expert.user_description or f"{expert.expert}-{expert.id}"
-                expert_options.append(shortname)
-                expert_map[shortname] = expert.id
-            
-            logger.debug(f"[GET_EXPERT_OPTIONS] Built {len(expert_options)} expert options")
-            return expert_options, expert_map
-        
-        except Exception as e:
-            logger.error(f"Error getting expert options: {e}", exc_info=True)
-            return ['All'], {'All': 'All'}
-        finally:
-            session.close()
+        """Get list of expert options and ID mapping (uses cached version)."""
+        return get_expert_options_for_ui()
     
     def _populate_expert_filter(self):
         """Populate the expert filter dropdown with all available experts."""

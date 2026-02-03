@@ -66,36 +66,51 @@ def preview_cleanup(
         }
     """
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_to_keep)
-    
+
     with get_db() as session:
-        # Build base query for old analyses
-        query = select(MarketAnalysis).where(MarketAnalysis.created_at < cutoff_date)
-        
+        from sqlalchemy.orm import selectinload
+
+        # Build base query for old analyses with eager loading to avoid N+1 queries
+        query = (
+            select(MarketAnalysis)
+            .options(
+                selectinload(MarketAnalysis.analysis_outputs),
+                selectinload(MarketAnalysis.expert_recommendations)
+            )
+            .where(MarketAnalysis.created_at < cutoff_date)
+        )
+
         # Add status filter if provided
         if statuses:
             query = query.where(MarketAnalysis.status.in_(statuses))
-        
+
         # Add expert filter if provided
         if expert_instance_id:
             query = query.where(MarketAnalysis.expert_instance_id == expert_instance_id)
-        
+
         old_analyses = session.exec(query).all()
-        
+        logger.debug(f"[preview_cleanup] Found {len(old_analyses)} analyses to check")
+
+        # Batch query: get all analysis IDs that have open transactions (single query)
+        all_analysis_ids = [a.id for a in old_analyses]
+        protected_ids = _get_analysis_ids_with_open_transactions(session, all_analysis_ids)
+        logger.debug(f"[preview_cleanup] {len(protected_ids)} analyses have open transactions")
+
         # Categorize analyses
         deletable = []
         protected = []
         analyses_by_status = {}
         total_outputs = 0
         total_recommendations = 0
-        
+
         for analysis in old_analyses:
             # Count outputs and recommendations
             outputs_count = len(analysis.analysis_outputs)
             recommendations_count = len(analysis.expert_recommendations)
-            
-            # Check if analysis has open transactions linked via expert recommendations
-            has_open_transaction = _has_open_transaction(session, analysis.id)
-            
+
+            # Check if analysis has open transactions (from batch result)
+            has_open_transaction = analysis.id in protected_ids
+
             # Build preview item
             preview_item = {
                 'id': analysis.id,
@@ -106,18 +121,19 @@ def preview_cleanup(
                 'recommendations_count': recommendations_count,
                 'has_open_transaction': has_open_transaction
             }
-            
+
             # Track by status
             status_key = analysis.status.value
             analyses_by_status[status_key] = analyses_by_status.get(status_key, 0) + 1
-            
+
             if has_open_transaction:
                 protected.append(preview_item)
             else:
                 deletable.append(preview_item)
                 total_outputs += outputs_count
                 total_recommendations += recommendations_count
-        
+
+        logger.debug(f"[preview_cleanup] Categorization complete: {len(deletable)} deletable, {len(protected)} protected")
         return {
             'total_analyses': len(old_analyses),
             'deletable_analyses': len(deletable),
@@ -219,9 +235,14 @@ def execute_cleanup(
                 query = query.where(MarketAnalysis.expert_instance_id == expert_instance_id)
             
             old_analyses = session.exec(query).all()
-            
+
             logger.info(f"Cleanup: Found {len(old_analyses)} analyses older than {days_to_keep} days")
-            
+
+            # Batch query: get all analysis IDs that have open transactions (single query)
+            all_analysis_ids = [a.id for a in old_analyses]
+            protected_ids = _get_analysis_ids_with_open_transactions(session, all_analysis_ids)
+            logger.info(f"Cleanup: {len(protected_ids)} analyses have open transactions and will be protected")
+
             for analysis in old_analyses:
                 # Create a new session context for each analysis to avoid rollback cascade issues
                 try:
@@ -230,11 +251,10 @@ def execute_cleanup(
                         analysis_obj = analysis_session.get(MarketAnalysis, analysis.id)
                         if not analysis_obj:
                             continue
-                        
-                        # Check if analysis has open transactions - use no_autoflush to prevent premature flushes
-                        with analysis_session.no_autoflush:
-                            has_open = _has_open_transaction(analysis_session, analysis_obj.id)
-                        
+
+                        # Check if analysis has open transactions (from batch result)
+                        has_open = analysis.id in protected_ids
+
                         if has_open:
                             analyses_protected += 1
                             logger.debug(f"Cleanup: Protecting analysis {analysis_obj.id} (has open transaction)")
@@ -332,44 +352,62 @@ def execute_cleanup(
     }
 
 
+def _get_analysis_ids_with_open_transactions(session: Session, analysis_ids: List[int]) -> set:
+    """
+    Get set of MarketAnalysis IDs that have linked open transactions (batch query).
+
+    Uses a single efficient join query instead of N+1 queries per analysis.
+
+    Args:
+        session: Database session
+        analysis_ids: List of MarketAnalysis IDs to check
+
+    Returns:
+        Set of analysis IDs that have open transactions linked to them
+    """
+    if not analysis_ids:
+        return set()
+
+    try:
+        logger.debug(f"[_get_analysis_ids_with_open_transactions] Checking {len(analysis_ids)} analyses")
+        # Single efficient query: join through the chain and filter for OPENED transactions
+        # MarketAnalysis -> ExpertRecommendation -> TradingOrder -> Transaction (OPENED)
+        stmt = (
+            select(ExpertRecommendation.market_analysis_id)
+            .distinct()
+            .join(TradingOrder, TradingOrder.expert_recommendation_id == ExpertRecommendation.id)
+            .join(Transaction, Transaction.id == TradingOrder.transaction_id)
+            .where(
+                ExpertRecommendation.market_analysis_id.in_(analysis_ids),
+                Transaction.status == TransactionStatus.OPENED
+            )
+        )
+        result = session.exec(stmt).all()
+        logger.debug(f"[_get_analysis_ids_with_open_transactions] Found {len(result)} with open transactions")
+        return set(result)
+    except Exception as e:
+        logger.error(f"Error checking open transactions for analyses: {e}", exc_info=True)
+        # If we can't determine, return empty set (analyses won't be protected)
+        return set()
+
+
 def _has_open_transaction(session: Session, market_analysis_id: int) -> bool:
     """
     Check if a MarketAnalysis has any linked open transactions.
-    
-    A transaction is linked to an analysis via ExpertRecommendation -> TradingOrder -> Transaction.
-    
+
+    NOTE: For batch operations, use _get_analysis_ids_with_open_transactions() instead
+    to avoid N+1 query issues.
+
     Args:
         session: Database session
         market_analysis_id: ID of the MarketAnalysis to check
-    
+
     Returns:
         True if there are any open transactions linked to this analysis, False otherwise
     """
     try:
-        # Get all expert recommendations for this analysis
-        recommendations = session.exec(
-            select(ExpertRecommendation).where(
-                ExpertRecommendation.market_analysis_id == market_analysis_id
-            )
-        ).all()
-        
-        # Check each recommendation for linked open transactions
-        for recommendation in recommendations:
-            # Get trading orders for this recommendation
-            orders = session.exec(
-                select(TradingOrder).where(
-                    TradingOrder.expert_recommendation_id == recommendation.id
-                )
-            ).all()
-            
-            # Check if any of these orders have open transactions
-            for order in orders:
-                if order.transaction_id:
-                    transaction = session.get(Transaction, order.transaction_id)
-                    if transaction and transaction.status == TransactionStatus.OPENED:
-                        return True
-        
-        return False
+        result = _get_analysis_ids_with_open_transactions(session, [market_analysis_id])
+        return market_analysis_id in result
     except Exception as e:
         # If we can't determine transaction status, err on the side of caution and protect the analysis
         logger.warning(f"Could not check transaction status for analysis {market_analysis_id}: {e}")
@@ -484,7 +522,7 @@ def cleanup_activity_logs(days_to_keep: int = 60) -> Dict[str, Any]:
     try:
         with get_db() as session:
             # Find old activity logs
-            old_logs_query = select(ActivityLog).where(ActivityLog.timestamp < cutoff_date)
+            old_logs_query = select(ActivityLog).where(ActivityLog.created_at < cutoff_date)
             old_logs = session.exec(old_logs_query).all()
             
             deleted_count = len(old_logs)
@@ -548,8 +586,8 @@ def get_activity_log_statistics() -> Dict[str, Any]:
         
         for log in all_logs:
             # Ensure timestamp is timezone-aware for comparison
-            timestamp = _ensure_timezone_aware(log.timestamp)
-            
+            timestamp = _ensure_timezone_aware(log.created_at)
+
             if timestamp > age_buckets['7_days']:
                 logs_by_age['7_days'] += 1
             elif timestamp > age_buckets['30_days']:
@@ -562,17 +600,17 @@ def get_activity_log_statistics() -> Dict[str, Any]:
                 logs_by_age['180_days'] += 1
             else:
                 logs_by_age['older'] += 1
-        
+
         # Count by type
         logs_by_type = {}
         for log in all_logs:
-            log_type = log.activity_type
+            log_type = log.type.value if log.type else 'unknown'
             logs_by_type[log_type] = logs_by_type.get(log_type, 0) + 1
         
         # Count by severity
         logs_by_severity = {}
         for log in all_logs:
-            severity = log.severity
+            severity = log.severity.value if log.severity else 'unknown'
             logs_by_severity[severity] = logs_by_severity.get(severity, 0) + 1
         
         return {
