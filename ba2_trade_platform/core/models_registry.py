@@ -478,7 +478,36 @@ MODELS: Dict[str, Dict[str, Any]] = {
         },
         "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING],
     },
-    
+    "kimi_k2.5": {
+        "native_provider": PROVIDER_MOONSHOT,
+        "display_name": "Kimi K2.5",
+        "description": "Moonshot AI's Kimi K2.5 multimodal agentic model with 256K context (thinking enabled by default)",
+        "provider_names": {
+            PROVIDER_MOONSHOT: "kimi-k2.5",
+            PROVIDER_NAGAAI: "kimi-k2.5",
+            PROVIDER_OPENROUTER: "moonshotai/kimi-k2.5",
+        },
+        "labels": [LABEL_LOW_COST, LABEL_VISION, LABEL_CODING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING, LABEL_THINKING],
+        "fixed_temperature": 1.0,  # Kimi K2.5 thinking mode requires temperature=1
+        "fixed_top_p": 0.95,  # Kimi K2.5 only accepts top_p=0.95
+    },
+    "kimi_k2.5-nonthinking": {
+        "native_provider": PROVIDER_MOONSHOT,
+        "display_name": "Kimi K2.5 (Instant)",
+        "description": "Moonshot AI's Kimi K2.5 in instant mode - faster responses without reasoning traces",
+        "provider_names": {
+            # Uses same API model name - the thinking parameter controls the mode
+            PROVIDER_MOONSHOT: "kimi-k2.5",
+            PROVIDER_NAGAAI: "kimi-k2.5",
+            PROVIDER_OPENROUTER: "moonshotai/kimi-k2.5",
+        },
+        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_VISION, LABEL_CODING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "fixed_temperature": 0.6,  # Kimi K2.5 with thinking disabled requires temperature=0.6
+        "fixed_top_p": 0.95,  # Kimi K2.5 only accepts top_p=0.95
+        # Disable thinking mode for instant responses
+        "default_model_kwargs": {"thinking": {"type": "disabled"}},
+    },
+
     # =========================================================================
     # Google Gemini Family
     # =========================================================================
@@ -543,6 +572,18 @@ MODELS: Dict[str, Dict[str, Any]] = {
     # =========================================================================
     # Anthropic Claude Family
     # =========================================================================
+    "claude_opus_4_5": {
+        "native_provider": PROVIDER_ANTHROPIC,
+        "display_name": "Claude Opus 4.5",
+        "description": "Anthropic's most capable model with enhanced reasoning and creativity",
+        "provider_names": {
+            PROVIDER_ANTHROPIC: "claude-opus-4-5-20251101",
+            PROVIDER_NAGAAI: "claude-opus-4-5-20251101",
+            PROVIDER_OPENROUTER: "anthropic/claude-opus-4-5-20251101",
+            PROVIDER_BEDROCK: "anthropic.claude-opus-4-5-20251101-v1:0",
+        },
+        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_CODING, LABEL_TOOL_CALLING],
+    },
     "claude_4_opus": {
         "native_provider": PROVIDER_ANTHROPIC,
         "display_name": "Claude 4 Opus",

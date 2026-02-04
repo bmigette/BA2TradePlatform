@@ -30,9 +30,44 @@ class FinancialSituationMemory:
             # Use local sentence-transformers model (no API calls)
             try:
                 from sentence_transformers import SentenceTransformer
-                self.local_embedding_model = SentenceTransformer(model_name)
+                import torch
+
+                # Determine device
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+
+                def load_model(force_redownload=False):
+                    """Load the embedding model, optionally forcing redownload."""
+                    cache_folder = None
+                    if force_redownload:
+                        # Clear cached model to force fresh download
+                        import shutil
+                        from huggingface_hub import snapshot_download
+                        from huggingface_hub.constants import HF_HUB_CACHE
+                        model_cache_path = os.path.join(HF_HUB_CACHE, f"models--{model_name.replace('/', '--')}")
+                        if os.path.exists(model_cache_path):
+                            logger.warning(f"Clearing corrupted model cache: {model_cache_path}")
+                            shutil.rmtree(model_cache_path, ignore_errors=True)
+
+                    return SentenceTransformer(
+                        model_name,
+                        device=device,
+                        trust_remote_code=True,
+                        cache_folder=cache_folder
+                    )
+
+                try:
+                    # First attempt: normal load
+                    self.local_embedding_model = load_model()
+                except NotImplementedError as e:
+                    # Handle meta tensor error - usually means corrupted model files
+                    if "meta tensor" in str(e):
+                        logger.warning(f"Meta tensor error (likely corrupted cache), re-downloading model: {e}")
+                        self.local_embedding_model = load_model(force_redownload=True)
+                    else:
+                        raise
+
                 self.client = None  # No OpenAI client needed
-                logger.info(f"Initialized local embedding model: {model_name}")
+                logger.info(f"Initialized local embedding model: {model_name} on {device}")
             except ImportError:
                 logger.error("sentence-transformers not installed. Install with: pip install sentence-transformers")
                 raise ImportError("sentence-transformers package required for local embeddings. Install with: pip install sentence-transformers")

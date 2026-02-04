@@ -14,14 +14,14 @@ def create_trader(llm, memory):
         fundamentals_report = state["fundamentals_report"]
 
         curr_situation = f"{market_research_report}\n\n{sentiment_report}\n\n{news_report}\n\n{fundamentals_report}"
-        past_memories = memory.get_memories(curr_situation, n_matches=2, aggregate_chunks=False)
 
-        past_memory_str = ""
-        if past_memories:
-            for i, rec in enumerate(past_memories, 1):
-                past_memory_str += rec["recommendation"] + "\n\n"
-        else:
-            past_memory_str = "No past memories found."
+        past_memory_str = "No past memories found."
+        if memory is not None:
+            past_memories = memory.get_memories(curr_situation, n_matches=2, aggregate_chunks=False)
+            if past_memories:
+                past_memory_str = ""
+                for i, rec in enumerate(past_memories, 1):
+                    past_memory_str += rec["recommendation"] + "\n\n"
 
         context = {
             "role": "user",

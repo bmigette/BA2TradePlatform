@@ -21,11 +21,12 @@ def create_bear_researcher(llm, memory):
         macro_report = state.get("macro_report", "")
 
         curr_situation = f"{market_research_report}\n\n{sentiment_report}\n\n{news_report}\n\n{fundamentals_report}\n\n{macro_report}"
-        past_memories = memory.get_memories(curr_situation, n_matches=2, aggregate_chunks=False)
 
         past_memory_str = ""
-        for i, rec in enumerate(past_memories, 1):
-            past_memory_str += rec["recommendation"] + "\n\n"
+        if memory is not None:
+            past_memories = memory.get_memories(curr_situation, n_matches=2, aggregate_chunks=False)
+            for i, rec in enumerate(past_memories, 1):
+                past_memory_str += rec["recommendation"] + "\n\n"
 
         prompt = format_bear_researcher_prompt(
             market_research_report=market_research_report,

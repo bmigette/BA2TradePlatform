@@ -27,9 +27,8 @@ eodhd
 langgraph
 chromadb
 setuptools
-# Optional: sentence-transformers for local embeddings (no API calls)
-# Uncomment to enable Local/ embedding models in TradingAgents
-# sentence-transformers
+torch  # Required by sentence-transformers
+sentence-transformers
 backtrader
 akshare
 tushare
@@ -54,3 +53,4 @@ trafilatura  # Web content extraction for LLMs
 google-generativeai
 
 tzlocal 
+

@@ -18,9 +18,15 @@ Usage:
     info = ModelFactory.get_model_info("openai/gpt4o")
 """
 
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Type, Union
+import json
+import httpx
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.messages import (
+    AIMessage, AIMessageChunk, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+)
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 
 from .models_registry import (
     MODELS, PROVIDER_CONFIG, 
@@ -31,6 +37,260 @@ from .models_registry import (
 )
 from ..config import get_app_setting, OPENAI_ENABLE_STREAMING, OPENAI_BACKEND_URL
 from ..logger import logger
+
+
+class ChatMoonshotThinking(BaseChatModel):
+    """
+    Custom LangChain chat model for Moonshot (Kimi) with thinking mode support.
+
+    This class uses httpx directly instead of the OpenAI SDK because:
+    1. LangChain's ChatOpenAI explicitly filters out 'reasoning_content' from messages
+    2. Kimi API requires reasoning_content in message history for multi-turn tool calls
+    3. See: https://github.com/anomalyco/opencode/issues/10996
+
+    When thinking mode is enabled and tool calls are made, the API returns reasoning_content
+    which must be preserved in subsequent requests, otherwise you get:
+    "thinking is enabled but reasoning_content is missing in assistant tool call message"
+    """
+
+    model: str = "kimi-k2.5"
+    api_key: str = ""
+    base_url: str = "https://api.moonshot.ai/v1"
+    temperature: float = 1.0
+    top_p: float = 0.95
+    max_tokens: int = 4096
+    thinking_enabled: bool = True
+
+    # Store reasoning_content for messages to preserve during tool call flows
+    _reasoning_cache: Dict[str, str] = {}
+
+    @property
+    def _llm_type(self) -> str:
+        return "moonshot-thinking"
+
+    @property
+    def _identifying_params(self) -> Dict[str, Any]:
+        return {
+            "model": self.model,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "thinking_enabled": self.thinking_enabled,
+        }
+
+    def _convert_message_to_dict(self, message: BaseMessage) -> Dict[str, Any]:
+        """Convert a LangChain message to Kimi API format, preserving reasoning_content."""
+        if isinstance(message, SystemMessage):
+            return {"role": "system", "content": message.content}
+        elif isinstance(message, HumanMessage):
+            return {"role": "user", "content": message.content}
+        elif isinstance(message, AIMessage):
+            msg_dict = {"role": "assistant", "content": message.content or ""}
+
+            # Include tool_calls if present
+            if message.tool_calls:
+                msg_dict["tool_calls"] = [
+                    {
+                        "id": tc.get("id", f"call_{i}"),
+                        "type": "function",
+                        "function": {
+                            "name": tc.get("name", ""),
+                            "arguments": json.dumps(tc.get("args", {}))
+                        }
+                    }
+                    for i, tc in enumerate(message.tool_calls)
+                ]
+
+            # Restore reasoning_content from cache if available (critical for thinking mode)
+            # Use message.id if available, otherwise use a hash of content+tool_calls
+            msg_key = message.id if message.id else str(hash(str(message.content) + str(message.tool_calls)))
+            if msg_key in self._reasoning_cache:
+                msg_dict["reasoning_content"] = self._reasoning_cache[msg_key]
+            # Also check additional_kwargs for reasoning_content
+            elif message.additional_kwargs.get("reasoning_content"):
+                msg_dict["reasoning_content"] = message.additional_kwargs["reasoning_content"]
+
+            return msg_dict
+        elif isinstance(message, ToolMessage):
+            return {
+                "role": "tool",
+                "tool_call_id": message.tool_call_id,
+                "content": message.content if isinstance(message.content, str) else json.dumps(message.content),
+            }
+        else:
+            # Fallback for other message types
+            return {"role": "user", "content": str(message.content)}
+
+    def _generate(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        """Generate a response using httpx to preserve reasoning_content."""
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        api_url = f"{self.base_url}/chat/completions"
+
+        # Convert messages to API format
+        api_messages = [self._convert_message_to_dict(m) for m in messages]
+
+        # Build request body
+        request_body = {
+            "model": self.model,
+            "messages": api_messages,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "max_tokens": self.max_tokens,
+        }
+
+        # Add thinking mode control
+        if self.thinking_enabled:
+            request_body["thinking"] = {"type": "enabled"}
+        else:
+            request_body["thinking"] = {"type": "disabled"}
+
+        # Add tools if provided in kwargs
+        if "tools" in kwargs:
+            # Convert LangChain tool format to OpenAI format
+            request_body["tools"] = kwargs["tools"]
+
+        if stop:
+            request_body["stop"] = stop
+
+        logger.debug(f"ChatMoonshotThinking request: model={self.model}, thinking={self.thinking_enabled}, messages={len(api_messages)}")
+
+        try:
+            with httpx.Client(timeout=120.0) as client:
+                response = client.post(api_url, headers=headers, json=request_body)
+                response.raise_for_status()
+                response_data = response.json()
+
+            choice = response_data["choices"][0]
+            message_data = choice.get("message", {})
+
+            # Extract response content
+            content = message_data.get("content", "")
+            reasoning_content = message_data.get("reasoning_content")
+
+            # Build tool_calls if present
+            tool_calls = []
+            if message_data.get("tool_calls"):
+                for tc in message_data["tool_calls"]:
+                    tool_calls.append({
+                        "id": tc.get("id", ""),
+                        "name": tc.get("function", {}).get("name", ""),
+                        "args": json.loads(tc.get("function", {}).get("arguments", "{}"))
+                    })
+
+            # Create AIMessage with additional_kwargs to store reasoning_content
+            additional_kwargs = {}
+            if reasoning_content:
+                additional_kwargs["reasoning_content"] = reasoning_content
+            if message_data.get("tool_calls"):
+                additional_kwargs["tool_calls"] = message_data["tool_calls"]
+
+            ai_message = AIMessage(
+                content=content,
+                tool_calls=tool_calls,
+                additional_kwargs=additional_kwargs
+            )
+
+            # Cache reasoning_content for this message so it can be restored later
+            if reasoning_content:
+                msg_key = ai_message.id if ai_message.id else str(hash(str(content) + str(tool_calls)))
+                self._reasoning_cache[msg_key] = reasoning_content
+                logger.debug(f"Cached reasoning_content (len={len(reasoning_content)}) for message")
+
+            # Extract usage info
+            usage = response_data.get("usage", {})
+
+            generation = ChatGeneration(
+                message=ai_message,
+                generation_info={
+                    "finish_reason": choice.get("finish_reason"),
+                    "reasoning_content": reasoning_content,
+                }
+            )
+
+            return ChatResult(
+                generations=[generation],
+                llm_output={
+                    "token_usage": usage,
+                    "model_name": self.model,
+                }
+            )
+
+        except httpx.HTTPStatusError as e:
+            error_detail = e.response.text if e.response else str(e)
+            logger.error(f"Moonshot API error: {e.response.status_code} - {error_detail}")
+            raise ValueError(f"Moonshot API error: {e.response.status_code} - {error_detail}")
+        except Exception as e:
+            logger.error(f"Error calling Moonshot API: {e}", exc_info=True)
+            raise
+
+    def bind_tools(
+        self,
+        tools: Sequence[Any],
+        **kwargs: Any,
+    ) -> "ChatMoonshotThinking":
+        """Bind tools to this chat model for function calling."""
+        from langchain_core.tools import BaseTool
+        from langchain_core.utils.function_calling import convert_to_openai_tool
+
+        # Convert tools to OpenAI format
+        formatted_tools = []
+        for tool in tools:
+            if isinstance(tool, BaseTool):
+                formatted_tools.append(convert_to_openai_tool(tool))
+            elif isinstance(tool, dict):
+                formatted_tools.append(tool)
+            else:
+                # Try to convert other formats
+                formatted_tools.append(convert_to_openai_tool(tool))
+
+        # Create a new instance with tools bound
+        # We use a wrapper that passes tools to _generate
+        return _ChatMoonshotThinkingWithTools(
+            model=self.model,
+            api_key=self.api_key,
+            base_url=self.base_url,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            max_tokens=self.max_tokens,
+            thinking_enabled=self.thinking_enabled,
+            _bound_tools=formatted_tools,
+            _reasoning_cache=self._reasoning_cache,
+        )
+
+
+class _ChatMoonshotThinkingWithTools(ChatMoonshotThinking):
+    """Internal class that wraps ChatMoonshotThinking with bound tools."""
+
+    _bound_tools: List[Dict[str, Any]] = []
+
+    def _generate(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        """Generate with tools included in the request."""
+        # Merge bound tools with any additional tools
+        tools = list(self._bound_tools)
+        if "tools" in kwargs:
+            tools.extend(kwargs["tools"])
+
+        return super()._generate(
+            messages=messages,
+            stop=stop,
+            run_manager=run_manager,
+            tools=tools if tools else None,
+            **kwargs
+        )
 
 
 class ModelFactory:
@@ -189,7 +449,14 @@ class ModelFactory:
         
         # Check if model supports temperature (O-series models don't)
         supports_temp = not model_info.get("no_temperature", False)
-        effective_temperature = temperature if supports_temp else None
+        # Some models require a fixed temperature (e.g., Kimi K2.5 requires 1.0)
+        fixed_temp = model_info.get("fixed_temperature")
+        if fixed_temp is not None:
+            effective_temperature = fixed_temp
+        elif supports_temp:
+            effective_temperature = temperature
+        else:
+            effective_temperature = None
         
         # Merge default model_kwargs with user-provided ones (user takes precedence)
         default_kwargs = get_model_default_kwargs(friendly_name) or {}
@@ -229,7 +496,7 @@ class ModelFactory:
                 model_name=provider_model_name,
                 base_url=provider_config.get("base_url"),
                 api_key=api_key,
-                temperature=temperature,
+                temperature=effective_temperature,
                 streaming=streaming,
                 callbacks=callbacks,
                 model_kwargs=merged_model_kwargs if merged_model_kwargs else None,
@@ -239,7 +506,7 @@ class ModelFactory:
             return cls._create_xai(
                 model_name=provider_model_name,
                 api_key=api_key,
-                temperature=temperature,
+                temperature=effective_temperature,
                 streaming=streaming,
                 callbacks=callbacks,
                 model_kwargs=merged_model_kwargs if merged_model_kwargs else None,
@@ -249,7 +516,7 @@ class ModelFactory:
             return cls._create_deepseek(
                 model_name=provider_model_name,
                 api_key=api_key,
-                temperature=temperature,
+                temperature=effective_temperature,
                 streaming=streaming,
                 callbacks=callbacks,
                 model_kwargs=merged_model_kwargs if merged_model_kwargs else None,
@@ -259,7 +526,7 @@ class ModelFactory:
             return cls._create_moonshot(
                 model_name=provider_model_name,
                 api_key=api_key,
-                temperature=temperature,
+                temperature=effective_temperature,
                 streaming=streaming,
                 callbacks=callbacks,
                 model_kwargs=merged_model_kwargs if merged_model_kwargs else None,
@@ -268,7 +535,7 @@ class ModelFactory:
         elif langchain_class == "ChatBedrockConverse":
             return cls._create_bedrock(
                 model_name=provider_model_name,
-                temperature=temperature,
+                temperature=effective_temperature,
                 streaming=streaming,
                 callbacks=callbacks,
                 model_kwargs=merged_model_kwargs if merged_model_kwargs else None,
@@ -315,22 +582,32 @@ class ModelFactory:
         if callbacks:
             llm_params["callbacks"] = callbacks
         
-        # Process model_kwargs
+        # Process model_kwargs - use extra_body for non-standard params
+        # This ensures provider-specific params like "thinking" are passed correctly
         if model_kwargs:
-            remaining_kwargs = {}
+            extra_body_params = {}
             for key, value in model_kwargs.items():
                 if key in direct_params:
                     llm_params[key] = value
                 else:
-                    remaining_kwargs[key] = value
-            
-            if remaining_kwargs:
-                llm_params["model_kwargs"] = remaining_kwargs
-        
+                    # Non-standard params go into extra_body for the OpenAI SDK
+                    extra_body_params[key] = value
+
+            if extra_body_params:
+                llm_params["extra_body"] = extra_body_params
+                # WORKAROUND: langchain-openai has a bug where extra_body is not passed
+                # in streaming mode. Force streaming off when using extra_body.
+                if streaming:
+                    logger.warning(
+                        f"Disabling streaming for {model_name} because extra_body is used. "
+                        "langchain-openai has a known bug where extra_body is not passed in streaming mode."
+                    )
+                    llm_params["streaming"] = False
+
         # Add any extra kwargs
         llm_params.update(extra_kwargs)
-        
-        logger.info(f"Creating ChatOpenAI: model={model_name}, provider={provider}, base_url={base_url}")
+
+        logger.info(f"Creating ChatOpenAI: model={model_name}, provider={provider}, base_url={base_url}, extra_body={llm_params.get('extra_body')}")
         return ChatOpenAI(**llm_params)
     
     @classmethod
@@ -521,41 +798,82 @@ class ModelFactory:
         **extra_kwargs
     ) -> BaseChatModel:
         """Create a Moonshot (Kimi) LLM.
-        
-        Note: We use ChatOpenAI instead of MoonshotChat because MoonshotChat
-        has a bug where it doesn't respect the base_url parameter for
-        international endpoints (api.moonshot.ai vs api.moonshot.cn).
-        Since Moonshot uses OpenAI-compatible API, ChatOpenAI works fine.
+
+        For thinking mode (kimi-k2.5 default), uses ChatMoonshotThinking which
+        preserves reasoning_content for multi-turn tool calls.
+
+        For non-thinking mode (kimi-k2.5-nonthinking), uses ChatOpenAI.
+
+        The custom ChatMoonshotThinking class is needed because:
+        - LangChain's ChatOpenAI explicitly filters out 'reasoning_content'
+        - Kimi API requires reasoning_content in message history for tool calls
+        - See: https://github.com/anomalyco/opencode/issues/10996
         """
-        from langchain_openai import ChatOpenAI
-        
-        # Get base_url from provider config (international vs CN endpoint)
         from .models_registry import PROVIDER_CONFIG, PROVIDER_MOONSHOT
         base_url = PROVIDER_CONFIG[PROVIDER_MOONSHOT].get("base_url")
-        
-        llm_params = {
-            "model": model_name,
-            "api_key": api_key,
-            "streaming": streaming,
-            "base_url": base_url,
-            "max_retries": 3,  # Retry on transient network errors
-            "stream_usage": True,  # Enable usage tracking even in streaming mode
-        }
-        
-        # Moonshot supports temperature
-        if temperature != 0.7:  # Only set if non-default
-            llm_params["temperature"] = temperature
-        
-        if callbacks:
-            llm_params["callbacks"] = callbacks
-        
-        if model_kwargs:
-            llm_params.update(model_kwargs)
-        
-        llm_params.update(extra_kwargs)
-        
-        logger.info(f"Creating Moonshot via ChatOpenAI: model={model_name}, base_url={base_url}")
-        return ChatOpenAI(**llm_params)
+
+        # Check if thinking mode is enabled or disabled
+        thinking_config = (model_kwargs or {}).get("thinking", {})
+        thinking_type = thinking_config.get("type", "enabled") if isinstance(thinking_config, dict) else "enabled"
+        thinking_enabled = thinking_type != "disabled"
+
+        # Extract other model kwargs
+        top_p = (model_kwargs or {}).get("top_p", 0.95) if model_kwargs else 0.95
+        max_tokens = (model_kwargs or {}).get("max_tokens", 4096) if model_kwargs else 4096
+
+        if thinking_enabled:
+            # Use custom ChatMoonshotThinking for thinking mode to preserve reasoning_content
+            logger.info(f"Creating ChatMoonshotThinking: model={model_name}, thinking=enabled")
+            return ChatMoonshotThinking(
+                model=model_name,
+                api_key=api_key,
+                base_url=base_url,
+                temperature=temperature if temperature is not None else 1.0,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                thinking_enabled=True,
+            )
+        else:
+            # Use standard ChatOpenAI for non-thinking mode (faster, simpler)
+            from langchain_openai import ChatOpenAI
+
+            llm_params = {
+                "model": model_name,
+                "api_key": api_key,
+                "streaming": streaming,
+                "base_url": base_url,
+                "max_retries": 3,
+                "stream_usage": True,
+            }
+
+            if temperature is not None:
+                llm_params["temperature"] = temperature
+
+            if callbacks:
+                llm_params["callbacks"] = callbacks
+
+            # For non-thinking mode, pass thinking disabled via extra_body
+            extra_body_params = {"thinking": {"type": "disabled"}}
+            if model_kwargs:
+                direct_params = ['max_tokens', 'top_p', 'frequency_penalty', 'presence_penalty']
+                for key, value in model_kwargs.items():
+                    if key in direct_params:
+                        llm_params[key] = value
+                    elif key != "thinking":  # Skip thinking, already handled
+                        extra_body_params[key] = value
+
+            llm_params["extra_body"] = extra_body_params
+            # Disable streaming when using extra_body (langchain-openai bug)
+            if streaming:
+                logger.warning(
+                    f"Disabling streaming for {model_name} because extra_body is used."
+                )
+                llm_params["streaming"] = False
+
+            llm_params.update(extra_kwargs)
+
+            logger.info(f"Creating Moonshot via ChatOpenAI: model={model_name}, thinking=disabled")
+            return ChatOpenAI(**llm_params)
     
     @classmethod
     def _create_bedrock(
@@ -816,7 +1134,7 @@ class ModelFactory:
                 if native_provider:
                     provider = native_provider
                     logger.debug(f"Resolved 'native' provider to '{provider}' for model '{friendly_name}'")
-            
+
             # Get provider-specific model name from registry
             actual_model = get_model_for_provider(friendly_name, provider)
             if actual_model:
@@ -825,13 +1143,26 @@ class ModelFactory:
             else:
                 model_name = friendly_name
                 logger.warning(f"Model '{friendly_name}' not found in registry for provider '{provider}', using as-is")
+
+            # Check for fixed_temperature (e.g., kimi-k2.5 requires temperature=1)
+            fixed_temp = model_info.get("fixed_temperature")
+            if fixed_temp is not None:
+                temperature = fixed_temp
+                logger.debug(f"Using fixed_temperature={temperature} for model '{friendly_name}'")
+
+            # Check for fixed_top_p (e.g., kimi-k2.5 requires top_p=0.95)
+            fixed_top_p = model_info.get("fixed_top_p")
         else:
             model_name = friendly_name
+            fixed_top_p = None
             logger.debug(f"Model '{friendly_name}' not in registry, using as actual model name")
-        
+
         # Get provider config
         provider_config = get_provider_config(provider)
-        
+
+        # Use fixed_top_p if set, otherwise default to 1.0
+        top_p = fixed_top_p if fixed_top_p is not None else 1.0
+
         # Determine API type and configuration based on provider
         if provider == PROVIDER_OPENAI:
             # OpenAI uses Responses API with web_search_preview tool
@@ -844,7 +1175,7 @@ class ModelFactory:
             base_url = provider_config.get('base_url', 'https://api.naga.ac/v1') if provider_config else 'https://api.naga.ac/v1'
             api_key_setting = provider_config.get('api_key_setting', 'naga_ai_api_key') if provider_config else 'naga_ai_api_key'
             api_key = get_app_setting(api_key_setting) or "dummy-key"
-            return cls._call_nagaai_websearch(model_name, prompt, base_url, api_key, max_tokens, temperature)
+            return cls._call_nagaai_websearch(model_name, prompt, base_url, api_key, max_tokens, temperature, top_p)
         
         elif provider == PROVIDER_XAI:
             # xAI (Grok) - use native Live Search API with search_parameters
@@ -865,7 +1196,9 @@ class ModelFactory:
             base_url = moonshot_config.get('base_url', 'https://api.moonshot.cn/v1') if moonshot_config else 'https://api.moonshot.cn/v1'
             api_key_setting = moonshot_config.get('api_key_setting', 'moonshot_api_key') if moonshot_config else 'moonshot_api_key'
             api_key = get_app_setting(api_key_setting) or "dummy-key"
-            return cls._call_kimi_websearch(model_name, prompt, base_url, api_key, max_tokens, temperature)
+            # Get default_model_kwargs for the model (e.g., thinking: {type: "disabled"})
+            extra_body = model_info.get("default_model_kwargs") if model_info else None
+            return cls._call_kimi_websearch(model_name, prompt, base_url, api_key, max_tokens, temperature, top_p, extra_body)
         
         else:
             # Model does not support web search - raise error instead of fallback
@@ -950,12 +1283,12 @@ class ModelFactory:
 
 
     @classmethod
-    def _call_nagaai_websearch(cls, model: str, prompt: str, base_url: str, api_key: str, max_tokens: int, temperature: float) -> str:
+    def _call_nagaai_websearch(cls, model: str, prompt: str, base_url: str, api_key: str, max_tokens: int, temperature: float, top_p: float = 1.0) -> str:
         """Call NagaAI Chat Completions API with web_search_options."""
         from openai import OpenAI
-        
+
         client = OpenAI(base_url=base_url, api_key=api_key)
-        
+
         try:
             response = client.chat.completions.create(
                 model=model,
@@ -968,7 +1301,7 @@ class ModelFactory:
                 web_search_options={},  # Enable web search with default options
                 temperature=temperature,
                 max_tokens=max_tokens,
-                top_p=1.0
+                top_p=top_p
             )
             
             # Extract text from chat completion response
@@ -1050,24 +1383,52 @@ class ModelFactory:
             raise
 
     @classmethod
-    def _call_kimi_websearch(cls, model: str, prompt: str, base_url: str, api_key: str, max_tokens: int, temperature: float) -> str:
+    def _call_kimi_websearch(cls, model: str, prompt: str, base_url: str, api_key: str, max_tokens: int, temperature: float, top_p: float = 1.0, extra_body: dict = None) -> str:
         """
         Call Kimi (Moonshot AI) API with $web_search builtin tool.
-        
+
         Kimi uses a unique tool_calls pattern where the $web_search builtin function
         is declared with type="builtin_function" and executed by the Kimi backend.
         See: https://platform.moonshot.cn/docs/guide/use-web-search
+
+        Args:
+            extra_body: Optional extra body parameters (e.g., {"thinking": {"type": "disabled"}})
+
+        Note: We use httpx directly instead of the OpenAI SDK because the SDK strips
+        out Kimi-specific fields like 'reasoning_content' which are required for
+        thinking mode tool calls.
+
+        IMPORTANT: The $web_search builtin tool has a known API limitation where
+        reasoning_content is NOT returned in tool_call responses even when thinking
+        is enabled, but the API expects it in follow-up messages. Therefore, we
+        force thinking mode DISABLED for websearch calls.
+        Regular tool calls (via ChatMoonshotThinking) work fine with thinking mode.
         """
-        from openai import OpenAI
-        import json
-        
-        client = OpenAI(base_url=base_url, api_key=api_key)
-        
+        import httpx
+
+        # Use httpx directly to preserve Kimi-specific fields like reasoning_content
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        api_url = f"{base_url}/chat/completions"
+
+        # IMPORTANT: Force thinking mode DISABLED for $web_search builtin tool
+        # The $web_search builtin has an API limitation where reasoning_content
+        # is NOT returned in tool_call responses even when thinking is enabled,
+        # but the API expects it in follow-up messages, causing error:
+        # "thinking is enabled but reasoning_content is missing in assistant tool call message"
+        # This is different from regular tool calls which work fine with thinking.
+        # See: https://github.com/anomalyco/opencode/issues/10996
+        extra_body = {"thinking": {"type": "disabled"}}
+        temperature = 0.6  # Instant mode temperature
+        logger.debug("Using instant mode for Kimi $web_search (API limitation with builtin tool)")
+
         try:
             messages = [
                 {"role": "user", "content": prompt}
             ]
-            
+
             # Define the $web_search builtin tool
             tools = [
                 {
@@ -1077,66 +1438,89 @@ class ModelFactory:
                     },
                 }
             ]
-            
+
             finish_reason = None
             max_iterations = 5  # Prevent infinite loops
             iteration = 0
-            
-            while finish_reason != "stop" and iteration < max_iterations:
-                iteration += 1
-                
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    tools=tools,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                
-                choice = response.choices[0]
-                finish_reason = choice.finish_reason
-                
-                if finish_reason == "tool_calls":
-                    # Model wants to use web search - add assistant message
-                    messages.append(choice.message)
-                    
-                    # Process each tool call
-                    for tool_call in choice.message.tool_calls:
-                        tool_call_name = tool_call.function.name
-                        tool_call_arguments = json.loads(tool_call.function.arguments) if tool_call.function.arguments else {}
-                        
-                        if tool_call_name == "$web_search":
-                            # For $web_search, just return the arguments back
-                            # The Kimi backend will execute the actual search
-                            tool_result = tool_call_arguments
-                        else:
-                            tool_result = {"error": f"Unknown tool: {tool_call_name}"}
-                        
-                        # Add tool result to messages
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "name": tool_call_name,
-                            "content": json.dumps(tool_result),
-                        })
-                
-                elif finish_reason == "stop":
-                    # Model finished generating response
-                    if hasattr(choice.message, 'content') and choice.message.content:
-                        return choice.message.content
-                    return ""
-                
-                else:
-                    # Unexpected finish reason
-                    logger.warning(f"Unexpected finish_reason from Kimi: {finish_reason}")
-                    if hasattr(choice.message, 'content') and choice.message.content:
-                        return choice.message.content
-                    return ""
-            
-            # Max iterations reached
-            logger.warning(f"Kimi websearch reached max iterations ({max_iterations})")
-            return ""
-            
+
+            with httpx.Client(timeout=120.0) as client:
+                while finish_reason != "stop" and iteration < max_iterations:
+                    iteration += 1
+
+                    # Build request body
+                    request_body = {
+                        "model": model,
+                        "messages": messages,
+                        "tools": tools,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                        "top_p": top_p,
+                    }
+                    # Add extra_body params directly (e.g., thinking mode control)
+                    if extra_body:
+                        request_body.update(extra_body)
+
+                    response = client.post(api_url, headers=headers, json=request_body)
+                    response.raise_for_status()
+                    response_data = response.json()
+
+                    choice = response_data["choices"][0]
+                    finish_reason = choice.get("finish_reason")
+                    message = choice.get("message", {})
+
+                    if finish_reason == "tool_calls":
+                        # Model wants to use web search - add assistant message
+                        assistant_msg = {
+                            "role": "assistant",
+                            "content": message.get("content") or "",
+                            "tool_calls": message.get("tool_calls", [])
+                        }
+
+                        # Include reasoning_content if present (for thinking mode)
+                        if "reasoning_content" in message and message["reasoning_content"]:
+                            assistant_msg["reasoning_content"] = message["reasoning_content"]
+
+                        messages.append(assistant_msg)
+
+                        # Process each tool call from the raw response dict
+                        for tool_call in message.get("tool_calls", []):
+                            tool_call_name = tool_call.get("function", {}).get("name", "")
+                            tool_call_args = tool_call.get("function", {}).get("arguments", "")
+                            tool_call_arguments = json.loads(tool_call_args) if tool_call_args else {}
+
+                            if tool_call_name == "$web_search":
+                                # For $web_search, just return the arguments back
+                                # The Kimi backend will execute the actual search
+                                tool_result = tool_call_arguments
+                            else:
+                                tool_result = {"error": f"Unknown tool: {tool_call_name}"}
+
+                            # Add tool result to messages
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.get("id", ""),
+                                "name": tool_call_name,
+                                "content": json.dumps(tool_result),
+                            })
+
+                    elif finish_reason == "stop":
+                        # Model finished generating response
+                        content = message.get("content")
+                        return content if content else ""
+
+                    else:
+                        # Unexpected finish reason
+                        logger.warning(f"Unexpected finish_reason from Kimi: {finish_reason}")
+                        content = message.get("content")
+                        return content if content else ""
+
+                # Max iterations reached
+                logger.warning(f"Kimi websearch reached max iterations ({max_iterations})")
+                return ""
+
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error calling Kimi API: {e.response.status_code} - {e.response.text}", exc_info=True)
+            raise
         except Exception as e:
             logger.error(f"Error calling Kimi API with web search: {e}", exc_info=True)
             raise

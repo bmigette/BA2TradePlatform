@@ -354,10 +354,10 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         
         @tool
         def get_ohlcv_data(
-            symbol: str = None,
-            start_date: str = None,
-            end_date: str = None,
-            interval: str = None
+            symbol: Optional[str] = None,
+            start_date: Optional[str] = None,
+            end_date: Optional[str] = None,
+            interval: Optional[str] = None
         ) -> str:
             """Get OHLCV (Open, High, Low, Close, Volume) stock price data for the company being analyzed.
             
@@ -378,10 +378,10 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         @tool
         def get_indicator_data(
             indicator: str,
-            symbol: str = None,
-            start_date: str = None,
-            end_date: str = None,
-            interval: str = None
+            symbol: Optional[str] = None,
+            start_date: Optional[str] = None,
+            end_date: Optional[str] = None,
+            interval: Optional[str] = None
         ) -> str:
             """Calculate and retrieve technical indicator values (like RSI, MACD, Bollinger Bands) for a stock.
             
@@ -421,8 +421,8 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         @tool
         def get_company_news(
             end_date: str,
-            symbol: str = None,
-            lookback_days: int = None
+            symbol: Optional[str] = None,
+            lookback_days: Optional[int] = None
         ) -> str:
             """Get news articles about the company being analyzed.
             
@@ -442,7 +442,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         @tool
         def get_global_news(
             end_date: str,
-            lookback_days: int = None
+            lookback_days: Optional[int] = None
         ) -> str:
             """Get global market and macroeconomic news."""
             return self.toolkit.get_global_news(end_date, lookback_days)
@@ -459,8 +459,8 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         @tool
         def get_social_media_sentiment(
             end_date: str,
-            symbol: str = None,
-            lookback_days: int = None
+            symbol: Optional[str] = None,
+            lookback_days: Optional[int] = None
         ) -> str:
             """Retrieve social media sentiment and discussions about the company being analyzed.
             
@@ -481,7 +481,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         def get_balance_sheet(
             frequency: str,
             end_date: str,
-            symbol: str = None,
+            symbol: Optional[str] = None,
             lookback_periods: int = 4
         ) -> str:
             """Get company balance sheet data for the company being analyzed."""
@@ -494,7 +494,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         def get_income_statement(
             frequency: str,
             end_date: str,
-            symbol: str = None,
+            symbol: Optional[str] = None,
             lookback_periods: int = 4
         ) -> str:
             """Get company income statement data for the company being analyzed."""
@@ -507,7 +507,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         def get_cashflow_statement(
             frequency: str,
             end_date: str,
-            symbol: str = None,
+            symbol: Optional[str] = None,
             lookback_periods: int = 4
         ) -> str:
             """Get company cash flow statement data for the company being analyzed."""
@@ -519,8 +519,8 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         @tool
         def get_insider_transactions(
             end_date: str,
-            symbol: str = None,
-            lookback_days: int = None
+            symbol: Optional[str] = None,
+            lookback_days: Optional[int] = None
         ) -> str:
             """Get insider trading transactions for the company being analyzed."""
             actual_symbol = symbol or self.ticker
@@ -531,8 +531,8 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         @tool
         def get_insider_sentiment(
             end_date: str,
-            symbol: str = None,
-            lookback_days: int = None
+            symbol: Optional[str] = None,
+            lookback_days: Optional[int] = None
         ) -> str:
             """Get aggregated insider sentiment metrics for the company being analyzed."""
             actual_symbol = symbol or self.ticker
@@ -543,7 +543,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         @tool
         def get_earnings_estimates(
             as_of_date: str,
-            symbol: str = None,
+            symbol: Optional[str] = None,
             lookback_periods: int = 4,
             frequency: str = "quarterly"
         ) -> str:
@@ -556,8 +556,8 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         @tool
         def get_economic_indicators(
             end_date: str,
-            lookback_days: int = None,
-            indicators: list[str] = None
+            lookback_days: Optional[int] = None,
+            indicators: Optional[List[str]] = None
         ) -> str:
             """Get economic indicators (GDP, unemployment, inflation, etc.)."""
             return self.toolkit.get_economic_indicators(end_date, lookback_days, indicators)
@@ -565,7 +565,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         @tool
         def get_yield_curve(
             end_date: str,
-            lookback_days: int = None
+            lookback_days: Optional[int] = None
         ) -> str:
             """Get Treasury yield curve data."""
             return self.toolkit.get_yield_curve(end_date, lookback_days)
@@ -573,7 +573,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         @tool
         def get_fed_calendar(
             end_date: str,
-            lookback_days: int = None
+            lookback_days: Optional[int] = None
         ) -> str:
             """Get Federal Reserve calendar and meetings."""
             return self.toolkit.get_fed_calendar(end_date, lookback_days)
@@ -627,16 +627,41 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         }
 
     def _initialize_memories_and_graph(self, symbol: str):
-        """Initialize memory collections and create the graph with properly initialized memories"""
+        """Initialize memory collections and create the graph with properly initialized memories.
+
+        Memory initialization is optional - if it fails, analysis continues without memory support.
+        """
         from ..agents.utils.memory import FinancialSituationMemory
-        
-        self.bull_memory = FinancialSituationMemory("bull_memory", self.config, symbol, self.market_analysis_id, self.expert_instance_id)
-        self.bear_memory = FinancialSituationMemory("bear_memory", self.config, symbol, self.market_analysis_id, self.expert_instance_id)
-        self.trader_memory = FinancialSituationMemory("trader_memory", self.config, symbol, self.market_analysis_id, self.expert_instance_id)
-        self.invest_judge_memory = FinancialSituationMemory("invest_judge_memory", self.config, symbol, self.market_analysis_id, self.expert_instance_id)
-        self.risk_manager_memory = FinancialSituationMemory("risk_manager_memory", self.config, symbol, self.market_analysis_id, self.expert_instance_id)
-        
-        # Create GraphSetup with the newly initialized memories
+
+        # Try to initialize memory collections, but continue without them if it fails
+        use_memory = self.config.get("use_memory", True)
+        memory_initialized = False
+
+        if use_memory:
+            try:
+                self.bull_memory = FinancialSituationMemory("bull_memory", self.config, symbol, self.market_analysis_id, self.expert_instance_id)
+                self.bear_memory = FinancialSituationMemory("bear_memory", self.config, symbol, self.market_analysis_id, self.expert_instance_id)
+                self.trader_memory = FinancialSituationMemory("trader_memory", self.config, symbol, self.market_analysis_id, self.expert_instance_id)
+                self.invest_judge_memory = FinancialSituationMemory("invest_judge_memory", self.config, symbol, self.market_analysis_id, self.expert_instance_id)
+                self.risk_manager_memory = FinancialSituationMemory("risk_manager_memory", self.config, symbol, self.market_analysis_id, self.expert_instance_id)
+                memory_initialized = True
+                logger.debug(f"Memory collections initialized successfully for symbol: {symbol}")
+            except Exception as e:
+                logger.error(f"Failed to initialize memory for {symbol}: {e}. Analysis will continue without memory support.", exc_info=True)
+                self.bull_memory = None
+                self.bear_memory = None
+                self.trader_memory = None
+                self.invest_judge_memory = None
+                self.risk_manager_memory = None
+        else:
+            logger.debug(f"Memory disabled by config for symbol: {symbol}")
+            self.bull_memory = None
+            self.bear_memory = None
+            self.trader_memory = None
+            self.invest_judge_memory = None
+            self.risk_manager_memory = None
+
+        # Create GraphSetup with the memories (can be None if memory failed)
         self.graph_setup = GraphSetup(
             self.quick_thinking_llm,
             self.deep_thinking_llm,
@@ -650,11 +675,12 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             self.conditional_logic,
             self.config,
         )
-        
+
         # Now create the graph with properly initialized memories
         self.graph = self.graph_setup.setup_graph(self.selected_analysts)
-        
-        logger.debug(f"Initialized memory collections and graph for symbol: {symbol}, market_analysis_id: {self.market_analysis_id}")
+
+        status = "with memory" if memory_initialized else "without memory"
+        logger.debug(f"Initialized graph {status} for symbol: {symbol}, market_analysis_id: {self.market_analysis_id}")
 
     def propagate(self, company_name, trade_date):
         """Run the trading agents graph for a company on a specific date."""
