@@ -9,6 +9,7 @@ from nicegui import ui
 from ba2_trade_platform.core.db import get_db
 from ba2_trade_platform.core.models import Transaction, TradingOrder, ExpertInstance, AccountDefinition
 from ba2_trade_platform.core.types import TransactionStatus
+from ba2_trade_platform.core.utils import calculate_transaction_pnl
 from ba2_trade_platform.ui.components.performance_charts import (
     MetricCard, PerformanceBarChart, TimeSeriesChart, PieChartComponent,
     PerformanceTable, MultiMetricDashboard, ComboChart,
@@ -19,6 +20,7 @@ from typing import Dict, List, Any, Optional, Tuple
 import pandas as pd
 import numpy as np
 from collections import defaultdict
+from ba2_trade_platform.ui.utils.perf_logger import PerfLogger
 
 
 class PerformanceTab:
@@ -121,29 +123,28 @@ class PerformanceTab:
                     duration = (txn.close_date - txn.open_date).total_seconds() / 86400  # days
                     durations.append(duration)
             
-            # Calculate P&L
-            # P&L = (close_price - open_price) * quantity (for longs)
+            # Calculate P&L (handles both long and short positions)
             pnls = []
             for txn in txns:
-                if txn.open_price and txn.close_price and txn.quantity:
-                    pnl = (txn.close_price - txn.open_price) * txn.quantity
+                pnl = calculate_transaction_pnl(txn)
+                if pnl is not None:
                     pnls.append(pnl)
-            
+
             winning_pnls = [p for p in pnls if p > 0]
             losing_pnls = [p for p in pnls if p < 0]
-            
+
             # Win/loss ratio
             win_rate, wins, losses = calculate_win_loss_ratio(
                 [{'pnl': pnl} for pnl in pnls]
             )
-            
+
             # Calculate returns for Sharpe ratio
             returns = []
             for txn in txns:
-                if txn.open_price and txn.close_price and txn.quantity:
+                pnl = calculate_transaction_pnl(txn)
+                if pnl is not None:
                     position_value = txn.open_price * txn.quantity
                     if position_value != 0:
-                        pnl = (txn.close_price - txn.open_price) * txn.quantity
                         returns.append(pnl / position_value)
             
             expert_metrics[expert_name] = {
@@ -185,9 +186,9 @@ class PerformanceTab:
                 session.close()
 
         for txn in transactions:
-            if txn.close_date and txn.open_price and txn.close_price and txn.quantity:
+            pnl = calculate_transaction_pnl(txn)
+            if txn.close_date and pnl is not None:
                 month_key = txn.close_date.strftime('%Y-%m')
-                pnl = (txn.close_price - txn.open_price) * txn.quantity
 
                 # Get expert instance display name from pre-fetched map
                 expert = experts_map.get(txn.expert_id)
@@ -490,15 +491,17 @@ class PerformanceTab:
     
     def render(self):
         """Render the complete performance tab."""
+        render_timer = PerfLogger.start(PerfLogger.PAGE, PerfLogger.RENDER, "Performance")
         with ui.column().classes('w-full gap-4'):
             ui.label("Trade Performance Analytics").classes('text-2xl font-bold mb-2').style('color: #e2e8f0;')
-            
+
             # Filters
             self._render_filters()
-            
+
             # Content container for refresh
             self.content_container = ui.column().classes('w-full gap-4')
-            
+
             with self.content_container:
                 # Initial load
                 self._load_and_render_content()
+        render_timer.stop()

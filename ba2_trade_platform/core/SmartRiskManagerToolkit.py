@@ -218,7 +218,9 @@ class SmartRiskManagerToolkit:
                         current_price = trans.open_price  # Fallback
                     
                     # Get actual quantity from filled orders
-                    quantity = trans.get_current_open_qty()
+                    # abs() because get_current_open_qty() returns signed qty (negative for shorts)
+                    # and direction is already handled separately in the P&L if/else below
+                    quantity = abs(trans.get_current_open_qty())
                     logger.debug(f"  Transaction {trans.id} ({trans.symbol}): quantity={quantity}")
                     
                     # Infer direction from first order
@@ -1929,7 +1931,7 @@ class SmartRiskManagerToolkit:
                 
                 if existing_transaction:
                     # Check if it's the same direction
-                    existing_direction = OrderDirection.BUY if existing_transaction.quantity > 0 else OrderDirection.SELL
+                    existing_direction = existing_transaction.side
                     if existing_direction == order_direction:
                         return {
                             "success": False,
@@ -2424,23 +2426,24 @@ class SmartRiskManagerToolkit:
                 # Process opened transactions
                 for trans in opened_transactions:
                     symbol = trans.symbol
-                    quantity = trans.get_current_open_qty()
-                    
+                    # abs() because get_current_open_qty() returns signed qty (negative for shorts)
+                    quantity = abs(trans.get_current_open_qty())
+
                     if quantity == 0:
                         continue
-                    
+
                     # Determine direction from first order
                     direction = None
                     if trans.trading_orders:
                         first_order = sorted(trans.trading_orders, key=lambda o: o.created_at)[0]
                         direction = first_order.side
-                    
+
                     if not direction:
                         continue
-                    
+
                     if symbol not in summary:
                         summary[symbol] = {"buy_qty": 0.0, "sell_qty": 0.0}
-                    
+
                     if direction == OrderDirection.BUY:
                         summary[symbol]["buy_qty"] += quantity
                     else:  # SELL

@@ -10,6 +10,7 @@ from typing import Dict, List, Optional
 from ...core.db import get_db
 from ...core.models import Transaction, ExpertInstance
 from ...core.types import TransactionStatus
+from ...core.utils import calculate_transaction_pnl
 from ...logger import logger
 from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
 
@@ -68,10 +69,10 @@ class ProfitPerExpertChart:
                     # Create unique expert name using alias or expert type with ID
                     expert_name = f"{expert.alias or expert.expert}-{expert.id}"
                     
-                    # Calculate profit/loss
-                    # Profit = (close_price - open_price) * quantity
-                    # Note: For short positions, this would be negative if price went up
-                    profit = (transaction.close_price - transaction.open_price) * transaction.quantity
+                    # Calculate profit/loss (handles both long and short positions)
+                    profit = calculate_transaction_pnl(transaction)
+                    if profit is None:
+                        continue
                     
                     # Add to expert's total
                     if expert_name not in profits:

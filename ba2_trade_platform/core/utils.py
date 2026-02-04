@@ -285,6 +285,27 @@ def get_account_instance_from_id(account_id: int, session=None, use_cache: bool 
         return account_class(account_id)
 
 
+def calculate_transaction_pnl(transaction: Transaction) -> Optional[float]:
+    """
+    Calculate P&L for a transaction, correctly handling both long and short positions.
+
+    For LONG (BUY): P&L = (close_price - open_price) * quantity
+    For SHORT (SELL): P&L = (open_price - close_price) * quantity
+
+    Args:
+        transaction: Transaction with open_price, close_price, quantity, and side fields
+
+    Returns:
+        P&L as float, or None if required fields are missing
+    """
+    if not transaction.close_price or not transaction.open_price or not transaction.quantity:
+        return None
+    if transaction.side == OrderDirection.BUY:
+        return (transaction.close_price - transaction.open_price) * transaction.quantity
+    else:  # Short position
+        return (transaction.open_price - transaction.close_price) * transaction.quantity
+
+
 def close_transaction_with_logging(
     transaction: Transaction,
     account_id: int,
@@ -313,13 +334,7 @@ def close_transaction_with_logging(
             transaction.close_date = datetime.now(timezone.utc)
         
         # Calculate P&L if available
-        profit_loss = None
-        if transaction.close_price and transaction.open_price and transaction.quantity:
-            # Use side field: BUY=LONG, SELL=SHORT
-            if transaction.side == OrderDirection.BUY:  # Long position
-                profit_loss = (transaction.close_price - transaction.open_price) * transaction.quantity
-            else:  # Short position
-                profit_loss = (transaction.open_price - transaction.close_price) * transaction.quantity
+        profit_loss = calculate_transaction_pnl(transaction)
         
         # Build activity description
         description = f"Closed {transaction.symbol} transaction #{transaction.id}"
