@@ -274,23 +274,23 @@ class OverviewTab:
         """Check for quantity mismatches between broker positions and transactions asynchronously."""
         from ...core.models import Transaction
         from ...core.types import TransactionStatus
-        
+
         try:
             session = get_db()
             try:
                 mismatches = []
-                
+
                 # Get all accounts
                 accounts = get_all_instances(AccountDefinition)
-                
+
                 for acc in accounts:
                     try:
                         provider_obj = get_account_instance_from_id(acc.id)
                         if not provider_obj:
                             continue
-                        
-                        # Get positions from broker
-                        positions = provider_obj.get_positions()
+
+                        # Get positions from broker (run in thread to avoid blocking event loop)
+                        positions = await asyncio.to_thread(provider_obj.get_positions)
                         
                         # Create a map of symbol -> broker quantity
                         broker_positions = {}
@@ -608,7 +608,8 @@ class OverviewTab:
                 try:
                     provider_obj = get_account_instance_from_id(acc.id)
                     if provider_obj:
-                        positions = provider_obj.get_positions()
+                        # Run in thread to avoid blocking event loop
+                        positions = await asyncio.to_thread(provider_obj.get_positions)
                         for pos in positions:
                             pos_dict = pos if isinstance(pos, dict) else dict(pos)
                             pos_dict['account'] = acc.name
