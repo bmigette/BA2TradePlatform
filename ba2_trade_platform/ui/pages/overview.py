@@ -15,6 +15,7 @@ from ...core.TransactionHelper import TransactionHelper
 from ...core.ModelBillingUsage import ModelBillingUsage
 from ...modules.accounts import providers
 from ...logger import logger
+from ..utils.perf_logger import PerfLogger
 from ..components import ProfitPerExpertChart, InstrumentDistributionChart, BalanceUsagePerExpertChart
 from ..components.FloatingPLPerExpertWidget import FloatingPLPerExpertWidget
 from ..components.FloatingPLPerAccountWidget import FloatingPLPerAccountWidget
@@ -111,6 +112,28 @@ class OverviewTab:
         finally:
             session.close()
     
+    async def _check_and_display_error_orders_async(self):
+        """Check for orders with ERROR status and display alert banner asynchronously."""
+        timer = PerfLogger.start(PerfLogger.COMPONENT, PerfLogger.LOAD, "ErrorOrdersCheck")
+        try:
+            with self.error_orders_container:
+                self._check_and_display_error_orders()
+        except RuntimeError:
+            pass  # Client navigated away
+        finally:
+            timer.stop()
+
+    async def _check_and_display_pending_orders_async(self, tabs_ref=None):
+        """Check for pending orders and display notification banner asynchronously."""
+        timer = PerfLogger.start(PerfLogger.COMPONENT, PerfLogger.LOAD, "PendingOrdersCheck")
+        try:
+            with self.pending_orders_container:
+                self._check_and_display_pending_orders(tabs_ref)
+        except RuntimeError:
+            pass  # Client navigated away
+        finally:
+            timer.stop()
+
     def _check_and_display_pending_orders(self, tabs_ref=None):
         """Check for pending orders and display notification banner."""
         session = get_db()
@@ -497,29 +520,32 @@ class OverviewTab:
             ui.notify(f'Error updating quantities: {str(e)}', type='negative')
     
     def render(self):
-        """Render the overview tab."""
-        logger.debug("[RENDER] OverviewTab.render() - START")
-        
+        """Render the overview tab.
+
+        All widgets render their card shell with a loading spinner immediately,
+        then load data asynchronously. This makes the page appear instantly
+        while data populates progressively.
+        """
+        render_timer = PerfLogger.start(PerfLogger.PAGE, PerfLogger.RENDER, "OverviewTab")
+
         # Clear container and rebuild
         self.container.clear()
-        
+
         with self.container:
             # Add refresh button at the top
             with ui.row().classes('w-full justify-end mb-2'):
                 ui.button('🔄 Refresh', on_click=lambda: self.render()).props('flat color=primary')
-            
-            # Check for ERROR orders and display alert
-            self._check_and_display_error_orders()
-            
-            # Create container for quantity mismatch alerts
+
+            # Alert banners - async containers
+            self.error_orders_container = ui.column().classes('w-full')
+            asyncio.create_task(self._check_and_display_error_orders_async())
+
             self.mismatch_alerts_container = ui.column().classes('w-full')
-            
-            # Check for quantity mismatches asynchronously
             asyncio.create_task(self._check_and_display_quantity_mismatches_async())
-            
-            # Check for PENDING orders and display notification
-            self._check_and_display_pending_orders(self.tabs_ref)
-            
+
+            self.pending_orders_container = ui.column().classes('w-full')
+            asyncio.create_task(self._check_and_display_pending_orders_async(self.tabs_ref))
+
             with ui.grid(columns=4).classes('w-full gap-4'):
                 # Row 1: API Usage, Analysis Jobs, Order Statistics, and Trade Recommendations
                 self._render_api_usage_widget()
@@ -527,22 +553,24 @@ class OverviewTab:
                 self._render_order_statistics_widget()
                 with ui.column().classes(''):
                     self._render_order_recommendations_widget()
-            
+
             # Row 2: Profit Per Expert and Balance Usage Per Expert (double width each)
             with ui.grid(columns=2).classes('w-full gap-4'):
                 ProfitPerExpertChart()
                 BalanceUsagePerExpertChart()
-            
+
             with ui.grid(columns=4).classes('w-full gap-4'):
                 # Row 3: Floating P/L widgets
                 FloatingPLPerExpertWidget()
                 FloatingPLPerAccountWidget()
-                
+
                 # Row 4: Position Distribution by Label
                 self._render_position_distribution_widget(grouping_field='labels')
-                
-                # Row 4: Position Distribution by Category (can span or be paired with other widgets)
+
+                # Row 4: Position Distribution by Category
                 self._render_position_distribution_widget(grouping_field='categories')
+
+        render_timer.stop()
     
     def _render_position_distribution_widget(self, grouping_field='labels'):
         """Fetch positions from accounts and render distribution chart.
@@ -632,192 +660,228 @@ class OverviewTab:
             asyncio.create_task(self._load_api_usage_data(loading_label, content_container))
     
     def _render_analysis_jobs_widget(self):
-        """Widget showing analysis job statistics."""
+        """Widget showing analysis job statistics with async data loading."""
         with ui.card().classes('p-4'):
             ui.label('📊 Analysis Jobs').classes('text-h6 mb-4')
-            
-            # Get selected account filter
+            loading_label = ui.label('🔄 Loading...').classes('text-sm text-gray-500')
+            content_container = ui.column().classes('w-full')
+            asyncio.create_task(self._load_analysis_jobs_data(loading_label, content_container))
+
+    async def _load_analysis_jobs_data(self, loading_label, content_container):
+        """Load analysis job statistics asynchronously."""
+        timer = PerfLogger.start(PerfLogger.COMPONENT, PerfLogger.LOAD, "AnalysisJobsWidget")
+        try:
             selected_account_id = get_selected_account_id()
             expert_ids = get_expert_ids_for_account(selected_account_id)
-            
-            # Get actual data from database
-            session = get_db()
-            try:
-                # Build base query with optional account filter
+
+            with get_db() as session:
                 def build_count_query(status):
                     query = select(func.count(MarketAnalysis.id)).where(MarketAnalysis.status == status)
                     if expert_ids is not None:
                         if expert_ids:
                             query = query.where(MarketAnalysis.expert_instance_id.in_(expert_ids))
                         else:
-                            # No experts for this account - return 0
                             return None
                     return query
-                
-                # Count successful analyses
+
                 query = build_count_query(MarketAnalysisStatus.COMPLETED)
                 successful_count = session.exec(query).first() if query is not None else 0
                 successful_count = successful_count or 0
-                
-                # Count failed analyses
+
                 query = build_count_query(MarketAnalysisStatus.FAILED)
                 failed_count = session.exec(query).first() if query is not None else 0
                 failed_count = failed_count or 0
-                
-                # Count running analyses
+
                 query = build_count_query(MarketAnalysisStatus.RUNNING)
                 running_count = session.exec(query).first() if query is not None else 0
                 running_count = running_count or 0
-                
-            finally:
-                session.close()
-            
-            with ui.row().classes('w-full justify-between items-center mb-2'):
-                ui.label('✅ Successful:').classes('text-sm')
-                ui.label(str(successful_count)).classes('text-sm font-bold text-green-600')
-            
-            with ui.row().classes('w-full justify-between items-center mb-2'):
-                ui.label('❌ Failed:').classes('text-sm')
-                ui.label(str(failed_count)).classes('text-sm font-bold text-red-600')
-            
-            with ui.row().classes('w-full justify-between items-center mb-2'):
-                ui.label('⏳ Running:').classes('text-sm')
-                ui.label(str(running_count)).classes('text-sm font-bold text-orange-600')
+
+            try:
+                loading_label.delete()
+            except RuntimeError:
+                return
+
+            try:
+                with content_container:
+                    with ui.row().classes('w-full justify-between items-center mb-2'):
+                        ui.label('✅ Successful:').classes('text-sm')
+                        ui.label(str(successful_count)).classes('text-sm font-bold text-green-600')
+
+                    with ui.row().classes('w-full justify-between items-center mb-2'):
+                        ui.label('❌ Failed:').classes('text-sm')
+                        ui.label(str(failed_count)).classes('text-sm font-bold text-red-600')
+
+                    with ui.row().classes('w-full justify-between items-center mb-2'):
+                        ui.label('⏳ Running:').classes('text-sm')
+                        ui.label(str(running_count)).classes('text-sm font-bold text-orange-600')
+            except RuntimeError:
+                pass
+        except Exception as e:
+            logger.error(f"Error loading analysis jobs data: {e}", exc_info=True)
+        finally:
+            timer.stop()
     
     def _render_order_statistics_widget(self):
-        """Widget showing order statistics per account."""
+        """Widget showing order statistics per account with async data loading."""
         with ui.card().classes('p-4'):
             ui.label('📋 Orders by Account').classes('text-h6 mb-4')
-            
-            # Get selected account filter
+            loading_label = ui.label('🔄 Loading...').classes('text-sm text-gray-500')
+            content_container = ui.column().classes('w-full')
+            asyncio.create_task(self._load_order_statistics_data(loading_label, content_container))
+
+    async def _load_order_statistics_data(self, loading_label, content_container):
+        """Load order statistics data asynchronously."""
+        timer = PerfLogger.start(PerfLogger.COMPONENT, PerfLogger.LOAD, "OrderStatisticsWidget")
+        try:
             selected_account_id = get_selected_account_id()
-            
-            # Get accounts to display (filtered if account selected)
+
             all_accounts = get_all_instances(AccountDefinition)
             if selected_account_id is not None:
                 accounts = [acc for acc in all_accounts if acc.id == selected_account_id]
             else:
                 accounts = all_accounts
-            
-            if not accounts:
-                ui.label('No accounts configured').classes('text-sm text-gray-500')
-                return
-            
-            session = get_db()
+
             try:
+                loading_label.delete()
+            except RuntimeError:
+                return
+
+            if not accounts:
+                try:
+                    with content_container:
+                        ui.label('No accounts configured').classes('text-sm text-gray-500')
+                except RuntimeError:
+                    pass
+                return
+
+            # Fetch all counts in a single session
+            account_stats = []
+            with get_db() as session:
                 for account in accounts:
-                    # Count orders by status for this account
-                    # ONLY count MARKET orders (entry orders)
-                    # EXCLUDE TP/SL orders (OCO, SELL_LIMIT, BUY_LIMIT, SELL_STOP, BUY_STOP)
-                    # These are exit orders that don't use buying power
-                    
-                    # Open orders = FILLED, NEW, OPEN, ACCEPTED (MARKET entry orders only)
                     open_count = session.exec(
                         select(func.count(TradingOrder.id))
                         .where(TradingOrder.account_id == account.id)
                         .where(TradingOrder.status.in_([
-                            OrderStatus.FILLED, 
-                            OrderStatus.NEW, 
-                            OrderStatus.OPEN, 
+                            OrderStatus.FILLED,
+                            OrderStatus.NEW,
+                            OrderStatus.OPEN,
                             OrderStatus.ACCEPTED
                         ]))
                         .where(TradingOrder.order_type == OrderType.MARKET)
                     ).first() or 0
-                    
-                    # Pending orders = PENDING, WAITING_TRIGGER (MARKET entry orders only)
+
                     pending_count = session.exec(
                         select(func.count(TradingOrder.id))
                         .where(TradingOrder.account_id == account.id)
                         .where(TradingOrder.status.in_([OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER]))
                         .where(TradingOrder.order_type == OrderType.MARKET)
                     ).first() or 0
-                    
-                    # Error orders (MARKET entry orders only)
+
                     error_count = session.exec(
                         select(func.count(TradingOrder.id))
                         .where(TradingOrder.account_id == account.id)
                         .where(TradingOrder.status == OrderStatus.ERROR)
                         .where(TradingOrder.order_type == OrderType.MARKET)
                     ).first() or 0
-                    
-                    # Display account section
-                    with ui.column().classes('w-full mb-4'):
-                        ui.label(f'🏦 {account.name}').classes('text-sm font-bold mb-2')
-                        
-                        with ui.row().classes('w-full justify-between items-center mb-1'):
-                            ui.label('📂 Open:').classes('text-xs')
-                            ui.label(str(open_count)).classes('text-xs font-bold text-blue-600')
-                        
-                        with ui.row().classes('w-full justify-between items-center mb-1'):
-                            ui.label('⏳ Pending:').classes('text-xs')
-                            ui.label(str(pending_count)).classes('text-xs font-bold text-orange-600')
-                        
-                        with ui.row().classes('w-full justify-between items-center mb-1'):
-                            ui.label('❌ Error:').classes('text-xs')
-                            ui.label(str(error_count)).classes('text-xs font-bold text-red-600')
-                        
-                        # Add separator between accounts (except for last one)
-                        if account != accounts[-1]:
-                            ui.separator().classes('my-2')
-                            
-            finally:
-                session.close()
+
+                    account_stats.append((account.name, open_count, pending_count, error_count))
+
+            # Render the UI with fetched data
+            try:
+                with content_container:
+                    for i, (name, open_count, pending_count, error_count) in enumerate(account_stats):
+                        with ui.column().classes('w-full mb-4'):
+                            ui.label(f'🏦 {name}').classes('text-sm font-bold mb-2')
+
+                            with ui.row().classes('w-full justify-between items-center mb-1'):
+                                ui.label('📂 Open:').classes('text-xs')
+                                ui.label(str(open_count)).classes('text-xs font-bold text-blue-600')
+
+                            with ui.row().classes('w-full justify-between items-center mb-1'):
+                                ui.label('⏳ Pending:').classes('text-xs')
+                                ui.label(str(pending_count)).classes('text-xs font-bold text-orange-600')
+
+                            with ui.row().classes('w-full justify-between items-center mb-1'):
+                                ui.label('❌ Error:').classes('text-xs')
+                                ui.label(str(error_count)).classes('text-xs font-bold text-red-600')
+
+                            if i < len(account_stats) - 1:
+                                ui.separator().classes('my-2')
+            except RuntimeError:
+                pass
+
+        except Exception as e:
+            logger.error(f"Error loading order statistics data: {e}", exc_info=True)
+        finally:
+            timer.stop()
     
     def _render_order_recommendations_widget(self):
-        """Widget showing trade recommendation statistics."""
+        """Widget showing trade recommendation statistics with async data loading."""
         with ui.card().classes('p-4'):
             ui.label('📈 Trade Recommendations').classes('text-h6 mb-4')
-            
-            # Get account filter
+            loading_label = ui.label('🔄 Loading...').classes('text-sm text-gray-500')
+            content_container = ui.column().classes('w-full')
+            asyncio.create_task(self._load_order_recommendations_data(loading_label, content_container))
+
+    async def _load_order_recommendations_data(self, loading_label, content_container):
+        """Load trade recommendation statistics asynchronously."""
+        timer = PerfLogger.start(PerfLogger.COMPONENT, PerfLogger.LOAD, "OrderRecommendationsWidget")
+        try:
             selected_account_id = get_selected_account_id()
             expert_ids = get_expert_ids_for_account(selected_account_id)
-            
-            # Calculate date ranges
+
             now = datetime.now()
             week_ago = now - timedelta(days=7)
             month_ago = now - timedelta(days=30)
-            
-            session = get_db()
-            try:
-                # Get recommendations for last week and month, filtered by account
+
+            with get_db() as session:
                 week_recs = self._get_recommendation_counts(session, week_ago, expert_ids)
                 month_recs = self._get_recommendation_counts(session, month_ago, expert_ids)
-                
-            finally:
-                session.close()
-            
-            with ui.row().classes('w-full gap-8'):
-                # Last Week column
-                with ui.column().classes('flex-1'):
-                    ui.label('Last Week').classes('text-subtitle1 font-bold mb-2')
-                    
-                    with ui.row().classes('w-full justify-between items-center mb-1'):
-                        ui.label('🟢 BUY:').classes('text-sm')
-                        ui.label(str(week_recs['BUY'])).classes('text-sm font-bold text-green-600')
-                    
-                    with ui.row().classes('w-full justify-between items-center mb-1'):
-                        ui.label('🔴 SELL:').classes('text-sm')
-                        ui.label(str(week_recs['SELL'])).classes('text-sm font-bold text-red-600')
-                    
-                    with ui.row().classes('w-full justify-between items-center mb-1'):
-                        ui.label('🟡 HOLD:').classes('text-sm')
-                        ui.label(str(week_recs['HOLD'])).classes('text-sm font-bold text-orange-600')
-                
-                # Last Month column
-                with ui.column().classes('flex-1'):
-                    ui.label('Last Month').classes('text-subtitle1 font-bold mb-2')
-                    
-                    with ui.row().classes('w-full justify-between items-center mb-1'):
-                        ui.label('🟢 BUY:').classes('text-sm')
-                        ui.label(str(month_recs['BUY'])).classes('text-sm font-bold text-green-600')
-                    
-                    with ui.row().classes('w-full justify-between items-center mb-1'):
-                        ui.label('🔴 SELL:').classes('text-sm')
-                        ui.label(str(month_recs['SELL'])).classes('text-sm font-bold text-red-600')
-                    
-                    with ui.row().classes('w-full justify-between items-center mb-1'):
-                        ui.label('🟡 HOLD:').classes('text-sm')
-                        ui.label(str(month_recs['HOLD'])).classes('text-sm font-bold text-orange-600')
+
+            try:
+                loading_label.delete()
+            except RuntimeError:
+                return
+
+            try:
+                with content_container:
+                    with ui.row().classes('w-full gap-8'):
+                        with ui.column().classes('flex-1'):
+                            ui.label('Last Week').classes('text-subtitle1 font-bold mb-2')
+
+                            with ui.row().classes('w-full justify-between items-center mb-1'):
+                                ui.label('🟢 BUY:').classes('text-sm')
+                                ui.label(str(week_recs['BUY'])).classes('text-sm font-bold text-green-600')
+
+                            with ui.row().classes('w-full justify-between items-center mb-1'):
+                                ui.label('🔴 SELL:').classes('text-sm')
+                                ui.label(str(week_recs['SELL'])).classes('text-sm font-bold text-red-600')
+
+                            with ui.row().classes('w-full justify-between items-center mb-1'):
+                                ui.label('🟡 HOLD:').classes('text-sm')
+                                ui.label(str(week_recs['HOLD'])).classes('text-sm font-bold text-orange-600')
+
+                        with ui.column().classes('flex-1'):
+                            ui.label('Last Month').classes('text-subtitle1 font-bold mb-2')
+
+                            with ui.row().classes('w-full justify-between items-center mb-1'):
+                                ui.label('🟢 BUY:').classes('text-sm')
+                                ui.label(str(month_recs['BUY'])).classes('text-sm font-bold text-green-600')
+
+                            with ui.row().classes('w-full justify-between items-center mb-1'):
+                                ui.label('🔴 SELL:').classes('text-sm')
+                                ui.label(str(month_recs['SELL'])).classes('text-sm font-bold text-red-600')
+
+                            with ui.row().classes('w-full justify-between items-center mb-1'):
+                                ui.label('🟡 HOLD:').classes('text-sm')
+                                ui.label(str(month_recs['HOLD'])).classes('text-sm font-bold text-orange-600')
+            except RuntimeError:
+                pass
+
+        except Exception as e:
+            logger.error(f"Error loading recommendation data: {e}", exc_info=True)
+        finally:
+            timer.stop()
     
     def _get_recommendation_counts(self, session, since_date: datetime, expert_ids: Optional[List[int]] = None) -> Dict[str, int]:
         """Get recommendation counts since a specific date.
@@ -1508,12 +1572,17 @@ class AccountOverviewTab:
         ]
         
         if all_orders:
-            ui.table(
-                columns=order_columns, 
-                rows=all_orders, 
+            orders_table = ui.table(
+                columns=order_columns,
+                rows=all_orders,
                 row_key='symbol',
                 pagination={'rowsPerPage': 20, 'sortBy': 'created_at', 'descending': True}
             ).classes('w-full dark-pagination')
+            orders_table.add_slot('body-cell-comment', '''
+                <q-td :props="props" style="max-width: 400px; white-space: pre-wrap; word-break: break-word; text-align: left;">
+                    {{ props.value }}
+                </q-td>
+            ''')
         else:
             ui.label('No orders found or no accounts configured.').classes('text-gray-500')
     
@@ -1599,7 +1668,7 @@ class AccountOverviewTab:
                 {'name': 'stop_price', 'label': 'Stop Price', 'field': 'stop_price'},
                 {'name': 'expert', 'label': 'Expert', 'field': 'expert'},
                 {'name': 'waited_status', 'label': 'Waited Status', 'field': 'waited_status'},
-                {'name': 'comment', 'label': 'Comment', 'field': 'comment'},
+                {'name': 'comment', 'label': 'Comment', 'field': 'comment', 'align': 'left'},
                 {'name': 'actions', 'label': 'Actions', 'field': 'actions'}
             ]
             
@@ -1644,6 +1713,12 @@ class AccountOverviewTab:
                 </q-td>
             ''')
             
+            table.add_slot('body-cell-comment', '''
+                <q-td :props="props" style="max-width: 400px; white-space: pre-wrap; word-break: break-word; text-align: left;">
+                    {{ props.value }}
+                </q-td>
+            ''')
+
             # Handle submit order event
             table.on('submit_order', self._handle_submit_order)
             
@@ -4741,17 +4816,44 @@ def content() -> None:
         for tab_name, tab_label in tab_config:
             tab_objects[tab_name] = ui.tab(tab_name, label=tab_label)
 
+    # Lazy tab loading: only render the active tab, defer others until clicked
+    loaded_tabs = set()
+    tab_containers = {}
+
     with ui.tab_panels(tabs, value=tab_objects['overview']).classes('w-full'):
-        logger.debug("[RENDER] overview.content() - Creating tab panels")
         with ui.tab_panel(tab_objects['overview']):
-            OverviewTab(tabs_ref=tabs)
+            tab_containers['overview'] = ui.column().classes('w-full')
         with ui.tab_panel(tab_objects['account']):
-            AccountOverviewTab()
+            tab_containers['account'] = ui.column().classes('w-full')
         with ui.tab_panel(tab_objects['performance']):
-            PerformanceTab()
+            tab_containers['performance'] = ui.column().classes('w-full')
         with ui.tab_panel(tab_objects['llmusage']):
-            llm_usage_page = LLMUsagePage()
-            llm_usage_page.render()
+            tab_containers['llmusage'] = ui.column().classes('w-full')
+
+    def _load_tab(tab_name: str):
+        if tab_name not in loaded_tabs:
+            loaded_tabs.add(tab_name)
+            with tab_containers[tab_name]:
+                with PerfLogger.timer(PerfLogger.COMPONENT, PerfLogger.RENDER, f"Tab_{tab_name}"):
+                    if tab_name == 'overview':
+                        OverviewTab(tabs_ref=tabs)
+                    elif tab_name == 'account':
+                        AccountOverviewTab()
+                    elif tab_name == 'performance':
+                        PerformanceTab()
+                    elif tab_name == 'llmusage':
+                        llm_usage_page = LLMUsagePage()
+                        llm_usage_page.render()
+
+    # Load the default tab immediately
+    _load_tab('overview')
+
+    # Load other tabs lazily on first click
+    def on_tab_change(e):
+        tab_name = e.value if isinstance(e.value, str) else getattr(e.value, 'value', str(e.value))
+        _load_tab(tab_name)
+
+    tabs.on_value_change(on_tab_change)
     
     # Setup HTML5 history navigation for tabs (NiceGUI 3.0 compatible)
     async def setup_tab_navigation():
