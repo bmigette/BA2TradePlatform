@@ -1,0 +1,17 @@
+{
+  "timestamp": "2026-01-29T15:46:20.645892",
+  "providers": {
+    "moonshot": {
+      "display_name": "Moonshot",
+      "api_key_configured": false,
+      "total_models": 0,
+      "inference_passed": 0,
+      "inference_failed": 0,
+      "tool_call_passed": 0,
+      "tool_call_failed": 0,
+      "websearch_passed": 0,
+      "websearch_failed": 0,
+      "results": []
+    }
+  }
+}
