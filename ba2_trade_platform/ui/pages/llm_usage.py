@@ -10,6 +10,7 @@ from datetime import datetime
 import asyncio
 from typing import Dict, Any
 
+from ba2_trade_platform.ui.utils.perf_logger import PerfLogger
 from ba2_trade_platform.core.LLMUsageQueries import (
     get_usage_summary,
     get_usage_by_day,
@@ -59,8 +60,6 @@ class LLMUsagePage:
     
     def create_tokens_over_time_chart(self, data: list):
         """Create line chart for tokens over time."""
-        if not data:
-            return ui.label('No data available').classes('text-grey-6')
         
         chart_options = {
             'backgroundColor': 'transparent',
@@ -160,8 +159,6 @@ class LLMUsagePage:
     
     def create_usage_by_model_chart(self, data: list):
         """Create bar chart for usage by model."""
-        if not data:
-            return ui.label('No data available').classes('text-grey-6')
         
         chart_options = {
             'backgroundColor': 'transparent',
@@ -259,8 +256,6 @@ class LLMUsagePage:
     
     def create_usage_by_provider_chart(self, data: list):
         """Create pie chart for usage by provider."""
-        if not data:
-            return ui.label('No data available').classes('text-grey-6')
         
         # Color palette for providers
         colors = ['#5470C6', '#91CC75', '#FAC858', '#EE6666', '#73C0DE', '#3BA272', '#FC8452', '#9A60B4']
@@ -330,8 +325,6 @@ class LLMUsagePage:
     
     def create_usage_by_use_case_chart(self, data: list):
         """Create bar chart for usage by use case."""
-        if not data:
-            return ui.label('No data available').classes('text-grey-6')
         
         chart_options = {
             'backgroundColor': 'transparent',
@@ -429,8 +422,6 @@ class LLMUsagePage:
     
     def create_usage_by_expert_chart(self, data: list):
         """Create bar chart for usage by expert."""
-        if not data:
-            return ui.label('No data available').classes('text-grey-6')
         
         chart_options = {
             'backgroundColor': 'transparent',
@@ -528,8 +519,6 @@ class LLMUsagePage:
     
     def create_recent_requests_table(self, data: list):
         """Create table for recent requests."""
-        if not data:
-            return ui.label('No recent requests').classes('text-grey-6')
         
         columns = [
             {'name': 'timestamp', 'label': 'Time', 'field': 'timestamp', 'align': 'left', 'sortable': True},
@@ -676,6 +665,7 @@ class LLMUsagePage:
     
     def render(self):
         """Render the LLM usage page."""
+        render_timer = PerfLogger.start(PerfLogger.PAGE, PerfLogger.RENDER, "LLMUsage")
         ui.label('LLM Usage Tracking').classes('text-h4 mb-4')
         
         # Time filter
@@ -710,27 +700,28 @@ class LLMUsagePage:
         
         with ui.row().classes('w-full gap-4 mb-4'):
             with ui.card().classes('flex-grow'):
-                self.create_tokens_over_time_chart(get_usage_by_day(self.days_filter))
+                self.create_tokens_over_time_chart([])
             with ui.card().classes('flex-grow'):
-                self.create_usage_by_provider_chart(get_usage_by_provider(self.days_filter))
-        
+                self.create_usage_by_provider_chart([])
+
         with ui.row().classes('w-full gap-4 mb-4'):
             with ui.card().classes('flex-grow'):
-                self.create_usage_by_model_chart(get_usage_by_model(self.days_filter, 10))
+                self.create_usage_by_model_chart([])
             with ui.card().classes('flex-grow'):
-                self.create_usage_by_use_case_chart(get_usage_by_use_case(self.days_filter))
-        
+                self.create_usage_by_use_case_chart([])
+
         with ui.row().classes('w-full gap-4 mb-4'):
             with ui.card().classes('flex-grow'):
-                self.create_usage_by_expert_chart(get_usage_by_expert(self.days_filter, 10))
-        
+                self.create_usage_by_expert_chart([])
+
         # Recent requests table
         ui.label('Recent Requests (Last 1000)').classes('text-h6 mb-2 mt-4')
         with ui.card().classes('w-full'):
-            self.create_recent_requests_table(get_recent_requests(1000))
+            self.create_recent_requests_table([])
         
         # Initial data load
         asyncio.create_task(self.load_data())
+        render_timer.stop()
 
 
 def create_llm_usage_page():
