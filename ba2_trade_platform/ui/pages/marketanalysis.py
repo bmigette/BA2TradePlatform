@@ -19,6 +19,7 @@ from ...core.utils import get_account_instance_from_id
 from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
 from ..components.SmartRiskManagerDetailDialog import SmartRiskManagerDetailDialog
 from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
+from ..utils.perf_logger import PerfLogger
 from sqlmodel import select, func, distinct
 
 
@@ -3631,74 +3632,89 @@ class OrderRecommendationsTab:
                 statement = statement.group_by(ExpertRecommendation.symbol).order_by(func.max(ExpertRecommendation.created_at).desc())
                 
                 results = session.exec(statement).all()
-                
+
+                if not results:
+                    return []
+
+                symbols = [r.symbol for r in results]
+
+                # Bulk fetch latest recommendation per symbol using a subquery
+                from sqlalchemy import and_
+                latest_ts_subq = (
+                    select(
+                        ExpertRecommendation.symbol,
+                        func.max(ExpertRecommendation.id).label('max_id')
+                    )
+                    .where(ExpertRecommendation.symbol.in_(symbols))
+                )
+                if account_expert_ids is not None and account_expert_ids:
+                    latest_ts_subq = latest_ts_subq.where(ExpertRecommendation.instance_id.in_(account_expert_ids))
+                if self.expert_filter and self.expert_filter != 'all':
+                    try:
+                        expert_id = int(self.expert_filter)
+                        latest_ts_subq = latest_ts_subq.where(ExpertRecommendation.instance_id == expert_id)
+                    except (ValueError, IndexError):
+                        pass
+                latest_ts_subq = latest_ts_subq.group_by(ExpertRecommendation.symbol).subquery()
+
+                latest_recs_stmt = (
+                    select(ExpertRecommendation)
+                    .join(latest_ts_subq, and_(
+                        ExpertRecommendation.id == latest_ts_subq.c.max_id
+                    ))
+                )
+                latest_recs = session.exec(latest_recs_stmt).all()
+                latest_recs_map = {rec.symbol: rec for rec in latest_recs}
+
+                # Bulk fetch order counts per symbol
+                orders_count_stmt = (
+                    select(
+                        TradingOrder.symbol,
+                        func.count(TradingOrder.id).label('order_count')
+                    )
+                    .where(
+                        TradingOrder.symbol.in_(symbols),
+                        TradingOrder.transaction_id.is_not(None)
+                    )
+                )
+                if self.expert_filter and self.expert_filter != 'all':
+                    try:
+                        expert_id = int(self.expert_filter)
+                        orders_count_stmt = orders_count_stmt.join(
+                            ExpertRecommendation,
+                            TradingOrder.expert_recommendation_id == ExpertRecommendation.id
+                        ).where(ExpertRecommendation.instance_id == expert_id)
+                    except (ValueError, IndexError):
+                        pass
+                orders_count_stmt = orders_count_stmt.group_by(TradingOrder.symbol)
+                orders_counts = {row.symbol: row.order_count for row in session.exec(orders_count_stmt).all()}
+
                 summary_data = []
                 for result in results:
                     symbol = result.symbol
-                    
-                    # Get the latest recommendation for this symbol to extract last confidence, action, and price
-                    latest_rec_statement = (
-                        select(ExpertRecommendation)
-                        .where(ExpertRecommendation.symbol == symbol)
-                    )
-                    
-                    # Apply global account filter to latest recommendation
-                    if account_expert_ids is not None and account_expert_ids:
-                        latest_rec_statement = latest_rec_statement.where(ExpertRecommendation.instance_id.in_(account_expert_ids))
-                    
-                    # Apply expert filter to latest recommendation if not 'all'
-                    if self.expert_filter and self.expert_filter != 'all':
-                        try:
-                            expert_id = int(self.expert_filter)
-                            latest_rec_statement = latest_rec_statement.where(ExpertRecommendation.instance_id == expert_id)
-                        except (ValueError, IndexError):
-                            pass
-                    
-                    latest_rec_statement = latest_rec_statement.order_by(ExpertRecommendation.created_at.desc()).limit(1)
-                    latest_recommendation = session.exec(latest_rec_statement).first()
-                    
-                    # Count orders created for this symbol
-                    orders_statement = select(func.count(TradingOrder.id)).where(
-                        TradingOrder.symbol == symbol,
-                        TradingOrder.transaction_id.is_not(None)
-                    )
-                    
-                    # Apply expert filter to orders count if not 'all'
-                    if self.expert_filter and self.expert_filter != 'all':
-                        try:
-                            expert_id = int(self.expert_filter)
-                            # Join with ExpertRecommendation to filter by expert
-                            orders_statement = orders_statement.join(
-                                ExpertRecommendation,
-                                TradingOrder.expert_recommendation_id == ExpertRecommendation.id
-                            ).where(ExpertRecommendation.instance_id == expert_id)
-                        except (ValueError, IndexError):
-                            pass  # If parsing fails, don't filter orders
-                    
-                    orders_count = session.exec(orders_statement).first() or 0
-                    
+                    orders_count = orders_counts.get(symbol, 0)
+
                     # Apply order status filter
                     if hasattr(self, 'order_status_filter') and self.order_status_filter.value != 'All':
                         if self.order_status_filter.value == 'With Orders' and orders_count == 0:
-                            continue  # Skip symbols without orders
+                            continue
                         elif self.order_status_filter.value == 'Without Orders' and orders_count > 0:
-                            continue  # Skip symbols with orders
-                    
+                            continue
+
                     # Extract last recommendation details
                     last_confidence = 'N/A'
                     last_recommendation = 'N/A'
                     last_price = 'N/A'
-                    
+
+                    latest_recommendation = latest_recs_map.get(symbol)
                     if latest_recommendation:
                         if latest_recommendation.confidence is not None:
                             last_confidence = f"{latest_recommendation.confidence:.1f}%"
-                        
                         if latest_recommendation.recommended_action:
                             last_recommendation = latest_recommendation.recommended_action.value
-                        
                         if latest_recommendation.price_at_date is not None:
                             last_price = f"${latest_recommendation.price_at_date:.2f}"
-                    
+
                     summary_data.append({
                         'symbol': symbol,
                         'total_recommendations': result.total_recommendations,
@@ -3713,7 +3729,7 @@ class OrderRecommendationsTab:
                         'last_price': last_price,
                         'actions': 'actions'
                     })
-                
+
                 return summary_data
                 
         except Exception as e:
@@ -4105,6 +4121,27 @@ class OrderRecommendationsTab:
         except Exception as e:
             logger.error(f"Error viewing evaluation details: {e}", exc_info=True)
             ui.notify(f'Error loading evaluation details: {str(e)}', type='negative')
+
+    def troubleshoot_ruleset(self, event_data):
+        """Navigate to the ruleset test page with market analysis parameters."""
+        analysis_id = None
+        try:
+            if hasattr(event_data, 'args') and hasattr(event_data.args, '__len__') and len(event_data.args) > 0:
+                analysis_id = int(event_data.args[0])
+            elif isinstance(event_data, int):
+                analysis_id = event_data
+            elif hasattr(event_data, 'args') and isinstance(event_data.args, int):
+                analysis_id = event_data.args
+            else:
+                logger.error(f"Invalid event data for troubleshoot_ruleset: {event_data}")
+                ui.notify("Invalid event data", type='negative')
+                return
+
+            ui.navigate.to(f'/rulesettest?market_analysis_id={analysis_id}')
+
+        except Exception as e:
+            logger.error(f"Error navigating to ruleset test {analysis_id if analysis_id else 'unknown'}: {e}", exc_info=True)
+            ui.notify(f"Error opening ruleset test: {str(e)}", type='negative')
 
     def _get_current_price(self, symbol):
         """Get current price for a symbol."""
@@ -4744,6 +4781,7 @@ class OrderRecommendationsTab:
 
 
 def content() -> None:
+    render_timer = PerfLogger.start(PerfLogger.PAGE, PerfLogger.RENDER, "MarketAnalysis")
     # Tab configuration: (tab_name, tab_label)
     tab_config = [
         ('monitoring', 'Job Monitoring'),
@@ -4751,21 +4789,49 @@ def content() -> None:
         ('scheduled', 'Scheduled Jobs'),
         ('recommendations', 'Trade Recommendations')
     ]
-    
+
     with ui.tabs() as tabs:
         tab_objects = {}
         for tab_name, tab_label in tab_config:
             tab_objects[tab_name] = ui.tab(tab_name, label=tab_label)
 
-    with ui.tab_panels(tabs, value=tab_objects['monitoring']).classes('w-full'):
+    # Lazy tab loading: only render the active tab, defer others until clicked
+    loaded_tabs = set()
+    tab_containers = {}
+
+    with ui.tab_panels(tabs, value=tab_objects['monitoring']).classes('w-full') as panels:
         with ui.tab_panel(tab_objects['monitoring']):
-            JobMonitoringTab()
+            tab_containers['monitoring'] = ui.column().classes('w-full')
         with ui.tab_panel(tab_objects['manual']):
-            ManualAnalysisTab()
+            tab_containers['manual'] = ui.column().classes('w-full')
         with ui.tab_panel(tab_objects['scheduled']):
-            ScheduledJobsTab()
+            tab_containers['scheduled'] = ui.column().classes('w-full')
         with ui.tab_panel(tab_objects['recommendations']):
-            OrderRecommendationsTab()
+            tab_containers['recommendations'] = ui.column().classes('w-full')
+
+    tab_classes = {
+        'monitoring': JobMonitoringTab,
+        'manual': ManualAnalysisTab,
+        'scheduled': ScheduledJobsTab,
+        'recommendations': OrderRecommendationsTab,
+    }
+
+    def _load_tab(tab_name: str):
+        if tab_name not in loaded_tabs:
+            loaded_tabs.add(tab_name)
+            with tab_containers[tab_name]:
+                with PerfLogger.timer(PerfLogger.COMPONENT, PerfLogger.RENDER, f"Tab_{tab_name}"):
+                    tab_classes[tab_name]()
+
+    # Load the default tab immediately
+    _load_tab('monitoring')
+
+    # Load other tabs lazily on first click
+    def on_tab_change(e):
+        tab_name = e.value if isinstance(e.value, str) else getattr(e.value, 'value', str(e.value))
+        _load_tab(tab_name)
+
+    tabs.on_value_change(on_tab_change)
     
     # Setup HTML5 history navigation for tabs (NiceGUI 3.0 compatible)
     async def setup_tab_navigation():
@@ -4849,3 +4915,4 @@ def content() -> None:
     
     # Use timer to run async setup (shorter delay since we explicitly wait for connection)
     ui.timer(0.1, setup_tab_navigation, once=True)
+    render_timer.stop()
