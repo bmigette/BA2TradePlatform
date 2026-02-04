@@ -97,7 +97,8 @@ class PerfLogger:
     TABLE = "table"
     COMPONENT = "component"
     DATA = "data"
-    
+    DB = "db"
+
     # Operations
     RENDER = "render"
     LOAD = "load"
@@ -108,6 +109,8 @@ class PerfLogger:
     REFRESH = "refresh"
     FETCH = "fetch"
     FORMAT = "format"
+    QUERY = "query"
+    LOCK_WAIT = "lock_wait"
     
     @staticmethod
     def start(category: str, operation: str, component: str) -> ActiveTimer:

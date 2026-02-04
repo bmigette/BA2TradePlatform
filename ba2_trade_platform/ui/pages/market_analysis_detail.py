@@ -8,20 +8,8 @@ from ...core.models import MarketAnalysis, ExpertInstance, AnalysisOutput, Instr
 from ...core.types import MarketAnalysisStatus, OrderStatus
 from ...core.MarketAnalysisPDFExport import export_market_analysis_pdf
 from ...logger import logger
+from ..utils.perf_logger import PerfLogger
 from sqlmodel import select
-
-
-def _get_instrument_details(symbol: str) -> Optional[Instrument]:
-    """Get instrument details by symbol."""
-    try:
-        session = get_db()
-        statement = select(Instrument).where(Instrument.name == symbol)
-        instrument = session.exec(statement).first()
-        session.close()
-        return instrument
-    except Exception as e:
-        logger.error(f"Error loading instrument details for {symbol}: {e}", exc_info=True)
-        return None
 
 
 def content(analysis_id: int) -> None:
@@ -70,79 +58,71 @@ def content(analysis_id: int) -> None:
             ui.notification(f'Error starting PDF export: {str(e)}', type='negative')
             logger.error(f"Error starting PDF export for analysis {analysis_id}: {e}", exc_info=True)
     
+    render_timer = PerfLogger.start(PerfLogger.PAGE, PerfLogger.RENDER, "MarketAnalysisDetail")
     try:
-        # Load the market analysis
-        market_analysis = get_instance(MarketAnalysis, analysis_id)
-        if not market_analysis:
-            with ui.card().classes('w-full p-8 text-center'):
-                ui.label(f'Market Analysis {analysis_id} not found').classes('text-h5 text-negative')
-                ui.button('Back to Market Analysis', on_click=lambda: ui.navigate.to('/marketanalysis')).classes('mt-4')
-            return
-        
-        # Load the expert instance
-        expert_instance = get_instance(ExpertInstance, market_analysis.expert_instance_id)
-        if not expert_instance:
-            with ui.card().classes('w-full p-8 text-center'):
-                ui.label(f'Expert Instance {market_analysis.expert_instance_id} not found').classes('text-h5 text-negative')
-                ui.button('Back to Market Analysis', on_click=lambda: ui.navigate.to('/marketanalysis')).classes('mt-4')
-            return
-        
-        # Get expert instance with appropriate class
-        from ...core.utils import get_expert_instance_from_id
-        expert = get_expert_instance_from_id(expert_instance.id)
-        if not expert:
-            with ui.card().classes('w-full p-8 text-center'):
-                ui.label(f'Expert class {expert_instance.expert} not found').classes('text-h5 text-negative')
-                ui.button('Back to Market Analysis', on_click=lambda: ui.navigate.to('/marketanalysis')).classes('mt-4')
-            return
-        
-        # Load analysis outputs
-        session = get_db()
-        statement = select(AnalysisOutput).where(AnalysisOutput.market_analysis_id == analysis_id).order_by(AnalysisOutput.created_at)
-        analysis_outputs = session.exec(statement).all()
-        session.close()
-        
-        # Load instrument details
-        instrument = _get_instrument_details(market_analysis.symbol)
-        
-        # Header section
+        # Load all required data in a single session
+        with PerfLogger.timer(PerfLogger.DATA, PerfLogger.FETCH, "MarketAnalysisDetail_data"):
+            market_analysis = get_instance(MarketAnalysis, analysis_id)
+            if not market_analysis:
+                with ui.card().classes('w-full p-8 text-center'):
+                    ui.label(f'Market Analysis {analysis_id} not found').classes('text-h5 text-negative')
+                    ui.button('Back to Market Analysis', on_click=lambda: ui.navigate.to('/marketanalysis')).classes('mt-4')
+                return
+
+            expert_instance = get_instance(ExpertInstance, market_analysis.expert_instance_id)
+            if not expert_instance:
+                with ui.card().classes('w-full p-8 text-center'):
+                    ui.label(f'Expert Instance {market_analysis.expert_instance_id} not found').classes('text-h5 text-negative')
+                    ui.button('Back to Market Analysis', on_click=lambda: ui.navigate.to('/marketanalysis')).classes('mt-4')
+                return
+
+            from ...core.utils import get_expert_instance_from_id
+            expert = get_expert_instance_from_id(expert_instance.id)
+            if not expert:
+                with ui.card().classes('w-full p-8 text-center'):
+                    ui.label(f'Expert class {expert_instance.expert} not found').classes('text-h5 text-negative')
+                    ui.button('Back to Market Analysis', on_click=lambda: ui.navigate.to('/marketanalysis')).classes('mt-4')
+                return
+
+            # Load analysis outputs and instrument details in a single session
+            with get_db() as session:
+                statement = select(AnalysisOutput).where(AnalysisOutput.market_analysis_id == analysis_id).order_by(AnalysisOutput.created_at)
+                analysis_outputs = session.exec(statement).all()
+
+                inst_statement = select(Instrument).where(Instrument.name == market_analysis.symbol)
+                instrument = session.exec(inst_statement).first()
+
+        # Header section - render synchronously (fast, just labels)
         with ui.card().classes('w-full mb-4'):
             with ui.row().classes('w-full items-center justify-between'):
                 with ui.column():
                     ui.label(f'Market Analysis Detail - {market_analysis.symbol}').classes('text-h4')
-                    
-                    # Instrument details if available
+
                     if instrument:
                         if instrument.company_name:
                             ui.label(f'Company: {instrument.company_name}').classes('text-subtitle1 text-grey-8')
-                        
-                        # Display categories (sectors)
                         if instrument.categories:
                             categories_text = ', '.join(instrument.categories)
                             ui.label(f'Sector: {categories_text}').classes('text-subtitle2 text-grey-7')
-                        
-                        # Display labels
                         if instrument.labels:
                             labels_text = ', '.join(instrument.labels)
                             ui.label(f'Labels: {labels_text}').classes('text-subtitle2 text-grey-7')
-                    
-                    # Analysis details
+
                     expert_display = expert_instance.alias or expert_instance.expert
                     ui.label(f'Expert: {expert_display} (ID: {expert_instance.id})').classes('text-subtitle1 text-grey-7 mt-2')
                     ui.label(f'Status: {market_analysis.status.value if market_analysis.status else "Unknown"}').classes('text-subtitle2')
-                    
-                    # Convert UTC to local time for display
+
                     if market_analysis.created_at:
                         local_time = market_analysis.created_at.replace(tzinfo=timezone.utc).astimezone()
                         created_display = local_time.strftime("%Y-%m-%d %H:%M:%S %Z")
                     else:
                         created_display = "Unknown"
                     ui.label(f'Created: {created_display}').classes('text-subtitle2')
-                
+
                 with ui.column().classes('gap-2'):
                     ui.button('Export PDF', on_click=export_to_pdf, icon='picture_as_pdf').classes('bg-blue-600')
                     ui.button('Back to Market Analysis', on_click=lambda: ui.navigate.to('/marketanalysis'), icon='arrow_back')
-        
+
         # Handle different states based on analysis status
         if market_analysis.status == MarketAnalysisStatus.PENDING:
             _render_pending_state(market_analysis)
@@ -153,20 +133,22 @@ def content(analysis_id: int) -> None:
         elif market_analysis.status in [MarketAnalysisStatus.FAILED]:
             _render_error_state(market_analysis)
             return
-        
+
         # Check for failed analysis even if status is not ERROR
         has_error = _check_for_analysis_errors(market_analysis)
         if has_error:
             _render_error_banner(market_analysis)
-        
-        # Main content - just show the analysis results directly
+
+        # Main content - show the analysis results directly
         _render_expert_analysis(market_analysis, expert)
-        
+
     except Exception as e:
         logger.error(f"Error loading market analysis detail {analysis_id}: {e}", exc_info=True)
         with ui.card().classes('w-full p-8 text-center'):
             ui.label(f'Error loading analysis: {str(e)}').classes('text-h5 text-negative')
             ui.button('Back to Market Analysis', on_click=lambda: ui.navigate.to('/marketanalysis')).classes('mt-4')
+    finally:
+        render_timer.stop()
 
 
 def _render_pending_state(market_analysis: MarketAnalysis) -> None:
@@ -337,30 +319,25 @@ def _render_error_banner(market_analysis: MarketAnalysis) -> None:
 def _render_order_recommendations_tab(market_analysis: MarketAnalysis) -> None:
     """Render the Trade Recommendations tab showing orders linked to this analysis."""
     try:
-        session = get_db()
-        
-        # Get expert recommendations from this analysis
-        statement = select(ExpertRecommendation).where(
-            ExpertRecommendation.market_analysis_id == market_analysis.id
-        )
-        recommendations = list(session.exec(statement).all())
-        
-        if not recommendations:
-            with ui.card().classes('w-full p-8 text-center'):
-                ui.icon('info', size='2rem', color='grey').classes('mb-4')
-                ui.label('No recommendations generated from this analysis').classes('text-h6 text-grey-6')
-                ui.label('This analysis may still be processing or may not have generated actionable recommendations.').classes('text-grey-7')
-            session.close()
-            return
-        
-        # Get orders linked to these recommendations
-        recommendation_ids = [rec.id for rec in recommendations]
-        orders_statement = select(TradingOrder).where(
-            TradingOrder.expert_recommendation_id.in_(recommendation_ids)
-        ).order_by(TradingOrder.created_at.desc())
-        orders = list(session.exec(orders_statement).all())
-        
-        session.close()
+        with get_db() as session:
+            # Get expert recommendations and orders in a single session
+            statement = select(ExpertRecommendation).where(
+                ExpertRecommendation.market_analysis_id == market_analysis.id
+            )
+            recommendations = list(session.exec(statement).all())
+
+            if not recommendations:
+                with ui.card().classes('w-full p-8 text-center'):
+                    ui.icon('info', size='2rem', color='grey').classes('mb-4')
+                    ui.label('No recommendations generated from this analysis').classes('text-h6 text-grey-6')
+                    ui.label('This analysis may still be processing or may not have generated actionable recommendations.').classes('text-grey-7')
+                return
+
+            recommendation_ids = [rec.id for rec in recommendations]
+            orders_statement = select(TradingOrder).where(
+                TradingOrder.expert_recommendation_id.in_(recommendation_ids)
+            ).order_by(TradingOrder.created_at.desc())
+            orders = list(session.exec(orders_statement).all())
         
         # Summary section
         with ui.card().classes('w-full mb-4'):

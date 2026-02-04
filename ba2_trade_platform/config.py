@@ -29,6 +29,11 @@ ALPHA_VANTAGE_API_KEY=None
 # Price cache duration in seconds
 PRICE_CACHE_TIME = 60  # Default to 60 seconds
 
+# Database performance logging threshold in milliseconds
+# Only log DB operations (queries, lock waits) exceeding this threshold
+# Set DB_PERF_LOG_THRESHOLD_MS in .env to override
+DB_PERF_LOG_THRESHOLD_MS = 100
+
 # OpenAI streaming configuration
 # Enable streaming responses from OpenAI API for faster initial response times
 # When enabled, responses are sent incrementally as they're generated
@@ -39,7 +44,7 @@ PRICE_CACHE_TIME = 60  # Default to 60 seconds
 OPENAI_ENABLE_STREAMING = True  # Default to True for better performance
 
 def load_config_from_env() -> None:
-    global FINNHUB_API_KEY, OPENAI_API_KEY, OPENAI_BACKEND_URL, ALPHA_VANTAGE_API_KEY, FILE_LOGGING, PRICE_CACHE_TIME, OPENAI_ENABLE_STREAMING, STORAGE_SECRET
+    global FINNHUB_API_KEY, OPENAI_API_KEY, OPENAI_BACKEND_URL, ALPHA_VANTAGE_API_KEY, FILE_LOGGING, PRICE_CACHE_TIME, OPENAI_ENABLE_STREAMING, STORAGE_SECRET, DB_PERF_LOG_THRESHOLD_MS
     """Loads configuration from environment variables and database app settings."""
 
     env_file = os.path.join(HOME_PARENT, '.env')
@@ -59,6 +64,12 @@ def load_config_from_env() -> None:
     except ValueError:
         PRICE_CACHE_TIME = 60
     
+    # Load DB performance logging threshold from environment
+    try:
+        DB_PERF_LOG_THRESHOLD_MS = int(os.getenv('DB_PERF_LOG_THRESHOLD_MS', DB_PERF_LOG_THRESHOLD_MS))
+    except ValueError:
+        DB_PERF_LOG_THRESHOLD_MS = 100
+
     # Load OpenAI streaming configuration from environment
     openai_streaming = os.getenv('OPENAI_ENABLE_STREAMING', '').lower()
     if openai_streaming in ('true', '1', 'yes', 'on'):

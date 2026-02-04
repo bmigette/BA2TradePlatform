@@ -1,6 +1,6 @@
 from sqlmodel import  Field, Session, SQLModel, create_engine
 
-from ..config import DB_FILE
+from ..config import DB_FILE, DB_PERF_LOG_THRESHOLD_MS
 from ..logger import logger
 from sqlalchemy import String, Float, JSON, select, event
 import os
@@ -12,15 +12,48 @@ import atexit
 
 
 # Create engine and session
-import os
-import threading
-
-
-# Create engine and session
 logger.debug(f"Database file path: {DB_FILE}")
 
-# Thread lock for all database write operations
-_db_write_lock = threading.Lock()
+
+def _log_db_perf(operation: str, detail: str, duration_ms: float):
+    """Log a database performance measurement if above threshold."""
+    if duration_ms >= DB_PERF_LOG_THRESHOLD_MS:
+        msg = f"[DB:{operation}] {detail} - {duration_ms:.2f}ms"
+        if duration_ms > 1000:
+            logger.warning(msg)
+        else:
+            logger.info(msg)
+
+
+class _TimedWriteLock:
+    """Wrapper around threading.Lock that measures wait time for acquisition."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    def __enter__(self):
+        start = time.perf_counter()
+        self._lock.acquire()
+        wait_ms = (time.perf_counter() - start) * 1000
+        self._caller_wait_ms = wait_ms
+        if wait_ms >= DB_PERF_LOG_THRESHOLD_MS:
+            import inspect
+            caller = inspect.stack()[1].function if len(inspect.stack()) > 1 else "unknown"
+            _log_db_perf("lock_wait", f"{caller}() waited for write lock", wait_ms)
+        return self
+
+    def __exit__(self, *args):
+        self._lock.release()
+
+    def acquire(self, *args, **kwargs):
+        return self._lock.acquire(*args, **kwargs)
+
+    def release(self):
+        return self._lock.release()
+
+
+# Thread lock for all database write operations (with timing instrumentation)
+_db_write_lock = _TimedWriteLock()
 
 # Activity logging queue for async processing (prevents blocking on database locks)
 _activity_log_queue = Queue(maxsize=1000)
@@ -296,37 +329,42 @@ def add_instance(instance, session: Session | None = None, expunge_after_flush: 
         instance: The instance to add.
         session (Session, optional): An existing SQLModel session. If not provided, a new session is created.
         expunge_after_flush (bool, optional): If True, expunge the instance from the session after flush
-            to prevent attribute expiration. This allows the instance to be used like a normal 
+            to prevent attribute expiration. This allows the instance to be used like a normal
             Pydantic/SQLModel object without session errors. Default is False for backward compatibility.
 
     Returns:
         The ID of the added instance.
     """
+    start = time.perf_counter()
     instance_class = instance.__class__.__name__
-    with _db_write_lock:
-        try:
-            if session:
-                session.add(instance)
-                session.flush()  # Flush to generate the ID without committing
-                instance_id = instance.id  # Get ID after flush
-                if expunge_after_flush:
-                    session.expunge(instance)  # Detach from session to prevent attribute expiration
-                session.commit()
-                logger.info(f"Added instance: {instance_class} (id={instance_id})")
-                return instance_id
-            else:
-                with Session(engine) as new_session:
-                    new_session.add(instance)
-                    new_session.flush()  # Flush to generate the ID without committing
+    try:
+        with _db_write_lock:
+            try:
+                if session:
+                    session.add(instance)
+                    session.flush()  # Flush to generate the ID without committing
                     instance_id = instance.id  # Get ID after flush
                     if expunge_after_flush:
-                        new_session.expunge(instance)  # Detach from session to prevent attribute expiration
-                    new_session.commit()
+                        session.expunge(instance)  # Detach from session to prevent attribute expiration
+                    session.commit()
                     logger.info(f"Added instance: {instance_class} (id={instance_id})")
                     return instance_id
-        except Exception as e:
-            # Let the retry decorator handle logging with appropriate detail level
-            raise
+                else:
+                    with Session(engine) as new_session:
+                        new_session.add(instance)
+                        new_session.flush()  # Flush to generate the ID without committing
+                        instance_id = instance.id  # Get ID after flush
+                        if expunge_after_flush:
+                            new_session.expunge(instance)  # Detach from session to prevent attribute expiration
+                        new_session.commit()
+                        logger.info(f"Added instance: {instance_class} (id={instance_id})")
+                        return instance_id
+            except Exception as e:
+                # Let the retry decorator handle logging with appropriate detail level
+                raise
+    finally:
+        duration_ms = (time.perf_counter() - start) * 1000
+        _log_db_perf("query", f"add_instance({instance_class})", duration_ms)
 
 @retry_on_lock
 def update_instance(instance, session: Session | None = None):
@@ -336,7 +374,7 @@ def update_instance(instance, session: Session | None = None):
     Commits and refreshes the instance after updating.
     Thread-safe: Uses a lock to prevent concurrent write conflicts.
     Retries on database lock errors with exponential backoff.
-    
+
     Handles objects already attached to different sessions by merging them
     into the current session.
 
@@ -347,54 +385,60 @@ def update_instance(instance, session: Session | None = None):
     Returns:
         True if update was successful.
     """
-    with _db_write_lock:
-        try:
-            instance_id = instance.id
-            model_class = type(instance)
-            
-            if session:
-                # Merge the instance into the current session to avoid attachment issues
-                merged_instance = session.get(model_class, instance_id)
-                if merged_instance:
-                    # Update merged instance with the values from the passed instance
-                    for key, value in instance.__dict__.items():
-                        if not key.startswith('_'):
-                            setattr(merged_instance, key, value)
-                    session.commit()
-                    session.refresh(merged_instance)
-                    # Update the original instance with refreshed values
-                    for key in instance.__dict__.keys():
-                        if not key.startswith('_') and hasattr(merged_instance, key):
-                            setattr(instance, key, getattr(merged_instance, key))
-                else:
-                    # Object not found in current session, try adding it
-                    session.add(instance)
-                    session.commit()
-                    session.refresh(instance)
-            else:
-                with Session(engine) as new_session:
-                    # Get the instance in this session
-                    merged_instance = new_session.get(model_class, instance_id)
+    start = time.perf_counter()
+    instance_class = instance.__class__.__name__
+    try:
+        with _db_write_lock:
+            try:
+                instance_id = instance.id
+                model_class = type(instance)
+
+                if session:
+                    # Merge the instance into the current session to avoid attachment issues
+                    merged_instance = session.get(model_class, instance_id)
                     if merged_instance:
                         # Update merged instance with the values from the passed instance
                         for key, value in instance.__dict__.items():
                             if not key.startswith('_'):
                                 setattr(merged_instance, key, value)
-                        new_session.commit()
-                        new_session.refresh(merged_instance)
+                        session.commit()
+                        session.refresh(merged_instance)
                         # Update the original instance with refreshed values
                         for key in instance.__dict__.keys():
                             if not key.startswith('_') and hasattr(merged_instance, key):
                                 setattr(instance, key, getattr(merged_instance, key))
                     else:
-                        # Object not found in new session, add it
-                        new_session.add(instance)
-                        new_session.commit()
-                        new_session.refresh(instance)
-            return True
-        except Exception as e:
-            # Let the retry decorator handle logging with appropriate detail level
-            raise
+                        # Object not found in current session, try adding it
+                        session.add(instance)
+                        session.commit()
+                        session.refresh(instance)
+                else:
+                    with Session(engine) as new_session:
+                        # Get the instance in this session
+                        merged_instance = new_session.get(model_class, instance_id)
+                        if merged_instance:
+                            # Update merged instance with the values from the passed instance
+                            for key, value in instance.__dict__.items():
+                                if not key.startswith('_'):
+                                    setattr(merged_instance, key, value)
+                            new_session.commit()
+                            new_session.refresh(merged_instance)
+                            # Update the original instance with refreshed values
+                            for key in instance.__dict__.keys():
+                                if not key.startswith('_') and hasattr(merged_instance, key):
+                                    setattr(instance, key, getattr(merged_instance, key))
+                        else:
+                            # Object not found in new session, add it
+                            new_session.add(instance)
+                            new_session.commit()
+                            new_session.refresh(instance)
+                return True
+            except Exception as e:
+                # Let the retry decorator handle logging with appropriate detail level
+                raise
+    finally:
+        duration_ms = (time.perf_counter() - start) * 1000
+        _log_db_perf("query", f"update_instance({instance_class})", duration_ms)
 
 
 @retry_on_lock_critical
@@ -492,6 +536,7 @@ def get_instance(model_class, instance_id, session: Session | None = None):
     Returns:
         The instance if found, otherwise None.
     """
+    start = time.perf_counter()
     try:
         if session:
             instance = session.get(model_class, instance_id)
@@ -509,6 +554,9 @@ def get_instance(model_class, instance_id, session: Session | None = None):
     except Exception as e:
         logger.error(f"Error retrieving instance: {e}", exc_info=True)
         raise
+    finally:
+        duration_ms = (time.perf_counter() - start) * 1000
+        _log_db_perf("query", f"get_instance({model_class.__name__}, {instance_id})", duration_ms)
     
 def get_all_instances(model_class, session: Session | None = None):
     """
@@ -521,6 +569,7 @@ def get_all_instances(model_class, session: Session | None = None):
     Returns:
         List of all instances of the model class.
     """
+    start = time.perf_counter()
     try:
         if session:
             statement = select(model_class)
@@ -532,10 +581,14 @@ def get_all_instances(model_class, session: Session | None = None):
                 results = session.exec(statement)
                 instances = results.all()
         #logger.debug(f"Retrieved {len(instances)} instances of {model_class.__name__}")
-        return [i[0] for i in instances]
+        result_list = [i[0] for i in instances]
+        return result_list
     except Exception as e:
         logger.error(f"Error retrieving all instances: {e}", exc_info=True)
         raise
+    finally:
+        duration_ms = (time.perf_counter() - start) * 1000
+        _log_db_perf("query", f"get_all_instances({model_class.__name__})", duration_ms)
 
 
 def get_setting(key: str) -> str | None:

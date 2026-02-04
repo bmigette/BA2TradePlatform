@@ -12,6 +12,7 @@ from ...core.db import get_db
 from ...core.models import MarketAnalysis, ExpertRecommendation, ExpertInstance, AccountDefinition
 from ...core.types import OrderRecommendation
 from ...ui.components import InstrumentGraph
+from ..utils.perf_logger import PerfLogger
 
 
 class MarketAnalysisHistoryPage:
@@ -40,31 +41,34 @@ class MarketAnalysisHistoryPage:
         
     def render(self) -> None:
         """Render the complete market analysis history page."""
+        render_timer = PerfLogger.start(PerfLogger.PAGE, PerfLogger.RENDER, "MarketAnalysisHistory")
         try:
             # Page header
             with ui.row().classes('w-full items-center justify-between mb-4'):
                 ui.label(f'📊 Market Analysis History - {self.symbol}').classes('text-h4')
                 ui.button('← Back', on_click=lambda: ui.navigate.back()).props('flat')
-            
+
             # Load data
             self._load_data()
-            
+
             # Expert filter controls (in a container that doesn't constrain width)
             with ui.column().classes('w-full'):
                 self._render_expert_filters()
-            
+
             # Price chart with recommendations - ensure full width container
             with ui.column().classes('w-full mt-4'):
                 self.graph_container = ui.column().classes('w-full')
                 self._render_chart()
-            
+
             # Recommendations table
             with ui.column().classes('w-full mt-4'):
                 self._render_recommendations_table()
-            
+
         except Exception as e:
             logger.error(f"Error rendering market analysis history page: {e}", exc_info=True)
             ui.label(f'Error loading market analysis history: {e}').classes('text-red-500')
+        finally:
+            render_timer.stop()
     
     def _load_data(self) -> None:
         """Load price data and recommendations from database."""

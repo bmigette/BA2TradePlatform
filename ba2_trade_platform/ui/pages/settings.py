@@ -21,6 +21,7 @@ from ..components.ModelSelector import ModelSelectorInput
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ...core.rules_export_import import RulesExportImportUI
 from ...core.rules_documentation import get_event_type_documentation, get_action_type_documentation
+from ..utils.perf_logger import PerfLogger
 
 # --- InstrumentSettingsTab ---
 class InstrumentSettingsTab:
@@ -5586,8 +5587,9 @@ class BatchCleanupTab:
 
 
 def content() -> None:
+    render_timer = PerfLogger.start(PerfLogger.PAGE, PerfLogger.RENDER, "Settings")
     logger.debug('Initializing settings page')
-    
+
     # Tab configuration: (tab_name, tab_label)
     tab_config = [
         ('global', 'Global Settings'),
@@ -5700,6 +5702,7 @@ def content() -> None:
                 setupTabClickHandlers();
             })();
         ''', timeout=3.0)
-    
+
     # Use timer to run async setup (shorter delay since we explicitly wait for connection)
     ui.timer(0.1, setup_tab_navigation, once=True)
+    render_timer.stop()
