@@ -7,6 +7,7 @@ A histogram chart showing profit/loss for each expert instance based on complete
 from nicegui import ui
 from sqlmodel import select, func
 from typing import Dict, List, Optional
+import asyncio
 from ...core.db import get_db
 from ...core.models import Transaction, ExpertInstance
 from ...core.types import TransactionStatus
@@ -17,9 +18,11 @@ from ..account_filter_context import get_selected_account_id, get_expert_ids_for
 
 class ProfitPerExpertChart:
     """Component that displays a histogram of profit per expert instance."""
-    
+
     def __init__(self):
         self.chart = None
+        self.container = None
+        self.summary_container = None
         self.render()
     
     def calculate_expert_profits(self) -> Dict[str, float]:
@@ -94,20 +97,37 @@ class ProfitPerExpertChart:
     
     def render(self):
         """Render the profit per expert chart."""
-        with ui.card().classes('p-4'):
+        with ui.card().classes('p-4') as card:
             ui.label('📈 Profit Per Expert').classes('text-h6 mb-4')
-            
-            # Get profit data
-            profit_data = self.calculate_expert_profits()
-            
+
+            # Create container for the chart content
+            self.container = ui.column().classes('w-full')
+
+            # Load data asynchronously
+            asyncio.create_task(self._load_chart_async())
+
+    async def _load_chart_async(self):
+        """Asynchronously load and render the chart data."""
+        with self.container:
+            # Show loading spinner
+            spinner = ui.spinner(size='lg')
+            loading_label = ui.label('Loading profit data...').classes('text-sm text-gray-500 ml-2')
+
+        # Run the data calculation in a thread to avoid blocking
+        profit_data = await asyncio.to_thread(self.calculate_expert_profits)
+
+        # Clear the container
+        self.container.clear()
+
+        with self.container:
             if not profit_data:
                 ui.label('No completed transactions found with expert attribution.').classes('text-sm text-gray-500')
                 return
-            
+
             # Prepare data for chart
             expert_names = list(profit_data.keys())
             profit_values = list(profit_data.values())
-            
+
             # Create data array with individual colors for each bar
             # ECharts expects data as objects with value and itemStyle properties
             chart_data = []
@@ -125,7 +145,7 @@ class ProfitPerExpertChart:
                         'borderRadius': border_radius
                     }
                 })
-            
+
             # Create echart options
             options = {
                 'backgroundColor': 'transparent',
@@ -200,14 +220,14 @@ class ProfitPerExpertChart:
                     }
                 }]
             }
-            
+
             # Create the chart
             self.chart = ui.echart(options).classes('w-full h-64')
-            
+
             # Add summary statistics
             total_profit = sum(profit_values)
             profitable_experts = sum(1 for p in profit_values if p > 0)
-            
+
             with ui.row().classes('w-full justify-between mt-4 text-sm'):
                 ui.label(f'Total Experts: {len(profit_data)}').classes('text-gray-600')
                 ui.label(f'Profitable: {profitable_experts}').classes('text-green-600')
@@ -217,28 +237,6 @@ class ProfitPerExpertChart:
     
     def refresh(self):
         """Refresh the chart with updated data."""
-        if self.chart:
-            profit_data = self.calculate_expert_profits()
-            
-            if profit_data:
-                expert_names = list(profit_data.keys())
-                profit_values = list(profit_data.values())
-                
-                # Create data array with individual colors for each bar
-                chart_data = []
-                for profit in profit_values:
-                    if profit >= 0:
-                        border_radius = [4, 4, 0, 0]  # Round top
-                    else:
-                        border_radius = [0, 0, 4, 4]  # Round bottom
-                    chart_data.append({
-                        'value': round(profit, 2),
-                        'itemStyle': {
-                            'color': '#00d4aa' if profit >= 0 else '#ff6b6b',
-                            'borderRadius': border_radius
-                        }
-                    })
-                
-                self.chart.options['xAxis']['data'] = expert_names
-                self.chart.options['series'][0]['data'] = chart_data
-                self.chart.update()
+        if self.container:
+            self.container.clear()
+            asyncio.create_task(self._load_chart_async())
