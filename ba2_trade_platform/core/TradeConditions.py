@@ -288,6 +288,59 @@ class HasPositionCondition(FlagCondition):
     def get_description(self) -> str:
         return f"Check if this expert has an open position for {self.instrument_name} (based on transactions)"
 
+
+class HasBuyPositionCondition(FlagCondition):
+    """Check if this expert has an open BUY (long) position for the instrument."""
+    def evaluate(self) -> bool:
+        try:
+            from .db import get_db
+            from .models import Transaction
+            from .types import TransactionStatus, OrderDirection
+            from sqlmodel import select
+
+            expert_id = self.expert_recommendation.instance_id
+
+            with get_db() as session:
+                statement = select(Transaction).where(
+                    Transaction.expert_id == expert_id,
+                    Transaction.symbol == self.instrument_name,
+                    Transaction.status == TransactionStatus.OPENED,
+                    Transaction.side == OrderDirection.BUY
+                )
+                return len(session.exec(statement).all()) > 0
+        except Exception as e:
+            logger.error(f"Error checking BUY position for {self.instrument_name}: {e}", exc_info=True)
+            return False
+    def get_description(self) -> str:
+        return f"Check if this expert has an open BUY position for {self.instrument_name}"
+
+
+class HasSellPositionCondition(FlagCondition):
+    """Check if this expert has an open SELL (short) position for the instrument."""
+    def evaluate(self) -> bool:
+        try:
+            from .db import get_db
+            from .models import Transaction
+            from .types import TransactionStatus, OrderDirection
+            from sqlmodel import select
+
+            expert_id = self.expert_recommendation.instance_id
+
+            with get_db() as session:
+                statement = select(Transaction).where(
+                    Transaction.expert_id == expert_id,
+                    Transaction.symbol == self.instrument_name,
+                    Transaction.status == TransactionStatus.OPENED,
+                    Transaction.side == OrderDirection.SELL
+                )
+                return len(session.exec(statement).all()) > 0
+        except Exception as e:
+            logger.error(f"Error checking SELL position for {self.instrument_name}: {e}", exc_info=True)
+            return False
+    def get_description(self) -> str:
+        return f"Check if this expert has an open SELL position for {self.instrument_name}"
+
+
 # Account-level Position Conditions
 class HasNoPositionAccountCondition(FlagCondition):
     """Check if there's no open position for the instrument at the account level."""
@@ -1137,6 +1190,8 @@ def create_condition(event_type: ExpertEventType, account: AccountInterface,
         ExpertEventType.F_BULLISH: BullishCondition,
         ExpertEventType.F_HAS_NO_POSITION: HasNoPositionCondition,
         ExpertEventType.F_HAS_POSITION: HasPositionCondition,
+        ExpertEventType.F_HAS_BUY_POSITION: HasBuyPositionCondition,
+        ExpertEventType.F_HAS_SELL_POSITION: HasSellPositionCondition,
         ExpertEventType.F_HAS_NO_POSITION_ACCOUNT: HasNoPositionAccountCondition,
         ExpertEventType.F_HAS_POSITION_ACCOUNT: HasPositionAccountCondition,
         ExpertEventType.F_LONG_TERM: LongTermCondition,

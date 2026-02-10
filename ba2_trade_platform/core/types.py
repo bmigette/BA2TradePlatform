@@ -269,6 +269,8 @@ class ExpertEventType(str, Enum):
     F_BULLISH = "bullish"
     F_HAS_NO_POSITION = "has_no_position"
     F_HAS_POSITION = "has_position"
+    F_HAS_BUY_POSITION = "has_buy_position"    # Expert has an open BUY (long) position
+    F_HAS_SELL_POSITION = "has_sell_position"   # Expert has an open SELL (short) position
     F_HAS_NO_POSITION_ACCOUNT = "has_no_position_account"
     F_HAS_POSITION_ACCOUNT = "has_position_account"
     F_RATING_NEGATIVE_TO_NEUTRAL = "rating_negative_to_neutral"

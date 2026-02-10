@@ -1,0 +1,108 @@
+{
+  "export_version": "1.0",
+  "export_type": "rulesets",
+  "export_timestamp": "2026-02-10T18:00:00.000000",
+  "description": "Simple copy signal strategy for FMPSenateTraderCopy expert. Enter market: open BUY on BUY signal, open SELL on SELL signal. Open positions: close when opposite signal arrives.",
+  "rulesets": [
+    {
+      "name": "Copy Signal - Enter Market",
+      "description": "Open positions directly from copy trade signals. BUY when signal is BUY (bullish), SELL when signal is SELL (bearish). No confidence or profit filters - trusts the copy signal fully.",
+      "type": "trading_recommendation_rule",
+      "subtype": "enter_market",
+      "rules": [
+        {
+          "name": "CopySignal_BUY",
+          "type": "trading_recommendation_rule",
+          "subtype": "enter_market",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "bullish"
+            },
+            "trigger_1": {
+              "event_type": "has_no_position"
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "buy"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 0
+        },
+        {
+          "name": "CopySignal_SELL",
+          "type": "trading_recommendation_rule",
+          "subtype": "enter_market",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "bearish"
+            },
+            "trigger_1": {
+              "event_type": "has_no_position"
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "sell"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 1
+        }
+      ]
+    },
+    {
+      "name": "Copy Signal - Open Positions",
+      "description": "Close positions when opposite signal arrives. Close BUY position on SELL signal, close SELL position on BUY signal.",
+      "type": "trading_recommendation_rule",
+      "subtype": "open_positions",
+      "rules": [
+        {
+          "name": "CopySignal_Close_BUY_On_SELL",
+          "type": "trading_recommendation_rule",
+          "subtype": "open_positions",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "has_buy_position"
+            },
+            "trigger_1": {
+              "event_type": "bearish"
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "close"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 0
+        },
+        {
+          "name": "CopySignal_Close_SELL_On_BUY",
+          "type": "trading_recommendation_rule",
+          "subtype": "open_positions",
+          "triggers": {
+            "trigger_0": {
+              "event_type": "has_sell_position"
+            },
+            "trigger_1": {
+              "event_type": "bullish"
+            }
+          },
+          "actions": {
+            "action_0": {
+              "action_type": "close"
+            }
+          },
+          "extra_parameters": {},
+          "continue_processing": false,
+          "order_index": 1
+        }
+      ]
+    }
+  ]
+}
