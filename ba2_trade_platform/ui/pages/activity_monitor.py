@@ -7,12 +7,12 @@ risk manager runs, analysis execution, and more.
 """
 
 from nicegui import ui
-from sqlmodel import select, or_, and_, Session
+from sqlmodel import select, or_, and_, Session, func
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 import asyncio
 
-from ...core.db import get_db, get_instance
+from ...core.db import get_db
 from ...core.models import ActivityLog, ExpertInstance, AccountDefinition
 from ...core.types import ActivityLogSeverity, ActivityLogType
 from ...logger import logger
@@ -111,20 +111,34 @@ class ActivityMonitorPage:
                     # Default sort by created_at descending (most recent first)
                     query = query.order_by(ActivityLog.created_at.desc())
                 
-                # Get total count first (before pagination)
-                count_query = select(ActivityLog)
+                # Get total count efficiently using COUNT()
+                count_query = select(func.count(ActivityLog.id))
                 if db_filters:
                     count_query = count_query.where(and_(*db_filters))
-                total_count = len(session.exec(count_query).all())
+                total_count = session.exec(count_query).one()
                 
                 # Apply pagination
                 offset = (page - 1) * page_size
                 query = query.offset(offset).limit(page_size)
                 
                 activities = session.exec(query).all()
-                
+
+                # Pre-fetch all experts and accounts to avoid N+1 queries
+                expert_ids = set(a.source_expert_id for a in activities if a.source_expert_id)
+                account_ids = set(a.source_account_id for a in activities if a.source_account_id)
+
+                experts_map = {}
+                if expert_ids:
+                    experts = session.exec(select(ExpertInstance).where(ExpertInstance.id.in_(expert_ids))).all()
+                    experts_map = {e.id: e for e in experts}
+
+                accounts_map = {}
+                if account_ids:
+                    accounts = session.exec(select(AccountDefinition).where(AccountDefinition.id.in_(account_ids))).all()
+                    accounts_map = {a.id: a for a in accounts}
+
                 # Format activities for display
-                rows = self._format_activities_rows(activities)
+                rows = self._format_activities_rows(activities, experts_map, accounts_map)
                 
                 return rows, total_count
                 
@@ -137,34 +151,36 @@ class ActivityMonitorPage:
         if self.lazy_table:
             await self.lazy_table.refresh()
     
-    def _format_activities_rows(self, activities) -> list:
-        """Format activities into table rows."""
+    def _format_activities_rows(self, activities, experts_map: dict = None, accounts_map: dict = None) -> list:
+        """Format activities into table rows.
+
+        Args:
+            activities: List of ActivityLog records
+            experts_map: Pre-fetched dict of expert_id -> ExpertInstance
+            accounts_map: Pre-fetched dict of account_id -> AccountDefinition
+        """
         rows = []
+        experts_map = experts_map or {}
+        accounts_map = accounts_map or {}
+
         try:
             for activity in activities:
-                # Format expert display
+                # Format expert display using pre-fetched map
                 expert_display = ""
                 if activity.source_expert_id:
-                    try:
-                        expert = get_instance(ExpertInstance, activity.source_expert_id)
-                        if expert:
-                            if expert.alias:
-                                expert_display = expert.alias
-                            else:
-                                expert_display = f"{expert.expert} #{expert.id}"
-                    except Exception:
-                        # Expert instance was deleted, show ID only
+                    expert = experts_map.get(activity.source_expert_id)
+                    if expert:
+                        expert_display = expert.alias if expert.alias else f"{expert.expert} #{expert.id}"
+                    else:
                         expert_display = f"Expert #{activity.source_expert_id} (deleted)"
-                
-                # Format account display
+
+                # Format account display using pre-fetched map
                 account_display = ""
                 if activity.source_account_id:
-                    try:
-                        account = get_instance(AccountDefinition, activity.source_account_id)
-                        if account:
-                            account_display = account.name
-                    except Exception:
-                        # Account was deleted, show ID only
+                    account = accounts_map.get(activity.source_account_id)
+                    if account:
+                        account_display = account.name
+                    else:
                         account_display = f"Account #{activity.source_account_id} (deleted)"
                 
                 # Convert UTC timestamp to local time

@@ -1333,34 +1333,41 @@ class SmartRiskManagerToolkit:
         # Handle case where model passes a single symbol string instead of list
         if isinstance(symbols, str):
             symbols = [symbols]
-        
+
         results = {
             "prices": {},
             "errors": []
         }
-        
-        for symbol in symbols:
-            try:
-                logger.debug(f"Getting current price for {symbol}")
-                price = self.account.get_instrument_current_price(symbol, price_type='bid')
-                
-                # Handle case where method might return dict instead of float
-                if isinstance(price, dict):
-                    logger.error(f"get_instrument_current_price returned dict instead of float for {symbol}: {price}")
-                    results["errors"].append({"symbol": symbol, "error": f"Expected float price, got dict"})
-                    continue
-                
-                if price is None:
-                    logger.error(f"get_instrument_current_price returned None for {symbol}")
-                    results["errors"].append({"symbol": symbol, "error": "No price available"})
-                    continue
-                
-                results["prices"][symbol] = float(price)
-                logger.debug(f"Current price for {symbol}: {price}")
-            except Exception as e:
-                logger.error(f"Error getting current price for {symbol}: {e}", exc_info=True)
-                results["errors"].append({"symbol": symbol, "error": str(e)})
-        
+
+        try:
+            # Use bulk API: pass full list for a single API call
+            price_map = self.account.get_instrument_current_price(symbols, price_type='bid')
+
+            if isinstance(price_map, dict):
+                for symbol, price in price_map.items():
+                    if price is not None:
+                        results["prices"][symbol] = float(price)
+                    else:
+                        results["errors"].append({"symbol": symbol, "error": "No price available"})
+            else:
+                # Fallback: if single symbol was passed and result is a float
+                if len(symbols) == 1 and price_map is not None:
+                    results["prices"][symbols[0]] = float(price_map)
+                else:
+                    results["errors"].append({"symbol": str(symbols), "error": "Unexpected response format"})
+        except Exception as e:
+            logger.error(f"Error in bulk price fetch for {symbols}: {e}", exc_info=True)
+            # Fallback to individual fetches
+            for symbol in symbols:
+                try:
+                    price = self.account.get_instrument_current_price(symbol, price_type='bid')
+                    if price is not None and not isinstance(price, dict):
+                        results["prices"][symbol] = float(price)
+                    else:
+                        results["errors"].append({"symbol": symbol, "error": "No price available"})
+                except Exception as inner_e:
+                    results["errors"].append({"symbol": symbol, "error": str(inner_e)})
+
         logger.info(f"Got prices for {len(results['prices'])} symbols, {len(results['errors'])} errors")
         return results
 

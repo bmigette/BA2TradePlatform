@@ -1582,15 +1582,34 @@ class TradeManager:
                             instrument_name=recommendation.symbol,
                             existing_transactions=existing_transactions
                         )
-                        
+
+                        # Resolve the primary (entry) order from the oldest open transaction
+                        # This is needed for conditions like DaysOpenedCondition that use order.created_at
+                        existing_order = None
+                        oldest_transaction = min(existing_transactions, key=lambda t: t.open_date or t.created_at)
+                        if oldest_transaction:
+                            entry_order_stmt = (
+                                select(TradingOrder)
+                                .where(
+                                    TradingOrder.transaction_id == oldest_transaction.id,
+                                    TradingOrder.side == oldest_transaction.side,
+                                    TradingOrder.status == OrderStatus.FILLED
+                                )
+                                .order_by(TradingOrder.created_at.asc())
+                                .limit(1)
+                            )
+                            existing_order = session.exec(entry_order_stmt).first()
+                            if existing_order:
+                                self.logger.debug(f"Resolved entry order {existing_order.id} for {recommendation.symbol} (created: {existing_order.created_at})")
+
                         # Evaluate recommendation through the open_positions ruleset
                         self.logger.debug(f"Evaluating recommendation {recommendation.id} for {recommendation.symbol} (open_positions)")
-                        
+
                         action_summaries = evaluator.evaluate(
                             instrument_name=recommendation.symbol,
                             expert_recommendation=recommendation,
                             ruleset_id=expert_instance.open_positions_ruleset_id,
-                            existing_order=None
+                            existing_order=existing_order
                         )
                         
                         # Check if evaluation produced any actions

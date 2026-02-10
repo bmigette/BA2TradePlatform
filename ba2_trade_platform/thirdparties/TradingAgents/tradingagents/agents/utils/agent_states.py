@@ -92,6 +92,9 @@ class AgentState(MessagesState):
     ]
     final_trade_decision: Annotated[str, "Final decision made by the Risk Analysts"]
     
+    # price context
+    current_price: Annotated[float, "Current market price of the instrument (prefetched from broker)"]
+
     # final summarization step
     expert_recommendation: Annotated[dict, "Structured expert recommendation from Final Summarization Agent"]
     final_analysis_summary: Annotated[dict, "Summary of analysis components from Final Summarization Agent"]

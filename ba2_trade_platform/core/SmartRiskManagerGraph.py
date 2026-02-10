@@ -340,15 +340,37 @@ def _build_positions_summary(open_positions: List[Dict[str, Any]]) -> str:
     """
     if not open_positions:
         return "No open positions. You can only open new positions."
-    
+
     lines = ["**ONLY these transaction IDs are valid for actions:**"]
     for pos in open_positions:
         tid = pos.get('transaction_id')
         symbol = pos.get('symbol')
         qty = pos.get('quantity')
         direction = pos.get('direction', 'BUY')
-        lines.append(f"- **Transaction #{tid}**: {symbol} ({qty} shares, {direction})")
-    
+        current_price = pos.get('current_price')
+        entry_price = pos.get('entry_price')
+        pnl_pct = pos.get('unrealized_pnl_pct')
+
+        # Build price info string
+        price_info = ""
+        if current_price:
+            price_info += f" @ ${current_price:.2f}"
+        if entry_price:
+            price_info += f" | Entry: ${entry_price:.2f}"
+        if pnl_pct is not None:
+            sign = "+" if pnl_pct >= 0 else ""
+            price_info += f" | P&L: {sign}{pnl_pct:.1f}%"
+
+        # Build SL/TP info
+        sl_order = pos.get('sl_order')
+        tp_order = pos.get('tp_order')
+        if sl_order and sl_order.get('price'):
+            price_info += f" | SL: ${sl_order['price']:.2f}"
+        if tp_order and tp_order.get('price'):
+            price_info += f" | TP: ${tp_order['price']:.2f}"
+
+        lines.append(f"- **Transaction #{tid}**: {symbol} ({qty} shares, {direction}){price_info}")
+
     lines.append("")
     lines.append("⚠️ **CRITICAL**: Do NOT use any other transaction IDs!")
     lines.append("⚠️ Do NOT guess IDs like 1, 2, 3 - use the EXACT IDs listed above.")
@@ -612,9 +634,11 @@ Research market analyses and recommend specific trading actions. You have FULL A
 **Research Tools:**
 - `get_positions_tool()` - Get portfolio positions with transaction_ids, quantities, TP/SL levels
 - `get_trade_summary_by_symbol_tool()` - Get aggregated BUY/SELL quantities across ALL experts (use for hedging check)
-- `get_current_price_tool(symbol)` - Get price for one symbol
-- `get_current_prices_tool(symbols: List[str])` - Get prices for multiple symbols (RECOMMENDED)
+- `get_current_price_tool(symbol)` - Get price for one symbol (only for symbols NOT in your context above)
+- `get_current_prices_tool(symbols: List[str])` - Get prices for multiple symbols (only for symbols NOT in your context above)
 - `get_all_recent_analyses_tool(max_age_hours=72)` - Discover all available analyses
+
+**Note:** Current prices for all portfolio positions and analyzed symbols are already included in the sections above. Only use price tools for symbols NOT already listed in your context.
 - `get_analysis_outputs_batch_tool(analysis_ids, output_keys)` - Fetch analysis content (RECOMMENDED)
 - `get_analysis_outputs_tool(analysis_id)` - List available output keys for an analysis
 - `get_analysis_output_detail_tool(analysis_id, output_key)` - Get specific output content
@@ -1454,9 +1478,10 @@ def check_recent_analyses(state: SmartRiskManagerState) -> Dict[str, Any]:
                     'confidence': confidence if confidence is not None else 0.0,
                     'expected_profit': expected_profit,
                     'risk_level': risk_level,
-                    'term': time_horizon.replace('_', ' ').title()
+                    'term': time_horizon.replace('_', ' ').title(),
+                    'price_at_analysis': recommendation.price_at_date,
                 }
-                
+
                 # Check if SL/TP data exists in recommendation.data
                 if recommendation.data:
                     rec_details['sl_price'] = recommendation.data.get('stop_loss_price')
@@ -1549,12 +1574,24 @@ def check_recent_analyses(state: SmartRiskManagerState) -> Dict[str, Any]:
                         risk_info = ""
                         if rec_details.get('risk_level'):
                             risk_info = f" | Risk: {rec_details['risk_level']}"
-                        
+
+                        # Build price-at-analysis info with delta
+                        price_analysis_info = ""
+                        price_at_analysis = rec_details.get('price_at_analysis')
+                        if price_at_analysis:
+                            price_analysis_info = f" | Price@Analysis: ${price_at_analysis:.2f}"
+                            # Calculate delta from current bid price
+                            sym_bid = bid_prices.get(sym)
+                            if sym_bid and price_at_analysis > 0:
+                                delta_pct = ((sym_bid - price_at_analysis) / price_at_analysis) * 100
+                                sign = "+" if delta_pct >= 0 else ""
+                                price_analysis_info += f" ({sign}{delta_pct:.1f}%)"
+
                         analyses_summary += (
                             f"  [{time_display}] [Analysis #{analysis['analysis_id']}] {analysis['expert_name']}\n"
                             f"    → Confidence: {rec_details['confidence']:.1f}% | "
                             f"Expected Profit: {rec_details.get('expected_profit', 0.0):.1f}% | "
-                            f"Term: {rec_details['term']}{sl_tp_info}{risk_info}\n"
+                            f"Term: {rec_details['term']}{sl_tp_info}{risk_info}{price_analysis_info}\n"
                         )
                     else:
                         # Fallback to simple format (no recommendation data available)

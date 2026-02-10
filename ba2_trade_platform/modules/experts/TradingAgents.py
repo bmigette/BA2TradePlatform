@@ -813,8 +813,19 @@ Analysis completed at: {self._get_current_timestamp()}"""
         # Run analysis
         trade_date = datetime.now().strftime("%Y-%m-%d")
         self.logger.debug(f"Running TradingAgents propagation for {symbol} on {trade_date}")
-        
-        final_state, processed_signal = ta_graph.propagate(symbol, trade_date)
+
+        # Prefetch current price from broker so the summarization agent has a real price
+        current_price = 0.0
+        try:
+            from ...core.utils import get_account_instance_from_id
+            account = get_account_instance_from_id(self.instance.account_id)
+            if account:
+                current_price = account.get_instrument_current_price(symbol) or 0.0
+                self.logger.info(f"Prefetched current price for {symbol}: ${current_price:.2f}")
+        except Exception as e:
+            self.logger.warning(f"Could not prefetch current price for {symbol}: {e}")
+
+        final_state, processed_signal = ta_graph.propagate(symbol, trade_date, current_price=current_price)
         self.logger.debug(f"TradingAgents propagation completed for {symbol}")
         
         return final_state, processed_signal

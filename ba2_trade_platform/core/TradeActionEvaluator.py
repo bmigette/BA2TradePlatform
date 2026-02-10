@@ -248,7 +248,7 @@ class TradeActionEvaluator:
                     action_results.append(result_dict)
                     
                     # Log trade action activity (entering markets = new entry)
-                    from ..utils import log_trade_action_activity
+                    from .utils import log_trade_action_activity
                     expert_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
                     log_trade_action_activity(
                         action_type=str(action_type),
@@ -355,7 +355,7 @@ class TradeActionEvaluator:
                             action_results.append(result_dict)
                             
                             # Log trade action activity (on open positions)
-                            from ..utils import log_trade_action_activity
+                            from .utils import log_trade_action_activity
                             expert_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
                             log_trade_action_activity(
                                 action_type=str(action_type),
