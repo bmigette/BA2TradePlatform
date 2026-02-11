@@ -142,3 +142,6 @@ cython_debug/
 
 # VS Code settings
 .vscode/
+
+# Git worktrees
+.worktrees/
