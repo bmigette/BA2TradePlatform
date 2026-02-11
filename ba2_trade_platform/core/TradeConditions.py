@@ -1092,7 +1092,7 @@ class InstrumentAccountShareCondition(CompareCondition):
             # Get expert virtual equity
             virtual_equity = self._get_expert_virtual_equity()
             if virtual_equity is None or virtual_equity <= 0:
-                logger.error(f"Invalid virtual equity for expert")
+                logger.error(f"Invalid virtual equity for expert {self.expert_recommendation.instance_id} ({self.instrument_name}): virtual_equity={virtual_equity}")
                 self.calculated_value = None
                 return False
             
