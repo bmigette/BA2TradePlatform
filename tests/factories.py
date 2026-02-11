@@ -19,13 +19,18 @@ from ba2_trade_platform.core.types import (
 from ba2_trade_platform.core.db import add_instance
 
 
+def _create_and_persist(obj):
+    """Add instance to DB using expunge_after_flush to avoid DetachedInstanceError."""
+    add_instance(obj, expunge_after_flush=True)
+    return obj
+
+
 def create_account_definition(
     name="Test Account", provider="MockAccount", description="Test account",
     **kwargs
 ):
     obj = AccountDefinition(name=name, provider=provider, description=description, **kwargs)
-    obj.id = add_instance(obj)
-    return obj
+    return _create_and_persist(obj)
 
 
 def create_expert_instance(
@@ -36,8 +41,7 @@ def create_expert_instance(
         account_id=account_id, expert=expert, enabled=enabled,
         virtual_equity_pct=virtual_equity_pct, **kwargs
     )
-    obj.id = add_instance(obj)
-    return obj
+    return _create_and_persist(obj)
 
 
 def create_recommendation(
@@ -61,8 +65,7 @@ def create_recommendation(
         details=details,
         **kwargs,
     )
-    obj.id = add_instance(obj)
-    return obj
+    return _create_and_persist(obj)
 
 
 def create_transaction(
@@ -77,8 +80,7 @@ def create_transaction(
         expert_id=expert_id,
         **kwargs,
     )
-    obj.id = add_instance(obj)
-    return obj
+    return _create_and_persist(obj)
 
 
 def create_trading_order(
@@ -96,8 +98,7 @@ def create_trading_order(
         transaction_id=transaction_id,
         **kwargs,
     )
-    obj.id = add_instance(obj)
-    return obj
+    return _create_and_persist(obj)
 
 
 def create_ruleset(
@@ -106,8 +107,7 @@ def create_ruleset(
     subtype=None, **kwargs
 ):
     obj = Ruleset(name=name, description=description, type=type, subtype=subtype, **kwargs)
-    obj.id = add_instance(obj)
-    return obj
+    return _create_and_persist(obj)
 
 
 def create_event_action(
@@ -124,8 +124,7 @@ def create_event_action(
         continue_processing=continue_processing,
         **kwargs,
     )
-    obj.id = add_instance(obj)
-    return obj
+    return _create_and_persist(obj)
 
 
 def create_market_analysis(
@@ -141,16 +140,18 @@ def create_market_analysis(
         subtype=subtype,
         **kwargs,
     )
-    obj.id = add_instance(obj)
-    return obj
+    return _create_and_persist(obj)
 
 
 def link_rule_to_ruleset(ruleset_id, eventaction_id, order_index=0):
-    """Create a RulesetEventActionLink record."""
+    """Create a RulesetEventActionLink record (composite PK, no id field)."""
+    from ba2_trade_platform.core.db import get_db
     obj = RulesetEventActionLink(
         ruleset_id=ruleset_id,
         eventaction_id=eventaction_id,
         order_index=order_index,
     )
-    add_instance(obj)
+    with get_db() as session:
+        session.add(obj)
+        session.commit()
     return obj

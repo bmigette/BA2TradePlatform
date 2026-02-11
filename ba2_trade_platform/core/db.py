@@ -673,29 +673,28 @@ def move_rule_up(ruleset_id: int, eventaction_id: int) -> bool:
             from .models import RulesetEventActionLink
             from sqlalchemy import update
             with Session(engine) as session:
-                # Get the current order index
-                current_result = session.exec(
+                # Get the current order index (scalar to get int, not Row)
+                current_order = session.exec(
                     select(RulesetEventActionLink.order_index).where(
                         RulesetEventActionLink.ruleset_id == ruleset_id,
                         RulesetEventActionLink.eventaction_id == eventaction_id
                     )
-                ).first()
-                
-                if not current_result or current_result == 0:
+                ).scalar()
+
+                if current_order is None or current_order == 0:
                     return False  # Already at top or not found
-                
-                current_order = current_result
+
                 target_order = current_order - 1
-                
+
                 # Get the eventaction_id that's currently at the target position
-                above_result = session.exec(
+                above_ea_id = session.exec(
                     select(RulesetEventActionLink.eventaction_id).where(
                         RulesetEventActionLink.ruleset_id == ruleset_id,
                         RulesetEventActionLink.order_index == target_order
                     )
-                ).first()
-                
-                if above_result:
+                ).scalar()
+
+                if above_ea_id is not None:
                     # Swap the order indexes using SQLAlchemy Core updates
                     # Move current rule to target position
                     stmt1 = update(RulesetEventActionLink).where(
@@ -706,17 +705,17 @@ def move_rule_up(ruleset_id: int, eventaction_id: int) -> bool:
                     # Move above rule to current position
                     stmt2 = update(RulesetEventActionLink).where(
                         RulesetEventActionLink.ruleset_id == ruleset_id,
-                        RulesetEventActionLink.eventaction_id == above_result
+                        RulesetEventActionLink.eventaction_id == above_ea_id
                     ).values(order_index=current_order)
-                    
+
                     session.execute(stmt1)
                     session.execute(stmt2)
                     session.commit()
                     logger.info(f"Moved rule {eventaction_id} up in ruleset {ruleset_id}")
                     return True
-                
+
                 return False
-                
+
         except Exception as e:
             logger.error(f"Error moving rule up: {e}", exc_info=True)
             return False
@@ -739,40 +738,38 @@ def move_rule_down(ruleset_id: int, eventaction_id: int) -> bool:
             from .models import RulesetEventActionLink
             from sqlalchemy import update
             with Session(engine) as session:
-                # Get the current order index
-                current_result = session.exec(
+                # Get the current order index (scalar to get int, not Row)
+                current_order = session.exec(
                     select(RulesetEventActionLink.order_index).where(
                         RulesetEventActionLink.ruleset_id == ruleset_id,
                         RulesetEventActionLink.eventaction_id == eventaction_id
                     )
-                ).first()
-                
-                if not current_result:
+                ).scalar()
+
+                if current_order is None:
                     return False  # Not found
-                
-                current_order = current_result
-                
+
                 # Get the max order index for this ruleset
                 max_order = session.exec(
                     select(RulesetEventActionLink.order_index).where(
                         RulesetEventActionLink.ruleset_id == ruleset_id
                     ).order_by(RulesetEventActionLink.order_index.desc())
-                ).first()
-                
-                if not max_order or current_order >= max_order:
+                ).scalar()
+
+                if max_order is None or current_order >= max_order:
                     return False  # Already at bottom
-                
+
                 target_order = current_order + 1
-                
+
                 # Get the eventaction_id that's currently at the target position
-                below_result = session.exec(
+                below_ea_id = session.exec(
                     select(RulesetEventActionLink.eventaction_id).where(
                         RulesetEventActionLink.ruleset_id == ruleset_id,
                         RulesetEventActionLink.order_index == target_order
                     )
-                ).first()
-                
-                if below_result:
+                ).scalar()
+
+                if below_ea_id is not None:
                     # Swap the order indexes using SQLAlchemy Core updates
                     # Move current rule to target position
                     stmt1 = update(RulesetEventActionLink).where(
@@ -783,7 +780,7 @@ def move_rule_down(ruleset_id: int, eventaction_id: int) -> bool:
                     # Move below rule to current position
                     stmt2 = update(RulesetEventActionLink).where(
                         RulesetEventActionLink.ruleset_id == ruleset_id,
-                        RulesetEventActionLink.eventaction_id == below_result
+                        RulesetEventActionLink.eventaction_id == below_ea_id
                     ).values(order_index=current_order)
                     
                     session.execute(stmt1)

@@ -130,6 +130,37 @@ class MockAccount(AccountInterface):
     def get_order_by_broker_id(self, broker_order_id):
         return None
 
+    def symbols_exist(self, symbols):
+        return {s: True for s in symbols}
+
+    def _submit_order_impl(self, trading_order, tp_price=None, sl_price=None):
+        if not self._submit_order_result:
+            return None
+        trading_order.status = OrderStatus.FILLED
+        trading_order.filled_qty = trading_order.quantity
+        trading_order.open_price = self._prices.get(trading_order.symbol, 100.0)
+        return trading_order
+
+    def _get_instrument_current_price_impl(self, symbol_or_symbols, price_type='bid'):
+        if isinstance(symbol_or_symbols, list):
+            return {s: self._prices.get(s) for s in symbol_or_symbols}
+        return self._prices.get(symbol_or_symbols)
+
+    def get_order(self, order_id):
+        return None
+
+    def modify_order(self, order_id):
+        return None
+
+    def _set_order_tp_impl(self, trading_order, tp_price):
+        return True
+
+    def _set_order_sl_impl(self, trading_order, sl_price):
+        return True
+
+    def _set_order_tp_sl_impl(self, trading_order, tp_price, sl_price):
+        return True
+
 
 # ---------------------------------------------------------------------------
 # MockExpert — concrete MarketExpertInterface for tests
