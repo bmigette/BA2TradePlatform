@@ -87,9 +87,9 @@ class EventAction(SQLModel, table=True):
 
 class ExpertRecommendation(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    instance_id: int = Field(foreign_key="expertinstance.id", nullable=False, ondelete="CASCADE")
-    market_analysis_id: int | None = Field(foreign_key="marketanalysis.id", nullable=True, ondelete="CASCADE")
-    symbol: str
+    instance_id: int = Field(foreign_key="expertinstance.id", nullable=False, ondelete="CASCADE", index=True)
+    market_analysis_id: int | None = Field(foreign_key="marketanalysis.id", nullable=True, ondelete="CASCADE", index=True)
+    symbol: str = Field(index=True)
     recommended_action: OrderRecommendation
     expected_profit_percent: float
     price_at_date: float
@@ -98,7 +98,7 @@ class ExpertRecommendation(SQLModel, table=True):
     risk_level: RiskLevel = Field(description="LOW|MEDIUM|HIGH")
     time_horizon: TimeHorizon = Field(description="SHORT_TERM|MEDIUM_TERM|LONG_TERM")
     data: Dict[str, Any] | None = Field(default=None, sa_column=Column(JSON), description="Expert-specific data (nested by expert name)")
-    created_at: DateTime | None = Field(default_factory=lambda: DateTime.now(timezone.utc))
+    created_at: DateTime | None = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
     
     # Relationship back to market analysis
     market_analysis: Optional["MarketAnalysis"] = Relationship(back_populates="expert_recommendations")
@@ -109,12 +109,12 @@ class ExpertRecommendation(SQLModel, table=True):
 
 class MarketAnalysis(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    symbol: str
-    expert_instance_id: int = Field(foreign_key="expertinstance.id", nullable=False, ondelete="CASCADE")
-    status: MarketAnalysisStatus = MarketAnalysisStatus.PENDING
+    symbol: str = Field(index=True)
+    expert_instance_id: int = Field(foreign_key="expertinstance.id", nullable=False, ondelete="CASCADE", index=True)
+    status: MarketAnalysisStatus = Field(default=MarketAnalysisStatus.PENDING, index=True)
     subtype: AnalysisUseCase = Field(default=AnalysisUseCase.ENTER_MARKET)
     state: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict)
-    created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc))
+    created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
     
     # Relationships
     analysis_outputs: List["AnalysisOutput"] = Relationship(back_populates="market_analysis")
@@ -162,7 +162,7 @@ class AnalysisOutput(SQLModel, table=True):
 
 class Transaction(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    symbol: str
+    symbol: str = Field(index=True)
     quantity: float  # Always positive - use side field to determine LONG/SHORT
     side: OrderDirection  # BUY for LONG positions, SELL for SHORT positions
     open_price: float | None = Field(default=None)
@@ -172,15 +172,15 @@ class Transaction(SQLModel, table=True):
     open_date: DateTime | None = Field(default=None)
     close_date: DateTime | None = Field(default=None)
     close_reason: str | None = Field(default=None, description="Reason for closing (tp_sl_filled, manual_close, smart_risk_manager, broker_closed, etc.)")
-    status: TransactionStatus = Field(default=TransactionStatus.WAITING)
-    created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc))
-    
+    status: TransactionStatus = Field(default=TransactionStatus.WAITING, index=True)
+    created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
+
     # JSON field for storing additional data (e.g., TradeConditionsData)
     # Named 'meta_data' to avoid conflict with SQLAlchemy's reserved 'metadata' attribute
     meta_data: dict | None = Field(default=None, sa_column=Column(JSON))
-    
+
     # Optional reference to expert instance for tracking which expert initiated this transaction
-    expert_id: int | None = Field(foreign_key="expertinstance.id", nullable=True, ondelete="SET NULL")
+    expert_id: int | None = Field(foreign_key="expertinstance.id", nullable=True, ondelete="SET NULL", index=True)
     
     # Relationship to trading orders (1:many - one transaction can have multiple orders)
     trading_orders: List["TradingOrder"] = Relationship(back_populates="transaction")
@@ -388,21 +388,21 @@ class TradingOrder(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     # REMOVED order_id: str | None
     account_id: int = Field(foreign_key="accountdefinition.id", nullable=False, ondelete="CASCADE")
-    symbol: str
+    symbol: str = Field(index=True)
     quantity: float
-    side: OrderDirection 
+    side: OrderDirection
     order_type: OrderType
     good_for: str | None
-    status: OrderStatus = OrderStatus.UNKNOWN
+    status: OrderStatus = Field(default=OrderStatus.UNKNOWN, index=True)
     filled_qty: float | None
     open_price: float | None = Field(default=None, description="Price at which the order opened (for filled orders)")
     comment: str | None
-    created_at: DateTime | None = Field(default_factory=lambda: DateTime.now(timezone.utc))
-    
+    created_at: DateTime | None = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
+
     # New fields
     open_type: OrderOpenType = Field(default=OrderOpenType.AUTOMATIC)
     broker_order_id: str | None = Field(default=None, description="Broker-specific order ID for tracking")
-    expert_recommendation_id: int | None = Field(default=None, foreign_key="expertrecommendation.id", ondelete="SET NULL", description="Expert recommendation that generated this order")
+    expert_recommendation_id: int | None = Field(default=None, foreign_key="expertrecommendation.id", ondelete="SET NULL", index=True, description="Expert recommendation that generated this order")
     limit_price: float | None = Field(default=None, description="Limit price for limit orders")
     stop_price: float | None = Field(default=None, description="Stop price for stop orders")
 
@@ -411,7 +411,7 @@ class TradingOrder(SQLModel, table=True):
     depends_order_status_trigger: OrderStatus | None = Field(default=None, description="Status that the depends_on_order must reach to trigger this order")
     
     # Many:1 relationship with Transaction (many orders can belong to one transaction)
-    transaction_id: int | None = Field(foreign_key="transaction.id", nullable=True, ondelete="CASCADE")
+    transaction_id: int | None = Field(foreign_key="transaction.id", nullable=True, ondelete="CASCADE", index=True)
     transaction: Optional["Transaction"] = Relationship(back_populates="trading_orders")
     
     # Self-referencing relationship for order dependencies - uses depends_on_order FK
@@ -585,10 +585,10 @@ class TradeActionResult(SQLModel, table=True):
     data: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict, description="Additional data from the action")
     
     # Timestamps
-    created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), description="When the action was executed")
-    
+    created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True, description="When the action was executed")
+
     # Foreign key relationships (expert_recommendation_id is required - all actions come from recommendations)
-    expert_recommendation_id: int = Field(foreign_key="expertrecommendation.id", nullable=False, ondelete="CASCADE", description="Expert recommendation that triggered this action")
+    expert_recommendation_id: int = Field(foreign_key="expertrecommendation.id", nullable=False, ondelete="CASCADE", index=True, description="Expert recommendation that triggered this action")
     
     # Relationships
     expert_recommendation: "ExpertRecommendation" = Relationship(back_populates="trade_action_results")
@@ -640,15 +640,15 @@ class ActivityLog(SQLModel, table=True):
     Records transaction lifecycle, TP/SL modifications, risk manager runs, analysis execution, etc.
     """
     id: int | None = Field(default=None, primary_key=True)
-    created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), description="When this activity occurred")
-    
+    created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True, description="When this activity occurred")
+
     # Classification
     severity: ActivityLogSeverity = Field(description="SUCCESS, INFO, WARNING, FAILURE, DEBUG")
-    type: ActivityLogType = Field(description="Type of activity (e.g., TRANSACTION_CREATED, ANALYSIS_COMPLETED)")
-    
+    type: ActivityLogType = Field(index=True, description="Type of activity (e.g., TRANSACTION_CREATED, ANALYSIS_COMPLETED)")
+
     # Source context
-    source_expert_id: int | None = Field(default=None, foreign_key="expertinstance.id", nullable=True, ondelete="CASCADE", description="Expert that generated this activity (if applicable)")
-    source_account_id: int | None = Field(default=None, foreign_key="accountdefinition.id", nullable=True, ondelete="CASCADE", description="Account associated with this activity (if applicable)")
+    source_expert_id: int | None = Field(default=None, foreign_key="expertinstance.id", nullable=True, ondelete="CASCADE", index=True, description="Expert that generated this activity (if applicable)")
+    source_account_id: int | None = Field(default=None, foreign_key="accountdefinition.id", nullable=True, ondelete="CASCADE", index=True, description="Account associated with this activity (if applicable)")
     
     # Content
     description: str = Field(description="Human-readable description of the activity")

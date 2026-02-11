@@ -682,12 +682,17 @@ class TransactionHelper:
                         f"NEGATIVE QUANTITY DETECTED in partial close (remaining_qty): {remaining_qty}",
                         exc_info=True
                     )
-                transaction.quantity = abs(float(remaining_qty))
-                if tp_price:
-                    transaction.take_profit = tp_price
-                if sl_price:
-                    transaction.stop_loss = sl_price
-                update_instance(transaction)
+                # Update transaction scalars directly to avoid session conflict
+                # (transaction may have relationship objects loaded from a different session)
+                with Session(get_db().bind) as update_session:
+                    db_txn = update_session.get(Transaction, transaction.id)
+                    if db_txn:
+                        db_txn.quantity = abs(float(remaining_qty))
+                        if tp_price:
+                            db_txn.take_profit = tp_price
+                        if sl_price:
+                            db_txn.stop_loss = sl_price
+                        update_session.commit()
                 
                 result["success"] = True
                 result["message"] = (
@@ -796,12 +801,17 @@ class TransactionHelper:
                         f"NEGATIVE QUANTITY DETECTED in bulk_modify_tp_sl (new_qty): {new_qty}",
                         exc_info=True
                     )
-                transaction.quantity = abs(float(new_qty))
-                if tp_price:
-                    transaction.take_profit = tp_price
-                if sl_price:
-                    transaction.stop_loss = sl_price
-                update_instance(transaction)
+                # Update transaction scalars directly to avoid session conflict
+                # (transaction may have relationship objects loaded from a different session)
+                with Session(get_db().bind) as update_session:
+                    db_txn = update_session.get(Transaction, transaction.id)
+                    if db_txn:
+                        db_txn.quantity = abs(float(new_qty))
+                        if tp_price:
+                            db_txn.take_profit = tp_price
+                        if sl_price:
+                            db_txn.stop_loss = sl_price
+                        update_session.commit()
                 
                 result["success"] = True
                 result["message"] = (
