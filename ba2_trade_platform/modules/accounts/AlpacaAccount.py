@@ -182,25 +182,80 @@ class AlpacaAccount(AccountInterface):
         """
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
         return f"{timestamp}-{order_type}-[ACC:{account_id}/TR:{transaction_id}/PORD:{parent_order_id}]"
-    
-    def _update_existing_oco_legs(self, parent_order: TradingOrder, alpaca_parent_order) -> int:
+
+    @staticmethod
+    def _sanitize_enum_field(value, enum_class, field_name, nullable=True, default_value=None):
+        """
+        Sanitize enum values from Alpaca API with proper logging and error handling.
+
+        Args:
+            value: The value to sanitize
+            enum_class: The enum class to validate against
+            field_name: Name of the field for logging
+            nullable: Whether the field can be None
+            default_value: Default value if sanitization fails (only for non-nullable fields)
+
+        Returns:
+            Sanitized enum value or None/default_value
+
+        Raises:
+            ValueError: If field is not nullable and sanitization fails
+        """
+        if value is None:
+            if nullable:
+                return None
+            elif default_value is not None:
+                return default_value
+            else:
+                raise ValueError(f"Required enum field '{field_name}' cannot be None")
+
+        # Handle Alpaca enum objects - extract the .value attribute
+        if hasattr(value, 'value'):
+            str_value = str(value.value).lower()
+        else:
+            # Convert value to string for comparison
+            str_value = str(value).lower()
+
+        # Try to find matching enum value (case-insensitive)
+        for enum_item in enum_class:
+            if enum_item.value.lower() == str_value:
+                return enum_item
+
+        # Special handling for OrderStatus
+        if enum_class == OrderStatus:
+            if str_value in ['unknown', 'invalid', '']:
+                return OrderStatus.UNKNOWN
+            else:
+                logger.warning(f"Unknown Alpaca order status '{value}' for field '{field_name}', setting to UNKNOWN")
+                return OrderStatus.UNKNOWN
+
+        # For other enums, log warning and handle based on nullability
+        if nullable:
+            logger.warning(f"Unknown value '{value}' for enum field '{field_name}', setting to None")
+            return None
+        elif default_value is not None:
+            logger.warning(f"Unknown value '{value}' for required enum field '{field_name}', using default value")
+            return default_value
+        else:
+            raise ValueError(f"Unknown value '{value}' for required enum field '{field_name}' and no default provided")
+
+    def _update_existing_oco_legs(self, parent_order: TradingOrder) -> int:
         """
         Update status and other fields of existing OCO leg orders in the database.
-        
+
         CRITICAL FIX: OCO leg orders are NOT returned by Alpaca's get_orders() API as separate items.
         They are only returned as metadata on the parent OCO order. However, they exist in our database
         as separate TradingOrder records. During refresh_orders(), we must explicitly update these legs
         because they won't be processed by the main loop.
-        
+
         This method:
         1. Finds all leg orders linked to this parent OCO order in the database
         2. For each leg, fetches its current status from Alpaca (via get_order API)
         3. Updates the database record if the status or filled_qty changed
-        
+
         Args:
             parent_order: The parent OCO TradingOrder record
-            alpaca_parent_order: The Alpaca order object for the parent OCO
-            
+
         Returns:
             int: Number of leg orders updated
         """
@@ -476,79 +531,23 @@ class AlpacaAccount(AccountInterface):
         """
         Convert an Alpaca order object to a TradingOrder object.
         """
-        # Helper function to sanitize enum fields
-        def sanitize_enum_field(value, enum_class, field_name, nullable=True, default_value=None):
-            """
-            Sanitize enum values with proper logging and error handling.
-            
-            Args:
-                value: The value to sanitize
-                enum_class: The enum class to validate against
-                field_name: Name of the field for logging
-                nullable: Whether the field can be None
-                default_value: Default value if sanitization fails (only for non-nullable fields)
-            
-            Returns:
-                Sanitized enum value or None/default_value
-            
-            Raises:
-                ValueError: If field is not nullable and sanitization fails
-            """
-            if value is None:
-                if nullable:
-                    return None
-                elif default_value is not None:
-                    return default_value
-                else:
-                    raise ValueError(f"Required enum field '{field_name}' cannot be None")
-            
-            # Handle Alpaca enum objects - extract the .value attribute
-            if hasattr(value, 'value'):
-                str_value = str(value.value).lower()
-            else:
-                # Convert value to string for comparison
-                str_value = str(value).lower()
-            
-            # Try to find matching enum value (case-insensitive)
-            for enum_item in enum_class:
-                if enum_item.value.lower() == str_value:
-                    return enum_item
-            
-            # Special handling for OrderStatus
-            if enum_class == OrderStatus:
-                if str_value in ['unknown', 'invalid', '']:
-                    return OrderStatus.UNKNOWN
-                else:
-                    logger.warning(f"Unknown Alpaca order status '{value}' for field '{field_name}', setting to UNKNOWN")
-                    return OrderStatus.UNKNOWN
-            
-            # For other enums, log warning and handle based on nullability
-            if nullable:
-                logger.warning(f"Unknown value '{value}' for enum field '{field_name}', setting to None")
-                return None
-            elif default_value is not None:
-                logger.warning(f"Unknown value '{value}' for required enum field '{field_name}', using default value")
-                return default_value
-            else:
-                raise ValueError(f"Unknown value '{value}' for required enum field '{field_name}' and no default provided")
-        
         # Sanitize enum fields
-        side = sanitize_enum_field(
+        side = self._sanitize_enum_field(
             getattr(order, "side", None), 
             OrderDirection, 
             "side", 
             nullable=False
         )
         
-        order_type = sanitize_enum_field(
-            getattr(order, "type", None), 
-            OrderType, 
-            "order_type", 
-            nullable=False, 
+        order_type = self._sanitize_enum_field(
+            getattr(order, "type", None),
+            OrderType,
+            "order_type",
+            nullable=False,
             default_value=OrderType.MARKET
         )
-        
-        status = sanitize_enum_field(
+
+        status = self._sanitize_enum_field(
             getattr(order, "status", None), 
             OrderStatus, 
             "status", 
@@ -592,7 +591,7 @@ class AlpacaAccount(AccountInterface):
             status=status,
             filled_qty=getattr(order, "filled_qty", None),
             open_price=getattr(order, "filled_avg_price", None),  # Use broker's filled_avg_price as open_price
-            comment=getattr(order, "client_order_id", None),
+            comment=None,
             created_at=getattr(order, "created_at", None),
             legs_broker_ids=legs_broker_ids,  # Store OCO leg broker IDs for upstream processing
         )
@@ -629,30 +628,33 @@ class AlpacaAccount(AccountInterface):
         )
         
     @alpaca_api_retry
-    def get_orders(self, status: Optional[OrderStatus] = OrderStatus.ALL, fetch_all: bool = False): # TODO: Add filter handling
+    def _fetch_raw_alpaca_orders(self, status: Optional[OrderStatus] = OrderStatus.ALL, fetch_all: bool = False) -> list:
         """
-        Retrieve a list of orders based on the provided filter.
-        
+        Fetch raw Alpaca order objects from the API.
+
+        Returns raw Alpaca SDK order objects (not converted to TradingOrder).
+        Used internally by get_orders() and refresh_orders().
+
         Args:
             status: Filter by order status. Defaults to ALL.
-            fetch_all: If True, fetches ALL orders using date-based pagination. If False, returns first 500 orders.
-            
+            fetch_all: If True, fetches ALL orders using date-based pagination.
+                       If False, returns first 500 orders.
+
         Returns:
-            list: A list of TradingOrder objects representing the orders.
-            Returns empty list if an error occurs.
+            list: Raw Alpaca order objects. Empty list if authentication fails or error occurs.
         """
         if not self._check_authentication():
             return []
-            
+
         try:
             limit = 500  # Always use 500 as limit per Alpaca's maximum
             all_orders_dict = {}  # Use dict to deduplicate by broker_order_id
-            
+
             if fetch_all:
                 # Paginate through all orders using date-based pagination
                 until_date = None  # Start with no date filter (gets most recent orders)
                 page = 0
-                
+
                 while True:
                     # Build filter with optional until parameter
                     filter_params = {
@@ -661,46 +663,46 @@ class AlpacaAccount(AccountInterface):
                     }
                     if until_date:
                         filter_params["until"] = until_date
-                    
+
                     filter = GetOrdersRequest(**filter_params)
                     filter.nested = True  # Get nested orders (for OCO)
                     alpaca_orders = self.client.get_orders(filter)
-                    
+
                     # If no orders returned, we've fetched everything
                     if not alpaca_orders:
                         logger.debug(f"No more orders to fetch at page {page + 1}")
                         break
-                    
+
                     # Add orders to dict (deduplicates by broker_order_id)
                     new_order_count = 0
                     oldest_order_date = None
-                    
+
                     for order in alpaca_orders:
                         if order.id:  # Alpaca's order.id is the broker_order_id
                             if order.id not in all_orders_dict:
                                 all_orders_dict[order.id] = order
                                 new_order_count += 1
-                            
+
                             # Track the oldest order date in this batch
                             if order.created_at:
                                 if oldest_order_date is None or order.created_at < oldest_order_date:
                                     oldest_order_date = order.created_at
-                    
+
                     logger.debug(
                         f"Fetched page {page + 1}: {len(alpaca_orders)} orders returned, "
                         f"{new_order_count} new unique orders (total unique: {len(all_orders_dict)})"
                     )
-                    
+
                     # If we got fewer than limit, we've reached the end
                     if len(alpaca_orders) < limit:
                         logger.debug(f"Received fewer than {limit} orders, pagination complete")
                         break
-                    
+
                     # If no new unique orders were added, we're seeing duplicates - stop
                     if new_order_count == 0:
                         logger.debug(f"No new unique orders in this batch, pagination complete")
                         break
-                    
+
                     # Set until_date to oldest order's date - 1 day for next iteration
                     # The 'until' parameter means "fetch orders created BEFORE this date"
                     # So we go backwards in time to get older orders
@@ -712,18 +714,18 @@ class AlpacaAccount(AccountInterface):
                         # No date found, can't continue pagination
                         logger.warning("No created_at date found in orders, stopping pagination")
                         break
-                    
+
                     page += 1
-                    
+
                     # Safety limit: stop after 100 pages to prevent infinite loops
                     if page >= 100:
                         logger.warning(f"Reached maximum pagination limit of 100 pages, stopping")
                         break
-                
+
                 # Convert dict values to list
                 alpaca_orders = list(all_orders_dict.values())
                 logger.info(f"Fetched {len(alpaca_orders)} unique orders across {page + 1} page(s)")
-                
+
             else:
                 # Just fetch first batch (up to 500 orders)
                 filter = GetOrdersRequest(
@@ -733,15 +735,29 @@ class AlpacaAccount(AccountInterface):
                 filter.nested = True  # Get nested orders (for OCO)
                 alpaca_orders = self.client.get_orders(filter)
                 logger.debug(f"Fetched {len(alpaca_orders)} orders (single page, no pagination)")
-            
-            # Convert to TradingOrder objects
-            orders = [self.alpaca_order_to_tradingorder(order) for order in alpaca_orders]
-            logger.debug(f"Converted to {len(orders)} TradingOrder objects")
-            return orders
-            
+
+            return alpaca_orders
+
         except Exception as e:
-            logger.error(f"Error listing Alpaca orders: {e}", exc_info=True)
+            logger.error(f"Error fetching Alpaca orders: {e}", exc_info=True)
             return []
+
+    def get_orders(self, status: Optional[OrderStatus] = OrderStatus.ALL, fetch_all: bool = False):
+        """
+        Retrieve a list of orders based on the provided filter.
+
+        Args:
+            status: Filter by order status. Defaults to ALL.
+            fetch_all: If True, fetches ALL orders using date-based pagination. If False, returns first 500 orders.
+
+        Returns:
+            list: A list of TradingOrder objects representing the orders.
+            Returns empty list if an error occurs.
+        """
+        raw_orders = self._fetch_raw_alpaca_orders(status=status, fetch_all=fetch_all)
+        orders = [self.alpaca_order_to_tradingorder(order) for order in raw_orders]
+        logger.debug(f"Converted {len(raw_orders)} raw orders to {len(orders)} TradingOrder objects")
+        return orders
 
     @alpaca_api_retry
     def _submit_order_impl(self, trading_order: TradingOrder, tp_price: Optional[float] = None, sl_price: Optional[float] = None) -> TradingOrder:
@@ -927,7 +943,7 @@ class AlpacaAccount(AccountInterface):
                     time_in_force=time_in_force,
                     stop_price=rounded_stop_price,
                     limit_price=rounded_limit_price,
-                    client_order_id=trading_order.comment
+                    client_order_id=str(trading_order.id)
                 )
             elif order_type_value == CoreOrderType.OCO.value.lower():
                 # OCO (One-Cancels-Other): Both TP and SL in one submission
@@ -1483,159 +1499,168 @@ class AlpacaAccount(AccountInterface):
         """
         Refresh/synchronize account orders from Alpaca broker.
         This method updates database records with current order states from the broker.
-        
+
+        Uses raw Alpaca orders directly to access client_order_id (which is our database
+        order ID) as the primary matching mechanism.
+
         Args:
-            heuristic_mapping (bool): If True, attempt to map orders by comment field when broker_order_id is missing.
-                                      Useful for recovering from errors where broker_order_id wasn't saved.
-                                      Assumes comment field is unique for this account's orders.
-            fetch_all (bool): If True, fetches all orders from Alpaca using pagination. 
+            heuristic_mapping (bool): If True, pre-loads all database orders into memory for
+                                      faster broker_order_id lookups (performance optimization
+                                      for large order sets).
+            fetch_all (bool): If True, fetches all orders from Alpaca using pagination.
                               If False, fetches only first 500 orders (faster but incomplete).
                               Defaults to True for complete synchronization.
-        
+
         Returns:
             bool: True if refresh was successful, False otherwise
         """
         try:
-            # Get all orders from Alpaca (with pagination if fetch_all=True)
-            alpaca_orders = self.get_orders(OrderStatus.ALL, fetch_all=fetch_all)
-            
-            if not alpaca_orders:
+            # Get raw Alpaca orders (not converted to TradingOrder)
+            raw_alpaca_orders = self._fetch_raw_alpaca_orders(OrderStatus.ALL, fetch_all=fetch_all)
+
+            if not raw_alpaca_orders:
                 logger.warning("No orders returned from Alpaca during refresh")
                 return True
-            
+
             updated_count = 0
             mapped_count = 0
-            
-            # Get all database orders for this account (for heuristic mapping)
+
+            # Pre-load broker_order_id map for faster lookups when heuristic_mapping is enabled
+            broker_id_map = {}
             if heuristic_mapping:
                 with Session(get_db().bind) as session:
                     db_orders = session.exec(
                         select(TradingOrder).where(TradingOrder.account_id == self.id)
                     ).all()
-                    # Create lookup maps: comment -> db_order and broker_order_id -> db_order
-                    comment_map = {order.comment: order for order in db_orders if order.comment}
                     broker_id_map = {order.broker_order_id: order for order in db_orders if order.broker_order_id}
-            
-            # Process each Alpaca order
-            for alpaca_order in alpaca_orders:
-                if not alpaca_order.broker_order_id:
+
+            # Process each raw Alpaca order
+            for raw_order in raw_alpaca_orders:
+                broker_order_id = str(raw_order.id) if raw_order.id else None
+                if not broker_order_id:
                     continue
-                
+
                 db_order = None
-                
-                # Step 1: Try to find by broker_order_id first
-                if heuristic_mapping and alpaca_order.broker_order_id in broker_id_map:
-                    db_order = broker_id_map[alpaca_order.broker_order_id]
-                else:
-                    # Standard lookup by broker_order_id
-                    with Session(get_db().bind) as session:
-                        statement = select(TradingOrder).where(
-                            TradingOrder.broker_order_id == alpaca_order.broker_order_id,
-                            TradingOrder.account_id == self.id
-                        )
-                        result = session.exec(statement).first()
-                        if result:
-                            db_order = get_instance(TradingOrder, result.id)
-                
-                # Step 2: If not found and heuristic_mapping enabled, try client_order_id matching to our order ID
-                if not db_order and heuristic_mapping and alpaca_order.client_order_id:
+
+                # Step 1: Try client_order_id first (primary match)
+                # client_order_id is set to str(trading_order.id) during submission
+                client_order_id = getattr(raw_order, 'client_order_id', None)
+                if client_order_id:
                     try:
-                        # client_order_id should be our database order ID
-                        order_id_from_client = int(alpaca_order.client_order_id)
-                        with get_db() as session:
+                        order_id = int(client_order_id)
+                        candidate = get_instance(TradingOrder, order_id)
+                        if candidate and candidate.account_id == self.id:
+                            db_order = candidate
+                            # Backfill broker_order_id if missing
+                            if not db_order.broker_order_id:
+                                db_order.broker_order_id = broker_order_id
+                                update_instance(db_order)
+                                mapped_count += 1
+                                logger.info(f"Mapped database order {db_order.id} to broker order {broker_order_id} via client_order_id")
+                    except (ValueError, TypeError):
+                        # client_order_id is not a valid int (e.g., OCO legs set by Alpaca)
+                        pass
+
+                # Step 2: Fallback to broker_order_id lookup
+                if not db_order:
+                    if heuristic_mapping and broker_order_id in broker_id_map:
+                        db_order = broker_id_map[broker_order_id]
+                    else:
+                        with Session(get_db().bind) as session:
                             statement = select(TradingOrder).where(
-                                TradingOrder.id == order_id_from_client,
+                                TradingOrder.broker_order_id == broker_order_id,
                                 TradingOrder.account_id == self.id
                             )
                             result = session.exec(statement).first()
                             if result:
-                                candidate = get_instance(TradingOrder, result.id)
-                                # Only map if broker_order_id is empty (avoid overwriting valid mappings)
-                                if not candidate.broker_order_id:
-                                    db_order = candidate
-                                    db_order.broker_order_id = alpaca_order.broker_order_id
-                                    update_instance(db_order)
-                                    mapped_count += 1
-                                    logger.info(f"Heuristic mapping: Linked database order {db_order.id} to broker order {alpaca_order.broker_order_id} via client_order_id '{alpaca_order.client_order_id}'")
-                    except (ValueError, TypeError) as e:
-                        logger.debug(f"Could not parse client_order_id '{alpaca_order.client_order_id}' as order ID: {e}")
-                
+                                db_order = get_instance(TradingOrder, result.id)
+
                 # Step 3: Update order state if we found a match
                 if db_order:
                     has_changes = False
-                    #logger.debug(f"Processing order {db_order.id}: DB status={db_order.status}, Alpaca status={alpaca_order.status}, alpaca_broker_id={alpaca_order.broker_order_id}")
-                    
+
+                    # Convert Alpaca status to our OrderStatus enum
+                    alpaca_status = self._sanitize_enum_field(
+                        getattr(raw_order, 'status', None),
+                        OrderStatus,
+                        'status',
+                        nullable=False,
+                        default_value=OrderStatus.UNKNOWN
+                    )
+                    alpaca_filled_qty = getattr(raw_order, 'filled_qty', None)
+                    alpaca_open_price = getattr(raw_order, 'filled_avg_price', None)
+
                     # Special handling for PENDING_CANCEL orders: Can only transition to CANCELLED
                     # PENDING_CANCEL means we're waiting for cancellation before replacing the order
                     # Ignore all broker state updates except transition to CANCELLED
                     if db_order.status == OrderStatus.PENDING_CANCEL:
-                        if alpaca_order.status == OrderStatus.CANCELED:
+                        if alpaca_status == OrderStatus.CANCELED:
                             logger.info(f"Order {db_order.id} transitioned from PENDING_CANCEL to CANCELED as expected")
                             db_order.status = OrderStatus.CANCELED
                             has_changes = True
                         else:
                             # Ignore broker state - order is waiting for cancellation
-                            logger.debug(f"Order {db_order.id} in PENDING_CANCEL - ignoring broker state {alpaca_order.status}, waiting for CANCELED")
+                            logger.debug(f"Order {db_order.id} in PENDING_CANCEL - ignoring broker state {alpaca_status}, waiting for CANCELED")
                     # Normal status update for non-PENDING_CANCEL orders
-                    elif db_order.status != alpaca_order.status:
-                        logger.debug(f"Order {db_order.id} status changed: {db_order.status} -> {alpaca_order.status}")
-                        db_order.status = alpaca_order.status
+                    elif db_order.status != alpaca_status:
+                        logger.debug(f"Order {db_order.id} status changed: {db_order.status} -> {alpaca_status}")
+                        db_order.status = alpaca_status
                         has_changes = True
-                    
-                    if db_order.filled_qty is None or float(db_order.filled_qty) != float(alpaca_order.filled_qty):
-                        logger.debug(f"Order {db_order.id} filled_qty changed: {db_order.filled_qty} -> {alpaca_order.filled_qty}")
-                        db_order.filled_qty = alpaca_order.filled_qty
+
+                    if alpaca_filled_qty is not None and (db_order.filled_qty is None or float(db_order.filled_qty) != float(alpaca_filled_qty)):
+                        logger.debug(f"Order {db_order.id} filled_qty changed: {db_order.filled_qty} -> {alpaca_filled_qty}")
+                        db_order.filled_qty = alpaca_filled_qty
                         has_changes = True
-                    
+
                     # Update open_price if it changed (use broker's filled_avg_price)
-                    if alpaca_order.open_price and (db_order.open_price is None or float(db_order.open_price) != float(alpaca_order.open_price)):
-                        logger.debug(f"Order {db_order.id} open_price changed: {db_order.open_price} -> {alpaca_order.open_price}")
-                        db_order.open_price = alpaca_order.open_price
+                    if alpaca_open_price and (db_order.open_price is None or float(db_order.open_price) != float(alpaca_open_price)):
+                        logger.debug(f"Order {db_order.id} open_price changed: {db_order.open_price} -> {alpaca_open_price}")
+                        db_order.open_price = alpaca_open_price
                         has_changes = True
-                    
-                    # Update broker_order_id if it wasn't set before (non-heuristic path)
+
+                    # Update broker_order_id if it wasn't set before
                     if not db_order.broker_order_id:
-                        logger.debug(f"Order {db_order.id} broker_order_id set to: {alpaca_order.broker_order_id}")
-                        db_order.broker_order_id = alpaca_order.broker_order_id
+                        logger.debug(f"Order {db_order.id} broker_order_id set to: {broker_order_id}")
+                        db_order.broker_order_id = broker_order_id
                         has_changes = True
-                    
+
                     # Use thread-safe update if there were changes
                     if has_changes:
                         update_instance(db_order)
                         updated_count += 1
-                        logger.debug(f"Updated database order {db_order.id} with changes from Alpaca order {alpaca_order.broker_order_id}")
-                    
-                    # Step 3a: Update or insert OCO order legs if this is an OCO order and we have a matched DB order
+                        logger.debug(f"Updated database order {db_order.id} with changes from Alpaca order {broker_order_id}")
+
+                    # Step 3a: Update or insert OCO order legs if this is an OCO order
                     if db_order.order_type == CoreOrderType.OCO:
                         legs_inserted = 0
                         legs_updated = 0
-                        
-                        # Try to update existing legs from the converted order's legs_broker_ids field
-                        # This field is populated by alpaca_order_to_tradingorder() when Alpaca returns legs
-                        if alpaca_order.legs_broker_ids:
-                            #logger.debug(f"Order {db_order.id} has {len(alpaca_order.legs_broker_ids)} OCO leg broker IDs: {alpaca_order.legs_broker_ids}")
-                            # CRITICAL FIX: Update existing OCO legs that are already in database
-                            # OCO legs are NOT returned by get_orders() as separate items, so we must update them
-                            # based on the parent order's status and information
-                            legs_updated = self._update_existing_oco_legs(db_order, alpaca_order)
-                            # Then insert any legs that don't exist yet
-                            legs_inserted = self._insert_oco_legs_from_broker_ids(db_order, alpaca_order.legs_broker_ids)
-                        
-                        # Also try insert legs from the raw Alpaca order if it has them
-                        # (Alpaca submit_order response includes full leg objects, but get_orders response doesn't)
-                        if (hasattr(alpaca_order, 'order_class') and 
-                            alpaca_order.order_class == OrderClass.OCO and
-                            hasattr(alpaca_order, 'legs') and alpaca_order.legs):
-                            self._insert_oco_order_legs(alpaca_order, db_order, db_order.transaction_id)
-                        
+
+                        # Extract legs_broker_ids from raw order's legs array
+                        raw_legs = getattr(raw_order, 'legs', None)
+                        legs_broker_ids = None
+                        if raw_legs:
+                            legs_broker_ids = [str(leg.id) for leg in raw_legs if hasattr(leg, 'id') and leg.id]
+
+                        if legs_broker_ids:
+                            # Update existing OCO legs in database
+                            legs_updated = self._update_existing_oco_legs(db_order)
+                            # Insert any legs that don't exist yet (has duplicate check by broker_order_id)
+                            legs_inserted = self._insert_oco_legs_from_broker_ids(db_order, legs_broker_ids)
+                        elif raw_legs:
+                            # Fallback: full leg objects but no broker IDs extracted — use raw leg insertion
+                            self._insert_oco_order_legs(raw_order, db_order, db_order.transaction_id)
+                        else:
+                            # OCO order but no legs in response -- update existing legs from individual API calls
+                            legs_updated = self._update_existing_oco_legs(db_order)
+
                         if legs_inserted > 0 or legs_updated > 0:
                             logger.info(f"Order {db_order.id}: Updated {legs_updated} OCO legs, Inserted {legs_inserted} OCO leg orders")
-            
+
             # Step 4: Mark database orders with broker_order_ids that don't exist in Alpaca as CANCELED
             # This catches orders that were canceled in Alpaca but status wasn't updated in database
             canceled_count = 0
-            alpaca_broker_ids = {order.broker_order_id for order in alpaca_orders if order.broker_order_id}
-            
+            alpaca_broker_ids = {str(order.id) for order in raw_alpaca_orders if order.id}
+
             # CRITICAL: Add OCO leg broker IDs to safe set
             # OCO legs are not returned by get_orders() as separate items, but they exist in our database
             # We must include their broker IDs in the safe set so they don't get incorrectly marked as CANCELED
@@ -1649,11 +1674,11 @@ class AlpacaAccount(AccountInterface):
                     )
                 ).all()
                 oco_leg_broker_ids = {leg.broker_order_id for leg in oco_legs}
-            
+
             # Combine both sets: parent orders + OCO legs
             alpaca_broker_ids = alpaca_broker_ids.union(oco_leg_broker_ids)
             logger.debug(f"Total broker IDs to check (parents + OCO legs): {len(alpaca_broker_ids)} (parents: {len(alpaca_broker_ids) - len(oco_leg_broker_ids)}, legs: {len(oco_leg_broker_ids)})")
-            
+
             with Session(get_db().bind) as session:
                 # Get all database orders for this account with broker_order_id and non-terminal status
                 db_active_orders = session.exec(
@@ -1661,12 +1686,12 @@ class AlpacaAccount(AccountInterface):
                         TradingOrder.account_id == self.id,
                         TradingOrder.broker_order_id.is_not(None),
                         TradingOrder.status.not_in([
-                            OrderStatus.FILLED, OrderStatus.CANCELED, 
+                            OrderStatus.FILLED, OrderStatus.CANCELED,
                             OrderStatus.EXPIRED, OrderStatus.REPLACED, OrderStatus.REJECTED
                         ])
                     )
                 ).all()
-                
+
                 for db_order in db_active_orders:
                     # If this broker_order_id doesn't exist in Alpaca anymore, check if we should mark as CANCELED
                     if db_order.broker_order_id not in alpaca_broker_ids:
@@ -1678,7 +1703,7 @@ class AlpacaAccount(AccountInterface):
                             if created_at.tzinfo is None:
                                 # created_at is offset-naive, make it aware in UTC
                                 created_at = created_at.replace(tzinfo=timezone.utc)
-                            
+
                             order_age_minutes = (datetime.now(timezone.utc) - created_at).total_seconds() / 60
                             if order_age_minutes < 5:
                                 logger.debug(
@@ -1686,7 +1711,7 @@ class AlpacaAccount(AccountInterface):
                                     f"not found in Alpaca but is only {order_age_minutes:.1f} minutes old - skipping cancellation"
                                 )
                                 continue
-                        
+
                         # CRITICAL: Before marking as CANCELED, try to verify order status at broker
                         # Alpaca's get_orders() API has retention limits and may not return old orders
                         # We should only mark as CANCELED if we can explicitly confirm the order is canceled
@@ -1697,7 +1722,7 @@ class AlpacaAccount(AccountInterface):
                         except Exception as check_err:
                             logger.debug(f"Could not verify order {db_order.broker_order_id} at broker: {check_err}")
                             verification_failed = True
-                        
+
                         # If we successfully retrieved the order from broker, update to match broker status
                         if broker_order:
                             if broker_order.status == OrderStatus.FILLED:
@@ -1731,12 +1756,12 @@ class AlpacaAccount(AccountInterface):
                                 fresh_order = get_instance(TradingOrder, db_order.id)
                                 if fresh_order:
                                     status_changed = fresh_order.status != broker_order.status
-                                    
+
                                     # Compare filled_qty with type conversion (broker may return string "0" vs float 0.0)
                                     broker_filled = float(broker_order.filled_qty) if broker_order.filled_qty else 0.0
                                     db_filled = float(fresh_order.filled_qty) if fresh_order.filled_qty else 0.0
                                     filled_qty_changed = broker_filled != db_filled
-                                    
+
                                     if status_changed or filled_qty_changed:
                                         logger.info(
                                             f"Order {db_order.id} (broker_order_id={db_order.broker_order_id}) "
@@ -1748,7 +1773,7 @@ class AlpacaAccount(AccountInterface):
                                         update_instance(fresh_order)
                                         updated_count += 1
                                 continue
-                        
+
                         # If verification failed or order not found at broker:
                         # DON'T automatically mark as CANCELED - this could be an old order beyond retention period
                         # Only mark as CANCELED if it's recent (less than 30 days old)
@@ -1757,7 +1782,7 @@ class AlpacaAccount(AccountInterface):
                                 created_at = db_order.created_at
                                 if created_at.tzinfo is None:
                                     created_at = created_at.replace(tzinfo=timezone.utc)
-                                
+
                                 order_age_days = (datetime.now(timezone.utc) - created_at).total_seconds() / 86400
                                 if order_age_days > 30:
                                     # Old order - probably beyond retention period, leave it alone
@@ -1766,7 +1791,7 @@ class AlpacaAccount(AccountInterface):
                                         f"not found at broker but is {order_age_days:.1f} days old (likely beyond retention period) - skipping"
                                     )
                                     continue
-                            
+
                             # Recent order not found - mark as CANCELED
                             logger.warning(
                                 f"Order {db_order.id} (broker_order_id={db_order.broker_order_id}) "
@@ -1777,16 +1802,16 @@ class AlpacaAccount(AccountInterface):
                                 fresh_order.status = OrderStatus.CANCELED
                                 update_instance(fresh_order)
                                 canceled_count += 1
-            
+
             # Step 5: Check for dependent orders that can now be submitted
             triggered_count = self._check_and_submit_dependent_orders()
-            
-            if heuristic_mapping and mapped_count > 0:
-                logger.info(f"Successfully refreshed orders from Alpaca: {updated_count} updated, {mapped_count} mapped via comment heuristic, {canceled_count} marked as canceled, {triggered_count} dependent orders triggered")
+
+            if mapped_count > 0:
+                logger.info(f"Successfully refreshed orders from Alpaca: {updated_count} updated, {mapped_count} mapped via client_order_id, {canceled_count} marked as canceled, {triggered_count} dependent orders triggered")
             else:
                 logger.info(f"Successfully refreshed orders from Alpaca: {updated_count} updated, {canceled_count} marked as canceled, {triggered_count} dependent orders triggered")
             return True
-            
+
         except Exception as e:
             logger.error(f"Error refreshing orders from Alpaca: {e}", exc_info=True)
             return False
