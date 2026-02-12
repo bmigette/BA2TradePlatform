@@ -27,6 +27,7 @@ import langchain
 from ..logger import logger
 from .. import config as config_module
 from .models import SmartRiskManagerJob, MarketAnalysis, Transaction
+from .types import MarketAnalysisStatus
 from .db import get_db, add_instance, update_instance, get_instance
 from .models import AppSetting
 from .SmartRiskManagerToolkit import SmartRiskManagerToolkit
@@ -673,7 +674,7 @@ Research market analyses and recommend specific trading actions. You have FULL A
 
 **Hedging Check{hedging_check_note}:**
 {hedging_instructions}
-
+{locked_symbols_section}
 **TP/SL on New Positions:**
 - Include `tp_price`/`sl_price` in `recommend_open_*_position()` - they're set automatically
 - Do NOT call separate `recommend_update_tp/sl()` after - creates duplicates!
@@ -3887,6 +3888,81 @@ class SmartRiskManagerGraph:
             finish_research_tool
         ]
     
+    def _build_locked_symbols_section(
+        self, expert_instance_id: int, trade_summary: Dict[str, Dict[str, float]]
+    ) -> str:
+        """
+        Build a locked symbols section for the research prompt when hedging is disabled.
+
+        Checks which symbols this expert has analyzed in the last 7 days, then cross-references
+        with account-wide positions (trade_summary) to determine direction locks.
+
+        If another expert on the same account holds a BUY position for TSLA, this expert
+        must not open a SELL for TSLA (and vice versa).
+
+        Args:
+            expert_instance_id: The expert instance to check analyses for
+            trade_summary: Account-wide aggregated positions {symbol: {buy_qty, sell_qty}}
+
+        Returns:
+            Formatted string section for the prompt, or empty string if no locks
+        """
+        from datetime import timedelta
+
+        try:
+            # Get symbols this expert analyzed in the last 7 days
+            with get_db() as session:
+                cutoff_time = datetime.now(timezone.utc) - timedelta(days=7)
+                analyzed_symbols_rows = session.exec(
+                    select(MarketAnalysis.symbol)
+                    .where(
+                        MarketAnalysis.expert_instance_id == expert_instance_id,
+                        MarketAnalysis.status == MarketAnalysisStatus.COMPLETED,
+                        MarketAnalysis.created_at >= cutoff_time
+                    )
+                    .distinct()
+                ).all()
+                analyzed_symbols = set(analyzed_symbols_rows)
+
+            # Also include symbols from trade_summary (positions this expert might act on)
+            all_relevant_symbols = analyzed_symbols | set(trade_summary.keys())
+
+            # Build locked symbols list
+            locked_lines = []
+            for symbol in sorted(all_relevant_symbols):
+                if symbol not in trade_summary:
+                    continue
+                buy_qty = trade_summary[symbol]["buy_qty"]
+                sell_qty = trade_summary[symbol]["sell_qty"]
+
+                if buy_qty > 0 and sell_qty == 0:
+                    locked_lines.append(
+                        f"- **{symbol}**: Existing BUY position (qty {buy_qty:.0f}) on account → "
+                        f"only BUY allowed, SELL is BLOCKED"
+                    )
+                elif sell_qty > 0 and buy_qty == 0:
+                    locked_lines.append(
+                        f"- **{symbol}**: Existing SELL position (qty {sell_qty:.0f}) on account → "
+                        f"only SELL allowed, BUY is BLOCKED"
+                    )
+
+            if locked_lines:
+                section = (
+                    "\n**🔒 Locked Symbols (account-wide positions, hedging disabled):**\n"
+                    "The following symbols already have positions on this account (across all experts). "
+                    "You MUST NOT open positions in the opposite direction.\n"
+                    + "\n".join(locked_lines)
+                    + "\n"
+                )
+                logger.info(f"Built locked symbols section with {len(locked_lines)} locked symbol(s)")
+                return section
+
+            return ""
+
+        except Exception as e:
+            logger.warning(f"Could not build locked symbols section: {e}")
+            return ""
+
     def _initialize_research_agent(self, state: SmartRiskManagerState) -> Dict[str, Any]:
         """Initialize research LLM and conversation ONCE before research loop starts."""
         logger.info("Initializing research agent (LLM + initial prompt) - ONCE per graph session...")
@@ -3949,7 +4025,15 @@ class SmartRiskManagerGraph:
             else:
                 hedging_check_note = " (DISABLED - CRITICAL)"
                 hedging_instructions = "- ⚠️ Hedging is DISABLED - You CANNOT open positions in opposite direction on symbols where positions already exist\n- BEFORE recommending new positions, ALWAYS call `get_trade_summary_by_symbol_tool()` to check aggregate exposure\n- If a symbol has BUY positions, you CANNOT open SELL positions (and vice versa)\n- Review the AGGREGATE TRADE SUMMARY above to ensure no excessive one-directional exposure"
-            
+
+            # Build locked symbols section when hedging is disabled
+            # Check symbols from recent analyses against account-wide positions
+            locked_symbols_section = ""
+            if not allow_hedging and trade_summary:
+                locked_symbols_section = self._build_locked_symbols_section(
+                    expert_instance_id, trade_summary
+                )
+
             research_system_prompt = RESEARCH_PROMPT.format(
                 current_positions_summary=current_positions_summary,
                 trade_summary_by_symbol=trade_summary_by_symbol,
@@ -3958,7 +4042,8 @@ class SmartRiskManagerGraph:
                 max_position_pct=max_position_pct,
                 max_position_equity=max_position_equity,
                 hedging_check_note=hedging_check_note,
-                hedging_instructions=hedging_instructions
+                hedging_instructions=hedging_instructions,
+                locked_symbols_section=locked_symbols_section
             )
 
             # Initialize conversation with system prompt - SENT ONCE
