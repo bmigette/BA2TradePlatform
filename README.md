@@ -921,13 +921,18 @@ Database auto-initializes at: `~/Documents/ba2_trade_platform/db.sqlite`
 
 ## 🧪 Testing
 
-**Run TradingAgents test**:
+**Run all unit tests (pytest)**:
 ```bash
-python test_trade_agents.py
+.venv\Scripts\python.exe -m pytest              # Run all tests
+.venv\Scripts\python.exe -m pytest -x            # Stop on first failure
+.venv\Scripts\python.exe -m pytest -k "test_name" # Run specific test
 ```
 
-**Basic functionality test**:
+Test configuration is in `pytest.ini`. Tests are located in the `tests/` directory.
+
+**Legacy test scripts**:
 ```bash
+python test_trade_agents.py
 python test.py
 ```
 
@@ -985,6 +990,12 @@ pip freeze > requirements.txt
 5. **ChromaDB Instance Conflicts**: Fixed in latest version - each expert/symbol combination now gets isolated ChromaDB storage
 
 6. **AttributeError on TradingOrder**: Ensure database schema is up-to-date. The `filled_avg_price` field was removed in favor of `open_price`
+
+7. **PyTorch DLL Error on Windows** (`OSError: [WinError 1114]`): The default PyTorch build may fail to load CUDA DLLs. Install the CPU-only build instead:
+   ```bash
+   pip install torch --index-url https://download.pytorch.org/whl/cpu
+   ```
+   Do not blindly upgrade torch to the latest version (e.g. 2.10+) — pin to a known working version such as `torch==2.6.0+cpu`.
 
 **Debug Mode**:
 ```python

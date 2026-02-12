@@ -39,9 +39,21 @@ python migrate.py current                          # Check current revision
 
 ### Running Tests
 ```bash
-# Test files are in test_files/ directory
+# Unit tests (pytest)
+.venv\Scripts\python.exe -m pytest              # Run all tests
+.venv\Scripts\python.exe -m pytest -x            # Stop on first failure
+.venv\Scripts\python.exe -m pytest -k "test_name" # Run specific test
+
+# Legacy test files
 .venv\Scripts\python.exe test_files/test_name.py
 ```
+
+### PyTorch / Transformers
+PyTorch is a transitive dependency (via `transformers` used by `langchain_core`). On Windows, use the **CPU-only** build to avoid CUDA DLL issues:
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+```
+Do NOT upgrade torch to the latest (e.g. 2.10+) blindly - it causes `OSError: [WinError 1114]` DLL load failures on Windows. Pin to a known working version (e.g. `torch==2.6.0+cpu`).
 
 ## Architecture
 
