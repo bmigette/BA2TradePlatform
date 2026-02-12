@@ -540,13 +540,12 @@ class ModelFactory:
     ) -> BaseChatModel:
         """Create a Moonshot (Kimi) LLM.
 
-        For thinking mode (kimi-k2.5 default), uses ChatKimiThinking which
-        subclasses ChatDeepSeek and preserves reasoning_content for multi-turn
-        tool calls by re-injecting it into outgoing assistant messages.
-
-        For non-thinking mode (kimi-k2.5-nonthinking), uses ChatOpenAI.
+        Uses ChatKimiThinking (ChatDeepSeek subclass) for all Kimi models.
+        Thinking mode is controlled by the thinking_enabled flag, which is
+        derived from model_kwargs or defaults to enabled.
         """
         from .models_registry import PROVIDER_CONFIG, PROVIDER_MOONSHOT
+        from .ChatKimiThinking import ChatKimiThinking
         base_url = PROVIDER_CONFIG[PROVIDER_MOONSHOT].get("base_url")
 
         # Check if thinking mode is enabled or disabled
@@ -554,75 +553,31 @@ class ModelFactory:
         thinking_type = thinking_config.get("type", "enabled") if isinstance(thinking_config, dict) else "enabled"
         thinking_enabled = thinking_type != "disabled"
 
-        if thinking_enabled:
-            from .ChatKimiThinking import ChatKimiThinking
+        llm_params = {
+            "model": model_name,
+            "api_key": api_key,
+            "api_base": base_url,
+            "thinking_enabled": thinking_enabled,
+            "max_retries": 3,
+            "streaming": False,  # Streaming + extra_body has langchain-openai issues
+        }
 
-            llm_params = {
-                "model": model_name,
-                "api_key": api_key,
-                "api_base": base_url,
-                "thinking_enabled": True,
-                "max_retries": 3,
-                "streaming": False,  # Streaming + extra_body has langchain-openai issues
-            }
+        if temperature is not None:
+            llm_params["temperature"] = temperature
 
-            if temperature is not None:
-                llm_params["temperature"] = temperature
+        if callbacks:
+            llm_params["callbacks"] = callbacks
 
-            if callbacks:
-                llm_params["callbacks"] = callbacks
+        # Pass model_kwargs excluding 'thinking' (handled by the class)
+        if model_kwargs:
+            filtered = {k: v for k, v in model_kwargs.items() if k != "thinking"}
+            if filtered:
+                llm_params["model_kwargs"] = filtered
 
-            # Pass model_kwargs excluding 'thinking' (handled by the class)
-            if model_kwargs:
-                filtered = {k: v for k, v in model_kwargs.items() if k != "thinking"}
-                if filtered:
-                    llm_params["model_kwargs"] = filtered
+        llm_params.update(extra_kwargs)
 
-            llm_params.update(extra_kwargs)
-
-            logger.info(f"Creating ChatKimiThinking: model={model_name}, thinking=enabled")
-            return ChatKimiThinking(**llm_params)
-        else:
-            # Use standard ChatOpenAI for non-thinking mode (faster, simpler)
-            from langchain_openai import ChatOpenAI
-
-            llm_params = {
-                "model": model_name,
-                "api_key": api_key,
-                "streaming": streaming,
-                "base_url": base_url,
-                "max_retries": 3,
-                "stream_usage": True,
-            }
-
-            if temperature is not None:
-                llm_params["temperature"] = temperature
-
-            if callbacks:
-                llm_params["callbacks"] = callbacks
-
-            # For non-thinking mode, pass thinking disabled via extra_body
-            extra_body_params = {"thinking": {"type": "disabled"}}
-            if model_kwargs:
-                direct_params = ['max_tokens', 'top_p', 'frequency_penalty', 'presence_penalty']
-                for key, value in model_kwargs.items():
-                    if key in direct_params:
-                        llm_params[key] = value
-                    elif key != "thinking":  # Skip thinking, already handled
-                        extra_body_params[key] = value
-
-            llm_params["extra_body"] = extra_body_params
-            # Disable streaming when using extra_body (langchain-openai bug)
-            if streaming:
-                logger.warning(
-                    f"Disabling streaming for {model_name} because extra_body is used."
-                )
-                llm_params["streaming"] = False
-
-            llm_params.update(extra_kwargs)
-
-            logger.info(f"Creating Moonshot via ChatOpenAI: model={model_name}, thinking=disabled")
-            return ChatOpenAI(**llm_params)
+        logger.info(f"Creating ChatKimiThinking: model={model_name}, thinking={'enabled' if thinking_enabled else 'disabled'}")
+        return ChatKimiThinking(**llm_params)
     
     @classmethod
     def _create_bedrock(
