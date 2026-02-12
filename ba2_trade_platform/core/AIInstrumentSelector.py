@@ -148,6 +148,18 @@ Your response:"""
                 logger.error("AI returned empty response after stripping whitespace")
                 return None
 
+            # Get max_instruments setting from expert if available
+            max_instruments = 50  # Default fallback
+            if expert_instance_id:
+                try:
+                    from .utils import get_expert_instance_from_id, get_setting_safe
+                    expert = get_expert_instance_from_id(expert_instance_id)
+                    if expert and expert.settings:
+                        max_instruments = get_setting_safe(expert.settings, 'max_instruments', 50, int)
+                        logger.debug(f"Using max_instruments setting: {max_instruments}")
+                except Exception as e:
+                    logger.debug(f"Could not retrieve max_instruments setting: {e}")
+
             # Parse JSON response
             try:
                 # Handle markdown-wrapped JSON responses
@@ -158,25 +170,13 @@ Your response:"""
                 elif response_content.startswith("```") and response_content.endswith("```"):
                     # Extract from generic code block
                     json_content = response_content[3:-3].strip()
-                
+
                 instruments = json.loads(json_content)
-                
+
                 # Validate response format
                 if not isinstance(instruments, list):
                     logger.error(f"AI response is not a list: {type(instruments)}")
                     return None
-                
-                # Get max_instruments setting from expert if available
-                max_instruments = 50  # Default fallback
-                if expert_instance_id:
-                    try:
-                        from .utils import get_expert_instance_from_id, get_setting_safe
-                        expert = get_expert_instance_from_id(expert_instance_id)
-                        if expert and expert.settings:
-                            max_instruments = get_setting_safe(expert.settings, 'max_instruments', 50, int)
-                            logger.debug(f"Using max_instruments setting: {max_instruments}")
-                    except Exception as e:
-                        logger.debug(f"Could not retrieve max_instruments setting: {e}")
                 
                 # Validate all items are strings (symbols)
                 valid_instruments = []
@@ -234,7 +234,40 @@ Your response:"""
                 except Exception as log_error:
                     logger.warning(f"Could not log activity: {log_error}")
                 
-                # Try to extract symbols from text if JSON parsing failed
+                # Retry once with explicit JSON-only instruction
+                logger.info(f"Retrying AI instrument selection with explicit JSON instruction (model: {self.model_string})")
+                try:
+                    retry_prompt = (
+                        "Could not parse your last response. Reply ONLY with a valid JSON array of stock symbols. "
+                        "No explanations, no markdown, no commentary. Example: [\"AAPL\", \"GOOGL\", \"NVDA\"]\n\n"
+                        + selection_prompt
+                    )
+                    retry_response = self._call_with_web_search(retry_prompt)
+                    if retry_response:
+                        retry_response = retry_response.strip()
+                        # Handle markdown-wrapped JSON
+                        retry_json = retry_response
+                        if retry_response.startswith("```json") and retry_response.endswith("```"):
+                            retry_json = retry_response[7:-3].strip()
+                        elif retry_response.startswith("```") and retry_response.endswith("```"):
+                            retry_json = retry_response[3:-3].strip()
+
+                        retry_instruments = json.loads(retry_json)
+                        if isinstance(retry_instruments, list):
+                            valid_instruments = []
+                            for item in retry_instruments:
+                                if isinstance(item, str) and len(item) > 0:
+                                    symbol = item.strip().upper()
+                                    if symbol.isalpha() and len(symbol) <= 10:
+                                        valid_instruments.append(symbol)
+                            if valid_instruments:
+                                unique_instruments = list(dict.fromkeys(valid_instruments))[:max_instruments]
+                                logger.info(f"Retry succeeded - AI selected {len(unique_instruments)} instruments (max_instruments={max_instruments}): {unique_instruments}")
+                                return unique_instruments
+                except Exception as retry_error:
+                    logger.warning(f"Retry with JSON instruction also failed: {retry_error}")
+
+                # Final fallback: try to extract symbols from text
                 return self._extract_symbols_from_text(response_content, expert_instance_id)
 
         except Exception as e:

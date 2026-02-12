@@ -1093,7 +1093,17 @@ class WorkerQueue:
             # Remove from persistence when task completes or fails
             if task.status in [WorkerTaskStatus.COMPLETED, WorkerTaskStatus.FAILED]:
                 self._remove_persisted_task(task.id)
-    
+
+            # Check if all analysis tasks are completed/failed for this expert
+            # This must run on both success AND failure so the SmartRiskManager triggers
+            # even when the last task in a batch fails
+            if task.status == WorkerTaskStatus.FAILED:
+                logger.debug(f"[RISK_MGR_TRIGGER] Task '{task.id}' (expert {task.expert_instance_id}, {task.subtype}) failed. Checking for SmartRiskManager trigger...")
+                if task.subtype == AnalysisUseCase.ENTER_MARKET:
+                    self._check_and_process_expert_recommendations(task.expert_instance_id, AnalysisUseCase.ENTER_MARKET)
+                elif task.subtype == AnalysisUseCase.OPEN_POSITIONS:
+                    self._check_and_process_expert_recommendations(task.expert_instance_id, AnalysisUseCase.OPEN_POSITIONS)
+
     def _execute_smart_risk_manager_task(self, task: SmartRiskManagerTask, worker_name: str):
         """Execute a Smart Risk Manager task."""
         logger.debug(f"Worker {worker_name} executing Smart Risk Manager task '{task.id}' for expert {task.expert_instance_id}")
