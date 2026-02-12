@@ -322,13 +322,13 @@ def test_native_provider_prefix():
         if hasattr(llm, 'base_url'):
             print(f"  Base URL: {llm.base_url}")
 
-        # kimi_k2.5 (not nonthinking) should use ChatMoonshotThinking
-        expected_class = "ChatMoonshotThinking"
+        # kimi_k2.5 (not nonthinking) should use ChatKimiThinking
+        expected_class = "ChatKimiThinking"
         actual_class = type(llm).__name__
         print(f"  Expected class: {expected_class}, Got: {actual_class}")
 
         if actual_class == expected_class:
-            print("  [OK] native/kimi_k2.5 creates ChatMoonshotThinking (thinking mode)")
+            print("  [OK] native/kimi_k2.5 creates ChatKimiThinking (thinking mode)")
         else:
             print(f"  [INFO] native/kimi_k2.5 creates {actual_class}")
 
