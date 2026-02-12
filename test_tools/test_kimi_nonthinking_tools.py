@@ -79,16 +79,15 @@ def test_basic_tool_call():
         llm = ModelFactory.create_llm('moonshot/kimi_k2.5-nonthinking', temperature=0.2, track_usage=False)
         print(f"  LLM type: {type(llm).__name__}")
 
-        # Check extra_body is set
-        if hasattr(llm, 'extra_body'):
-            print(f"  extra_body: {llm.extra_body}")
-            thinking_config = llm.extra_body.get("thinking", {})
-            if thinking_config.get("type") != "disabled":
-                print("  [FAIL] extra_body thinking is NOT disabled!")
+        # Check thinking mode is disabled
+        if hasattr(llm, 'thinking_enabled'):
+            print(f"  thinking_enabled: {llm.thinking_enabled}")
+            if llm.thinking_enabled:
+                print("  [FAIL] thinking_enabled should be False!")
                 return False
-            print("  extra_body thinking=disabled confirmed")
+            print("  thinking_enabled=False confirmed")
         else:
-            print("  [WARN] No extra_body attribute on LLM")
+            print("  [WARN] No thinking_enabled attribute on LLM")
 
         llm_with_tools = llm.bind_tools(ALL_TOOLS)
         print(f"  Bound LLM type: {type(llm_with_tools).__name__}")
@@ -240,58 +239,38 @@ def test_parallel_tool_calls_param():
 # Test 4: Verify extra_body propagation through bind_tools
 # ============================================================
 
-def test_extra_body_propagation():
-    """Verify extra_body is preserved when bind_tools creates a RunnableBinding."""
+def test_thinking_disabled_propagation():
+    """Verify thinking_enabled=False is preserved when bind_tools creates a RunnableBinding."""
     print("\n" + "=" * 60)
-    print("Test 4: extra_body Propagation Through bind_tools")
+    print("Test 4: thinking_enabled Propagation Through bind_tools")
     print("=" * 60)
 
     try:
         llm = ModelFactory.create_llm('moonshot/kimi_k2.5-nonthinking', temperature=0.2, track_usage=False)
 
         # Check base LLM
-        base_extra_body = getattr(llm, 'extra_body', None)
-        print(f"  Base LLM extra_body: {base_extra_body}")
-
-        if not base_extra_body or base_extra_body.get("thinking", {}).get("type") != "disabled":
-            print("  [FAIL] Base LLM missing thinking=disabled in extra_body")
+        print(f"  Base LLM thinking_enabled: {llm.thinking_enabled}")
+        if llm.thinking_enabled:
+            print("  [FAIL] Base LLM thinking_enabled should be False")
             return False
 
         # Bind tools
         llm_with_tools = llm.bind_tools(ALL_TOOLS)
-
-        # Inspect the bound object
         print(f"  Bound type: {type(llm_with_tools).__name__}")
 
-        # Try to find extra_body in the chain
-        found_extra_body = False
-
-        # RunnableBinding wraps the original LLM
+        # RunnableBinding wraps the original LLM — check thinking_enabled is preserved
+        found = False
         if hasattr(llm_with_tools, 'bound'):
             bound = llm_with_tools.bound
             print(f"  Bound.bound type: {type(bound).__name__}")
-            if hasattr(bound, 'extra_body'):
-                print(f"  Bound.bound.extra_body: {bound.extra_body}")
-                if bound.extra_body.get("thinking", {}).get("type") == "disabled":
-                    found_extra_body = True
+            if hasattr(bound, 'thinking_enabled'):
+                print(f"  Bound.bound.thinking_enabled: {bound.thinking_enabled}")
+                found = not bound.thinking_enabled
 
-        # Also check kwargs (bind_tools stores tool config in kwargs)
-        if hasattr(llm_with_tools, 'kwargs'):
-            print(f"  Bound kwargs keys: {list(llm_with_tools.kwargs.keys())}")
-
-        # Check the first_id/last style chain
-        if hasattr(llm_with_tools, 'first'):
-            first = llm_with_tools.first
-            if hasattr(first, 'extra_body'):
-                print(f"  Chain.first.extra_body: {first.extra_body}")
-                if first.extra_body.get("thinking", {}).get("type") == "disabled":
-                    found_extra_body = True
-
-        if found_extra_body:
-            print("  [OK] extra_body with thinking=disabled preserved through bind_tools")
+        if found:
+            print("  [OK] thinking_enabled=False preserved through bind_tools")
         else:
-            print("  [WARN] Could not confirm extra_body propagation via inspection")
-            print("  (This doesn't mean it's broken - LangChain may propagate it at invoke time)")
+            print("  [WARN] Could not confirm via inspection, but _get_request_payload handles it")
 
         return True
 
@@ -355,7 +334,7 @@ if __name__ == "__main__":
     results.append(("Basic Tool Call", test_basic_tool_call()))
     results.append(("Multi-Turn Tool Calls", test_multi_turn_tool_calls()))
     results.append(("parallel_tool_calls Param", test_parallel_tool_calls_param()))
-    results.append(("extra_body Propagation", test_extra_body_propagation()))
+    results.append(("thinking_enabled Propagation", test_thinking_disabled_propagation()))
     results.append(("native/ Provider Prefix", test_native_provider_prefix()))
 
     # Summary
