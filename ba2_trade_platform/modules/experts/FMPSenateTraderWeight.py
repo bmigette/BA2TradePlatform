@@ -92,8 +92,8 @@ class FMPSenateTraderWeight(MarketExpertInterface):
                 "type": "float",
                 "required": True,
                 "default": 5.0,
-                "description": "Growth to confidence multiplier",
-                "tooltip": "Multiplier applied to trader's average growth on the symbol to calculate confidence. Formula: 50 + (avg_growth * multiplier). Higher values increase confidence for successful traders. Example: 10% growth * 5.0 = 50% bonus confidence."
+                "description": "Portfolio allocation to confidence multiplier",
+                "tooltip": "Multiplier applied to trader's portfolio allocation % on the symbol. Formula: 50 + (avg_symbol_focus% * multiplier) + (price_movement / 2). Symbol focus is capped at 10%. Example: 10% allocation * 5.0 = 50% bonus → 100% confidence."
             },
             "confidence_to_profit_factor": {
                 "type": "float",
