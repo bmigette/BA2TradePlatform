@@ -1106,7 +1106,7 @@ def log_manual_analysis(expert_instance_id: int, symbols: List[str], analysis_ty
         logger.warning(f"Failed to log manual analysis for expert {expert_instance_id}: {e}")
 
 
-def calculate_fmp_trade_metrics(trades: List[dict]) -> dict:
+def calculate_fmp_trade_metrics(trades: List[dict], all_trader_trades: List[dict] | None = None) -> dict:
     """
     Calculate metrics for FMP Senate/House trades including total money spent
     and percentage of yearly trading.
@@ -1114,10 +1114,13 @@ def calculate_fmp_trade_metrics(trades: List[dict]) -> dict:
     Analyzes the provided trades to extract financial metrics about the trader's activity.
     
     Args:
-        trades: List of trade dictionaries from FMP API. Each trade should contain:
+        trades: List of trade dictionaries for a specific symbol from FMP API. Each trade should contain:
                 - 'amount' (str or int): The amount range of the trade (e.g., "$1,000,001 - $5,000,000")
                 - 'transactionDate' (str): The date of the trade (YYYY-MM-DD format)
-    
+        all_trader_trades: Optional list of ALL trades by the same trader(s) across all symbols.
+                          When provided, percent_of_yearly is calculated as symbol volume / total volume.
+                          When omitted, percent_of_yearly is 0.0 (cannot be computed without total).
+
     Returns:
         Dictionary with metrics:
         - 'total_money_spent': float - Sum of all trade amounts in dollars
@@ -1212,15 +1215,17 @@ def calculate_fmp_trade_metrics(trades: List[dict]) -> dict:
         min_amount = min(trade_amounts)
         max_amount = max(trade_amounts)
         
-        # Estimate yearly trading volume from number of trades and average amount
-        # Assumption: trader makes roughly the same number of trades throughout the year
-        estimated_yearly_volume = total_spent * (365 / 30) if total_spent > 0 else 0  # Rough estimate
-        
-        # Calculate percentage
-        if estimated_yearly_volume > 0:
-            percent_of_yearly = (total_spent / estimated_yearly_volume) * 100
-        else:
-            percent_of_yearly = 0.0
+        # Calculate percentage of yearly trading volume
+        # Requires all_trader_trades to know the total volume across all symbols
+        percent_of_yearly = 0.0
+        if all_trader_trades and total_spent > 0:
+            total_all_volume = 0.0
+            for t in all_trader_trades:
+                amount_range = t.get('amount', '').strip()
+                if amount_range in AMOUNT_RANGES:
+                    total_all_volume += AMOUNT_RANGES[amount_range]
+            if total_all_volume > 0:
+                percent_of_yearly = (total_spent / total_all_volume) * 100
         
         return {
             'total_money_spent': total_spent,

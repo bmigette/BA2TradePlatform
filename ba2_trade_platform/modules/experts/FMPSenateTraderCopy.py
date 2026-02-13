@@ -680,7 +680,7 @@ Note: If multiple trades exist for the same instrument, the most recent trade de
         
         # Calculate trader money spent and percentage of yearly trading
         from ...core.utils import calculate_fmp_trade_metrics
-        trade_metrics = calculate_fmp_trade_metrics(symbol_trades)
+        trade_metrics = calculate_fmp_trade_metrics(symbol_trades, all_trader_trades=copy_trades)
         
         return {
             'signal': signal,
