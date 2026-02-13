@@ -268,10 +268,11 @@ class LiveTradesTab:
         Returns:
             Tuple of (rows, total_count)
         """
-        from ...core.models import Transaction, ExpertInstance
+        from ...core.models import Transaction, ExpertInstance, AccountDefinition
         from ...core.types import TransactionStatus
         from sqlmodel import col
-        
+        from sqlalchemy import case
+
         # Extract global filter from filters dict
         global_filter = filters.get('_global', '')
 
@@ -280,9 +281,11 @@ class LiveTradesTab:
 
         session = get_db()
         try:
-            # Build base query - join with ExpertInstance for expert info
+            # Build base query - join with ExpertInstance and AccountDefinition for sorting
             base_query = select(Transaction, ExpertInstance).outerjoin(
                 ExpertInstance, Transaction.expert_id == ExpertInstance.id
+            ).outerjoin(
+                AccountDefinition, ExpertInstance.account_id == AccountDefinition.id
             )
             
             # Apply global account filter from header dropdown
@@ -339,15 +342,29 @@ class LiveTradesTab:
             total_count = session.exec(count_query).one()
 
             # Apply sorting
+            # Map column names to SQL sort expressions where they differ from model fields
+            SORT_MAP = {
+                'direction': Transaction.side,
+                'closed_at': Transaction.close_date,
+                'account': AccountDefinition.name,
+                'expert': func.coalesce(ExpertInstance.alias, ExpertInstance.expert),
+                'closed_pnl': case(
+                    (Transaction.side == 'BUY',
+                     (Transaction.close_price - Transaction.open_price) * Transaction.quantity),
+                    else_=(Transaction.open_price - Transaction.close_price) * Transaction.quantity
+                ),
+            }
             if sort_by:
-                sort_column = getattr(Transaction, sort_by, None)
-                if sort_column is not None:
+                sort_expr = SORT_MAP.get(sort_by)
+                if sort_expr is None:
+                    sort_expr = getattr(Transaction, sort_by, None)
+                if sort_expr is not None:
                     if descending:
-                        base_query = base_query.order_by(sort_column.desc())
+                        base_query = base_query.order_by(sort_expr.desc())
                     else:
-                        base_query = base_query.order_by(sort_column.asc())
+                        base_query = base_query.order_by(sort_expr.asc())
                 else:
-                    # Default sort
+                    # Unknown column - fall back to default sort
                     base_query = base_query.order_by(Transaction.created_at.desc())
             else:
                 base_query = base_query.order_by(Transaction.created_at.desc())
