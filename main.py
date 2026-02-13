@@ -44,13 +44,21 @@ def parse_arguments():
 
 def initialize_system():
     """Initialize the system components."""
-    # Import these after config has been updated from command-line args
-    from ba2_trade_platform.core.db import init_db, get_db
-    from ba2_trade_platform.core.WorkerQueue import initialize_worker_queue
-    from ba2_trade_platform.core.SmartRiskManagerQueue import initialize_smart_risk_manager_queue
-    from ba2_trade_platform.core.JobManager import get_job_manager
     from ba2_trade_platform.logger import logger
     import ba2_trade_platform.config as config
+
+    # Import these after config has been updated from command-line args
+    logger.info("Loading database module...")
+    from ba2_trade_platform.core.db import init_db, get_db
+
+    logger.info("Loading worker queue module...")
+    from ba2_trade_platform.core.WorkerQueue import initialize_worker_queue
+
+    logger.info("Loading smart risk manager queue module...")
+    from ba2_trade_platform.core.SmartRiskManagerQueue import initialize_smart_risk_manager_queue
+
+    logger.info("Loading job manager module (importing experts, TradingAgents, langchain...)...")
+    from ba2_trade_platform.core.JobManager import get_job_manager
     
     # Apply Gemini compatibility patch early (before any LangChain usage)
     # DISABLED: Gemini 3 thought_signature requirement not fully compatible with LangGraph state management

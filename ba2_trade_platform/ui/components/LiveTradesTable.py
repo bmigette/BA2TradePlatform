@@ -344,7 +344,10 @@ class LiveTradesTable(LazyTable):
         """Set up all event handlers for the table."""
         if not self._table:
             return
-        
+
+        # Server-side sort handler (from base LazyTable)
+        self._table.on('request', self._handle_sort_request)
+
         # Selection toggle
         self._table.on('toggle_selection', self._handle_toggle_selection)
         
@@ -430,7 +433,7 @@ class LiveTradesTable(LazyTable):
                 columns=quasar_columns,
                 rows=[],
                 row_key=self.config.row_key,
-                pagination={'rowsPerPage': 0}  # Disable client-side pagination, we do server-side
+                pagination={'rowsPerPage': 0, 'sortBy': self._sort_by, 'descending': self._sort_descending, 'rowsNumber': 0}
             ).classes('w-full').props('flat bordered hide-pagination')
             
             # Add the body template for expansion and custom cells

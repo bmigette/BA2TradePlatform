@@ -276,6 +276,13 @@ class LazyTable:
                     row['_selected'] = row.get(row_key) in self._selected_ids
                 
                 self._table.rows = self._rows
+                # Sync Quasar pagination state for server-side sorting indicators
+                self._table.pagination = {
+                    'rowsPerPage': 0,
+                    'sortBy': self._sort_by,
+                    'descending': self._sort_descending,
+                    'rowsNumber': self._total_count,
+                }
                 self._table.update()
             
             # Update pagination label
@@ -364,7 +371,23 @@ class LazyTable:
         self._sort_descending = descending
         self._current_page = 1  # Reset to first page
         await self._load_data(operation=PerfLogger.SORT)
-    
+
+    def _handle_sort_request(self, e):
+        """Handle sort request event from Quasar table (server-side mode).
+
+        Quasar emits 'request' with {pagination: {sortBy, descending, ...}, filter, ...}
+        when in server-side mode (rowsNumber is set in pagination).
+        """
+        if hasattr(e, 'args') and e.args:
+            props = e.args[0] if isinstance(e.args, (list, tuple)) else e.args
+            if isinstance(props, dict):
+                pagination = props.get('pagination', props)
+            else:
+                return
+            sort_by = pagination.get('sortBy')
+            descending = pagination.get('descending', False)
+            asyncio.create_task(self._on_sort_change(sort_by, descending))
+
     async def _on_global_filter_change(self, value: str):
         """Handle global filter change."""
         self._global_filter = value
@@ -574,16 +597,25 @@ class LazyTable:
             elif self.config.selection_mode == 'multi':
                 selection_prop = 'multiple'
             
-            # Create table
+            # Create table with server-side sorting mode
+            # rowsNumber enables Quasar server-side mode (emits 'request' events
+            # instead of sorting client-side on visible rows only)
             self._table = ui.table(
                 columns=quasar_columns,
                 rows=[],
                 row_key=self.config.row_key,
-                selection=selection_prop
+                selection=selection_prop,
+                pagination={
+                    'rowsPerPage': 0,
+                    'sortBy': self._sort_by,
+                    'descending': self._sort_descending,
+                    'rowsNumber': 0,
+                }
             ).classes('w-full')
             
-            if table_props:
-                self._table.props(table_props)
+            # Always hide Quasar's built-in pagination (we use our own controls)
+            table_props += ' hide-pagination'
+            self._table.props(table_props)
             
             # Add custom cell slots
             for col in self.columns:
@@ -606,16 +638,8 @@ class LazyTable:
             if self.config.selection_mode != 'none':
                 self._table.on('selection', lambda e: self._on_selection_update(e.args[1]))
             
-            # Handle sort change from Quasar table
-            def handle_sort(e):
-                # e.args contains the sort state from Quasar
-                if hasattr(e, 'args') and e.args:
-                    pagination = e.args[0] if isinstance(e.args, (list, tuple)) else e.args
-                    sort_by = pagination.get('sortBy')
-                    descending = pagination.get('descending', False)
-                    asyncio.create_task(self._on_sort_change(sort_by, descending))
-            
-            self._table.on('request', handle_sort)
+            # Handle sort change from Quasar table (server-side mode)
+            self._table.on('request', self._handle_sort_request)
             
             # Pagination controls
             self._render_pagination_controls()
