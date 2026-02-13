@@ -412,10 +412,16 @@ class FMPSenateTraderWeight(MarketExpertInterface):
                     self.logger.debug(f"Could not get execution price for {trader_name}'s trade, skipping")
                     continue
                 
-                # Check price delta
-                price_delta_pct = abs((current_price - exec_price) / exec_price * 100)
-                if price_delta_pct > max_price_delta_pct:
-                    self.logger.debug(f"Price moved {price_delta_pct:.1f}% (max: {max_price_delta_pct}%), filtering out")
+                # Check price delta - only filter out unfavourable moves
+                # BUY trades: price dropping is unfavourable (negative delta)
+                # SELL trades: price rising is unfavourable (positive delta)
+                price_delta_pct = (current_price - exec_price) / exec_price * 100
+                trade_type = trade.get('type', '').lower()
+                is_buy = 'purchase' in trade_type or 'buy' in trade_type
+                unfavourable_move = -price_delta_pct if is_buy else price_delta_pct
+                if unfavourable_move > max_price_delta_pct:
+                    self.logger.debug(f"Price moved {price_delta_pct:+.1f}% against {'BUY' if is_buy else 'SELL'} "
+                                      f"(max unfavourable: {max_price_delta_pct}%), filtering out")
                     continue
                 
                 # Add calculated fields to trade
