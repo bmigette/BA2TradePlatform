@@ -528,10 +528,11 @@ class FMPSenateTraderCopy(MarketExpertInterface):
         
         return copy_trades
     
-    def _generate_recommendations(self, copy_trades: List[Dict[str, Any]], 
-                                 symbol: str, 
+    def _generate_recommendations(self, copy_trades: List[Dict[str, Any]],
+                                 symbol: str,
                                  current_price: float,
-                                 subtype=None) -> Dict[str, Any]:
+                                 subtype=None,
+                                 all_copy_trades: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
         """
         Generate recommendations from copy trades.
         
@@ -680,7 +681,7 @@ Note: If multiple trades exist for the same instrument, the most recent trade de
         
         # Calculate trader money spent and percentage of yearly trading
         from ...core.utils import calculate_fmp_trade_metrics
-        trade_metrics = calculate_fmp_trade_metrics(symbol_trades, all_trader_trades=copy_trades)
+        trade_metrics = calculate_fmp_trade_metrics(symbol_trades, all_trader_trades=all_copy_trades)
         
         return {
             'signal': signal,
@@ -1041,7 +1042,8 @@ Recommendations Generated:"""
                     
                     # Generate recommendations for this symbol
                     recommendation_data = self._generate_recommendations(
-                        symbol_trades, trade_symbol, current_price, subtype=AnalysisUseCase.ENTER_MARKET
+                        symbol_trades, trade_symbol, current_price, subtype=AnalysisUseCase.ENTER_MARKET,
+                        all_copy_trades=copy_trades
                     )
                     
                     # Create ExpertRecommendation record for this symbol
