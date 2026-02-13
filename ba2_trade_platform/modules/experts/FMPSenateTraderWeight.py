@@ -969,6 +969,8 @@ All {len(trade_details)} trades shown above for transparency.
             'sell_count': sell_count,
             'total_buy_amount': total_buy_amount,
             'total_sell_amount': total_sell_amount,
+            'avg_price_delta': avg_price_delta,
+            'price_confidence_adj': price_confidence_adj,
             # Add trade metrics
             'trade_metrics': self._calculate_trade_metrics(filtered_trades)
         }
@@ -1187,7 +1189,9 @@ All {len(trade_details)} trades shown above for transparency.
                         'details': recommendation_data['details'],
                         # Add financial metrics
                         'money_spent': trade_metrics.get('total_money_spent', 0.0),
-                        'percent_of_yearly': trade_metrics.get('percent_of_yearly', 0.0)
+                        'percent_of_yearly': trade_metrics.get('percent_of_yearly', 0.0),
+                        'avg_price_delta': recommendation_data.get('avg_price_delta', 0.0),
+                        'price_confidence_adj': recommendation_data.get('price_confidence_adj', 0.0)
                     },
                     'trade_statistics': {
                         'total_trades': len(all_trades),
@@ -1381,7 +1385,16 @@ All {len(trade_details)} trades shown above for transparency.
                 if current_price:
                     ui.separator().classes('my-2')
                     ui.label(f'Current Price: ${current_price:.2f}').style('color: #a0aec0')
-            
+
+                # Price movement impact on confidence
+                avg_price_delta = rec.get('avg_price_delta', 0.0)
+                price_confidence_adj = rec.get('price_confidence_adj', 0.0)
+                if avg_price_delta != 0.0:
+                    delta_color = '#00d4aa' if price_confidence_adj > 0 else '#ff6b6b'
+                    ui.label(
+                        f'Avg Price Move: {avg_price_delta:+.1f}% → Confidence {price_confidence_adj:+.1f}'
+                    ).classes('text-sm').style(f'color: {delta_color}')
+
             # Trade Statistics
             total_trades = stats.get('total_trades', 0)
             filtered_trades = stats.get('filtered_trades', 0)
@@ -1481,18 +1494,18 @@ All {len(trade_details)} trades shown above for transparency.
                     ui.markdown('''
 **Confidence Calculation:**
 
-For each trade:
 1. **Base Confidence**: Start at 50%
-2. **+ Trader Performance**: Add historical growth % from trader's past trades
-   - Positive if past trades gained value
-   - Negative if past trades lost value
-3. **Investment Size Boost**: +5% per $100k invested
-4. **Cap**: Maximum 80% before investment boost, 100% final cap
+2. **+ Portfolio Allocation**: Avg symbol focus % × multiplier (max 10% focus)
+3. **+ Price Movement**: avg price delta / 2
+   - BUY + price dropped → positive (better entry)
+   - BUY + price rose → negative (opportunity partly gone)
+   - SELL: opposite logic
+4. **Cap**: 0% floor, 100% ceiling
 
 **Trade Filtering:**
 - Only trades disclosed within last **{max_disclose}** days
-- Only trades executed within last **{max_exec}** days  
-- Only trades where price hasn't moved more than **±{max_delta}%** (opportunity still available)
+- Only trades executed within last **{max_exec}** days
+- Only trades where price hasn't moved more than **+{max_delta}%** in the trade's favour (opportunity passed)
 
 **Signal Logic:**
 - **BUY**: More government officials buying than selling
