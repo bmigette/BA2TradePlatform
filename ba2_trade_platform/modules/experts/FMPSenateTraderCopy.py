@@ -615,8 +615,6 @@ class FMPSenateTraderCopy(MarketExpertInterface):
         else:
             primary_trader = 'Unknown'
         
-        # Copy trade: 100% confidence, 0% expected profit (unknown profit potential)
-        confidence = 100.0
         expected_profit = 0.0
         
         # Build trade details
@@ -682,7 +680,11 @@ Note: If multiple trades exist for the same instrument, the most recent trade de
         # Calculate trader money spent and percentage of yearly trading
         from ...core.utils import calculate_fmp_trade_metrics
         trade_metrics = calculate_fmp_trade_metrics(symbol_trades, all_trader_trades=all_copy_trades)
-        
+
+        # Confidence: 60% base + percent_of_yearly (capped at 100%)
+        percent_of_yearly = trade_metrics.get('percent_of_yearly', 0.0)
+        confidence = min(100.0, 60.0 + percent_of_yearly)
+
         return {
             'signal': signal,
             'confidence': confidence,
