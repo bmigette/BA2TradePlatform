@@ -412,11 +412,18 @@ class FMPSenateTraderWeight(MarketExpertInterface):
                     self.logger.debug(f"Could not get execution price for {trader_name}'s trade, skipping")
                     continue
                 
-                # Check price delta - filter if price moved too much in either direction
-                # If price already moved significantly, it's too late to follow the trade
-                price_delta_pct = abs((current_price - exec_price) / exec_price * 100)
-                if price_delta_pct > max_price_delta_pct:
-                    self.logger.debug(f"Price moved {price_delta_pct:.1f}% (max: {max_price_delta_pct}%), filtering out")
+                # Check price delta - only filter when price moved in the trade's favour
+                # beyond the threshold (opportunity already passed)
+                # BUY + price UP too much → filter (already ran up, too late)
+                # SELL + price DOWN too much → filter (already dropped, too late)
+                # Moves against the trade are NOT filtered (better entry opportunity)
+                price_delta_pct = (current_price - exec_price) / exec_price * 100
+                trade_type = trade.get('type', '').lower()
+                is_buy = 'purchase' in trade_type or 'buy' in trade_type
+                favourable_move = price_delta_pct if is_buy else -price_delta_pct
+                if favourable_move > max_price_delta_pct:
+                    self.logger.debug(f"Price moved {price_delta_pct:+.1f}% in favour of {'BUY' if is_buy else 'SELL'} "
+                                      f"(max: {max_price_delta_pct}%), opportunity passed - filtering out")
                     continue
                 
                 # Add calculated fields to trade
@@ -846,11 +853,26 @@ class FMPSenateTraderWeight(MarketExpertInterface):
             avg_symbol_focus_pct = 0.0
         
         # Apply symbol focus-based formula
-        # Confidence: 50 + (symbol_focus_pct * multiplier)
+        # Confidence: 50 + (symbol_focus_pct * multiplier) + price_movement_adjustment
         # Logic: symbol_focus_pct is capped at 10%, so with default multiplier 5.0:
         #   10% portfolio allocation * 5.0 = 50% bonus = 100% total confidence
         #   0% portfolio allocation * 5.0 = 0% bonus = 50% total confidence
-        overall_confidence = min(100.0, max(0.0, 50.0 + avg_symbol_focus_pct * growth_multiplier))
+        #
+        # Price movement adjustment (delta / 2):
+        #   BUY + price down 10% → +5 confidence (better entry)
+        #   BUY + price up 10% → -5 confidence (opportunity partly gone)
+        #   SELL + price up 10% → +5 confidence (better entry for short)
+        #   SELL + price down 10% → -5 confidence (opportunity partly gone)
+        avg_price_delta = 0.0
+        if relevant_trades:
+            deltas = [t.get('price_delta_pct', 0.0) for t in relevant_trades]
+            avg_price_delta = sum(deltas) / len(deltas)
+        is_buy_signal = signal == OrderRecommendation.BUY
+        # For BUY: price down (negative delta) is good → negate to get positive adjustment
+        # For SELL: price up (positive delta) is good → keep as positive adjustment
+        price_confidence_adj = (-avg_price_delta if is_buy_signal else avg_price_delta) / 2
+
+        overall_confidence = min(100.0, max(0.0, 50.0 + avg_symbol_focus_pct * growth_multiplier + price_confidence_adj))
         
         # Expected Profit: Confidence multiplied by profit factor (always positive regardless of BUY/SELL)
         # Example: 80% confidence * 0.15 factor = 12% expected profit
@@ -914,10 +936,12 @@ Confidence Calculation Method:
    - This shows what % of their portfolio is allocated to {symbol}
    - Cap at 10% to avoid extreme values
 2. Average Symbol Focus across relevant {signal.value} traders: {avg_symbol_focus_pct:.1f}%
-3. Confidence Formula: 50 + (Avg Symbol Focus % × {growth_multiplier}) = {overall_confidence:.1f}%
-   - 10% portfolio allocation × {growth_multiplier} = {10 * growth_multiplier:.0f}% bonus = {50 + 10 * growth_multiplier:.0f}% confidence
-   - 0% portfolio allocation × {growth_multiplier} = 0% bonus = 50% confidence
-4. Expected Profit: Uses same formula = {abs(expected_profit):.1f}%
+3. Price Movement Adjustment: avg delta {avg_price_delta:+.1f}% → {price_confidence_adj:+.1f} confidence
+4. Confidence Formula: 50 + (Avg Symbol Focus % × {growth_multiplier}) + price adj ({price_confidence_adj:+.1f}) = {overall_confidence:.1f}%
+   - 10% portfolio allocation × {growth_multiplier} = {10 * growth_multiplier:.0f}% bonus
+   - Price dropped 10% on BUY → +5 confidence (better entry)
+   - Price rose 10% on BUY → -5 confidence (opportunity partly gone)
+5. Expected Profit: Uses same formula = {abs(expected_profit):.1f}%
 
 Symbol Focus Analysis:
 This measures how much conviction/focus the trader has on {symbol}.
