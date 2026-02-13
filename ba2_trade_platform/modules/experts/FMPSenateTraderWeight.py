@@ -101,6 +101,20 @@ class FMPSenateTraderWeight(MarketExpertInterface):
                 "default": 0.15,
                 "description": "Confidence to profit factor",
                 "tooltip": "Factor to convert confidence to expected profit. Default 0.15 means 100% confidence = 15% expected profit. Formula: expected_profit = confidence * factor."
+            },
+            "min_traders": {
+                "type": "int",
+                "required": True,
+                "default": 2,
+                "description": "Minimum unique traders required",
+                "tooltip": "Minimum number of unique traders that must have traded the symbol. Both min_traders and min_trades must be met. Default 2: need at least 2 different traders."
+            },
+            "min_trades": {
+                "type": "int",
+                "required": True,
+                "default": 2,
+                "description": "Minimum total trades required",
+                "tooltip": "Minimum number of total trades required for the symbol. Both min_traders and min_trades must be met. Default 2: need at least 2 trades total."
             }
         }
     
@@ -802,6 +816,32 @@ class FMPSenateTraderWeight(MarketExpertInterface):
                 except:
                     pass
         
+        # Check minimum traders and trades thresholds
+        min_traders = int(self.get_setting_with_interface_default('min_traders'))
+        min_trades_required = int(self.get_setting_with_interface_default('min_trades'))
+        unique_traders = set(t['trader'] for t in trade_details)
+        num_unique_traders = len(unique_traders)
+        num_total_trades = len(trade_details)
+
+        if num_unique_traders < min_traders or num_total_trades < min_trades_required:
+            self.logger.info(f"Below minimums: {num_unique_traders} traders (min {min_traders}), "
+                           f"{num_total_trades} trades (min {min_trades_required}) - returning HOLD")
+            return {
+                'signal': OrderRecommendation.HOLD,
+                'confidence': 0.0,
+                'expected_profit_percent': 0.0,
+                'details': f'Below minimum thresholds: {num_unique_traders} unique trader(s) (min {min_traders}), '
+                          f'{num_total_trades} trade(s) (min {min_trades_required}). Both must be met.',
+                'trades': trade_details,
+                'trade_count': len(filtered_trades),
+                'buy_count': buy_count,
+                'sell_count': sell_count,
+                'total_buy_amount': total_buy_amount,
+                'total_sell_amount': total_sell_amount,
+                'avg_price_delta': 0.0,
+                'price_confidence_adj': 0.0
+            }
+
         # Determine overall signal based on net portfolio allocation
         # Compare the total symbol focus % for buy trades vs sell trades
         # This weighs traders by how much of their portfolio they're allocating to this symbol
