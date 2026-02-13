@@ -465,11 +465,55 @@ class TradeManager:
                                 if transaction:
                                     # Update TP or SL price depending on order type
                                     if dependent_order.data and "TP_SL" in dependent_order.data and "tp_percent" in dependent_order.data["TP_SL"]:
+                                        old_tp = transaction.take_profit
                                         transaction.take_profit = dependent_order.limit_price
                                         self.logger.info(f"Updated Transaction {dependent_order.transaction_id} take_profit to ${dependent_order.limit_price:.2f}")
+                                        # Log activity for TP recalculation
+                                        try:
+                                            from .db import log_activity
+                                            from .types import ActivityLogSeverity, ActivityLogType
+                                            old_tp_str = f"${old_tp:.2f}" if old_tp else "none"
+                                            log_activity(
+                                                severity=ActivityLogSeverity.INFO,
+                                                activity_type=ActivityLogType.TP_SL_ADJUSTED,
+                                                description=f"Recalculated TP {old_tp_str} → ${dependent_order.limit_price:.2f} for {transaction.symbol} (source: price_recalculation)",
+                                                data={
+                                                    "transaction_id": transaction.id,
+                                                    "symbol": transaction.symbol,
+                                                    "old_tp": old_tp,
+                                                    "new_tp": dependent_order.limit_price,
+                                                    "source": "price_recalculation",
+                                                    "parent_filled_price": parent_order.open_price
+                                                },
+                                                source_expert_id=transaction.expert_id
+                                            )
+                                        except Exception as log_error:
+                                            self.logger.warning(f"Failed to log TP recalculation activity: {log_error}")
                                     elif dependent_order.data and "TP_SL" in dependent_order.data and "sl_percent" in dependent_order.data["TP_SL"]:
+                                        old_sl = transaction.stop_loss
                                         transaction.stop_loss = dependent_order.stop_price
                                         self.logger.info(f"Updated Transaction {dependent_order.transaction_id} stop_loss to ${dependent_order.stop_price:.2f}")
+                                        # Log activity for SL recalculation
+                                        try:
+                                            from .db import log_activity
+                                            from .types import ActivityLogSeverity, ActivityLogType
+                                            old_sl_str = f"${old_sl:.2f}" if old_sl else "none"
+                                            log_activity(
+                                                severity=ActivityLogSeverity.INFO,
+                                                activity_type=ActivityLogType.TP_SL_ADJUSTED,
+                                                description=f"Recalculated SL {old_sl_str} → ${dependent_order.stop_price:.2f} for {transaction.symbol} (source: price_recalculation)",
+                                                data={
+                                                    "transaction_id": transaction.id,
+                                                    "symbol": transaction.symbol,
+                                                    "old_sl": old_sl,
+                                                    "new_sl": dependent_order.stop_price,
+                                                    "source": "price_recalculation",
+                                                    "parent_filled_price": parent_order.open_price
+                                                },
+                                                source_expert_id=transaction.expert_id
+                                            )
+                                        except Exception as log_error:
+                                            self.logger.warning(f"Failed to log SL recalculation activity: {log_error}")
                                     session.add(transaction)
                             
                             # Double-check quantity one more time before adding to submit list

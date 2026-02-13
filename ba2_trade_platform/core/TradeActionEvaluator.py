@@ -49,8 +49,8 @@ class TradeActionEvaluator:
         self.rule_evaluations = []
         # Store TradeAction objects for reuse between evaluate() and execute()
         self.trade_actions = []
-        # Store instrument name for transaction lookup
-        self.instrument_name = None
+        # Store expert recommendation for use in execute() after evaluate() sets it
+        self.expert_recommendation = None
         # Flag to control whether orders are submitted to broker or created as PENDING
         self.submit_to_broker = True
     
@@ -81,8 +81,9 @@ class TradeActionEvaluator:
             # NEW: Track generated actions to prevent duplicates (key: action_type + config hash)
             generated_actions = set()
             
-            # Store instrument name for later use in execute()
+            # Store instrument name and expert recommendation for later use in execute()
             self.instrument_name = instrument_name
+            self.expert_recommendation = expert_recommendation
             
             # Get the ruleset
             ruleset = get_instance(Ruleset, ruleset_id)
@@ -313,19 +314,55 @@ class TradeActionEvaluator:
                             logger.info(f"Will adjust TP/SL for newly created order {order_id} (transaction: {order.transaction_id})")
                     
                 elif self.existing_transactions:
-                    # open_positions: Use orders from existing transactions
-                    from .db import get_instance
-                    from .models import TradingOrder
-                    
+                    # open_positions: Find entry orders for existing transactions
+                    from .TransactionHelper import TransactionHelper
+
                     for transaction in self.existing_transactions:
-                        if hasattr(transaction, 'order_id') and transaction.order_id:
-                            order = get_instance(TradingOrder, transaction.order_id)
-                            if order:
-                                orders_to_adjust.append(order)
-                                logger.info(f"Will adjust TP/SL for existing transaction order {order.id}")
-                
+                        try:
+                            entry_order = TransactionHelper.get_entry_order(transaction)
+                            if entry_order:
+                                orders_to_adjust.append(entry_order)
+                                logger.info(f"Will adjust TP/SL for existing transaction {transaction.id} entry order {entry_order.id}")
+                            else:
+                                logger.error(
+                                    f"No entry order found for transaction {transaction.id} "
+                                    f"(symbol: {transaction.symbol}) — cannot adjust TP/SL"
+                                )
+                        except Exception as e:
+                            logger.error(
+                                f"Error finding entry order for transaction {transaction.id}: {e}",
+                                exc_info=True
+                            )
+
                 if not orders_to_adjust:
-                    logger.warning("No orders available for TP/SL adjustments")
+                    error_msg = (
+                        f"No orders available for TP/SL adjustments for {self.instrument_name or 'unknown'} "
+                        f"(created_orders: {len(created_order_ids)}, existing_transactions: {len(self.existing_transactions)})"
+                    )
+                    logger.error(error_msg)
+
+                    # Log failure activity so it appears in Activity Monitor
+                    try:
+                        from .db import log_activity
+                        from .types import ActivityLogSeverity, ActivityLogType
+
+                        expert_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
+                        action_descs = [a.get_description() for a in adjustment_actions]
+                        log_activity(
+                            severity=ActivityLogSeverity.FAILURE,
+                            activity_type=ActivityLogType.TP_SL_ADJUSTED,
+                            description=f"Failed TP/SL adjustment for {self.instrument_name}: no entry orders found",
+                            data={
+                                "symbol": self.instrument_name,
+                                "error": error_msg,
+                                "adjustment_actions": action_descs,
+                                "existing_transaction_ids": [t.id for t in self.existing_transactions],
+                            },
+                            source_account_id=self.account.id if self.account else None,
+                            source_expert_id=expert_id
+                        )
+                    except Exception as log_error:
+                        logger.warning(f"Failed to log TP/SL adjustment failure activity: {log_error}")
                 
                 # Execute adjustment actions for each order
                 for order in orders_to_adjust:

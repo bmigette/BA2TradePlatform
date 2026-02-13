@@ -1038,13 +1038,13 @@ class AlpacaAccount(AccountInterface):
                             # The skip logic in adjust_tp_sl will prevent redundant calls if caller calls again
                             if tp_price and sl_price:
                                 logger.debug(f"Creating TP/SL orders for transaction {transaction.id} via adjust_tp_sl")
-                                self.adjust_tp_sl(transaction, tp_price, sl_price)
+                                self.adjust_tp_sl(transaction, tp_price, sl_price, source="initial_setup")
                             elif tp_price:
                                 logger.debug(f"Creating TP order for transaction {transaction.id} via adjust_tp")
-                                self.adjust_tp(transaction, tp_price)
+                                self.adjust_tp(transaction, tp_price, source="initial_setup")
                             elif sl_price:
                                 logger.debug(f"Creating SL order for transaction {transaction.id} via adjust_sl")
-                                self.adjust_sl(transaction, sl_price)
+                                self.adjust_sl(transaction, sl_price, source="initial_setup")
                         else:
                             logger.warning(f"Transaction {fresh_order.transaction_id} not found for setting TP/SL")
                     else:
@@ -2672,86 +2672,98 @@ class AlpacaAccount(AccountInterface):
         else:
             return order.side == OrderDirection.BUY and order.stop_price > (entry_order.open_price or 0)
     
-    def adjust_tp(self, transaction: Transaction, new_tp_price: float) -> bool:
+    def adjust_tp(self, transaction: Transaction, new_tp_price: float, source: str = "") -> bool:
         """
         Adjust take profit for a transaction.
-        
+
         Args:
             transaction: Transaction to adjust TP for
             new_tp_price: New take profit price
-            
+            source: Origin of adjustment (e.g. "manual", "ruleset", "smart_risk_manager")
+
         Returns:
             bool: True if adjustment succeeded
         """
-        return self.adjust_tp_sl(transaction, new_tp_price=new_tp_price, new_sl_price=None)
-    
-    def adjust_sl(self, transaction: Transaction, new_sl_price: float) -> bool:
+        return self.adjust_tp_sl(transaction, new_tp_price=new_tp_price, new_sl_price=None, source=source)
+
+    def adjust_sl(self, transaction: Transaction, new_sl_price: float, source: str = "") -> bool:
         """
         Adjust stop loss for a transaction.
-        
+
         Args:
             transaction: Transaction to adjust SL for
             new_sl_price: New stop loss price
-            
+            source: Origin of adjustment (e.g. "manual", "ruleset", "smart_risk_manager")
+
         Returns:
             bool: True if adjustment succeeded
         """
-        return self.adjust_tp_sl(transaction, new_tp_price=None, new_sl_price=new_sl_price)
-    
+        return self.adjust_tp_sl(transaction, new_tp_price=None, new_sl_price=new_sl_price, source=source)
+
     def adjust_tp_sl(
-        self, 
-        transaction: Transaction, 
-        new_tp_price: float | None = None, 
-        new_sl_price: float | None = None
+        self,
+        transaction: Transaction,
+        new_tp_price: float | None = None,
+        new_sl_price: float | None = None,
+        source: str = ""
     ) -> bool:
         """
         Adjust take profit and/or stop loss for a transaction.
-        
+
         This is the main implementation for transaction-level TP/SL management. It handles:
         - Entry order in PENDING state (creates/updates WAITING_TRIGGER orders)
         - Entry order FILLED (creates/updates broker orders)
         - Mixed states (OCO vs separate TP/SL orders)
-        
+
         Args:
             transaction: Transaction to adjust
             new_tp_price: New take profit price (None = don't adjust TP)
             new_sl_price: New stop loss price (None = don't adjust SL)
-            
+            source: Origin of adjustment (e.g. "manual", "ruleset", "smart_risk_manager")
+
         Returns:
             bool: True if adjustment succeeded
         """
         return self._adjust_tpsl_internal(
             transaction=transaction,
             new_tp_price=new_tp_price,
-            new_sl_price=new_sl_price
+            new_sl_price=new_sl_price,
+            source=source
         )
 
     def _adjust_tpsl_internal(
-        self, 
-        transaction: Transaction, 
-        new_tp_price: float | None = None, 
-        new_sl_price: float | None = None
+        self,
+        transaction: Transaction,
+        new_tp_price: float | None = None,
+        new_sl_price: float | None = None,
+        source: str = ""
     ) -> bool:
         """
         Internal unified helper for adjusting TP and/or SL.
-        
+
         This consolidates all the duplicated logic from adjust_tp(), adjust_sl(), and adjust_tp_sl().
-        
+
         Args:
             transaction: Transaction to adjust
             new_tp_price: New take profit price (None = don't adjust TP)
             new_sl_price: New stop loss price (None = don't adjust SL)
-            
+            source: Origin of adjustment (e.g. "manual", "ruleset", "smart_risk_manager")
+
         Returns:
             bool: True if adjustment succeeded
         """
         try:
+            # Capture old values before any modification for activity logging
+            old_tp = transaction.take_profit
+            old_sl = transaction.stop_loss
+
             adjustment_type = []
             if new_tp_price is not None:
                 adjustment_type.append(f"TP=${new_tp_price:.2f}")
             if new_sl_price is not None:
                 adjustment_type.append(f"SL=${new_sl_price:.2f}")
-            logger.info(f"Adjusting {', '.join(adjustment_type)} for transaction {transaction.id}")
+            source_label = f" (source: {source})" if source else ""
+            logger.info(f"Adjusting {', '.join(adjustment_type)} for transaction {transaction.id}{source_label}")
             
             # Use a single session context to avoid SQLAlchemy session conflicts
             from sqlmodel import Session, select
@@ -2922,25 +2934,32 @@ class AlpacaAccount(AccountInterface):
                     try:
                         from ...core.db import log_activity
                         from ...core.types import ActivityLogSeverity, ActivityLogType
-                        
+
                         adjustment_desc = []
                         if new_tp_price is not None:
-                            adjustment_desc.append(f"TP to ${new_tp_price:.2f}")
+                            old_tp_str = f"${old_tp:.2f}" if old_tp else "none"
+                            adjustment_desc.append(f"TP {old_tp_str} → ${new_tp_price:.2f}")
                         if new_sl_price is not None:
-                            adjustment_desc.append(f"SL to ${new_sl_price:.2f}")
-                        
+                            old_sl_str = f"${old_sl:.2f}" if old_sl else "none"
+                            adjustment_desc.append(f"SL {old_sl_str} → ${new_sl_price:.2f}")
+
+                        source_suffix = f" (source: {source})" if source else ""
                         log_activity(
                             severity=ActivityLogSeverity.SUCCESS,
                             activity_type=ActivityLogType.TP_SL_ADJUSTED,
-                            description=f"Adjusted {' and '.join(adjustment_desc)} for transaction {transaction_in_session.id} ({transaction_in_session.symbol})",
+                            description=f"Adjusted {' and '.join(adjustment_desc)} for {transaction_in_session.symbol}{source_suffix}",
                             data={
                                 "transaction_id": transaction_in_session.id,
                                 "symbol": transaction_in_session.symbol,
-                                "new_tp_price": new_tp_price,
-                                "new_sl_price": new_sl_price,
+                                "old_tp": old_tp,
+                                "new_tp": new_tp_price,
+                                "old_sl": old_sl,
+                                "new_sl": new_sl_price,
+                                "source": source,
                                 "entry_order_status": entry_order.status.value
                             },
-                            source_account_id=self.id
+                            source_account_id=self.id,
+                            source_expert_id=transaction_in_session.expert_id
                         )
                     except Exception as log_error:
                         logger.warning(f"Failed to log TP/SL adjustment activity: {log_error}")
@@ -2954,25 +2973,32 @@ class AlpacaAccount(AccountInterface):
             try:
                 from ...core.db import log_activity
                 from ...core.types import ActivityLogSeverity, ActivityLogType
-                
+
                 adjustment_desc = []
                 if new_tp_price is not None:
-                    adjustment_desc.append(f"TP to ${new_tp_price:.2f}")
+                    old_tp_str = f"${old_tp:.2f}" if old_tp else "none"
+                    adjustment_desc.append(f"TP {old_tp_str} → ${new_tp_price:.2f}")
                 if new_sl_price is not None:
-                    adjustment_desc.append(f"SL to ${new_sl_price:.2f}")
-                
+                    old_sl_str = f"${old_sl:.2f}" if old_sl else "none"
+                    adjustment_desc.append(f"SL {old_sl_str} → ${new_sl_price:.2f}")
+
+                source_suffix = f" (source: {source})" if source else ""
                 log_activity(
                     severity=ActivityLogSeverity.FAILURE,
                     activity_type=ActivityLogType.TP_SL_ADJUSTED,
-                    description=f"Failed to adjust {' and '.join(adjustment_desc)} for transaction {transaction.id} ({transaction.symbol}): {str(e)}",
+                    description=f"Failed to adjust {' and '.join(adjustment_desc)} for {transaction.symbol}{source_suffix}: {str(e)}",
                     data={
                         "transaction_id": transaction.id,
                         "symbol": transaction.symbol,
-                        "new_tp_price": new_tp_price,
-                        "new_sl_price": new_sl_price,
+                        "old_tp": old_tp,
+                        "new_tp": new_tp_price,
+                        "old_sl": old_sl,
+                        "new_sl": new_sl_price,
+                        "source": source,
                         "error": str(e)
                     },
-                    source_account_id=self.id
+                    source_account_id=self.id,
+                    source_expert_id=transaction.expert_id
                 )
             except Exception as log_error:
                 logger.warning(f"Failed to log TP/SL adjustment failure activity: {log_error}")
@@ -3550,19 +3576,20 @@ class AlpacaAccount(AccountInterface):
     
     # ==================== END OCO-ONLY HANDLERS ====================
     
-    def adjust_tp(self, transaction: Transaction, new_tp_price: float) -> bool:
+    def adjust_tp(self, transaction: Transaction, new_tp_price: float, source: str = "") -> bool:
         """
         Adjust take profit for a transaction.
-        
+
         Args:
             transaction: Transaction to adjust TP for
             new_tp_price: New take profit price
-            
+            source: Origin of adjustment (e.g. "manual", "ruleset", "smart_risk_manager")
+
         Returns:
             bool: True if adjustment succeeded
         """
-        return self._adjust_tpsl_internal(transaction, new_tp_price=new_tp_price, new_sl_price=None)
-    
+        return self._adjust_tpsl_internal(transaction, new_tp_price=new_tp_price, new_sl_price=None, source=source)
+
     def _calculate_tp_percent(self, entry_order: TradingOrder, tp_price: float) -> float:
         """Calculate TP percent from entry price"""
         if not entry_order.open_price or entry_order.open_price == 0:
@@ -3763,19 +3790,20 @@ class AlpacaAccount(AccountInterface):
             logger.error(f"Error replacing broker TP order: {e}", exc_info=True)
             return False
     
-    def adjust_sl(self, transaction: Transaction, new_sl_price: float) -> bool:
+    def adjust_sl(self, transaction: Transaction, new_sl_price: float, source: str = "") -> bool:
         """
         Adjust stop loss for a transaction.
-        
+
         Args:
             transaction: Transaction to adjust SL for
             new_sl_price: New stop loss price
-            
+            source: Origin of adjustment (e.g. "manual", "ruleset", "smart_risk_manager")
+
         Returns:
             bool: True if adjustment succeeded
         """
-        return self._adjust_tpsl_internal(transaction, new_tp_price=None, new_sl_price=new_sl_price)
-    
+        return self._adjust_tpsl_internal(transaction, new_tp_price=None, new_sl_price=new_sl_price, source=source)
+
     def _calculate_sl_percent(self, entry_order: TradingOrder, sl_price: float) -> float:
         """Calculate SL percent from entry price"""
         if not entry_order.open_price or entry_order.open_price == 0:
@@ -4029,19 +4057,20 @@ class AlpacaAccount(AccountInterface):
             logger.error(f"Error replacing broker SL order: {e}", exc_info=True)
             return False
     
-    def adjust_tp_sl(self, transaction: Transaction, new_tp_price: float, new_sl_price: float) -> bool:
+    def adjust_tp_sl(self, transaction: Transaction, new_tp_price: float, new_sl_price: float, source: str = "") -> bool:
         """
         Adjust both take profit and stop loss for a transaction.
-        
+
         Args:
             transaction: Transaction to adjust TP/SL for
             new_tp_price: New take profit price
             new_sl_price: New stop loss price
-            
+            source: Origin of adjustment (e.g. "manual", "ruleset", "smart_risk_manager")
+
         Returns:
             bool: True if adjustment succeeded
         """
-        return self._adjust_tpsl_internal(transaction, new_tp_price=new_tp_price, new_sl_price=new_sl_price)
+        return self._adjust_tpsl_internal(transaction, new_tp_price=new_tp_price, new_sl_price=new_sl_price, source=source)
     
     def _replace_broker_oco_order(self, session: Session, existing_oco: TradingOrder, new_tp_price: float, new_sl_price: float) -> bool:
         """

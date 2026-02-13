@@ -768,12 +768,22 @@ class WorkerQueue:
                             # Log batch start activity
                             try:
                                 from .utils import log_analysis_batch_start
+                                from .db import get_instance
+                                from .models import ExpertInstance
+                                batch_account_id = None
+                                try:
+                                    expert_inst = get_instance(ExpertInstance, task.expert_instance_id)
+                                    if expert_inst:
+                                        batch_account_id = expert_inst.account_id
+                                except Exception:
+                                    pass
                                 log_analysis_batch_start(
                                     batch_id=task.batch_id,
                                     expert_instance_id=task.expert_instance_id,
                                     total_jobs=1,  # Will be corrected in final log
                                     analysis_type=task.subtype,
-                                    is_scheduled="_" in task.batch_id  # Scheduled batches have format: expertid_HHmm_YYYYMMDD
+                                    is_scheduled="_" in task.batch_id,  # Scheduled batches have format: expertid_HHmm_YYYYMMDD
+                                    account_id=batch_account_id
                                 )
                             except Exception as e:
                                 logger.warning(f"Failed to log batch start for {task.batch_id}: {e}")
@@ -1070,13 +1080,23 @@ class WorkerQueue:
                         start_time, elapsed_seconds, total_jobs = batch_completion
                         try:
                             from .utils import log_analysis_batch_end
+                            from .db import get_instance
+                            from .models import ExpertInstance
+                            batch_account_id = None
+                            try:
+                                expert_inst = get_instance(ExpertInstance, task.expert_instance_id)
+                                if expert_inst:
+                                    batch_account_id = expert_inst.account_id
+                            except Exception:
+                                pass
                             log_analysis_batch_end(
                                 batch_id=task.batch_id,
                                 expert_instance_id=task.expert_instance_id,
                                 total_jobs=total_jobs,
                                 elapsed_seconds=elapsed_seconds,
                                 analysis_type=task.subtype,
-                                is_scheduled="_" in task.batch_id  # Scheduled batches have format: expertid_HHmm_YYYYMMDD
+                                is_scheduled="_" in task.batch_id,  # Scheduled batches have format: expertid_HHmm_YYYYMMDD
+                                account_id=batch_account_id
                             )
                         except Exception as e:
                             logger.warning(f"Failed to log batch end for {task.batch_id}: {e}")

@@ -792,7 +792,7 @@ class AdjustTakeProfitAction(TradeAction):
                     )
                 
                 logger.debug(f"Calling adjust_tp for transaction {transaction.id} with price ${self.take_profit_price:.2f}")
-                success = self.account.adjust_tp(transaction, self.take_profit_price)
+                success = self.account.adjust_tp(transaction, self.take_profit_price, source="ruleset")
                 
                 if success:
                     logger.info(f"✅ Successfully adjusted take profit for {self.instrument_name}: OCO/OTO order created/updated")
@@ -1178,7 +1178,7 @@ class AdjustStopLossAction(TradeAction):
                     )
                 
                 logger.debug(f"Calling adjust_sl for transaction {transaction.id} with price ${self.stop_loss_price:.2f}")
-                success = self.account.adjust_sl(transaction, self.stop_loss_price)
+                success = self.account.adjust_sl(transaction, self.stop_loss_price, source="ruleset")
                 
                 if success:
                     logger.info(f"✅ Successfully adjusted stop loss for {self.instrument_name}: OCO/OTO order created/updated")

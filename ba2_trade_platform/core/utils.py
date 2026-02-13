@@ -952,32 +952,33 @@ def get_expert_options_for_ui() -> tuple[list[str], dict[str, int]]:
         session.close()
 
 
-def log_analysis_batch_start(batch_id: str, expert_instance_id: int, total_jobs: int, analysis_type: str = "ENTER_MARKET", is_scheduled: bool = True) -> None:
+def log_analysis_batch_start(batch_id: str, expert_instance_id: int, total_jobs: int, analysis_type: str = "ENTER_MARKET", is_scheduled: bool = True, account_id: int = None) -> None:
     """
     Log the start of an analysis batch to the activity log.
-    
+
     Used for both scheduled and manual analysis batches. For scheduled jobs, batch_id format is
     expertid_HHmm_YYYYMMDD. For manual batches, batch_id is a timestamp-based identifier.
-    
+
     Args:
         batch_id: Unique batch identifier
         expert_instance_id: ID of the expert instance performing the analysis
         total_jobs: Total number of jobs in this batch
         analysis_type: Type of analysis ("ENTER_MARKET" or "OPEN_POSITIONS")
         is_scheduled: True for scheduled batches, False for manual batches
-        
+        account_id: Optional account ID for the expert instance
+
     Example:
         >>> log_analysis_batch_start("3_0930_20251030", 3, 50, "ENTER_MARKET", is_scheduled=True)
         >>> # Logs: "Analysis batch started: 50 jobs for expert 3, scheduled at 09:30"
-        
+
         >>> log_analysis_batch_start("manual_1730302000_batch1", 3, 2, "ENTER_MARKET", is_scheduled=False)
         >>> # Logs: "Manual analysis batch started: 2 jobs for expert 3 (AAPL, GOOGL)"
     """
     try:
         from .db import log_activity
-        
+
         batch_source = "scheduled" if is_scheduled else "manual"
-        
+
         description = f"Analysis batch started: {total_jobs} jobs ({analysis_type})"
         data = {
             "batch_id": batch_id,
@@ -986,25 +987,26 @@ def log_analysis_batch_start(batch_id: str, expert_instance_id: int, total_jobs:
             "analysis_type": analysis_type,
             "batch_source": batch_source
         }
-        
+
         log_activity(
             severity=ActivityLogSeverity.INFO,
             activity_type=ActivityLogType.ANALYSIS_STARTED,
             description=description,
             data=data,
-            source_expert_id=expert_instance_id
+            source_expert_id=expert_instance_id,
+            source_account_id=account_id
         )
         logger.info(f"Logged batch START for {batch_id}: {total_jobs} jobs")
     except Exception as e:
         logger.warning(f"Failed to log analysis batch start for {batch_id}: {e}")
 
 
-def log_analysis_batch_end(batch_id: str, expert_instance_id: int, total_jobs: int, elapsed_seconds: int, analysis_type: str = "ENTER_MARKET", is_scheduled: bool = True) -> None:
+def log_analysis_batch_end(batch_id: str, expert_instance_id: int, total_jobs: int, elapsed_seconds: int, analysis_type: str = "ENTER_MARKET", is_scheduled: bool = True, account_id: int = None) -> None:
     """
     Log the end of an analysis batch to the activity log with elapsed time.
-    
+
     Called when the last job in a batch completes.
-    
+
     Args:
         batch_id: Unique batch identifier (must match the start log batch_id)
         expert_instance_id: ID of the expert instance that performed the analysis
@@ -1012,24 +1014,25 @@ def log_analysis_batch_end(batch_id: str, expert_instance_id: int, total_jobs: i
         elapsed_seconds: Total elapsed time for the entire batch in seconds
         analysis_type: Type of analysis ("ENTER_MARKET" or "OPEN_POSITIONS")
         is_scheduled: True for scheduled batches, False for manual batches
-        
+        account_id: Optional account ID for the expert instance
+
     Example:
         >>> log_analysis_batch_end("3_0930_20251030", 3, 50, 1245, "ENTER_MARKET", is_scheduled=True)
         >>> # Logs: "Analysis batch completed: 50 jobs in 20 minutes 45 seconds"
-        
+
         >>> log_analysis_batch_end("manual_1730302000_batch1", 3, 2, 45, "ENTER_MARKET", is_scheduled=False)
         >>> # Logs: "Manual analysis batch completed: 2 jobs in 45 seconds"
     """
     try:
         from .db import log_activity
-        
+
         batch_source = "scheduled" if is_scheduled else "manual"
         minutes = elapsed_seconds // 60
         seconds = elapsed_seconds % 60
-        
+
         time_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
         description = f"Analysis batch completed: {total_jobs} jobs in {time_str} ({analysis_type})"
-        
+
         data = {
             "batch_id": batch_id,
             "expert_id": expert_instance_id,
@@ -1039,13 +1042,14 @@ def log_analysis_batch_end(batch_id: str, expert_instance_id: int, total_jobs: i
             "analysis_type": analysis_type,
             "batch_source": batch_source
         }
-        
+
         log_activity(
             severity=ActivityLogSeverity.SUCCESS,
             activity_type=ActivityLogType.ANALYSIS_COMPLETED,
             description=description,
             data=data,
-            source_expert_id=expert_instance_id
+            source_expert_id=expert_instance_id,
+            source_account_id=account_id
         )
         logger.info(f"Logged batch END for {batch_id}: {total_jobs} jobs in {time_str}")
     except Exception as e:

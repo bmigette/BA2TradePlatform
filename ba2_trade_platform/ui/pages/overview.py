@@ -3760,7 +3760,7 @@ class TransactionsTab:
             if has_tp and has_sl:
                 # Both TP and SL defined - create as OCO order
                 try:
-                    success = account_inst.adjust_tp_sl(txn, txn.take_profit, txn.stop_loss)
+                    success = account_inst.adjust_tp_sl(txn, txn.take_profit, txn.stop_loss, source="manual")
                     if success:
                         orders_created.extend(['TP', 'SL'])
                         logger.info(
@@ -3776,7 +3776,7 @@ class TransactionsTab:
                 # Only one of TP or SL defined - create separately
                 if has_tp:
                     try:
-                        success = account_inst.adjust_tp(txn, txn.take_profit)
+                        success = account_inst.adjust_tp(txn, txn.take_profit, source="manual")
                         if success:
                             orders_created.append('TP')
                             logger.info(f"Created TP order at ${txn.take_profit:.2f} for transaction {transaction_id}")
@@ -3787,7 +3787,7 @@ class TransactionsTab:
                 
                 if has_sl:
                     try:
-                        success = account_inst.adjust_sl(txn, txn.stop_loss)
+                        success = account_inst.adjust_sl(txn, txn.stop_loss, source="manual")
                         if success:
                             orders_created.append('SL')
                             logger.info(f"Created SL order at ${txn.stop_loss:.2f} for transaction {transaction_id}")
@@ -3957,7 +3957,7 @@ class TransactionsTab:
                 if tp_value and sl_value:
                     # Both have values - account will create/update OCO
                     try:
-                        success = account.adjust_tp_sl(txn, tp_value, sl_value)
+                        success = account.adjust_tp_sl(txn, tp_value, sl_value, source="manual")
                         if success:
                             ui.notify(f'TP/SL updated to ${tp_value:.2f}/${sl_value:.2f}', type='positive')
                         else:
@@ -3968,7 +3968,7 @@ class TransactionsTab:
                 elif tp_value:
                     # Only TP remains - account will create individual LIMIT order
                     try:
-                        success = account.adjust_tp(txn, tp_value)
+                        success = account.adjust_tp(txn, tp_value, source="manual")
                         if success:
                             ui.notify(f'TP updated to ${tp_value:.2f}, SL removed', type='positive')
                         else:
@@ -3979,7 +3979,7 @@ class TransactionsTab:
                 elif sl_value:
                     # Only SL remains - account will create individual STOP order
                     try:
-                        success = account.adjust_sl(txn, sl_value)
+                        success = account.adjust_sl(txn, sl_value, source="manual")
                         if success:
                             ui.notify(f'SL updated to ${sl_value:.2f}, TP removed', type='positive')
                         else:
@@ -4013,7 +4013,7 @@ class TransactionsTab:
                 # Only TP changed - account method will handle OCO ↔ individual transitions
                 if tp_value:
                     try:
-                        success = account.adjust_tp(txn, tp_value)
+                        success = account.adjust_tp(txn, tp_value, source="manual")
                         if success:
                             ui.notify(f'Take Profit updated to ${tp_value:.2f}', type='positive')
                         else:
@@ -4025,7 +4025,7 @@ class TransactionsTab:
                     # TP deleted - if SL exists, account will create SL-only order
                     if txn.stop_loss:
                         try:
-                            success = account.adjust_sl(txn, txn.stop_loss)
+                            success = account.adjust_sl(txn, txn.stop_loss, source="manual")
                             if success:
                                 ui.notify('Take Profit removed, Stop Loss kept', type='positive')
                             else:
@@ -4059,7 +4059,7 @@ class TransactionsTab:
                 # Only SL changed - account method will handle OCO ↔ individual transitions
                 if sl_value:
                     try:
-                        success = account.adjust_sl(txn, sl_value)
+                        success = account.adjust_sl(txn, sl_value, source="manual")
                         if success:
                             ui.notify(f'Stop Loss updated to ${sl_value:.2f}', type='positive')
                         else:
@@ -4071,7 +4071,7 @@ class TransactionsTab:
                     # SL deleted - if TP exists, account will create TP-only order
                     if txn.take_profit:
                         try:
-                            success = account.adjust_tp(txn, txn.take_profit)
+                            success = account.adjust_tp(txn, txn.take_profit, source="manual")
                             if success:
                                 ui.notify('Stop Loss removed, Take Profit kept', type='positive')
                             else:
@@ -4705,7 +4705,7 @@ class TransactionsTab:
                         # Use adjust_tp() to handle TP adjustment properly (creates OCO/OTO orders)
                         logger.info(f"[Batch TP] Transaction {txn_id}: calling adjust_tp with price ${new_tp_price:.2f}")
                         try:
-                            success = account.adjust_tp(txn, new_tp_price)
+                            success = account.adjust_tp(txn, new_tp_price, source="manual")
                             if success:
                                 success_count += 1
                                 existing_tp_modified.append(txn_id)

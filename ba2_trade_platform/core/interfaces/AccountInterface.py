@@ -297,21 +297,21 @@ class AccountInterface(ExtendableSettingsInterface):
                     # Both TP and SL provided - use adjust_tp_sl for OCO order
                     logger.debug(f"Creating TP/SL orders for transaction {transaction.id} via adjust_tp_sl")
                     try:
-                        self.adjust_tp_sl(transaction, tp_price, sl_price)
+                        self.adjust_tp_sl(transaction, tp_price, sl_price, source="initial_setup")
                     except NotImplementedError:
                         logger.warning(f"Broker {self.__class__.__name__} does not implement adjust_tp_sl - TP/SL not set")
                 elif tp_price:
                     # Only TP provided - use adjust_tp for OTO order
                     logger.debug(f"Creating TP order for transaction {transaction.id} via adjust_tp")
                     try:
-                        self.adjust_tp(transaction, tp_price)
+                        self.adjust_tp(transaction, tp_price, source="initial_setup")
                     except NotImplementedError:
                         logger.warning(f"Broker {self.__class__.__name__} does not implement adjust_tp - TP not set")
                 elif sl_price:
                     # Only SL provided - use adjust_sl for OTO order
                     logger.debug(f"Creating SL order for transaction {transaction.id} via adjust_sl")
                     try:
-                        self.adjust_sl(transaction, sl_price)
+                        self.adjust_sl(transaction, sl_price, source="initial_setup")
                     except NotImplementedError:
                         logger.warning(f"Broker {self.__class__.__name__} does not implement adjust_sl - SL not set")
         

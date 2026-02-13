@@ -1658,8 +1658,8 @@ class SmartRiskManagerToolkit:
                 
                 # Use AccountInterface's adjust_sl method - stateless operation that determines action based on current state
                 try:
-                    success = self.account.adjust_sl(transaction, new_sl_price)
-                    
+                    success = self.account.adjust_sl(transaction, new_sl_price, source="smart_risk_manager")
+
                     if success:
                         logger.info(f"Successfully adjusted stop loss from {old_sl_price} to {new_sl_price}")
                         return {
@@ -1802,8 +1802,8 @@ class SmartRiskManagerToolkit:
                 
                 # Use AccountInterface's adjust_tp method - stateless operation that determines action based on current state
                 try:
-                    success = self.account.adjust_tp(transaction, new_tp_price)
-                    
+                    success = self.account.adjust_tp(transaction, new_tp_price, source="smart_risk_manager")
+
                     if success:
                         logger.info(f"Successfully adjusted take profit from {old_tp_price} to {new_tp_price}")
                         return {
@@ -2248,7 +2248,7 @@ class SmartRiskManagerToolkit:
                     if tp_price and tp_valid and sl_price and sl_valid:
                         # Set both TP and SL together
                         logger.info(f"Adjusting TP to {tp_price:.2f} and SL to {sl_price:.2f} using account.adjust_tp_sl()")
-                        success = self.account.adjust_tp_sl(transaction, tp_price, sl_price)
+                        success = self.account.adjust_tp_sl(transaction, tp_price, sl_price, source="smart_risk_manager")
                         if success:
                             tp_created = True
                             sl_created = True
@@ -2260,7 +2260,7 @@ class SmartRiskManagerToolkit:
                     elif tp_price and tp_valid:
                         # Set TP only
                         logger.info(f"Adjusting TP to {tp_price:.2f} using account.adjust_tp()")
-                        success = self.account.adjust_tp(transaction, tp_price)
+                        success = self.account.adjust_tp(transaction, tp_price, source="smart_risk_manager")
                         if success:
                             tp_created = True
                         else:
@@ -2269,7 +2269,7 @@ class SmartRiskManagerToolkit:
                     elif sl_price and sl_valid:
                         # Set SL only
                         logger.info(f"Adjusting SL to {sl_price:.2f} using account.adjust_sl()")
-                        success = self.account.adjust_sl(transaction, sl_price)
+                        success = self.account.adjust_sl(transaction, sl_price, source="smart_risk_manager")
                         if success:
                             sl_created = True
                         else:
