@@ -3257,7 +3257,7 @@ class TransactionsTab:
                     cost_basis = txn.open_price * abs(txn.quantity)
                     pnl_closed_pct = (pnl_closed / cost_basis * 100) if cost_basis > 0 else 0
                     closed_pnl = f"${pnl_closed:+.2f} ({pnl_closed_pct:+.1f}%)"
-                    closed_pnl_numeric = pnl_closed  # Store numeric value for sorting
+                    closed_pnl_numeric = pnl_closed_pct  # Store percentage for sorting
 
                 # Status styling
                 status_color = {

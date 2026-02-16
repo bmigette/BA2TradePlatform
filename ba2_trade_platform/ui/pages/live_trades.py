@@ -343,18 +343,24 @@ class LiveTradesTab:
 
             # Apply sorting
             # Map column names to SQL sort expressions where they differ from model fields
+            # Computed fields (current_pnl_numeric) require in-memory sorting after price fetch
+            IN_MEMORY_SORT_FIELDS = {'current_pnl_numeric'}
             SORT_MAP = {
                 'direction': Transaction.side,
                 'closed_at': Transaction.close_date,
                 'account': AccountDefinition.name,
                 'expert': func.coalesce(ExpertInstance.alias, ExpertInstance.expert),
-                'closed_pnl': case(
+                'closed_pnl_numeric': case(
+                    (Transaction.open_price == 0, 0),
                     (Transaction.side == 'BUY',
-                     (Transaction.close_price - Transaction.open_price) * Transaction.quantity),
-                    else_=(Transaction.open_price - Transaction.close_price) * Transaction.quantity
+                     (Transaction.close_price - Transaction.open_price) / Transaction.open_price * 100),
+                    else_=(Transaction.open_price - Transaction.close_price) / Transaction.open_price * 100
                 ),
             }
-            if sort_by:
+
+            needs_in_memory_sort = sort_by in IN_MEMORY_SORT_FIELDS
+
+            if sort_by and not needs_in_memory_sort:
                 sort_expr = SORT_MAP.get(sort_by)
                 if sort_expr is None:
                     sort_expr = getattr(Transaction, sort_by, None)
@@ -366,8 +372,32 @@ class LiveTradesTab:
                 else:
                     # Unknown column - fall back to default sort
                     base_query = base_query.order_by(Transaction.created_at.desc())
-            else:
+            elif not needs_in_memory_sort:
                 base_query = base_query.order_by(Transaction.created_at.desc())
+
+            if needs_in_memory_sort:
+                # For computed fields: fetch ALL matching rows, build rows, sort in-memory, then paginate
+                results = list(session.exec(base_query).all())
+                transactions = []
+                transaction_experts = {}
+                for txn, expert in results:
+                    transactions.append(txn)
+                    transaction_experts[txn.id] = expert
+
+                if not transactions:
+                    fetch_timer.stop(f"count=0, total={total_count}")
+                    return [], total_count
+
+                rows = self._build_transaction_rows(transactions, transaction_experts, session)
+                rows.sort(key=lambda r: r.get(sort_by, 0), reverse=descending)
+
+                # Apply pagination in-memory
+                start = (page - 1) * page_size
+                end = start + page_size
+                rows = rows[start:end]
+
+                fetch_timer.stop(f"count={len(rows)}, total={total_count} (in-memory sort by {sort_by})")
+                return rows, total_count
 
             # Apply pagination - LazyTable uses 1-indexed pages
             offset = (page - 1) * page_size
@@ -387,7 +417,7 @@ class LiveTradesTab:
 
             # Build rows using existing logic
             rows = self._build_transaction_rows(transactions, transaction_experts, session)
-            
+
             fetch_timer.stop(f"count={len(rows)}, total={total_count}")
             return rows, total_count
 
@@ -488,7 +518,7 @@ class LiveTradesTab:
                 cost_basis = txn.open_price * abs(txn.quantity)
                 pnl_closed_pct = (pnl_closed / cost_basis * 100) if cost_basis > 0 else 0
                 closed_pnl = f"${pnl_closed:+.2f} ({pnl_closed_pct:+.1f}%)"
-                closed_pnl_numeric = pnl_closed
+                closed_pnl_numeric = pnl_closed_pct
 
             # Status styling
             status_color = {
