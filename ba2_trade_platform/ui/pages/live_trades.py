@@ -342,15 +342,15 @@ class LiveTradesTab:
             total_count = session.exec(count_query).one()
 
             # Apply sorting
-            # Map column names to SQL sort expressions where they differ from model fields
-            # Computed fields (current_pnl_numeric) require in-memory sorting after price fetch
-            IN_MEMORY_SORT_FIELDS = {'current_pnl_numeric'}
+            # Keys are column NAMES (Quasar sends column name as sortBy, not field)
+            # Computed fields (current_pnl) require in-memory sorting after price fetch
+            IN_MEMORY_SORT_FIELDS = {'current_pnl': 'current_pnl_numeric'}  # column name -> row data key
             SORT_MAP = {
                 'direction': Transaction.side,
                 'closed_at': Transaction.close_date,
                 'account': AccountDefinition.name,
                 'expert': func.coalesce(ExpertInstance.alias, ExpertInstance.expert),
-                'closed_pnl_numeric': case(
+                'closed_pnl': case(
                     (Transaction.open_price == 0, 0),
                     (Transaction.side == 'BUY',
                      (Transaction.close_price - Transaction.open_price) / Transaction.open_price * 100),
@@ -389,7 +389,8 @@ class LiveTradesTab:
                     return [], total_count
 
                 rows = self._build_transaction_rows(transactions, transaction_experts, session)
-                rows.sort(key=lambda r: r.get(sort_by, 0), reverse=descending)
+                row_key = IN_MEMORY_SORT_FIELDS[sort_by]  # Map column name to row data key
+                rows.sort(key=lambda r: r.get(row_key, 0), reverse=descending)
 
                 # Apply pagination in-memory
                 start = (page - 1) * page_size
