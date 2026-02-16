@@ -1492,8 +1492,10 @@ All {len(trade_details)} trades shown above for transparency.
                                         ui.label(f'Exec: {trade.get("exec_date", "N/A")} ({trade.get("days_since_exec", 0)}d ago)')
                                         ui.label(f'Disclosed: {trade.get("disclose_date", "N/A")} ({trade.get("days_since_disclose", 0)}d ago)')
                                     
-                                    # Trader activity statistics
-                                    with ui.column().classes('mt-2 text-xs').style('color: #718096'):
+                                    # Trader total activity statistics (all symbols)
+                                    ui.separator().classes('mt-2 mb-1')
+                                    with ui.column().classes('text-xs').style('color: #718096'):
+                                        ui.label('Total trades (all symbols):').classes('text-xs text-weight-medium')
                                         ui.label(f'Recent: {trade.get("trader_recent_buys", "N/A")} buys, {trade.get("trader_recent_sells", "N/A")} sells')
                                         ui.label(f'Yearly: {trade.get("trader_yearly_buys", "N/A")} buys, {trade.get("trader_yearly_sells", "N/A")} sells')
                                 
@@ -1510,7 +1512,7 @@ All {len(trade_details)} trades shown above for transparency.
                                     modifier = trade.get('trader_confidence_modifier', 0)
                                     if modifier != 0:
                                         modifier_color = 'positive' if modifier > 0 else 'negative'
-                                        ui.label(f'Pattern: {modifier:+.1f}%').classes(f'text-xs text-{modifier_color}')
+                                        ui.label(f'Symbol Alloc: {modifier:+.1f}%').classes(f'text-xs text-{modifier_color}')
                     
                     if len(trades) > 5:
                         ui.label(f'+ {len(trades) - 5} more trades').classes('text-sm mt-2').style('color: #718096')
