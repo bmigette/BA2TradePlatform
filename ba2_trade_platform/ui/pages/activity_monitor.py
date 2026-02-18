@@ -353,7 +353,12 @@ class ActivityMonitorPage:
             ColumnDef(name='type', label='Type', field='type', sortable=True, align='left'),
             ColumnDef(name='expert', label='Expert', field='expert', sortable=True, align='left'),
             ColumnDef(name='account', label='Account', field='account', sortable=True, align='left'),
-            ColumnDef(name='description', label='Description', field='description', align='left', filterable=True),
+            ColumnDef(name='description', label='Description', field='description', align='left', filterable=True,
+                      slot_template='''
+                        <q-td :props="props" style="white-space: pre-wrap; word-break: break-word; max-width: 600px; vertical-align: top;">
+                            {{ props.value }}
+                        </q-td>
+                      '''),
         ]
         
         # Configure LazyTable

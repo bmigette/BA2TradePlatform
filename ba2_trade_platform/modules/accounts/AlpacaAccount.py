@@ -2963,7 +2963,42 @@ class AlpacaAccount(AccountInterface):
                         )
                     except Exception as log_error:
                         logger.warning(f"Failed to log TP/SL adjustment activity: {log_error}")
-                
+
+                else:
+                    # result=False without exception means broker rejected the order
+                    try:
+                        from ...core.db import log_activity
+                        from ...core.types import ActivityLogSeverity, ActivityLogType
+
+                        adjustment_desc = []
+                        if new_tp_price is not None:
+                            old_tp_str = f"${old_tp:.2f}" if old_tp else "none"
+                            adjustment_desc.append(f"TP {old_tp_str} → ${new_tp_price:.2f}")
+                        if new_sl_price is not None:
+                            old_sl_str = f"${old_sl:.2f}" if old_sl else "none"
+                            adjustment_desc.append(f"SL {old_sl_str} → ${new_sl_price:.2f}")
+
+                        source_suffix = f" (source: {source})" if source else ""
+                        log_activity(
+                            severity=ActivityLogSeverity.FAILURE,
+                            activity_type=ActivityLogType.TP_SL_ADJUSTED,
+                            description=f"Failed to adjust {' and '.join(adjustment_desc)} for {transaction_in_session.symbol}{source_suffix}: broker rejected order",
+                            data={
+                                "transaction_id": transaction_in_session.id,
+                                "symbol": transaction_in_session.symbol,
+                                "old_tp": old_tp,
+                                "new_tp": new_tp_price,
+                                "old_sl": old_sl,
+                                "new_sl": new_sl_price,
+                                "source": source,
+                                "error": "broker rejected order"
+                            },
+                            source_account_id=self.id,
+                            source_expert_id=transaction_in_session.expert_id
+                        )
+                    except Exception as log_error:
+                        logger.warning(f"Failed to log TP/SL adjustment failure activity: {log_error}")
+
                 return result
                     
         except Exception as e:
@@ -3660,6 +3695,12 @@ class AlpacaAccount(AccountInterface):
             logger.info(f"Submitting {order_type.value} TP order {tp_order.id} to broker")
             try:
                 self.submit_order(tp_order)
+                # submit_order handles broker errors internally (sets status=ERROR, logs FAILURE)
+                # without raising exceptions, so we must re-check the actual order status.
+                session.refresh(tp_order)
+                if tp_order.status == OrderStatus.ERROR:
+                    logger.error(f"TP order {tp_order.id} was rejected by broker (status=ERROR) for transaction {transaction.id}")
+                    return False
                 logger.info(f"Successfully submitted {order_type.value} TP order {tp_order.id} for transaction {transaction.id}")
                 return True
             except Exception as e:
@@ -3859,6 +3900,12 @@ class AlpacaAccount(AccountInterface):
             logger.info(f"Submitting OCO order {oco_order.id} to broker")
             try:
                 self.submit_order(oco_order)
+                # submit_order handles broker errors internally (sets status=ERROR, logs FAILURE)
+                # without raising exceptions, so we must re-check the actual order status.
+                session.refresh(oco_order)
+                if oco_order.status == OrderStatus.ERROR:
+                    logger.error(f"OCO order {oco_order.id} was rejected by broker (status=ERROR) for transaction {transaction.id}")
+                    return False
                 logger.info(f"Successfully submitted OCO order {oco_order.id} for transaction {transaction.id}")
                 return True
             except Exception as e:
@@ -3931,6 +3978,12 @@ class AlpacaAccount(AccountInterface):
             logger.info(f"Submitting {order_type.value} SL order {sl_order.id} to broker")
             try:
                 self.submit_order(sl_order)
+                # submit_order handles broker errors internally (sets status=ERROR, logs FAILURE)
+                # without raising exceptions, so we must re-check the actual order status.
+                session.refresh(sl_order)
+                if sl_order.status == OrderStatus.ERROR:
+                    logger.error(f"SL order {sl_order.id} was rejected by broker (status=ERROR) for transaction {transaction.id}")
+                    return False
                 logger.info(f"Successfully submitted {order_type.value} SL order {sl_order.id} for transaction {transaction.id}")
                 return True
             except Exception as e:

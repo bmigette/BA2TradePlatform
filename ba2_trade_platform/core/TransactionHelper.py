@@ -628,53 +628,76 @@ class TransactionHelper:
                     except Exception as e:
                         logger.error(f"Error canceling TP/SL order {tpsl_order.id}: {e}", exc_info=True)
                 
-                # Step 3: Create WAITING_TRIGGER TP/SL orders
+                # Step 3: Create WAITING_TRIGGER OCO order (or single TP/SL if only one is set)
                 # These will be triggered when the close order is FILLED
-                if tp_price and remaining_qty > 0:
-                    tp_order_type = OrderType.SELL_LIMIT if entry_direction == OrderDirection.BUY else OrderType.BUY_LIMIT
-                    tp_order = TradingOrder(
-                        transaction_id=transaction.id,
-                        account_id=account.id,
-                        symbol=symbol,
-                        side=close_direction,
-                        quantity=remaining_qty,
-                        order_type=tp_order_type,
-                        limit_price=tp_price,
-                        status=OrderStatus.WAITING_TRIGGER,
-                        depends_on_order=close_order_id,
-                        depends_order_status_trigger=OrderStatus.FILLED,
-                        comment="Take Profit order (triggered by close fill)",
-                        created_at=datetime.now(timezone.utc)
-                    )
-                    tp_id = add_instance(tp_order)
-                    result["orders_created"].append(tp_id)
-                    logger.info(
-                        f"Created WAITING_TRIGGER TP order {tp_id} at ${tp_price}, qty={remaining_qty}, "
-                        f"will trigger when order {close_order_id} is FILLED"
-                    )
-                
-                if sl_price and remaining_qty > 0:
-                    sl_order_type = OrderType.SELL_STOP if entry_direction == OrderDirection.BUY else OrderType.BUY_STOP
-                    sl_order = TradingOrder(
-                        transaction_id=transaction.id,
-                        account_id=account.id,
-                        symbol=symbol,
-                        side=close_direction,
-                        quantity=remaining_qty,
-                        order_type=sl_order_type,
-                        stop_price=sl_price,
-                        status=OrderStatus.WAITING_TRIGGER,
-                        depends_on_order=close_order_id,
-                        depends_order_status_trigger=OrderStatus.FILLED,
-                        comment="Stop Loss order (triggered by close fill)",
-                        created_at=datetime.now(timezone.utc)
-                    )
-                    sl_id = add_instance(sl_order)
-                    result["orders_created"].append(sl_id)
-                    logger.info(
-                        f"Created WAITING_TRIGGER SL order {sl_id} at ${sl_price}, qty={remaining_qty}, "
-                        f"will trigger when order {close_order_id} is FILLED"
-                    )
+                if remaining_qty > 0 and (tp_price or sl_price):
+                    if tp_price and sl_price:
+                        # Both TP and SL - create a single OCO order
+                        oco_order = TradingOrder(
+                            transaction_id=transaction.id,
+                            account_id=account.id,
+                            symbol=symbol,
+                            side=close_direction,
+                            quantity=remaining_qty,
+                            order_type=OrderType.OCO,
+                            limit_price=tp_price,
+                            stop_price=sl_price,
+                            status=OrderStatus.WAITING_TRIGGER,
+                            depends_on_order=close_order_id,
+                            depends_order_status_trigger=OrderStatus.FILLED,
+                            comment="OCO TP/SL (triggered by close fill)",
+                            created_at=datetime.now(timezone.utc)
+                        )
+                        oco_id = add_instance(oco_order)
+                        result["orders_created"].append(oco_id)
+                        logger.info(
+                            f"Created WAITING_TRIGGER OCO order {oco_id} TP=${tp_price}/SL=${sl_price}, qty={remaining_qty}, "
+                            f"will trigger when order {close_order_id} is FILLED"
+                        )
+                    elif tp_price:
+                        tp_order_type = OrderType.SELL_LIMIT if entry_direction == OrderDirection.BUY else OrderType.BUY_LIMIT
+                        tp_order = TradingOrder(
+                            transaction_id=transaction.id,
+                            account_id=account.id,
+                            symbol=symbol,
+                            side=close_direction,
+                            quantity=remaining_qty,
+                            order_type=tp_order_type,
+                            limit_price=tp_price,
+                            status=OrderStatus.WAITING_TRIGGER,
+                            depends_on_order=close_order_id,
+                            depends_order_status_trigger=OrderStatus.FILLED,
+                            comment="Take Profit order (triggered by close fill)",
+                            created_at=datetime.now(timezone.utc)
+                        )
+                        tp_id = add_instance(tp_order)
+                        result["orders_created"].append(tp_id)
+                        logger.info(
+                            f"Created WAITING_TRIGGER TP order {tp_id} at ${tp_price}, qty={remaining_qty}, "
+                            f"will trigger when order {close_order_id} is FILLED"
+                        )
+                    else:
+                        sl_order_type = OrderType.SELL_STOP if entry_direction == OrderDirection.BUY else OrderType.BUY_STOP
+                        sl_order = TradingOrder(
+                            transaction_id=transaction.id,
+                            account_id=account.id,
+                            symbol=symbol,
+                            side=close_direction,
+                            quantity=remaining_qty,
+                            order_type=sl_order_type,
+                            stop_price=sl_price,
+                            status=OrderStatus.WAITING_TRIGGER,
+                            depends_on_order=close_order_id,
+                            depends_order_status_trigger=OrderStatus.FILLED,
+                            comment="Stop Loss order (triggered by close fill)",
+                            created_at=datetime.now(timezone.utc)
+                        )
+                        sl_id = add_instance(sl_order)
+                        result["orders_created"].append(sl_id)
+                        logger.info(
+                            f"Created WAITING_TRIGGER SL order {sl_id} at ${sl_price}, qty={remaining_qty}, "
+                            f"will trigger when order {close_order_id} is FILLED"
+                        )
                 
                 # Update transaction with abs() safety
                 if remaining_qty < 0:
@@ -747,53 +770,79 @@ class TransactionHelper:
                     except Exception as e:
                         logger.error(f"Error canceling TP/SL order {tpsl_order.id}: {e}", exc_info=True)
                 
-                # Step 3: Create WAITING_TRIGGER TP/SL orders
+                # Step 3: Create WAITING_TRIGGER OCO order (or single TP/SL if only one is set)
                 # These will be triggered when the old TP/SL order is CANCELED
-                if tp_price and new_qty > 0:
-                    tp_order_type = OrderType.SELL_LIMIT if entry_direction == OrderDirection.BUY else OrderType.BUY_LIMIT
-                    tp_order = TradingOrder(
-                        transaction_id=transaction.id,
-                        account_id=account.id,
-                        symbol=symbol,
-                        side=close_direction,
-                        quantity=new_qty,
-                        order_type=tp_order_type,
-                        limit_price=tp_price,
-                        status=OrderStatus.WAITING_TRIGGER if trigger_order_id else OrderStatus.PENDING,
-                        depends_on_order=trigger_order_id,
-                        depends_order_status_trigger=OrderStatus.CANCELED if trigger_order_id else None,
-                        comment="Take Profit order (triggered by old TP/SL cancel)",
-                        created_at=datetime.now(timezone.utc)
-                    )
-                    tp_id = add_instance(tp_order)
-                    result["orders_created"].append(tp_id)
-                    logger.info(
-                        f"Created WAITING_TRIGGER TP order {tp_id} at ${tp_price}, qty={new_qty}, "
-                        f"will trigger when order {trigger_order_id} is CANCELED"
-                    )
-                
-                if sl_price and new_qty > 0:
-                    sl_order_type = OrderType.SELL_STOP if entry_direction == OrderDirection.BUY else OrderType.BUY_STOP
-                    sl_order = TradingOrder(
-                        transaction_id=transaction.id,
-                        account_id=account.id,
-                        symbol=symbol,
-                        side=close_direction,
-                        quantity=new_qty,
-                        order_type=sl_order_type,
-                        stop_price=sl_price,
-                        status=OrderStatus.WAITING_TRIGGER if trigger_order_id else OrderStatus.PENDING,
-                        depends_on_order=trigger_order_id,
-                        depends_order_status_trigger=OrderStatus.CANCELED if trigger_order_id else None,
-                        comment="Stop Loss order (triggered by old TP/SL cancel)",
-                        created_at=datetime.now(timezone.utc)
-                    )
-                    sl_id = add_instance(sl_order)
-                    result["orders_created"].append(sl_id)
-                    logger.info(
-                        f"Created WAITING_TRIGGER SL order {sl_id} at ${sl_price}, qty={new_qty}, "
-                        f"will trigger when order {trigger_order_id} is CANCELED"
-                    )
+                if new_qty > 0 and (tp_price or sl_price):
+                    order_status = OrderStatus.WAITING_TRIGGER if trigger_order_id else OrderStatus.PENDING
+                    trigger_status = OrderStatus.CANCELED if trigger_order_id else None
+
+                    if tp_price and sl_price:
+                        # Both TP and SL - create a single OCO order
+                        oco_order = TradingOrder(
+                            transaction_id=transaction.id,
+                            account_id=account.id,
+                            symbol=symbol,
+                            side=close_direction,
+                            quantity=new_qty,
+                            order_type=OrderType.OCO,
+                            limit_price=tp_price,
+                            stop_price=sl_price,
+                            status=order_status,
+                            depends_on_order=trigger_order_id,
+                            depends_order_status_trigger=trigger_status,
+                            comment="OCO TP/SL (triggered by old TP/SL cancel)",
+                            created_at=datetime.now(timezone.utc)
+                        )
+                        oco_id = add_instance(oco_order)
+                        result["orders_created"].append(oco_id)
+                        logger.info(
+                            f"Created WAITING_TRIGGER OCO order {oco_id} TP=${tp_price}/SL=${sl_price}, qty={new_qty}, "
+                            f"will trigger when order {trigger_order_id} is CANCELED"
+                        )
+                    elif tp_price:
+                        tp_order_type = OrderType.SELL_LIMIT if entry_direction == OrderDirection.BUY else OrderType.BUY_LIMIT
+                        tp_order = TradingOrder(
+                            transaction_id=transaction.id,
+                            account_id=account.id,
+                            symbol=symbol,
+                            side=close_direction,
+                            quantity=new_qty,
+                            order_type=tp_order_type,
+                            limit_price=tp_price,
+                            status=order_status,
+                            depends_on_order=trigger_order_id,
+                            depends_order_status_trigger=trigger_status,
+                            comment="Take Profit order (triggered by old TP/SL cancel)",
+                            created_at=datetime.now(timezone.utc)
+                        )
+                        tp_id = add_instance(tp_order)
+                        result["orders_created"].append(tp_id)
+                        logger.info(
+                            f"Created WAITING_TRIGGER TP order {tp_id} at ${tp_price}, qty={new_qty}, "
+                            f"will trigger when order {trigger_order_id} is CANCELED"
+                        )
+                    else:
+                        sl_order_type = OrderType.SELL_STOP if entry_direction == OrderDirection.BUY else OrderType.BUY_STOP
+                        sl_order = TradingOrder(
+                            transaction_id=transaction.id,
+                            account_id=account.id,
+                            symbol=symbol,
+                            side=close_direction,
+                            quantity=new_qty,
+                            order_type=sl_order_type,
+                            stop_price=sl_price,
+                            status=order_status,
+                            depends_on_order=trigger_order_id,
+                            depends_order_status_trigger=trigger_status,
+                            comment="Stop Loss order (triggered by old TP/SL cancel)",
+                            created_at=datetime.now(timezone.utc)
+                        )
+                        sl_id = add_instance(sl_order)
+                        result["orders_created"].append(sl_id)
+                        logger.info(
+                            f"Created WAITING_TRIGGER SL order {sl_id} at ${sl_price}, qty={new_qty}, "
+                            f"will trigger when order {trigger_order_id} is CANCELED"
+                        )
                 
                 # Update transaction with abs() safety
                 if new_qty < 0:

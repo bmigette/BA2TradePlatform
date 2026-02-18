@@ -3235,7 +3235,7 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
                         with get_db() as session:
                             transaction = session.get(Transaction, transaction_id)
                             if transaction:
-                                result = toolkit.account.adjust_tp_sl(transaction, new_tp_price, new_sl_price, source="ruleset")
+                                result = toolkit.account.adjust_tp_sl(transaction, new_tp_price, new_sl_price, source="smart_risk_manager")
                                 
                                 if result:
                                     # Create success result dict matching other action formats
