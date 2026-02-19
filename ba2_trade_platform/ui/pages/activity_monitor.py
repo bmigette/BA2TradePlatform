@@ -371,7 +371,8 @@ class ActivityMonitorPage:
             default_sort_by='timestamp',
             default_sort_descending=True,
             auto_refresh_interval=0,  # We manage auto-refresh ourselves
-            table_name='ActivityMonitorTable'
+            table_name='ActivityMonitorTable',
+            wrap_cells=True  # Allow description text to wrap instead of truncating
         )
         
         # Create and render LazyTable

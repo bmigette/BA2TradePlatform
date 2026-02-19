@@ -102,6 +102,7 @@ class LazyTableConfig:
     dense: bool = False
     flat: bool = True
     bordered: bool = True
+    wrap_cells: bool = False  # Enable Quasar wrap-cells prop (overrides default nowrap)
     
     # Default sort
     default_sort_by: Optional[str] = None
@@ -589,6 +590,8 @@ class LazyTable:
             table_props = 'flat bordered' if self.config.flat and self.config.bordered else ''
             if self.config.dense:
                 table_props += ' dense'
+            if self.config.wrap_cells:
+                table_props += ' wrap-cells'
             
             # Selection prop
             selection_prop = None
