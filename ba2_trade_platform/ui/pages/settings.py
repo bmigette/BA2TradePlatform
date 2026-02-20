@@ -4444,15 +4444,15 @@ class TradeSettingsTab:
                             for rule in available_rules:
                                 is_selected = rule.id in selected_rule_ids
 
-                                with ui.card().classes('w-full p-2 mb-1'):
-                                    with ui.row().classes('w-full items-center gap-2'):
+                                with ui.card().classes('w-full p-1 mb-1'):
+                                    with ui.row().classes('w-full items-center gap-1').style('margin-bottom: -8px'):
                                         rule_checkbox = ui.checkbox(
                                             text='',
                                             value=is_selected
                                         )
                                         ui.label(f'{rule.name}').classes('font-medium text-sm flex-1')
 
-                                    with ui.expansion('Details', value=False).classes('w-full').props('dense'):
+                                    with ui.expansion('Details', value=False).classes('w-full').props('dense').style('margin-top: 0'):
                                         ui.label(f'Subtype: {rule.subtype.value.replace("_", " ").title()}').classes('text-xs text-grey-6')
                                         ui.label(f'Continue Processing: {"Yes" if rule.continue_processing else "No"}').classes('text-xs text-grey-6')
                                         if rule.triggers:
