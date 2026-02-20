@@ -482,7 +482,7 @@ class LazyTable:
                     options=self.config.page_size_options,
                     value=self._page_size,
                     on_change=lambda e: asyncio.create_task(self._on_page_size_change(e.value))
-                ).classes('w-20')
+                ).classes('w-24')
             
             # Center: pagination info
             self._pagination_label = ui.label('Loading...').classes('text-sm text-gray-600')

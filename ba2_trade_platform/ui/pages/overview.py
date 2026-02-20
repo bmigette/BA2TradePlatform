@@ -10,7 +10,7 @@ import json
 from ...core.db import get_all_instances, get_db, get_instance, update_instance
 from ...core.models import AccountDefinition, MarketAnalysis, ExpertRecommendation, ExpertInstance, AppSetting, TradingOrder, Transaction
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, OrderStatus, OrderOpenType, OrderType
-from ...core.utils import get_expert_instance_from_id, get_market_analysis_id_from_order_id, get_account_instance_from_id, get_expert_options_for_ui
+from ...core.utils import get_expert_instance_from_id, get_market_analysis_id_from_order_id, get_account_instance_from_id, get_expert_options_for_ui, calculate_transaction_pnl
 from ...core.TransactionHelper import TransactionHelper
 from ...core.ModelBillingUsage import ModelBillingUsage
 from ...modules.accounts import providers
@@ -547,12 +547,11 @@ class OverviewTab:
             asyncio.create_task(self._check_and_display_pending_orders_async(self.tabs_ref))
 
             with ui.grid(columns=4).classes('w-full gap-4'):
-                # Row 1: API Usage, Analysis Jobs, Order Statistics, and Trade Recommendations
+                # Row 1: API Usage, Analysis & Recommendations, Order Statistics, Trade Performance
                 self._render_api_usage_widget()
-                self._render_analysis_jobs_widget()
+                self._render_combined_jobs_reco_widget()
                 self._render_order_statistics_widget()
-                with ui.column().classes(''):
-                    self._render_order_recommendations_widget()
+                self._render_trade_performance_widget()
 
             # Row 2: Profit Per Expert and Balance Usage Per Expert (double width each)
             with ui.grid(columns=2).classes('w-full gap-4'):
@@ -660,22 +659,27 @@ class OverviewTab:
             # Load data asynchronously
             asyncio.create_task(self._load_api_usage_data(loading_label, content_container))
     
-    def _render_analysis_jobs_widget(self):
-        """Widget showing analysis job statistics with async data loading."""
+    def _render_combined_jobs_reco_widget(self):
+        """Widget showing analysis job stats and trade recommendation counts."""
         with ui.card().classes('p-4'):
-            ui.label('📊 Analysis Jobs').classes('text-h6 mb-4')
+            ui.label('📊 Analysis & Recommendations').classes('text-h6 mb-2')
             loading_label = ui.label('🔄 Loading...').classes('text-sm text-gray-500')
             content_container = ui.column().classes('w-full')
-            asyncio.create_task(self._load_analysis_jobs_data(loading_label, content_container))
+            asyncio.create_task(self._load_combined_jobs_reco_data(loading_label, content_container))
 
-    async def _load_analysis_jobs_data(self, loading_label, content_container):
-        """Load analysis job statistics asynchronously."""
-        timer = PerfLogger.start(PerfLogger.COMPONENT, PerfLogger.LOAD, "AnalysisJobsWidget")
+    async def _load_combined_jobs_reco_data(self, loading_label, content_container):
+        """Load analysis job statistics and trade recommendation counts asynchronously."""
+        timer = PerfLogger.start(PerfLogger.COMPONENT, PerfLogger.LOAD, "CombinedJobsRecoWidget")
         try:
             selected_account_id = get_selected_account_id()
             expert_ids = get_expert_ids_for_account(selected_account_id)
 
+            now = datetime.now()
+            week_ago = now - timedelta(days=7)
+            month_ago = now - timedelta(days=30)
+
             with get_db() as session:
+                # Analysis job counts
                 def build_count_query(status):
                     query = select(func.count(MarketAnalysis.id)).where(MarketAnalysis.status == status)
                     if expert_ids is not None:
@@ -697,6 +701,10 @@ class OverviewTab:
                 running_count = session.exec(query).first() if query is not None else 0
                 running_count = running_count or 0
 
+                # Trade recommendation counts
+                week_recs = self._get_recommendation_counts(session, week_ago, expert_ids)
+                month_recs = self._get_recommendation_counts(session, month_ago, expert_ids)
+
             try:
                 loading_label.delete()
             except RuntimeError:
@@ -704,21 +712,51 @@ class OverviewTab:
 
             try:
                 with content_container:
-                    with ui.row().classes('w-full justify-between items-center mb-2'):
-                        ui.label('✅ Successful:').classes('text-sm')
-                        ui.label(str(successful_count)).classes('text-sm font-bold text-green-600')
+                    # Analysis Jobs section - compact row
+                    ui.label('Analysis Jobs').classes('text-subtitle2 text-accent mb-1')
+                    with ui.row().classes('w-full gap-4 mb-2'):
+                        with ui.row().classes('items-center gap-1'):
+                            ui.label('✅').classes('text-xs')
+                            ui.label(str(successful_count)).classes('text-xs font-bold text-green-600')
+                        with ui.row().classes('items-center gap-1'):
+                            ui.label('❌').classes('text-xs')
+                            ui.label(str(failed_count)).classes('text-xs font-bold text-red-600')
+                        with ui.row().classes('items-center gap-1'):
+                            ui.label('⏳').classes('text-xs')
+                            ui.label(str(running_count)).classes('text-xs font-bold text-orange-600')
 
-                    with ui.row().classes('w-full justify-between items-center mb-2'):
-                        ui.label('❌ Failed:').classes('text-sm')
-                        ui.label(str(failed_count)).classes('text-sm font-bold text-red-600')
+                    ui.separator().classes('my-2')
 
-                    with ui.row().classes('w-full justify-between items-center mb-2'):
-                        ui.label('⏳ Running:').classes('text-sm')
-                        ui.label(str(running_count)).classes('text-sm font-bold text-orange-600')
+                    # Trade Recommendations section
+                    ui.label('Recommendations').classes('text-subtitle2 text-accent mb-1')
+                    with ui.row().classes('w-full gap-4'):
+                        with ui.column().classes('flex-1'):
+                            ui.label('Last 7d').classes('text-xs font-bold mb-1')
+                            with ui.row().classes('w-full justify-between items-center'):
+                                ui.label('BUY').classes('text-xs')
+                                ui.label(str(week_recs['BUY'])).classes('text-xs font-bold text-green-600')
+                            with ui.row().classes('w-full justify-between items-center'):
+                                ui.label('SELL').classes('text-xs')
+                                ui.label(str(week_recs['SELL'])).classes('text-xs font-bold text-red-600')
+                            with ui.row().classes('w-full justify-between items-center'):
+                                ui.label('HOLD').classes('text-xs')
+                                ui.label(str(week_recs['HOLD'])).classes('text-xs font-bold text-orange-600')
+
+                        with ui.column().classes('flex-1'):
+                            ui.label('Last 30d').classes('text-xs font-bold mb-1')
+                            with ui.row().classes('w-full justify-between items-center'):
+                                ui.label('BUY').classes('text-xs')
+                                ui.label(str(month_recs['BUY'])).classes('text-xs font-bold text-green-600')
+                            with ui.row().classes('w-full justify-between items-center'):
+                                ui.label('SELL').classes('text-xs')
+                                ui.label(str(month_recs['SELL'])).classes('text-xs font-bold text-red-600')
+                            with ui.row().classes('w-full justify-between items-center'):
+                                ui.label('HOLD').classes('text-xs')
+                                ui.label(str(month_recs['HOLD'])).classes('text-xs font-bold text-orange-600')
             except RuntimeError:
                 pass
         except Exception as e:
-            logger.error(f"Error loading analysis jobs data: {e}", exc_info=True)
+            logger.error(f"Error loading combined jobs/reco data: {e}", exc_info=True)
         finally:
             timer.stop()
     
@@ -816,74 +854,144 @@ class OverviewTab:
         finally:
             timer.stop()
     
-    def _render_order_recommendations_widget(self):
-        """Widget showing trade recommendation statistics with async data loading."""
+    def _render_trade_performance_widget(self):
+        """Widget showing trade performance: open/closed counts, win/loss, P&L with period comparison."""
         with ui.card().classes('p-4'):
-            ui.label('📈 Trade Recommendations').classes('text-h6 mb-4')
+            ui.label('📈 Trade Performance').classes('text-h6 mb-2')
             loading_label = ui.label('🔄 Loading...').classes('text-sm text-gray-500')
             content_container = ui.column().classes('w-full')
-            asyncio.create_task(self._load_order_recommendations_data(loading_label, content_container))
+            asyncio.create_task(self._load_trade_performance_data(loading_label, content_container))
 
-    async def _load_order_recommendations_data(self, loading_label, content_container):
-        """Load trade recommendation statistics asynchronously."""
-        timer = PerfLogger.start(PerfLogger.COMPONENT, PerfLogger.LOAD, "OrderRecommendationsWidget")
+    async def _load_trade_performance_data(self, loading_label, content_container):
+        """Load trade performance data asynchronously."""
+        from ...core.types import TransactionStatus
+        timer = PerfLogger.start(PerfLogger.COMPONENT, PerfLogger.LOAD, "TradePerformanceWidget")
         try:
             selected_account_id = get_selected_account_id()
             expert_ids = get_expert_ids_for_account(selected_account_id)
 
             now = datetime.now()
-            week_ago = now - timedelta(days=7)
-            month_ago = now - timedelta(days=30)
+            d7 = now - timedelta(days=7)
+            d14 = now - timedelta(days=14)
+            d30 = now - timedelta(days=30)
+            d60 = now - timedelta(days=60)
 
             with get_db() as session:
-                week_recs = self._get_recommendation_counts(session, week_ago, expert_ids)
-                month_recs = self._get_recommendation_counts(session, month_ago, expert_ids)
+                def base_query():
+                    query = select(Transaction)
+                    if expert_ids is not None:
+                        if expert_ids:
+                            query = query.where(Transaction.expert_id.in_(expert_ids))
+                        else:
+                            return None
+                    return query
+
+                def count_query(status):
+                    query = select(func.count(Transaction.id)).where(Transaction.status == status)
+                    if expert_ids is not None:
+                        if expert_ids:
+                            query = query.where(Transaction.expert_id.in_(expert_ids))
+                        else:
+                            return None
+                    return query
+
+                # Open trade count
+                q = count_query(TransactionStatus.OPENED)
+                open_count = session.exec(q).first() if q is not None else 0
+                open_count = open_count or 0
+
+                # Closed trades in different periods
+                def get_closed_in_range(start, end):
+                    q = base_query()
+                    if q is None:
+                        return []
+                    q = q.where(
+                        Transaction.status == TransactionStatus.CLOSED,
+                        Transaction.close_date.isnot(None),
+                        Transaction.close_date >= start,
+                        Transaction.close_date < end
+                    )
+                    return session.exec(q).all()
+
+                closed_7d = get_closed_in_range(d7, now)
+                closed_prev_7d = get_closed_in_range(d14, d7)
+                closed_30d = get_closed_in_range(d30, now)
+                closed_prev_30d = get_closed_in_range(d60, d30)
+
+            # Compute P&L
+            def compute_pnl_stats(transactions):
+                pnls = []
+                for txn in transactions:
+                    pnl = calculate_transaction_pnl(txn)
+                    if pnl is not None:
+                        pnls.append(pnl)
+                total = sum(pnls)
+                wins = sum(1 for p in pnls if p > 0)
+                losses = sum(1 for p in pnls if p < 0)
+                return total, wins, losses
+
+            pnl_7d, wins_7d, losses_7d = compute_pnl_stats(closed_7d)
+            pnl_prev_7d, _, _ = compute_pnl_stats(closed_prev_7d)
+            pnl_30d, wins_30d, losses_30d = compute_pnl_stats(closed_30d)
+            pnl_prev_30d, _, _ = compute_pnl_stats(closed_prev_30d)
+
+            total_wins = wins_30d
+            total_losses = losses_30d
+            closed_count = len(closed_30d)
 
             try:
                 loading_label.delete()
             except RuntimeError:
                 return
 
+            def render_pnl_comparison(label, current_pnl, prev_pnl):
+                """Render a P&L row with period-over-period comparison."""
+                change = current_pnl - prev_pnl
+                with ui.row().classes('w-full justify-between items-center'):
+                    ui.label(label).classes('text-xs')
+                    with ui.row().classes('items-center gap-2'):
+                        pnl_color = 'text-green-500' if current_pnl >= 0 else 'text-red-500'
+                        ui.label(f'${current_pnl:,.2f}').classes(f'text-sm font-bold {pnl_color}')
+                        if change > 0:
+                            ui.label(f'▲ +${change:,.2f}').classes('text-xs text-green-500')
+                        elif change < 0:
+                            ui.label(f'▼ -${abs(change):,.2f}').classes('text-xs text-red-500')
+                        else:
+                            ui.label('— $0.00').classes('text-xs text-gray-500')
+
             try:
                 with content_container:
-                    with ui.row().classes('w-full gap-8'):
-                        with ui.column().classes('flex-1'):
-                            ui.label('Last Week').classes('text-subtitle1 font-bold mb-2')
+                    # Open / Closed counts
+                    with ui.row().classes('w-full justify-between items-center mb-1'):
+                        ui.label('Open Trades').classes('text-xs')
+                        ui.label(str(open_count)).classes('text-sm font-bold text-blue-500')
+                    with ui.row().classes('w-full justify-between items-center mb-1'):
+                        ui.label('Closed (30d)').classes('text-xs')
+                        ui.label(str(closed_count)).classes('text-sm font-bold')
 
-                            with ui.row().classes('w-full justify-between items-center mb-1'):
-                                ui.label('🟢 BUY:').classes('text-sm')
-                                ui.label(str(week_recs['BUY'])).classes('text-sm font-bold text-green-600')
+                    ui.separator().classes('my-1')
 
-                            with ui.row().classes('w-full justify-between items-center mb-1'):
-                                ui.label('🔴 SELL:').classes('text-sm')
-                                ui.label(str(week_recs['SELL'])).classes('text-sm font-bold text-red-600')
+                    # Win / Loss
+                    with ui.row().classes('w-full justify-between items-center mb-1'):
+                        ui.label('Winning').classes('text-xs')
+                        ui.label(str(total_wins)).classes('text-sm font-bold text-green-500')
+                    with ui.row().classes('w-full justify-between items-center mb-1'):
+                        ui.label('Losing').classes('text-xs')
+                        ui.label(str(total_losses)).classes('text-sm font-bold text-red-500')
 
-                            with ui.row().classes('w-full justify-between items-center mb-1'):
-                                ui.label('🟡 HOLD:').classes('text-sm')
-                                ui.label(str(week_recs['HOLD'])).classes('text-sm font-bold text-orange-600')
+                    ui.separator().classes('my-1')
 
-                        with ui.column().classes('flex-1'):
-                            ui.label('Last Month').classes('text-subtitle1 font-bold mb-2')
-
-                            with ui.row().classes('w-full justify-between items-center mb-1'):
-                                ui.label('🟢 BUY:').classes('text-sm')
-                                ui.label(str(month_recs['BUY'])).classes('text-sm font-bold text-green-600')
-
-                            with ui.row().classes('w-full justify-between items-center mb-1'):
-                                ui.label('🔴 SELL:').classes('text-sm')
-                                ui.label(str(month_recs['SELL'])).classes('text-sm font-bold text-red-600')
-
-                            with ui.row().classes('w-full justify-between items-center mb-1'):
-                                ui.label('🟡 HOLD:').classes('text-sm')
-                                ui.label(str(month_recs['HOLD'])).classes('text-sm font-bold text-orange-600')
+                    # P&L with comparison
+                    render_pnl_comparison('P&L (7d)', pnl_7d, pnl_prev_7d)
+                    render_pnl_comparison('P&L (30d)', pnl_30d, pnl_prev_30d)
             except RuntimeError:
                 pass
 
         except Exception as e:
-            logger.error(f"Error loading recommendation data: {e}", exc_info=True)
+            logger.error(f"Error loading trade performance data: {e}", exc_info=True)
         finally:
             timer.stop()
-    
+
     def _get_recommendation_counts(self, session, since_date: datetime, expert_ids: Optional[List[int]] = None) -> Dict[str, int]:
         """Get recommendation counts since a specific date.
         
