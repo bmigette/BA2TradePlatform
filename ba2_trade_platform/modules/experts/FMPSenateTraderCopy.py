@@ -659,6 +659,14 @@ Trade #{i}:
 - Disclosure Date: {trade_info['disclose_date']} ({trade_info['days_since_disclose']} days ago)
 """
         
+        # Calculate trader money spent and percentage of yearly trading
+        from ...core.utils import calculate_fmp_trade_metrics
+        trade_metrics = calculate_fmp_trade_metrics(symbol_trades, all_trader_trades=all_copy_trades)
+
+        # Confidence: 60% base + percent_of_yearly (capped at 100%)
+        percent_of_yearly = trade_metrics.get('percent_of_yearly', 0.0)
+        confidence = min(100.0, 60.0 + percent_of_yearly)
+
         details += f"""
 
 Overall Signal: {signal.value}
@@ -676,14 +684,6 @@ Trades for {symbol}: {len(symbol_trades)}
 
 Note: If multiple trades exist for the same instrument, the most recent trade determines the signal.
 """
-        
-        # Calculate trader money spent and percentage of yearly trading
-        from ...core.utils import calculate_fmp_trade_metrics
-        trade_metrics = calculate_fmp_trade_metrics(symbol_trades, all_trader_trades=all_copy_trades)
-
-        # Confidence: 60% base + percent_of_yearly (capped at 100%)
-        percent_of_yearly = trade_metrics.get('percent_of_yearly', 0.0)
-        confidence = min(100.0, 60.0 + percent_of_yearly)
 
         return {
             'signal': signal,
