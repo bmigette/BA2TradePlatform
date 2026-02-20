@@ -2791,11 +2791,11 @@ class ExpertSettingsTab:
                         if ui_editor_type != "ModelSelector":
                             tooltip_combined = tooltip_text or help_text or ''
                             if tooltip_combined:
-                                with ui.row().classes('items-center gap-1').style('min-width: 220px; max-width: 220px'):
+                                with ui.row().classes('items-center gap-1').style('width: 60%; flex-shrink: 0'):
                                     ui.label(label).classes('text-xs')
                                     ui.icon('help_outline', size='xs').classes('text-gray-500 cursor-help').tooltip(tooltip_combined)
                             else:
-                                ui.label(label).classes('text-xs').style('min-width: 220px; max-width: 220px')
+                                ui.label(label).classes('text-xs').style('width: 60%; flex-shrink: 0')
                             display_label = ""
                         else:
                             if tooltip_text:
@@ -2916,7 +2916,7 @@ class ExpertSettingsTab:
                         # Make inputs compact (skip ModelSelector which has its own layout)
                         if ui_editor_type != "ModelSelector":
                             try:
-                                inp.classes('flex-1', remove='w-full')
+                                inp.classes(remove='w-full').style('width: 40%')
                                 inp.props('dense')
                             except Exception:
                                 pass
