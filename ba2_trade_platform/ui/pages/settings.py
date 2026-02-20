@@ -2781,30 +2781,20 @@ class ExpertSettingsTab:
                     tooltip_text = meta.get("tooltip")
                     ui_editor_type = meta.get("ui_editor_type")  # Custom UI editor type
                     
-                    # Create a container for this setting
-                    if ui_editor_type == "ModelSelector":
-                        setting_container = ui.column().classes('w-full mb-2')
-                    else:
-                        setting_container = ui.row().classes('w-full mb-2 items-center gap-2')
+                    # Create a 2-column grid container (60% label / 40% input)
+                    setting_container = ui.element('div').classes('w-full mb-2').style(
+                        'display: grid; grid-template-columns: 60% 40%; align-items: center; gap: 8px'
+                    )
                     with setting_container:
-                        # Show label on the left side for non-ModelSelector
-                        if ui_editor_type != "ModelSelector":
-                            tooltip_combined = tooltip_text or help_text or ''
-                            if tooltip_combined:
-                                with ui.row().classes('items-center gap-1').style('width: 60%; flex-shrink: 0'):
-                                    ui.label(label).classes('text-xs')
-                                    ui.icon('help_outline', size='xs').classes('text-gray-500 cursor-help').tooltip(tooltip_combined)
-                            else:
-                                ui.label(label).classes('text-xs').style('width: 60%; flex-shrink: 0')
-                            display_label = ""
+                        # Left column: label with optional tooltip
+                        tooltip_combined = tooltip_text or help_text or ''
+                        if tooltip_combined:
+                            with ui.row().classes('items-center gap-1'):
+                                ui.label(label).classes('text-xs')
+                                ui.icon('help_outline', size='xs').classes('text-gray-500 cursor-help').tooltip(tooltip_combined)
                         else:
-                            if tooltip_text:
-                                with ui.row().classes('items-center gap-1 mb-1'):
-                                    ui.label(label).classes('text-xs')
-                                    ui.icon('help_outline', size='xs').classes('text-gray-500 cursor-help').tooltip(tooltip_text)
-                                display_label = ""
-                            else:
-                                display_label = label
+                            ui.label(label).classes('text-xs')
+                        display_label = ""
                         
                         # Create the input field directly in the same container
                         # First check for custom ui_editor_type
@@ -2814,9 +2804,9 @@ class ExpertSettingsTab:
                             # Check for required_labels in setting definition (e.g., ["websearch"])
                             required_labels = meta.get("required_labels")
                             model_selector = ModelSelectorInput(
-                                label=display_label if display_label else label,
+                                label='',
                                 value=value,
-                                help_text=help_text,
+                                help_text=None,
                                 required_labels=required_labels,
                             )
                             model_selector.render()
@@ -2913,10 +2903,10 @@ class ExpertSettingsTab:
                             else:
                                 inp = ui.input(label=display_label, value=str(value)).classes('w-full')
                         
-                        # Make inputs compact (skip ModelSelector which has its own layout)
+                        # Make inputs compact
                         if ui_editor_type != "ModelSelector":
                             try:
-                                inp.classes(remove='w-full').style('width: 40%')
+                                inp.classes('w-full', remove='flex-1')
                                 inp.props('dense')
                             except Exception:
                                 pass
