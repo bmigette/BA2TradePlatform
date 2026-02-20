@@ -4128,7 +4128,7 @@ class TradeSettingsTab:
                                 options=['<', '>', '=', '!=', '<=', '>='],
                                 label='Op',
                                 value=trigger_config.get('operator', '>') if trigger_config else '>'
-                            ).classes('w-24').props('dense')
+                            ).classes('w-32').props('dense')
 
                             value_input = ui.input(
                                 label='Value',
