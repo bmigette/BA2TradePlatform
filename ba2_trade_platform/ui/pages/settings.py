@@ -1483,93 +1483,6 @@ class ExpertSettingsTab:
             with ui.card().classes('w-full').style('width: 90vw; max-width: 1400px; height: 95vh; margin: auto; display: flex; flex-direction: column'):
                 ui.label('Add Expert' if not is_edit else 'Edit Expert').classes('text-h6')
                 
-                # Basic expert information
-                with ui.column().classes('w-full gap-4'):
-                    # Expert type and alias on the same line
-                    with ui.row().classes('w-full gap-4'):
-                        expert_types = self._get_available_expert_types()
-                        self.expert_select = ui.select(
-                            expert_types, 
-                            label='Expert Type'
-                        ).classes('flex-1')
-                        
-                        # Alias as short display name
-                        self.alias_input = ui.input(
-                            label='Alias (max 100 chars)',
-                            placeholder='Short display name for this expert...'
-                        ).props('stack-label maxlength=100').classes('flex-1')
-                    
-                    # Description as read-only display
-                    self.description_label = ui.label('').classes('text-grey-7 mb-2')
-                    
-                    # User description as editable textarea
-                    self.user_description_textarea = ui.textarea(
-                        label='User Notes',
-                        placeholder='Add your own notes about this expert instance...'
-                    ).props('stack-label').classes('w-full')
-                    
-                    with ui.row().classes('w-full'):
-                        self.enabled_checkbox = ui.checkbox('Enabled', value=True)
-                        self.virtual_equity_input = ui.input(
-                            label='Virtual Equity', 
-                            value='100.0'
-                        ).classes('w-48')
-                    
-                    # Account selection and instrument selection method on the same line
-                    with ui.row().classes('w-full gap-4'):
-                        accounts = self._get_available_accounts()
-                        self.account_select = ui.select(
-                            accounts,
-                            label='Trading Account'
-                        ).classes('flex-1')
-                        
-                        # Instrument selection method
-                        self.instrument_selection_method_select = ui.select(
-                            options=["static", "dynamic", "expert"],
-                            label='Instrument Selection Method',
-                            value="static",
-                            on_change=self._on_instrument_selection_method_change
-                        ).classes('flex-1').tooltip(
-                            "How instruments are selected: Static (manual selection), Dynamic (AI prompt), Expert (expert-driven selection)"
-                        )
-                
-                # Fill values if editing
-                if is_edit:
-                    self.expert_select.value = expert_instance.expert
-                    self.alias_input.value = expert_instance.alias or ''
-                    self.user_description_textarea.value = expert_instance.user_description or ''
-                    self.enabled_checkbox.value = expert_instance.enabled
-                    self.virtual_equity_input.value = str(expert_instance.virtual_equity_pct)
-                    
-                    # Find and set the account display string
-                    account_instance = get_instance(AccountDefinition, expert_instance.account_id)
-                    if account_instance:
-                        self.account_select.value = f"{account_instance.name} ({account_instance.provider})"
-                    
-                    # Load instrument selection method from settings
-                    try:
-                        from ...core.utils import get_expert_instance_from_id
-                        expert = get_expert_instance_from_id(expert_instance.id)
-                        if expert:
-                            instrument_method = expert.settings.get('instrument_selection_method', 'static')
-                            self.instrument_selection_method_select.value = instrument_method
-                    except Exception as e:
-                        logger.debug(f'Could not load instrument selection method: {e}')
-                        self.instrument_selection_method_select.value = 'static'
-                else:
-                    if expert_types:
-                        self.expert_select.value = expert_types[0]
-                    if accounts:
-                        self.account_select.value = accounts[0]
-                
-                # Update description when expert type changes
-                self.expert_select.on('update:model-value', 
-                                    lambda e: self._on_expert_type_change_dialog(e, expert_instance))
-                
-                # Set initial description and instrument selection options
-                self._update_expert_description()
-                self._update_instrument_selection_options()
-                
                 # Tabs for different settings sections
                 with ui.tabs() as settings_tabs:
                     ui.tab('General Settings', icon='schedule')
@@ -1580,6 +1493,51 @@ class ExpertSettingsTab:
                 with ui.tab_panels(settings_tabs, value='General Settings').classes('w-full').style('flex: 1; overflow-y: auto'):
                     # General Settings tab
                     with ui.tab_panel('General Settings'):
+                        # Basic expert information
+                        with ui.column().classes('w-full gap-2'):
+                            with ui.row().classes('w-full gap-4'):
+                                expert_types = self._get_available_expert_types()
+                                self.expert_select = ui.select(
+                                    expert_types,
+                                    label='Expert Type'
+                                ).classes('flex-1').props('dense')
+
+                                self.alias_input = ui.input(
+                                    label='Alias (max 100 chars)',
+                                    placeholder='Short display name...'
+                                ).props('stack-label maxlength=100 dense').classes('flex-1')
+
+                            self.description_label = ui.label('').classes('text-grey-7 text-xs')
+
+                            self.user_description_textarea = ui.textarea(
+                                label='User Notes',
+                                placeholder='Add your own notes...'
+                            ).props('stack-label dense rows=2').classes('w-full')
+
+                            with ui.row().classes('w-full items-center gap-4'):
+                                self.enabled_checkbox = ui.checkbox('Enabled', value=True)
+                                self.virtual_equity_input = ui.input(
+                                    label='Virtual Equity',
+                                    value='100.0'
+                                ).props('dense').classes('w-32')
+
+                            with ui.row().classes('w-full gap-4'):
+                                accounts = self._get_available_accounts()
+                                self.account_select = ui.select(
+                                    accounts,
+                                    label='Trading Account'
+                                ).classes('flex-1').props('dense')
+
+                                self.instrument_selection_method_select = ui.select(
+                                    options=["static", "dynamic", "expert"],
+                                    label='Instrument Selection Method',
+                                    value="static",
+                                    on_change=self._on_instrument_selection_method_change
+                                ).classes('flex-1').props('dense').tooltip(
+                                    "Static (manual), Dynamic (AI prompt), Expert (expert-driven)"
+                                )
+
+                        ui.separator().classes('my-2')
                         ui.label('General Expert Configuration:').classes('text-subtitle1 mb-4')
                         
                         # Schedule settings with expandable cards for both types
@@ -1850,10 +1808,43 @@ class ExpertSettingsTab:
                     with ui.tab_panel('Import/Export'):
                         self._render_import_export_tab(expert_instance)
                     
+                # Fill values if editing
+                if is_edit:
+                    self.expert_select.value = expert_instance.expert
+                    self.alias_input.value = expert_instance.alias or ''
+                    self.user_description_textarea.value = expert_instance.user_description or ''
+                    self.enabled_checkbox.value = expert_instance.enabled
+                    self.virtual_equity_input.value = str(expert_instance.virtual_equity_pct)
+
+                    account_instance = get_instance(AccountDefinition, expert_instance.account_id)
+                    if account_instance:
+                        self.account_select.value = f"{account_instance.name} ({account_instance.provider})"
+
+                    try:
+                        from ...core.utils import get_expert_instance_from_id
+                        expert = get_expert_instance_from_id(expert_instance.id)
+                        if expert:
+                            instrument_method = expert.settings.get('instrument_selection_method', 'static')
+                            self.instrument_selection_method_select.value = instrument_method
+                    except Exception as e:
+                        logger.debug(f'Could not load instrument selection method: {e}')
+                        self.instrument_selection_method_select.value = 'static'
+                else:
+                    if expert_types:
+                        self.expert_select.value = expert_types[0]
+                    if accounts:
+                        self.account_select.value = accounts[0]
+
+                self.expert_select.on('update:model-value',
+                                    lambda e: self._on_expert_type_change_dialog(e, expert_instance))
+
+                self._update_expert_description()
+                self._update_instrument_selection_options()
+
                 # Load general settings if editing
                 if is_edit:
                     self._load_general_settings(expert_instance)
-                
+
                 # Save button
                 with ui.row().classes('w-full justify-end mt-4'):
                     ui.button('Cancel', on_click=self.dialog.close).props('flat')
@@ -2780,19 +2771,30 @@ class ExpertSettingsTab:
                     tooltip_text = meta.get("tooltip")
                     ui_editor_type = meta.get("ui_editor_type")  # Custom UI editor type
                     
-                    # Create a container for this setting (title + input)
-                    setting_container = ui.column().classes('w-full mb-4')
+                    # Create a container for this setting
+                    if ui_editor_type == "ModelSelector":
+                        setting_container = ui.column().classes('w-full mb-2')
+                    else:
+                        setting_container = ui.row().classes('w-full mb-2 items-center gap-2')
                     with setting_container:
-                        # Create label with tooltip inline
-                        if tooltip_text:
-                            with ui.row().classes('items-center gap-1 mb-2'):
-                                ui.label(label).classes('text-sm font-medium')
-                                ui.icon('help_outline', size='sm').classes('text-gray-500 cursor-help').tooltip(tooltip_text).style('font-size: 18px !important; padding: 12px !important; max-width: 350px !important; line-height: 1.4 !important;')
-                            
-                            # Use empty label for input since we show it above
+                        # Show label on the left side for non-ModelSelector
+                        if ui_editor_type != "ModelSelector":
+                            tooltip_combined = tooltip_text or help_text or ''
+                            if tooltip_combined:
+                                with ui.row().classes('items-center gap-1').style('min-width: 220px; max-width: 220px'):
+                                    ui.label(label).classes('text-xs')
+                                    ui.icon('help_outline', size='xs').classes('text-gray-500 cursor-help').tooltip(tooltip_combined)
+                            else:
+                                ui.label(label).classes('text-xs').style('min-width: 220px; max-width: 220px')
                             display_label = ""
                         else:
-                            display_label = label
+                            if tooltip_text:
+                                with ui.row().classes('items-center gap-1 mb-1'):
+                                    ui.label(label).classes('text-xs')
+                                    ui.icon('help_outline', size='xs').classes('text-gray-500 cursor-help').tooltip(tooltip_text)
+                                display_label = ""
+                            else:
+                                display_label = label
                         
                         # Create the input field directly in the same container
                         # First check for custom ui_editor_type
@@ -2901,9 +2903,13 @@ class ExpertSettingsTab:
                             else:
                                 inp = ui.input(label=display_label, value=str(value)).classes('w-full')
                         
-                        # Add help text if available (skip for ModelSelector which handles its own help text)
-                        if help_text and ui_editor_type != "ModelSelector":
-                            ui.markdown(help_text).classes('text-sm text-gray-600 mt-1')
+                        # Make inputs compact (skip ModelSelector which has its own layout)
+                        if ui_editor_type != "ModelSelector":
+                            try:
+                                inp.classes('flex-1', remove='w-full')
+                                inp.props('dense')
+                            except Exception:
+                                pass
                     
                     setting_container.move(self.expert_settings_container)
                     
@@ -3951,21 +3957,20 @@ class TradeSettingsTab:
                 ui.label('Add Rule' if not is_edit else 'Edit Rule').classes('text-h6 mb-4')
                 
                 # Basic rule information
-                with ui.column().classes('w-full gap-4'):
+                with ui.row().classes('w-full gap-4 items-center'):
                     self.rule_name_input = ui.input(
                         label='Rule Name',
                         value=rule.name if is_edit else ''
-                    ).classes('w-full')
-                    
-                    # Subtype selection
+                    ).classes('flex-1').props('dense')
+
                     self.rule_subtype_select = ui.select(
                         options={subtype.value: subtype.value.replace('_', ' ').title() for subtype in AnalysisUseCase},
-                        label='Subtype (Analysis Use Case)',
+                        label='Subtype',
                         value=rule.subtype.value if is_edit and rule.subtype else AnalysisUseCase.ENTER_MARKET.value
-                    ).classes('w-full')
-                    
+                    ).classes('flex-1').props('dense')
+
                     self.continue_processing_checkbox = ui.checkbox(
-                        'Continue processing other rules after this one',
+                        'Continue processing',
                         value=rule.continue_processing if is_edit else False
                     )
                 
@@ -3978,8 +3983,7 @@ class TradeSettingsTab:
                 with ui.tab_panels(rule_tabs, value='Triggers').classes('w-full').style('flex: 1; overflow-y: auto'):
                     # Triggers tab
                     with ui.tab_panel('Triggers'):
-                        ui.label('Configure Triggers').classes('text-subtitle1 mb-4')
-                        ui.label('Triggers define when this rule should activate.').classes('text-grey-7 mb-4')
+                        ui.label('Triggers define when this rule should activate.').classes('text-grey-7 text-xs mb-2')
                         
                         self.triggers_container = ui.column().classes('w-full')
                         self.triggers = {}
@@ -3993,8 +3997,7 @@ class TradeSettingsTab:
                     
                     # Actions tab
                     with ui.tab_panel('Actions'):
-                        ui.label('Configure Actions').classes('text-subtitle1 mb-4')
-                        ui.label('Actions define what should happen when triggers are met.').classes('text-grey-7 mb-4')
+                        ui.label('Actions define what should happen when triggers are met.').classes('text-grey-7 text-xs mb-2')
                         
                         self.actions_container = ui.column().classes('w-full')
                         self.actions = {}
@@ -4062,24 +4065,25 @@ class TradeSettingsTab:
         trigger_id = trigger_key or f"trigger_{len(self.triggers)}"
         
         with self.triggers_container:
-            with ui.card().classes('w-full p-4') as trigger_card:
-                with ui.row().classes('w-full items-center'):
+            with ui.card().classes('w-full p-2') as trigger_card:
+                with ui.row().classes('w-full items-center gap-2'):
                     # Trigger type selection
                     trigger_select = ui.select(
                         options=[t.value for t in ExpertEventType],
                         label='Trigger Type',
                         value=trigger_config.get('event_type', trigger_config.get('type', ExpertEventType.F_HAS_POSITION.value)) if trigger_config else ExpertEventType.F_HAS_POSITION.value
-                    ).classes('flex-1')
-                    
-                    # Add help icon with tooltip showing event documentation
-                    help_icon = ui.icon('help_outline', size='sm').classes('text-gray-500 cursor-help ml-2')
-                    
+                    ).classes('flex-1').props('dense')
+
+                    # Inline container for operator/value inputs
+                    value_container = ui.row().classes('items-center gap-2')
+
                     # Remove button
-                    ui.button('Remove', on_click=lambda: self._remove_trigger_row(trigger_id, trigger_card), 
-                             icon='delete', color='red').props('flat dense')
-                
-                # Documentation area for selected trigger type
-                docs_container = ui.column().classes('w-full mt-2')
+                    ui.button(icon='delete', on_click=lambda: self._remove_trigger_row(trigger_id, trigger_card),
+                             color='red').props('flat dense round')
+
+                # Foldable documentation area
+                with ui.expansion('Info', icon='help_outline', value=False).classes('w-full').props('dense'):
+                    docs_container = ui.column().classes('w-full')
                 
                 def update_trigger_documentation():
                     """Update the documentation for the selected trigger type."""
@@ -4096,36 +4100,30 @@ class TradeSettingsTab:
                                     if doc.get('example'):
                                         ui.label(f"💡 Example: {doc['example']}").classes('text-xs text-[#4dabf7] mt-1 italic')
                 
-                # Value input (for N_ types)
-                value_row = ui.row().classes('w-full')
                 operator_select = None
                 value_input = None
-                
+
                 def update_value_inputs():
-                    value_row.clear()
+                    value_container.clear()
                     selected_type = trigger_select.value
-                    
+
                     # Update documentation
                     update_trigger_documentation()
-                    
+
                     if selected_type and is_numeric_event(selected_type):
-                        # Numeric trigger - show operator and value
-                        with value_row:
+                        # Numeric trigger - show operator and value inline
+                        with value_container:
                             nonlocal operator_select, value_input
                             operator_select = ui.select(
                                 options=['<', '>', '=', '!=', '<=', '>='],
-                                label='Operator',
+                                label='Op',
                                 value=trigger_config.get('operator', '>') if trigger_config else '>'
-                            ).classes('w-32')
-                            
+                            ).classes('w-24').props('dense')
+
                             value_input = ui.input(
                                 label='Value',
                                 value=str(trigger_config.get('value', '')) if trigger_config else ''
-                            ).classes('flex-1')
-                    else:
-                        # Flag trigger - no additional inputs needed
-                        with value_row:
-                            ui.label('Flag trigger - no additional configuration needed').classes('text-grey-7')
+                            ).classes('w-32').props('dense')
                 
                 # Initial setup
                 update_value_inputs()
@@ -4154,25 +4152,26 @@ class TradeSettingsTab:
         action_id = action_key or f"action_{len(self.actions)}"
         
         with self.actions_container:
-            with ui.card().classes('w-full p-4') as action_card:
-                with ui.row().classes('w-full items-center'):
+            with ui.card().classes('w-full p-2') as action_card:
+                with ui.row().classes('w-full items-center gap-2'):
                     # Action type selection with user-friendly labels
                     action_options = {a.value: get_action_type_display_label(a.value) for a in ExpertActionType}
                     action_select = ui.select(
                         options=action_options,
                         label='Action Type',
                         value=action_config.get('action_type', action_config.get('type', ExpertActionType.BUY.value)) if action_config else ExpertActionType.BUY.value
-                    ).classes('flex-1')
-                    
-                    # Add help icon with tooltip showing action documentation
-                    help_icon = ui.icon('help_outline', size='sm').classes('text-gray-500 cursor-help ml-2')
-                    
+                    ).classes('flex-1').props('dense')
+
+                    # Inline container for value inputs
+                    action_value_container = ui.row().classes('items-center gap-2')
+
                     # Remove button
-                    ui.button('Remove', on_click=lambda: self._remove_action_row(action_id, action_card), 
-                             icon='delete', color='red').props('flat dense')
-                
-                # Documentation area for selected action type
-                action_docs_container = ui.column().classes('w-full mt-2')
+                    ui.button(icon='delete', on_click=lambda: self._remove_action_row(action_id, action_card),
+                             color='red').props('flat dense round')
+
+                # Foldable documentation area
+                with ui.expansion('Info', icon='help_outline', value=False).classes('w-full').props('dense'):
+                    action_docs_container = ui.column().classes('w-full')
                 
                 def update_action_documentation():
                     """Update the documentation for the selected action type."""
@@ -4194,62 +4193,47 @@ class TradeSettingsTab:
                                         for use_case in doc['use_cases'][:2]:  # Show first 2 use cases
                                             ui.label(f"• {use_case}").classes('text-xs text-[#00d4aa] ml-2')
                 
-                # Value input (for ADJUST_ types and INCREASE/DECREASE_INSTRUMENT_SHARE)
-                value_row = ui.row().classes('w-full')
                 value_input = None
                 reference_select = None
                 target_percent_input = None
-                
+
                 def update_action_inputs():
-                    value_row.clear()
+                    action_value_container.clear()
                     selected_type = action_select.value
-                    
+
                     # Update documentation
                     update_action_documentation()
-                    
+
                     if selected_type and is_adjustment_action(selected_type):
-                        # Adjustment action - show value input and reference selector
-                        with value_row:
-                            with ui.column().classes('w-full gap-2'):
-                                nonlocal value_input, reference_select
-                                
-                                # Value input
-                                value_input = ui.input(
-                                    label='Adjustment Value (can be positive or negative)',
-                                    value=str(action_config.get('value', '')) if action_config else '',
-                                    placeholder='e.g. 5.0 or -2.5'
-                                ).classes('w-full')
-                                
-                                # Reference value selector
-                                from ...core.types import get_reference_value_options
-                                reference_select = ui.select(
-                                    options=get_reference_value_options(),
-                                    label='Reference Value',
-                                    value=action_config.get('reference_value', 'current_price') if action_config else 'current_price'
-                                ).classes('w-full')
+                        # Adjustment action - show value and reference inline
+                        with action_value_container:
+                            nonlocal value_input, reference_select
+
+                            value_input = ui.input(
+                                label='Value',
+                                value=str(action_config.get('value', '')) if action_config else '',
+                                placeholder='e.g. 5.0'
+                            ).classes('w-32').props('dense')
+
+                            from ...core.types import get_reference_value_options
+                            reference_select = ui.select(
+                                options=get_reference_value_options(),
+                                label='Reference',
+                                value=action_config.get('reference_value', 'current_price') if action_config else 'current_price'
+                            ).classes('w-40').props('dense')
                     elif selected_type and is_share_adjustment_action(selected_type):
-                        # Share adjustment action - show target_percent input
-                        with value_row:
-                            with ui.column().classes('w-full gap-2'):
-                                nonlocal target_percent_input
-                                
-                                # Target percent input
-                                target_percent_input = ui.number(
-                                    label='Target Percent of Account Equity (%)',
-                                    value=action_config.get('target_percent', 10.0) if action_config else 10.0,
-                                    min=0.0,
-                                    max=100.0,
-                                    step=0.1,
-                                    format='%.1f',
-                                    placeholder='e.g. 10.0 for 10%'
-                                ).classes('w-full')
-                                
-                                # Help text
-                                ui.label('Minimum: 1 share | Maximum: Respects max_virtual_equity_per_instrument_percent setting and available balance').classes('text-xs text-grey-6 mt-1')
-                    else:
-                        # Simple action - no additional inputs needed
-                        with value_row:
-                            ui.label('Simple action - no additional configuration needed').classes('text-grey-7')
+                        # Share adjustment action - show target_percent inline
+                        with action_value_container:
+                            nonlocal target_percent_input
+
+                            target_percent_input = ui.number(
+                                label='Target %',
+                                value=action_config.get('target_percent', 10.0) if action_config else 10.0,
+                                min=0.0,
+                                max=100.0,
+                                step=0.1,
+                                format='%.1f'
+                            ).classes('w-32').props('dense')
                 
                 # Initial setup
                 update_action_inputs()
@@ -4385,30 +4369,30 @@ class TradeSettingsTab:
                 ui.label('Add Ruleset' if not is_edit else 'Edit Ruleset').classes('text-h6 mb-4')
                 
                 # Basic ruleset information
-                with ui.column().classes('w-full gap-4'):
-                    self.ruleset_name_input = ui.input(
-                        label='Ruleset Name',
-                        value=ruleset.name if is_edit else ''
-                    ).classes('w-full')
-                    
-                    # Subtype selection
-                    self.ruleset_subtype_select = ui.select(
-                        options={subtype.value: subtype.value.replace('_', ' ').title() for subtype in AnalysisUseCase},
-                        label='Subtype (Analysis Use Case)',
-                        value=ruleset.subtype.value if is_edit and ruleset.subtype else AnalysisUseCase.ENTER_MARKET.value
-                    ).classes('w-full')
-                    
+                with ui.column().classes('w-full gap-2'):
+                    with ui.row().classes('w-full gap-4'):
+                        self.ruleset_name_input = ui.input(
+                            label='Ruleset Name',
+                            value=ruleset.name if is_edit else ''
+                        ).classes('flex-1').props('dense')
+
+                        self.ruleset_subtype_select = ui.select(
+                            options={subtype.value: subtype.value.replace('_', ' ').title() for subtype in AnalysisUseCase},
+                            label='Subtype (Analysis Use Case)',
+                            value=ruleset.subtype.value if is_edit and ruleset.subtype else AnalysisUseCase.ENTER_MARKET.value
+                        ).classes('flex-1').props('dense')
+
                     self.ruleset_description_input = ui.textarea(
                         label='Description',
                         value=ruleset.description if is_edit and ruleset.description else ''
-                    ).classes('w-full')
+                    ).classes('w-full').props('dense rows=2')
                 
                 # Rules selection section
-                ui.label('Select Rules for this Ruleset').classes('text-subtitle1 mt-4 mb-2')
-                ui.label('Choose which rules should be part of this ruleset. Only rules with matching subtype are shown.').classes('text-grey-7 mb-4')
-                
+                ui.label('Select Rules for this Ruleset').classes('text-subtitle1 mt-2 mb-1')
+                ui.label('Choose which rules should be part of this ruleset. Only rules with matching subtype are shown.').classes('text-grey-7 text-xs mb-2')
+
                 # Container for rules that will be updated when subtype changes
-                self.rules_selection_container = ui.column().classes('w-full')
+                self.rules_selection_container = ui.column().classes('w-full').style('flex: 1; overflow-y: auto')
                 
                 # Function to update available rules based on selected subtype
                 def update_available_rules():
@@ -4446,31 +4430,28 @@ class TradeSettingsTab:
                     self.selected_rules = {}
                     
                     with self.rules_selection_container:
-                        with ui.column().classes('w-full').style('max-height: 400px; overflow-y: auto') as rules_container:
+                        with ui.column().classes('w-full'):
                             for rule in available_rules:
-                                # Check if rule is currently associated with this ruleset
                                 is_selected = rule.id in selected_rule_ids
-                                
-                                with ui.card().classes('w-full p-4 mb-2'):
-                                    with ui.row().classes('w-full items-center'):
-                                        # Checkbox for selection
+
+                                with ui.card().classes('w-full p-2 mb-1'):
+                                    with ui.row().classes('w-full items-center gap-2'):
                                         rule_checkbox = ui.checkbox(
                                             text='',
                                             value=is_selected
                                         )
-                                        
-                                        # Rule information
-                                        with ui.column().classes('flex-1'):
-                                            ui.label(f'{rule.name}').classes('font-medium')
-                                            ui.label(f'Subtype: {rule.subtype.value.replace("_", " ").title()}').classes('text-sm text-grey-6')
-                                            ui.label(f'Continue Processing: {"Yes" if rule.continue_processing else "No"}').classes('text-sm text-grey-6')
-                                            if rule.triggers:
-                                                trigger_summary = ', '.join([f"{k}: {v.get('event_type', v.get('type', 'unknown'))}" for k, v in rule.triggers.items()])
-                                                ui.label(f'Triggers: {trigger_summary}').classes('text-sm text-grey-6')
-                                            if rule.actions:
-                                                action_summary = ', '.join([f"{k}: {get_action_type_display_label(v.get('action_type', v.get('type', 'unknown')))}" for k, v in rule.actions.items()])
-                                                ui.label(f'Actions: {action_summary}').classes('text-sm text-grey-6')
-                                
+                                        ui.label(f'{rule.name}').classes('font-medium text-sm flex-1')
+
+                                    with ui.expansion('Details', value=False).classes('w-full').props('dense'):
+                                        ui.label(f'Subtype: {rule.subtype.value.replace("_", " ").title()}').classes('text-xs text-grey-6')
+                                        ui.label(f'Continue Processing: {"Yes" if rule.continue_processing else "No"}').classes('text-xs text-grey-6')
+                                        if rule.triggers:
+                                            trigger_summary = ', '.join([f"{k}: {v.get('event_type', v.get('type', 'unknown'))}" for k, v in rule.triggers.items()])
+                                            ui.label(f'Triggers: {trigger_summary}').classes('text-xs text-grey-6')
+                                        if rule.actions:
+                                            action_summary = ', '.join([f"{k}: {get_action_type_display_label(v.get('action_type', v.get('type', 'unknown')))}" for k, v in rule.actions.items()])
+                                            ui.label(f'Actions: {action_summary}').classes('text-xs text-grey-6')
+
                                 self.selected_rules[rule.id] = rule_checkbox
                 
                 # Initial load of rules
