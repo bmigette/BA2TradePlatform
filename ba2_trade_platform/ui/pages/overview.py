@@ -950,12 +950,12 @@ class OverviewTab:
                 with ui.row().classes('w-full justify-between items-center'):
                     ui.label(label).classes('text-xs')
                     with ui.row().classes('items-center gap-2'):
-                        pnl_color = 'text-green-500' if current_pnl >= 0 else 'text-red-500'
+                        pnl_color = 'text-green-600' if current_pnl >= 0 else 'text-red-600'
                         ui.label(f'${current_pnl:,.2f}').classes(f'text-sm font-bold {pnl_color}')
                         if change > 0:
-                            ui.label(f'▲ +${change:,.2f}').classes('text-xs text-green-500')
+                            ui.label(f'▲ +${change:,.2f}').classes('text-xs text-green-600')
                         elif change < 0:
-                            ui.label(f'▼ -${abs(change):,.2f}').classes('text-xs text-red-500')
+                            ui.label(f'▼ -${abs(change):,.2f}').classes('text-xs text-red-600')
                         else:
                             ui.label('— $0.00').classes('text-xs text-gray-500')
 
@@ -964,20 +964,21 @@ class OverviewTab:
                     # Open / Closed counts
                     with ui.row().classes('w-full justify-between items-center mb-1'):
                         ui.label('Open Trades').classes('text-xs')
-                        ui.label(str(open_count)).classes('text-sm font-bold text-blue-500')
+                        ui.label(str(open_count)).classes('text-sm font-bold text-blue-600')
                     with ui.row().classes('w-full justify-between items-center mb-1'):
                         ui.label('Closed (30d)').classes('text-xs')
-                        ui.label(str(closed_count)).classes('text-sm font-bold')
+                        closed_color = 'text-green-600' if pnl_30d > 0 else 'text-red-600' if pnl_30d < 0 else ''
+                        ui.label(str(closed_count)).classes(f'text-sm font-bold {closed_color}')
 
                     ui.separator().classes('my-1')
 
                     # Win / Loss
                     with ui.row().classes('w-full justify-between items-center mb-1'):
                         ui.label('Winning').classes('text-xs')
-                        ui.label(str(total_wins)).classes('text-sm font-bold text-green-500')
+                        ui.label(str(total_wins)).classes('text-sm font-bold text-green-600')
                     with ui.row().classes('w-full justify-between items-center mb-1'):
                         ui.label('Losing').classes('text-xs')
-                        ui.label(str(total_losses)).classes('text-sm font-bold text-red-500')
+                        ui.label(str(total_losses)).classes('text-sm font-bold text-red-600')
 
                     ui.separator().classes('my-1')
 
