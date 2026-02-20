@@ -181,7 +181,7 @@ class LiveTradesTable(LazyTable):
         </q-tr>
         <q-tr v-show="props.expand" :props="props" class="bg-white/5">
             <q-td colspan="100%">
-                <div class="q-pa-md">
+                <div class="q-pa-xs">
                     <div class="text-subtitle2 q-mb-sm text-accent">📋 Related Orders ({{ props.row.order_count }})</div>
                     <q-markup-table flat bordered dense v-if="props.row.orders && props.row.orders.length > 0" class="bg-transparent">
                         <thead>
@@ -428,13 +428,31 @@ class LiveTradesTable(LazyTable):
             # Quasar columns
             quasar_columns = [col.to_quasar_column() for col in self.columns]
             
+            # Build table props from config
+            table_props = 'flat bordered hide-pagination'
+            if self._config.dense:
+                table_props += ' dense'
+            if self._config.wrap_cells:
+                table_props += ' wrap-cells'
+
             # Create table - hide built-in pagination since we use custom dark-themed controls
             self._table = ui.table(
                 columns=quasar_columns,
                 rows=[],
                 row_key=self.config.row_key,
                 pagination={'rowsPerPage': 0, 'sortBy': self._sort_by, 'descending': self._sort_descending, 'rowsNumber': 0}
-            ).classes('w-full').props('flat bordered hide-pagination')
+            ).classes('w-full live-trades-table').props(table_props)
+
+            # Compact CSS for tighter cell padding when dense mode is enabled
+            if self._config.dense:
+                ui.add_css('''
+                    .live-trades-table .q-table td, .live-trades-table .q-table th {
+                        padding: 2px 6px !important;
+                    }
+                    .live-trades-table .q-table .q-td {
+                        padding: 2px 6px !important;
+                    }
+                ''')
             
             # Add the body template for expansion and custom cells
             self._table.add_slot('body', self.BODY_TEMPLATE)
