@@ -944,7 +944,8 @@ class LiveTradesTab:
                 page_size=20,
                 table_name="LiveTradesTable",
                 show_global_filter=True,
-                show_selection=True
+                show_selection=True,
+                dense=True
             ),
             on_edit=self._handle_edit_transaction,
             on_close=self._handle_close_transaction,
