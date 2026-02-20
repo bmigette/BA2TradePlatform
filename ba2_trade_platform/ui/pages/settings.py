@@ -1497,9 +1497,11 @@ class ExpertSettingsTab:
                         with ui.column().classes('w-full gap-2'):
                             with ui.row().classes('w-full gap-4'):
                                 expert_types = self._get_available_expert_types()
+                                initial_expert = expert_instance.expert if is_edit else (expert_types[0] if expert_types else None)
                                 self.expert_select = ui.select(
                                     expert_types,
-                                    label='Expert Type'
+                                    label='Expert Type',
+                                    value=initial_expert
                                 ).classes('flex-1').props('dense')
 
                                 self.alias_input = ui.input(
@@ -1523,9 +1525,17 @@ class ExpertSettingsTab:
 
                             with ui.row().classes('w-full gap-4'):
                                 accounts = self._get_available_accounts()
+                                initial_account = None
+                                if is_edit:
+                                    account_inst = get_instance(AccountDefinition, expert_instance.account_id)
+                                    if account_inst:
+                                        initial_account = f"{account_inst.name} ({account_inst.provider})"
+                                elif accounts:
+                                    initial_account = accounts[0]
                                 self.account_select = ui.select(
                                     accounts,
-                                    label='Trading Account'
+                                    label='Trading Account',
+                                    value=initial_account
                                 ).classes('flex-1').props('dense')
 
                                 self.instrument_selection_method_select = ui.select(
