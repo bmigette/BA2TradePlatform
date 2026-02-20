@@ -2791,7 +2791,8 @@ class ExpertSettingsTab:
                         if tooltip_combined:
                             with ui.row().classes('items-center gap-1'):
                                 ui.label(label).classes('text-xs')
-                                ui.icon('help_outline', size='xs').classes('text-gray-500 cursor-help').tooltip(tooltip_combined)
+                                with ui.icon('help_outline', size='xs').classes('text-gray-500 cursor-help'):
+                                    ui.tooltip(tooltip_combined).style('font-size: 14px; max-width: 400px; line-height: 1.4')
                         else:
                             ui.label(label).classes('text-xs')
                         display_label = ""
