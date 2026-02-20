@@ -632,7 +632,10 @@ class LiveTradesTab:
         return rows
 
     def _check_missing_tpsl_orders(self, txn, txn_orders) -> bool:
-        """Check if TP/SL are defined but have no valid orders."""
+        """Check if TP/SL are defined but have no valid orders.
+
+        Uses TransactionHelper.is_tp_order/is_sl_order for reliable order type detection.
+        """
         from ...core.types import TransactionStatus
 
         if txn.status != TransactionStatus.OPENED:
@@ -647,51 +650,22 @@ class LiveTradesTab:
         has_valid_tp_order = False
         has_valid_sl_order = False
         invalid_statuses = {'canceled', 'rejected', 'error', 'expired'}
-        entry_order_types = {'market', 'limit'}
 
         for order in txn_orders:
-            order_type = order.order_type.value.lower() if hasattr(order.order_type, 'value') else str(order.order_type).lower()
-
-            if order_type in entry_order_types and not order.depends_on_order:
-                continue
-
             order_status = order.status.value.lower() if hasattr(order.status, 'value') else str(order.status).lower()
             if order_status in invalid_statuses:
                 continue
 
-            order_limit_price = round(order.limit_price, 1) if order.limit_price else None
-            order_stop_price = round(order.stop_price, 1) if order.stop_price else None
-            txn_tp = round(txn.take_profit, 1) if txn.take_profit else None
-            txn_sl = round(txn.stop_loss, 1) if txn.stop_loss else None
-
-            # Check for OCO order
-            if has_tp_defined and has_sl_defined:
-                if order_type == 'oco':
-                    if order_limit_price == txn_tp and order_stop_price == txn_sl:
-                        has_valid_tp_order = True
-                        has_valid_sl_order = True
-                elif 'stop_limit' in order_type:
-                    if order_limit_price == txn_tp and order_stop_price == txn_sl:
-                        has_valid_tp_order = True
-                        has_valid_sl_order = True
-
-            # Check individual TP order
             if has_tp_defined and not has_valid_tp_order:
-                if order_type == 'oco' and has_sl_defined:
-                    if order_limit_price == txn_tp and order_stop_price == txn_sl:
-                        has_valid_tp_order = True
-                elif ('limit' in order_type and 'stop' not in order_type) or order_type in ['sell_limit', 'buy_limit']:
-                    if order_limit_price == txn_tp:
-                        has_valid_tp_order = True
+                if TransactionHelper.is_tp_order(order):
+                    has_valid_tp_order = True
 
-            # Check individual SL order
             if has_sl_defined and not has_valid_sl_order:
-                if order_type == 'oco' and has_tp_defined:
-                    if order_limit_price == txn_tp and order_stop_price == txn_sl:
-                        has_valid_sl_order = True
-                elif ('stop' in order_type and 'limit' not in order_type) or order_type in ['sell_stop', 'buy_stop']:
-                    if order_stop_price == txn_sl:
-                        has_valid_sl_order = True
+                if TransactionHelper.is_sl_order(order):
+                    has_valid_sl_order = True
+
+            if (not has_tp_defined or has_valid_tp_order) and (not has_sl_defined or has_valid_sl_order):
+                break
 
         return (has_tp_defined and not has_valid_tp_order) or (has_sl_defined and not has_valid_sl_order)
 
@@ -919,86 +893,7 @@ class LiveTradesTab:
 
                 # Check if TP/SL are defined but have no valid orders
                 # Valid means: order exists with correct type/price and is not CANCELED/REJECTED/ERROR
-                has_missing_tpsl_orders = False
-                if txn.status == TransactionStatus.OPENED:  # Only for open transactions
-                    has_tp_defined = txn.take_profit is not None and txn.take_profit > 0
-                    has_sl_defined = txn.stop_loss is not None and txn.stop_loss > 0
-
-                    if has_tp_defined or has_sl_defined:
-                        # Check if we have valid TP/SL orders
-                        from ...core.types import OrderStatus
-
-                        has_valid_tp_order = False
-                        has_valid_sl_order = False
-                        has_valid_bracket_order = False  # STOP_LIMIT order that covers both TP and SL
-
-                        # Invalid order statuses (terminal failed states)
-                        invalid_statuses = {'canceled', 'rejected', 'error', 'expired'}
-
-                        # Entry order types to skip (not TP/SL orders)
-                        entry_order_types = {'market', 'limit'}
-
-                        for order in txn_orders:
-                            # Get order type first to determine if this is an entry order
-                            order_type = order.order_type.value.lower() if hasattr(order.order_type, 'value') else str(order.order_type).lower()
-
-                            # Skip entry orders (MARKET/LIMIT without depends_on_order)
-                            if order_type in entry_order_types and not order.depends_on_order:
-                                continue
-
-                            # Check if order is in valid state
-                            order_status = order.status.value.lower() if hasattr(order.status, 'value') else str(order.status).lower()
-                            is_valid_order = order_status not in invalid_statuses
-
-                            if not is_valid_order:
-                                continue
-
-                            # Round prices to 1 decimal for comparison
-                            order_limit_price = round(order.limit_price, 1) if order.limit_price else None
-                            order_stop_price = round(order.stop_price, 1) if order.stop_price else None
-                            txn_tp = round(txn.take_profit, 1) if txn.take_profit else None
-                            txn_sl = round(txn.stop_loss, 1) if txn.stop_loss else None
-
-                            # Check for bracket order (STOP_LIMIT that covers both TP and SL)
-                            if has_tp_defined and has_sl_defined:
-                                # OCO order: has both TP (limit_price) and SL (stop_price)
-                                if order_type == 'oco':
-                                    if order_limit_price == txn_tp and order_stop_price == txn_sl:
-                                        has_valid_bracket_order = True
-                                        has_valid_tp_order = True
-                                        has_valid_sl_order = True
-                                # Legacy STOP_LIMIT bracket orders
-                                elif 'stop_limit' in order_type:
-                                    # For bracket orders, check if both TP (limit) and SL (stop) match
-                                    if order_limit_price == txn_tp and order_stop_price == txn_sl:
-                                        has_valid_bracket_order = True
-                                        has_valid_tp_order = True
-                                        has_valid_sl_order = True
-
-                            # Check for individual TP order (LIMIT or OCO with only TP)
-                            if has_tp_defined and not has_valid_tp_order:
-                                # OCO order with both TP and SL
-                                if order_type == 'oco' and has_sl_defined:
-                                    if order_limit_price == txn_tp and order_stop_price == txn_sl:
-                                        has_valid_tp_order = True
-                                # Individual TP-only orders (SELL_LIMIT / BUY_LIMIT)
-                                elif ('limit' in order_type and 'stop' not in order_type) or order_type in ['sell_limit', 'buy_limit']:
-                                    if order_limit_price == txn_tp:
-                                        has_valid_tp_order = True
-
-                            # Check for individual SL order (STOP or OCO with only SL)
-                            if has_sl_defined and not has_valid_sl_order:
-                                # OCO order with both TP and SL
-                                if order_type == 'oco' and has_tp_defined:
-                                    if order_limit_price == txn_tp and order_stop_price == txn_sl:
-                                        has_valid_sl_order = True
-                                # Individual SL-only orders (SELL_STOP / BUY_STOP)
-                                elif ('stop' in order_type and 'limit' not in order_type) or order_type in ['sell_stop', 'buy_stop']:
-                                    if order_stop_price == txn_sl:
-                                        has_valid_sl_order = True
-
-                        # Missing if TP/SL is defined but no valid order exists
-                        has_missing_tpsl_orders = (has_tp_defined and not has_valid_tp_order) or (has_sl_defined and not has_valid_sl_order)
+                has_missing_tpsl_orders = self._check_missing_tpsl_orders(txn, txn_orders)
 
                 row = {
                     'id': txn.id,
