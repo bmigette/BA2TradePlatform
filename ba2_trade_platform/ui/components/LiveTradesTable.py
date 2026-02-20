@@ -221,7 +221,7 @@ class LiveTradesTable(LazyTable):
                                 </td>
                                 <td class="text-left text-caption">{{ order.broker_order_id }}</td>
                                 <td class="text-left">{{ order.created_at }}</td>
-                                <td class="text-left text-caption">{{ order.comment }}</td>
+                                <td class="text-left text-caption" style="white-space: normal; word-break: break-word; max-width: 300px;">{{ order.comment }}</td>
                                 <td class="text-center">
                                     <q-btn v-if="order.has_recommendation"
                                            icon="info"
@@ -447,10 +447,15 @@ class LiveTradesTable(LazyTable):
             if self._config.dense:
                 ui.add_css('''
                     .live-trades-table .q-table td, .live-trades-table .q-table th {
-                        padding: 2px 6px !important;
+                        padding: 1px 4px !important;
+                        line-height: 1.2 !important;
                     }
                     .live-trades-table .q-table .q-td {
-                        padding: 2px 6px !important;
+                        padding: 1px 4px !important;
+                        line-height: 1.2 !important;
+                    }
+                    .live-trades-table .q-table .q-tr {
+                        height: auto !important;
                     }
                 ''')
             
