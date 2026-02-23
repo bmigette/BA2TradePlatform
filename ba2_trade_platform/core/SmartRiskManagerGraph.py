@@ -637,9 +637,12 @@ Research market analyses and recommend specific trading actions. You have FULL A
 - `get_trade_summary_by_symbol_tool()` - Get aggregated BUY/SELL quantities across ALL experts (use for hedging check)
 - `get_current_price_tool(symbol)` - Get price for one symbol (only for symbols NOT in your context above)
 - `get_current_prices_tool(symbols: List[str])` - Get prices for multiple symbols (only for symbols NOT in your context above)
+- `get_price_movement_tool(symbol, days=7)` - Get price movement % over past X days (close-to-close). Already pre-loaded for 7/15/30/60 days in Portfolio Context above — use this tool only for other periods or new symbols
 - `get_all_recent_analyses_tool(max_age_hours=72)` - Discover all available analyses
 
 **Note:** Current prices for all portfolio positions and analyzed symbols are already included in the sections above. Only use price tools for symbols NOT already listed in your context.
+
+**Buy-the-Dip Analysis:** Use `get_price_movement_tool(symbol, days)` to check recent price drops for symbols you're considering. Look for significant drawdowns from recent highs (e.g., >5% drop with high consecutive down days) as potential buy-the-dip opportunities. Combine this with analysis confidence to decide whether a dip is a genuine opportunity or a trend reversal.
 - `get_analysis_outputs_batch_tool(analysis_ids, output_keys)` - Fetch analysis content (RECOMMENDED)
 - `get_analysis_outputs_tool(analysis_id)` - List available output keys for an analysis
 - `get_analysis_output_detail_tool(analysis_id, output_key)` - Get specific output content
@@ -1521,6 +1524,25 @@ def check_recent_analyses(state: SmartRiskManagerState) -> Dict[str, Any]:
             bid_prices = {}
             ask_prices = {}
         
+        # Pre-load price movement data for all symbols (7d, 15d, 30d, 60d)
+        price_movement_periods = [7, 15, 30, 60]
+        price_movement_data = {}
+        if all_symbols:
+            logger.info(f"Pre-loading price movement data for {len(all_symbols)} symbols ({price_movement_periods} days)")
+            for sym in all_symbols:
+                sym_movements = {}
+                for period in price_movement_periods:
+                    try:
+                        result = toolkit.get_price_movement(sym, period)
+                        if "error" not in result:
+                            sym_movements[period] = result["price_change_pct"]
+                        else:
+                            sym_movements[period] = None
+                    except Exception as pm_err:
+                        logger.error(f"Price movement fetch failed for {sym} ({period}d): {pm_err}", exc_info=True)
+                        sym_movements[period] = None
+                price_movement_data[sym] = sym_movements
+
         # Show summary grouped by action type, then symbol
         action_labels = {
             'BUY': '🟢 Strong BUY Signals',
@@ -1598,6 +1620,23 @@ def check_recent_analyses(state: SmartRiskManagerState) -> Dict[str, Any]:
                         # Fallback to simple format (no recommendation data available)
                         analyses_summary += f"  [{time_display}] [Analysis #{analysis['analysis_id']}] {analysis['expert_name']}\n"
         
+        # Build price movement summary
+        if price_movement_data:
+            analyses_summary += "\n\n## Price Movement Summary (Close-to-Close % Change)\n"
+            analyses_summary += "| Symbol | 7d | 15d | 30d | 60d |\n"
+            analyses_summary += "|--------|-----|------|------|------|\n"
+            for sym in sorted(price_movement_data.keys()):
+                movements = price_movement_data[sym]
+                cols = []
+                for period in price_movement_periods:
+                    val = movements.get(period)
+                    if val is not None:
+                        cols.append(f"{val:+.2f}%")
+                    else:
+                        cols.append("N/A")
+                analyses_summary += f"| {sym} | {' | '.join(cols)} |\n"
+            analyses_summary += "\n*Negative values indicate price drops — potential buy-the-dip opportunities when combined with bullish analysis signals.*\n"
+
         # Handle case where agent_scratchpad might be a list
         current_scratchpad = state["agent_scratchpad"]
         if isinstance(current_scratchpad, list):
@@ -1902,14 +1941,34 @@ def create_research_tools(toolkit: SmartRiskManagerToolkit, recommended_actions_
             Dict with "prices" mapping symbol to price, and "errors" list for any failures
         """
         return toolkit.get_current_prices(symbols)
-    
+
+    @tool
+    @smart_risk_manager_tool
+    def get_price_movement_tool(
+        symbol: Annotated[str, "Instrument symbol to check price movement for"],
+        days: Annotated[int, "Number of past days to analyze (default: 7)"] = 7
+    ) -> Dict[str, Any]:
+        """Get price movement percentage over the past X trading days (close-to-close).
+
+        Negative value means the price dropped over the period.
+        Useful for identifying buy-the-dip opportunities.
+
+        Args:
+            symbol: Instrument symbol (e.g., 'AAPL')
+            days: Number of past trading days to compare (default: 7)
+
+        Returns:
+            Dict with symbol, days, and price_change_pct
+        """
+        return toolkit.get_price_movement(symbol, days)
+
     @tool
     @smart_risk_manager_tool
     def finish_research_tool(
         summary: Annotated[str, "Concise summary of key findings from your research (2-3 paragraphs)"]
     ) -> str:
         """Call this when you have gathered enough information and are ready to return to decision making.
-        
+
         Args:
             summary: Concise summary of key findings from your research (2-3 paragraphs)
             
@@ -2325,6 +2384,7 @@ def create_research_tools(toolkit: SmartRiskManagerToolkit, recommended_actions_
         get_all_recent_analyses_tool,
         get_current_price_tool,
         get_current_prices_tool,
+        get_price_movement_tool,
         get_all_transactions_tool,
         get_pending_actions_tool,
         modify_pending_tp_sl_tool,
@@ -3715,7 +3775,19 @@ class SmartRiskManagerGraph:
             Use this instead of calling get_current_price_tool multiple times to save iterations.
             """
             return self.toolkit.get_current_prices(symbols)
-        
+
+        @tool
+        @smart_risk_manager_tool
+        def get_price_movement_tool(
+            symbol: Annotated[str, "Instrument symbol to check price movement for"],
+            days: Annotated[int, "Number of past days to analyze (default: 7)"] = 7
+        ) -> Dict[str, Any]:
+            """Get price movement percentage over the past X trading days (close-to-close).
+
+            Negative value means the price dropped. Useful for identifying buy-the-dip opportunities.
+            """
+            return self.toolkit.get_price_movement(symbol, days)
+
         @tool
         @smart_risk_manager_tool
         def finish_research_tool(
@@ -3879,6 +3951,7 @@ class SmartRiskManagerGraph:
             get_trade_summary_by_symbol_tool,
             get_current_price_tool,
             get_current_prices_tool,
+            get_price_movement_tool,
             recommend_close_position,
             recommend_adjust_quantity,
             recommend_update_stop_loss,

@@ -2489,7 +2489,109 @@ class SmartRiskManagerToolkit:
         except Exception as e:
             logger.error(f"Error getting trade summary by symbol: {e}", exc_info=True)
             return {}
-    
+
+    def _get_ohlcv_provider(self):
+        """
+        Get the OHLCV data provider based on expert settings.
+
+        If the expert has a 'vendor_stock_data' setting (e.g., TradingAgents),
+        uses the first configured provider. Otherwise defaults to YFinance.
+
+        Returns:
+            An instantiated OHLCV data provider
+        """
+        from ..modules.dataproviders import OHLCV_PROVIDERS, YFinanceDataProvider
+
+        try:
+            vendor_setting = self.expert.get_setting_with_interface_default("vendor_stock_data", log_warning=False)
+        except (ValueError, AttributeError):
+            vendor_setting = None
+
+        if vendor_setting:
+            # vendor_stock_data can be a list or comma-separated string
+            if isinstance(vendor_setting, list):
+                vendors = vendor_setting
+            elif isinstance(vendor_setting, str):
+                vendors = [v.strip() for v in vendor_setting.split(',') if v.strip()]
+            else:
+                vendors = []
+
+            # Use first available provider from the list
+            for vendor in vendors:
+                if vendor in OHLCV_PROVIDERS:
+                    provider_class = OHLCV_PROVIDERS[vendor]
+                    logger.debug(f"Using OHLCV provider '{vendor}' from expert settings")
+                    return provider_class()
+                else:
+                    logger.warning(f"OHLCV provider '{vendor}' not found in registry, trying next")
+
+        # Default to YFinance
+        logger.debug("Using default YFinance OHLCV provider")
+        return YFinanceDataProvider()
+
+    def get_price_movement(
+        self,
+        symbol: Annotated[str, "Instrument symbol to check price movement for"],
+        days: Annotated[int, "Number of past days to analyze (default: 7)"] = 7
+    ) -> Dict[str, Any]:
+        """
+        Get price movement percentage over the past X days using close prices.
+
+        Compares today's close to the close X trading days ago and returns
+        the percentage change. Negative means the price dropped.
+
+        Args:
+            symbol: Instrument symbol (e.g., 'AAPL', 'MSFT')
+            days: Number of past trading days to compare (default: 7)
+
+        Returns:
+            Dict with:
+                - symbol: The symbol analyzed
+                - days: Actual trading days in the period
+                - price_change_pct: Percentage change (negative = price dropped)
+        """
+        try:
+            provider = self._get_ohlcv_provider()
+
+            end_date = datetime.now()
+            # Fetch extra days to account for weekends/holidays
+            start_date = end_date - timedelta(days=days + 5)
+
+            datapoints = provider.get_data(
+                symbol=symbol,
+                start_date=start_date,
+                end_date=end_date,
+                interval='1d'
+            )
+
+            if not datapoints or len(datapoints) < 2:
+                return {
+                    "symbol": symbol,
+                    "days": days,
+                    "error": f"Insufficient OHLCV data for {symbol}"
+                }
+
+            # Take last N+1 trading days so index 0 is the reference day
+            relevant = datapoints[-(days + 1):] if len(datapoints) > days else datapoints
+            start_price = float(relevant[0].close)
+            end_price = float(relevant[-1].close)
+            price_change_pct = round(((end_price - start_price) / start_price) * 100, 2)
+
+            logger.info(f"Price movement for {symbol} over {len(relevant)-1}d: {price_change_pct:+.2f}%")
+            return {
+                "symbol": symbol,
+                "days": len(relevant) - 1,
+                "price_change_pct": price_change_pct
+            }
+
+        except Exception as e:
+            logger.error(f"Error getting price movement for {symbol}: {e}", exc_info=True)
+            return {
+                "symbol": symbol,
+                "days": days,
+                "error": str(e)
+            }
+
     def get_tools(self) -> List:
         """
         Get all tools as a list for LangChain agent.
@@ -2498,7 +2600,7 @@ class SmartRiskManagerToolkit:
             List of LangChain tool objects (all 15 tools)
         """
         return [
-            # Portfolio & Analysis Tools (8)
+            # Portfolio & Analysis Tools (9)
             self.get_portfolio_status,
             self.get_recent_analyses,
             self.get_analysis_outputs,
@@ -2507,6 +2609,7 @@ class SmartRiskManagerToolkit:
             self.get_historical_analyses,
             self.get_analysis_at_open_time,
             self.get_last_risk_manager_summary,
+            self.get_price_movement,
             # Trading Action Tools (7)
             self.close_position,
             self.adjust_quantity,
