@@ -4436,22 +4436,58 @@ class TradeSettingsTab:
                                 is_selected = rule.id in selected_rule_ids
 
                                 with ui.card().classes('w-full p-1 mb-1'):
-                                    with ui.row().classes('w-full items-center gap-1').style('margin-bottom: -8px'):
+                                    with ui.row().classes('w-full items-center gap-1'):
                                         rule_checkbox = ui.checkbox(
                                             text='',
                                             value=is_selected
-                                        )
+                                        ).props('dense')
                                         ui.label(f'{rule.name}').classes('font-medium text-sm flex-1')
+                                        toggle_btn = ui.button(icon='expand_more').props('flat dense size=sm')
+                                    details_container = ui.column().classes('w-full pl-8').style('display: none')
 
-                                    with ui.expansion('Details', value=False).classes('w-full').props('dense').style('margin-top: 0'):
+                                    def make_toggle(btn, container):
+                                        def toggle():
+                                            visible = container._style.get('display', 'none') != 'none'
+                                            container._style['display'] = 'none' if visible else ''
+                                            btn._props['icon'] = 'expand_more' if visible else 'expand_less'
+                                            container.update()
+                                            btn.update()
+                                        return toggle
+                                    toggle_btn.on('click', make_toggle(toggle_btn, details_container))
+
+                                    with details_container:
                                         ui.label(f'Subtype: {rule.subtype.value.replace("_", " ").title()}').classes('text-xs text-grey-6')
                                         ui.label(f'Continue Processing: {"Yes" if rule.continue_processing else "No"}').classes('text-xs text-grey-6')
                                         if rule.triggers:
-                                            trigger_summary = ', '.join([f"{k}: {v.get('event_type', v.get('type', 'unknown'))}" for k, v in rule.triggers.items()])
-                                            ui.label(f'Triggers: {trigger_summary}').classes('text-xs text-grey-6')
+                                            trigger_parts = []
+                                            for k, v in rule.triggers.items():
+                                                event_type = v.get('event_type', v.get('type', 'unknown'))
+                                                detail = event_type
+                                                if is_numeric_event(event_type):
+                                                    op = v.get('operator', '')
+                                                    val = v.get('value', '')
+                                                    if op or val:
+                                                        detail += f' {op} {val}'
+                                                trigger_parts.append(f"{k}: {detail}")
+                                            ui.label(f'Triggers: {", ".join(trigger_parts)}').classes('text-xs text-grey-6')
                                         if rule.actions:
-                                            action_summary = ', '.join([f"{k}: {get_action_type_display_label(v.get('action_type', v.get('type', 'unknown')))}" for k, v in rule.actions.items()])
-                                            ui.label(f'Actions: {action_summary}').classes('text-xs text-grey-6')
+                                            action_parts = []
+                                            for k, v in rule.actions.items():
+                                                action_type = v.get('action_type', v.get('type', 'unknown'))
+                                                label = get_action_type_display_label(action_type)
+                                                if is_adjustment_action(action_type):
+                                                    val = v.get('value', '')
+                                                    ref = v.get('reference_value', '')
+                                                    if val:
+                                                        label += f' {val}%'
+                                                    if ref:
+                                                        label += f' of {ref.replace("_", " ")}'
+                                                elif is_share_adjustment_action(action_type):
+                                                    pct = v.get('target_percent', '')
+                                                    if pct:
+                                                        label += f' to {pct}%'
+                                                action_parts.append(f"{k}: {label}")
+                                            ui.label(f'Actions: {", ".join(action_parts)}').classes('text-xs text-grey-6')
 
                                 self.selected_rules[rule.id] = rule_checkbox
                 
