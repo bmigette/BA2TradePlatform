@@ -5020,21 +5020,26 @@ class AccountGrowthTab:
                 ui.label('No balance history or dividend data available.').classes('text-sm text-gray-500')
                 return
 
-            # Prepare balance history series
-            balance_dates = []
-            balance_values = []
+            # Aggregate balance history per date across accounts.
+            # Each entry has 'account_id' and 'date'. For each date, sum
+            # the NLV of all accounts using per-account forward-fill.
+            balance_dates_set = set()
+            per_account_data = {}  # account_id -> {date_str: nlv}
             if balance_history:
-                sorted_hist = sorted(balance_history, key=lambda x: str(x.get('date', '')))
-                for entry in sorted_hist:
+                for entry in balance_history:
                     date_val = entry.get('date')
-                    if date_val:
-                        date_str = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)
-                        balance_dates.append(date_str)
-                        balance_values.append(round(float(entry.get('net_liquidating_value', 0)), 2))
+                    if not date_val:
+                        continue
+                    date_str = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)
+                    acc_id = entry.get('account_id', 0)
+                    balance_dates_set.add(date_str)
+                    if acc_id not in per_account_data:
+                        per_account_data[acc_id] = {}
+                    per_account_data[acc_id][date_str] = float(entry.get('net_liquidating_value', 0))
 
             # Prepare cumulative dividend series
-            div_dates = []
-            div_cumulative = []
+            div_dates_set = set()
+            div_by_date = {}  # date_str -> total amount
             if dividends:
                 sorted_divs = sorted(dividends, key=lambda x: str(x.get('date', '')))
                 cumulative = 0
@@ -5043,26 +5048,28 @@ class AccountGrowthTab:
                     if date_val:
                         date_str = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)
                         cumulative += float(entry.get('amount', 0))
-                        div_dates.append(date_str)
-                        div_cumulative.append(round(cumulative, 2))
+                        div_dates_set.add(date_str)
+                        div_by_date[date_str] = round(cumulative, 2)
 
             # Merge all dates for x-axis
-            all_dates = sorted(set(balance_dates + div_dates))
+            all_dates = sorted(balance_dates_set | div_dates_set)
 
-            # Build aligned series (forward-fill gaps)
-            balance_map = dict(zip(balance_dates, balance_values))
-            div_map = dict(zip(div_dates, div_cumulative))
-
+            # Build aligned balance series: for each date, sum per-account
+            # NLV with forward-fill per account.
             aligned_balance = []
+            last_per_account = {acc_id: 0.0 for acc_id in per_account_data}
+            for d in all_dates:
+                for acc_id, acc_data in per_account_data.items():
+                    if d in acc_data:
+                        last_per_account[acc_id] = acc_data[d]
+                aligned_balance.append(round(sum(last_per_account.values()), 2))
+
+            # Build aligned dividend series with forward-fill
             aligned_div = []
-            last_balance = 0
             last_div = 0
             for d in all_dates:
-                if d in balance_map:
-                    last_balance = balance_map[d]
-                aligned_balance.append(last_balance)
-                if d in div_map:
-                    last_div = div_map[d]
+                if d in div_by_date:
+                    last_div = div_by_date[d]
                 aligned_div.append(last_div)
 
             series = []
