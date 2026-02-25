@@ -5097,6 +5097,7 @@ class AccountGrowthTab:
         """Render cumulative growth bar chart grouped by instrument labels."""
         from ...core.models import Instrument
         from ...core.db import get_db
+        from ...core.InstrumentAutoAdder import get_instrument_auto_adder
         from sqlmodel import select as sql_select
 
         if not all_positions:
@@ -5112,6 +5113,14 @@ class AccountGrowthTab:
                         symbol_labels[inst.name] = inst.labels
         except Exception as e:
             logger.warning(f"Could not load instrument labels: {e}")
+
+        # Auto-add instruments not found in database
+        missing_symbols = [pos.symbol for pos in all_positions if pos.symbol not in symbol_labels]
+        if missing_symbols:
+            unique_missing = list(set(missing_symbols))
+            logger.info(f"Auto-adding {len(unique_missing)} missing instruments from positions: {unique_missing}")
+            adder = get_instrument_auto_adder()
+            adder.queue_instruments_for_addition(unique_missing, expert_shortname='', source='account_positions')
 
         # Group positions by label and aggregate values
         label_data = {}  # label -> {market_value, cost_basis, unrealized_pl}

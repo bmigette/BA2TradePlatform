@@ -164,10 +164,12 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
                 if qty == 0:
                     continue
 
+                multiplier = int(pos.multiplier) if pos.multiplier else 1
                 avg_price = float(pos.average_open_price)
-                current = float(pos.mark or pos.close_price or avg_price)
-                cost_basis = avg_price * abs(qty)
-                market_val = current * abs(qty)
+                # mark_price is per-share; mark is total position value
+                current = float(pos.mark_price or pos.close_price or avg_price)
+                cost_basis = avg_price * abs(qty) * multiplier
+                market_val = current * abs(qty) * multiplier
                 unrealized_pl = market_val - cost_basis
                 unrealized_plpc = (unrealized_pl / cost_basis * 100) if cost_basis else 0
 

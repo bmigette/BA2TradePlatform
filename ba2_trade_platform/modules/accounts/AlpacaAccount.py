@@ -4223,28 +4223,36 @@ class AlpacaAccount(AccountInterface):
             return []
 
         try:
-            from alpaca.trading.requests import GetAccountActivitiesRequest
-
-            params = {"activity_types": ["DIV"]}
+            params = {}
             if start_date:
-                params["after"] = start_date.isoformat()
+                params["after"] = start_date.isoformat() if hasattr(start_date, 'isoformat') else str(start_date)
             if end_date:
-                params["until"] = end_date.isoformat()
+                params["until"] = end_date.isoformat() if hasattr(end_date, 'isoformat') else str(end_date)
 
-            activities = self.client.get_account_activities(GetAccountActivitiesRequest(**params))
+            # TradingClient doesn't expose get_account_activities; use REST get() directly
+            raw_activities = self.client.get("/account/activities/DIV", params or None)
+
+            if not isinstance(raw_activities, list):
+                raw_activities = [raw_activities] if raw_activities else []
 
             dividends = []
-            for activity in activities:
-                act_symbol = getattr(activity, 'symbol', None)
+            for activity in raw_activities:
+                act_symbol = activity.get('symbol')
                 if symbol and act_symbol != symbol:
                     continue
 
+                date_str = activity.get('date') or activity.get('transaction_time')
+                try:
+                    date_val = datetime.fromisoformat(str(date_str)) if date_str else None
+                except (ValueError, TypeError):
+                    date_val = date_str
+
                 div_record = {
                     'symbol': act_symbol,
-                    'amount': float(getattr(activity, 'net_amount', 0) or getattr(activity, 'qty', 0)),
-                    'date': getattr(activity, 'date', None) or getattr(activity, 'transaction_time', None),
+                    'amount': float(activity.get('net_amount', 0) or 0),
+                    'date': date_val,
                     'drip_quantity': None,
-                    'drip_price': None
+                    'drip_price': None,
                 }
                 dividends.append(div_record)
 
