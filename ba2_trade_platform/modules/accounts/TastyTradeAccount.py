@@ -64,31 +64,18 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
 
         is_test = bool(self.settings.get("is_test", False))
 
-        self._session = _run_async(self._create_session(
+        self._session = TastySession(
             provider_secret=self.settings["client_secret"],
             refresh_token=self.settings["refresh_token"],
-            is_test=is_test
-        ))
-
-        # Fetch the specific account
-        accounts = _run_async(TastyAccount.get_accounts(self._session))
-        target_id = self.settings["account_id"]
-        for acc in accounts:
-            if acc.account_number == target_id:
-                self._account = acc
-                break
-
-        if not self._account:
-            raise ValueError(f"Account {target_id} not found. Available: {[a.account_number for a in accounts]}")
-
-    @staticmethod
-    async def _create_session(provider_secret, refresh_token, is_test):
-        from tastytrade.session import Session as TastySession
-        return TastySession(
-            provider_secret=provider_secret,
-            refresh_token=refresh_token,
-            is_test=is_test
+            is_test=is_test,
         )
+
+        # Fetch the specific account by account number
+        target_id = self.settings["account_id"]
+        self._account = _run_async(TastyAccount.get(self._session, account_number=target_id))
+
+        if self._account is None:
+            raise ValueError(f"Account {target_id} not found on TastyTrade.")
 
     def _check_authentication(self) -> bool:
         if self._session is None or self._account is None:
