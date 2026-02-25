@@ -5502,6 +5502,12 @@ class AccountGrowthTab:
             cumulative_divs.append(last_div)
             drip_quantities.append(last_drip)
 
+        # Total Value = Position Value + Cumulative Dividends
+        total_values = [
+            round(pv + cd, 2) if pv is not None else None
+            for pv, cd in zip(position_values, cumulative_divs)
+        ]
+
         # Position Value on primary y-axis (left)
         series = [{
             'name': 'Position Value',
@@ -5521,6 +5527,19 @@ class AccountGrowthTab:
                 }
             },
         }]
+
+        # Total Value (price + dividends) on same y-axis as Position Value
+        if has_dividends and last_div > 0:
+            series.append({
+                'name': 'Total Value (Price + Div)',
+                'type': 'line',
+                'yAxisIndex': 0,
+                'data': total_values,
+                'smooth': True,
+                'showSymbol': False,
+                'lineStyle': {'width': 2, 'color': '#AB47BC'},
+                'itemStyle': {'color': '#AB47BC'},
+            })
 
         y_axes = [{
             'type': 'value',
