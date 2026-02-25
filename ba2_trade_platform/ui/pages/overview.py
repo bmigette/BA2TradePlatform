@@ -4960,6 +4960,7 @@ class AccountGrowthTab:
                 with charts_container:
                     self._render_total_growth_chart(all_balance_history, all_dividends)
                     self._render_growth_by_label_charts(all_positions)
+                    self._render_dividend_history_table(all_dividends)
                     self._render_per_position_section(all_positions, account_map)
             except RuntimeError:
                 return
@@ -5206,6 +5207,80 @@ class AccountGrowthTab:
                 chart.update()
 
             label_select.on_value_change(on_label_filter_change)
+
+    def _render_dividend_history_table(self, dividends):
+        """Render a paginated table of dividend history for the last 6 months."""
+        from datetime import datetime, timedelta
+
+        if not dividends:
+            return
+
+        # Filter to last 6 months
+        cutoff = datetime.now() - timedelta(days=183)
+        filtered = []
+        for div in dividends:
+            date_val = div.get('date')
+            if not date_val:
+                continue
+            if hasattr(date_val, 'timestamp'):
+                if date_val < cutoff:
+                    continue
+            else:
+                try:
+                    parsed = datetime.fromisoformat(str(date_val))
+                    if parsed < cutoff:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+            filtered.append(div)
+
+        if not filtered:
+            return
+
+        # Sort most recent first
+        filtered.sort(key=lambda x: str(x.get('date', '')), reverse=True)
+
+        # Build table rows
+        rows = []
+        for i, div in enumerate(filtered):
+            date_val = div.get('date')
+            date_str = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)
+            row = {
+                'id': i,
+                'date': date_str,
+                'symbol': div.get('symbol', ''),
+                'amount': round(float(div.get('amount', 0)), 2),
+                'account': div.get('account_name', ''),
+            }
+            drip_qty = div.get('drip_quantity')
+            if drip_qty:
+                row['drip_shares'] = round(float(drip_qty), 4)
+                drip_price = div.get('drip_price')
+                row['drip_price'] = round(float(drip_price), 2) if drip_price else ''
+            else:
+                row['drip_shares'] = ''
+                row['drip_price'] = ''
+            rows.append(row)
+
+        columns = [
+            {'name': 'date', 'label': 'Date', 'field': 'date', 'sortable': True, 'align': 'left'},
+            {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'align': 'left'},
+            {'name': 'amount', 'label': 'Amount ($)', 'field': 'amount', 'sortable': True, 'align': 'right'},
+            {'name': 'drip_shares', 'label': 'DRIP Shares', 'field': 'drip_shares', 'sortable': False, 'align': 'right'},
+            {'name': 'drip_price', 'label': 'DRIP Price', 'field': 'drip_price', 'sortable': False, 'align': 'right'},
+            {'name': 'account', 'label': 'Account', 'field': 'account', 'sortable': True, 'align': 'left'},
+        ]
+
+        with ui.card().classes('w-full mb-4 p-4'):
+            ui.label('Dividend History (Last 6 Months)').classes('text-md font-bold mb-2')
+            total = sum(r['amount'] for r in rows)
+            ui.label(f'Total: ${total:,.2f} across {len(rows)} dividends').classes('text-sm text-gray-400 mb-2')
+            ui.table(
+                columns=columns,
+                rows=rows,
+                row_key='id',
+                pagination={'rowsPerPage': 10, 'sortBy': 'date', 'descending': True},
+            ).classes('w-full').props('dense')
 
     def _render_per_position_section(self, all_positions, account_map):
         """Render per-position growth dropdown and chart."""
