@@ -5007,7 +5007,7 @@ class AccountGrowthTab:
             try:
                 with charts_container:
                     self._render_total_growth_chart(all_balance_history, all_dividends)
-                    self._render_growth_by_label_charts(all_positions, historical_prices)
+                    self._render_growth_by_label_charts(all_positions, historical_prices, all_dividends)
                     self._render_dividend_history_table(all_dividends)
                     self._render_per_position_section(all_positions, account_map)
             except RuntimeError:
@@ -5148,7 +5148,7 @@ class AccountGrowthTab:
             }
             ui.echart(chart_options).classes('w-full h-96')
 
-    def _render_growth_by_label_charts(self, all_positions, historical_prices=None):
+    def _render_growth_by_label_charts(self, all_positions, historical_prices=None, all_dividends=None):
         """Render historical growth line chart grouped by instrument labels."""
         from ...core.models import Instrument
         from ...core.db import get_db
@@ -5236,6 +5236,35 @@ class AccountGrowthTab:
                         for label in info['labels']:
                             label_daily_values[label][i] += val
 
+        # Build cumulative dividends per label per date
+        label_cum_divs = {label: [0.0] * len(all_dates) for label in all_labels}
+        if all_dividends:
+            # Map each dividend symbol to its labels
+            for div in all_dividends:
+                sym = div.get('symbol')
+                if not sym or sym not in symbol_info:
+                    continue
+                date_val = div.get('date')
+                if not date_val:
+                    continue
+                date_str = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)
+                amount = float(div.get('amount', 0))
+                labels_for_sym = symbol_info[sym]['labels']
+                # Find the index in all_dates for this date or the next available
+                if date_str in all_dates:
+                    idx = all_dates.index(date_str)
+                    for label in labels_for_sym:
+                        label_cum_divs[label][idx] += amount
+
+            # Convert to cumulative (running total)
+            for label in all_labels:
+                for i in range(1, len(all_dates)):
+                    label_cum_divs[label][i] += label_cum_divs[label][i - 1]
+                # Round
+                label_cum_divs[label] = [round(v, 2) for v in label_cum_divs[label]]
+
+        has_any_dividends = any(label_cum_divs[l][-1] > 0 for l in all_labels) if all_dates else False
+
         # Color palette for labels
         colors = ['#1976D2', '#4CAF50', '#FF9800', '#E91E63', '#9C27B0',
                   '#00BCD4', '#FF5722', '#795548', '#607D8B', '#CDDC39']
@@ -5245,8 +5274,10 @@ class AccountGrowthTab:
 
             def build_chart_options(visible_labels):
                 series = []
+                legend_data = []
                 for i, label in enumerate(visible_labels):
                     color = colors[i % len(colors)]
+                    # Price value line per label
                     series.append({
                         'name': label,
                         'type': 'line',
@@ -5256,6 +5287,42 @@ class AccountGrowthTab:
                         'itemStyle': {'color': color},
                         'showSymbol': False,
                     })
+                    legend_data.append(label)
+
+                if has_any_dividends:
+                    for i, label in enumerate(visible_labels):
+                        color = colors[i % len(colors)]
+                        if label_cum_divs[label][-1] > 0:
+                            # Cumulative dividends line per label (dashed)
+                            div_name = f'{label} (Dividends)'
+                            series.append({
+                                'name': div_name,
+                                'type': 'line',
+                                'data': label_cum_divs[label],
+                                'smooth': True,
+                                'lineStyle': {'width': 1.5, 'color': color, 'type': 'dashed'},
+                                'itemStyle': {'color': color},
+                                'showSymbol': False,
+                            })
+                            legend_data.append(div_name)
+
+                            # Total value line per label (dotted)
+                            total_name = f'{label} (Total)'
+                            total_data = [
+                                round(pv + dv, 2)
+                                for pv, dv in zip(label_daily_values[label], label_cum_divs[label])
+                            ]
+                            series.append({
+                                'name': total_name,
+                                'type': 'line',
+                                'data': total_data,
+                                'smooth': True,
+                                'lineStyle': {'width': 1.5, 'color': color, 'type': 'dotted'},
+                                'itemStyle': {'color': color},
+                                'showSymbol': False,
+                            })
+                            legend_data.append(total_name)
+
                 return {
                     'backgroundColor': 'transparent',
                     'tooltip': {
@@ -5265,7 +5332,7 @@ class AccountGrowthTab:
                         'textStyle': {'color': '#ffffff'},
                     },
                     'legend': {
-                        'data': visible_labels,
+                        'data': legend_data,
                         'textStyle': {'color': '#a0aec0'},
                         'top': 5,
                     },
