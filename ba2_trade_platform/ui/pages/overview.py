@@ -4886,6 +4886,14 @@ class AccountGrowthTab:
             ui.label('Account Growth').classes('text-lg font-bold mb-2')
             ui.label('Track portfolio value, dividend income, and per-position growth over time.').classes('text-sm text-gray-500 mb-4')
 
+            with ui.row().classes('items-center gap-4 mb-4'):
+                ui.label('Price Source:').classes('text-sm text-gray-400')
+                self.price_source_select = ui.select(
+                    options=['Yahoo Finance', 'Broker API'],
+                    value='Yahoo Finance',
+                    label='Price Data Source',
+                ).classes('w-48').props('dense')
+
             # Loading state
             loading_label = ui.label('Loading account growth data...').classes('text-sm text-gray-500')
             charts_container = ui.column().classes('w-full')
@@ -5355,6 +5363,11 @@ class AccountGrowthTab:
         if not all_positions:
             return
 
+        # Build position qty map: symbol -> total qty
+        position_qty = {}
+        for pos in all_positions:
+            position_qty[pos.symbol] = position_qty.get(pos.symbol, 0) + pos.qty
+
         with ui.card().classes('w-full mb-4 p-4'):
             ui.label('Per-Position Growth').classes('text-md font-bold mb-2')
 
@@ -5372,6 +5385,16 @@ class AccountGrowthTab:
                 try:
                     dividends = await asyncio.to_thread(account_inst.get_dividends, symbol)
                     drip_enabled = await asyncio.to_thread(account_inst.is_drip_enabled)
+
+                    # Fetch historical prices for this symbol
+                    import yfinance as yf
+                    hist_data = await asyncio.to_thread(
+                        lambda: yf.download(symbol, period='6mo', progress=False)
+                    )
+                    hist_prices = {}
+                    if not hist_data.empty and 'Close' in hist_data.columns:
+                        for d, v in hist_data['Close'].dropna().items():
+                            hist_prices[d.strftime('%Y-%m-%d')] = float(v)
                 except Exception as e:
                     try:
                         if loading:
@@ -5382,8 +5405,11 @@ class AccountGrowthTab:
                 try:
                     if loading:
                         loading.delete()
+                    qty = position_qty.get(symbol, 0)
                     with container:
-                        self._render_position_growth_chart_from_data(symbol, dividends, drip_enabled)
+                        self._render_position_growth_chart_from_data(
+                            symbol, dividends, drip_enabled, hist_prices, qty
+                        )
                 except RuntimeError:
                     pass
 
@@ -5411,69 +5437,118 @@ class AccountGrowthTab:
                 if account_inst:
                     asyncio.create_task(_load_position_chart(chart_container, account_inst, initial_symbol))
 
-    def _render_position_growth_chart_from_data(self, symbol, dividends, drip_enabled):
+    def _render_position_growth_chart_from_data(self, symbol, dividends, drip_enabled,
+                                                hist_prices=None, current_qty=0):
         """Render growth chart for a single position from pre-fetched data."""
-        if not dividends:
-            ui.label(f'{symbol} - No dividend data available for this position.').classes('text-sm text-gray-400')
+        hist_prices = hist_prices or {}
+        has_dividends = bool(dividends)
+        has_prices = bool(hist_prices)
+
+        if not has_dividends and not has_prices:
+            ui.label(f'{symbol} - No data available for this position.').classes('text-sm text-gray-400')
             return
 
-        sorted_divs = sorted(dividends, key=lambda x: str(x.get('date', '')))
+        # Build dividend data
+        div_map = {}  # date -> {cumulative_div, cumulative_drip}
+        if has_dividends:
+            sorted_divs = sorted(dividends, key=lambda x: str(x.get('date', '')))
+            cumulative = 0
+            cumulative_drip = 0
+            for div in sorted_divs:
+                date_val = div.get('date')
+                if date_val:
+                    date_str = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)
+                    cumulative += float(div.get('amount', 0))
+                    drip_qty = div.get('drip_quantity')
+                    if drip_qty:
+                        cumulative_drip += float(drip_qty)
+                    div_map[date_str] = {
+                        'cumulative_div': round(cumulative, 2),
+                        'cumulative_drip': round(cumulative_drip, 4),
+                    }
 
-        dates = []
-        cumulative_div = []
+        # Merge all dates from prices and dividends
+        all_dates = sorted(set(list(hist_prices.keys()) + list(div_map.keys())))
+
+        # Build aligned series with forward-fill
+        position_values = []
+        cumulative_divs = []
         drip_quantities = []
-        cumulative = 0
-        cumulative_drip = 0
+        last_price = None
+        last_div = 0
+        last_drip = 0
 
-        for div in sorted_divs:
-            date_val = div.get('date')
-            if date_val:
-                date_str = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)
-                dates.append(date_str)
-                cumulative += float(div.get('amount', 0))
-                cumulative_div.append(round(cumulative, 2))
-                drip_qty = div.get('drip_quantity')
-                if drip_qty:
-                    cumulative_drip += float(drip_qty)
-                drip_quantities.append(round(cumulative_drip, 4))
+        for d in all_dates:
+            if d in hist_prices:
+                last_price = hist_prices[d]
+            position_values.append(round(current_qty * last_price, 2) if last_price else None)
 
+            if d in div_map:
+                last_div = div_map[d]['cumulative_div']
+                last_drip = div_map[d]['cumulative_drip']
+            cumulative_divs.append(last_div)
+            drip_quantities.append(last_drip)
+
+        # Position Value on primary y-axis (left)
         series = [{
-            'name': 'Cumulative Dividends',
+            'name': 'Position Value',
             'type': 'line',
-            'data': cumulative_div,
+            'data': position_values,
             'smooth': True,
-            'lineStyle': {'width': 2, 'color': '#4CAF50'},
-            'itemStyle': {'color': '#4CAF50'},
+            'showSymbol': False,
+            'lineStyle': {'width': 2, 'color': '#1976D2'},
+            'itemStyle': {'color': '#1976D2'},
+            'areaStyle': {
+                'color': {
+                    'type': 'linear', 'x': 0, 'y': 0, 'x2': 0, 'y2': 1,
+                    'colorStops': [
+                        {'offset': 0, 'color': 'rgba(25, 118, 210, 0.15)'},
+                        {'offset': 1, 'color': 'rgba(25, 118, 210, 0.02)'}
+                    ]
+                }
+            },
         }]
 
         y_axes = [{
             'type': 'value',
-            'name': 'Dividends ($)',
+            'name': 'Value ($)',
             'axisLabel': {'color': '#a0aec0', 'formatter': '${value}'},
             'splitLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.05)'}},
         }]
 
-        if drip_enabled and any(q > 0 for q in drip_quantities):
+        # Cumulative dividends on secondary y-axis (right)
+        if has_dividends and last_div > 0:
             y_axes.append({
                 'type': 'value',
-                'name': 'DRIP Shares',
-                'axisLabel': {'color': '#a0aec0'},
+                'name': 'Dividends ($)',
+                'axisLabel': {'color': '#a0aec0', 'formatter': '${value}'},
                 'splitLine': {'show': False},
             })
             series.append({
-                'name': 'DRIP Shares (cumulative)',
+                'name': 'Cumulative Dividends',
                 'type': 'line',
                 'yAxisIndex': 1,
-                'data': drip_quantities,
+                'data': cumulative_divs,
                 'smooth': True,
-                'lineStyle': {'width': 2, 'color': '#FF9800', 'type': 'dashed'},
-                'itemStyle': {'color': '#FF9800'},
+                'lineStyle': {'width': 2, 'color': '#4CAF50'},
+                'itemStyle': {'color': '#4CAF50'},
             })
+
+            if drip_enabled and any(q > 0 for q in drip_quantities):
+                series.append({
+                    'name': 'DRIP Shares (cumulative)',
+                    'type': 'line',
+                    'yAxisIndex': 1,
+                    'data': drip_quantities,
+                    'smooth': True,
+                    'lineStyle': {'width': 2, 'color': '#FF9800', 'type': 'dashed'},
+                    'itemStyle': {'color': '#FF9800'},
+                })
 
         chart_options = {
             'backgroundColor': 'transparent',
             'title': {
-                'text': f'{symbol} - Dividend & DRIP Growth',
+                'text': f'{symbol} - Position Growth',
                 'left': 'center',
                 'textStyle': {'color': '#a0aec0', 'fontSize': 14},
             },
@@ -5487,10 +5562,10 @@ class AccountGrowthTab:
                 'textStyle': {'color': '#a0aec0'},
                 'top': 30,
             },
-            'grid': {'left': '3%', 'right': '3%', 'bottom': '3%', 'containLabel': True},
+            'grid': {'left': '3%', 'right': '6%', 'bottom': '3%', 'containLabel': True},
             'xAxis': {
                 'type': 'category',
-                'data': dates,
+                'data': all_dates,
                 'axisLabel': {'color': '#a0aec0', 'rotate': 45, 'fontSize': 10},
             },
             'yAxis': y_axes,
