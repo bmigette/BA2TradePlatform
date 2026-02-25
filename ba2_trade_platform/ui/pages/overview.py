@@ -4912,36 +4912,17 @@ class AccountGrowthTab:
 
     def render(self):
         logger.debug("[RENDER] AccountGrowthTab.render() - START")
-        self._selected_account_id = get_selected_account_id()
-        # Cached data for re-rendering on price source change
-        self._all_positions = []
-        self._all_dividends = []
-        self._all_balance_history = []
-        self._account_map = {}
+        selected_account_id = get_selected_account_id()
 
         with ui.card().classes('w-full mb-4 p-4'):
             ui.label('Account Growth').classes('text-lg font-bold mb-2')
-            ui.label('Track portfolio value, dividend income, and per-position growth over time.').classes('text-sm text-gray-500 mb-4')
-
-            with ui.row().classes('items-center gap-4 mb-4'):
-                ui.label('Price Source:').classes('text-sm text-gray-400')
-                self.price_source_select = ui.select(
-                    options=['Yahoo Finance', 'Broker API'],
-                    value='Yahoo Finance',
-                    label='Price Data Source',
-                ).classes('w-48').props('dense')
+            ui.label('Track portfolio value, dividend income, and per-position growth over time. Price data from Yahoo Finance.').classes('text-sm text-gray-500 mb-4')
 
             # Loading state
             loading_label = ui.label('Loading account growth data...').classes('text-sm text-gray-500')
-            self._charts_container = ui.column().classes('w-full')
+            charts_container = ui.column().classes('w-full')
 
-            def on_price_source_change(e):
-                if self._all_positions:
-                    asyncio.create_task(self._reload_price_dependent_charts())
-
-            self.price_source_select.on_value_change(on_price_source_change)
-
-            asyncio.create_task(self._load_growth_data(loading_label, self._charts_container, self._selected_account_id))
+            asyncio.create_task(self._load_growth_data(loading_label, charts_container, selected_account_id))
 
     async def _load_growth_data(self, loading_label, charts_container, selected_account_id):
         """Load all growth data asynchronously."""
@@ -4996,29 +4977,39 @@ class AccountGrowthTab:
                 return
 
             # Pre-fetch positions from all accounts in thread pool
+            all_positions = []
+            account_map = {}  # symbol -> account instance
             for acc_def, account_instance in target_accounts:
                 try:
                     positions = await asyncio.to_thread(account_instance.get_positions)
                     for pos in positions:
                         all_positions.append(pos)
-                        self._account_map[pos.symbol] = account_instance
+                        account_map[pos.symbol] = account_instance
                 except Exception as e:
                     logger.warning(f"Could not load positions for {acc_def.name}: {e}")
 
-            # Store data for re-use on price source change
-            self._all_positions = all_positions
-            self._all_dividends = all_dividends
-            self._all_balance_history = all_balance_history
-
-            # Fetch historical prices based on selected source
-            historical_prices = await self._fetch_historical_prices(all_positions)
+            # Fetch historical prices from Yahoo Finance
+            historical_prices = {}
+            position_symbols = list(set(pos.symbol for pos in all_positions))
+            if position_symbols:
+                try:
+                    import yfinance as yf
+                    hist_data = await asyncio.to_thread(
+                        lambda: yf.download(position_symbols, period='6mo', progress=False, group_by='ticker')
+                    )
+                    for sym in position_symbols:
+                        prices = _extract_yf_close_prices(hist_data, sym)
+                        if prices:
+                            historical_prices[sym] = prices
+                except Exception as e:
+                    logger.warning(f"Could not fetch historical prices: {e}")
 
             try:
                 with charts_container:
                     self._render_total_growth_chart(all_balance_history, all_dividends)
                     self._render_growth_by_label_charts(all_positions, historical_prices)
                     self._render_dividend_history_table(all_dividends)
-                    self._render_per_position_section(all_positions, self._account_map)
+                    self._render_per_position_section(all_positions, account_map)
             except RuntimeError:
                 return
 
@@ -5028,58 +5019,6 @@ class AccountGrowthTab:
                 loading_label.set_text(f'Error loading growth data: {str(e)}')
             except RuntimeError:
                 pass
-
-    async def _fetch_historical_prices(self, all_positions):
-        """Fetch historical prices based on the selected price source."""
-        historical_prices = {}
-        position_symbols = list(set(pos.symbol for pos in all_positions))
-        if not position_symbols:
-            return historical_prices
-
-        source = self.price_source_select.value
-
-        if source == 'Broker API':
-            # Use broker's current mark prices — no historical timeline,
-            # just today's value for each symbol.
-            from datetime import date as date_cls
-            today = date_cls.today().strftime('%Y-%m-%d')
-            for pos in all_positions:
-                if pos.symbol not in historical_prices:
-                    historical_prices[pos.symbol] = {}
-                historical_prices[pos.symbol][today] = pos.current_price
-        else:
-            # Yahoo Finance: fetch 6 months of daily close prices
-            try:
-                import yfinance as yf
-                hist_data = await asyncio.to_thread(
-                    lambda: yf.download(position_symbols, period='6mo', progress=False, group_by='ticker')
-                )
-                for sym in position_symbols:
-                    prices = _extract_yf_close_prices(hist_data, sym)
-                    if prices:
-                        historical_prices[sym] = prices
-            except Exception as e:
-                logger.warning(f"Could not fetch historical prices: {e}")
-
-        return historical_prices
-
-    async def _reload_price_dependent_charts(self):
-        """Re-render charts that depend on the price source selection."""
-        historical_prices = await self._fetch_historical_prices(self._all_positions)
-
-        # Find and replace the Growth by Label and Per-Position cards.
-        # They are the 2nd and 4th children of charts_container
-        # (Total Growth, Growth by Label, Dividend History, Per-Position).
-        # Simplest: clear and re-render all charts.
-        try:
-            self._charts_container.clear()
-            with self._charts_container:
-                self._render_total_growth_chart(self._all_balance_history, self._all_dividends)
-                self._render_growth_by_label_charts(self._all_positions, historical_prices)
-                self._render_dividend_history_table(self._all_dividends)
-                self._render_per_position_section(self._all_positions, self._account_map)
-        except RuntimeError:
-            pass
 
     def _render_total_growth_chart(self, balance_history, dividends):
         """Render the total account growth line chart with price growth and cumulative dividends."""
@@ -5463,20 +5402,12 @@ class AccountGrowthTab:
                     dividends = await asyncio.to_thread(account_inst.get_dividends, symbol)
                     drip_enabled = await asyncio.to_thread(account_inst.is_drip_enabled)
 
-                    # Fetch historical prices based on price source
-                    source = self.price_source_select.value
-                    if source == 'Broker API':
-                        from datetime import date as date_cls
-                        # Find position's current price from broker
-                        pos_match = next((p for p in all_positions if p.symbol == symbol), None)
-                        today = date_cls.today().strftime('%Y-%m-%d')
-                        hist_prices = {today: pos_match.current_price} if pos_match else {}
-                    else:
-                        import yfinance as yf
-                        hist_data = await asyncio.to_thread(
-                            lambda: yf.download(symbol, period='6mo', progress=False)
-                        )
-                        hist_prices = _extract_yf_close_prices(hist_data, symbol)
+                    # Fetch historical prices from Yahoo Finance
+                    import yfinance as yf
+                    hist_data = await asyncio.to_thread(
+                        lambda: yf.download(symbol, period='6mo', progress=False)
+                    )
+                    hist_prices = _extract_yf_close_prices(hist_data, symbol)
                 except Exception as e:
                     try:
                         if loading:
