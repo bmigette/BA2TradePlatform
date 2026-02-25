@@ -299,7 +299,7 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
         # Positions are always fetched live from API
         return True
 
-    def refresh_orders(self) -> bool:
+    def refresh_orders(self, **kwargs) -> bool:
         # Orders are always fetched live from API
         return True
 
