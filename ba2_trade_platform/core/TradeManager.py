@@ -267,14 +267,20 @@ class TradeManager:
                         continue
                     
                     account = account_class(account_def.id)
-                    
+
+                    if not getattr(account, 'supports_trading', True):
+                        self.logger.error(f"Account {account_def.id} ({account_def.provider}) is read-only, cannot submit orders")
+                        dependent_order.status = OrderStatus.ERROR
+                        update_instance(dependent_order)
+                        continue
+
                     self.logger.info(
                         f"Submitting dependent order {dependent_order.id}: {dependent_order.side.value} "
                         f"{dependent_order.quantity} {dependent_order.symbol} @ {dependent_order.order_type.value} "
                         f"(triggered by parent order {parent_order_id})"
                     )
                     submitted_order = account.submit_order(dependent_order)
-                    
+
                     if submitted_order:
                         self.logger.info(f"Successfully submitted dependent order {dependent_order.id} triggered by parent order {parent_order_id}")
                         submitted_count += 1
@@ -576,14 +582,20 @@ class TradeManager:
                         continue
                     
                     account = account_class(account_def.id)
-                    
+
+                    if not getattr(account, 'supports_trading', True):
+                        self.logger.error(f"Account {account_def.id} ({account_def.provider}) is read-only, cannot submit orders")
+                        dependent_order.status = OrderStatus.ERROR
+                        update_instance(dependent_order)
+                        continue
+
                     self.logger.info(
                         f"Submitting dependent order {dependent_order.id}: {dependent_order.side.value} "
                         f"{dependent_order.quantity} {dependent_order.symbol} @ {dependent_order.order_type.value} "
                         f"(triggered by parent order {parent_order_id})"
                     )
                     submitted_order = account.submit_order(dependent_order)
-                    
+
                     if submitted_order:
                         self.logger.info(f"Successfully submitted dependent order {dependent_order.id}")
                         submitted_count += 1
@@ -850,7 +862,11 @@ class TradeManager:
                 return None
                 
             account = account_class(account_def.id)
-            
+
+            if not getattr(account, 'supports_trading', True):
+                self.logger.error(f"Account {account_def.id} ({account_def.provider}) is read-only, cannot submit orders")
+                return None
+
             # Submit the order through the account interface
             submitted_order = account.submit_order(order)
             if submitted_order:

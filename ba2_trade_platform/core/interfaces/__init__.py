@@ -17,6 +17,7 @@ Import all interfaces from this module for easy access:
 """
 
 # Core platform interfaces
+from .ReadOnlyAccountInterface import ReadOnlyAccountInterface
 from .AccountInterface import AccountInterface
 from .MarketExpertInterface import MarketExpertInterface
 from .ExtendableSettingsInterface import ExtendableSettingsInterface
@@ -36,6 +37,7 @@ from .SocialMediaDataProviderInterface import SocialMediaDataProviderInterface
 
 __all__ = [
     # Core platform interfaces
+    "ReadOnlyAccountInterface",
     "AccountInterface",
     "MarketExpertInterface",
     "ExtendableSettingsInterface",

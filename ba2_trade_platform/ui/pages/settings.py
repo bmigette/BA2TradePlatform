@@ -1348,9 +1348,15 @@ class ExpertSettingsTab:
         return expert_types
     
     def _get_available_accounts(self):
-        """Get list of available accounts."""
+        """Get list of available trading accounts (excludes read-only accounts)."""
+        from ...modules.accounts import providers
         accounts = get_all_instances(AccountDefinition)
-        return [f"{acc.name} ({acc.provider})" for acc in accounts]
+        result = []
+        for acc in accounts:
+            provider_cls = providers.get(acc.provider)
+            if provider_cls and getattr(provider_cls, 'supports_trading', True):
+                result.append(f"{acc.name} ({acc.provider})")
+        return result
     
     def _get_account_id_from_display_string(self, display_string):
         """Get account ID from display string like 'Account Name (provider)'."""

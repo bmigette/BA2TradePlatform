@@ -4872,12 +4872,501 @@ class PerformanceTab:
         if selected_account_id:
             render_performance_for_account(selected_account_id)
 
+class AccountGrowthTab:
+    """Account Growth tab showing balance history and dividend income charts."""
+
+    def __init__(self):
+        self.render()
+
+    def render(self):
+        logger.debug("[RENDER] AccountGrowthTab.render() - START")
+        selected_account_id = get_selected_account_id()
+
+        with ui.card().classes('w-full mb-4 p-4'):
+            ui.label('Account Growth').classes('text-lg font-bold mb-2')
+            ui.label('Track portfolio value, dividend income, and per-position growth over time.').classes('text-sm text-gray-500 mb-4')
+
+            # Loading state
+            loading_label = ui.label('Loading account growth data...').classes('text-sm text-gray-500')
+            charts_container = ui.column().classes('w-full')
+
+            asyncio.create_task(self._load_growth_data(loading_label, charts_container, selected_account_id))
+
+    async def _load_growth_data(self, loading_label, charts_container, selected_account_id):
+        """Load all growth data asynchronously."""
+        try:
+            accounts = get_all_instances(AccountDefinition)
+            if not accounts:
+                loading_label.set_text('No accounts configured.')
+                return
+
+            # Determine which accounts to load
+            target_accounts = []
+            for acc_def in accounts:
+                if selected_account_id is not None and acc_def.id != selected_account_id:
+                    continue
+                try:
+                    account_instance = get_account_instance_from_id(acc_def.id)
+                    if account_instance:
+                        target_accounts.append((acc_def, account_instance))
+                except Exception as e:
+                    logger.warning(f"Could not load account {acc_def.id}: {e}")
+
+            if not target_accounts:
+                loading_label.set_text('No accounts available for growth data.')
+                return
+
+            # Collect balance history and dividend data from all target accounts
+            all_balance_history = []
+            all_dividends = []
+
+            for acc_def, account_instance in target_accounts:
+                try:
+                    balance_hist = await asyncio.to_thread(account_instance.get_balance_history)
+                    for entry in balance_hist:
+                        entry['account_name'] = acc_def.name
+                        entry['account_id'] = acc_def.id
+                    all_balance_history.extend(balance_hist)
+                except Exception as e:
+                    logger.warning(f"Could not load balance history for {acc_def.name}: {e}")
+
+                try:
+                    dividends = await asyncio.to_thread(account_instance.get_dividends)
+                    for entry in dividends:
+                        entry['account_name'] = acc_def.name
+                        entry['account_id'] = acc_def.id
+                    all_dividends.extend(dividends)
+                except Exception as e:
+                    logger.warning(f"Could not load dividends for {acc_def.name}: {e}")
+
+            try:
+                loading_label.delete()
+            except RuntimeError:
+                return
+
+            # Pre-fetch positions from all accounts in thread pool
+            all_positions = []
+            account_map = {}  # symbol -> account instance
+            for acc_def, account_instance in target_accounts:
+                try:
+                    positions = await asyncio.to_thread(account_instance.get_positions)
+                    for pos in positions:
+                        all_positions.append(pos)
+                        account_map[pos.symbol] = account_instance
+                except Exception as e:
+                    logger.warning(f"Could not load positions for {acc_def.name}: {e}")
+
+            try:
+                with charts_container:
+                    self._render_total_growth_chart(all_balance_history, all_dividends)
+                    self._render_growth_by_label_charts(all_dividends, all_positions)
+                    self._render_per_position_section(all_positions, account_map)
+            except RuntimeError:
+                return
+
+        except Exception as e:
+            logger.error(f"Error loading account growth data: {e}", exc_info=True)
+            try:
+                loading_label.set_text(f'Error loading growth data: {str(e)}')
+            except RuntimeError:
+                pass
+
+    def _render_total_growth_chart(self, balance_history, dividends):
+        """Render the total account growth line chart with price growth and cumulative dividends."""
+        with ui.card().classes('w-full mb-4 p-4'):
+            ui.label('Total Account Growth').classes('text-md font-bold mb-2')
+
+            if not balance_history and not dividends:
+                ui.label('No balance history or dividend data available.').classes('text-sm text-gray-500')
+                return
+
+            # Prepare balance history series
+            balance_dates = []
+            balance_values = []
+            if balance_history:
+                sorted_hist = sorted(balance_history, key=lambda x: str(x.get('date', '')))
+                for entry in sorted_hist:
+                    date_val = entry.get('date')
+                    if date_val:
+                        date_str = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)
+                        balance_dates.append(date_str)
+                        balance_values.append(round(float(entry.get('net_liquidating_value', 0)), 2))
+
+            # Prepare cumulative dividend series
+            div_dates = []
+            div_cumulative = []
+            if dividends:
+                sorted_divs = sorted(dividends, key=lambda x: str(x.get('date', '')))
+                cumulative = 0
+                for entry in sorted_divs:
+                    date_val = entry.get('date')
+                    if date_val:
+                        date_str = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)
+                        cumulative += float(entry.get('amount', 0))
+                        div_dates.append(date_str)
+                        div_cumulative.append(round(cumulative, 2))
+
+            # Merge all dates for x-axis
+            all_dates = sorted(set(balance_dates + div_dates))
+
+            # Build aligned series (forward-fill gaps)
+            balance_map = dict(zip(balance_dates, balance_values))
+            div_map = dict(zip(div_dates, div_cumulative))
+
+            aligned_balance = []
+            aligned_div = []
+            last_balance = 0
+            last_div = 0
+            for d in all_dates:
+                if d in balance_map:
+                    last_balance = balance_map[d]
+                aligned_balance.append(last_balance)
+                if d in div_map:
+                    last_div = div_map[d]
+                aligned_div.append(last_div)
+
+            series = []
+            if aligned_balance:
+                series.append({
+                    'name': 'Portfolio Value',
+                    'type': 'line',
+                    'data': aligned_balance,
+                    'smooth': True,
+                    'lineStyle': {'width': 2, 'color': '#1976D2'},
+                    'itemStyle': {'color': '#1976D2'},
+                    'areaStyle': {
+                        'color': {
+                            'type': 'linear', 'x': 0, 'y': 0, 'x2': 0, 'y2': 1,
+                            'colorStops': [
+                                {'offset': 0, 'color': 'rgba(25, 118, 210, 0.2)'},
+                                {'offset': 1, 'color': 'rgba(25, 118, 210, 0.02)'}
+                            ]
+                        }
+                    }
+                })
+            if aligned_div:
+                series.append({
+                    'name': 'Cumulative Dividends',
+                    'type': 'line',
+                    'data': aligned_div,
+                    'smooth': True,
+                    'lineStyle': {'width': 2, 'color': '#4CAF50'},
+                    'itemStyle': {'color': '#4CAF50'},
+                    'areaStyle': {
+                        'color': {
+                            'type': 'linear', 'x': 0, 'y': 0, 'x2': 0, 'y2': 1,
+                            'colorStops': [
+                                {'offset': 0, 'color': 'rgba(76, 175, 80, 0.2)'},
+                                {'offset': 1, 'color': 'rgba(76, 175, 80, 0.02)'}
+                            ]
+                        }
+                    }
+                })
+
+            chart_options = {
+                'backgroundColor': 'transparent',
+                'tooltip': {
+                    'trigger': 'axis',
+                    'backgroundColor': 'rgba(37, 43, 59, 0.95)',
+                    'borderColor': 'rgba(255, 255, 255, 0.1)',
+                    'textStyle': {'color': '#ffffff'},
+                },
+                'legend': {
+                    'data': [s['name'] for s in series],
+                    'textStyle': {'color': '#a0aec0'},
+                    'top': 5,
+                },
+                'grid': {'left': '3%', 'right': '3%', 'bottom': '3%', 'containLabel': True},
+                'xAxis': {
+                    'type': 'category',
+                    'data': all_dates,
+                    'axisLabel': {'color': '#a0aec0', 'rotate': 45, 'fontSize': 10},
+                    'axisLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.1)'}},
+                },
+                'yAxis': {
+                    'type': 'value',
+                    'axisLabel': {'color': '#a0aec0', 'formatter': '${value}'},
+                    'splitLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.05)'}},
+                },
+                'series': series,
+            }
+            ui.echart(chart_options).classes('w-full h-96')
+
+    def _render_growth_by_label_charts(self, dividends, all_positions):
+        """Render growth charts grouped by instrument labels."""
+        from ...core.models import Instrument
+        from ...core.db import get_db
+        from sqlmodel import select as sql_select
+
+        if not all_positions:
+            return
+
+        # Get all instruments and their labels
+        symbol_labels = {}
+        try:
+            with get_db() as session:
+                instruments = session.exec(sql_select(Instrument)).all()
+                for inst in instruments:
+                    if inst.labels:
+                        symbol_labels[inst.name] = inst.labels
+        except Exception as e:
+            logger.warning(f"Could not load instrument labels: {e}")
+
+        # Group positions by label
+        label_symbols = {}
+        for pos in all_positions:
+            labels = symbol_labels.get(pos.symbol, ['Unlabeled'])
+            for label in labels:
+                if label not in label_symbols:
+                    label_symbols[label] = set()
+                label_symbols[label].add(pos.symbol)
+
+        if not label_symbols:
+            return
+
+        with ui.card().classes('w-full mb-4 p-4'):
+            ui.label('Growth by Label').classes('text-md font-bold mb-2')
+
+            label_colors = ['#1976D2', '#4CAF50', '#FF9800', '#E91E63', '#9C27B0', '#00BCD4', '#795548', '#607D8B']
+            series = []
+            labels_list = sorted(label_symbols.keys())
+
+            for i, label in enumerate(labels_list):
+                symbols = label_symbols[label]
+                total_value = sum(
+                    pos.market_value for pos in all_positions if pos.symbol in symbols
+                )
+                color = label_colors[i % len(label_colors)]
+                series.append({
+                    'name': label,
+                    'value': round(total_value, 2),
+                    'itemStyle': {'color': color},
+                })
+
+            chart_options = {
+                'backgroundColor': 'transparent',
+                'tooltip': {
+                    'trigger': 'item',
+                    'formatter': '{b}: ${c} ({d}%)',
+                    'backgroundColor': 'rgba(37, 43, 59, 0.95)',
+                    'textStyle': {'color': '#ffffff'},
+                },
+                'legend': {
+                    'orient': 'vertical',
+                    'left': 'left',
+                    'textStyle': {'color': '#a0aec0'},
+                },
+                'series': [{
+                    'name': 'Market Value by Label',
+                    'type': 'pie',
+                    'radius': ['40%', '70%'],
+                    'center': ['60%', '50%'],
+                    'data': series,
+                    'emphasis': {'itemStyle': {'shadowBlur': 10, 'shadowOffsetX': 0, 'shadowColor': 'rgba(0, 0, 0, 0.5)'}},
+                    'label': {'color': '#a0aec0'},
+                }],
+            }
+            ui.echart(chart_options).classes('w-full h-80')
+
+            # Dividend income by label
+            if dividends:
+                label_div_totals = {}
+                for div in dividends:
+                    div_symbol = div.get('symbol')
+                    labels = symbol_labels.get(div_symbol, ['Unlabeled'])
+                    for label in labels:
+                        label_div_totals[label] = label_div_totals.get(label, 0) + float(div.get('amount', 0))
+
+                if label_div_totals:
+                    div_series = []
+                    for i, label in enumerate(sorted(label_div_totals.keys())):
+                        color = label_colors[i % len(label_colors)]
+                        div_series.append({
+                            'name': label,
+                            'value': round(label_div_totals[label], 2),
+                            'itemStyle': {'color': color},
+                        })
+
+                    div_chart_options = {
+                        'backgroundColor': 'transparent',
+                        'title': {
+                            'text': 'Dividend Income by Label',
+                            'left': 'center',
+                            'textStyle': {'color': '#a0aec0', 'fontSize': 14},
+                        },
+                        'tooltip': {
+                            'trigger': 'item',
+                            'formatter': '{b}: ${c} ({d}%)',
+                            'backgroundColor': 'rgba(37, 43, 59, 0.95)',
+                            'textStyle': {'color': '#ffffff'},
+                        },
+                        'series': [{
+                            'name': 'Dividends by Label',
+                            'type': 'pie',
+                            'radius': ['40%', '70%'],
+                            'center': ['50%', '55%'],
+                            'data': div_series,
+                            'label': {'color': '#a0aec0'},
+                        }],
+                    }
+                    ui.echart(div_chart_options).classes('w-full h-72')
+
+    def _render_per_position_section(self, all_positions, account_map):
+        """Render per-position growth dropdown and chart."""
+        if not all_positions:
+            return
+
+        with ui.card().classes('w-full mb-4 p-4'):
+            ui.label('Per-Position Growth').classes('text-md font-bold mb-2')
+
+            symbol_options = sorted(set(pos.symbol for pos in all_positions))
+            chart_container = ui.column().classes('w-full')
+
+            async def _load_position_chart(container, account_inst, symbol):
+                """Load per-position chart asynchronously."""
+                loading = None
+                try:
+                    with container:
+                        loading = ui.label(f'Loading {symbol} data...').classes('text-sm text-gray-500')
+                except RuntimeError:
+                    return
+                try:
+                    dividends = await asyncio.to_thread(account_inst.get_dividends, symbol)
+                    drip_enabled = await asyncio.to_thread(account_inst.is_drip_enabled)
+                except Exception as e:
+                    try:
+                        if loading:
+                            loading.set_text(f'Error loading data for {symbol}: {e}')
+                    except RuntimeError:
+                        pass
+                    return
+                try:
+                    if loading:
+                        loading.delete()
+                    with container:
+                        self._render_position_growth_chart_from_data(symbol, dividends, drip_enabled)
+                except RuntimeError:
+                    pass
+
+            def on_symbol_change(e):
+                chart_container.clear()
+                if not e.value:
+                    return
+                selected_symbol = e.value
+                account_inst = account_map.get(selected_symbol)
+                if not account_inst:
+                    with chart_container:
+                        ui.label('Account not found for symbol.').classes('text-sm text-gray-500')
+                    return
+                asyncio.create_task(_load_position_chart(chart_container, account_inst, selected_symbol))
+
+            ui.select(
+                options=symbol_options,
+                value=symbol_options[0] if symbol_options else None,
+                label='Select Symbol'
+            ).on_value_change(on_symbol_change).classes('w-64 mb-4')
+
+            if symbol_options:
+                initial_symbol = symbol_options[0]
+                account_inst = account_map.get(initial_symbol)
+                if account_inst:
+                    asyncio.create_task(_load_position_chart(chart_container, account_inst, initial_symbol))
+
+    def _render_position_growth_chart_from_data(self, symbol, dividends, drip_enabled):
+        """Render growth chart for a single position from pre-fetched data."""
+        if not dividends:
+            ui.label(f'No dividend data available for {symbol}.').classes('text-sm text-gray-500')
+            return
+
+        sorted_divs = sorted(dividends, key=lambda x: str(x.get('date', '')))
+
+        dates = []
+        cumulative_div = []
+        drip_quantities = []
+        cumulative = 0
+        cumulative_drip = 0
+
+        for div in sorted_divs:
+            date_val = div.get('date')
+            if date_val:
+                date_str = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)
+                dates.append(date_str)
+                cumulative += float(div.get('amount', 0))
+                cumulative_div.append(round(cumulative, 2))
+                drip_qty = div.get('drip_quantity')
+                if drip_qty:
+                    cumulative_drip += float(drip_qty)
+                drip_quantities.append(round(cumulative_drip, 4))
+
+        series = [{
+            'name': 'Cumulative Dividends',
+            'type': 'line',
+            'data': cumulative_div,
+            'smooth': True,
+            'lineStyle': {'width': 2, 'color': '#4CAF50'},
+            'itemStyle': {'color': '#4CAF50'},
+        }]
+
+        y_axes = [{
+            'type': 'value',
+            'name': 'Dividends ($)',
+            'axisLabel': {'color': '#a0aec0', 'formatter': '${value}'},
+            'splitLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.05)'}},
+        }]
+
+        if drip_enabled and any(q > 0 for q in drip_quantities):
+            y_axes.append({
+                'type': 'value',
+                'name': 'DRIP Shares',
+                'axisLabel': {'color': '#a0aec0'},
+                'splitLine': {'show': False},
+            })
+            series.append({
+                'name': 'DRIP Shares (cumulative)',
+                'type': 'line',
+                'yAxisIndex': 1,
+                'data': drip_quantities,
+                'smooth': True,
+                'lineStyle': {'width': 2, 'color': '#FF9800', 'type': 'dashed'},
+                'itemStyle': {'color': '#FF9800'},
+            })
+
+        chart_options = {
+            'backgroundColor': 'transparent',
+            'title': {
+                'text': f'{symbol} - Dividend & DRIP Growth',
+                'left': 'center',
+                'textStyle': {'color': '#a0aec0', 'fontSize': 14},
+            },
+            'tooltip': {
+                'trigger': 'axis',
+                'backgroundColor': 'rgba(37, 43, 59, 0.95)',
+                'textStyle': {'color': '#ffffff'},
+            },
+            'legend': {
+                'data': [s['name'] for s in series],
+                'textStyle': {'color': '#a0aec0'},
+                'top': 30,
+            },
+            'grid': {'left': '3%', 'right': '3%', 'bottom': '3%', 'containLabel': True},
+            'xAxis': {
+                'type': 'category',
+                'data': dates,
+                'axisLabel': {'color': '#a0aec0', 'rotate': 45, 'fontSize': 10},
+            },
+            'yAxis': y_axes,
+            'series': series,
+        }
+        ui.echart(chart_options).classes('w-full h-80')
+
+
 def content() -> None:
     logger.debug("[RENDER] overview.content() - START")
     # Tab configuration: (tab_name, tab_label)
     tab_config = [
         ('overview', 'Overview'),
         ('account', 'Account Overview'),
+        ('account_growth', 'Account Growth'),
         ('performance', 'Performance'),
         ('llmusage', 'LLM Usage')
     ]
@@ -4896,6 +5385,8 @@ def content() -> None:
             tab_containers['overview'] = ui.column().classes('w-full')
         with ui.tab_panel(tab_objects['account']):
             tab_containers['account'] = ui.column().classes('w-full')
+        with ui.tab_panel(tab_objects['account_growth']):
+            tab_containers['account_growth'] = ui.column().classes('w-full')
         with ui.tab_panel(tab_objects['performance']):
             tab_containers['performance'] = ui.column().classes('w-full')
         with ui.tab_panel(tab_objects['llmusage']):
@@ -4910,6 +5401,8 @@ def content() -> None:
                         OverviewTab(tabs_ref=tabs)
                     elif tab_name == 'account':
                         AccountOverviewTab()
+                    elif tab_name == 'account_growth':
+                        AccountGrowthTab()
                     elif tab_name == 'performance':
                         PerformanceTab()
                     elif tab_name == 'llmusage':
@@ -4940,6 +5433,7 @@ def content() -> None:
                 const labelToName = {
                     'Overview': 'overview',
                     'Account Overview': 'account',
+                    'Account Growth': 'account_growth',
                     'Performance': 'performance',
                     'LLM Usage': 'llmusage'
                 };

@@ -128,7 +128,8 @@ class AlpacaAccount(AccountInterface):
         return {
             "api_key": {"type": 'str', "required": True, "description": "Alpaca API Key ID"},
             "api_secret": {"type": 'str', "required": True, "description": "Alpaca API Secret Key"},
-            "paper_account": {"type": 'bool', "required": True, "description": "Is this a paper trading account?"}
+            "paper_account": {"type": 'bool', "required": True, "description": "Is this a paper trading account?"},
+            "drip_enabled": {"type": 'bool', "required": False, "default": False, "description": "Is DRIP (Dividend Reinvestment Plan) enabled?"}
         }
     
     @staticmethod
@@ -4216,6 +4217,84 @@ class AlpacaAccount(AccountInterface):
             logger.error(f"Error replacing broker OCO order: {e}", exc_info=True)
             return False
 
+    def get_dividends(self, symbol=None, start_date=None, end_date=None):
+        """Get dividend history from Alpaca activities API."""
+        if not self._check_authentication():
+            return []
 
+        try:
+            from alpaca.trading.requests import GetAccountActivitiesRequest
 
+            params = {"activity_types": ["DIV"]}
+            if start_date:
+                params["after"] = start_date.isoformat()
+            if end_date:
+                params["until"] = end_date.isoformat()
+
+            activities = self.client.get_account_activities(GetAccountActivitiesRequest(**params))
+
+            dividends = []
+            for activity in activities:
+                act_symbol = getattr(activity, 'symbol', None)
+                if symbol and act_symbol != symbol:
+                    continue
+
+                div_record = {
+                    'symbol': act_symbol,
+                    'amount': float(getattr(activity, 'net_amount', 0) or getattr(activity, 'qty', 0)),
+                    'date': getattr(activity, 'date', None) or getattr(activity, 'transaction_time', None),
+                    'drip_quantity': None,
+                    'drip_price': None
+                }
+                dividends.append(div_record)
+
+            logger.debug(f"[Account {self.id}] Retrieved {len(dividends)} dividend activities")
+            return dividends
+
+        except Exception as e:
+            logger.error(f"[Account {self.id}] Error fetching dividends: {e}", exc_info=True)
+            return []
+
+    def get_balance_history(self, start_date=None, end_date=None):
+        """Get portfolio history from Alpaca portfolio history API."""
+        if not self._check_authentication():
+            return []
+
+        try:
+            from alpaca.trading.requests import GetPortfolioHistoryRequest
+
+            params = {"timeframe": "1D"}
+            if start_date:
+                params["start"] = start_date.strftime("%Y-%m-%d")
+            if end_date:
+                params["end"] = end_date.strftime("%Y-%m-%d")
+
+            history = self.client.get_portfolio_history(GetPortfolioHistoryRequest(**params))
+
+            snapshots = []
+            timestamps = getattr(history, 'timestamp', []) or []
+            equity_values = getattr(history, 'equity', []) or []
+            profit_loss = getattr(history, 'profit_loss', []) or []
+
+            for i, ts in enumerate(timestamps):
+                equity = float(equity_values[i]) if i < len(equity_values) and equity_values[i] is not None else 0.0
+                pnl = float(profit_loss[i]) if i < len(profit_loss) and profit_loss[i] is not None else 0.0
+
+                snapshots.append({
+                    'date': datetime.fromtimestamp(ts, tz=timezone.utc) if isinstance(ts, (int, float)) else ts,
+                    'net_liquidating_value': equity,
+                    'cash_balance': equity - pnl,  # Approximate: equity minus day's P&L
+                    'equity_value': pnl
+                })
+
+            logger.debug(f"[Account {self.id}] Retrieved {len(snapshots)} balance history snapshots")
+            return snapshots
+
+        except Exception as e:
+            logger.error(f"[Account {self.id}] Error fetching balance history: {e}", exc_info=True)
+            return []
+
+    def is_drip_enabled(self):
+        """Check if DRIP is enabled via account settings."""
+        return bool(self.settings.get("drip_enabled", False))
 

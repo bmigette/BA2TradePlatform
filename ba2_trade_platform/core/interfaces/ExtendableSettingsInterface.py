@@ -259,11 +259,11 @@ class ExtendableSettingsInterface(ABC):
         
         # Also invalidate the singleton cache to ensure fresh data on next access
         try:
-            # Check if this is an AccountInterface or MarketExpertInterface
-            from ..interfaces.AccountInterface import AccountInterface
+            # Check if this is an AccountInterface/ReadOnlyAccountInterface or MarketExpertInterface
+            from ..interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
             from ..interfaces.MarketExpertInterface import MarketExpertInterface
-            
-            if isinstance(self, AccountInterface):
+
+            if isinstance(self, ReadOnlyAccountInterface):
                 from ..AccountInstanceCache import AccountInstanceCache
                 AccountInstanceCache.invalidate_instance(self.id)
                 logger.debug(f"Invalidated AccountInstanceCache for account {self.id}")

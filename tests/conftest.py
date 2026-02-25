@@ -161,6 +161,15 @@ class MockAccount(AccountInterface):
     def _set_order_tp_sl_impl(self, trading_order, tp_price, sl_price):
         return True
 
+    def get_dividends(self, symbol=None, start_date=None, end_date=None):
+        return []
+
+    def get_balance_history(self, start_date=None, end_date=None):
+        return []
+
+    def is_drip_enabled(self):
+        return False
+
 
 # ---------------------------------------------------------------------------
 # MockExpert — concrete MarketExpertInterface for tests

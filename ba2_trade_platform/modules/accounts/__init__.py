@@ -1,11 +1,13 @@
 from .AlpacaAccount import AlpacaAccount
 from .IBKRAccount import IBKRAccount
+from .TastyTradeAccount import TastyTradeAccount
 
 # Registry of account provider classes
 providers = {
     "Alpaca": AlpacaAccount,
     "IBKR": IBKRAccount,
     "InteractiveBrokers": IBKRAccount,  # Alias
+    "TastyTrade": TastyTradeAccount,
 }
 
 def get_account_class(provider_name):

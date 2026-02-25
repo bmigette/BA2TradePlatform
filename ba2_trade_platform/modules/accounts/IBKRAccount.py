@@ -143,6 +143,12 @@ class IBKRAccount(AccountInterface):
                 "required": True,
                 "default": True,
                 "description": "Whether this is a paper trading account"
+            },
+            "drip_enabled": {
+                "type": "bool",
+                "required": False,
+                "default": False,
+                "description": "Is DRIP (Dividend Reinvestment Plan) enabled?"
             }
         }
     
@@ -593,7 +599,21 @@ class IBKRAccount(AccountInterface):
             
             logger.warning(f"No price data available for {symbol}")
             return None
-            
+
         except Exception as e:
             logger.error(f"Error getting price for {symbol}: {e}", exc_info=True)
             return None
+
+    def get_dividends(self, symbol=None, start_date=None, end_date=None):
+        """Get dividend history from IBKR. Returns empty list as IBKR API dividend history access is limited."""
+        logger.warning(f"[Account {self.id}] IBKR dividend history retrieval not fully supported via API")
+        return []
+
+    def get_balance_history(self, start_date=None, end_date=None):
+        """Get balance history from IBKR. Returns empty list as IBKR API balance history access is limited."""
+        logger.warning(f"[Account {self.id}] IBKR balance history retrieval not fully supported via API")
+        return []
+
+    def is_drip_enabled(self):
+        """Check if DRIP is enabled via account settings."""
+        return bool(self.settings.get("drip_enabled", False))
