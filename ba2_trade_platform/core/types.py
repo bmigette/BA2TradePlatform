@@ -208,6 +208,7 @@ class OrderStatus(str, Enum):
 
 class InstrumentType(str, Enum):
     STOCK = "stock"
+    ETF = "etf"
     CRYPTO = "crypto"
 
 class OrderType(str, Enum):

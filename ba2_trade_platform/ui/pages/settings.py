@@ -412,7 +412,7 @@ class InstrumentSettingsTab:
                     options=[t.value for t in InstrumentType],
                     label='Instrument Type',
                     value=instrument.instrument_type if is_edit else InstrumentType.STOCK
-                )
+                ).classes('w-full')
                 labels_input = ui.input(label='Labels (comma separated)', value=(', '.join(instrument.labels) if is_edit and hasattr(instrument, 'labels') else ''))
                 def save():
                     session = get_db()
