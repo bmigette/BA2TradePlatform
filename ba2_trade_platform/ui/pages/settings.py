@@ -1059,55 +1059,58 @@ class AccountDefinitionsTab:
             return {}
 
     def _render_dynamic_settings(self, provider, account=None):
-        # Example: Render provider-specific fields dynamically
-        provider_config = providers.get(provider, {})
+        # Render provider-specific fields dynamically inside the container
+        provider_config = providers.get(provider)
+        if not provider_config:
+            return
         settings_def = provider_config.get_settings_definitions()
         
         # Get settings directly from database without creating AccountInterface
         settings_values = {}
         if account:
             settings_values = self._get_account_settings_from_db(account.id)
-        
+
         self.settings_inputs = {}
-        if settings_def and len(settings_def.keys()) > 0:
-            for key, meta in settings_def.items():
-                label = meta.get("description", key)
-                value = settings_values.get(key, None) if settings_values else None
-                tooltip_text = meta.get("tooltip")
-                
-                # Create a container for this setting (title + input)
-                with ui.column().classes('w-full mb-4'):
-                    # Create label with tooltip inline
-                    if tooltip_text:
-                        with ui.row().classes('items-center gap-1 mb-2'):
-                            ui.label(label).classes('text-sm font-medium')
-                            ui.icon('help_outline', size='sm').classes('text-gray-500 cursor-help').tooltip(tooltip_text).style('font-size: 18px !important; padding: 12px !important; max-width: 350px !important; line-height: 1.4 !important;')
-                        
-                        # Use empty label for input since we show it above
-                        display_label = ""
-                    else:
-                        display_label = label
-                    
-                    # Create the input field directly in the same container
-                    if meta["type"] == "str":
-                        inp = ui.input(label=display_label, value=value or "").classes('w-full')
-                    elif meta["type"] == "bool":
-                        # Proper boolean conversion - handle string "false"/"true" and boolean values
-                        bool_value = False
-                        if value is not None:
-                            if isinstance(value, bool):
-                                bool_value = value
-                            elif isinstance(value, str):
-                                bool_value = value.lower() in ('true', '1', 'yes')
-                            else:
-                                bool_value = bool(value)
-                        inp = ui.checkbox(text=display_label, value=bool_value)
-                    else:
-                        inp = ui.input(label=display_label, value=value or "").classes('w-full')
-                
-                self.settings_inputs[key] = inp
-        else:
-            ui.label("No provider-specific settings available.")
+        with self.dynamic_settings_container:
+            if settings_def and len(settings_def.keys()) > 0:
+                for key, meta in settings_def.items():
+                    label = meta.get("description", key)
+                    value = settings_values.get(key, None) if settings_values else None
+                    tooltip_text = meta.get("tooltip")
+
+                    # Create a container for this setting (title + input)
+                    with ui.column().classes('w-full mb-4'):
+                        # Create label with tooltip inline
+                        if tooltip_text:
+                            with ui.row().classes('items-center gap-1 mb-2'):
+                                ui.label(label).classes('text-sm font-medium')
+                                ui.icon('help_outline', size='sm').classes('text-gray-500 cursor-help').tooltip(tooltip_text).style('font-size: 18px !important; padding: 12px !important; max-width: 350px !important; line-height: 1.4 !important;')
+
+                            # Use empty label for input since we show it above
+                            display_label = ""
+                        else:
+                            display_label = label
+
+                        # Create the input field directly in the same container
+                        if meta["type"] == "str":
+                            inp = ui.input(label=display_label, value=value or "").classes('w-full')
+                        elif meta["type"] == "bool":
+                            # Proper boolean conversion - handle string "false"/"true" and boolean values
+                            bool_value = False
+                            if value is not None:
+                                if isinstance(value, bool):
+                                    bool_value = value
+                                elif isinstance(value, str):
+                                    bool_value = value.lower() in ('true', '1', 'yes')
+                                else:
+                                    bool_value = bool(value)
+                            inp = ui.checkbox(text=display_label, value=bool_value)
+                        else:
+                            inp = ui.input(label=display_label, value=value or "").classes('w-full')
+
+                    self.settings_inputs[key] = inp
+            else:
+                ui.label("No provider-specific settings available.")
 
     def _on_table_edit_click(self, msg) -> None:
         logger.debug('Handling edit account from table, data %s', msg)
