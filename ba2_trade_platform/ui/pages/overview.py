@@ -5351,19 +5351,26 @@ class AccountGrowthTab:
                     'series': series,
                 }
 
+            default_labels = [l for l in all_labels if l != 'auto_added']
+            if not default_labels:
+                default_labels = all_labels
+
             label_select = ui.select(
                 options=all_labels,
-                value=all_labels,
+                value=default_labels,
                 label='Visible Labels',
                 multiple=True,
             ).classes('w-64 mb-2')
 
-            chart = ui.echart(build_chart_options(all_labels)).classes('w-full h-80')
+            chart_container = ui.column().classes('w-full')
+            with chart_container:
+                ui.echart(build_chart_options(default_labels)).classes('w-full h-80')
 
             def on_label_filter_change(e):
-                visible = sorted(e.value) if e.value else []
-                chart.options = build_chart_options(visible)
-                chart.update()
+                visible = sorted(list(e.value)) if e.value else []
+                chart_container.clear()
+                with chart_container:
+                    ui.echart(build_chart_options(visible)).classes('w-full h-80')
 
             label_select.on_value_change(on_label_filter_change)
 
