@@ -4995,7 +4995,7 @@ class AccountGrowthTab:
                 try:
                     import yfinance as yf
                     hist_data = await asyncio.to_thread(
-                        lambda: yf.download(position_symbols, period='6mo', progress=False, group_by='ticker')
+                        lambda: yf.download(position_symbols, period='6mo', progress=False)
                     )
                     for sym in position_symbols:
                         prices = _extract_yf_close_prices(hist_data, sym)
