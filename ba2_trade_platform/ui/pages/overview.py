@@ -4956,10 +4956,41 @@ class AccountGrowthTab:
                 except Exception as e:
                     logger.warning(f"Could not load positions for {acc_def.name}: {e}")
 
+            # Fetch historical prices for all position symbols via yfinance
+            historical_prices = {}
+            position_symbols = list(set(pos.symbol for pos in all_positions))
+            if position_symbols:
+                try:
+                    import yfinance as yf
+                    hist_data = await asyncio.to_thread(
+                        lambda: yf.download(position_symbols, period='6mo', progress=False, group_by='ticker')
+                    )
+                    if len(position_symbols) == 1:
+                        sym = position_symbols[0]
+                        if not hist_data.empty and 'Close' in hist_data.columns:
+                            historical_prices[sym] = {
+                                d.strftime('%Y-%m-%d'): float(v)
+                                for d, v in hist_data['Close'].dropna().items()
+                            }
+                    else:
+                        for sym in position_symbols:
+                            try:
+                                if sym in hist_data.columns.get_level_values(0):
+                                    sym_data = hist_data[sym]
+                                    if 'Close' in sym_data.columns:
+                                        historical_prices[sym] = {
+                                            d.strftime('%Y-%m-%d'): float(v)
+                                            for d, v in sym_data['Close'].dropna().items()
+                                        }
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logger.warning(f"Could not fetch historical prices: {e}")
+
             try:
                 with charts_container:
                     self._render_total_growth_chart(all_balance_history, all_dividends)
-                    self._render_growth_by_label_charts(all_positions)
+                    self._render_growth_by_label_charts(all_positions, historical_prices)
                     self._render_dividend_history_table(all_dividends)
                     self._render_per_position_section(all_positions, account_map)
             except RuntimeError:
@@ -5093,8 +5124,8 @@ class AccountGrowthTab:
             }
             ui.echart(chart_options).classes('w-full h-96')
 
-    def _render_growth_by_label_charts(self, all_positions):
-        """Render cumulative growth bar chart grouped by instrument labels."""
+    def _render_growth_by_label_charts(self, all_positions, historical_prices=None):
+        """Render historical growth line chart grouped by instrument labels."""
         from ...core.models import Instrument
         from ...core.db import get_db
         from ...core.InstrumentAutoAdder import get_instrument_auto_adder
@@ -5102,6 +5133,8 @@ class AccountGrowthTab:
 
         if not all_positions:
             return
+
+        historical_prices = historical_prices or {}
 
         # Get all instruments and their labels
         symbol_labels = {}
@@ -5122,48 +5155,101 @@ class AccountGrowthTab:
             adder = get_instrument_auto_adder()
             adder.queue_instruments_for_addition(unique_missing, expert_shortname='', source='account_positions')
 
-        # Group positions by label and aggregate values
-        label_data = {}  # label -> {market_value, cost_basis, unrealized_pl}
+        # Build position map: symbol -> {qty, cost_basis, labels}
+        symbol_info = {}
         for pos in all_positions:
             labels = symbol_labels.get(pos.symbol, ['Unlabeled'])
-            for label in labels:
-                if label not in label_data:
-                    label_data[label] = {'market_value': 0, 'cost_basis': 0, 'unrealized_pl': 0}
-                label_data[label]['market_value'] += pos.market_value
-                label_data[label]['cost_basis'] += pos.cost_basis
-                label_data[label]['unrealized_pl'] += pos.unrealized_pl
+            if pos.symbol not in symbol_info:
+                symbol_info[pos.symbol] = {'qty': 0, 'cost_basis': 0, 'labels': labels}
+            symbol_info[pos.symbol]['qty'] += pos.qty
+            symbol_info[pos.symbol]['cost_basis'] += pos.cost_basis
 
-        if not label_data:
+        if not symbol_info:
             return
+
+        # Build all dates from historical data
+        all_dates_set = set()
+        for sym_prices in historical_prices.values():
+            all_dates_set.update(sym_prices.keys())
+        all_dates = sorted(all_dates_set)
+
+        if not all_dates:
+            # Fallback: no historical data, show a simple current-value bar chart
+            with ui.card().classes('w-full mb-4 p-4'):
+                ui.label('Growth by Label').classes('text-md font-bold mb-2')
+                ui.label('No historical price data available for line chart.').classes('text-sm text-gray-400')
+            return
+
+        # Compute daily market value per label
+        all_labels_set = set()
+        for info in symbol_info.values():
+            all_labels_set.update(info['labels'])
+        all_labels = sorted(all_labels_set)
+
+        # label -> [daily_value] aligned with all_dates
+        label_daily_values = {label: [0.0] * len(all_dates) for label in all_labels}
+
+        for sym, info in symbol_info.items():
+            sym_prices = historical_prices.get(sym, {})
+            if not sym_prices:
+                continue
+            qty = info['qty']
+            for i, d in enumerate(all_dates):
+                price = sym_prices.get(d)
+                if price is not None:
+                    val = qty * price
+                    for label in info['labels']:
+                        label_daily_values[label][i] += val
+                else:
+                    # Forward-fill: use previous value for this symbol
+                    # Find last known price
+                    last_price = None
+                    for prev_d in all_dates[:i]:
+                        if prev_d in sym_prices:
+                            last_price = sym_prices[prev_d]
+                    if last_price is not None:
+                        val = qty * last_price
+                        for label in info['labels']:
+                            label_daily_values[label][i] += val
+
+        # Color palette for labels
+        colors = ['#1976D2', '#4CAF50', '#FF9800', '#E91E63', '#9C27B0',
+                  '#00BCD4', '#FF5722', '#795548', '#607D8B', '#CDDC39']
 
         with ui.card().classes('w-full mb-4 p-4'):
             ui.label('Growth by Label').classes('text-md font-bold mb-2')
 
-            all_labels = sorted(label_data.keys())
-
             def build_chart_options(visible_labels):
-                cost_values = [round(label_data[l]['cost_basis'], 2) for l in visible_labels]
-                market_values = [round(label_data[l]['market_value'], 2) for l in visible_labels]
-                growth_values = [round(label_data[l]['unrealized_pl'], 2) for l in visible_labels]
+                series = []
+                for i, label in enumerate(visible_labels):
+                    color = colors[i % len(colors)]
+                    series.append({
+                        'name': label,
+                        'type': 'line',
+                        'data': [round(v, 2) for v in label_daily_values[label]],
+                        'smooth': True,
+                        'lineStyle': {'width': 2, 'color': color},
+                        'itemStyle': {'color': color},
+                        'showSymbol': False,
+                    })
                 return {
                     'backgroundColor': 'transparent',
                     'tooltip': {
                         'trigger': 'axis',
-                        'axisPointer': {'type': 'shadow'},
                         'backgroundColor': 'rgba(37, 43, 59, 0.95)',
                         'borderColor': 'rgba(255, 255, 255, 0.1)',
                         'textStyle': {'color': '#ffffff'},
                     },
                     'legend': {
-                        'data': ['Cost Basis', 'Market Value', 'Unrealized P&L'],
+                        'data': visible_labels,
                         'textStyle': {'color': '#a0aec0'},
                         'top': 5,
                     },
                     'grid': {'left': '3%', 'right': '3%', 'bottom': '3%', 'containLabel': True},
                     'xAxis': {
                         'type': 'category',
-                        'data': visible_labels,
-                        'axisLabel': {'color': '#a0aec0', 'fontSize': 11},
+                        'data': all_dates,
+                        'axisLabel': {'color': '#a0aec0', 'rotate': 45, 'fontSize': 10},
                         'axisLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.1)'}},
                     },
                     'yAxis': {
@@ -5171,34 +5257,7 @@ class AccountGrowthTab:
                         'axisLabel': {'color': '#a0aec0', 'formatter': '${value}'},
                         'splitLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.05)'}},
                     },
-                    'series': [
-                        {
-                            'name': 'Cost Basis',
-                            'type': 'bar',
-                            'data': cost_values,
-                            'itemStyle': {'color': '#607D8B'},
-                        },
-                        {
-                            'name': 'Market Value',
-                            'type': 'bar',
-                            'data': market_values,
-                            'itemStyle': {'color': '#1976D2'},
-                        },
-                        {
-                            'name': 'Unrealized P&L',
-                            'type': 'bar',
-                            'data': growth_values,
-                            'itemStyle': {
-                                'color': {
-                                    'type': 'linear', 'x': 0, 'y': 0, 'x2': 0, 'y2': 1,
-                                    'colorStops': [
-                                        {'offset': 0, 'color': '#4CAF50'},
-                                        {'offset': 1, 'color': 'rgba(76, 175, 80, 0.6)'}
-                                    ]
-                                }
-                            },
-                        },
-                    ],
+                    'series': series,
                 }
 
             label_select = ui.select(

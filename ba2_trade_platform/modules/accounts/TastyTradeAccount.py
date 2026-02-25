@@ -1,7 +1,7 @@
 import asyncio
 import threading
 from typing import Any, Dict, List, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date, timedelta
 from decimal import Decimal
 
 from ...logger import logger
@@ -353,6 +353,7 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
                 txn_symbol = getattr(txn, 'underlying_symbol', None) or getattr(txn, 'symbol', None)
                 txn_date = getattr(txn, 'transaction_date', None) or getattr(txn, 'executed_at', None)
 
+                # Check for separate DRIP transaction
                 drip_qty = None
                 drip_price = None
                 drip_key = (txn_symbol, getattr(txn, 'transaction_date', None))
@@ -361,9 +362,24 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
                     drip_qty = float(getattr(drip_txn, 'quantity', 0) or 0)
                     drip_price = float(getattr(drip_txn, 'price', 0) or 0)
 
+                # Compute dividend amount: prefer net_value/value if non-zero,
+                # otherwise calculate from price * quantity (DRIP reinvestments
+                # have net_value=0 but deliver shares at a price).
+                net_val = float(getattr(txn, 'net_value', 0) or 0)
+                val = float(getattr(txn, 'value', 0) or 0)
+                amount = net_val or val
+                if amount == 0:
+                    txn_price = float(getattr(txn, 'price', 0) or 0)
+                    txn_qty = float(getattr(txn, 'quantity', 0) or 0)
+                    amount = txn_price * txn_qty
+                    # This transaction itself is a DRIP reinvestment
+                    if txn_qty > 0 and drip_qty is None:
+                        drip_qty = txn_qty
+                        drip_price = txn_price
+
                 dividends.append({
                     'symbol': txn_symbol,
-                    'amount': float(getattr(txn, 'net_value', 0) or getattr(txn, 'value', 0) or 0),
+                    'amount': amount,
                     'date': txn_date,
                     'drip_quantity': drip_qty,
                     'drip_price': drip_price,
@@ -379,9 +395,14 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
         if not self._check_authentication():
             return []
         try:
-            params = {}
+            # TastyTrade requires start_date to return daily snapshots;
+            # without it, only a few snapshots are returned.
             if start_date:
-                params["start_date"] = start_date.date() if isinstance(start_date, datetime) else start_date
+                sd = start_date.date() if isinstance(start_date, datetime) else start_date
+            else:
+                sd = date.today() - timedelta(days=365)
+
+            params = {"start_date": sd}
             if end_date:
                 params["end_date"] = end_date.date() if isinstance(end_date, datetime) else end_date
 

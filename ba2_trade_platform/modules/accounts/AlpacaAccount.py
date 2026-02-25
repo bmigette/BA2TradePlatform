@@ -4271,9 +4271,10 @@ class AlpacaAccount(AccountInterface):
         try:
             from alpaca.trading.requests import GetPortfolioHistoryRequest
 
-            params = {"timeframe": "1D"}
+            params = {"timeframe": "1D", "period": "1A"}
             if start_date:
                 params["start"] = start_date.strftime("%Y-%m-%d")
+                params.pop("period", None)  # start overrides period
             if end_date:
                 params["end"] = end_date.strftime("%Y-%m-%d")
 
