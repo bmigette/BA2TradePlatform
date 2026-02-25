@@ -4872,6 +4872,38 @@ class PerformanceTab:
         if selected_account_id:
             render_performance_for_account(selected_account_id)
 
+def _extract_yf_close_prices(hist_data, symbol):
+    """Extract close prices from yfinance DataFrame, handling MultiIndex columns."""
+    if hist_data.empty:
+        return {}
+    try:
+        # yfinance may return MultiIndex columns (Price, Ticker) or flat columns
+        if isinstance(hist_data.columns, __import__('pandas').MultiIndex):
+            # Try (Close, SYMBOL) for multi-ticker or single-ticker MultiIndex
+            if ('Close', symbol) in hist_data.columns:
+                series = hist_data[('Close', symbol)].dropna()
+            elif 'Close' in hist_data.columns.get_level_values(0):
+                close_df = hist_data['Close']
+                if hasattr(close_df, 'columns') and symbol in close_df.columns:
+                    series = close_df[symbol].dropna()
+                elif hasattr(close_df, 'dropna'):
+                    series = close_df.dropna()
+                else:
+                    return {}
+            else:
+                return {}
+        elif 'Close' in hist_data.columns:
+            series = hist_data['Close'].dropna()
+        else:
+            return {}
+        return {
+            d.strftime('%Y-%m-%d'): float(v)
+            for d, v in series.items()
+        }
+    except Exception:
+        return {}
+
+
 class AccountGrowthTab:
     """Account Growth tab showing balance history and dividend income charts."""
 
@@ -4973,25 +5005,10 @@ class AccountGrowthTab:
                     hist_data = await asyncio.to_thread(
                         lambda: yf.download(position_symbols, period='6mo', progress=False, group_by='ticker')
                     )
-                    if len(position_symbols) == 1:
-                        sym = position_symbols[0]
-                        if not hist_data.empty and 'Close' in hist_data.columns:
-                            historical_prices[sym] = {
-                                d.strftime('%Y-%m-%d'): float(v)
-                                for d, v in hist_data['Close'].dropna().items()
-                            }
-                    else:
-                        for sym in position_symbols:
-                            try:
-                                if sym in hist_data.columns.get_level_values(0):
-                                    sym_data = hist_data[sym]
-                                    if 'Close' in sym_data.columns:
-                                        historical_prices[sym] = {
-                                            d.strftime('%Y-%m-%d'): float(v)
-                                            for d, v in sym_data['Close'].dropna().items()
-                                        }
-                            except Exception:
-                                pass
+                    for sym in position_symbols:
+                        prices = _extract_yf_close_prices(hist_data, sym)
+                        if prices:
+                            historical_prices[sym] = prices
                 except Exception as e:
                     logger.warning(f"Could not fetch historical prices: {e}")
 
@@ -5398,10 +5415,7 @@ class AccountGrowthTab:
                     hist_data = await asyncio.to_thread(
                         lambda: yf.download(symbol, period='6mo', progress=False)
                     )
-                    hist_prices = {}
-                    if not hist_data.empty and 'Close' in hist_data.columns:
-                        for d, v in hist_data['Close'].dropna().items():
-                            hist_prices[d.strftime('%Y-%m-%d')] = float(v)
+                    hist_prices = _extract_yf_close_prices(hist_data, symbol)
                 except Exception as e:
                     try:
                         if loading:

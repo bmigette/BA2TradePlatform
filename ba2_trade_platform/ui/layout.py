@@ -111,7 +111,7 @@ def _render_account_filter_dropdown():
         # Soft reload via NiceGUI navigation (faster than full browser reload)
         # Gets current path and navigates to it, triggering page re-render
         current_path = await ui.run_javascript('window.location.pathname')
-        await ui.navigate.to(current_path)
+        ui.navigate.to(current_path)
     
     with ui.row().classes('items-center gap-1 mr-4'):
         ui.icon('account_circle', size='xs').classes('text-secondary-custom')
