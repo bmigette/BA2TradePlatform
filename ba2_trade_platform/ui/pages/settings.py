@@ -1009,7 +1009,7 @@ class AccountDefinitionsTab:
         self.dialog.open()
 
     def _on_provider_change(self, event, account):
-        provider = event.value if hasattr(event, 'value') else event
+        provider = self.type_select.value
         logger.debug(f'Provider changed to: {provider}')
         self.dynamic_settings_container.clear()
         self._render_dynamic_settings(provider, account)

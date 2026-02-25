@@ -5275,7 +5275,7 @@ class AccountGrowthTab:
     def _render_position_growth_chart_from_data(self, symbol, dividends, drip_enabled):
         """Render growth chart for a single position from pre-fetched data."""
         if not dividends:
-            ui.label(f'No dividend data available for {symbol}.').classes('text-sm text-gray-500')
+            ui.label(f'{symbol} - No dividend data available for this position.').classes('text-sm text-gray-400')
             return
 
         sorted_divs = sorted(dividends, key=lambda x: str(x.get('date', '')))
