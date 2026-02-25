@@ -4959,7 +4959,7 @@ class AccountGrowthTab:
             try:
                 with charts_container:
                     self._render_total_growth_chart(all_balance_history, all_dividends)
-                    self._render_growth_by_label_charts(all_dividends, all_positions)
+                    self._render_growth_by_label_charts(all_positions)
                     self._render_per_position_section(all_positions, account_map)
             except RuntimeError:
                 return
@@ -5092,8 +5092,8 @@ class AccountGrowthTab:
             }
             ui.echart(chart_options).classes('w-full h-96')
 
-    def _render_growth_by_label_charts(self, dividends, all_positions):
-        """Render growth charts grouped by instrument labels."""
+    def _render_growth_by_label_charts(self, all_positions):
+        """Render cumulative growth bar chart grouped by instrument labels."""
         from ...core.models import Instrument
         from ...core.db import get_db
         from sqlmodel import select as sql_select
@@ -5112,104 +5112,86 @@ class AccountGrowthTab:
         except Exception as e:
             logger.warning(f"Could not load instrument labels: {e}")
 
-        # Group positions by label
-        label_symbols = {}
+        # Group positions by label and aggregate values
+        label_data = {}  # label -> {market_value, cost_basis, unrealized_pl}
         for pos in all_positions:
             labels = symbol_labels.get(pos.symbol, ['Unlabeled'])
             for label in labels:
-                if label not in label_symbols:
-                    label_symbols[label] = set()
-                label_symbols[label].add(pos.symbol)
+                if label not in label_data:
+                    label_data[label] = {'market_value': 0, 'cost_basis': 0, 'unrealized_pl': 0}
+                label_data[label]['market_value'] += pos.market_value
+                label_data[label]['cost_basis'] += pos.cost_basis
+                label_data[label]['unrealized_pl'] += pos.unrealized_pl
 
-        if not label_symbols:
+        if not label_data:
             return
 
         with ui.card().classes('w-full mb-4 p-4'):
             ui.label('Growth by Label').classes('text-md font-bold mb-2')
 
             label_colors = ['#1976D2', '#4CAF50', '#FF9800', '#E91E63', '#9C27B0', '#00BCD4', '#795548', '#607D8B']
-            series = []
-            labels_list = sorted(label_symbols.keys())
+            labels_list = sorted(label_data.keys())
 
-            for i, label in enumerate(labels_list):
-                symbols = label_symbols[label]
-                total_value = sum(
-                    pos.market_value for pos in all_positions if pos.symbol in symbols
-                )
-                color = label_colors[i % len(label_colors)]
-                series.append({
-                    'name': label,
-                    'value': round(total_value, 2),
-                    'itemStyle': {'color': color},
-                })
+            cost_values = [round(label_data[l]['cost_basis'], 2) for l in labels_list]
+            market_values = [round(label_data[l]['market_value'], 2) for l in labels_list]
+            growth_values = [round(label_data[l]['unrealized_pl'], 2) for l in labels_list]
 
             chart_options = {
                 'backgroundColor': 'transparent',
                 'tooltip': {
-                    'trigger': 'item',
-                    'formatter': '{b}: ${c} ({d}%)',
+                    'trigger': 'axis',
+                    'axisPointer': {'type': 'shadow'},
                     'backgroundColor': 'rgba(37, 43, 59, 0.95)',
+                    'borderColor': 'rgba(255, 255, 255, 0.1)',
                     'textStyle': {'color': '#ffffff'},
                 },
                 'legend': {
-                    'orient': 'vertical',
-                    'left': 'left',
+                    'data': ['Cost Basis', 'Market Value', 'Unrealized P&L'],
                     'textStyle': {'color': '#a0aec0'},
+                    'top': 5,
                 },
-                'series': [{
-                    'name': 'Market Value by Label',
-                    'type': 'pie',
-                    'radius': ['40%', '70%'],
-                    'center': ['60%', '50%'],
-                    'data': series,
-                    'emphasis': {'itemStyle': {'shadowBlur': 10, 'shadowOffsetX': 0, 'shadowColor': 'rgba(0, 0, 0, 0.5)'}},
-                    'label': {'color': '#a0aec0'},
-                }],
+                'grid': {'left': '3%', 'right': '3%', 'bottom': '3%', 'containLabel': True},
+                'xAxis': {
+                    'type': 'category',
+                    'data': labels_list,
+                    'axisLabel': {'color': '#a0aec0', 'fontSize': 11},
+                    'axisLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.1)'}},
+                },
+                'yAxis': {
+                    'type': 'value',
+                    'axisLabel': {'color': '#a0aec0', 'formatter': '${value}'},
+                    'splitLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.05)'}},
+                },
+                'series': [
+                    {
+                        'name': 'Cost Basis',
+                        'type': 'bar',
+                        'data': cost_values,
+                        'itemStyle': {'color': '#607D8B'},
+                    },
+                    {
+                        'name': 'Market Value',
+                        'type': 'bar',
+                        'data': market_values,
+                        'itemStyle': {'color': '#1976D2'},
+                    },
+                    {
+                        'name': 'Unrealized P&L',
+                        'type': 'bar',
+                        'data': growth_values,
+                        'itemStyle': {
+                            'color': {
+                                'type': 'linear', 'x': 0, 'y': 0, 'x2': 0, 'y2': 1,
+                                'colorStops': [
+                                    {'offset': 0, 'color': '#4CAF50'},
+                                    {'offset': 1, 'color': 'rgba(76, 175, 80, 0.6)'}
+                                ]
+                            }
+                        },
+                    },
+                ],
             }
             ui.echart(chart_options).classes('w-full h-80')
-
-            # Dividend income by label
-            if dividends:
-                label_div_totals = {}
-                for div in dividends:
-                    div_symbol = div.get('symbol')
-                    labels = symbol_labels.get(div_symbol, ['Unlabeled'])
-                    for label in labels:
-                        label_div_totals[label] = label_div_totals.get(label, 0) + float(div.get('amount', 0))
-
-                if label_div_totals:
-                    div_series = []
-                    for i, label in enumerate(sorted(label_div_totals.keys())):
-                        color = label_colors[i % len(label_colors)]
-                        div_series.append({
-                            'name': label,
-                            'value': round(label_div_totals[label], 2),
-                            'itemStyle': {'color': color},
-                        })
-
-                    div_chart_options = {
-                        'backgroundColor': 'transparent',
-                        'title': {
-                            'text': 'Dividend Income by Label',
-                            'left': 'center',
-                            'textStyle': {'color': '#a0aec0', 'fontSize': 14},
-                        },
-                        'tooltip': {
-                            'trigger': 'item',
-                            'formatter': '{b}: ${c} ({d}%)',
-                            'backgroundColor': 'rgba(37, 43, 59, 0.95)',
-                            'textStyle': {'color': '#ffffff'},
-                        },
-                        'series': [{
-                            'name': 'Dividends by Label',
-                            'type': 'pie',
-                            'radius': ['40%', '70%'],
-                            'center': ['50%', '55%'],
-                            'data': div_series,
-                            'label': {'color': '#a0aec0'},
-                        }],
-                    }
-                    ui.echart(div_chart_options).classes('w-full h-72')
 
     def _render_per_position_section(self, all_positions, account_map):
         """Render per-position growth dropdown and chart."""
