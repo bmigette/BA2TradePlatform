@@ -5530,11 +5530,13 @@ class AccountGrowthTab:
         }]
 
         # Cumulative dividends on secondary y-axis (right)
+        has_drip = drip_enabled and any(q > 0 for q in drip_quantities)
         if has_dividends and last_div > 0:
             y_axes.append({
                 'type': 'value',
                 'name': 'Dividends ($)',
-                'axisLabel': {'color': '#a0aec0', 'formatter': '${value}'},
+                'nameTextStyle': {'color': '#4CAF50'},
+                'axisLabel': {'color': '#4CAF50', 'formatter': '${value}'},
                 'splitLine': {'show': False},
             })
             series.append({
@@ -5547,16 +5549,27 @@ class AccountGrowthTab:
                 'itemStyle': {'color': '#4CAF50'},
             })
 
-            if drip_enabled and any(q > 0 for q in drip_quantities):
+            # DRIP Shares on a third y-axis (right, offset)
+            if has_drip:
+                y_axes.append({
+                    'type': 'value',
+                    'name': 'DRIP Shares',
+                    'nameTextStyle': {'color': '#FF9800'},
+                    'axisLabel': {'color': '#FF9800'},
+                    'splitLine': {'show': False},
+                    'offset': 60,
+                })
                 series.append({
                     'name': 'DRIP Shares (cumulative)',
                     'type': 'line',
-                    'yAxisIndex': 1,
+                    'yAxisIndex': 2,
                     'data': drip_quantities,
                     'smooth': True,
                     'lineStyle': {'width': 2, 'color': '#FF9800', 'type': 'dashed'},
                     'itemStyle': {'color': '#FF9800'},
                 })
+
+        right_margin = '12%' if has_drip else '6%'
 
         chart_options = {
             'backgroundColor': 'transparent',
@@ -5575,7 +5588,7 @@ class AccountGrowthTab:
                 'textStyle': {'color': '#a0aec0'},
                 'top': 30,
             },
-            'grid': {'left': '3%', 'right': '6%', 'bottom': '3%', 'containLabel': True},
+            'grid': {'left': '3%', 'right': right_margin, 'bottom': '3%', 'containLabel': True},
             'xAxis': {
                 'type': 'category',
                 'data': all_dates,
