@@ -5129,69 +5129,83 @@ class AccountGrowthTab:
         with ui.card().classes('w-full mb-4 p-4'):
             ui.label('Growth by Label').classes('text-md font-bold mb-2')
 
-            label_colors = ['#1976D2', '#4CAF50', '#FF9800', '#E91E63', '#9C27B0', '#00BCD4', '#795548', '#607D8B']
-            labels_list = sorted(label_data.keys())
+            all_labels = sorted(label_data.keys())
 
-            cost_values = [round(label_data[l]['cost_basis'], 2) for l in labels_list]
-            market_values = [round(label_data[l]['market_value'], 2) for l in labels_list]
-            growth_values = [round(label_data[l]['unrealized_pl'], 2) for l in labels_list]
-
-            chart_options = {
-                'backgroundColor': 'transparent',
-                'tooltip': {
-                    'trigger': 'axis',
-                    'axisPointer': {'type': 'shadow'},
-                    'backgroundColor': 'rgba(37, 43, 59, 0.95)',
-                    'borderColor': 'rgba(255, 255, 255, 0.1)',
-                    'textStyle': {'color': '#ffffff'},
-                },
-                'legend': {
-                    'data': ['Cost Basis', 'Market Value', 'Unrealized P&L'],
-                    'textStyle': {'color': '#a0aec0'},
-                    'top': 5,
-                },
-                'grid': {'left': '3%', 'right': '3%', 'bottom': '3%', 'containLabel': True},
-                'xAxis': {
-                    'type': 'category',
-                    'data': labels_list,
-                    'axisLabel': {'color': '#a0aec0', 'fontSize': 11},
-                    'axisLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.1)'}},
-                },
-                'yAxis': {
-                    'type': 'value',
-                    'axisLabel': {'color': '#a0aec0', 'formatter': '${value}'},
-                    'splitLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.05)'}},
-                },
-                'series': [
-                    {
-                        'name': 'Cost Basis',
-                        'type': 'bar',
-                        'data': cost_values,
-                        'itemStyle': {'color': '#607D8B'},
+            def build_chart_options(visible_labels):
+                cost_values = [round(label_data[l]['cost_basis'], 2) for l in visible_labels]
+                market_values = [round(label_data[l]['market_value'], 2) for l in visible_labels]
+                growth_values = [round(label_data[l]['unrealized_pl'], 2) for l in visible_labels]
+                return {
+                    'backgroundColor': 'transparent',
+                    'tooltip': {
+                        'trigger': 'axis',
+                        'axisPointer': {'type': 'shadow'},
+                        'backgroundColor': 'rgba(37, 43, 59, 0.95)',
+                        'borderColor': 'rgba(255, 255, 255, 0.1)',
+                        'textStyle': {'color': '#ffffff'},
                     },
-                    {
-                        'name': 'Market Value',
-                        'type': 'bar',
-                        'data': market_values,
-                        'itemStyle': {'color': '#1976D2'},
+                    'legend': {
+                        'data': ['Cost Basis', 'Market Value', 'Unrealized P&L'],
+                        'textStyle': {'color': '#a0aec0'},
+                        'top': 5,
                     },
-                    {
-                        'name': 'Unrealized P&L',
-                        'type': 'bar',
-                        'data': growth_values,
-                        'itemStyle': {
-                            'color': {
-                                'type': 'linear', 'x': 0, 'y': 0, 'x2': 0, 'y2': 1,
-                                'colorStops': [
-                                    {'offset': 0, 'color': '#4CAF50'},
-                                    {'offset': 1, 'color': 'rgba(76, 175, 80, 0.6)'}
-                                ]
-                            }
+                    'grid': {'left': '3%', 'right': '3%', 'bottom': '3%', 'containLabel': True},
+                    'xAxis': {
+                        'type': 'category',
+                        'data': visible_labels,
+                        'axisLabel': {'color': '#a0aec0', 'fontSize': 11},
+                        'axisLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.1)'}},
+                    },
+                    'yAxis': {
+                        'type': 'value',
+                        'axisLabel': {'color': '#a0aec0', 'formatter': '${value}'},
+                        'splitLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.05)'}},
+                    },
+                    'series': [
+                        {
+                            'name': 'Cost Basis',
+                            'type': 'bar',
+                            'data': cost_values,
+                            'itemStyle': {'color': '#607D8B'},
                         },
-                    },
-                ],
-            }
-            ui.echart(chart_options).classes('w-full h-80')
+                        {
+                            'name': 'Market Value',
+                            'type': 'bar',
+                            'data': market_values,
+                            'itemStyle': {'color': '#1976D2'},
+                        },
+                        {
+                            'name': 'Unrealized P&L',
+                            'type': 'bar',
+                            'data': growth_values,
+                            'itemStyle': {
+                                'color': {
+                                    'type': 'linear', 'x': 0, 'y': 0, 'x2': 0, 'y2': 1,
+                                    'colorStops': [
+                                        {'offset': 0, 'color': '#4CAF50'},
+                                        {'offset': 1, 'color': 'rgba(76, 175, 80, 0.6)'}
+                                    ]
+                                }
+                            },
+                        },
+                    ],
+                }
+
+            label_select = ui.select(
+                options=all_labels,
+                value=all_labels,
+                label='Visible Labels',
+                multiple=True,
+            ).classes('w-64 mb-2')
+
+            chart = ui.echart(build_chart_options(all_labels)).classes('w-full h-80')
+
+            def on_label_filter_change(e):
+                visible = sorted(e.value) if e.value else []
+                chart.options = build_chart_options(visible)
+                chart.update()
+
+            label_select.on_value_change(on_label_filter_change)
 
     def _render_per_position_section(self, all_positions, account_map):
         """Render per-position growth dropdown and chart."""
