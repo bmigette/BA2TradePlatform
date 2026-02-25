@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -7,23 +8,6 @@ from ...logger import logger
 from ...core.models import Position
 from ...core.types import OrderDirection
 from ...core.interfaces import ReadOnlyAccountInterface
-
-
-def _run_async(coro):
-    """Run an async coroutine from synchronous code."""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # If an event loop is already running (e.g., inside NiceGUI),
-            # we need to run in a new thread
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(asyncio.run, coro)
-                return future.result()
-        else:
-            return loop.run_until_complete(coro)
-    except RuntimeError:
-        return asyncio.run(coro)
 
 
 class TastyTradeAccount(ReadOnlyAccountInterface):
@@ -40,6 +24,11 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
         self._session = None
         self._account = None
         self._authentication_error = None
+        # Persistent event loop for this account instance so the httpx
+        # async client's connections are never invalidated by a closed loop.
+        self._loop = asyncio.new_event_loop()
+        self._loop_thread = threading.Thread(target=self._loop.run_forever, daemon=True)
+        self._loop_thread.start()
 
         try:
             required_settings = ["client_secret", "refresh_token", "account_id"]
@@ -57,6 +46,11 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
             logger.error(f"Failed to initialize TastyTrade session for account {id}: {e}", exc_info=True)
             raise
 
+    def _run_async(self, coro):
+        """Run an async coroutine on this account's persistent event loop."""
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result(timeout=30)
+
     def _connect(self):
         """Establish connection to TastyTrade API."""
         from tastytrade.session import Session as TastySession
@@ -64,18 +58,29 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
 
         is_test = bool(self.settings.get("is_test", False))
 
-        self._session = TastySession(
+        # Create session on the persistent loop so httpx client binds to it
+        self._session = self._run_async(self._create_session_async(
             provider_secret=self.settings["client_secret"],
             refresh_token=self.settings["refresh_token"],
             is_test=is_test,
-        )
+        ))
 
         # Fetch the specific account by account number
         target_id = self.settings["account_id"]
-        self._account = _run_async(TastyAccount.get(self._session, account_number=target_id))
+        self._account = self._run_async(TastyAccount.get(self._session, account_number=target_id))
 
         if self._account is None:
             raise ValueError(f"Account {target_id} not found on TastyTrade.")
+
+    @staticmethod
+    async def _create_session_async(provider_secret, refresh_token, is_test):
+        """Create TastyTrade session on the async loop so httpx client binds correctly."""
+        from tastytrade.session import Session as TastySession
+        return TastySession(
+            provider_secret=provider_secret,
+            refresh_token=refresh_token,
+            is_test=is_test,
+        )
 
     def _check_authentication(self) -> bool:
         if self._session is None or self._account is None:
@@ -119,7 +124,7 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
         if not self._check_authentication():
             return None
         try:
-            balances = _run_async(self._account.get_balances(self._session))
+            balances = self._run_async(self._account.get_balances(self._session))
             return float(balances.net_liquidating_value)
         except Exception as e:
             logger.error(f"[Account {self.id}] Error getting balance: {e}", exc_info=True)
@@ -129,7 +134,7 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
         if not self._check_authentication():
             return {}
         try:
-            balances = _run_async(self._account.get_balances(self._session))
+            balances = self._run_async(self._account.get_balances(self._session))
             return {
                 "account_number": self._account.account_number,
                 "account_type": self._account.account_type_name,
@@ -152,7 +157,7 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
         if not self._check_authentication():
             return []
         try:
-            tt_positions = _run_async(self._account.get_positions(self._session, include_marks=True))
+            tt_positions = self._run_async(self._account.get_positions(self._session, include_marks=True))
             positions = []
             for pos in tt_positions:
                 qty = float(pos.quantity)
@@ -200,7 +205,7 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
         if not self._check_authentication():
             return []
         try:
-            orders = _run_async(self._account.get_order_history(self._session))
+            orders = self._run_async(self._account.get_order_history(self._session))
             logger.debug(f"[Account {self.id}] Retrieved {len(orders)} orders from TastyTrade")
             return orders
         except Exception as e:
@@ -212,7 +217,7 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
             return None
         try:
             from tastytrade.account import Account as TastyAccount
-            order = _run_async(self._account.get_order(self._session, int(order_id)))
+            order = self._run_async(self._account.get_order(self._session, int(order_id)))
             return order
         except Exception as e:
             logger.error(f"[Account {self.id}] Error getting order {order_id}: {e}", exc_info=True)
@@ -225,7 +230,7 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
             from tastytrade.instruments import Equity
             result = {}
             try:
-                equities = _run_async(Equity.get(self._session, symbols))
+                equities = self._run_async(Equity.get(self._session, symbols))
                 if isinstance(equities, list):
                     found_symbols = {e.symbol for e in equities}
                 else:
@@ -251,7 +256,7 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
             from tastytrade.order import InstrumentType
 
             if isinstance(symbol_or_symbols, str):
-                data = _run_async(get_market_data(self._session, symbol_or_symbols, InstrumentType.EQUITY))
+                data = self._run_async(get_market_data(self._session, symbol_or_symbols, InstrumentType.EQUITY))
                 if price_type == 'bid' and data.bid:
                     return float(data.bid)
                 elif price_type == 'ask' and data.ask:
@@ -267,7 +272,7 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
                 result = {}
                 for symbol in symbol_or_symbols:
                     try:
-                        data = _run_async(get_market_data(self._session, symbol, InstrumentType.EQUITY))
+                        data = self._run_async(get_market_data(self._session, symbol, InstrumentType.EQUITY))
                         if price_type == 'bid' and data.bid:
                             result[symbol] = float(data.bid)
                         elif price_type == 'ask' and data.ask:
@@ -314,7 +319,7 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
             if end_date:
                 params["end_date"] = end_date.date() if isinstance(end_date, datetime) else end_date
 
-            transactions = _run_async(self._account.get_history(self._session, **params))
+            transactions = self._run_async(self._account.get_history(self._session, **params))
 
             # Also fetch DRIP transactions to correlate
             drip_params = {
@@ -328,7 +333,7 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
                 drip_params["end_date"] = params.get("end_date")
 
             try:
-                drip_transactions = _run_async(self._account.get_history(self._session, **drip_params))
+                drip_transactions = self._run_async(self._account.get_history(self._session, **drip_params))
             except Exception:
                 drip_transactions = []
 
@@ -378,7 +383,7 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
             if end_date:
                 params["end_date"] = end_date.date() if isinstance(end_date, datetime) else end_date
 
-            snapshots = _run_async(self._account.get_balance_snapshots(
+            snapshots = self._run_async(self._account.get_balance_snapshots(
                 self._session,
                 page_offset=None,  # Get all pages
                 **params
