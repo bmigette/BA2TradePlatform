@@ -680,6 +680,7 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                 - date (datetime): Date the dividend was received
                 - drip_quantity (float | None): Number of shares reinvested via DRIP, if applicable
                 - drip_price (float | None): Price per share for DRIP reinvestment, if applicable
+                - tax_withheld (float): Tax withheld on the dividend (positive number, e.g., 0.12). Defaults to 0.0.
         """
         pass
 

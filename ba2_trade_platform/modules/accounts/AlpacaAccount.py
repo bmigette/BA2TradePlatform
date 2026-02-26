@@ -4235,6 +4235,24 @@ class AlpacaAccount(AccountInterface):
             if not isinstance(raw_activities, list):
                 raw_activities = [raw_activities] if raw_activities else []
 
+            # Fetch DIVNRA (non-resident alien tax withholding) activities
+            try:
+                raw_nra = self.client.get("/account/activities/DIVNRA", params or None)
+                if not isinstance(raw_nra, list):
+                    raw_nra = [raw_nra] if raw_nra else []
+            except Exception:
+                raw_nra = []
+
+            # Build map of tax withholding by (symbol, date)
+            nra_map = {}
+            for nra in raw_nra:
+                nra_symbol = nra.get('symbol')
+                nra_date = nra.get('date') or nra.get('transaction_time')
+                if nra_symbol and nra_date:
+                    nra_date_str = str(nra_date)[:10]  # Extract YYYY-MM-DD
+                    key = (nra_symbol, nra_date_str)
+                    nra_map[key] = nra_map.get(key, 0) + abs(float(nra.get('net_amount', 0) or 0))
+
             dividends = []
             for activity in raw_activities:
                 act_symbol = activity.get('symbol')
@@ -4247,12 +4265,17 @@ class AlpacaAccount(AccountInterface):
                 except (ValueError, TypeError):
                     date_val = date_str
 
+                # Look up matching tax withholding
+                date_key = str(date_str)[:10] if date_str else None
+                tax_withheld = nra_map.get((act_symbol, date_key), 0.0) if date_key else 0.0
+
                 div_record = {
                     'symbol': act_symbol,
                     'amount': float(activity.get('net_amount', 0) or 0),
                     'date': date_val,
                     'drip_quantity': None,
                     'drip_price': None,
+                    'tax_withheld': tax_withheld,
                 }
                 dividends.append(div_record)
 

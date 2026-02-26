@@ -5056,7 +5056,7 @@ class AccountGrowthTab:
                     date_val = entry.get('date')
                     if date_val:
                         date_str = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)
-                        cumulative += float(entry.get('amount', 0))
+                        cumulative += float(entry.get('amount', 0)) - float(entry.get('tax_withheld', 0))
                         div_dates_set.add(date_str)
                         div_by_date[date_str] = round(cumulative, 2)
 
@@ -5248,7 +5248,7 @@ class AccountGrowthTab:
                 if not date_val:
                     continue
                 date_str = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)
-                amount = float(div.get('amount', 0))
+                amount = float(div.get('amount', 0)) - float(div.get('tax_withheld', 0))
                 labels_for_sym = symbol_info[sym]['labels']
                 # Find the index in all_dates for this date or the next available
                 if date_str in all_dates:
@@ -5411,11 +5411,15 @@ class AccountGrowthTab:
         for i, div in enumerate(filtered):
             date_val = div.get('date')
             date_str = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)
+            gross = round(float(div.get('amount', 0)), 2)
+            tax = round(float(div.get('tax_withheld', 0)), 2)
             row = {
                 'id': i,
                 'date': date_str,
                 'symbol': div.get('symbol', ''),
-                'amount': round(float(div.get('amount', 0)), 2),
+                'amount': gross,
+                'tax': tax,
+                'net': round(gross - tax, 2),
                 'account': div.get('account_name', ''),
             }
             drip_qty = div.get('drip_quantity')
@@ -5431,7 +5435,9 @@ class AccountGrowthTab:
         columns = [
             {'name': 'date', 'label': 'Date', 'field': 'date', 'sortable': True, 'align': 'left'},
             {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'align': 'left'},
-            {'name': 'amount', 'label': 'Amount ($)', 'field': 'amount', 'sortable': True, 'align': 'right'},
+            {'name': 'amount', 'label': 'Gross ($)', 'field': 'amount', 'sortable': True, 'align': 'right'},
+            {'name': 'tax', 'label': 'Tax ($)', 'field': 'tax', 'sortable': True, 'align': 'right'},
+            {'name': 'net', 'label': 'Net ($)', 'field': 'net', 'sortable': True, 'align': 'right'},
             {'name': 'drip_shares', 'label': 'DRIP Shares', 'field': 'drip_shares', 'sortable': False, 'align': 'right'},
             {'name': 'drip_price', 'label': 'DRIP Price', 'field': 'drip_price', 'sortable': False, 'align': 'right'},
             {'name': 'account', 'label': 'Account', 'field': 'account', 'sortable': True, 'align': 'left'},
@@ -5439,8 +5445,13 @@ class AccountGrowthTab:
 
         with ui.card().classes('w-full mb-4 p-4'):
             ui.label('Dividend History (Last 6 Months)').classes('text-md font-bold mb-2')
-            total = sum(r['amount'] for r in rows)
-            ui.label(f'Total: ${total:,.2f} across {len(rows)} dividends').classes('text-sm text-gray-400 mb-2')
+            total_gross = sum(r['amount'] for r in rows)
+            total_tax = sum(r['tax'] for r in rows)
+            total_net = round(total_gross - total_tax, 2)
+            if total_tax > 0:
+                ui.label(f'Gross: ${total_gross:,.2f} | Tax: ${total_tax:,.2f} | Net: ${total_net:,.2f} — {len(rows)} dividends').classes('text-sm text-gray-400 mb-2')
+            else:
+                ui.label(f'Total: ${total_gross:,.2f} across {len(rows)} dividends').classes('text-sm text-gray-400 mb-2')
             ui.table(
                 columns=columns,
                 rows=rows,
@@ -5545,7 +5556,7 @@ class AccountGrowthTab:
                 date_val = div.get('date')
                 if date_val:
                     date_str = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)
-                    cumulative += float(div.get('amount', 0))
+                    cumulative += float(div.get('amount', 0)) - float(div.get('tax_withheld', 0))
                     drip_qty = div.get('drip_quantity')
                     if drip_qty:
                         cumulative_drip += float(drip_qty)

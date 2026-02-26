@@ -146,7 +146,7 @@ class InstrumentSettingsTab:
                 updated_flag = False
                 try:
                     profile_data = profiles.get(symbol.upper())
-                    if profile_data:
+                    if profile_data and isinstance(profile_data, dict):
                         sector = profile_data.get("sector")
                         if sector:
                             if self._add_to_list_field(db_instrument, 'categories', sector, local_session):
@@ -161,7 +161,7 @@ class InstrumentSettingsTab:
                         local_session.commit()
 
                     price_info = prices.get(symbol.upper())
-                    longname = price_info.get("longName") if price_info else None
+                    longname = price_info.get("longName") if isinstance(price_info, dict) else None
                     if longname:
                         db_instrument.company_name = longname
                         local_session.add(db_instrument)
@@ -244,7 +244,7 @@ class InstrumentSettingsTab:
                 updated_flag = False
                 try:
                     profile_data = profiles.get(symbol.upper())
-                    if profile_data:
+                    if profile_data and isinstance(profile_data, dict):
                         sector = profile_data.get("sector")
                         if sector and (not db_instrument.categories or len(db_instrument.categories) == 0):
                             if self._add_to_list_field(db_instrument, 'categories', sector, local_session):
@@ -257,7 +257,7 @@ class InstrumentSettingsTab:
                         local_session.commit()
 
                     price_info = prices.get(symbol.upper())
-                    longname = price_info.get("longName") if price_info else None
+                    longname = price_info.get("longName") if isinstance(price_info, dict) else None
                     if longname and not db_instrument.company_name:
                         db_instrument.company_name = longname
                         local_session.add(db_instrument)

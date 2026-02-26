@@ -348,6 +348,30 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
                 )
                 drip_map[key] = drip
 
+            # Fetch tax withholding transactions (Money Movement / Withholding)
+            wh_map = {}
+            for wh_sub_type in ["Withholding", "Tax Withholding"]:
+                try:
+                    wh_params = {
+                        "types": ["Money Movement"],
+                        "sub_types": [wh_sub_type],
+                        "sort": "Asc",
+                    }
+                    if start_date:
+                        wh_params["start_date"] = params.get("start_date")
+                    if end_date:
+                        wh_params["end_date"] = params.get("end_date")
+                    wh_transactions = self._run_async(self._account.get_history(self._session, **wh_params))
+                    for wh in wh_transactions:
+                        wh_symbol = getattr(wh, 'underlying_symbol', None) or getattr(wh, 'symbol', None)
+                        wh_date = getattr(wh, 'transaction_date', None)
+                        if wh_symbol and wh_date:
+                            key = (wh_symbol, wh_date)
+                            wh_amount = abs(float(getattr(wh, 'net_value', 0) or 0))
+                            wh_map[key] = wh_map.get(key, 0) + wh_amount
+                except Exception:
+                    pass
+
             dividends = []
             for txn in transactions:
                 txn_symbol = getattr(txn, 'underlying_symbol', None) or getattr(txn, 'symbol', None)
@@ -377,12 +401,16 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
                         drip_qty = txn_qty
                         drip_price = txn_price
 
+                # Look up matching tax withholding
+                tax_withheld = wh_map.get((txn_symbol, getattr(txn, 'transaction_date', None)), 0.0)
+
                 dividends.append({
                     'symbol': txn_symbol,
                     'amount': amount,
                     'date': txn_date,
                     'drip_quantity': drip_qty,
                     'drip_price': drip_price,
+                    'tax_withheld': tax_withheld,
                 })
 
             logger.debug(f"[Account {self.id}] Retrieved {len(dividends)} dividend records")
