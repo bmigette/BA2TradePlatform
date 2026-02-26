@@ -348,58 +348,77 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
                 )
                 drip_map[key] = drip
 
-            # Fetch tax withholding transactions (Money Movement / Withholding)
-            wh_map = {}
-            for wh_sub_type in ["Withholding", "Tax Withholding"]:
-                try:
-                    wh_params = {
-                        "types": ["Money Movement"],
-                        "sub_types": [wh_sub_type],
-                        "sort": "Asc",
-                    }
-                    if start_date:
-                        wh_params["start_date"] = params.get("start_date")
-                    if end_date:
-                        wh_params["end_date"] = params.get("end_date")
-                    wh_transactions = self._run_async(self._account.get_history(self._session, **wh_params))
-                    for wh in wh_transactions:
-                        wh_symbol = getattr(wh, 'underlying_symbol', None) or getattr(wh, 'symbol', None)
-                        wh_date = getattr(wh, 'transaction_date', None)
-                        if wh_symbol and wh_date:
-                            key = (wh_symbol, wh_date)
-                            wh_amount = abs(float(getattr(wh, 'net_value', 0) or 0))
-                            wh_map[key] = wh_map.get(key, 0) + wh_amount
-                except Exception:
-                    pass
+            # Fetch Money Movement transactions to find tax withholding and gross
+            # dividend amounts. TastyTrade records dividends as Money Movement
+            # groups per (symbol, date):
+            #   +0.97  "ROUNDHILL ETF TR"                   (gross dividend)
+            #   -0.15  "ROUNDHILL ETF TR"                   (tax withheld)
+            #   -0.82  "Cash dividend reinvested into MAGY" (DRIP cash = gross - tax)
+            # The negative entries with "reinvested" in description are DRIP cash
+            # movements, NOT tax. Only negative entries without "reinvested" are tax.
+            wh_map = {}   # (symbol, date) -> tax withheld
+            gross_map = {}  # (symbol, date) -> gross dividend amount
+            try:
+                mm_params = {
+                    "types": ["Money Movement"],
+                    "sort": "Asc",
+                }
+                if start_date:
+                    mm_params["start_date"] = params.get("start_date")
+                if end_date:
+                    mm_params["end_date"] = params.get("end_date")
+                mm_transactions = self._run_async(self._account.get_history(self._session, **mm_params))
+                for mm in mm_transactions:
+                    mm_symbol = getattr(mm, 'underlying_symbol', None) or getattr(mm, 'symbol', None)
+                    mm_date = getattr(mm, 'transaction_date', None)
+                    if not mm_symbol or not mm_date:
+                        continue
+                    net_val = float(getattr(mm, 'net_value', 0) or 0)
+                    desc = str(getattr(mm, 'description', '') or '').lower()
+                    key = (mm_symbol, mm_date)
+                    if net_val > 0:
+                        # Positive entry = gross dividend
+                        gross_map[key] = gross_map.get(key, 0) + net_val
+                    elif net_val < 0 and 'reinvested' not in desc:
+                        # Negative entry without "reinvested" = tax withholding
+                        wh_map[key] = wh_map.get(key, 0) + abs(net_val)
+            except Exception:
+                pass
 
             dividends = []
             for txn in transactions:
                 txn_symbol = getattr(txn, 'underlying_symbol', None) or getattr(txn, 'symbol', None)
                 txn_date = getattr(txn, 'transaction_date', None) or getattr(txn, 'executed_at', None)
 
-                # Check for separate DRIP transaction
-                drip_qty = None
-                drip_price = None
-                drip_key = (txn_symbol, getattr(txn, 'transaction_date', None))
-                if drip_key in drip_map:
-                    drip_txn = drip_map[drip_key]
-                    drip_qty = float(getattr(drip_txn, 'quantity', 0) or 0)
-                    drip_price = float(getattr(drip_txn, 'price', 0) or 0)
+                # Extract DRIP shares from the Receive Deliver transaction
+                # itself (e.g. "Received 0.0169 Long MAGY via Dividend").
+                txn_qty = float(getattr(txn, 'quantity', 0) or 0)
+                txn_price = float(getattr(txn, 'price', 0) or 0)
+                if txn_qty > 0:
+                    drip_qty = txn_qty
+                    drip_price = txn_price
+                else:
+                    # Fall back to separate DRIP transaction if available
+                    drip_qty = None
+                    drip_price = None
+                    drip_key = (txn_symbol, getattr(txn, 'transaction_date', None))
+                    if drip_key in drip_map:
+                        drip_txn = drip_map[drip_key]
+                        drip_qty = float(getattr(drip_txn, 'quantity', 0) or 0)
+                        drip_price = float(getattr(drip_txn, 'price', 0) or 0)
 
-                # Compute dividend amount: prefer net_value/value if non-zero,
-                # otherwise calculate from price * quantity (DRIP reinvestments
-                # have net_value=0 but deliver shares at a price).
-                net_val = float(getattr(txn, 'net_value', 0) or 0)
-                val = float(getattr(txn, 'value', 0) or 0)
-                amount = net_val or val
+                # Compute dividend amount. Prefer the gross amount from Money
+                # Movement if available (it reflects the actual gross dividend
+                # before tax). Otherwise fall back to the Receive Deliver
+                # transaction's net_value/value, or price*qty.
+                txn_date_key = (txn_symbol, getattr(txn, 'transaction_date', None))
+                amount = gross_map.get(txn_date_key, 0)
                 if amount == 0:
-                    txn_price = float(getattr(txn, 'price', 0) or 0)
-                    txn_qty = float(getattr(txn, 'quantity', 0) or 0)
+                    net_val = float(getattr(txn, 'net_value', 0) or 0)
+                    val = float(getattr(txn, 'value', 0) or 0)
+                    amount = net_val or val
+                if amount == 0:
                     amount = txn_price * txn_qty
-                    # This transaction itself is a DRIP reinvestment
-                    if txn_qty > 0 and drip_qty is None:
-                        drip_qty = txn_qty
-                        drip_price = txn_price
 
                 # Look up matching tax withholding
                 tax_withheld = wh_map.get((txn_symbol, getattr(txn, 'transaction_date', None)), 0.0)
