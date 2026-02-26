@@ -98,13 +98,11 @@ def _render_condition(condition: Dict[str, Any], compact: bool = False):
     operator = condition.get('operator', '')
     value = condition.get('value', '')
     reference_value = condition.get('reference_value', '')
-    calculated_value = condition.get('calculated_value')
-    left_operand = condition.get('left_operand')
-    right_operand = condition.get('right_operand')
+    actual_value_display = condition.get('actual_value_display')
     result = condition.get('condition_result', False)
     description = condition.get('condition_description', 'No description')
     cond_error = condition.get('error')
-    
+
     # Condition status styling
     if cond_error:
         cond_class = 'text-red-600'
@@ -118,7 +116,7 @@ def _render_condition(condition: Dict[str, Any], compact: bool = False):
         cond_class = 'text-orange-600'
         result_icon = '❌'
         result_text = 'FAILED'
-    
+
     with ui.row().classes('w-full items-center p-2 border-b border-grey-200'):
         ui.label(result_icon).classes('text-lg mr-2' if not compact else 'text-sm mr-1')
         with ui.column().classes('flex-1'):
@@ -128,25 +126,19 @@ def _render_condition(condition: Dict[str, Any], compact: bool = False):
                 condition_label += f' {operator} {value}'
             if reference_value:
                 condition_label += f' (ref: {reference_value})'
-            
-            # Add calculated value if available
-            if calculated_value is not None:
-                condition_label += f' [actual: {calculated_value:.2f}]'
-            
-            # Add operands for better clarity
-            if left_operand is not None and right_operand is not None:
-                # Show operands for comparison conditions
-                if operator:
-                    condition_label += f' [{left_operand:.2f} {operator} {right_operand:.2f}]'
-                else:
-                    # Flag conditions (like new_target_higher)
-                    condition_label += f' [current: ${left_operand:.2f}, target: ${right_operand:.2f}]'
-            
+
             ui.label(condition_label).classes(f'font-medium {cond_class}' if not compact else f'text-sm {cond_class}')
+
+            # Show actual value as a distinct styled line
+            if actual_value_display is not None:
+                ui.label(f'Actual: {actual_value_display}').classes(
+                    'text-sm font-medium text-cyan-700' if not compact else 'text-xs font-medium text-cyan-700'
+                )
+
             ui.label(description).classes('text-sm text-grey-6' if not compact else 'text-xs text-grey-6')
             if cond_error:
                 ui.label(f'Error: {cond_error}').classes('text-sm text-red-500' if not compact else 'text-xs text-red-500')
-        
+
         # Use Quasar color props for consistent styling
         badge_color = 'positive' if result else 'negative' if cond_error else 'warning'
         ui.badge(result_text).props(f'color={badge_color}').classes('text-white px-2 py-1')

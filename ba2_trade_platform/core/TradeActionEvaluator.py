@@ -526,6 +526,11 @@ class TradeActionEvaluator:
                         # For numeric conditions, left_operand is calculated value, right_operand is the threshold
                         condition_evaluation["left_operand"] = calculated_value
                         condition_evaluation["right_operand"] = trigger_config.get('value')
+
+                # Capture actual value display for all condition types
+                actual_display = condition.get_actual_value_display()
+                if actual_display is not None:
+                    condition_evaluation["actual_value_display"] = actual_display
                 
                 # For flag conditions (like new_target_higher), try to capture comparison values
                 # Check if condition has stored comparison attributes after evaluation

@@ -165,6 +165,15 @@ class TradeCondition(ABC):
             logger.error(f"Error checking expert position for {self.instrument_name}: {e}", exc_info=True)
             return False
     
+    def get_actual_value_display(self) -> Optional[str]:
+        """
+        Get a human-readable string of the actual value evaluated by this condition.
+
+        Returns:
+            Formatted string of the actual value, or None if not available
+        """
+        return None
+
     def has_account_position(self) -> bool:
         """
         Check if there's an open position for this instrument at the account level.
@@ -226,67 +235,96 @@ class CompareCondition(TradeCondition):
     def get_calculated_value(self) -> Optional[float]:
         """
         Get the last calculated value from condition evaluation.
-        
+
         Returns:
             The calculated value or None if not yet evaluated
         """
         return self.calculated_value
+
+    def get_actual_value_display(self) -> Optional[str]:
+        """Return formatted calculated value. Subclasses override for specific formatting."""
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:.2f}"
 
 
 # Flag Condition Implementations
 
 class BearishCondition(FlagCondition):
     """Check if market sentiment is bearish."""
-    
+
     def evaluate(self) -> bool:
         try:
             # Check if current recommendation is bearish (SELL)
             return self.expert_recommendation.recommended_action == OrderRecommendation.SELL
-            
+
         except Exception as e:
             logger.error(f"Error evaluating bearish condition: {e}", exc_info=True)
             return False
-    
+
     def get_description(self) -> str:
         """Get description of bearish condition."""
         return f"Check if current recommendation is bearish (SELL) for {self.instrument_name}"
 
+    def get_actual_value_display(self) -> Optional[str]:
+        action = getattr(self.expert_recommendation, 'recommended_action', None)
+        return f"Recommendation: {action.value}" if action else None
+
 
 class BullishCondition(FlagCondition):
     """Check if market sentiment is bullish."""
-    
+
     def evaluate(self) -> bool:
         try:
             # Check if current recommendation is bullish (BUY)
             return self.expert_recommendation.recommended_action == OrderRecommendation.BUY
-            
+
         except Exception as e:
             logger.error(f"Error evaluating bullish condition: {e}", exc_info=True)
             return False
-    
+
     def get_description(self) -> str:
         """Get description of bullish condition."""
         return f"Check if current recommendation is bullish (BUY) for {self.instrument_name}"
 
+    def get_actual_value_display(self) -> Optional[str]:
+        action = getattr(self.expert_recommendation, 'recommended_action', None)
+        return f"Recommendation: {action.value}" if action else None
+
 
 class HasNoPositionCondition(FlagCondition):
     """Check if this expert has no open position for the instrument (expert-level check based on transactions)."""
-    
+
     def evaluate(self) -> bool:
-        return not self.has_expert_position()
-    
+        self._has_position = self.has_expert_position()
+        return not self._has_position
+
     def get_description(self) -> str:
         """Get description of no position condition."""
         return f"Check if this expert has no open position for {self.instrument_name} (based on transactions)"
 
+    def get_actual_value_display(self) -> Optional[str]:
+        has_pos = getattr(self, '_has_position', None)
+        if has_pos is None:
+            return None
+        return f"Position found: {'Yes' if has_pos else 'No'}"
 
 
 class HasPositionCondition(FlagCondition):
     """Check if this expert has an open position for the instrument (expert-level check based on transactions)."""
+
     def evaluate(self) -> bool:
-        return self.has_expert_position()
+        self._has_position = self.has_expert_position()
+        return self._has_position
+
     def get_description(self) -> str:
         return f"Check if this expert has an open position for {self.instrument_name} (based on transactions)"
+
+    def get_actual_value_display(self) -> Optional[str]:
+        has_pos = getattr(self, '_has_position', None)
+        if has_pos is None:
+            return None
+        return f"Position found: {'Yes' if has_pos else 'No'}"
 
 
 class HasBuyPositionCondition(FlagCondition):
@@ -307,12 +345,19 @@ class HasBuyPositionCondition(FlagCondition):
                     Transaction.status == TransactionStatus.OPENED,
                     Transaction.side == OrderDirection.BUY
                 )
-                return len(session.exec(statement).all()) > 0
+                self._has_position = len(session.exec(statement).all()) > 0
+                return self._has_position
         except Exception as e:
             logger.error(f"Error checking BUY position for {self.instrument_name}: {e}", exc_info=True)
             return False
     def get_description(self) -> str:
         return f"Check if this expert has an open BUY position for {self.instrument_name}"
+
+    def get_actual_value_display(self) -> Optional[str]:
+        has_pos = getattr(self, '_has_position', None)
+        if has_pos is None:
+            return None
+        return f"BUY position found: {'Yes' if has_pos else 'No'}"
 
 
 class HasSellPositionCondition(FlagCondition):
@@ -333,31 +378,54 @@ class HasSellPositionCondition(FlagCondition):
                     Transaction.status == TransactionStatus.OPENED,
                     Transaction.side == OrderDirection.SELL
                 )
-                return len(session.exec(statement).all()) > 0
+                self._has_position = len(session.exec(statement).all()) > 0
+                return self._has_position
         except Exception as e:
             logger.error(f"Error checking SELL position for {self.instrument_name}: {e}", exc_info=True)
             return False
     def get_description(self) -> str:
         return f"Check if this expert has an open SELL position for {self.instrument_name}"
 
+    def get_actual_value_display(self) -> Optional[str]:
+        has_pos = getattr(self, '_has_position', None)
+        if has_pos is None:
+            return None
+        return f"SELL position found: {'Yes' if has_pos else 'No'}"
+
 
 # Account-level Position Conditions
 class HasNoPositionAccountCondition(FlagCondition):
     """Check if there's no open position for the instrument at the account level."""
-    
+
     def evaluate(self) -> bool:
-        return not self.has_account_position()
-    
+        self._has_position = self.has_account_position()
+        return not self._has_position
+
     def get_description(self) -> str:
         """Get description of account-level no position condition."""
         return f"Check if account has no open position for {self.instrument_name} (account-level)"
 
+    def get_actual_value_display(self) -> Optional[str]:
+        has_pos = getattr(self, '_has_position', None)
+        if has_pos is None:
+            return None
+        return f"Account position found: {'Yes' if has_pos else 'No'}"
+
 class HasPositionAccountCondition(FlagCondition):
     """Check if there's an open position for the instrument at the account level."""
+
     def evaluate(self) -> bool:
-        return self.has_account_position()
+        self._has_position = self.has_account_position()
+        return self._has_position
+
     def get_description(self) -> str:
         return f"Check if account has an open position for {self.instrument_name} (account-level)"
+
+    def get_actual_value_display(self) -> Optional[str]:
+        has_pos = getattr(self, '_has_position', None)
+        if has_pos is None:
+            return None
+        return f"Account position found: {'Yes' if has_pos else 'No'}"
 
 # Time Horizon Flag Conditions
 class LongTermCondition(FlagCondition):
@@ -371,6 +439,10 @@ class LongTermCondition(FlagCondition):
     def get_description(self) -> str:
         return f"Check if expert recommendation for {self.instrument_name} is LONG_TERM"
 
+    def get_actual_value_display(self) -> Optional[str]:
+        horizon = getattr(self.expert_recommendation, 'time_horizon', None)
+        return f"Time horizon: {horizon.value}" if horizon else "Time horizon: N/A"
+
 class MediumTermCondition(FlagCondition):
     """Check if expert recommendation is medium term."""
     def evaluate(self) -> bool:
@@ -382,6 +454,10 @@ class MediumTermCondition(FlagCondition):
     def get_description(self) -> str:
         return f"Check if expert recommendation for {self.instrument_name} is MEDIUM_TERM"
 
+    def get_actual_value_display(self) -> Optional[str]:
+        horizon = getattr(self.expert_recommendation, 'time_horizon', None)
+        return f"Time horizon: {horizon.value}" if horizon else "Time horizon: N/A"
+
 class ShortTermCondition(FlagCondition):
     """Check if expert recommendation is short term."""
     def evaluate(self) -> bool:
@@ -392,6 +468,10 @@ class ShortTermCondition(FlagCondition):
             return False
     def get_description(self) -> str:
         return f"Check if expert recommendation for {self.instrument_name} is SHORT_TERM"
+
+    def get_actual_value_display(self) -> Optional[str]:
+        horizon = getattr(self.expert_recommendation, 'time_horizon', None)
+        return f"Time horizon: {horizon.value}" if horizon else "Time horizon: N/A"
 
 
 # Current Rating Flag Conditions
@@ -406,6 +486,10 @@ class CurrentRatingPositiveCondition(FlagCondition):
     def get_description(self) -> str:
         return f"Check if current recommendation for {self.instrument_name} is BUY (positive)"
 
+    def get_actual_value_display(self) -> Optional[str]:
+        action = getattr(self.expert_recommendation, 'recommended_action', None)
+        return f"Current rating: {action.value}" if action else None
+
 
 class CurrentRatingNeutralCondition(FlagCondition):
     """Check if current recommendation is neutral (HOLD)."""
@@ -418,6 +502,10 @@ class CurrentRatingNeutralCondition(FlagCondition):
     def get_description(self) -> str:
         return f"Check if current recommendation for {self.instrument_name} is HOLD (neutral)"
 
+    def get_actual_value_display(self) -> Optional[str]:
+        action = getattr(self.expert_recommendation, 'recommended_action', None)
+        return f"Current rating: {action.value}" if action else None
+
 
 class CurrentRatingNegativeCondition(FlagCondition):
     """Check if current recommendation is negative (SELL)."""
@@ -429,6 +517,10 @@ class CurrentRatingNegativeCondition(FlagCondition):
             return False
     def get_description(self) -> str:
         return f"Check if current recommendation for {self.instrument_name} is SELL (negative)"
+
+    def get_actual_value_display(self) -> Optional[str]:
+        action = getattr(self.expert_recommendation, 'recommended_action', None)
+        return f"Current rating: {action.value}" if action else None
 
 
 # Risk Level Flag Conditions
@@ -443,6 +535,10 @@ class HighRiskCondition(FlagCondition):
     def get_description(self) -> str:
         return f"Check if expert recommendation for {self.instrument_name} has HIGH risk"
 
+    def get_actual_value_display(self) -> Optional[str]:
+        risk = getattr(self.expert_recommendation, 'risk_level', None)
+        return f"Risk level: {risk.value}" if risk else "Risk level: N/A"
+
 
 class MediumRiskCondition(FlagCondition):
     """Check if expert recommendation has medium risk."""
@@ -455,6 +551,10 @@ class MediumRiskCondition(FlagCondition):
     def get_description(self) -> str:
         return f"Check if expert recommendation for {self.instrument_name} has MEDIUM risk"
 
+    def get_actual_value_display(self) -> Optional[str]:
+        risk = getattr(self.expert_recommendation, 'risk_level', None)
+        return f"Risk level: {risk.value}" if risk else "Risk level: N/A"
+
 
 class LowRiskCondition(FlagCondition):
     """Check if expert recommendation has low risk."""
@@ -466,6 +566,10 @@ class LowRiskCondition(FlagCondition):
             return False
     def get_description(self) -> str:
         return f"Check if expert recommendation for {self.instrument_name} has LOW risk"
+
+    def get_actual_value_display(self) -> Optional[str]:
+        risk = getattr(self.expert_recommendation, 'risk_level', None)
+        return f"Risk level: {risk.value}" if risk else "Risk level: N/A"
 
 
 class NewTargetHigherCondition(FlagCondition):
@@ -557,6 +661,12 @@ class NewTargetHigherCondition(FlagCondition):
         """Get description of new target higher condition."""
         return f"Check if new expert target is higher than current TP for {self.instrument_name} (>{self.TOLERANCE_PERCENT}% tolerance)"
 
+    def get_actual_value_display(self) -> Optional[str]:
+        pct = getattr(self, 'percent_diff', None)
+        if pct is not None:
+            return f"Target diff: {pct:+.2f}% (current TP: ${self.current_tp_price:.2f}, new: ${self.new_target_price:.2f})"
+        return None
+
 
 class NewTargetLowerCondition(FlagCondition):
     """Check if new expert target is lower than current TP (with 2% tolerance)."""
@@ -647,6 +757,12 @@ class NewTargetLowerCondition(FlagCondition):
         """Get description of new target lower condition."""
         return f"Check if new expert target is lower than current TP for {self.instrument_name} (<-{self.TOLERANCE_PERCENT}% tolerance)"
 
+    def get_actual_value_display(self) -> Optional[str]:
+        pct = getattr(self, 'percent_diff', None)
+        if pct is not None:
+            return f"Target diff: {pct:+.2f}% (current TP: ${self.current_tp_price:.2f}, new: ${self.new_target_price:.2f})"
+        return None
+
 
 class RatingChangeCondition(FlagCondition):
     """Check if rating changed from one recommendation type to another."""
@@ -673,21 +789,33 @@ class RatingChangeCondition(FlagCondition):
         try:
             recommendations = self.get_previous_recommendations(self.account.id, limit=2)
             if len(recommendations) < 2:
+                self._previous_action = None
+                self._current_action = None
                 return False
-                
+
             previous = recommendations[1]  # Second most recent
             current = recommendations[0]   # Most recent
-            
-            return (previous.recommended_action == self.from_rating and 
+
+            self._previous_action = previous.recommended_action
+            self._current_action = current.recommended_action
+
+            return (previous.recommended_action == self.from_rating and
                    current.recommended_action == self.to_rating)
-                   
+
         except Exception as e:
             logger.error(f"Error evaluating rating change condition ({self.from_rating} -> {self.to_rating}): {e}", exc_info=True)
             return False
-    
+
     def get_description(self) -> str:
         """Get description of rating change condition."""
         return f"Check if rating changed from {self.from_rating.value} to {self.to_rating.value} for {self.instrument_name}"
+
+    def get_actual_value_display(self) -> Optional[str]:
+        prev = getattr(self, '_previous_action', None)
+        curr = getattr(self, '_current_action', None)
+        if prev is not None and curr is not None:
+            return f"Rating: {prev.value} -> {curr.value}"
+        return "Rating: insufficient history"
 
 
 # Convenience classes for specific rating changes (optional - can be removed if not needed)
@@ -743,27 +871,32 @@ class RatingPositiveToNeutralCondition(RatingChangeCondition):
 
 class ExpectedProfitTargetPercentCondition(CompareCondition):
     """Compare expected profit target percentage."""
-    
+
     def evaluate(self) -> bool:
         try:
             expected_profit = self.expert_recommendation.expected_profit_percent
-            
+
             # If no expected profit data, we cannot evaluate
             if expected_profit is None:
                 logger.debug(f"No expected profit data available for {self.instrument_name}")
                 self.calculated_value = None
                 return False
-            
+
             self.calculated_value = expected_profit  # Store calculated value
             return self.operator_func(expected_profit, self.value)
-            
+
         except Exception as e:
             logger.error(f"Error evaluating expected profit target condition: {e}", exc_info=True)
             return False
-    
+
     def get_description(self) -> str:
         """Get description of expected profit target condition."""
         return f"Check if expected profit target percent for {self.instrument_name} is {self.operator_str} {self.value}%"
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:.2f}%"
 
 
 class PercentToCurrentTargetCondition(CompareCondition):
@@ -818,6 +951,11 @@ class PercentToCurrentTargetCondition(CompareCondition):
     def get_description(self) -> str:
         """Get description of percent to current target condition."""
         return f"Check if percent from current price to current TP for {self.instrument_name} is {self.operator_str} {self.value}%"
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:+.2f}%"
 
 
 class NewTargetPercentCondition(CompareCondition):
@@ -898,6 +1036,11 @@ class NewTargetPercentCondition(CompareCondition):
         """Get description of new target percent condition."""
         return f"Check if new target percent change for {self.instrument_name} is {self.operator_str} {self.value}%"
 
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:+.2f}%"
+
 
 class PercentToNewTargetCondition(CompareCondition):
     """Compare percent from current price to new expert target price."""
@@ -959,6 +1102,11 @@ class PercentToNewTargetCondition(CompareCondition):
         """Get description of percent to new target condition."""
         return f"Check if percent from current price to new expert target for {self.instrument_name} is {self.operator_str} {self.value}%"
 
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:+.2f}%"
+
 
 class ProfitLossAmountCondition(CompareCondition):
     """Compare profit/loss amount."""
@@ -996,6 +1144,10 @@ class ProfitLossAmountCondition(CompareCondition):
         """Get description of profit/loss amount condition."""
         return f"Check if profit/loss amount for {self.instrument_name} is {self.operator_str} ${self.value}"
 
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"${self.calculated_value:.2f}"
 
 
 class ProfitLossPercentCondition(CompareCondition):
@@ -1025,6 +1177,11 @@ class ProfitLossPercentCondition(CompareCondition):
     def get_description(self) -> str:
         return f"Check if profit/loss percentage for {self.instrument_name} is {self.operator_str} {self.value}%"
 
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:.2f}%"
+
 # Confidence Condition Implementation
 class ConfidenceCondition(CompareCondition):
     """Compare expert confidence value."""
@@ -1043,6 +1200,11 @@ class ConfidenceCondition(CompareCondition):
             return False
     def get_description(self) -> str:
         return f"Check if expert confidence for {self.instrument_name} is {self.operator_str} {self.value}"
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:.1f}%"
 
 
 class DaysOpenedCondition(CompareCondition):
@@ -1075,6 +1237,11 @@ class DaysOpenedCondition(CompareCondition):
     def get_description(self) -> str:
         """Get description of days opened condition."""
         return f"Check if days since {self.instrument_name} order was opened is {self.operator_str} {self.value} days"
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:.1f} days"
 
 
 class InstrumentAccountShareCondition(CompareCondition):
@@ -1159,6 +1326,11 @@ class InstrumentAccountShareCondition(CompareCondition):
     
     def get_description(self) -> str:
         return f"Check if {self.instrument_name} position value as % of expert virtual equity is {self.operator_str} {self.value}%"
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:.2f}%"
 
 
 # Factory function to create conditions based on event type
