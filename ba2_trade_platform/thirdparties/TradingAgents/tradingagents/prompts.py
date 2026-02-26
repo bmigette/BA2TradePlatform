@@ -363,10 +363,12 @@ FINAL_SUMMARIZATION_AGENT_PROMPT = """You are the Final Summarization Agent for 
 - Extract confidence levels from the decision-making process (0-100 scale, where 100 = completely certain)
 - Derive risk levels from the certainty and market conditions described
 - **ESTIMATE expected_profit_percent based on the final_trade_decision and analysis**:
-  - For BUY/SELL: Provide a realistic profit estimate based on technical targets, fundamental valuation gaps, or momentum analysis (typically 5-20%)
+  - **ALWAYS POSITIVE** for both BUY and SELL (it represents expected profit from the trade, not price direction)
+  - For BUY: How much the price is expected to go UP (e.g., buy at $100, target $115 → expected_profit_percent = 15.0)
+  - For SELL: How much the price is expected to go DOWN (e.g., sell at $100, target $87 → expected_profit_percent = 13.0, NOT -13.0)
   - For HOLD: Use 0.0
   - Consider time_horizon: SHORT_TERM (5-10%), MEDIUM_TERM (10-15%), LONG_TERM (15-25%)
-  - Example: Bullish momentum + undervalued fundamentals + positive sentiment → estimate 12-18% profit potential
+  - Example: Bearish momentum + overvalued fundamentals + negative sentiment → SELL with expected_profit_percent = 12.0 (positive)
 
 **Risk Levels**: LOW (high certainty in final decision) | MEDIUM (moderate certainty) | HIGH (low certainty or volatile conditions)
 

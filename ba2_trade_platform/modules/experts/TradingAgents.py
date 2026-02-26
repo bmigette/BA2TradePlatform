@@ -567,7 +567,7 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                 instance_id=self.id,
                 symbol=symbol,
                 recommended_action=recommendation_data['signal'],
-                expected_profit_percent=round(recommendation_data['expected_profit'], 2),
+                expected_profit_percent=abs(round(recommendation_data['expected_profit'], 2)),
                 price_at_date=recommendation_data['price_at_date'],
                 details=recommendation_data['details'][:100000] if recommendation_data['details'] else None,
                 confidence=round(recommendation_data['confidence'], 3),
