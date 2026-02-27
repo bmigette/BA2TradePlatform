@@ -5105,7 +5105,7 @@ class AccountGrowthTab:
 
             try:
                 with charts_container:
-                    self._render_total_growth_chart(all_balance_history, all_dividends)
+                    self._render_total_growth_chart(all_balance_history, all_dividends, all_filled_trades)
                     self._render_growth_by_label_charts(all_positions, historical_prices, all_dividends, all_filled_trades)
                     self._render_dividend_history_table(all_dividends)
                     self._render_per_position_section(all_positions, account_map, all_filled_trades, all_dividends)
@@ -5119,8 +5119,8 @@ class AccountGrowthTab:
             except RuntimeError:
                 pass
 
-    def _render_total_growth_chart(self, balance_history, dividends):
-        """Render the total account growth line chart with price growth and cumulative dividends."""
+    def _render_total_growth_chart(self, balance_history, dividends, all_filled_trades=None):
+        """Render the total account growth line chart with price growth, cumulative dividends, and P/L %."""
         with ui.card().classes('w-full mb-4 p-4'):
             ui.label('Total Account Growth').classes('text-md font-bold mb-2')
 
@@ -5133,6 +5133,7 @@ class AccountGrowthTab:
             # the NLV of all accounts using per-account forward-fill.
             balance_dates_set = set()
             per_account_data = {}  # account_id -> {date_str: nlv}
+            per_account_cash = {}  # account_id -> {date_str: cash_balance}
             if balance_history:
                 for entry in balance_history:
                     date_val = entry.get('date')
@@ -5143,7 +5144,9 @@ class AccountGrowthTab:
                     balance_dates_set.add(date_str)
                     if acc_id not in per_account_data:
                         per_account_data[acc_id] = {}
+                        per_account_cash[acc_id] = {}
                     per_account_data[acc_id][date_str] = float(entry.get('net_liquidating_value', 0))
+                    per_account_cash[acc_id][date_str] = float(entry.get('cash_balance', 0))
 
             # Prepare cumulative dividend series
             div_dates_set = set()
@@ -5172,6 +5175,15 @@ class AccountGrowthTab:
                         last_per_account[acc_id] = acc_data[d]
                 aligned_balance.append(round(sum(last_per_account.values()), 2))
 
+            # Build aligned cash series with forward-fill per account
+            aligned_cash = []
+            last_per_account_cash = {acc_id: 0.0 for acc_id in per_account_cash}
+            for d in all_dates:
+                for acc_id, acc_data in per_account_cash.items():
+                    if d in acc_data:
+                        last_per_account_cash[acc_id] = acc_data[d]
+                aligned_cash.append(round(sum(last_per_account_cash.values()), 2))
+
             # Build aligned dividend series with forward-fill
             aligned_div = []
             last_div = 0
@@ -5180,13 +5192,87 @@ class AccountGrowthTab:
                     last_div = div_by_date[d]
                 aligned_div.append(last_div)
 
+            # Compute P/L % by detecting external cash flows (deposits/withdrawals)
+            # External flow = actual_cash_change - expected_cash_change_from_trades_and_dividends
+            trade_cash_by_date = {}  # date_str -> net cash impact from trades
+            for t in (all_filled_trades or []):
+                date_val = t.get('date')
+                if not date_val:
+                    continue
+                d = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)[:10]
+                tqty = float(t.get('qty', 0))
+                tprice = float(t.get('price', 0))
+                side = t.get('side', '')
+                if side == 'BUY':
+                    trade_cash_by_date[d] = trade_cash_by_date.get(d, 0.0) - tqty * tprice
+                elif side == 'SELL':
+                    trade_cash_by_date[d] = trade_cash_by_date.get(d, 0.0) + tqty * tprice
+
+            div_cash_by_date = {}  # date_str -> net cash impact from dividends (incl. DRIP outflow)
+            for div in (dividends or []):
+                date_val = div.get('date')
+                if not date_val:
+                    continue
+                d = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)[:10]
+                amount = float(div.get('amount', 0))
+                tax = float(div.get('tax_withheld', 0))
+                cash_in = amount - tax
+                drip_qty = div.get('drip_quantity')
+                drip_price = div.get('drip_price')
+                cash_out = float(drip_qty) * float(drip_price) if drip_qty and drip_price else 0.0
+                div_cash_by_date[d] = div_cash_by_date.get(d, 0.0) + cash_in - cash_out
+
+            pnl_pct_data = []
+            invested_capital = None
+            prev_cash = None
+            for i, d in enumerate(all_dates):
+                nlv = aligned_balance[i] if i < len(aligned_balance) else 0
+                cash = aligned_cash[i] if i < len(aligned_cash) else 0.0
+                if invested_capital is None:
+                    invested_capital = nlv
+                    prev_cash = cash
+                    pnl_pct_data.append(0.0)
+                    continue
+
+                actual_cash_change = cash - prev_cash
+                expected_cash_change = trade_cash_by_date.get(d, 0.0) + div_cash_by_date.get(d, 0.0)
+                external_flow = actual_cash_change - expected_cash_change
+                if abs(external_flow) > 1.0:
+                    invested_capital += external_flow
+
+                if invested_capital > 0:
+                    pnl = nlv - invested_capital
+                    pnl_pct = round(pnl / invested_capital * 100, 2)
+                    pnl_pct_data.append(pnl_pct)
+                else:
+                    pnl_pct_data.append(None)
+                prev_cash = cash
+
+            has_pnl = any(v is not None and v != 0 for v in pnl_pct_data)
+
+            # Build y-axes
+            y_axes = [{
+                'type': 'value',
+                'axisLabel': {'color': '#a0aec0', 'formatter': '${value}'},
+                'splitLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.05)'}},
+            }]
+            if has_pnl:
+                y_axes.append({
+                    'type': 'value',
+                    'name': 'P&L (%)',
+                    'axisLabel': {'color': '#a0aec0', 'formatter': '{value}%'},
+                    'splitLine': {'show': False},
+                })
+
             series = []
             if aligned_balance:
                 series.append({
                     'name': 'Portfolio Value',
                     'type': 'line',
+                    'yAxisIndex': 0,
                     'data': aligned_balance,
                     'smooth': True,
+                    'showSymbol': False,
                     'lineStyle': {'width': 2, 'color': '#1976D2'},
                     'itemStyle': {'color': '#1976D2'},
                     'areaStyle': {
@@ -5203,8 +5289,10 @@ class AccountGrowthTab:
                 series.append({
                     'name': 'Cumulative Dividends',
                     'type': 'line',
+                    'yAxisIndex': 0,
                     'data': aligned_div,
                     'smooth': True,
+                    'showSymbol': False,
                     'lineStyle': {'width': 2, 'color': '#4CAF50'},
                     'itemStyle': {'color': '#4CAF50'},
                     'areaStyle': {
@@ -5217,6 +5305,23 @@ class AccountGrowthTab:
                         }
                     }
                 })
+
+            # P/L % on right y-axis with green/red color mapping
+            pnl_series_index = None
+            if has_pnl:
+                pnl_series_index = len(series)
+                series.append({
+                    'name': 'P&L %',
+                    'type': 'line',
+                    'yAxisIndex': 1,
+                    'data': pnl_pct_data,
+                    'smooth': True,
+                    'showSymbol': False,
+                    'lineStyle': {'width': 1.5},
+                    'areaStyle': {'opacity': 0.3},
+                })
+
+            right_margin = '6%' if has_pnl else '3%'
 
             chart_options = {
                 'backgroundColor': 'transparent',
@@ -5231,20 +5336,28 @@ class AccountGrowthTab:
                     'textStyle': {'color': '#a0aec0'},
                     'top': 5,
                 },
-                'grid': {'left': '3%', 'right': '3%', 'bottom': '3%', 'containLabel': True},
+                'grid': {'left': '3%', 'right': right_margin, 'bottom': '3%', 'containLabel': True},
                 'xAxis': {
                     'type': 'category',
                     'data': all_dates,
                     'axisLabel': {'color': '#a0aec0', 'rotate': 45, 'fontSize': 10},
                     'axisLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.1)'}},
                 },
-                'yAxis': {
-                    'type': 'value',
-                    'axisLabel': {'color': '#a0aec0', 'formatter': '${value}'},
-                    'splitLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.05)'}},
-                },
+                'yAxis': y_axes,
                 'series': series,
             }
+
+            if pnl_series_index is not None:
+                chart_options['visualMap'] = {
+                    'show': False,
+                    'type': 'piecewise',
+                    'seriesIndex': pnl_series_index,
+                    'pieces': [
+                        {'gte': 0, 'color': '#4CAF50'},
+                        {'lt': 0, 'color': '#F44336'},
+                    ],
+                }
+
             ui.echart(chart_options).classes('w-full h-96')
 
     def _render_growth_by_label_charts(self, all_positions, historical_prices=None, all_dividends=None, all_filled_trades=None):
@@ -5848,7 +5961,8 @@ class AccountGrowthTab:
                 'itemStyle': {'color': '#AB47BC'},
             })
 
-        # P&L % on a separate right axis, split into profit/loss area series
+        # P&L % on a separate right axis with green/red color mapping
+        pnl_series_index = None
         if has_pnl:
             pnl_axis_index = len(y_axes)
             y_axes.append({
@@ -5859,30 +5973,16 @@ class AccountGrowthTab:
                 'splitLine': {'show': False},
             })
 
-            pnl_profit = [max(v, 0) if v is not None else None for v in pnl_pct_data]
-            pnl_loss = [min(v, 0) if v is not None else None for v in pnl_pct_data]
-
+            pnl_series_index = len(series)
             series.append({
-                'name': 'P&L % (Profit)',
+                'name': 'P&L %',
                 'type': 'line',
                 'yAxisIndex': pnl_axis_index,
-                'data': pnl_profit,
+                'data': pnl_pct_data,
                 'smooth': True,
                 'showSymbol': False,
-                'lineStyle': {'width': 1.5, 'color': '#4CAF50'},
-                'itemStyle': {'color': '#4CAF50'},
-                'areaStyle': {'color': 'rgba(76, 175, 80, 0.3)'},
-            })
-            series.append({
-                'name': 'P&L % (Loss)',
-                'type': 'line',
-                'yAxisIndex': pnl_axis_index,
-                'data': pnl_loss,
-                'smooth': True,
-                'showSymbol': False,
-                'lineStyle': {'width': 1.5, 'color': '#F44336'},
-                'itemStyle': {'color': '#F44336'},
-                'areaStyle': {'color': 'rgba(244, 67, 54, 0.3)'},
+                'lineStyle': {'width': 1.5},
+                'areaStyle': {'opacity': 0.3},
             })
 
         # Cumulative dividends on same $ axis
@@ -5954,6 +6054,17 @@ class AccountGrowthTab:
             'yAxis': y_axes,
             'series': series,
         }
+
+        if pnl_series_index is not None:
+            chart_options['visualMap'] = {
+                'show': False,
+                'type': 'piecewise',
+                'seriesIndex': pnl_series_index,
+                'pieces': [
+                    {'gte': 0, 'color': '#4CAF50'},
+                    {'lt': 0, 'color': '#F44336'},
+                ],
+            }
 
         ui.echart(chart_options).classes('w-full h-80')
 
