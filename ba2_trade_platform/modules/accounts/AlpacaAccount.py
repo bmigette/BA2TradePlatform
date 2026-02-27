@@ -4303,22 +4303,65 @@ class AlpacaAccount(AccountInterface):
 
             history = self.client.get_portfolio_history(GetPortfolioHistoryRequest(**params))
 
+            # Fetch cash transfers (deposits/withdrawals) to compute actual daily P/L.
+            # Alpaca's profit_loss from portfolio history does NOT exclude withdrawals,
+            # so we need to subtract transfer amounts from equity changes ourselves.
+            transfer_by_date = {}
+            try:
+                for act_type in ['CSD', 'CSW']:
+                    activities = self.client.get(f'/account/activities/{act_type}')
+                    for act in activities:
+                        act_date = str(act.get('date', ''))[:10]
+                        amount = float(act.get('net_amount', 0))
+                        transfer_by_date[act_date] = transfer_by_date.get(act_date, 0.0) + amount
+            except Exception as e:
+                logger.warning(f"[Account {self.id}] Could not fetch transfer activities: {e}")
+
             snapshots = []
             timestamps = getattr(history, 'timestamp', []) or []
             equity_values = getattr(history, 'equity', []) or []
-            profit_loss = getattr(history, 'profit_loss', []) or []
 
+            # Build list of history dates for T+1 settlement shifting.
+            # Transfers settle T+1: activity on Oct 29 → equity change on Oct 30.
+            all_history_dates = []
+            for ts in timestamps:
+                d_obj = datetime.fromtimestamp(ts, tz=timezone.utc) if isinstance(ts, (int, float)) else ts
+                all_history_dates.append(d_obj.strftime('%Y-%m-%d'))
+
+            shifted_transfers = {}
+            for act_date, amount in transfer_by_date.items():
+                shifted = False
+                for hd in all_history_dates:
+                    if hd > act_date:
+                        shifted_transfers[hd] = shifted_transfers.get(hd, 0.0) + amount
+                        shifted = True
+                        break
+                if not shifted:
+                    shifted_transfers[act_date] = shifted_transfers.get(act_date, 0.0) + amount
+            transfer_by_date = shifted_transfers
+
+            prev_equity = None
             for i, ts in enumerate(timestamps):
                 equity = float(equity_values[i]) if i < len(equity_values) and equity_values[i] is not None else 0.0
-                pnl = float(profit_loss[i]) if i < len(profit_loss) and profit_loss[i] is not None else 0.0
+                date_obj = datetime.fromtimestamp(ts, tz=timezone.utc) if isinstance(ts, (int, float)) else ts
+                date_str = date_obj.strftime('%Y-%m-%d')
+
+                # Compute actual daily market P/L by subtracting transfers
+                if prev_equity is not None:
+                    equity_change = equity - prev_equity
+                    transfer = transfer_by_date.get(date_str, 0.0)
+                    daily_pl = equity_change - transfer
+                else:
+                    daily_pl = 0.0
 
                 snapshots.append({
-                    'date': datetime.fromtimestamp(ts, tz=timezone.utc) if isinstance(ts, (int, float)) else ts,
+                    'date': date_obj,
                     'net_liquidating_value': equity,
-                    'cash_balance': 0.0,  # Not available from Alpaca portfolio history API
+                    'cash_balance': 0.0,
                     'equity_value': equity,
-                    'profit_loss': pnl,  # Daily P/L from Alpaca (excludes external flows)
+                    'profit_loss': daily_pl,
                 })
+                prev_equity = equity
 
             logger.debug(f"[Account {self.id}] Retrieved {len(snapshots)} balance history snapshots")
             return snapshots
