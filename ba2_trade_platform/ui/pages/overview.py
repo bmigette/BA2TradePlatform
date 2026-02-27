@@ -5714,12 +5714,13 @@ class AccountGrowthTab:
 
         # Build aligned series with forward-fill
         position_values = []
-        pnl_data = []
+        pnl_pct_data = []
         cumulative_divs = []
         drip_quantities = []
         last_price = None
         last_div = 0
         last_drip = 0
+        reference_price = None  # First close price when position existed — P&L % reference
 
         for d in all_dates:
             if d in hist_prices:
@@ -5728,14 +5729,14 @@ class AccountGrowthTab:
             if qty_at_date > 0 and last_price:
                 pos_val = round(qty_at_date * last_price, 2)
                 position_values.append(pos_val)
-                # P&L = (current_price - avg_cost) * qty_at_date
-                if avg_entry_price > 0:
-                    pnl_data.append(round((last_price - avg_entry_price) * qty_at_date, 2))
-                else:
-                    pnl_data.append(None)
+                # Use first close price as reference so P&L starts at 0%
+                if reference_price is None:
+                    reference_price = last_price
+                pnl_pct = round((last_price - reference_price) / reference_price * 100, 2)
+                pnl_pct_data.append(pnl_pct)
             else:
                 position_values.append(None)
-                pnl_data.append(None)
+                pnl_pct_data.append(None)
 
             if d in div_map:
                 last_div = div_map[d]['cumulative_div']
@@ -5750,7 +5751,7 @@ class AccountGrowthTab:
         ]
 
         # Check if we have P&L data
-        has_pnl = avg_entry_price > 0 and any(v is not None for v in pnl_data)
+        has_pnl = reference_price is not None and any(v is not None for v in pnl_pct_data)
         has_drip = drip_enabled and any(q > 0 for q in drip_quantities)
 
         # Single left axis for all $ values; optional right axis for DRIP shares only
@@ -5795,15 +5796,24 @@ class AccountGrowthTab:
                 'itemStyle': {'color': '#AB47BC'},
             })
 
-        # P&L as two area series (profit green, loss red) — no visualMap needed
+        # P&L % on a separate right axis, split into profit/loss area series
         if has_pnl:
-            pnl_profit = [max(v, 0) if v is not None else None for v in pnl_data]
-            pnl_loss = [min(v, 0) if v is not None else None for v in pnl_data]
+            pnl_axis_index = len(y_axes)
+            y_axes.append({
+                'type': 'value',
+                'name': 'P&L (%)',
+                'nameTextStyle': {'color': '#a0aec0'},
+                'axisLabel': {'color': '#a0aec0', 'formatter': '{value}%'},
+                'splitLine': {'show': False},
+            })
+
+            pnl_profit = [max(v, 0) if v is not None else None for v in pnl_pct_data]
+            pnl_loss = [min(v, 0) if v is not None else None for v in pnl_pct_data]
 
             series.append({
                 'name': 'P&L (Profit)',
                 'type': 'line',
-                'yAxisIndex': 0,
+                'yAxisIndex': pnl_axis_index,
                 'data': pnl_profit,
                 'smooth': True,
                 'showSymbol': False,
@@ -5814,7 +5824,7 @@ class AccountGrowthTab:
             series.append({
                 'name': 'P&L (Loss)',
                 'type': 'line',
-                'yAxisIndex': 0,
+                'yAxisIndex': pnl_axis_index,
                 'data': pnl_loss,
                 'smooth': True,
                 'showSymbol': False,
@@ -5857,7 +5867,11 @@ class AccountGrowthTab:
                     'itemStyle': {'color': '#FF9800'},
                 })
 
-        right_margin = '8%' if has_drip else '3%'
+        right_margin = '3%'
+        if has_pnl:
+            right_margin = '6%'
+        if has_drip:
+            right_margin = '10%'
 
         chart_options = {
             'backgroundColor': 'transparent',
