@@ -5094,7 +5094,7 @@ class AccountGrowthTab:
                 try:
                     import yfinance as yf
                     hist_data = await asyncio.to_thread(
-                        lambda: yf.download(position_symbols, period='6mo', progress=False)
+                        lambda: yf.download(position_symbols, period='6mo', progress=False, auto_adjust=False)
                     )
                     for sym in position_symbols:
                         prices = _extract_yf_close_prices(hist_data, sym)
@@ -5626,7 +5626,7 @@ class AccountGrowthTab:
                     # Fetch historical prices from Yahoo Finance
                     import yfinance as yf
                     hist_data = await asyncio.to_thread(
-                        lambda: yf.download(symbol, period='6mo', progress=False)
+                        lambda: yf.download(symbol, period='6mo', progress=False, auto_adjust=False)
                     )
                     hist_prices = _extract_yf_close_prices(hist_data, symbol)
                 except Exception as e:
