@@ -4904,18 +4904,22 @@ def _extract_yf_close_prices(hist_data, symbol):
         return {}
 
 
-def _build_qty_timeline(current_qty, filled_trades, all_dates):
+def _build_qty_timeline(current_qty, filled_trades, all_dates, dividends=None):
     """
-    Build a mapping of date -> qty by walking backwards from current_qty through filled trades.
+    Build a mapping of date -> qty by walking backwards from current_qty through filled trades
+    and DRIP dividend reinvestments.
 
     For each filled trade, reverses its effect:
     - BUY trade: subtract qty (going backwards means we had fewer shares before this buy)
     - SELL trade: add qty (going backwards means we had more shares before this sell)
+    For each DRIP dividend, reverses the reinvestment:
+    - DRIP: subtract drip_quantity (going backwards means we had fewer shares before the DRIP)
 
     Args:
         current_qty: Current position quantity
         filled_trades: List of dicts with 'qty', 'side', 'date' keys, for a single symbol
         all_dates: Sorted list of date strings (YYYY-MM-DD) used in the chart
+        dividends: Optional list of dividend dicts with 'date', 'drip_quantity' keys
 
     Returns:
         tuple: (qty_by_date dict {date_str: qty}, first_purchase_date_str or None)
@@ -4923,12 +4927,9 @@ def _build_qty_timeline(current_qty, filled_trades, all_dates):
     if not all_dates:
         return {}, None
 
-    # Sort trades by date descending (most recent first) for backward walk
-    sorted_trades = sorted(filled_trades, key=lambda t: str(t.get('date', '')), reverse=True)
-
     # Convert trade dates to YYYY-MM-DD strings
     trade_events = []
-    for t in sorted_trades:
+    for t in filled_trades:
         date_val = t.get('date')
         if date_val:
             if hasattr(date_val, 'strftime'):
@@ -4954,6 +4955,23 @@ def _build_qty_timeline(current_qty, filled_trades, all_dates):
         elif te['side'] == 'SELL':
             daily_change[d] -= te['qty']
 
+    # Add DRIP qty changes (DRIP adds shares, so it's like a BUY in the forward direction)
+    if dividends:
+        for div in dividends:
+            drip_qty = div.get('drip_quantity')
+            if not drip_qty:
+                continue
+            date_val = div.get('date')
+            if not date_val:
+                continue
+            if hasattr(date_val, 'strftime'):
+                date_str = date_val.strftime('%Y-%m-%d')
+            else:
+                date_str = str(date_val)[:10]
+            if date_str not in daily_change:
+                daily_change[date_str] = 0.0
+            daily_change[date_str] += float(drip_qty)
+
     # Walk backwards from the last date to reconstruct qty at each date
     qty_by_date = {}
     qty = current_qty
@@ -4961,7 +4979,7 @@ def _build_qty_timeline(current_qty, filled_trades, all_dates):
 
     for d in reversed(all_dates):
         qty_by_date[d] = qty
-        # If there's a trade on this date, reverse its effect to get qty before the trade
+        # If there's a trade/DRIP on this date, reverse its effect to get qty before
         if d in daily_change:
             qty -= daily_change[d]  # Reverse the forward change
         # Track when qty reaches zero or below going backwards
@@ -5090,7 +5108,7 @@ class AccountGrowthTab:
                     self._render_total_growth_chart(all_balance_history, all_dividends)
                     self._render_growth_by_label_charts(all_positions, historical_prices, all_dividends, all_filled_trades)
                     self._render_dividend_history_table(all_dividends)
-                    self._render_per_position_section(all_positions, account_map, all_filled_trades)
+                    self._render_per_position_section(all_positions, account_map, all_filled_trades, all_dividends)
             except RuntimeError:
                 return
 
@@ -5294,11 +5312,12 @@ class AccountGrowthTab:
         # label -> [daily_value] aligned with all_dates
         label_daily_values = {label: [0.0] * len(all_dates) for label in all_labels}
 
-        # Build per-symbol qty timelines using filled trades
+        # Build per-symbol qty timelines using filled trades and DRIP dividends
         sym_qty_timelines = {}
         for sym, info in symbol_info.items():
             sym_trades = [t for t in (all_filled_trades or []) if t.get('symbol') == sym]
-            qty_by_date, _ = _build_qty_timeline(info['qty'], sym_trades, all_dates)
+            sym_divs = [d for d in (all_dividends or []) if d.get('symbol') == sym]
+            qty_by_date, _ = _build_qty_timeline(info['qty'], sym_trades, all_dates, dividends=sym_divs)
             sym_qty_timelines[sym] = qty_by_date
 
         for sym, info in symbol_info.items():
@@ -5549,7 +5568,8 @@ class AccountGrowthTab:
                 pagination={'rowsPerPage': 10, 'sortBy': 'date', 'descending': True},
             ).classes('w-full').props('dense')
 
-    def _render_per_position_section(self, all_positions, account_map, all_filled_trades=None):
+    def _render_per_position_section(self, all_positions, account_map, all_filled_trades=None,
+                                     all_dividends=None):
         """Render per-position growth dropdown and chart."""
         if not all_positions:
             return
@@ -5562,6 +5582,22 @@ class AccountGrowthTab:
             # Use first encountered avg_entry_price (positions from same symbol should share it)
             if pos.symbol not in position_avg_price and pos.avg_entry_price:
                 position_avg_price[pos.symbol] = pos.avg_entry_price
+
+        # Pre-index dividends and filled trades by symbol for fast lookup
+        divs_by_symbol = {}
+        for div in (all_dividends or []):
+            sym = div.get('symbol')
+            if sym:
+                divs_by_symbol.setdefault(sym, []).append(div)
+
+        trades_by_symbol = {}
+        for t in (all_filled_trades or []):
+            sym = t.get('symbol')
+            if sym:
+                trades_by_symbol.setdefault(sym, []).append(t)
+
+        # Check drip_enabled once per account (cache by account instance id)
+        drip_cache = {}
 
         with ui.card().classes('w-full mb-4 p-4'):
             ui.label('Per-Position Growth').classes('text-md font-bold mb-2')
@@ -5578,9 +5614,14 @@ class AccountGrowthTab:
                 except RuntimeError:
                     return
                 try:
-                    dividends = await asyncio.to_thread(account_inst.get_dividends, symbol)
-                    drip_enabled = await asyncio.to_thread(account_inst.is_drip_enabled)
-                    filled_trades = await asyncio.to_thread(account_inst.get_filled_trades, symbol)
+                    # Use pre-fetched dividends and trades instead of fetching per-symbol
+                    dividends = divs_by_symbol.get(symbol, [])
+                    filled_trades = trades_by_symbol.get(symbol, [])
+
+                    acc_id = id(account_inst)
+                    if acc_id not in drip_cache:
+                        drip_cache[acc_id] = await asyncio.to_thread(account_inst.is_drip_enabled)
+                    drip_enabled = drip_cache[acc_id]
 
                     # Fetch historical prices from Yahoo Finance
                     import yfinance as yf
@@ -5666,9 +5707,9 @@ class AccountGrowthTab:
         # Merge all dates from prices and dividends
         all_dates = sorted(set(list(hist_prices.keys()) + list(div_map.keys())))
 
-        # Build qty timeline using filled trades
+        # Build qty timeline using filled trades and DRIP dividends
         qty_by_date, first_purchase_date = _build_qty_timeline(
-            current_qty, filled_trades or [], all_dates
+            current_qty, filled_trades or [], all_dates, dividends=dividends
         )
 
         # Build aligned series with forward-fill
@@ -5710,39 +5751,21 @@ class AccountGrowthTab:
 
         # Check if we have P&L data
         has_pnl = avg_entry_price > 0 and any(v is not None for v in pnl_data)
+        has_drip = drip_enabled and any(q > 0 for q in drip_quantities)
 
-        # y-axes: P&L on left (index 0), Value on right (index 1)
-        y_axes = []
-        if has_pnl:
-            y_axes.append({
-                'type': 'value',
-                'name': 'P&L ($)',
-                'nameTextStyle': {'color': '#a0aec0'},
-                'axisLabel': {'color': '#a0aec0', 'formatter': '${value}'},
-                'splitLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.05)'}},
-            })
-            y_axes.append({
-                'type': 'value',
-                'name': 'Value ($)',
-                'nameTextStyle': {'color': '#1976D2'},
-                'axisLabel': {'color': '#1976D2', 'formatter': '${value}'},
-                'splitLine': {'show': False},
-            })
-            value_axis_index = 1
-        else:
-            y_axes.append({
-                'type': 'value',
-                'name': 'Value ($)',
-                'axisLabel': {'color': '#a0aec0', 'formatter': '${value}'},
-                'splitLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.05)'}},
-            })
-            value_axis_index = 0
+        # Single left axis for all $ values; optional right axis for DRIP shares only
+        y_axes = [{
+            'type': 'value',
+            'name': 'Value ($)',
+            'axisLabel': {'color': '#a0aec0', 'formatter': '${value}'},
+            'splitLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.05)'}},
+        }]
 
         # Position Value line
         series = [{
             'name': 'Position Value',
             'type': 'line',
-            'yAxisIndex': value_axis_index,
+            'yAxisIndex': 0,
             'data': position_values,
             'smooth': True,
             'showSymbol': False,
@@ -5759,12 +5782,12 @@ class AccountGrowthTab:
             },
         }]
 
-        # Total Value (price + dividends) on same y-axis as Position Value
+        # Total Value (price + dividends) on same axis
         if has_dividends and last_div > 0:
             series.append({
                 'name': 'Total Value (Price + Div)',
                 'type': 'line',
-                'yAxisIndex': value_axis_index,
+                'yAxisIndex': 0,
                 'data': total_values,
                 'smooth': True,
                 'showSymbol': False,
@@ -5772,43 +5795,48 @@ class AccountGrowthTab:
                 'itemStyle': {'color': '#AB47BC'},
             })
 
-        # P&L area series (green positive / red negative)
-        pnl_series_index = None
+        # P&L as two area series (profit green, loss red) — no visualMap needed
         if has_pnl:
-            pnl_series_index = len(series)
+            pnl_profit = [max(v, 0) if v is not None else None for v in pnl_data]
+            pnl_loss = [min(v, 0) if v is not None else None for v in pnl_data]
+
             series.append({
-                'name': 'P&L',
+                'name': 'P&L (Profit)',
                 'type': 'line',
                 'yAxisIndex': 0,
-                'data': pnl_data,
+                'data': pnl_profit,
                 'smooth': True,
                 'showSymbol': False,
-                'lineStyle': {'width': 0},
-                'areaStyle': {'opacity': 0.5},
+                'lineStyle': {'width': 1.5, 'color': '#4CAF50'},
+                'itemStyle': {'color': '#4CAF50'},
+                'areaStyle': {'color': 'rgba(76, 175, 80, 0.3)'},
+            })
+            series.append({
+                'name': 'P&L (Loss)',
+                'type': 'line',
+                'yAxisIndex': 0,
+                'data': pnl_loss,
+                'smooth': True,
+                'showSymbol': False,
+                'lineStyle': {'width': 1.5, 'color': '#F44336'},
+                'itemStyle': {'color': '#F44336'},
+                'areaStyle': {'color': 'rgba(244, 67, 54, 0.3)'},
             })
 
-        # Cumulative dividends on additional y-axis (right)
-        has_drip = drip_enabled and any(q > 0 for q in drip_quantities)
+        # Cumulative dividends on same $ axis
         if has_dividends and last_div > 0:
-            div_axis_index = len(y_axes)
-            y_axes.append({
-                'type': 'value',
-                'name': 'Dividends ($)',
-                'nameTextStyle': {'color': '#4CAF50'},
-                'axisLabel': {'color': '#4CAF50', 'formatter': '${value}'},
-                'splitLine': {'show': False},
-            })
             series.append({
                 'name': 'Cumulative Dividends',
                 'type': 'line',
-                'yAxisIndex': div_axis_index,
+                'yAxisIndex': 0,
                 'data': cumulative_divs,
                 'smooth': True,
-                'lineStyle': {'width': 2, 'color': '#4CAF50'},
+                'showSymbol': False,
+                'lineStyle': {'width': 2, 'color': '#4CAF50', 'type': 'dashed'},
                 'itemStyle': {'color': '#4CAF50'},
             })
 
-            # DRIP Shares on another y-axis (right, offset)
+            # DRIP Shares on a right y-axis (the only secondary axis)
             if has_drip:
                 drip_axis_index = len(y_axes)
                 y_axes.append({
@@ -5817,7 +5845,6 @@ class AccountGrowthTab:
                     'nameTextStyle': {'color': '#FF9800'},
                     'axisLabel': {'color': '#FF9800'},
                     'splitLine': {'show': False},
-                    'offset': 60,
                 })
                 series.append({
                     'name': 'DRIP Shares (cumulative)',
@@ -5825,12 +5852,12 @@ class AccountGrowthTab:
                     'yAxisIndex': drip_axis_index,
                     'data': drip_quantities,
                     'smooth': True,
+                    'showSymbol': False,
                     'lineStyle': {'width': 2, 'color': '#FF9800', 'type': 'dashed'},
                     'itemStyle': {'color': '#FF9800'},
                 })
 
-        right_margin = '12%' if has_drip else '6%'
-        left_margin = '8%' if has_pnl else '3%'
+        right_margin = '8%' if has_drip else '3%'
 
         chart_options = {
             'backgroundColor': 'transparent',
@@ -5849,7 +5876,7 @@ class AccountGrowthTab:
                 'textStyle': {'color': '#a0aec0'},
                 'top': 30,
             },
-            'grid': {'left': left_margin, 'right': right_margin, 'bottom': '3%', 'containLabel': True},
+            'grid': {'left': '3%', 'right': right_margin, 'bottom': '3%', 'containLabel': True},
             'xAxis': {
                 'type': 'category',
                 'data': all_dates,
@@ -5858,17 +5885,6 @@ class AccountGrowthTab:
             'yAxis': y_axes,
             'series': series,
         }
-
-        # Add visualMap for P&L coloring (green positive, red negative)
-        if pnl_series_index is not None:
-            chart_options['visualMap'] = {
-                'show': False,
-                'seriesIndex': pnl_series_index,
-                'pieces': [
-                    {'min': 0, 'color': 'rgba(76, 175, 80, 0.5)'},
-                    {'max': 0, 'color': 'rgba(244, 67, 54, 0.5)'},
-                ],
-            }
 
         ui.echart(chart_options).classes('w-full h-80')
 
