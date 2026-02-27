@@ -5846,16 +5846,19 @@ class AccountGrowthTab:
                 'itemStyle': {'color': '#4CAF50'},
             })
 
-            # DRIP Shares on a right y-axis (the only secondary axis)
+            # DRIP Shares on a right y-axis, offset if P&L axis also present
             if has_drip:
                 drip_axis_index = len(y_axes)
-                y_axes.append({
+                drip_axis_def = {
                     'type': 'value',
                     'name': 'DRIP Shares',
                     'nameTextStyle': {'color': '#FF9800'},
                     'axisLabel': {'color': '#FF9800'},
                     'splitLine': {'show': False},
-                })
+                }
+                if has_pnl:
+                    drip_axis_def['offset'] = 60
+                y_axes.append(drip_axis_def)
                 series.append({
                     'name': 'DRIP Shares (cumulative)',
                     'type': 'line',
@@ -5871,7 +5874,7 @@ class AccountGrowthTab:
         if has_pnl:
             right_margin = '6%'
         if has_drip:
-            right_margin = '10%'
+            right_margin = '12%' if has_pnl else '8%'
 
         chart_options = {
             'backgroundColor': 'transparent',
