@@ -171,7 +171,7 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
                 cost_basis = avg_price * abs(qty) * multiplier
                 market_val = current * abs(qty) * multiplier
                 unrealized_pl = market_val - cost_basis
-                unrealized_plpc = (unrealized_pl / cost_basis * 100) if cost_basis else 0
+                unrealized_plpc = (unrealized_pl / cost_basis) if cost_basis else 0
 
                 side = OrderDirection.BUY if pos.quantity_direction == "Long" else OrderDirection.SELL
 
