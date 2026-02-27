@@ -5713,7 +5713,10 @@ class AccountGrowthTab:
         )
 
         # Build aligned series with forward-fill
+        # Position Value = purchased shares only (qty - DRIP shares) × price
+        # Total Value = all shares (qty including DRIP) × price — matches broker Net Liq
         position_values = []
+        total_values = []
         pnl_pct_data = []
         cumulative_divs = []
         drip_quantities = []
@@ -5725,10 +5728,18 @@ class AccountGrowthTab:
         for d in all_dates:
             if d in hist_prices:
                 last_price = hist_prices[d]
+            # Update dividend/drip tracking before position calc
+            if d in div_map:
+                last_div = div_map[d]['cumulative_div']
+                last_drip = div_map[d]['cumulative_drip']
+            cumulative_divs.append(last_div)
+            drip_quantities.append(last_drip)
+
             qty_at_date = qty_by_date.get(d, 0)
             if qty_at_date > 0 and last_price:
-                pos_val = round(qty_at_date * last_price, 2)
-                position_values.append(pos_val)
+                purchased_qty = max(qty_at_date - last_drip, 0)
+                position_values.append(round(purchased_qty * last_price, 2))
+                total_values.append(round(qty_at_date * last_price, 2))
                 # Use first close price as reference so P&L starts at 0%
                 if reference_price is None:
                     reference_price = last_price
@@ -5736,19 +5747,8 @@ class AccountGrowthTab:
                 pnl_pct_data.append(pnl_pct)
             else:
                 position_values.append(None)
+                total_values.append(None)
                 pnl_pct_data.append(None)
-
-            if d in div_map:
-                last_div = div_map[d]['cumulative_div']
-                last_drip = div_map[d]['cumulative_drip']
-            cumulative_divs.append(last_div)
-            drip_quantities.append(last_drip)
-
-        # Total Value = Position Value + Cumulative Dividends
-        total_values = [
-            round(pv + cd, 2) if pv is not None else None
-            for pv, cd in zip(position_values, cumulative_divs)
-        ]
 
         # Check if we have P&L data
         has_pnl = reference_price is not None and any(v is not None for v in pnl_pct_data)
@@ -5783,10 +5783,10 @@ class AccountGrowthTab:
             },
         }]
 
-        # Total Value (price + dividends) on same axis
+        # Total Value (all shares incl. DRIP) — matches broker Net Liq
         if has_dividends and last_div > 0:
             series.append({
-                'name': 'Total Value (Price + Div)',
+                'name': 'Total Value (incl. DRIP)',
                 'type': 'line',
                 'yAxisIndex': 0,
                 'data': total_values,
