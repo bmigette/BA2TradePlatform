@@ -5712,10 +5712,47 @@ class AccountGrowthTab:
             current_qty, filled_trades or [], all_dates, dividends=dividends
         )
 
+        # Build running cost basis from trades and DRIP events for accurate historical P&L.
+        # Using the static avg_entry_price is wrong because it includes DRIP buys that
+        # happened AFTER the initial purchase, making early dates look negative.
+        cost_events = {}  # date_str -> {'cost_delta': float, 'qty_delta': float}
+        for t in (filled_trades or []):
+            date_val = t.get('date')
+            if not date_val:
+                continue
+            d = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)[:10]
+            if d not in cost_events:
+                cost_events[d] = {'cost_delta': 0.0, 'qty_delta': 0.0}
+            tqty = float(t.get('qty', 0))
+            tprice = float(t.get('price', 0))
+            side = t.get('side', '')
+            if side == 'BUY':
+                cost_events[d]['cost_delta'] += tqty * tprice
+                cost_events[d]['qty_delta'] += tqty
+            elif side == 'SELL':
+                cost_events[d]['qty_delta'] -= tqty
+                # On sell, reduce cost proportionally (at current avg)
+                cost_events[d]['cost_delta'] -= tqty * tprice
+
+        if dividends:
+            for div in dividends:
+                drip_qty = div.get('drip_quantity')
+                drip_price = div.get('drip_price')
+                if not drip_qty or not drip_price:
+                    continue
+                date_val = div.get('date')
+                if not date_val:
+                    continue
+                d = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)[:10]
+                if d not in cost_events:
+                    cost_events[d] = {'cost_delta': 0.0, 'qty_delta': 0.0}
+                cost_events[d]['cost_delta'] += float(drip_qty) * float(drip_price)
+                cost_events[d]['qty_delta'] += float(drip_qty)
+
         # Build aligned series with forward-fill
         # Position Value = purchased shares only (qty - DRIP shares) × price
         # Total Value = all shares (qty including DRIP) × price — matches broker Net Liq
-        # P&L % = ((price - avg_entry) / avg_entry) * 100 — matches broker P/L Open%
+        # P&L % = ((price - running_avg) / running_avg) * 100 — evolves with cost basis
         position_values = []
         total_values = []
         pnl_pct_data = []
@@ -5724,6 +5761,8 @@ class AccountGrowthTab:
         last_price = None
         last_div = 0
         last_drip = 0
+        running_cost = 0.0
+        running_shares = 0.0
 
         for d in all_dates:
             if d in hist_prices:
@@ -5735,13 +5774,26 @@ class AccountGrowthTab:
             cumulative_divs.append(last_div)
             drip_quantities.append(last_drip)
 
+            # Update running cost basis
+            if d in cost_events:
+                evt = cost_events[d]
+                if evt['qty_delta'] < 0 and running_shares > 0:
+                    # For sells, reduce cost at current running avg (not sale price)
+                    running_avg = running_cost / running_shares
+                    running_cost += evt['qty_delta'] * running_avg
+                    running_shares += evt['qty_delta']
+                else:
+                    running_cost += evt['cost_delta']
+                    running_shares += evt['qty_delta']
+
             qty_at_date = qty_by_date.get(d, 0)
             if qty_at_date > 0 and last_price:
                 purchased_qty = max(qty_at_date - last_drip, 0)
                 position_values.append(round(purchased_qty * last_price, 2))
                 total_values.append(round(qty_at_date * last_price, 2))
-                if avg_entry_price > 0:
-                    pnl_pct = round((last_price - avg_entry_price) / avg_entry_price * 100, 2)
+                if running_shares > 0:
+                    running_avg = running_cost / running_shares
+                    pnl_pct = round((last_price - running_avg) / running_avg * 100, 2)
                     pnl_pct_data.append(pnl_pct)
                 else:
                     pnl_pct_data.append(None)
@@ -5751,7 +5803,7 @@ class AccountGrowthTab:
                 pnl_pct_data.append(None)
 
         # Check if we have P&L data
-        has_pnl = avg_entry_price > 0 and any(v is not None for v in pnl_pct_data)
+        has_pnl = any(v is not None for v in pnl_pct_data)
         has_drip = drip_enabled and any(q > 0 for q in drip_quantities)
 
         # Single left axis for all $ values; optional right axis for DRIP shares only
