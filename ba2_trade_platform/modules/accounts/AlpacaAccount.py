@@ -4315,8 +4315,9 @@ class AlpacaAccount(AccountInterface):
                 snapshots.append({
                     'date': datetime.fromtimestamp(ts, tz=timezone.utc) if isinstance(ts, (int, float)) else ts,
                     'net_liquidating_value': equity,
-                    'cash_balance': equity - pnl,  # Approximate: equity minus day's P&L
-                    'equity_value': pnl
+                    'cash_balance': 0.0,  # Not available from Alpaca portfolio history API
+                    'equity_value': equity,
+                    'profit_loss': pnl,  # Daily P/L from Alpaca (excludes external flows)
                 })
 
             logger.debug(f"[Account {self.id}] Retrieved {len(snapshots)} balance history snapshots")

@@ -5185,6 +5185,8 @@ class AccountGrowthTab:
             balance_dates_set = set()
             per_account_data = {}  # account_id -> {date_str: nlv}
             per_account_cash = {}  # account_id -> {date_str: cash_balance}
+            daily_pl_by_date = {}  # date_str -> sum of daily P/L across accounts
+            has_daily_pl = False
             if balance_history:
                 for entry in balance_history:
                     date_val = entry.get('date')
@@ -5198,6 +5200,11 @@ class AccountGrowthTab:
                         per_account_cash[acc_id] = {}
                     per_account_data[acc_id][date_str] = float(entry.get('net_liquidating_value', 0))
                     per_account_cash[acc_id][date_str] = float(entry.get('cash_balance', 0))
+                    # Collect daily P/L when provided (e.g. Alpaca)
+                    pl = entry.get('profit_loss')
+                    if pl is not None:
+                        has_daily_pl = True
+                        daily_pl_by_date[date_str] = daily_pl_by_date.get(date_str, 0.0) + float(pl)
 
             # Prepare cumulative dividend series
             div_dates_set = set()
@@ -5243,61 +5250,88 @@ class AccountGrowthTab:
                     last_div = div_by_date[d]
                 aligned_div.append(last_div)
 
-            # Compute P/L % by detecting external cash flows (deposits/withdrawals)
-            # External flow = actual_cash_change - expected_cash_change_from_trades_and_dividends
-            trade_cash_by_date = {}  # date_str -> net cash impact from trades
-            for t in (all_filled_trades or []):
-                date_val = t.get('date')
-                if not date_val:
-                    continue
-                d = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)[:10]
-                tqty = float(t.get('qty', 0))
-                tprice = float(t.get('price', 0))
-                side = t.get('side', '')
-                if side == 'BUY':
-                    trade_cash_by_date[d] = trade_cash_by_date.get(d, 0.0) - tqty * tprice
-                elif side == 'SELL':
-                    trade_cash_by_date[d] = trade_cash_by_date.get(d, 0.0) + tqty * tprice
-
-            div_cash_by_date = {}  # date_str -> net cash impact from dividends (incl. DRIP outflow)
-            for div in (dividends or []):
-                date_val = div.get('date')
-                if not date_val:
-                    continue
-                d = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)[:10]
-                amount = float(div.get('amount', 0))
-                tax = float(div.get('tax_withheld', 0))
-                cash_in = amount - tax
-                drip_qty = div.get('drip_quantity')
-                drip_price = div.get('drip_price')
-                cash_out = float(drip_qty) * float(drip_price) if drip_qty and drip_price else 0.0
-                div_cash_by_date[d] = div_cash_by_date.get(d, 0.0) + cash_in - cash_out
-
+            # Compute P/L % by detecting external cash flows (deposits/withdrawals).
+            # Two approaches depending on available data:
+            # 1. If balance history includes daily P/L (e.g. Alpaca): external_flow = ΔNLV - daily_pl
+            # 2. Fallback (e.g. TastyTrade): external_flow = Δcash - expected_trade/dividend_cash
             pnl_pct_data = []
             invested_capital = None
-            prev_cash = None
-            for i, d in enumerate(all_dates):
-                nlv = aligned_balance[i] if i < len(aligned_balance) else 0
-                cash = aligned_cash[i] if i < len(aligned_cash) else 0.0
-                if invested_capital is None:
-                    invested_capital = nlv
+
+            if has_daily_pl:
+                # Direct approach using daily P/L from broker API
+                for i, d in enumerate(all_dates):
+                    nlv = aligned_balance[i] if i < len(aligned_balance) else 0
+                    if invested_capital is None:
+                        invested_capital = nlv
+                        pnl_pct_data.append(0.0)
+                        continue
+
+                    prev_nlv = aligned_balance[i - 1] if i > 0 else nlv
+                    delta_nlv = nlv - prev_nlv
+                    daily_pl = daily_pl_by_date.get(d, 0.0)
+                    external_flow = delta_nlv - daily_pl
+                    if abs(external_flow) > 1.0:
+                        invested_capital += external_flow
+
+                    if invested_capital > 0:
+                        pnl = nlv - invested_capital
+                        pnl_pct = round(pnl / invested_capital * 100, 2)
+                        pnl_pct_data.append(pnl_pct)
+                    else:
+                        pnl_pct_data.append(None)
+            else:
+                # Fallback: detect external flows from cash balance changes
+                trade_cash_by_date = {}
+                for t in (all_filled_trades or []):
+                    date_val = t.get('date')
+                    if not date_val:
+                        continue
+                    d = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)[:10]
+                    tqty = float(t.get('qty', 0))
+                    tprice = float(t.get('price', 0))
+                    side = t.get('side', '')
+                    if side == 'BUY':
+                        trade_cash_by_date[d] = trade_cash_by_date.get(d, 0.0) - tqty * tprice
+                    elif side == 'SELL':
+                        trade_cash_by_date[d] = trade_cash_by_date.get(d, 0.0) + tqty * tprice
+
+                div_cash_by_date = {}
+                for div in (dividends or []):
+                    date_val = div.get('date')
+                    if not date_val:
+                        continue
+                    d = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)[:10]
+                    amount = float(div.get('amount', 0))
+                    tax = float(div.get('tax_withheld', 0))
+                    cash_in = amount - tax
+                    drip_qty = div.get('drip_quantity')
+                    drip_price = div.get('drip_price')
+                    cash_out = float(drip_qty) * float(drip_price) if drip_qty and drip_price else 0.0
+                    div_cash_by_date[d] = div_cash_by_date.get(d, 0.0) + cash_in - cash_out
+
+                prev_cash = None
+                for i, d in enumerate(all_dates):
+                    nlv = aligned_balance[i] if i < len(aligned_balance) else 0
+                    cash = aligned_cash[i] if i < len(aligned_cash) else 0.0
+                    if invested_capital is None:
+                        invested_capital = nlv
+                        prev_cash = cash
+                        pnl_pct_data.append(0.0)
+                        continue
+
+                    actual_cash_change = cash - prev_cash
+                    expected_cash_change = trade_cash_by_date.get(d, 0.0) + div_cash_by_date.get(d, 0.0)
+                    external_flow = actual_cash_change - expected_cash_change
+                    if abs(external_flow) > 1.0:
+                        invested_capital += external_flow
+
+                    if invested_capital > 0:
+                        pnl = nlv - invested_capital
+                        pnl_pct = round(pnl / invested_capital * 100, 2)
+                        pnl_pct_data.append(pnl_pct)
+                    else:
+                        pnl_pct_data.append(None)
                     prev_cash = cash
-                    pnl_pct_data.append(0.0)
-                    continue
-
-                actual_cash_change = cash - prev_cash
-                expected_cash_change = trade_cash_by_date.get(d, 0.0) + div_cash_by_date.get(d, 0.0)
-                external_flow = actual_cash_change - expected_cash_change
-                if abs(external_flow) > 1.0:
-                    invested_capital += external_flow
-
-                if invested_capital > 0:
-                    pnl = nlv - invested_capital
-                    pnl_pct = round(pnl / invested_capital * 100, 2)
-                    pnl_pct_data.append(pnl_pct)
-                else:
-                    pnl_pct_data.append(None)
-                prev_cash = cash
 
             has_pnl = any(v is not None and v != 0 for v in pnl_pct_data)
 
