@@ -5715,6 +5715,7 @@ class AccountGrowthTab:
         # Build aligned series with forward-fill
         # Position Value = purchased shares only (qty - DRIP shares) × price
         # Total Value = all shares (qty including DRIP) × price — matches broker Net Liq
+        # P&L % = ((price - avg_entry) / avg_entry) * 100 — matches broker P/L Open%
         position_values = []
         total_values = []
         pnl_pct_data = []
@@ -5723,7 +5724,6 @@ class AccountGrowthTab:
         last_price = None
         last_div = 0
         last_drip = 0
-        reference_price = None  # First close price when position existed — P&L % reference
 
         for d in all_dates:
             if d in hist_prices:
@@ -5740,18 +5740,18 @@ class AccountGrowthTab:
                 purchased_qty = max(qty_at_date - last_drip, 0)
                 position_values.append(round(purchased_qty * last_price, 2))
                 total_values.append(round(qty_at_date * last_price, 2))
-                # Use first close price as reference so P&L starts at 0%
-                if reference_price is None:
-                    reference_price = last_price
-                pnl_pct = round((last_price - reference_price) / reference_price * 100, 2)
-                pnl_pct_data.append(pnl_pct)
+                if avg_entry_price > 0:
+                    pnl_pct = round((last_price - avg_entry_price) / avg_entry_price * 100, 2)
+                    pnl_pct_data.append(pnl_pct)
+                else:
+                    pnl_pct_data.append(None)
             else:
                 position_values.append(None)
                 total_values.append(None)
                 pnl_pct_data.append(None)
 
         # Check if we have P&L data
-        has_pnl = reference_price is not None and any(v is not None for v in pnl_pct_data)
+        has_pnl = avg_entry_price > 0 and any(v is not None for v in pnl_pct_data)
         has_drip = drip_enabled and any(q > 0 for q in drip_quantities)
 
         # Single left axis for all $ values; optional right axis for DRIP shares only
@@ -5811,7 +5811,7 @@ class AccountGrowthTab:
             pnl_loss = [min(v, 0) if v is not None else None for v in pnl_pct_data]
 
             series.append({
-                'name': 'P&L (Profit)',
+                'name': 'P&L % (Profit)',
                 'type': 'line',
                 'yAxisIndex': pnl_axis_index,
                 'data': pnl_profit,
@@ -5822,7 +5822,7 @@ class AccountGrowthTab:
                 'areaStyle': {'color': 'rgba(76, 175, 80, 0.3)'},
             })
             series.append({
-                'name': 'P&L (Loss)',
+                'name': 'P&L % (Loss)',
                 'type': 'line',
                 'yAxisIndex': pnl_axis_index,
                 'data': pnl_loss,
