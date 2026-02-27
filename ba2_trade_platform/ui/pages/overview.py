@@ -4904,6 +4904,49 @@ def _extract_yf_close_prices(hist_data, symbol):
         return {}
 
 
+def _pnl_color_gradient(pnl_data, positive_color, negative_color):
+    """
+    Compute a horizontal linear gradient that changes color at zero-crossings.
+
+    Returns either a solid color string (when all values share the same sign)
+    or an ECharts LinearGradient dict whose color stops flip at every point
+    where the P&L data crosses zero.
+    """
+    valid = [(i, v) for i, v in enumerate(pnl_data) if v is not None]
+    n = len(pnl_data)
+
+    if not valid or n < 2:
+        return positive_color
+
+    if all(v >= 0 for _, v in valid):
+        return positive_color
+    if all(v < 0 for _, v in valid):
+        return negative_color
+
+    stops = []
+    first_color = positive_color if valid[0][1] >= 0 else negative_color
+    stops.append({'offset': 0, 'color': first_color})
+
+    for j in range(1, len(valid)):
+        prev_idx, prev_v = valid[j - 1]
+        curr_idx, curr_v = valid[j]
+        if (prev_v >= 0) != (curr_v >= 0):
+            prev_offset = prev_idx / (n - 1)
+            curr_offset = curr_idx / (n - 1)
+            ratio = abs(prev_v) / (abs(prev_v) + abs(curr_v))
+            cross_offset = prev_offset + ratio * (curr_offset - prev_offset)
+            stops.append({'offset': cross_offset, 'color': positive_color if prev_v >= 0 else negative_color})
+            stops.append({'offset': cross_offset, 'color': positive_color if curr_v >= 0 else negative_color})
+
+    last_color = positive_color if valid[-1][1] >= 0 else negative_color
+    stops.append({'offset': 1, 'color': last_color})
+
+    return {
+        'type': 'linear', 'x': 0, 'y': 0, 'x2': 1, 'y2': 0,
+        'colorStops': stops,
+    }
+
+
 def _build_qty_timeline(current_qty, filled_trades, all_dates, dividends=None):
     """
     Build a mapping of date -> qty by walking backwards from current_qty through filled trades
@@ -5306,10 +5349,12 @@ class AccountGrowthTab:
                     }
                 })
 
-            # P/L % on right y-axis with green/red color mapping
-            pnl_series_index = None
+            # P/L % on right y-axis with gradient color (green positive, red negative)
             if has_pnl:
-                pnl_series_index = len(series)
+                pnl_line_color = _pnl_color_gradient(pnl_pct_data, '#4CAF50', '#F44336')
+                pnl_area_color = _pnl_color_gradient(
+                    pnl_pct_data, 'rgba(76, 175, 80, 0.3)', 'rgba(244, 67, 54, 0.3)',
+                )
                 series.append({
                     'name': 'P&L %',
                     'type': 'line',
@@ -5317,8 +5362,9 @@ class AccountGrowthTab:
                     'data': pnl_pct_data,
                     'smooth': True,
                     'showSymbol': False,
-                    'lineStyle': {'width': 1.5},
-                    'areaStyle': {'opacity': 0.3},
+                    'lineStyle': {'width': 1.5, 'color': pnl_line_color},
+                    'itemStyle': {'color': '#4CAF50'},
+                    'areaStyle': {'color': pnl_area_color, 'origin': 'auto'},
                 })
 
             right_margin = '6%' if has_pnl else '3%'
@@ -5346,17 +5392,6 @@ class AccountGrowthTab:
                 'yAxis': y_axes,
                 'series': series,
             }
-
-            if pnl_series_index is not None:
-                chart_options['visualMap'] = {
-                    'show': False,
-                    'type': 'piecewise',
-                    'seriesIndex': pnl_series_index,
-                    'pieces': [
-                        {'gte': 0, 'color': '#4CAF50'},
-                        {'lt': 0, 'color': '#F44336'},
-                    ],
-                }
 
             ui.echart(chart_options).classes('w-full h-96')
 
@@ -5961,8 +5996,7 @@ class AccountGrowthTab:
                 'itemStyle': {'color': '#AB47BC'},
             })
 
-        # P&L % on a separate right axis with green/red color mapping
-        pnl_series_index = None
+        # P&L % on a separate right axis with gradient color (green positive, red negative)
         if has_pnl:
             pnl_axis_index = len(y_axes)
             y_axes.append({
@@ -5973,7 +6007,10 @@ class AccountGrowthTab:
                 'splitLine': {'show': False},
             })
 
-            pnl_series_index = len(series)
+            pnl_line_color = _pnl_color_gradient(pnl_pct_data, '#4CAF50', '#F44336')
+            pnl_area_color = _pnl_color_gradient(
+                pnl_pct_data, 'rgba(76, 175, 80, 0.3)', 'rgba(244, 67, 54, 0.3)',
+            )
             series.append({
                 'name': 'P&L %',
                 'type': 'line',
@@ -5981,8 +6018,9 @@ class AccountGrowthTab:
                 'data': pnl_pct_data,
                 'smooth': True,
                 'showSymbol': False,
-                'lineStyle': {'width': 1.5},
-                'areaStyle': {'opacity': 0.3},
+                'lineStyle': {'width': 1.5, 'color': pnl_line_color},
+                'itemStyle': {'color': '#4CAF50'},
+                'areaStyle': {'color': pnl_area_color, 'origin': 'auto'},
             })
 
         # Cumulative dividends on same $ axis
@@ -6054,17 +6092,6 @@ class AccountGrowthTab:
             'yAxis': y_axes,
             'series': series,
         }
-
-        if pnl_series_index is not None:
-            chart_options['visualMap'] = {
-                'show': False,
-                'type': 'piecewise',
-                'seriesIndex': pnl_series_index,
-                'pieces': [
-                    {'gte': 0, 'color': '#4CAF50'},
-                    {'lt': 0, 'color': '#F44336'},
-                ],
-            }
 
         ui.echart(chart_options).classes('w-full h-80')
 
