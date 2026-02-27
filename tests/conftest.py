@@ -164,6 +164,9 @@ class MockAccount(AccountInterface):
     def get_dividends(self, symbol=None, start_date=None, end_date=None):
         return []
 
+    def get_filled_trades(self, symbol=None, start_date=None, end_date=None):
+        return []
+
     def get_balance_history(self, start_date=None, end_date=None):
         return []
 

@@ -685,6 +685,26 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         pass
 
     @abstractmethod
+    def get_filled_trades(self, symbol: Optional[str] = None, start_date: Optional[datetime] = None, end_date: Optional[datetime] = None) -> List[Dict]:
+        """
+        Get filled trade history for this account.
+
+        Args:
+            symbol: Optional symbol to filter by. If None, returns trades for all symbols.
+            start_date: Optional start date filter.
+            end_date: Optional end date filter.
+
+        Returns:
+            List[Dict]: Each containing:
+                - symbol (str): The stock symbol
+                - qty (float): Filled quantity (always positive)
+                - side (str): 'BUY' or 'SELL'
+                - date (datetime): Date the trade was filled
+                - price (float): Fill price per share
+        """
+        pass
+
+    @abstractmethod
     def get_balance_history(self, start_date: Optional[datetime] = None, end_date: Optional[datetime] = None) -> List[Dict]:
         """
         Get historical balance/equity data for the account.

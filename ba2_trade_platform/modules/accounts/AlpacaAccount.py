@@ -4330,3 +4330,52 @@ class AlpacaAccount(AccountInterface):
         """Check if DRIP is enabled via account settings."""
         return bool(self.settings.get("drip_enabled", False))
 
+    def get_filled_trades(self, symbol=None, start_date=None, end_date=None):
+        """Get filled trade history from Alpaca closed orders."""
+        if not self._check_authentication():
+            return []
+
+        try:
+            raw_orders = self._fetch_raw_alpaca_orders(status=OrderStatus.CLOSED, fetch_all=True)
+            trades = []
+            for order in raw_orders:
+                filled_qty = float(getattr(order, 'filled_qty', 0) or 0)
+                if filled_qty <= 0:
+                    continue
+
+                order_symbol = getattr(order, 'symbol', None)
+                if symbol and order_symbol != symbol:
+                    continue
+
+                filled_at = getattr(order, 'filled_at', None) or getattr(order, 'created_at', None)
+                if filled_at:
+                    if start_date and filled_at < start_date:
+                        continue
+                    if end_date and filled_at > end_date:
+                        continue
+
+                # Normalize side from Alpaca enum
+                side_raw = getattr(order, 'side', None)
+                side_str = str(side_raw).lower() if side_raw else ''
+                if 'buy' in side_str:
+                    side = 'BUY'
+                else:
+                    side = 'SELL'
+
+                filled_price = float(getattr(order, 'filled_avg_price', 0) or 0)
+
+                trades.append({
+                    'symbol': order_symbol,
+                    'qty': filled_qty,
+                    'side': side,
+                    'date': filled_at,
+                    'price': filled_price,
+                })
+
+            logger.debug(f"[Account {self.id}] Retrieved {len(trades)} filled trades")
+            return trades
+
+        except Exception as e:
+            logger.error(f"[Account {self.id}] Error fetching filled trades: {e}", exc_info=True)
+            return []
+

@@ -480,3 +480,56 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
 
     def is_drip_enabled(self) -> bool:
         return bool(self.settings.get("drip_enabled", False))
+
+    def get_filled_trades(self, symbol=None, start_date=None, end_date=None) -> List[Dict]:
+        """Get filled trade history from TastyTrade transaction history."""
+        if not self._check_authentication():
+            return []
+
+        try:
+            params = {
+                "types": ["Trade"],
+                "sort": "Asc",
+            }
+            if symbol:
+                params["symbol"] = symbol
+            if start_date:
+                params["start_date"] = start_date.date() if isinstance(start_date, datetime) else start_date
+            if end_date:
+                params["end_date"] = end_date.date() if isinstance(end_date, datetime) else end_date
+
+            transactions = self._run_async(self._account.get_history(self._session, **params))
+
+            trades = []
+            for txn in transactions:
+                txn_symbol = getattr(txn, 'underlying_symbol', None) or getattr(txn, 'symbol', None)
+                txn_qty = float(getattr(txn, 'quantity', 0) or 0)
+                if txn_qty <= 0:
+                    continue
+
+                txn_date = getattr(txn, 'transaction_date', None) or getattr(txn, 'executed_at', None)
+                txn_price = float(getattr(txn, 'price', 0) or 0)
+
+                # Determine side from action field
+                action = str(getattr(txn, 'action', '') or '').lower()
+                if 'buy' in action:
+                    side = 'BUY'
+                elif 'sell' in action:
+                    side = 'SELL'
+                else:
+                    continue
+
+                trades.append({
+                    'symbol': txn_symbol,
+                    'qty': txn_qty,
+                    'side': side,
+                    'date': txn_date,
+                    'price': txn_price,
+                })
+
+            logger.debug(f"[Account {self.id}] Retrieved {len(trades)} filled trades")
+            return trades
+
+        except Exception as e:
+            logger.error(f"[Account {self.id}] Error fetching filled trades: {e}", exc_info=True)
+            return []
