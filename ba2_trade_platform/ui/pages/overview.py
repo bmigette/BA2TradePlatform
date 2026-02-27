@@ -4913,15 +4913,23 @@ def _pnl_color_gradient(pnl_data, positive_color, negative_color):
     where the P&L data crosses zero.
     """
     valid = [(i, v) for i, v in enumerate(pnl_data) if v is not None]
-    n = len(pnl_data)
 
-    if not valid or n < 2:
+    if not valid or len(valid) < 2:
         return positive_color
 
     if all(v >= 0 for _, v in valid):
         return positive_color
     if all(v < 0 for _, v in valid):
         return negative_color
+
+    # Offsets must be relative to the visible line bounding box (first to last
+    # non-None point), not the full data array, because ECharts maps the
+    # gradient to the rendered line extent.
+    first_valid_idx = valid[0][0]
+    last_valid_idx = valid[-1][0]
+    span = last_valid_idx - first_valid_idx
+    if span == 0:
+        return positive_color if valid[0][1] >= 0 else negative_color
 
     stops = []
     first_color = positive_color if valid[0][1] >= 0 else negative_color
@@ -4931,8 +4939,8 @@ def _pnl_color_gradient(pnl_data, positive_color, negative_color):
         prev_idx, prev_v = valid[j - 1]
         curr_idx, curr_v = valid[j]
         if (prev_v >= 0) != (curr_v >= 0):
-            prev_offset = prev_idx / (n - 1)
-            curr_offset = curr_idx / (n - 1)
+            prev_offset = (prev_idx - first_valid_idx) / span
+            curr_offset = (curr_idx - first_valid_idx) / span
             ratio = abs(prev_v) / (abs(prev_v) + abs(curr_v))
             cross_offset = prev_offset + ratio * (curr_offset - prev_offset)
             stops.append({'offset': cross_offset, 'color': positive_color if prev_v >= 0 else negative_color})
