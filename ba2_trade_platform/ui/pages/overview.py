@@ -5158,6 +5158,7 @@ class AccountGrowthTab:
                 with charts_container:
                     self._render_total_growth_chart(all_balance_history, all_dividends, all_filled_trades)
                     self._render_growth_by_label_charts(all_positions, historical_prices, all_dividends, all_filled_trades)
+                    self._render_growth_by_position_in_label_charts(all_positions, historical_prices, all_dividends, all_filled_trades)
                     self._render_dividend_history_table(all_dividends)
                     self._render_per_position_section(all_positions, account_map, all_filled_trades, all_dividends)
             except RuntimeError:
@@ -5681,6 +5682,225 @@ class AccountGrowthTab:
                     ui.echart(build_chart_options(visible)).classes('w-full h-80')
 
             label_select.on_value_change(on_label_filter_change)
+
+    def _render_growth_by_position_in_label_charts(self, all_positions, historical_prices=None, all_dividends=None, all_filled_trades=None):
+        """Render historical growth line chart for individual positions within a selected label."""
+        from ...core.models import Instrument
+        from ...core.db import get_db
+        from sqlmodel import select as sql_select
+
+        if not all_positions:
+            return
+
+        historical_prices = historical_prices or {}
+
+        # Get all instruments and their labels
+        symbol_labels = {}
+        try:
+            with get_db() as session:
+                instruments = session.exec(sql_select(Instrument)).all()
+                for inst in instruments:
+                    if inst.labels:
+                        symbol_labels[inst.name] = inst.labels
+        except Exception as e:
+            logger.warning(f"Could not load instrument labels: {e}")
+
+        # Build position map: symbol -> {qty, cost_basis, labels}
+        symbol_info = {}
+        for pos in all_positions:
+            labels = symbol_labels.get(pos.symbol, ['Unlabeled'])
+            if pos.symbol not in symbol_info:
+                symbol_info[pos.symbol] = {'qty': 0, 'cost_basis': 0, 'labels': labels}
+            symbol_info[pos.symbol]['qty'] += pos.qty
+            symbol_info[pos.symbol]['cost_basis'] += pos.cost_basis
+
+        if not symbol_info:
+            return
+
+        # Build all dates from historical data
+        all_dates_set = set()
+        for sym_prices in historical_prices.values():
+            all_dates_set.update(sym_prices.keys())
+        all_dates = sorted(all_dates_set)
+
+        if not all_dates:
+            return
+
+        # Get all labels
+        all_labels_set = set()
+        for info in symbol_info.values():
+            all_labels_set.update(info['labels'])
+        all_labels = sorted(all_labels_set)
+
+        if not all_labels:
+            return
+
+        # Build per-symbol qty timelines
+        sym_qty_timelines = {}
+        for sym, info in symbol_info.items():
+            sym_trades = [t for t in (all_filled_trades or []) if t.get('symbol') == sym]
+            sym_divs = [d for d in (all_dividends or []) if d.get('symbol') == sym]
+            qty_by_date, _ = _build_qty_timeline(info['qty'], sym_trades, all_dates, dividends=sym_divs)
+            sym_qty_timelines[sym] = qty_by_date
+
+        # Build per-symbol daily market values
+        sym_daily_values = {}
+        for sym, info in symbol_info.items():
+            sym_prices = historical_prices.get(sym, {})
+            if not sym_prices:
+                continue
+            qty_timeline = sym_qty_timelines.get(sym, {})
+            values = [0.0] * len(all_dates)
+            for i, d in enumerate(all_dates):
+                qty_at_date = qty_timeline.get(d, 0)
+                if qty_at_date <= 0:
+                    continue
+                price = sym_prices.get(d)
+                if price is not None:
+                    values[i] = qty_at_date * price
+                else:
+                    last_price = None
+                    for prev_d in all_dates[:i]:
+                        if prev_d in sym_prices:
+                            last_price = sym_prices[prev_d]
+                    if last_price is not None:
+                        values[i] = qty_at_date * last_price
+            sym_daily_values[sym] = values
+
+        # Build per-symbol cumulative dividends
+        sym_cum_divs = {sym: [0.0] * len(all_dates) for sym in symbol_info}
+        if all_dividends:
+            for div in all_dividends:
+                sym = div.get('symbol')
+                if not sym or sym not in symbol_info:
+                    continue
+                date_val = div.get('date')
+                if not date_val:
+                    continue
+                date_str = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)
+                amount = float(div.get('amount', 0)) - float(div.get('tax_withheld', 0))
+                if date_str in all_dates:
+                    idx = all_dates.index(date_str)
+                    sym_cum_divs[sym][idx] += amount
+            for sym in symbol_info:
+                for i in range(1, len(all_dates)):
+                    sym_cum_divs[sym][i] += sym_cum_divs[sym][i - 1]
+                sym_cum_divs[sym] = [round(v, 2) for v in sym_cum_divs[sym]]
+
+        colors = ['#1976D2', '#4CAF50', '#FF9800', '#E91E63', '#9C27B0',
+                  '#00BCD4', '#FF5722', '#795548', '#607D8B', '#CDDC39']
+
+        with ui.card().classes('w-full mb-4 p-4'):
+            ui.label('Growth by Position (within Label)').classes('text-md font-bold mb-2')
+
+            def get_symbols_for_label(label):
+                return sorted([sym for sym, info in symbol_info.items() if label in info['labels']])
+
+            def build_position_chart_options(label):
+                symbols = get_symbols_for_label(label)
+                series = []
+                legend_data = []
+                has_divs = (
+                    any(sym_cum_divs[sym][-1] > 0 for sym in symbols if sym in sym_cum_divs)
+                    if all_dates else False
+                )
+                for i, sym in enumerate(symbols):
+                    if sym not in sym_daily_values:
+                        continue
+                    color = colors[i % len(colors)]
+                    series.append({
+                        'name': sym,
+                        'type': 'line',
+                        'data': [round(v, 2) for v in sym_daily_values[sym]],
+                        'smooth': True,
+                        'lineStyle': {'width': 2, 'color': color},
+                        'itemStyle': {'color': color},
+                        'showSymbol': False,
+                    })
+                    legend_data.append(sym)
+
+                if has_divs:
+                    for i, sym in enumerate(symbols):
+                        if sym not in sym_cum_divs:
+                            continue
+                        color = colors[i % len(colors)]
+                        if sym_cum_divs[sym][-1] > 0:
+                            div_name = f'{sym} (Dividends)'
+                            series.append({
+                                'name': div_name,
+                                'type': 'line',
+                                'data': sym_cum_divs[sym],
+                                'smooth': True,
+                                'lineStyle': {'width': 1.5, 'color': color, 'type': 'dashed'},
+                                'itemStyle': {'color': color},
+                                'showSymbol': False,
+                            })
+                            legend_data.append(div_name)
+
+                            total_name = f'{sym} (Total)'
+                            total_data = [
+                                round(pv + dv, 2)
+                                for pv, dv in zip(sym_daily_values[sym], sym_cum_divs[sym])
+                            ]
+                            series.append({
+                                'name': total_name,
+                                'type': 'line',
+                                'data': total_data,
+                                'smooth': True,
+                                'lineStyle': {'width': 1.5, 'color': color, 'type': 'dotted'},
+                                'itemStyle': {'color': color},
+                                'showSymbol': False,
+                            })
+                            legend_data.append(total_name)
+
+                return {
+                    'backgroundColor': 'transparent',
+                    'tooltip': {
+                        'trigger': 'axis',
+                        'backgroundColor': 'rgba(37, 43, 59, 0.95)',
+                        'borderColor': 'rgba(255, 255, 255, 0.1)',
+                        'textStyle': {'color': '#ffffff'},
+                    },
+                    'legend': {
+                        'data': legend_data,
+                        'textStyle': {'color': '#a0aec0'},
+                        'top': 5,
+                    },
+                    'grid': {'left': '3%', 'right': '3%', 'bottom': '3%', 'containLabel': True},
+                    'xAxis': {
+                        'type': 'category',
+                        'data': all_dates,
+                        'axisLabel': {'color': '#a0aec0', 'rotate': 45, 'fontSize': 10},
+                        'axisLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.1)'}},
+                    },
+                    'yAxis': {
+                        'type': 'value',
+                        'axisLabel': {'color': '#a0aec0', 'formatter': '${value}'},
+                        'splitLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.05)'}},
+                    },
+                    'series': series,
+                }
+
+            default_label = next((l for l in all_labels if l != 'auto_added'), all_labels[0])
+
+            label_select = ui.select(
+                options=all_labels,
+                value=default_label,
+                label='Select Label',
+            ).classes('w-64 mb-2')
+
+            position_chart_container = ui.column().classes('w-full')
+            with position_chart_container:
+                ui.echart(build_position_chart_options(default_label)).classes('w-full h-80')
+
+            def on_position_label_change(e):
+                if not e.value:
+                    return
+                position_chart_container.clear()
+                with position_chart_container:
+                    ui.echart(build_position_chart_options(e.value)).classes('w-full h-80')
+
+            label_select.on_value_change(on_position_label_change)
 
     def _render_dividend_history_table(self, dividends):
         """Render a paginated table of dividend history for the last 6 months."""
