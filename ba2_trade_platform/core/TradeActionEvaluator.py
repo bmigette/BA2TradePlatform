@@ -7,7 +7,7 @@ and execute appropriate trading actions based on the evaluation results.
 
 from typing import List, Dict, Any, Optional, Tuple
 from .TradeConditions import TradeCondition, create_condition
-from .TradeActions import TradeAction, create_action
+from .TradeActions import TradeAction, create_action, AdjustTakeProfitAction, AdjustStopLossAction, IncreaseInstrumentShareAction, DecreaseInstrumentShareAction
 from .interfaces import AccountInterface
 from .models import Ruleset, EventAction, TradingOrder, TradeActionResult, ExpertRecommendation
 from .types import OrderRecommendation, ExpertEventType, ExpertActionType
@@ -237,7 +237,31 @@ class TradeActionEvaluator:
                 else:
                     logger.warning(f"Action {action.__class__.__name__} has unknown type ({action_type}) and will not be executed")
 
-            logger.info(f"📊 Categorized actions: {len(order_creating_actions)} order-creating, {len(adjustment_actions)} adjustments, {len(share_adjustment_actions)} share-adjustments")
+            # Deduplicate: keep only the last TP and last SL action (multiple conflicting TP/SL actions
+            # would create multiple OCO orders and override each other — only the last matters)
+            tp_actions = [a for a in adjustment_actions if isinstance(a, AdjustTakeProfitAction)]
+            sl_actions = [a for a in adjustment_actions if isinstance(a, AdjustStopLossAction)]
+            if len(tp_actions) > 1:
+                logger.warning(f"Multiple TP actions ({len(tp_actions)}) found for {self.instrument_name} — keeping only last")
+            if len(sl_actions) > 1:
+                logger.warning(f"Multiple SL actions ({len(sl_actions)}) found for {self.instrument_name} — keeping only last")
+            last_tp_action = tp_actions[-1] if tp_actions else None
+            last_sl_action = sl_actions[-1] if sl_actions else None
+            adjustment_actions = [a for a in [last_tp_action, last_sl_action] if a is not None]
+
+            # Deduplicate share adjustment actions: keep only the last INCREASE and last DECREASE
+            increase_actions = [a for a in share_adjustment_actions if isinstance(a, IncreaseInstrumentShareAction)]
+            decrease_actions = [a for a in share_adjustment_actions if isinstance(a, DecreaseInstrumentShareAction)]
+            if len(increase_actions) > 1:
+                logger.warning(f"Multiple INCREASE_SHARE actions ({len(increase_actions)}) found for {self.instrument_name} — keeping only last")
+            if len(decrease_actions) > 1:
+                logger.warning(f"Multiple DECREASE_SHARE actions ({len(decrease_actions)}) found for {self.instrument_name} — keeping only last")
+            share_adjustment_actions = [a for a in [
+                increase_actions[-1] if increase_actions else None,
+                decrease_actions[-1] if decrease_actions else None
+            ] if a is not None]
+
+            logger.info(f"📊 Categorized actions: {len(order_creating_actions)} order-creating, {len(adjustment_actions)} adjustments (deduped), {len(share_adjustment_actions)} share-adjustments (deduped)")
             
             # Validate: If we have adjustment actions, we need either order-creating actions OR existing transactions
             if adjustment_actions and not order_creating_actions and not self.existing_transactions:
@@ -391,57 +415,104 @@ class TradeActionEvaluator:
                         logger.warning(f"Failed to log TP/SL adjustment failure activity: {log_error}")
                 
                 # Execute adjustment actions for each order
+                # When both TP and SL are present, merge into a single adjust_tp_sl call
                 for order in orders_to_adjust:
-                    for action in adjustment_actions:
-                        try:
-                            # Update action's existing_order to the current order
-                            action.existing_order = order
-                            
-                            # Attach evaluation details to the action for storage in TradeActionResult
-                            action.evaluation_details = evaluation_details
-                            # Set the submit_to_broker flag on the action
-                            action.submit_to_broker = self.submit_to_broker
-                            
-                            logger.info(f"Phase 2 - Adjusting order {order.id}: {action.get_description()}")
-                            
-                            execution_result = action.execute()
-                            action_type = self._get_action_type_from_action(action)
-                            
-                            result_dict = {
-                                "action_type": execution_result.get('action_type') or action_type,
-                                "success": execution_result.get('success', False),
-                                "message": execution_result.get('message', ''),
-                                "data": execution_result.get('data', {}),
-                                "description": action.get_description()
-                            }
-                            
-                            action_results.append(result_dict)
-                            
-                            # Log trade action activity (on open positions)
-                            from .utils import log_trade_action_activity
-                            expert_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
-                            log_trade_action_activity(
-                                action_type=str(action_type),
-                                symbol=self.instrument_name,
-                                account_id=self.account.id,
-                                expert_id=expert_id,
-                                success=result_dict['success'],
-                                message=result_dict['message'],
-                                is_open_position=True,  # Adjustment on open position
-                                additional_data=result_dict.get('data', {})
-                            )
-                            
-                            logger.info(f"Adjustment result: {result_dict['success']} - {result_dict['message']}")
-                            
-                        except Exception as e:
-                            logger.error(f"Error executing adjustment action: {e}", exc_info=True)
-                            action_results.append({
-                                "action_type": self._get_action_type_from_action(action),
-                                "success": False,
-                                "message": f"Error executing action: {str(e)}",
-                                "data": None,
-                                "description": action.get_description()
-                            })
+                    try:
+                        from .utils import log_trade_action_activity
+                        expert_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
+
+                        if last_tp_action and last_sl_action:
+                            # Merged: compute both prices and call adjust_tp_sl once
+                            last_tp_action.existing_order = order
+                            last_sl_action.existing_order = order
+                            tp_price = last_tp_action.compute_price(order)
+                            sl_price = last_sl_action.compute_price(order)
+
+                            if tp_price and sl_price:
+                                from .models import Transaction
+                                transaction = get_instance(Transaction, order.transaction_id) if order.transaction_id else None
+                                if transaction:
+                                    logger.info(f"Phase 2 (merged) - Adjusting order {order.id}: TP=${tp_price:.2f}, SL=${sl_price:.2f}")
+                                    success = self.account.adjust_tp_sl(transaction, tp_price, sl_price, source="ruleset")
+                                    desc = f"Adjusted TP=${tp_price:.2f} and SL=${sl_price:.2f} for {self.instrument_name}"
+                                    result_dict = {
+                                        "action_type": ExpertActionType.ADJUST_TAKE_PROFIT,
+                                        "success": success,
+                                        "message": desc if success else f"Failed to adjust TP/SL for {self.instrument_name}",
+                                        "data": {"order_id": order.id, "tp_price": tp_price, "sl_price": sl_price},
+                                        "description": desc
+                                    }
+                                    action_results.append(result_dict)
+                                    log_trade_action_activity(
+                                        action_type=str(ExpertActionType.ADJUST_TAKE_PROFIT),
+                                        symbol=self.instrument_name,
+                                        account_id=self.account.id,
+                                        expert_id=expert_id,
+                                        success=success,
+                                        message=result_dict['message'],
+                                        is_open_position=True,
+                                        additional_data=result_dict.get('data', {})
+                                    )
+                                    logger.info(f"Merged TP/SL result: {success} - {result_dict['message']}")
+                                else:
+                                    logger.error(f"No transaction found for order {order.id}, cannot merge TP/SL")
+                            else:
+                                logger.error(f"Could not compute TP ({tp_price}) or SL ({sl_price}) for order {order.id} — falling back to sequential execution")
+                                for action in [last_tp_action, last_sl_action]:
+                                    action.existing_order = order
+                                    action.evaluation_details = evaluation_details
+                                    action.submit_to_broker = self.submit_to_broker
+                                    execution_result = action.execute()
+                                    action_type = self._get_action_type_from_action(action)
+                                    result_dict = {
+                                        "action_type": execution_result.get('action_type') or action_type,
+                                        "success": execution_result.get('success', False),
+                                        "message": execution_result.get('message', ''),
+                                        "data": execution_result.get('data', {}),
+                                        "description": action.get_description()
+                                    }
+                                    action_results.append(result_dict)
+
+                        else:
+                            # Single TP or single SL — execute normally
+                            for action in adjustment_actions:
+                                action.existing_order = order
+                                action.evaluation_details = evaluation_details
+                                action.submit_to_broker = self.submit_to_broker
+
+                                logger.info(f"Phase 2 - Adjusting order {order.id}: {action.get_description()}")
+                                execution_result = action.execute()
+                                action_type = self._get_action_type_from_action(action)
+
+                                result_dict = {
+                                    "action_type": execution_result.get('action_type') or action_type,
+                                    "success": execution_result.get('success', False),
+                                    "message": execution_result.get('message', ''),
+                                    "data": execution_result.get('data', {}),
+                                    "description": action.get_description()
+                                }
+                                action_results.append(result_dict)
+                                log_trade_action_activity(
+                                    action_type=str(action_type),
+                                    symbol=self.instrument_name,
+                                    account_id=self.account.id,
+                                    expert_id=expert_id,
+                                    success=result_dict['success'],
+                                    message=result_dict['message'],
+                                    is_open_position=True,
+                                    additional_data=result_dict.get('data', {})
+                                )
+                                logger.info(f"Adjustment result: {result_dict['success']} - {result_dict['message']}")
+
+                    except Exception as e:
+                        logger.error(f"Error executing adjustment action for order {order.id}: {e}", exc_info=True)
+                        action_results.append({
+                            "action_type": ExpertActionType.ADJUST_TAKE_PROFIT,
+                            "success": False,
+                            "message": f"Error executing action: {str(e)}",
+                            "data": None,
+                            "description": f"Adjustment failed for order {order.id}"
+                        })
             
             # Phase 3: Execute share adjustment actions (INCREASE/DECREASE_INSTRUMENT_SHARE)
             for action in share_adjustment_actions:

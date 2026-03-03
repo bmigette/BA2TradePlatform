@@ -1625,10 +1625,11 @@ class TradeManager:
                 # Process each recommendation through the open_positions ruleset
                 for recommendation in recommendations:
                     try:
-                        # Check if this symbol has existing transactions
+                        # Check if this symbol has existing transactions for THIS expert only
                         statement = select(Transaction).where(
                             Transaction.symbol == recommendation.symbol,
-                            Transaction.status.in_([TransactionStatus.WAITING, TransactionStatus.OPENED])
+                            Transaction.status.in_([TransactionStatus.WAITING, TransactionStatus.OPENED]),
+                            Transaction.expert_id == expert_instance_id
                         )
                         existing_transactions = session.exec(statement).all()
                         

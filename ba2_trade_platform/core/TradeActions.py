@@ -861,11 +861,57 @@ class AdjustTakeProfitAction(TradeAction):
                 data={"order_id": self.existing_order.id if self.existing_order else None}
             )
     
+    def compute_price(self, order: "TradingOrder") -> Optional[float]:
+        """Calculate the take profit price for the given order without submitting to broker."""
+        if self.take_profit_price is not None:
+            return self.take_profit_price
+
+        if self.reference_value is None or self.percent is None:
+            return None
+
+        from .types import ReferenceValue
+        reference_price = None
+
+        if self.reference_value == ReferenceValue.ORDER_OPEN_PRICE.value:
+            reference_price = order.limit_price or order.open_price
+            if reference_price is None:
+                reference_price = self.get_current_price()
+        elif self.reference_value == ReferenceValue.CURRENT_PRICE.value:
+            reference_price = self.get_current_price()
+        elif self.reference_value == ReferenceValue.EXPERT_TARGET_PRICE.value:
+            if order and order.expert_recommendation_id:
+                from .db import get_instance
+                from .models import ExpertRecommendation
+                expert_rec = get_instance(ExpertRecommendation, order.expert_recommendation_id)
+                if expert_rec and hasattr(expert_rec, 'price_at_date') and hasattr(expert_rec, 'expected_profit_percent'):
+                    base_price = expert_rec.price_at_date
+                    expected_profit = expert_rec.expected_profit_percent
+                    if expert_rec.recommended_action == OrderRecommendation.BUY:
+                        reference_price = base_price * (1 + expected_profit / 100)
+                    elif expert_rec.recommended_action == OrderRecommendation.SELL:
+                        reference_price = base_price * (1 - expected_profit / 100)
+
+        if reference_price is None:
+            return None
+
+        if self.order_recommendation == OrderRecommendation.BUY:
+            is_long = True
+        elif self.order_recommendation == OrderRecommendation.SELL:
+            is_long = False
+        else:
+            order_side = str(order.side.value if hasattr(order.side, 'value') else order.side).upper()
+            is_long = (order_side == "BUY")
+
+        if is_long:
+            return reference_price * (1 + self.percent / 100)
+        else:
+            return reference_price * (1 - self.percent / 100)
+
     def get_description(self) -> str:
         """Get description of adjust take profit action."""
         price_desc = f" at ${self.take_profit_price}" if self.take_profit_price else " (auto-calculated)"
         return f"Set or adjust take profit order for {self.instrument_name}{price_desc}"
-    
+
     def get_calculation_preview(self) -> Dict[str, Any]:
         """
         Get a preview of TP calculation without executing.
@@ -1233,15 +1279,77 @@ class AdjustStopLossAction(TradeAction):
                 data={}
             )
     
+    def compute_price(self, order: "TradingOrder") -> Optional[float]:
+        """Calculate the stop loss price for the given order without submitting to broker."""
+        if self.stop_loss_price is not None:
+            return self.stop_loss_price
+
+        if self.reference_value is None or self.percent is None:
+            return None
+
+        from .types import ReferenceValue
+        reference_price = None
+
+        if self.reference_value == ReferenceValue.ORDER_OPEN_PRICE.value:
+            reference_price = order.limit_price or order.open_price
+            if reference_price is None:
+                reference_price = self.get_current_price()
+        elif self.reference_value == ReferenceValue.CURRENT_PRICE.value:
+            reference_price = self.get_current_price()
+        elif self.reference_value == ReferenceValue.EXPERT_TARGET_PRICE.value:
+            if order and order.expert_recommendation_id:
+                from .db import get_instance
+                from .models import ExpertRecommendation
+                expert_rec = get_instance(ExpertRecommendation, order.expert_recommendation_id)
+                if expert_rec and hasattr(expert_rec, 'price_at_date') and hasattr(expert_rec, 'expected_profit_percent'):
+                    base_price = expert_rec.price_at_date
+                    expected_profit = expert_rec.expected_profit_percent
+                    if expert_rec.recommended_action == OrderRecommendation.BUY:
+                        reference_price = base_price * (1 + expected_profit / 100)
+                    elif expert_rec.recommended_action == OrderRecommendation.SELL:
+                        reference_price = base_price * (1 - expected_profit / 100)
+
+        if reference_price is None:
+            return None
+
+        if self.order_recommendation == OrderRecommendation.BUY:
+            is_long = True
+        elif self.order_recommendation == OrderRecommendation.SELL:
+            is_long = False
+        else:
+            order_side = str(order.side.value if hasattr(order.side, 'value') else order.side).upper()
+            is_long = (order_side == "BUY")
+
+        if is_long:
+            sl_price = reference_price * (1 + self.percent / 100)
+        else:
+            sl_price = reference_price * (1 - self.percent / 100)
+
+        # Enforce minimum SL distance from open price
+        if order.open_price and sl_price:
+            from ..config import get_min_tp_sl_percent
+            min_pct = get_min_tp_sl_percent()
+            open_price = float(order.open_price)
+            if is_long:
+                actual_pct = ((open_price - sl_price) / open_price) * 100
+                if actual_pct < min_pct:
+                    sl_price = open_price * (1 - min_pct / 100)
+            else:
+                actual_pct = ((sl_price - open_price) / open_price) * 100
+                if actual_pct < min_pct:
+                    sl_price = open_price * (1 + min_pct / 100)
+
+        return sl_price
+
     def get_description(self) -> str:
         """Get description of adjust stop loss action."""
         price_desc = f" at ${self.stop_loss_price}" if self.stop_loss_price else " (auto-calculated)"
         return f"Set or adjust stop loss order for {self.instrument_name}{price_desc}"
-    
+
     def get_calculation_preview(self) -> Dict[str, Any]:
         """
         Get a preview of SL calculation without executing.
-        
+
         Returns:
             Dictionary with reference_price, percent, calculated_price, reference_type
         """
