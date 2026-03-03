@@ -911,7 +911,8 @@ class AdjustTakeProfitAction(TradeAction):
                 # Calculate final price
                 if preview["reference_price"] and self.percent:
                     # For BUY orders, TP is above entry; for SELL orders, TP is below entry
-                    if self.existing_order.side == "buy":
+                    order_side = str(self.existing_order.side.value if hasattr(self.existing_order.side, 'value') else self.existing_order.side).upper()
+                    if order_side == "BUY":
                         preview["calculated_price"] = preview["reference_price"] * (1 + self.percent / 100)
                     else:  # sell
                         preview["calculated_price"] = preview["reference_price"] * (1 - self.percent / 100)
