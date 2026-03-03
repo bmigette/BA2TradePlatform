@@ -1350,8 +1350,8 @@ class IncreaseInstrumentShareAction(TradeAction):
                     data={}
                 )
             
-            # Get virtual equity (available balance)
-            virtual_equity = expert.get_available_balance()
+            # Get total virtual equity (allocated capital, not just free cash)
+            virtual_equity = expert.get_virtual_balance()
             if virtual_equity is None or virtual_equity <= 0:
                 return self.create_and_save_action_result(
                     action_type=ExpertActionType.INCREASE_INSTRUMENT_SHARE.value,
@@ -1530,8 +1530,8 @@ class DecreaseInstrumentShareAction(TradeAction):
                     data={}
                 )
             
-            # Get virtual equity (available balance)
-            virtual_equity = expert.get_available_balance()
+            # Get total virtual equity (allocated capital, not just free cash)
+            virtual_equity = expert.get_virtual_balance()
             if virtual_equity is None or virtual_equity <= 0:
                 return self.create_and_save_action_result(
                     action_type=ExpertActionType.DECREASE_INSTRUMENT_SHARE.value,

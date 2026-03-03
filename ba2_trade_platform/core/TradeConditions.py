@@ -1304,48 +1304,69 @@ class InstrumentAccountShareCondition(CompareCondition):
             return False
     
     def _get_instrument_position_value(self) -> Optional[float]:
-        """Get current market value of instrument position."""
+        """
+        Get this expert's share of the instrument's market value.
+
+        Uses the expert's own OPENED transactions (not the broker-level position)
+        to avoid counting shares held by other experts.
+        """
         try:
-            # Get current position quantity
-            position_qty = self.get_current_position()
-            if position_qty is None or position_qty == 0:
-                return 0.0  # No position means 0% share
-            
-            # Get current price
+            expert_instance_id = self.expert_recommendation.instance_id
+
+            from .db import get_db
+            from .models import Transaction
+            from .types import TransactionStatus
+            from sqlmodel import select as sql_select
+
+            with get_db() as session:
+                stmt = sql_select(Transaction).where(
+                    Transaction.expert_id == expert_instance_id,
+                    Transaction.symbol == self.instrument_name,
+                    Transaction.status == TransactionStatus.OPENED,
+                )
+                transactions = session.exec(stmt).all()
+
+            if not transactions:
+                return 0.0
+
+            total_qty = sum(abs(t.quantity) for t in transactions if t.quantity)
+            if total_qty == 0:
+                return 0.0
+
             current_price = self.get_current_price()
             if current_price is None:
                 logger.error(f"Cannot get current price for {self.instrument_name}")
                 return None
-            
-            # Calculate market value
-            position_value = abs(position_qty) * current_price
-            return position_value
-            
+
+            return total_qty * current_price
+
         except Exception as e:
             logger.error(f"Error getting instrument position value: {e}", exc_info=True)
             return None
-    
+
     def _get_expert_virtual_equity(self) -> Optional[float]:
-        """Get expert's virtual equity (available balance)."""
+        """
+        Get expert's total virtual equity (allocated capital, not just free cash).
+
+        Uses get_virtual_balance() = account_balance × virtual_equity_pct so that
+        a fully-invested expert still has a sensible denominator.
+        """
         try:
-            # Get expert instance from recommendation
             expert_instance_id = self.expert_recommendation.instance_id
-            
-            # Load expert instance with loaded settings
+
             from .utils import get_expert_instance_from_id
             expert = get_expert_instance_from_id(expert_instance_id)
             if not expert:
                 logger.error(f"Expert instance {expert_instance_id} not found")
                 return None
-            
-            # Get available balance (virtual equity)
-            available_balance = expert.get_available_balance()
-            if available_balance is None:
-                logger.error(f"Could not get available balance for expert {expert_instance_id}")
+
+            virtual_balance = expert.get_virtual_balance()
+            if virtual_balance is None:
+                logger.error(f"Could not get virtual balance for expert {expert_instance_id}")
                 return None
-            
-            return available_balance
-            
+
+            return virtual_balance
+
         except Exception as e:
             logger.error(f"Error getting expert virtual equity: {e}", exc_info=True)
             return None
