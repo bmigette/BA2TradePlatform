@@ -1108,8 +1108,37 @@ class PercentToNewTargetCondition(CompareCondition):
         return f"{self.calculated_value:+.2f}%"
 
 
+def _get_pnl_via_transaction(existing_order, current_price) -> Optional[Dict]:
+    """
+    Look up the Transaction linked to existing_order and calculate P&L using
+    TransactionHelper.calculate_pnl — the same formula as the Live Trades page.
+    Returns the pnl dict {'amount', 'percent'} or None on failure.
+    """
+    from .TransactionHelper import TransactionHelper
+    from .db import get_db
+    from .models import Transaction
+
+    transaction_id = getattr(existing_order, 'transaction_id', None)
+    if not transaction_id:
+        logger.warning(f"Order {existing_order.id} has no transaction_id — cannot compute P&L via transaction")
+        return None
+
+    try:
+        with get_db() as session:
+            transaction = session.get(Transaction, transaction_id)
+    except Exception as e:
+        logger.error(f"Error fetching transaction {transaction_id}: {e}", exc_info=True)
+        return None
+
+    if not transaction:
+        logger.warning(f"Transaction {transaction_id} not found for order {existing_order.id}")
+        return None
+
+    return TransactionHelper.calculate_pnl(transaction, current_price)
+
+
 class ProfitLossAmountCondition(CompareCondition):
-    """Compare profit/loss amount."""
+    """Compare profit/loss amount using the same formula as the Live Trades page."""
 
     def evaluate(self) -> bool:
         try:
@@ -1122,31 +1151,20 @@ class ProfitLossAmountCondition(CompareCondition):
                 self.calculated_value = None
                 return False
 
-            # Use limit_price for limit orders, fall back to open_price for market/filled orders
-            entry_price = self.existing_order.limit_price or self.existing_order.open_price
-            if entry_price is None:
-                logger.warning(f"No entry price (limit_price or open_price) for order {self.existing_order.id} — cannot compute P&L amount")
+            pnl = _get_pnl_via_transaction(self.existing_order, current_price)
+            if pnl is None:
                 self.calculated_value = None
                 return False
 
-            quantity = self.existing_order.quantity
-            pl_amount = (current_price - entry_price) * quantity
-            
-            # Adjust for short positions
-            if self.existing_order.side == "sell":
-                pl_amount = -pl_amount
-            
-            self.calculated_value = pl_amount  # Store calculated value
-                
-            return self.operator_func(pl_amount, self.value)
-            
+            self.calculated_value = pnl['amount']
+            return self.operator_func(pnl['amount'], self.value)
+
         except Exception as e:
             logger.error(f"Error evaluating profit loss amount condition: {e}", exc_info=True)
             self.calculated_value = None
             return False
-    
+
     def get_description(self) -> str:
-        """Get description of profit/loss amount condition."""
         return f"Check if profit/loss amount for {self.instrument_name} is {self.operator_str} ${self.value}"
 
     def get_actual_value_display(self) -> Optional[str]:
@@ -1156,33 +1174,32 @@ class ProfitLossAmountCondition(CompareCondition):
 
 
 class ProfitLossPercentCondition(CompareCondition):
-    """Compare profit/loss percentage."""
+    """Compare profit/loss percentage using the same formula as the Live Trades page."""
+
     def evaluate(self) -> bool:
         try:
             if not self.existing_order:
                 self.calculated_value = None
                 return False
+
             current_price = self.get_current_price()
             if current_price is None:
                 self.calculated_value = None
                 return False
-            # Use limit_price for limit orders, fall back to open_price for market/filled orders
-            entry_price = self.existing_order.limit_price or self.existing_order.open_price
-            if entry_price is None:
-                logger.warning(f"No entry price (limit_price or open_price) for order {self.existing_order.id} — cannot compute P&L %")
+
+            pnl = _get_pnl_via_transaction(self.existing_order, current_price)
+            if pnl is None:
                 self.calculated_value = None
                 return False
-            pl_percent = ((current_price - entry_price) / entry_price) * 100
-            # Adjust for short positions
-            if self.existing_order.side == "sell":
-                pl_percent = -pl_percent
-            
-            self.calculated_value = pl_percent  # Store calculated value
-            return self.operator_func(pl_percent, self.value)
+
+            self.calculated_value = pnl['percent']
+            return self.operator_func(pnl['percent'], self.value)
+
         except Exception as e:
             logger.error(f"Error evaluating profit loss percent condition: {e}", exc_info=True)
             self.calculated_value = None
             return False
+
     def get_description(self) -> str:
         return f"Check if profit/loss percentage for {self.instrument_name} is {self.operator_str} {self.value}%"
 

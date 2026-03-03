@@ -494,16 +494,12 @@ class LiveTradesTab:
                 try:
                     current_price = current_prices.get(txn.symbol)
                     if current_price:
+                        from ...core.TransactionHelper import TransactionHelper
                         current_price_str = f"${current_price:.2f}"
-                        # Use side field: BUY=LONG, SELL=SHORT
-                        if txn.side == OrderDirection.BUY:
-                            pnl_current = (current_price - txn.open_price) * txn.quantity
-                        else:
-                            pnl_current = (txn.open_price - current_price) * txn.quantity
-                        cost_basis = txn.open_price * abs(txn.quantity)
-                        pnl_pct = (pnl_current / cost_basis * 100) if cost_basis > 0 else 0
-                        current_pnl = f"${pnl_current:+.2f} ({pnl_pct:+.1f}%)"
-                        current_pnl_numeric = pnl_pct
+                        pnl = TransactionHelper.calculate_pnl(txn, current_price)
+                        if pnl:
+                            current_pnl = f"${pnl['amount']:+.2f} ({pnl['percent']:+.1f}%)"
+                            current_pnl_numeric = pnl['percent']
                 except Exception as e:
                     logger.debug(f"Could not calculate P/L for {txn.symbol}: {e}")
 
@@ -804,18 +800,12 @@ class LiveTradesTab:
                     try:
                         current_price = current_prices.get(txn.symbol)
                         if current_price:
+                            from ...core.TransactionHelper import TransactionHelper
                             current_price_str = f"${current_price:.2f}"
-                            # Calculate P/L: (current_price - open_price) * quantity
-                            # Use side field: BUY=LONG, SELL=SHORT
-                            if txn.side == OrderDirection.BUY:  # Long position
-                                pnl_current = (current_price - txn.open_price) * txn.quantity
-                            else:  # Short position
-                                pnl_current = (txn.open_price - current_price) * txn.quantity
-                            # Calculate P/L percentage based on cost basis
-                            cost_basis = txn.open_price * abs(txn.quantity)
-                            pnl_pct = (pnl_current / cost_basis * 100) if cost_basis > 0 else 0
-                            current_pnl = f"${pnl_current:+.2f} ({pnl_pct:+.1f}%)"
-                            current_pnl_numeric = pnl_pct  # Store percentage for sorting
+                            pnl = TransactionHelper.calculate_pnl(txn, current_price)
+                            if pnl:
+                                current_pnl = f"${pnl['amount']:+.2f} ({pnl['percent']:+.1f}%)"
+                                current_pnl_numeric = pnl['percent']
                     except Exception as e:
                         logger.debug(f"Could not calculate P/L for {txn.symbol}: {e}")
 

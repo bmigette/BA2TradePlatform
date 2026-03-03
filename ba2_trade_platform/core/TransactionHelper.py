@@ -875,3 +875,39 @@ class TransactionHelper:
             logger.error(f"Error adjusting transaction {transaction.id} quantity: {e}", exc_info=True)
             result["message"] = f"Error: {str(e)}"
             return result
+
+    @staticmethod
+    def calculate_pnl(transaction: Transaction, current_price: float) -> Optional[Dict[str, float]]:
+        """
+        Calculate current unrealised P&L for an open transaction.
+
+        Uses the same formula as the Live Trades page:
+            Long:  pnl = (current_price - open_price) * quantity
+            Short: pnl = (open_price - current_price) * quantity
+            pnl_pct = pnl / (open_price * abs(quantity)) * 100
+
+        Args:
+            transaction: An open Transaction with open_price, quantity and side set.
+            current_price: Current market price of the instrument.
+
+        Returns:
+            Dict with keys 'amount' (float, $) and 'percent' (float, %),
+            or None if required fields are missing.
+        """
+        if not transaction.open_price or not transaction.quantity:
+            return None
+        if current_price is None or current_price <= 0:
+            return None
+
+        open_price = transaction.open_price
+        quantity = transaction.quantity
+
+        if transaction.side == OrderDirection.BUY:
+            pnl_amount = (current_price - open_price) * quantity
+        else:
+            pnl_amount = (open_price - current_price) * quantity
+
+        cost_basis = open_price * abs(quantity)
+        pnl_pct = (pnl_amount / cost_basis * 100) if cost_basis > 0 else 0.0
+
+        return {'amount': round(pnl_amount, 2), 'percent': round(pnl_pct, 4)}
