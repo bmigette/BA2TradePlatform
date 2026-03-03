@@ -1716,7 +1716,10 @@ class TradeManager:
                             
                         else:
                             self.logger.info(f"Recommendation {recommendation.id} for {recommendation.symbol} passed ruleset - {len(action_summaries)} action(s) to execute")
-                            
+
+                            # Capture evaluation details before execution so they are always stored
+                            evaluation_details = evaluator.get_evaluation_details()
+
                             # Execute the actions with submit_to_broker flag set based on permission setting
                             try:
                                 execution_results = evaluator.execute(submit_to_broker=allow_automated_trade_modification)
@@ -1732,6 +1735,21 @@ class TradeManager:
                                     self.logger.debug(f"No orders created from actions for {recommendation.symbol}")
                             except Exception as e:
                                 self.logger.error(f"Error executing actions for recommendation {recommendation.id}: {e}", exc_info=True)
+
+                            # Store evaluation details so the rule analysis icon appears in the UI
+                            if evaluation_details:
+                                from ..core.models import TradeActionResult
+                                from ..core.db import add_instance
+
+                                evaluation_result = TradeActionResult(
+                                    action_type='evaluation_with_actions',
+                                    success=True,
+                                    message=f'Rule evaluation completed for {recommendation.symbol} (OPEN_POSITIONS) - {len(action_summaries)} action(s) triggered',
+                                    data={'evaluation_details': evaluation_details},
+                                    expert_recommendation_id=recommendation.id
+                                )
+                                add_instance(evaluation_result)
+                                self.logger.debug(f"Stored evaluation details for recommendation {recommendation.id} (OPEN_POSITIONS, actions executed)")
                         
                     except Exception as e:
                         self.logger.error(f"Error evaluating open_positions recommendation {recommendation.id}: {e}", exc_info=True)
