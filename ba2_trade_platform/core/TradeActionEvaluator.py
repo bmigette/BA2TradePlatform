@@ -14,6 +14,21 @@ from .types import OrderRecommendation, ExpertEventType, ExpertActionType
 from .db import get_db, get_instance
 from ..logger import logger
 from sqlmodel import select
+import enum
+import datetime
+
+
+def _sanitize_for_json(obj):
+    """Recursively convert non-JSON-serialisable values (enums, datetimes) to primitives."""
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_for_json(v) for v in obj]
+    if isinstance(obj, enum.Enum):
+        return obj.value
+    if isinstance(obj, (datetime.datetime, datetime.date)):
+        return obj.isoformat()
+    return obj
 
 
 class TradeActionEvaluator:
@@ -134,9 +149,11 @@ class TradeActionEvaluator:
                     )
                     action_summaries.extend(new_actions)
 
-                    # Attach triggered actions to the rule_evaluation entry for UI display
+                    # Attach triggered actions to the rule_evaluation entry for UI display.
+                    # Sanitise enum/datetime values so the dict remains JSON-serialisable
+                    # when stored in TradeActionResult.data.
                     if self.rule_evaluations and new_actions:
-                        self.rule_evaluations[-1]['actions'] = new_actions
+                        self.rule_evaluations[-1]['actions'] = _sanitize_for_json(new_actions)
                     
                     # Check if we should continue processing more event actions
                     # In force mode, always continue to see all possible actions
