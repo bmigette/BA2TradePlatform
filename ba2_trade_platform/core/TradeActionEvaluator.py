@@ -133,6 +133,10 @@ class TradeActionEvaluator:
                         event_action, instrument_name, expert_recommendation, existing_order, generated_actions
                     )
                     action_summaries.extend(new_actions)
+
+                    # Attach triggered actions to the rule_evaluation entry for UI display
+                    if self.rule_evaluations and new_actions:
+                        self.rule_evaluations[-1]['actions'] = new_actions
                     
                     # Check if we should continue processing more event actions
                     # In force mode, always continue to see all possible actions
@@ -203,15 +207,20 @@ class TradeActionEvaluator:
             # Categorize actions
             order_creating_actions = []
             adjustment_actions = []
-            
+            share_adjustment_actions = []
+
             for action in sorted_actions:
                 action_type = self._get_action_type_from_action(action)
                 if action_type in [ExpertActionType.BUY, ExpertActionType.SELL, ExpertActionType.CLOSE]:
                     order_creating_actions.append(action)
                 elif action_type in [ExpertActionType.ADJUST_TAKE_PROFIT, ExpertActionType.ADJUST_STOP_LOSS]:
                     adjustment_actions.append(action)
-            
-            logger.info(f"📊 Categorized actions: {len(order_creating_actions)} order-creating, {len(adjustment_actions)} adjustments")
+                elif action_type in [ExpertActionType.INCREASE_INSTRUMENT_SHARE, ExpertActionType.DECREASE_INSTRUMENT_SHARE]:
+                    share_adjustment_actions.append(action)
+                else:
+                    logger.warning(f"Action {action.__class__.__name__} has unknown type ({action_type}) and will not be executed")
+
+            logger.info(f"📊 Categorized actions: {len(order_creating_actions)} order-creating, {len(adjustment_actions)} adjustments, {len(share_adjustment_actions)} share-adjustments")
             
             # Validate: If we have adjustment actions, we need either order-creating actions OR existing transactions
             if adjustment_actions and not order_creating_actions and not self.existing_transactions:
@@ -417,6 +426,49 @@ class TradeActionEvaluator:
                                 "description": action.get_description()
                             })
             
+            # Phase 3: Execute share adjustment actions (INCREASE/DECREASE_INSTRUMENT_SHARE)
+            for action in share_adjustment_actions:
+                try:
+                    action.evaluation_details = evaluation_details
+                    action.submit_to_broker = self.submit_to_broker
+                    action_type = self._get_action_type_from_action(action)
+
+                    logger.info(f"Phase 3 - Share adjustment: {action.get_description()}")
+                    execution_result = action.execute()
+
+                    result_dict = {
+                        "action_type": execution_result.get('action_type') or action_type,
+                        "success": execution_result.get('success', False),
+                        "message": execution_result.get('message', ''),
+                        "data": execution_result.get('data', {}),
+                        "description": action.get_description()
+                    }
+                    action_results.append(result_dict)
+
+                    from .utils import log_trade_action_activity
+                    expert_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
+                    log_trade_action_activity(
+                        action_type=str(action_type),
+                        symbol=self.instrument_name,
+                        account_id=self.account.id,
+                        expert_id=expert_id,
+                        success=result_dict['success'],
+                        message=result_dict['message'],
+                        is_open_position=True,
+                        additional_data=result_dict.get('data', {})
+                    )
+                    logger.info(f"Share adjustment result: {result_dict['success']} - {result_dict['message']}")
+
+                except Exception as e:
+                    logger.error(f"Error executing share adjustment action: {e}", exc_info=True)
+                    action_results.append({
+                        "action_type": self._get_action_type_from_action(action),
+                        "success": False,
+                        "message": f"Error executing action: {str(e)}",
+                        "data": None,
+                        "description": action.get_description()
+                    })
+
         except Exception as e:
             logger.error(f"Error in execute: {e}", exc_info=True)
             action_results.append({
@@ -426,7 +478,7 @@ class TradeActionEvaluator:
                 "data": None,
                 "description": "Action execution failed due to error"
             })
-        
+
         return action_results
     
     def _evaluate_conditions(self, event_action: EventAction, instrument_name: str,
@@ -773,11 +825,15 @@ class TradeActionEvaluator:
                 # Also allow direct stop_loss_price if provided
                 kwargs['stop_loss_price'] = action_config.get('stop_loss_price')
             elif action_type == ExpertActionType.INCREASE_INSTRUMENT_SHARE:
-                # Extract target_percent for position sizing
-                kwargs['target_percent'] = action_config.get('value')  # 'value' in config is target percentage
+                target_val = action_config.get('value')
+                if target_val is None:
+                    logger.warning(f"INCREASE_INSTRUMENT_SHARE action has no 'value' configured — target_percent will be None and the action will fail at execution")
+                kwargs['target_percent'] = target_val
             elif action_type == ExpertActionType.DECREASE_INSTRUMENT_SHARE:
-                # Extract target_percent for position sizing
-                kwargs['target_percent'] = action_config.get('value')  # 'value' in config is target percentage
+                target_val = action_config.get('value')
+                if target_val is None:
+                    logger.warning(f"DECREASE_INSTRUMENT_SHARE action has no 'value' configured — target_percent will be None and the action will fail at execution")
+                kwargs['target_percent'] = target_val
             
             # Create action using factory function, passing expert_recommendation
             action = create_action(
@@ -814,6 +870,8 @@ class TradeActionEvaluator:
                 'CloseAction': ExpertActionType.CLOSE,
                 'AdjustTakeProfitAction': ExpertActionType.ADJUST_TAKE_PROFIT,
                 'AdjustStopLossAction': ExpertActionType.ADJUST_STOP_LOSS,
+                'IncreaseInstrumentShareAction': ExpertActionType.INCREASE_INSTRUMENT_SHARE,
+                'DecreaseInstrumentShareAction': ExpertActionType.DECREASE_INSTRUMENT_SHARE,
             }
             
             class_name = action.__class__.__name__

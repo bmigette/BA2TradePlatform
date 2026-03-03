@@ -1110,20 +1110,25 @@ class PercentToNewTargetCondition(CompareCondition):
 
 class ProfitLossAmountCondition(CompareCondition):
     """Compare profit/loss amount."""
-    
+
     def evaluate(self) -> bool:
         try:
             if not self.existing_order:
                 self.calculated_value = None
                 return False
-                
+
             current_price = self.get_current_price()
-            if current_price is None or not hasattr(self.existing_order, 'limit_price') or self.existing_order.limit_price is None:
+            if current_price is None:
                 self.calculated_value = None
                 return False
-                
-            # Calculate P&L amount
-            entry_price = self.existing_order.limit_price
+
+            # Use limit_price for limit orders, fall back to open_price for market/filled orders
+            entry_price = self.existing_order.limit_price or self.existing_order.open_price
+            if entry_price is None:
+                logger.warning(f"No entry price (limit_price or open_price) for order {self.existing_order.id} — cannot compute P&L amount")
+                self.calculated_value = None
+                return False
+
             quantity = self.existing_order.quantity
             pl_amount = (current_price - entry_price) * quantity
             
@@ -1158,11 +1163,15 @@ class ProfitLossPercentCondition(CompareCondition):
                 self.calculated_value = None
                 return False
             current_price = self.get_current_price()
-            if current_price is None or not hasattr(self.existing_order, 'limit_price') or self.existing_order.limit_price is None:
+            if current_price is None:
                 self.calculated_value = None
                 return False
-            # Calculate P&L percentage
-            entry_price = self.existing_order.limit_price
+            # Use limit_price for limit orders, fall back to open_price for market/filled orders
+            entry_price = self.existing_order.limit_price or self.existing_order.open_price
+            if entry_price is None:
+                logger.warning(f"No entry price (limit_price or open_price) for order {self.existing_order.id} — cannot compute P&L %")
+                self.calculated_value = None
+                return False
             pl_percent = ((current_price - entry_price) / entry_price) * 100
             # Adjust for short positions
             if self.existing_order.side == "sell":

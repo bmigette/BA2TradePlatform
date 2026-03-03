@@ -90,6 +90,13 @@ def _render_single_rule(rule_eval: Dict[str, Any], compact: bool = False):
                 for condition in conditions:
                     _render_condition(condition, compact)
 
+        # Show triggered actions for executed rules
+        if executed:
+            rule_actions = rule_eval.get('actions', [])
+            if rule_actions:
+                with ui.expansion('Triggered Actions', icon='bolt', value=True).classes('w-full'):
+                    _render_actions(rule_actions, compact)
+
 
 def _render_condition(condition: Dict[str, Any], compact: bool = False):
     """Render a single condition with its operands and result."""
