@@ -369,11 +369,11 @@ class JobMonitoringTab:
                            :disable="props.row.status === 'running'">
                         <q-tooltip>Cancel Analysis</q-tooltip>
                     </q-btn>
-                    <q-btn v-if="props.row.status === 'failed'" 
-                           flat dense icon="refresh" 
-                           color="orange" 
+                    <q-btn v-if="props.row.status === 'failed' || props.row.status === 'pending'"
+                           flat dense icon="refresh"
+                           color="orange"
                            @click="$parent.$emit('rerun_analysis', props.row.id)">
-                        <q-tooltip>Re-run Failed Analysis</q-tooltip>
+                        <q-tooltip>Re-run Analysis</q-tooltip>
                     </q-btn>
                     <q-btn flat dense icon="bug_report" 
                            color="accent" 
@@ -1847,9 +1847,9 @@ class JobMonitoringTab:
                 ui.notify("Analysis not found", type='negative')
                 return
             
-            # Only allow re-run for failed analyses
-            if analysis.status != MarketAnalysisStatus.FAILED:
-                ui.notify("Can only re-run failed analyses", type='warning')
+            # Only allow re-run for failed or stuck-pending analyses
+            if analysis.status not in [MarketAnalysisStatus.FAILED, MarketAnalysisStatus.PENDING]:
+                ui.notify("Can only re-run failed or pending analyses", type='warning')
                 return
             
             # Clear existing data

@@ -893,28 +893,41 @@ class WorkerQueue:
                     # Skip analysis due to insufficient balance
                     logger.info(f"Skipping ENTER_MARKET analysis for expert {task.expert_instance_id}, symbol {task.symbol}: "
                               f"Insufficient available balance: below threshold")
-                    
-                    # Create analysis record marked as skipped
-                    market_analysis = MarketAnalysis(
-                        symbol=task.symbol,
-                        expert_instance_id=task.expert_instance_id,
-                        status=MarketAnalysisStatus.SKIPPED,
-                        subtype=AnalysisUseCase(task.subtype),
-                        state={
-                            "skipped": True,
-                            "skip_reason": "Insufficient available balance: below threshold",
-                            "skip_type": "insufficient_balance"
-                        }
-                    )
-                    market_analysis_id = add_instance(market_analysis)
-                    task.market_analysis_id = market_analysis_id
-                    
+
+                    skip_state = {
+                        "skipped": True,
+                        "skip_reason": "Insufficient available balance: below threshold",
+                        "skip_type": "insufficient_balance"
+                    }
+                    if task.market_analysis_id:
+                        # Update existing record (e.g. retry that got skipped)
+                        from .db import get_instance as _get, update_instance as _upd
+                        existing = _get(MarketAnalysis, task.market_analysis_id)
+                        if existing:
+                            existing.status = MarketAnalysisStatus.SKIPPED
+                            existing.state = skip_state
+                            _upd(existing)
+                            market_analysis_id = task.market_analysis_id
+                            logger.debug(f"Updated existing MarketAnalysis {market_analysis_id} to SKIPPED (insufficient_balance)")
+                        else:
+                            task.market_analysis_id = None  # Fallthrough to create new
+                    if not task.market_analysis_id:
+                        market_analysis = MarketAnalysis(
+                            symbol=task.symbol,
+                            expert_instance_id=task.expert_instance_id,
+                            status=MarketAnalysisStatus.SKIPPED,
+                            subtype=AnalysisUseCase(task.subtype),
+                            state=skip_state
+                        )
+                        market_analysis_id = add_instance(market_analysis)
+                        task.market_analysis_id = market_analysis_id
+
                     # Update task as completed (but skipped)
                     with self._task_lock:
                         task.status = WorkerTaskStatus.COMPLETED
-                        task.result = {"market_analysis_id": market_analysis_id, "status": "skipped", "reason": "insufficient_balance"}
+                        task.result = {"market_analysis_id": task.market_analysis_id, "status": "skipped", "reason": "insufficient_balance"}
                         task.completed_at = time.time()
-                    
+
                     execution_time = task.completed_at - task.started_at
                     logger.debug(f"Analysis task '{task.id}' skipped due to insufficient balance in {execution_time:.2f}s")
                     return
@@ -925,29 +938,42 @@ class WorkerQueue:
                 if should_skip:
                     # Skip analysis due to symbol price/balance constraints
                     logger.info(f"Skipping ENTER_MARKET analysis for expert {task.expert_instance_id}, symbol {task.symbol}: {skip_reason}")
-                    
-                    # Create analysis record marked as skipped
-                    market_analysis = MarketAnalysis(
-                        symbol=task.symbol,
-                        expert_instance_id=task.expert_instance_id,
-                        status=MarketAnalysisStatus.SKIPPED,
-                        subtype=AnalysisUseCase(task.subtype),
-                        state={
-                            "skipped": True,
-                            "skip_reason": skip_reason,  # Store actual skip reason
-                            "skip_type": "symbol_price_balance_check",
-                            "analysis_timestamp": datetime.now(timezone.utc).isoformat()
-                        }
-                    )
-                    market_analysis_id = add_instance(market_analysis)
-                    task.market_analysis_id = market_analysis_id
-                    
+
+                    skip_state = {
+                        "skipped": True,
+                        "skip_reason": skip_reason,
+                        "skip_type": "symbol_price_balance_check",
+                        "analysis_timestamp": datetime.now(timezone.utc).isoformat()
+                    }
+                    if task.market_analysis_id:
+                        # Update existing record (e.g. retry that got skipped)
+                        from .db import get_instance as _get, update_instance as _upd
+                        existing = _get(MarketAnalysis, task.market_analysis_id)
+                        if existing:
+                            existing.status = MarketAnalysisStatus.SKIPPED
+                            existing.state = skip_state
+                            _upd(existing)
+                            market_analysis_id = task.market_analysis_id
+                            logger.debug(f"Updated existing MarketAnalysis {market_analysis_id} to SKIPPED (symbol_price_balance_check)")
+                        else:
+                            task.market_analysis_id = None  # Fallthrough to create new
+                    if not task.market_analysis_id:
+                        market_analysis = MarketAnalysis(
+                            symbol=task.symbol,
+                            expert_instance_id=task.expert_instance_id,
+                            status=MarketAnalysisStatus.SKIPPED,
+                            subtype=AnalysisUseCase(task.subtype),
+                            state=skip_state
+                        )
+                        market_analysis_id = add_instance(market_analysis)
+                        task.market_analysis_id = market_analysis_id
+
                     # Update task as completed (but skipped)
                     with self._task_lock:
                         task.status = WorkerTaskStatus.COMPLETED
-                        task.result = {"market_analysis_id": market_analysis_id, "status": "skipped", "reason": "symbol_price_balance_check"}
+                        task.result = {"market_analysis_id": task.market_analysis_id, "status": "skipped", "reason": "symbol_price_balance_check"}
                         task.completed_at = time.time()
-                    
+
                     execution_time = task.completed_at - task.started_at
                     logger.debug(f"Analysis task '{task.id}' skipped due to symbol price/balance constraints in {execution_time:.2f}s")
                     return
