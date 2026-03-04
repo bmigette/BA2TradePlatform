@@ -3329,26 +3329,28 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
                         quantity = parameters["quantity"]
                         tp_price = parameters.get("tp_price")
                         sl_price = parameters.get("sl_price")
-                        
+                        market_analysis_id = parameters.get("market_analysis_id")
+
                         # CRITICAL: Ensure quantity is a whole number (Alpaca requires integers for GTC orders)
                         if not isinstance(quantity, int) and quantity != int(quantity):
                             logger.warning(f"⚠️ Fractional quantity detected for {symbol}: {quantity} - rounding to {int(quantity)}")
                         quantity = int(quantity)
-                        
-                        result = toolkit.open_buy_position(symbol, quantity, tp_price, sl_price, reason)
-                    
+
+                        result = toolkit.open_buy_position(symbol, quantity, tp_price, sl_price, reason, confidence, market_analysis_id)
+
                     elif action_type == "open_sell_position":
                         symbol = parameters["symbol"]
                         quantity = parameters["quantity"]
                         tp_price = parameters.get("tp_price")
                         sl_price = parameters.get("sl_price")
-                        
+                        market_analysis_id = parameters.get("market_analysis_id")
+
                         # CRITICAL: Ensure quantity is a whole number (Alpaca requires integers for GTC orders)
                         if not isinstance(quantity, int) and quantity != int(quantity):
                             logger.warning(f"⚠️ Fractional quantity detected for {symbol}: {quantity} - rounding to {int(quantity)}")
                         quantity = int(quantity)
-                        
-                        result = toolkit.open_sell_position(symbol, quantity, tp_price, sl_price, reason)
+
+                        result = toolkit.open_sell_position(symbol, quantity, tp_price, sl_price, reason, confidence, market_analysis_id)
                     
                     else:
                         logger.warning(f"Unknown action_type: {action_type}")

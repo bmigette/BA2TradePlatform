@@ -240,25 +240,29 @@ class SmartRiskManagerContentRenderer:
                     else:
                         ui.label("N/A").classes(f'text-h6 {self._text_class("primary")}').style(self._text_style("primary"))
     
+    def _render_markdown(self, text: str) -> None:
+        """Render markdown text with appropriate dark mode styling."""
+        ui.markdown(text).classes(f'text-sm mt-2 {self._text_class("primary")}').style(self._text_style("primary"))
+
     def _render_user_instructions(self, job: SmartRiskManagerJob) -> None:
         """Render user instructions card."""
         if not job.user_instructions:
             return
-        
+
         with ui.card().classes('w-full mb-4').style(self._card_style()):
             ui.label('User Instructions').classes(f'text-h6 mb-2 {self._text_class("primary")}').style(self._text_style("primary"))
             ui.separator()
-            ui.label(job.user_instructions).classes(f'text-sm whitespace-pre-wrap mt-2 {self._text_class("primary")}').style(self._text_style("primary"))
-    
+            self._render_markdown(job.user_instructions)
+
     def _render_actions_summary(self, job: SmartRiskManagerJob) -> None:
         """Render actions summary card."""
         if not job.actions_summary:
             return
-        
+
         with ui.card().classes('w-full mb-4').style(self._card_style()):
             ui.label('Actions Summary').classes(f'text-h6 mb-2 {self._text_class("primary")}').style(self._text_style("primary"))
             ui.separator()
-            ui.label(job.actions_summary).classes(f'text-sm whitespace-pre-wrap mt-2 {self._text_class("primary")}').style(self._text_style("primary"))
+            self._render_markdown(job.actions_summary)
     
     def _render_actions_log(self, job: SmartRiskManagerJob) -> None:
         """Render detailed actions log."""
@@ -354,13 +358,13 @@ class SmartRiskManagerContentRenderer:
                 # Summary (if available)
                 if action.get('summary'):
                     ui.label('Summary:').classes(f'text-sm font-bold mt-2 {self._text_class("secondary")}').style(self._text_style("secondary"))
-                    ui.label(action['summary']).classes(f'text-sm whitespace-pre-wrap {self._text_class("primary")}').style(self._text_style("primary"))
-                
+                    self._render_markdown(action['summary'])
+
                 # Reasoning (support both 'reason' and 'reasoning' keys)
                 reasoning = action.get('reason') or action.get('reasoning')
                 if reasoning:
                     ui.label('Reasoning:').classes(f'text-sm font-bold mt-2 {self._text_class("secondary")}').style(self._text_style("secondary"))
-                    ui.label(reasoning).classes(f'text-sm whitespace-pre-wrap {self._text_class("primary")}').style(self._text_style("primary"))
+                    self._render_markdown(reasoning)
                 
                 # Arguments
                 if action.get('arguments'):
@@ -446,8 +450,8 @@ class SmartRiskManagerContentRenderer:
                     ui.icon('psychology', color='primary').props('size=md')
                     ui.label('Research Node Analysis').classes(f'text-h6 {self._text_class("primary")}').style(self._text_style("primary"))
                 ui.separator()
-                ui.label(research_findings).classes(f'text-sm whitespace-pre-wrap mt-2 {self._text_class("primary")}').style(self._text_style("primary"))
-        
+                self._render_markdown(research_findings)
+
         # Final Summary card
         if final_summary:
             with ui.card().classes('w-full mb-4').style(self._card_style()):
@@ -455,7 +459,7 @@ class SmartRiskManagerContentRenderer:
                     ui.icon('summarize', color='primary').props('size=md')
                     ui.label('Final Summary').classes(f'text-h6 {self._text_class("primary")}').style(self._text_style("primary"))
                 ui.separator()
-                ui.label(final_summary).classes(f'text-sm whitespace-pre-wrap mt-2 {self._text_class("primary")}').style(self._text_style("primary"))
+                self._render_markdown(final_summary)
     
     def _render_graph_state(self, job: SmartRiskManagerJob) -> None:
         """Render graph state JSON viewer."""

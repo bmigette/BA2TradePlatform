@@ -13,9 +13,9 @@ from sqlmodel import Session, select
 from ..logger import logger
 from .models import (
     Transaction, TradingOrder, MarketAnalysis, ExpertInstance,
-    SmartRiskManagerJob
+    SmartRiskManagerJob, ExpertRecommendation
 )
-from .types import TransactionStatus, OrderStatus, OrderType, OrderDirection, MarketAnalysisStatus, OrderOpenType
+from .types import TransactionStatus, OrderStatus, OrderType, OrderDirection, MarketAnalysisStatus, OrderOpenType, OrderRecommendation, RiskLevel, TimeHorizon
 from .db import get_db, get_instance, add_instance
 from .utils import get_expert_instance_from_id, get_account_instance_from_id
 from .interfaces import MarketExpertInterface
@@ -90,7 +90,8 @@ class SmartRiskManagerToolkit:
         depends_order_status_trigger: Optional[OrderStatus] = None,
         good_for: Optional[str] = None,
         comment: Optional[str] = None,
-        open_type: OrderOpenType = OrderOpenType.AUTOMATIC
+        open_type: OrderOpenType = OrderOpenType.AUTOMATIC,
+        expert_recommendation_id: Optional[int] = None
     ) -> TradingOrder:
         """
         Create a TradingOrder object with proper field validation.
@@ -146,7 +147,8 @@ class SmartRiskManagerToolkit:
             good_for=good_for,
             comment=comment,
             status=OrderStatus.PENDING,  # Will be updated by broker
-            open_type=open_type
+            open_type=open_type,
+            expert_recommendation_id=expert_recommendation_id
         )
         
         logger.debug(f"Created TradingOrder: {symbol} {side.value} {quantity} @ {order_type.value} (open_type={open_type.value})")
@@ -1847,45 +1849,53 @@ class SmartRiskManagerToolkit:
         quantity: Annotated[float, "Number of shares/units to buy"],
         tp_price: Annotated[Optional[float], "Optional take profit price (must be above entry price)"] = None,
         sl_price: Annotated[Optional[float], "Optional stop loss price (must be below entry price)"] = None,
-        reason: Annotated[str, "Reason for opening this long position"] = ""
+        reason: Annotated[str, "Reason for opening this long position"] = "",
+        confidence: float = 0,
+        market_analysis_id: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Open a new LONG (BUY) position.
-        
+
         Args:
             symbol: Instrument symbol to buy
             quantity: Number of shares to buy
             tp_price: Take profit price (optional, must be above entry)
             sl_price: Stop loss price (optional, must be below entry)
             reason: Explanation for opening this long position
-            
+            confidence: Confidence level 0-100
+            market_analysis_id: Optional ID of the MarketAnalysis that prompted this action
+
         Returns:
             Result dict with success, message, transaction_id, order_id, symbol, quantity, direction
         """
-        return self._open_position_internal(symbol, OrderDirection.BUY, quantity, tp_price, sl_price, reason)
-    
+        return self._open_position_internal(symbol, OrderDirection.BUY, quantity, tp_price, sl_price, reason, confidence, market_analysis_id)
+
     def open_sell_position(
         self,
         symbol: Annotated[str, "Instrument symbol to sell short"],
         quantity: Annotated[float, "Number of shares/units to sell short"],
         tp_price: Annotated[Optional[float], "Optional take profit price (must be below entry price)"] = None,
         sl_price: Annotated[Optional[float], "Optional stop loss price (must be above entry price)"] = None,
-        reason: Annotated[str, "Reason for opening this short position"] = ""
+        reason: Annotated[str, "Reason for opening this short position"] = "",
+        confidence: float = 0,
+        market_analysis_id: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Open a new SHORT (SELL) position.
-        
+
         Args:
             symbol: Instrument symbol to sell short
             quantity: Number of shares to sell short
             tp_price: Take profit price (optional, must be below entry)
             sl_price: Stop loss price (optional, must be above entry)
             reason: Explanation for opening this short position
-            
+            confidence: Confidence level 0-100
+            market_analysis_id: Optional ID of the MarketAnalysis that prompted this action
+
         Returns:
             Result dict with success, message, transaction_id, order_id, symbol, quantity, direction
         """
-        return self._open_position_internal(symbol, OrderDirection.SELL, quantity, tp_price, sl_price, reason)
+        return self._open_position_internal(symbol, OrderDirection.SELL, quantity, tp_price, sl_price, reason, confidence, market_analysis_id)
     
     def _open_position_internal(
         self,
@@ -1894,11 +1904,13 @@ class SmartRiskManagerToolkit:
         quantity: float,
         tp_price: Optional[float] = None,
         sl_price: Optional[float] = None,
-        reason: str = ""
+        reason: str = "",
+        confidence: float = 0,
+        market_analysis_id: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Internal method to open a new trading position.
-        
+
         Args:
             symbol: Instrument symbol
             order_direction: OrderDirection.BUY or OrderDirection.SELL
@@ -1906,7 +1918,9 @@ class SmartRiskManagerToolkit:
             tp_price: Take profit price (optional)
             sl_price: Stop loss price (optional)
             reason: Explanation for opening position
-            
+            confidence: Confidence level 0-100
+            market_analysis_id: Optional ID of the MarketAnalysis that prompted this action
+
         Returns:
             Result dict with success, message, transaction_id, order_id, symbol, quantity, direction
         """
@@ -2112,7 +2126,45 @@ class SmartRiskManagerToolkit:
             
             transaction_id = add_instance(transaction)
             logger.info(f"Created transaction {transaction_id} for {symbol} {direction} position (expert_id={self.expert_instance_id})")
-            
+
+            # Create an ExpertRecommendation so the order shows the ℹ button and links to analysis
+            rec_id = None
+            try:
+                # If no market_analysis_id provided, find the most recent completed one for this symbol
+                resolved_analysis_id = market_analysis_id
+                if resolved_analysis_id is None:
+                    with get_db() as session:
+                        latest_analysis = session.exec(
+                            select(MarketAnalysis)
+                            .where(
+                                MarketAnalysis.expert_instance_id == self.expert_instance_id,
+                                MarketAnalysis.symbol == symbol,
+                                MarketAnalysis.status == MarketAnalysisStatus.COMPLETED
+                            )
+                            .order_by(MarketAnalysis.id.desc())
+                            .limit(1)
+                        ).first()
+                        if latest_analysis:
+                            resolved_analysis_id = latest_analysis.id
+
+                recommended_action = OrderRecommendation.BUY if order_direction == OrderDirection.BUY else OrderRecommendation.SELL
+                recommendation = ExpertRecommendation(
+                    instance_id=self.expert_instance_id,
+                    market_analysis_id=resolved_analysis_id,
+                    symbol=symbol,
+                    recommended_action=recommended_action,
+                    expected_profit_percent=0.0,
+                    price_at_date=current_price,
+                    details=reason or f"Smart Risk Manager opened {direction} position",
+                    confidence=confidence,
+                    risk_level=RiskLevel.MEDIUM,
+                    time_horizon=TimeHorizon.SHORT_TERM,
+                )
+                rec_id = add_instance(recommendation)
+                logger.info(f"Created ExpertRecommendation {rec_id} for {symbol} {direction} (analysis_id={resolved_analysis_id})")
+            except Exception as e:
+                logger.warning(f"Could not create ExpertRecommendation for {symbol}: {e}")
+
             # Create and submit market order linked to transaction
             entry_order = self._create_trading_order(
                 symbol=symbol,
@@ -2120,7 +2172,8 @@ class SmartRiskManagerToolkit:
                 side=order_direction,
                 order_type=OrderType.MARKET,
                 transaction_id=transaction_id,
-                comment=f"New position: {reason}"
+                comment=f"New position: {reason}",
+                expert_recommendation_id=rec_id
             )
             
             # Submit order with TP/SL as bracket order if provided
