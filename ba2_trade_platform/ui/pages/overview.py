@@ -5560,38 +5560,40 @@ class AccountGrowthTab:
                         for label in info['labels']:
                             label_daily_values[label][i] += val
 
-        # Build cumulative dividends per label per date.
-        # Only include cash dividends (not DRIP): DRIP dividends are already
-        # reflected in qty * price via _build_qty_timeline, so counting them
-        # here too would double-count the reinvested amount.
+        # Build two cumulative dividend series per label:
+        # - label_cum_divs: ALL dividends (DRIP + cash) — shown as the display line
+        # - label_cum_cash_divs: cash dividends only — used for the Total line
+        #   (DRIP shares are already reflected in qty * price via _build_qty_timeline,
+        #    so only cash dividends should be added on top of the value)
         label_cum_divs = {label: [0.0] * len(all_dates) for label in all_labels}
+        label_cum_cash_divs = {label: [0.0] * len(all_dates) for label in all_labels}
         if all_dividends:
-            # Map each dividend symbol to its labels
             for div in all_dividends:
                 sym = div.get('symbol')
                 if not sym or sym not in symbol_info:
-                    continue
-                # Skip DRIP dividends — those shares are already in qty * price
-                if div.get('drip_quantity'):
                     continue
                 date_val = div.get('date')
                 if not date_val:
                     continue
                 date_str = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)
+                if date_str not in all_dates:
+                    continue
+                idx = all_dates.index(date_str)
                 amount = float(div.get('amount', 0)) - float(div.get('tax_withheld', 0))
+                is_drip = bool(div.get('drip_quantity'))
                 labels_for_sym = symbol_info[sym]['labels']
-                # Find the index in all_dates for this date or the next available
-                if date_str in all_dates:
-                    idx = all_dates.index(date_str)
-                    for label in labels_for_sym:
-                        label_cum_divs[label][idx] += amount
+                for label in labels_for_sym:
+                    label_cum_divs[label][idx] += amount
+                    if not is_drip:
+                        label_cum_cash_divs[label][idx] += amount
 
-            # Convert to cumulative (running total)
+            # Convert both to cumulative running totals
             for label in all_labels:
                 for i in range(1, len(all_dates)):
                     label_cum_divs[label][i] += label_cum_divs[label][i - 1]
-                # Round
+                    label_cum_cash_divs[label][i] += label_cum_cash_divs[label][i - 1]
                 label_cum_divs[label] = [round(v, 2) for v in label_cum_divs[label]]
+                label_cum_cash_divs[label] = [round(v, 2) for v in label_cum_cash_divs[label]]
 
         has_any_dividends = any(label_cum_divs[l][-1] > 0 for l in all_labels) if all_dates else False
 
@@ -5680,11 +5682,12 @@ class AccountGrowthTab:
                             })
                             legend_data.append(div_name)
 
-                            # Total value line per label (dotted)
+                            # Total value line per label (dotted):
+                            # value + cash dividends only (DRIP already in value)
                             total_name = f'{label} (Total)'
                             total_data = [
                                 round(pv + dv, 2)
-                                for pv, dv in zip(label_daily_values[label], label_cum_divs[label])
+                                for pv, dv in zip(label_daily_values[label], label_cum_cash_divs[label])
                             ]
                             series.append({
                                 'name': total_name,
@@ -5848,30 +5851,34 @@ class AccountGrowthTab:
                         values[i] = qty_at_date * last_price
             sym_daily_values[sym] = values
 
-        # Build per-symbol cumulative dividends (cash only).
-        # Skip DRIP dividends — those shares are already in qty * price via
-        # _build_qty_timeline, so adding them here would double-count.
+        # Build two per-symbol cumulative dividend series:
+        # - sym_cum_divs: ALL dividends (DRIP + cash) — shown as the display line
+        # - sym_cum_cash_divs: cash dividends only — used for the Total line
         sym_cum_divs = {sym: [0.0] * len(all_dates) for sym in symbol_info}
+        sym_cum_cash_divs = {sym: [0.0] * len(all_dates) for sym in symbol_info}
         if all_dividends:
             for div in all_dividends:
                 sym = div.get('symbol')
                 if not sym or sym not in symbol_info:
                     continue
-                # Skip DRIP dividends — already reflected in historical quantities
-                if div.get('drip_quantity'):
-                    continue
                 date_val = div.get('date')
                 if not date_val:
                     continue
                 date_str = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)
+                if date_str not in all_dates:
+                    continue
+                idx = all_dates.index(date_str)
                 amount = float(div.get('amount', 0)) - float(div.get('tax_withheld', 0))
-                if date_str in all_dates:
-                    idx = all_dates.index(date_str)
-                    sym_cum_divs[sym][idx] += amount
+                is_drip = bool(div.get('drip_quantity'))
+                sym_cum_divs[sym][idx] += amount
+                if not is_drip:
+                    sym_cum_cash_divs[sym][idx] += amount
             for sym in symbol_info:
                 for i in range(1, len(all_dates)):
                     sym_cum_divs[sym][i] += sym_cum_divs[sym][i - 1]
+                    sym_cum_cash_divs[sym][i] += sym_cum_cash_divs[sym][i - 1]
                 sym_cum_divs[sym] = [round(v, 2) for v in sym_cum_divs[sym]]
+                sym_cum_cash_divs[sym] = [round(v, 2) for v in sym_cum_cash_divs[sym]]
 
         # Build per-symbol cumulative invested amounts:
         # base at first date = qty_at_first_date * (cost_basis / current_qty),
@@ -5961,10 +5968,11 @@ class AccountGrowthTab:
                             })
                             legend_data.append(div_name)
 
+                            # Total = value + cash dividends only (DRIP already in value)
                             total_name = f'{sym} (Total)'
                             total_data = [
                                 round(pv + dv, 2)
-                                for pv, dv in zip(sym_daily_values[sym], sym_cum_divs[sym])
+                                for pv, dv in zip(sym_daily_values[sym], sym_cum_cash_divs[sym])
                             ]
                             series.append({
                                 'name': total_name,
