@@ -5293,6 +5293,7 @@ class AccountGrowthTab:
                 per_acc_div_cash[a_id][d] = per_acc_div_cash[a_id].get(d, 0.0) + cash_in - cash_out
 
             pnl_pct_data = []
+            aligned_invested = []
             per_acc_invested = {}  # acc_id -> invested_capital
             per_acc_prev_nlv = {}  # acc_id -> previous NLV (forward-filled)
             per_acc_prev_cash = {}  # acc_id -> previous cash (forward-filled)
@@ -5335,6 +5336,8 @@ class AccountGrowthTab:
 
                     total_nlv += acc_nlv
                     total_invested += per_acc_invested[acc_id]
+
+                aligned_invested.append(round(total_invested, 2))
 
                 if total_invested > 0:
                     pnl = total_nlv - total_invested
@@ -5399,6 +5402,18 @@ class AccountGrowthTab:
                             ]
                         }
                     }
+                })
+
+            if any(v > 0 for v in aligned_invested):
+                series.append({
+                    'name': 'Invested Capital',
+                    'type': 'line',
+                    'yAxisIndex': 0,
+                    'data': aligned_invested,
+                    'smooth': False,
+                    'showSymbol': False,
+                    'lineStyle': {'width': 1.5, 'color': '#FF9800', 'type': 'dashed'},
+                    'itemStyle': {'color': '#FF9800'},
                 })
 
             # P/L % on right y-axis with gradient color (green positive, red negative)
@@ -5574,6 +5589,50 @@ class AccountGrowthTab:
 
         has_any_dividends = any(label_cum_divs[l][-1] > 0 for l in all_labels) if all_dates else False
 
+        # Build cumulative invested per label per date:
+        # base = qty_at_first_date * (cost_basis / current_qty) for each symbol,
+        # then add/subtract actual BUY/SELL trade costs within the chart window.
+        label_cum_invested = {label: [0.0] * len(all_dates) for label in all_labels}
+        for sym, info in symbol_info.items():
+            current_qty = info['qty']
+            cost_basis = info['cost_basis']
+            if current_qty <= 0:
+                continue
+            cost_per_share = cost_basis / current_qty
+            qty_timeline = sym_qty_timelines.get(sym, {})
+            # Base invested at first date
+            start_qty = qty_timeline.get(all_dates[0], 0) if all_dates else 0
+            base_invested = start_qty * cost_per_share
+            # Build a delta array: trade costs that fall within all_dates
+            date_to_idx = {d: i for i, d in enumerate(all_dates)}
+            trade_deltas = [0.0] * len(all_dates)
+            for t in (all_filled_trades or []):
+                if t.get('symbol') != sym:
+                    continue
+                date_val = t.get('date')
+                if not date_val:
+                    continue
+                t_date = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)[:10]
+                if t_date not in date_to_idx:
+                    continue
+                idx = date_to_idx[t_date]
+                cost = float(t.get('qty', 0)) * float(t.get('price', 0))
+                if t.get('side') == 'BUY':
+                    trade_deltas[idx] += cost
+                elif t.get('side') == 'SELL':
+                    trade_deltas[idx] -= cost
+            # Cumulate
+            running = base_invested
+            for i in range(len(all_dates)):
+                running += trade_deltas[i]
+                for label in info['labels']:
+                    label_cum_invested[label][i] += running
+        # Round
+        for label in all_labels:
+            label_cum_invested[label] = [round(v, 2) for v in label_cum_invested[label]]
+
+        has_any_invested = any(label_cum_invested[l][-1] > 0 for l in all_labels) if all_dates else False
+
         # Color palette for labels
         colors = ['#1976D2', '#4CAF50', '#FF9800', '#E91E63', '#9C27B0',
                   '#00BCD4', '#FF5722', '#795548', '#607D8B', '#CDDC39']
@@ -5631,6 +5690,22 @@ class AccountGrowthTab:
                                 'showSymbol': False,
                             })
                             legend_data.append(total_name)
+
+                if has_any_invested:
+                    for i, label in enumerate(visible_labels):
+                        color = colors[i % len(colors)]
+                        if label_cum_invested[label][-1] > 0:
+                            inv_name = f'{label} (Invested)'
+                            series.append({
+                                'name': inv_name,
+                                'type': 'line',
+                                'data': label_cum_invested[label],
+                                'smooth': False,
+                                'lineStyle': {'width': 1.5, 'color': color, 'type': 'dotdash'},
+                                'itemStyle': {'color': color},
+                                'showSymbol': False,
+                            })
+                            legend_data.append(inv_name)
 
                 return {
                     'backgroundColor': 'transparent',
@@ -5787,6 +5862,40 @@ class AccountGrowthTab:
                     sym_cum_divs[sym][i] += sym_cum_divs[sym][i - 1]
                 sym_cum_divs[sym] = [round(v, 2) for v in sym_cum_divs[sym]]
 
+        # Build per-symbol cumulative invested amounts:
+        # base at first date = qty_at_first_date * (cost_basis / current_qty),
+        # then add BUY costs / subtract SELL proceeds within the chart window.
+        sym_cum_invested = {sym: [0.0] * len(all_dates) for sym in symbol_info}
+        date_to_idx_pos = {d: i for i, d in enumerate(all_dates)}
+        for sym, info in symbol_info.items():
+            current_qty = info['qty']
+            cost_basis = info['cost_basis']
+            if current_qty <= 0:
+                continue
+            cost_per_share = cost_basis / current_qty
+            qty_timeline = sym_qty_timelines.get(sym, {})
+            start_qty = qty_timeline.get(all_dates[0], 0) if all_dates else 0
+            base_invested = start_qty * cost_per_share
+            sym_trades = [t for t in (all_filled_trades or []) if t.get('symbol') == sym]
+            trade_deltas = [0.0] * len(all_dates)
+            for t in sym_trades:
+                date_val = t.get('date')
+                if not date_val:
+                    continue
+                t_date = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)[:10]
+                if t_date not in date_to_idx_pos:
+                    continue
+                idx = date_to_idx_pos[t_date]
+                cost = float(t.get('qty', 0)) * float(t.get('price', 0))
+                if t.get('side') == 'BUY':
+                    trade_deltas[idx] += cost
+                elif t.get('side') == 'SELL':
+                    trade_deltas[idx] -= cost
+            running = base_invested
+            for i in range(len(all_dates)):
+                running += trade_deltas[i]
+                sym_cum_invested[sym][i] = round(running, 2)
+
         colors = ['#1976D2', '#4CAF50', '#FF9800', '#E91E63', '#9C27B0',
                   '#00BCD4', '#FF5722', '#795548', '#607D8B', '#CDDC39']
 
@@ -5802,6 +5911,10 @@ class AccountGrowthTab:
                 legend_data = []
                 has_divs = (
                     any(sym_cum_divs[sym][-1] > 0 for sym in symbols if sym in sym_cum_divs)
+                    if all_dates else False
+                )
+                has_invested = (
+                    any(sym_cum_invested[sym][-1] > 0 for sym in symbols if sym in sym_cum_invested)
                     if all_dates else False
                 )
                 for i, sym in enumerate(symbols):
@@ -5852,6 +5965,24 @@ class AccountGrowthTab:
                                 'showSymbol': False,
                             })
                             legend_data.append(total_name)
+
+                if has_invested:
+                    for i, sym in enumerate(symbols):
+                        if sym not in sym_cum_invested:
+                            continue
+                        color = colors[i % len(colors)]
+                        if sym_cum_invested[sym][-1] > 0:
+                            inv_name = f'{sym} (Invested)'
+                            series.append({
+                                'name': inv_name,
+                                'type': 'line',
+                                'data': sym_cum_invested[sym],
+                                'smooth': False,
+                                'lineStyle': {'width': 1.5, 'color': color, 'type': 'dotdash'},
+                                'itemStyle': {'color': color},
+                                'showSymbol': False,
+                            })
+                            legend_data.append(inv_name)
 
                 return {
                     'backgroundColor': 'transparent',
