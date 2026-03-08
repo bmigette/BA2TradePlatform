@@ -5560,13 +5560,19 @@ class AccountGrowthTab:
                         for label in info['labels']:
                             label_daily_values[label][i] += val
 
-        # Build cumulative dividends per label per date
+        # Build cumulative dividends per label per date.
+        # Only include cash dividends (not DRIP): DRIP dividends are already
+        # reflected in qty * price via _build_qty_timeline, so counting them
+        # here too would double-count the reinvested amount.
         label_cum_divs = {label: [0.0] * len(all_dates) for label in all_labels}
         if all_dividends:
             # Map each dividend symbol to its labels
             for div in all_dividends:
                 sym = div.get('symbol')
                 if not sym or sym not in symbol_info:
+                    continue
+                # Skip DRIP dividends — those shares are already in qty * price
+                if div.get('drip_quantity'):
                     continue
                 date_val = div.get('date')
                 if not date_val:
@@ -5842,12 +5848,17 @@ class AccountGrowthTab:
                         values[i] = qty_at_date * last_price
             sym_daily_values[sym] = values
 
-        # Build per-symbol cumulative dividends
+        # Build per-symbol cumulative dividends (cash only).
+        # Skip DRIP dividends — those shares are already in qty * price via
+        # _build_qty_timeline, so adding them here would double-count.
         sym_cum_divs = {sym: [0.0] * len(all_dates) for sym in symbol_info}
         if all_dividends:
             for div in all_dividends:
                 sym = div.get('symbol')
                 if not sym or sym not in symbol_info:
+                    continue
+                # Skip DRIP dividends — already reflected in historical quantities
+                if div.get('drip_quantity'):
                     continue
                 date_val = div.get('date')
                 if not date_val:
