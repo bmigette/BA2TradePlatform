@@ -1185,41 +1185,41 @@ class TradingAgentsUI:
                         is_json_output = output_obj.name.endswith('_json')
                         
                         with ui.expansion(f'{icon} {display_name}', icon='code').classes('w-full mb-2'):
-                            with ui.card().classes('w-full p-4 bg-grey-1'):
+                            with ui.card().classes('w-full p-4').style('background: #1e2a3a;'):
                                 # Show metadata
                                 with ui.row().classes('w-full gap-4 mb-3'):
-                                    ui.label(f'Output #{idx}').classes('text-xs text-grey-7')
-                                    ui.label(f'Type: {output_obj.type}').classes('text-xs text-grey-7')
+                                    ui.label(f'Output #{idx}').classes('text-xs').style('color: #a0aec0;')
+                                    ui.label(f'Type: {output_obj.type}').classes('text-xs').style('color: #a0aec0;')
                                     if output_obj.created_at:
-                                        ui.label(f'Time: {output_obj.created_at.strftime("%H:%M:%S")}').classes('text-xs text-grey-7')
-                                
+                                        ui.label(f'Time: {output_obj.created_at.strftime("%H:%M:%S")}').classes('text-xs').style('color: #a0aec0;')
+
                                 ui.separator().classes('my-2')
-                                
+
                                 # Render content based on type
                                 if is_json_output and output_obj.text:
                                     # JSON output - use json_editor for nice display
                                     try:
                                         json_data = json.loads(output_obj.text)
-                                        ui.label('📋 Tool Parameters (JSON):').classes('text-sm font-bold mb-2')
+                                        ui.label('📋 Tool Parameters (JSON):').classes('text-sm font-bold mb-2').style('color: #e2e8f0;')
                                         ui.json_editor({'content': {'json': json_data}}).classes('w-full')
                                     except json.JSONDecodeError as e:
                                         logger.warning(f"Failed to parse JSON for {output_obj.name}: {e}")
                                         # Fallback to text display with pre tag
                                         with ui.scroll_area().classes('w-full max-h-96'):
                                             escaped_text = html.escape(output_obj.text or '(empty)')
-                                            ui.html(f'<pre class="whitespace-pre-wrap text-xs font-mono bg-white p-3 rounded border overflow-x-auto">{escaped_text}</pre>', sanitize=False)
-                                
+                                            ui.html(f'<pre style="white-space:pre-wrap;font-size:0.75rem;font-family:monospace;background:#0d1117;color:#e2e8f0;padding:0.75rem;border-radius:0.25rem;border:1px solid rgba(255,255,255,0.1);overflow-x:auto">{escaped_text}</pre>', sanitize=False)
+
                                 elif output_obj.text:
                                     # Text/Markdown output - show in scrollable pre
                                     with ui.scroll_area().classes('w-full max-h-96'):
                                         if self._looks_like_markdown(output_obj.text):
-                                            ui.markdown(output_obj.text).classes('text-sm')
+                                            ui.markdown(output_obj.text).classes('text-sm').style('color: #e2e8f0;')
                                         else:
                                             # Use pre tag for preserving formatting and whitespace
                                             escaped_text = html.escape(output_obj.text)
-                                            ui.html(f'<pre class="whitespace-pre-wrap text-xs font-mono bg-white p-3 rounded border overflow-x-auto">{escaped_text}</pre>', sanitize=False)
+                                            ui.html(f'<pre style="white-space:pre-wrap;font-size:0.75rem;font-family:monospace;background:#0d1117;color:#e2e8f0;padding:0.75rem;border-radius:0.25rem;border:1px solid rgba(255,255,255,0.1);overflow-x:auto">{escaped_text}</pre>', sanitize=False)
                                 else:
-                                    ui.label('(No output content)').classes('text-grey-5 italic')
+                                    ui.label('(No output content)').classes('italic').style('color: #718096;')
                 
                 finally:
                     session.close()
