@@ -244,31 +244,9 @@ class SmartRiskManagerToolkit:
                     unrealized_pnl_pct = (unrealized_pnl / (trans.open_price * quantity)) * 100 if trans.open_price > 0 else 0.0
                     position_value = current_price * quantity
                     
-                    # Get TP/SL orders - these are orders that depend on the entry order
-                    # TP = SELL_LIMIT (for long) or BUY_LIMIT (for short) with depends_on_order set
-                    # SL = SELL_STOP (for long) or BUY_STOP (for short) with depends_on_order set
-                    entry_order = trans.trading_orders[0] if trans.trading_orders else None
-                    tp_order = None
-                    sl_order = None
-                    
-                    if entry_order:
-                        # Get all dependent orders
-                        dependent_orders = session.exec(
-                            select(TradingOrder)
-                            .where(TradingOrder.depends_on_order == entry_order.id)
-                            .where(TradingOrder.status.not_in(OrderStatus.get_terminal_statuses()))
-                        ).all()
-                        
-                        for order in dependent_orders:
-                            # TP order: SELL_LIMIT (long) or BUY_LIMIT (short)
-                            if (direction == OrderDirection.BUY and order.order_type == OrderType.SELL_LIMIT) or \
-                               (direction == OrderDirection.SELL and order.order_type == OrderType.BUY_LIMIT):
-                                tp_order = order
-                            # SL order: SELL_STOP (long) or BUY_STOP (short)
-                            elif (direction == OrderDirection.BUY and order.order_type == OrderType.SELL_STOP) or \
-                                 (direction == OrderDirection.SELL and order.order_type == OrderType.BUY_STOP):
-                                sl_order = order
-                    
+                    # Get TP/SL order dicts - handles OCO, SELL_LIMIT/SELL_STOP, BUY_LIMIT/BUY_STOP
+                    tpsl_dicts = TransactionHelper.get_tpsl_order_dicts(trans, session)
+
                     position_data = {
                         "transaction_id": trans.id,
                         "symbol": trans.symbol,
@@ -279,18 +257,8 @@ class SmartRiskManagerToolkit:
                         "unrealized_pnl": round(unrealized_pnl, 2),
                         "unrealized_pnl_pct": round(unrealized_pnl_pct, 2),
                         "position_value": round(position_value, 2),
-                        "tp_order": {
-                            "order_id": tp_order.id,
-                            "price": tp_order.limit_price,
-                            "quantity": tp_order.quantity,
-                            "status": tp_order.status.value
-                        } if tp_order else None,
-                        "sl_order": {
-                            "order_id": sl_order.id,
-                            "price": sl_order.stop_price,
-                            "quantity": sl_order.quantity,
-                            "status": sl_order.status.value
-                        } if sl_order else None
+                        "tp_order": tpsl_dicts["tp_order"],
+                        "sl_order": tpsl_dicts["sl_order"]
                     }
                     
                     open_positions.append(position_data)

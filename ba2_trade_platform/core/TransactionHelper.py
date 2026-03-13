@@ -453,7 +453,71 @@ class TransactionHelper:
                     break
         
         return {'tp_price': tp_price, 'sl_price': sl_price}
-    
+
+    @staticmethod
+    def get_tpsl_order_dicts(
+        transaction: Transaction,
+        session: Optional[Session] = None
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+        """
+        Get TP and SL order info as dicts for use in position_data structures.
+
+        Handles OCO orders (single order containing both TP limit_price and SL stop_price)
+        as well as separate SELL_LIMIT/SELL_STOP (or BUY_LIMIT/BUY_STOP) orders.
+
+        Returns:
+            Dict with keys:
+            - 'tp_order': dict with order_id, price, quantity, status — or None
+            - 'sl_order': dict with order_id, price, quantity, status — or None
+        """
+        tpsl_orders = TransactionHelper.get_tpsl_orders(transaction, session, include_terminal=False)
+
+        tp_order_dict = None
+        sl_order_dict = None
+
+        # OCO orders carry both prices in one order
+        for order in tpsl_orders['oco']:
+            if tp_order_dict is None and order.limit_price is not None:
+                tp_order_dict = {
+                    "order_id": order.id,
+                    "price": order.limit_price,
+                    "quantity": order.quantity,
+                    "status": order.status.value
+                }
+            if sl_order_dict is None and order.stop_price is not None:
+                sl_order_dict = {
+                    "order_id": order.id,
+                    "price": order.stop_price,
+                    "quantity": order.quantity,
+                    "status": order.status.value
+                }
+
+        # Fall back to individual TP orders
+        if tp_order_dict is None:
+            for order in tpsl_orders['tp']:
+                if order.limit_price is not None:
+                    tp_order_dict = {
+                        "order_id": order.id,
+                        "price": order.limit_price,
+                        "quantity": order.quantity,
+                        "status": order.status.value
+                    }
+                    break
+
+        # Fall back to individual SL orders
+        if sl_order_dict is None:
+            for order in tpsl_orders['sl']:
+                if order.stop_price is not None:
+                    sl_order_dict = {
+                        "order_id": order.id,
+                        "price": order.stop_price,
+                        "quantity": order.quantity,
+                        "status": order.status.value
+                    }
+                    break
+
+        return {"tp_order": tp_order_dict, "sl_order": sl_order_dict}
+
     @staticmethod
     def validate_entry_order_qty(entry_order: Optional[TradingOrder]) -> bool:
         """
