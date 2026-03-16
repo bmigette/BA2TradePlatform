@@ -1681,113 +1681,115 @@ class ExpertSettingsTab:
                             )
                             ui.label('Allows the expert to automatically modify or close existing positions').classes('text-body2 text-grey-7 ml-6')
                         
-                        ui.separator().classes('my-4')
-                        
-                        # Risk Management settings
-                        ui.label('Risk Management:').classes('text-subtitle2 mb-2')
-                        ui.label('Configure risk management parameters for this expert:').classes('text-body2 mb-2')
-                        
-                        with ui.column().classes('w-full gap-2'):
-                            # Max Virtual Equity Per Instrument
-                            with ui.row().classes('items-center gap-2'):
-                                ui.label('Max equity per instrument (%):').classes('text-sm font-medium')
-                                self.max_virtual_equity_per_instrument_input = ui.input(
-                                    value='10.0',
-                                    placeholder='10.0'
-                                ).classes('w-20')
-                                ui.label('%').classes('text-sm')
-                            ui.label('Maximum percentage of virtual trading balance that can be allocated to a single instrument. Recommended: 5-15%.').classes('text-body2 text-grey-7 ml-2')
-                            
-                            # Min Available Balance Percentage
-                            with ui.row().classes('items-center gap-2 mt-2'):
-                                ui.label('Min balance for new positions (%):').classes('text-sm font-medium')
-                                self.min_available_balance_pct_input = ui.input(
-                                    value='10.0',
-                                    placeholder='10.0'
-                                ).classes('w-20')
-                                ui.label('%').classes('text-sm')
-                            ui.label('Minimum available balance percentage required to enter new market positions. Lower values (5-10%) allow more aggressive trading, higher values (15-25%) provide more conservative risk management.').classes('text-body2 text-grey-7 ml-2')
-                        
-                        ui.separator().classes('my-4')
-                        
-                        # AI Model Settings
-                        ui.label('AI Model Settings:').classes('text-subtitle2 mb-2')
-                        ui.label('Configure AI models used by this expert for various tasks:').classes('text-body2 mb-2')
-                        
-                        # Get model options from builtin settings definitions for defaults/descriptions
-                        from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
-                        MarketExpertInterface._ensure_builtin_settings()
-                        
-                        risk_manager_model_def = MarketExpertInterface._builtin_settings.get('risk_manager_model', {})
-                        risk_manager_model_default = risk_manager_model_def.get('default', 'nagaai/gpt5')
-                        risk_manager_model_help = risk_manager_model_def.get('description', 'AI model used for risk management analysis and decision-making')
-                        
-                        dynamic_model_def = MarketExpertInterface._builtin_settings.get('dynamic_instrument_selection_model', {})
-                        dynamic_model_default = dynamic_model_def.get('default', 'nagaai/gpt5')
-                        dynamic_model_help = dynamic_model_def.get('description', 'AI model used for dynamically selecting trading instruments based on market conditions')
-                        
-                        # Import the ModelSelectorInput component and labels
-                        from ..components.ModelSelector import ModelSelectorInput
-                        from ...core.models_registry import LABEL_WEBSEARCH
-                        
-                        with ui.column().classes('w-full gap-2'):
-                            # Risk Manager Model - using ModelSelectorInput
-                            self.risk_manager_model_input = ModelSelectorInput(
-                                label='Risk Manager Model',
-                                value=risk_manager_model_default,
-                                default_provider='nagaai',
-                                help_text=risk_manager_model_help
-                            )
-                            self.risk_manager_model_input.render()
-                            
-                            # Dynamic Instrument Selection Model - REQUIRES web search capability
-                            self.dynamic_instrument_selection_model_input = ModelSelectorInput(
-                                label='Dynamic Instrument Selection Model',
-                                value=dynamic_model_default,
-                                default_provider='nagaai',
-                                help_text=dynamic_model_help + ' (Only models with web search capability are shown)',
-                                required_labels=[LABEL_WEBSEARCH]  # Only show models with websearch label
-                            )
-                            self.dynamic_instrument_selection_model_input.render()
-                        
-                        ui.separator().classes('my-4')
-                        
-                        # Risk Manager Mode
-                        ui.label('Risk Manager Mode:').classes('text-subtitle2 mb-2')
-                        ui.label('Select how risk management decisions are made:').classes('text-body2 mb-2')
-                        
-                        with ui.column().classes('w-full gap-2'):
-                            self.risk_manager_mode_select = ui.select(
-                                options={
-                                    'classic': 'Classic (Rules)',
-                                    'smart': 'Smart (Agentic)'
-                                },
-                                label='Risk Management Mode',
-                                value='classic'
-                            ).classes('w-full')
-                            ui.label('Classic: Rule-based risk management using automation rulesets. Smart: AI-powered agentic risk management.').classes('text-body2 text-grey-7 ml-2')
-                            
-                            # Smart Risk Manager User Instructions
-                            ui.label('Smart Risk Manager User Instructions:').classes('text-sm font-medium mt-2')
-                            self.smart_risk_manager_user_instructions_input = ui.textarea(
-                                label='Instructions for Smart Risk Manager',
-                                value='Maximize short term profit with medium risk taking',
-                                placeholder='Enter your risk management strategy instructions...'
-                            ).props('stack-label rows=3').classes('w-full')
-                            ui.label('Provide high-level instructions to guide the smart risk manager when in Smart mode (e.g., focus areas, risk tolerance, time horizon)').classes('text-body2 text-grey-7 ml-2')
-                            
-                            # Smart Risk Manager Max Iterations
-                            ui.label('Smart Risk Manager Max Iterations:').classes('text-sm font-medium mt-2')
-                            self.smart_risk_manager_max_iterations_input = ui.number(
-                                label='Maximum Iterations',
-                                value=10,
-                                min=1,
-                                max=50,
-                                step=1
-                            ).classes('w-full')
-                            ui.label('Maximum number of analysis cycles the smart risk manager can perform. Higher values allow more thorough analysis but take longer. Recommended: 5-15.').classes('text-body2 text-grey-7 ml-2')
-                        
-                        ui.separator().classes('my-4')
+                        # Risk manager section - hidden for experts that manage their own risk
+                        with ui.column().classes('w-full') as self.risk_manager_section:
+                            ui.separator().classes('my-4')
+
+                            # Risk Management settings
+                            ui.label('Risk Management:').classes('text-subtitle2 mb-2')
+                            ui.label('Configure risk management parameters for this expert:').classes('text-body2 mb-2')
+
+                            with ui.column().classes('w-full gap-2'):
+                                # Max Virtual Equity Per Instrument
+                                with ui.row().classes('items-center gap-2'):
+                                    ui.label('Max equity per instrument (%):').classes('text-sm font-medium')
+                                    self.max_virtual_equity_per_instrument_input = ui.input(
+                                        value='10.0',
+                                        placeholder='10.0'
+                                    ).classes('w-20')
+                                    ui.label('%').classes('text-sm')
+                                ui.label('Maximum percentage of virtual trading balance that can be allocated to a single instrument. Recommended: 5-15%.').classes('text-body2 text-grey-7 ml-2')
+
+                                # Min Available Balance Percentage
+                                with ui.row().classes('items-center gap-2 mt-2'):
+                                    ui.label('Min balance for new positions (%):').classes('text-sm font-medium')
+                                    self.min_available_balance_pct_input = ui.input(
+                                        value='10.0',
+                                        placeholder='10.0'
+                                    ).classes('w-20')
+                                    ui.label('%').classes('text-sm')
+                                ui.label('Minimum available balance percentage required to enter new market positions. Lower values (5-10%) allow more aggressive trading, higher values (15-25%) provide more conservative risk management.').classes('text-body2 text-grey-7 ml-2')
+
+                            ui.separator().classes('my-4')
+
+                            # AI Model Settings
+                            ui.label('AI Model Settings:').classes('text-subtitle2 mb-2')
+                            ui.label('Configure AI models used by this expert for various tasks:').classes('text-body2 mb-2')
+
+                            # Get model options from builtin settings definitions for defaults/descriptions
+                            from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
+                            MarketExpertInterface._ensure_builtin_settings()
+
+                            risk_manager_model_def = MarketExpertInterface._builtin_settings.get('risk_manager_model', {})
+                            risk_manager_model_default = risk_manager_model_def.get('default', 'nagaai/gpt5')
+                            risk_manager_model_help = risk_manager_model_def.get('description', 'AI model used for risk management analysis and decision-making')
+
+                            dynamic_model_def = MarketExpertInterface._builtin_settings.get('dynamic_instrument_selection_model', {})
+                            dynamic_model_default = dynamic_model_def.get('default', 'nagaai/gpt5')
+                            dynamic_model_help = dynamic_model_def.get('description', 'AI model used for dynamically selecting trading instruments based on market conditions')
+
+                            # Import the ModelSelectorInput component and labels
+                            from ..components.ModelSelector import ModelSelectorInput
+                            from ...core.models_registry import LABEL_WEBSEARCH
+
+                            with ui.column().classes('w-full gap-2'):
+                                # Risk Manager Model - using ModelSelectorInput
+                                self.risk_manager_model_input = ModelSelectorInput(
+                                    label='Risk Manager Model',
+                                    value=risk_manager_model_default,
+                                    default_provider='nagaai',
+                                    help_text=risk_manager_model_help
+                                )
+                                self.risk_manager_model_input.render()
+
+                                # Dynamic Instrument Selection Model - REQUIRES web search capability
+                                self.dynamic_instrument_selection_model_input = ModelSelectorInput(
+                                    label='Dynamic Instrument Selection Model',
+                                    value=dynamic_model_default,
+                                    default_provider='nagaai',
+                                    help_text=dynamic_model_help + ' (Only models with web search capability are shown)',
+                                    required_labels=[LABEL_WEBSEARCH]  # Only show models with websearch label
+                                )
+                                self.dynamic_instrument_selection_model_input.render()
+
+                            ui.separator().classes('my-4')
+
+                            # Risk Manager Mode
+                            ui.label('Risk Manager Mode:').classes('text-subtitle2 mb-2')
+                            ui.label('Select how risk management decisions are made:').classes('text-body2 mb-2')
+
+                            with ui.column().classes('w-full gap-2'):
+                                self.risk_manager_mode_select = ui.select(
+                                    options={
+                                        'classic': 'Classic (Rules)',
+                                        'smart': 'Smart (Agentic)'
+                                    },
+                                    label='Risk Management Mode',
+                                    value='classic'
+                                ).classes('w-full')
+                                ui.label('Classic: Rule-based risk management using automation rulesets. Smart: AI-powered agentic risk management.').classes('text-body2 text-grey-7 ml-2')
+
+                                # Smart Risk Manager User Instructions
+                                ui.label('Smart Risk Manager User Instructions:').classes('text-sm font-medium mt-2')
+                                self.smart_risk_manager_user_instructions_input = ui.textarea(
+                                    label='Instructions for Smart Risk Manager',
+                                    value='Maximize short term profit with medium risk taking',
+                                    placeholder='Enter your risk management strategy instructions...'
+                                ).props('stack-label rows=3').classes('w-full')
+                                ui.label('Provide high-level instructions to guide the smart risk manager when in Smart mode (e.g., focus areas, risk tolerance, time horizon)').classes('text-body2 text-grey-7 ml-2')
+
+                                # Smart Risk Manager Max Iterations
+                                ui.label('Smart Risk Manager Max Iterations:').classes('text-sm font-medium mt-2')
+                                self.smart_risk_manager_max_iterations_input = ui.number(
+                                    label='Maximum Iterations',
+                                    value=10,
+                                    min=1,
+                                    max=50,
+                                    step=1
+                                ).classes('w-full')
+                                ui.label('Maximum number of analysis cycles the smart risk manager can perform. Higher values allow more thorough analysis but take longer. Recommended: 5-15.').classes('text-body2 text-grey-7 ml-2')
+
+                            ui.separator().classes('my-4')
                         
                         # Ruleset assignment settings
                         ui.label('Automation Rulesets:').classes('text-subtitle2 mb-2')
@@ -1877,6 +1879,7 @@ class ExpertSettingsTab:
                 self._update_expert_description()
                 self._update_instrument_selection_options()
                 self._update_schedule_visibility()
+                self._update_risk_manager_visibility()
 
                 # Load general settings if editing
                 if is_edit:
@@ -2542,6 +2545,7 @@ class ExpertSettingsTab:
         self._update_instrument_selection_options()
         self._render_expert_settings(expert_instance)
         self._update_schedule_visibility()
+        self._update_risk_manager_visibility()
 
     def _update_schedule_visibility(self):
         """Hide execution schedule settings for live experts (LiveExpertInterface subclasses)."""
@@ -2561,6 +2565,21 @@ class ExpertSettingsTab:
         except Exception:
             is_live = False
         self.execution_schedule_section.set_visibility(not is_live)
+
+    def _update_risk_manager_visibility(self):
+        """Hide risk manager settings for experts that manage their own risk."""
+        if not hasattr(self, 'risk_manager_section'):
+            return
+        expert_type = self.expert_select.value if hasattr(self, 'expert_select') else None
+        if not expert_type:
+            self.risk_manager_section.set_visibility(True)
+            return
+        expert_class = self._get_expert_class(expert_type)
+        if expert_class is None:
+            self.risk_manager_section.set_visibility(True)
+            return
+        uses_rm = getattr(expert_class, 'uses_risk_manager', True)
+        self.risk_manager_section.set_visibility(bool(uses_rm))
     
     def _update_instrument_selection_options(self):
         """Update instrument selection method options based on selected expert's capabilities."""
@@ -2974,6 +2993,7 @@ class ExpertSettingsTab:
         logger.debug(f'Expert type changed to: {event.value if hasattr(event, "value") else event}')
         self._render_expert_settings(expert_instance)
         self._update_schedule_visibility()
+        self._update_risk_manager_visibility()
     
     def _get_expert_class(self, expert_type: str):
         """Get the expert class by type name."""

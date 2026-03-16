@@ -20,6 +20,10 @@ class LiveExpertInterface(MarketExpertInterface):
     - Abstract _run_daily_pipeline() for subclass orchestration
     """
 
+    # Live experts manage their own risk — disable platform risk manager UI by default.
+    # Override to True in a subclass if it actually delegates to the platform risk manager.
+    uses_risk_manager: bool = False
+
     def __init__(self, id: int):
         super().__init__(id)
         self._thread: Optional[threading.Thread] = None

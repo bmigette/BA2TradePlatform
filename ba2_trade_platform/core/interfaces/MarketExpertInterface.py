@@ -13,7 +13,11 @@ from .AccountInterface import AccountInterface
 class MarketExpertInterface(ExtendableSettingsInterface):
     SETTING_MODEL = ExpertSetting
     SETTING_LOOKUP_FIELD = "instance_id"
-    
+
+    # Set to False in subclasses that manage their own risk (e.g. LiveExpertInterface).
+    # When False, the platform's risk manager settings are hidden in the UI.
+    uses_risk_manager: bool = True
+
     """
     Abstract base class for trading account interfaces.
     Defines the required methods for account implementations.
