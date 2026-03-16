@@ -98,10 +98,14 @@ class LiveExpertInterface(MarketExpertInterface):
     # Lifecycle
     # ------------------------------------------------------------------
 
+    def _get_logger(self):
+        """Return the expert's own logger if set, otherwise the module logger."""
+        return getattr(self, 'logger', logger)
+
     def start(self):
         """Create and start the background daemon thread."""
         if self._is_running:
-            logger.warning(f"LiveExpert {self.id} is already running")
+            self._get_logger().warning(f"LiveExpert {self.id} is already running")
             return
 
         self._stop_event.clear()
@@ -113,15 +117,15 @@ class LiveExpertInterface(MarketExpertInterface):
         )
         self._is_running = True
         self._thread.start()
-        logger.info(f"LiveExpert {self.id} started")
+        self._get_logger().info(f"LiveExpert {self.id} started")
 
     def stop(self):
         """Signal the thread to stop, wait for it to finish, and reset state."""
         if not self._is_running:
-            logger.warning(f"LiveExpert {self.id} is not running")
+            self._get_logger().warning(f"LiveExpert {self.id} is not running")
             return
 
-        logger.info(f"LiveExpert {self.id} stopping...")
+        self._get_logger().info(f"LiveExpert {self.id} stopping...")
         self._stop_event.set()
         # Unblock any wait on manual_start_event
         self._manual_start_event.set()
@@ -129,14 +133,14 @@ class LiveExpertInterface(MarketExpertInterface):
         if self._thread is not None:
             self._thread.join(timeout=30)
             if self._thread.is_alive():
-                logger.warning(f"LiveExpert {self.id} thread did not stop within 30s")
+                self._get_logger().warning(f"LiveExpert {self.id} thread did not stop within 30s")
 
         self._is_running = False
         self._thread = None
         self._current_phase = None
         self._stop_event.clear()
         self._manual_start_event.clear()
-        logger.info(f"LiveExpert {self.id} stopped")
+        self._get_logger().info(f"LiveExpert {self.id} stopped")
 
     def request_manual_start(self) -> str:
         """Trigger the daily pipeline immediately (unblock the wait)."""
@@ -162,12 +166,13 @@ class LiveExpertInterface(MarketExpertInterface):
 
     def _run_loop(self):
         """Main loop executed in the background thread."""
-        logger.info(f"LiveExpert {self.id} run loop entered")
+        _log = self._get_logger()
+        _log.info(f"LiveExpert {self.id} run loop entered")
         try:
             while not self._stop_event.is_set():
                 # Check if today is a trading day
                 if not self._is_trading_day():
-                    logger.debug(f"LiveExpert {self.id}: not a trading day, sleeping 1h")
+                    _log.debug(f"LiveExpert {self.id}: not a trading day, sleeping 1h")
                     # Sleep up to 1 hour, checking stop every second
                     if self._stop_event.wait(timeout=3600):
                         break
@@ -177,7 +182,7 @@ class LiveExpertInterface(MarketExpertInterface):
                     # Before kickoff — wait until kickoff time (manual can interrupt)
                     seconds = self._seconds_until_kickoff()
                     if seconds > 0:
-                        logger.info(
+                        _log.info(
                             f"LiveExpert {self.id}: waiting {seconds:.0f}s until kickoff"
                         )
                         triggered = self._manual_start_event.wait(timeout=seconds)
@@ -187,7 +192,7 @@ class LiveExpertInterface(MarketExpertInterface):
                 else:
                     # Past kickoff — wait for manual start or next kickoff
                     seconds = self._seconds_until_next_kickoff()
-                    logger.info(
+                    _log.info(
                         f"LiveExpert {self.id}: past kickoff, waiting for manual start "
                         f"or next kickoff in {seconds:.0f}s"
                     )
@@ -202,10 +207,10 @@ class LiveExpertInterface(MarketExpertInterface):
                 # Run the daily pipeline
                 if not self._stop_event.is_set():
                     try:
-                        logger.info(f"LiveExpert {self.id}: running daily pipeline")
+                        _log.info(f"LiveExpert {self.id}: running daily pipeline")
                         self._run_daily_pipeline()
                     except Exception as e:
-                        logger.error(
+                        _log.error(
                             f"LiveExpert {self.id}: daily pipeline failed: {e}",
                             exc_info=True,
                         )
@@ -213,7 +218,7 @@ class LiveExpertInterface(MarketExpertInterface):
                     # Sleep until next kickoff
                     seconds = self._seconds_until_next_kickoff()
                     if seconds > 0 and not self._stop_event.is_set():
-                        logger.info(
+                        _log.info(
                             f"LiveExpert {self.id}: pipeline done, sleeping {seconds:.0f}s "
                             f"until next kickoff"
                         )
@@ -221,12 +226,12 @@ class LiveExpertInterface(MarketExpertInterface):
                         self._manual_start_event.clear()
 
         except Exception as e:
-            logger.error(
+            _log.error(
                 f"LiveExpert {self.id}: run loop crashed: {e}", exc_info=True
             )
         finally:
             self._current_phase = None
-            logger.info(f"LiveExpert {self.id} run loop exited")
+            _log.info(f"LiveExpert {self.id} run loop exited")
 
     # ------------------------------------------------------------------
     # Abstract method

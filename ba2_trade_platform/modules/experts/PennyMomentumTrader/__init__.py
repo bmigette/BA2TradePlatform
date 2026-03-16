@@ -16,6 +16,7 @@ Pipeline phases:
 """
 
 import json
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -178,16 +179,16 @@ class PennyMomentumTrader(LiveExpertInterface):
             "max_quick_filter_candidates": {
                 "type": "int",
                 "required": True,
-                "default": 20,
+                "default": 15,
                 "description": "Maximum survivors from quick filter",
-                "tooltip": "How many candidates the quick-filter LLM should keep.",
+                "tooltip": "How many candidates the quick-filter LLM should keep from the screener results.",
             },
             "max_final_candidates": {
                 "type": "int",
                 "required": True,
-                "default": 10,
+                "default": 15,
                 "description": "Maximum finalists from deep triage",
-                "tooltip": "How many survivors to perform deep triage on.",
+                "tooltip": "Maximum finalists to carry forward from deep triage, selected by highest confidence score.",
             },
             "max_monitored_symbols": {
                 "type": "int",
@@ -253,6 +254,19 @@ class PennyMomentumTrader(LiveExpertInterface):
                 "valid_values": ["fmp"],
                 "multiple": True,
                 "tooltip": "Insider trading data providers.",
+            },
+            "vendor_social": {
+                "type": "list",
+                "required": True,
+                "default": ["stocktwits"],
+                "description": "Data vendor(s) for social sentiment",
+                "valid_values": ["stocktwits", "websearch"],
+                "multiple": True,
+                "tooltip": (
+                    "'stocktwits' fetches real-time Bullish/Bearish tags directly. "
+                    "'websearch' uses the websearch_llm to search social media. "
+                    "StockTwits data is also injected into the quick-filter LLM context."
+                ),
             },
             "vendor_ohlcv": {
                 "type": "list",
@@ -331,44 +345,48 @@ class PennyMomentumTrader(LiveExpertInterface):
 
         # Check balance for new entries
         if self.has_sufficient_balance_for_entry():
-            # Phase 1: Screen
+            # Phase 1: Screen — no LLM, returns top-N by volume
             self._current_phase = "screen"
             self._update_state(market_analysis, {"phase": "screen"})
-            candidates = self._phase_1_screen(market_analysis)
-            self.logger.debug(f"Phase 1 complete: {len(candidates)} tradeable candidates")
+            screener_candidates = self._phase_1_screen(market_analysis)
+            self.logger.debug(f"Phase 1 complete: {len(screener_candidates)} tradeable candidates")
             if self._stop_event.is_set():
                 self.logger.info("Pipeline aborted after phase 1 (stop requested)")
                 return
 
-            # Phase 1b: LLM-based discovery of additional candidates
-            self._current_phase = "discovery"
-            self._update_state(market_analysis, {"phase": "discovery"})
-            discovered = self._phase_1b_llm_discovery(candidates, market_analysis)
-            if discovered:
-                existing_symbols = {c.get("symbol") for c in candidates}
-                new_ones = [d for d in discovered if d.get("symbol") not in existing_symbols]
-                candidates = candidates + new_ones
-                self.logger.info(
-                    f"Phase 1b added {len(new_ones)} LLM-discovered candidates "
-                    f"(total: {len(candidates)})"
-                )
-            if self._stop_event.is_set():
-                self.logger.info("Pipeline aborted after phase 1b (stop requested)")
-                return
-
-            # Phase 2: Quick filter via LLM
+            # Phase 2: Quick filter via LLM — narrows screener results only
             self._current_phase = "quick_filter"
             self._update_state(market_analysis, {"phase": "quick_filter"})
-            survivors = self._phase_2_quick_filter(candidates, market_analysis)
+            survivors = self._phase_2_quick_filter(screener_candidates, market_analysis)
             self.logger.debug(f"Phase 2 complete: {len(survivors)} survivors")
             if self._stop_event.is_set():
                 self.logger.info("Pipeline aborted after phase 2 (stop requested)")
                 return
 
+            # Phase 1b: LLM discovery — finds additional symbols NOT in screener results
+            self._current_phase = "discovery"
+            self._update_state(market_analysis, {"phase": "discovery"})
+            discovered = self._phase_1b_llm_discovery(screener_candidates, market_analysis)
+            if discovered:
+                survivor_symbols = {c.get("symbol") for c in survivors}
+                new_ones = [d for d in discovered if d.get("symbol") not in survivor_symbols]
+                self.logger.info(
+                    f"Phase 1b added {len(new_ones)} LLM-discovered candidates "
+                    f"(survivors: {len(survivors)}, total for deep triage: {len(survivors) + len(new_ones)})"
+                )
+            else:
+                new_ones = []
+            if self._stop_event.is_set():
+                self.logger.info("Pipeline aborted after phase 1b (stop requested)")
+                return
+
+            # Combine survivors + LLM-discovered for deep triage
+            deep_triage_input = survivors + new_ones
+
             # Phase 3: Deep triage via LLM
             self._current_phase = "deep_triage"
             self._update_state(market_analysis, {"phase": "deep_triage"})
-            finalists = self._phase_3_deep_triage(survivors, market_analysis)
+            finalists = self._phase_3_deep_triage(deep_triage_input, market_analysis)
             self.logger.debug(f"Phase 3 complete: {len(finalists)} finalists")
             if self._stop_event.is_set():
                 self.logger.info("Pipeline aborted after phase 3 (stop requested)")
@@ -413,9 +431,9 @@ class PennyMomentumTrader(LiveExpertInterface):
         self.logger.info(f"Found {len(open_positions)} open positions")
 
         # Check for positions exceeding max holding days
-        max_holding = self.get_setting_with_interface_default(
+        max_holding = int(self.get_setting_with_interface_default(
             "max_holding_days", log_warning=False
-        )
+        ))
         for pos in open_positions:
             try:
                 with get_db() as session:
@@ -710,7 +728,7 @@ class PennyMomentumTrader(LiveExpertInterface):
     def _phase_2_quick_filter(
         self, candidates: List[Dict[str, Any]], market_analysis: MarketAnalysis
     ) -> List[Dict[str, Any]]:
-        """Quick-filter candidates via fast LLM."""
+        """Quick-filter candidates via fast LLM, optionally enriched with StockTwits data."""
         self.logger.info(f"Phase 2: Quick filtering {len(candidates)} candidates")
 
         if not candidates:
@@ -718,9 +736,16 @@ class PennyMomentumTrader(LiveExpertInterface):
             self._update_state(market_analysis, {"quick_filter_survivors": []})
             return []
 
-        max_survivors = self.get_setting_with_interface_default(
-            "max_quick_filter_candidates", log_warning=False
+        # Enrich with StockTwits data if configured
+        vendor_social = self.get_setting_with_interface_default(
+            "vendor_social", log_warning=False
         )
+        if "stocktwits" in (vendor_social or []):
+            candidates = self._enrich_with_stocktwits(candidates)
+
+        max_survivors = int(self.get_setting_with_interface_default(
+            "max_quick_filter_candidates", log_warning=False
+        ))
         prompt = build_quick_filter_prompt(candidates, max_survivors)
 
         scanning_model = self.get_setting_with_interface_default(
@@ -778,7 +803,9 @@ class PennyMomentumTrader(LiveExpertInterface):
         deep_triage_results: Dict[str, Dict[str, Any]] = {}
         finalists: List[Dict[str, Any]] = []
 
-        for candidate in survivors[:max_final]:
+        # Process ALL candidates (input is already bounded by phase 1+2 limits).
+        # max_final_candidates caps the OUTPUT — we take the top N by confidence.
+        for candidate in survivors:
             if self._stop_event.is_set():
                 break
 
@@ -907,6 +934,19 @@ class PennyMomentumTrader(LiveExpertInterface):
                     f"Deep triage failed for {symbol}: {e}", exc_info=True
                 )
 
+        # Cap finalists to max_final by confidence (highest confidence first)
+        if len(finalists) > max_final:
+            finalists.sort(key=lambda f: f.get("confidence", 0), reverse=True)
+            dropped = [f["symbol"] for f in finalists[max_final:]]
+            finalists = finalists[:max_final]
+            self.logger.info(
+                f"Capped finalists to top {max_final} by confidence "
+                f"(dropped: {dropped})"
+            )
+            # Remove dropped symbols from deep_triage_results to keep state consistent
+            for sym in dropped:
+                deep_triage_results.pop(sym, None)
+
         # Calculate position sizes for finalists
         if finalists:
             trade_mgr = PennyTradeManager(self.instance.id)
@@ -936,14 +976,14 @@ class PennyMomentumTrader(LiveExpertInterface):
         monitored: Dict[str, Dict[str, Any]] = dict(
             market_analysis.state.get("monitored_symbols", {})
         )
-        max_monitored = self.get_setting_with_interface_default(
+        max_monitored = int(self.get_setting_with_interface_default(
             "max_monitored_symbols", log_warning=False
-        )
+        ))
 
         # Expire old monitors
-        max_age = self.get_setting_with_interface_default(
+        max_age = int(self.get_setting_with_interface_default(
             "max_entry_age_days", log_warning=False
-        )
+        ))
         now = datetime.now(timezone.utc)
         expired_symbols = []
         for sym, info in monitored.items():
@@ -1463,26 +1503,114 @@ class PennyMomentumTrader(LiveExpertInterface):
         return "No insider data available."
 
     def _gather_social(self, symbol: str) -> str:
-        """Get social sentiment via websearch LLM."""
-        websearch_model = self.get_setting_with_interface_default(
-            "websearch_llm", log_warning=False
+        """Get social sentiment from configured vendors (StockTwits and/or websearch LLM)."""
+        vendor_social = self.get_setting_with_interface_default(
+            "vendor_social", log_warning=False
+        ) or []
+
+        parts: List[str] = []
+
+        if "stocktwits" in vendor_social:
+            try:
+                provider = self._get_stocktwits_provider()
+                result = provider.get_social_media_sentiment(
+                    symbol,
+                    end_date=datetime.now(timezone.utc),
+                    lookback_days=3,
+                    format_type="markdown",
+                )
+                parts.append(f"--- StockTwits ---\n{result}")
+            except Exception as e:
+                self.logger.warning(f"StockTwits failed for {symbol}: {e}")
+
+        if "websearch" in vendor_social:
+            websearch_model = self.get_setting_with_interface_default(
+                "websearch_llm", log_warning=False
+            )
+            try:
+                llm = ModelFactory.create_llm(
+                    websearch_model,
+                    temperature=0.3,
+                    expert_instance_id=self.instance.id,
+                    use_case="PennyMomentum Social Sentiment",
+                )
+                prompt = (
+                    f"Search for the latest social media sentiment and discussion "
+                    f"about {symbol} stock on Reddit, StockTwits, Twitter/X, and "
+                    f"financial forums. Summarize the overall sentiment (bullish, "
+                    f"bearish, neutral), key themes being discussed, and any "
+                    f"notable trends in retail interest. Be concise."
+                )
+                response = llm.invoke(prompt)
+                text = response.content if hasattr(response, "content") else str(response)
+                parts.append(f"--- AI Websearch ---\n{text}")
+            except Exception as e:
+                self.logger.warning(f"Websearch social sentiment failed for {symbol}: {e}")
+
+        return "\n\n".join(parts) if parts else "No social sentiment data available."
+
+    def _get_stocktwits_provider(self):
+        """Return a cached StockTwits provider instance (lazy init)."""
+        if not hasattr(self, "_stocktwits_provider") or self._stocktwits_provider is None:
+            from ....modules.dataproviders.socialmedia import StockTwitsSentiment
+            self._stocktwits_provider = StockTwitsSentiment(message_limit=30)
+        return self._stocktwits_provider
+
+    def _enrich_with_stocktwits(
+        self, candidates: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Batch-fetch StockTwits metadata for all candidates and inject fields:
+        st_watchlist, st_bullish_pct, st_bearish_pct, st_trending, st_trending_score.
+
+        On failure the candidate is included unenriched so the pipeline continues.
+        """
+        provider = self._get_stocktwits_provider()
+        self.logger.info(
+            f"Fetching StockTwits data for {len(candidates)} candidates..."
         )
-        try:
-            llm = ModelFactory.create_llm(
-                websearch_model,
-                temperature=0.3,
-                expert_instance_id=self.instance.id,
-                use_case="PennyMomentum Social Sentiment",
+
+        enriched = []
+        for i, candidate in enumerate(candidates):
+            symbol = candidate.get("symbol")
+            if not symbol:
+                enriched.append(candidate)
+                continue
+            try:
+                result = provider.get_social_media_sentiment(
+                    symbol,
+                    end_date=datetime.now(timezone.utc),
+                    lookback_days=1,
+                    format_type="dict",
+                )
+                meta = result.get("metadata", {})
+                sent = result.get("sentiment", {})
+                enriched_candidate = dict(candidate)
+                enriched_candidate["st_watchlist"] = meta.get("watchlist_count")
+                enriched_candidate["st_bullish_pct"] = sent.get("bullish_pct")
+                enriched_candidate["st_bearish_pct"] = sent.get("bearish_pct")
+                enriched_candidate["st_trending"] = meta.get("trending")
+                enriched_candidate["st_trending_score"] = meta.get("trending_score")
+                enriched.append(enriched_candidate)
+            except Exception as e:
+                self.logger.warning(
+                    f"StockTwits enrichment failed for {symbol}: {e}", exc_info=True
+                )
+                enriched.append(candidate)
+
+            # Small delay between requests to avoid rate limiting
+            if i < len(candidates) - 1:
+                time.sleep(0.2)
+
+        fetched = sum(1 for c in enriched if c.get("st_watchlist") is not None)
+        failed = len(candidates) - fetched
+        if failed:
+            self.logger.warning(
+                f"StockTwits enrichment: {fetched}/{len(candidates)} fetched, "
+                f"{failed} failed (will proceed without their social data)"
             )
-            prompt = (
-                f"Search for the latest social media sentiment and discussion "
-                f"about {symbol} stock on Reddit, StockTwits, Twitter/X, and "
-                f"financial forums. Summarize the overall sentiment (bullish, "
-                f"bearish, neutral), key themes being discussed, and any "
-                f"notable trends in retail interest. Be concise."
+        else:
+            self.logger.info(
+                f"StockTwits enrichment complete: {fetched}/{len(candidates)} fetched"
             )
-            response = llm.invoke(prompt)
-            return response.content if hasattr(response, "content") else str(response)
-        except Exception as e:
-            self.logger.warning(f"Social sentiment gathering failed for {symbol}: {e}")
-            return "No social sentiment data available."
+        return enriched

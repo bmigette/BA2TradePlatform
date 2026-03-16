@@ -21,35 +21,87 @@ _SYSTEM_PREAMBLE = (
 
 def build_quick_filter_prompt(
     candidates: List[Dict[str, Any]],
-    max_survivors: int = 20,
+    max_survivors: int = 15,
 ) -> str:
     """
-    Build the prompt for the quick-filter stage that narrows ~50 candidates
-    down to the top picks based on surface-level attributes.
+    Build the prompt for the quick-filter stage that narrows ~50 screener
+    candidates down to the top picks based on surface-level attributes
+    and StockTwits social sentiment data (when available).
 
     Args:
-        candidates: List of candidate dicts with keys: symbol, company_name,
+        candidates: List of candidate dicts. Core keys: symbol, company_name,
             price, volume, market_cap, sector, industry, exchange.
+            Optional StockTwits keys: st_watchlist, st_bullish_pct,
+            st_bearish_pct, st_trending, st_trending_score.
         max_survivors: Maximum number of candidates to keep.
 
     Returns:
         Prompt string for the LLM.
     """
-    candidates_json = json.dumps(candidates, indent=2)
+    # Build a concise per-candidate summary to keep the prompt token-efficient
+    candidate_lines = []
+    for c in candidates:
+        symbol = c.get("symbol", "?")
+        price = c.get("price")
+        volume = c.get("volume")
+        mktcap = c.get("market_cap")
+        sector = c.get("sector", "")
+        exchange = c.get("exchange", "")
+
+        price_str = f"${price:.2f}" if price else "N/A"
+        vol_str = f"{volume:,}" if volume else "N/A"
+        cap_str = f"${mktcap/1e6:.0f}M" if mktcap else "N/A"
+
+        # StockTwits fields (may be absent)
+        st_wl = c.get("st_watchlist")
+        st_bull = c.get("st_bullish_pct")
+        st_bear = c.get("st_bearish_pct")
+        st_trend = c.get("st_trending")
+        st_tscore = c.get("st_trending_score")
+
+        line = (
+            f'{symbol}: price={price_str}, vol={vol_str}, mktcap={cap_str}, '
+            f'sector={sector or "?"}, exchange={exchange or "?"}'
+        )
+        if st_wl is not None:
+            wl_str = f"{st_wl:,}"
+            line += f", st_watchlist={wl_str}"
+        if st_bull is not None:
+            line += f", st_bull={st_bull}% st_bear={st_bear}%"
+        if st_trend is not None:
+            trend_str = "YES" if st_trend else "no"
+            line += f", trending={trend_str}(score={st_tscore:.2f})" if st_tscore is not None else f", trending={trend_str}"
+        candidate_lines.append(line)
+
+    candidates_text = "\n".join(candidate_lines)
+
+    # Conditionally explain StockTwits fields if any candidate has them
+    has_stocktwits = any(c.get("st_watchlist") is not None for c in candidates)
+    stocktwits_note = ""
+    if has_stocktwits:
+        stocktwits_note = """
+STOCKTWITS DATA EXPLANATION:
+- st_watchlist: number of StockTwits users watching this stock (higher = more retail interest)
+- st_bull / st_bear: % of tagged messages that are Bullish vs Bearish (tagged messages only)
+- trending: whether the stock is currently trending on StockTwits
+- trending_score: positive = gaining attention, negative = losing attention
+Use these as confirmation signals — high watchlist + high bull% + trending strongly favor selection.
+"""
 
     return f"""{_SYSTEM_PREAMBLE}
 
 You are filtering penny-stock momentum candidates. From the list below, select the top {max_survivors} stocks most likely to produce a profitable momentum trade today or this week.
-
+{stocktwits_note}
 FILTER CRITERIA (apply all):
 1. Sector quality: Avoid biotech/pharma stocks that appear to be pre-FDA (high risk binary events). Avoid energy stocks unless oil prices are trending up. Favor technology, consumer, and industrial sectors with clear momentum drivers.
 2. Volume/price action: Prefer stocks with unusually high volume relative to their typical levels. Higher volume signals institutional interest or catalyst-driven activity.
 3. Market cap sweet spot: Favor $50M-$500M market cap. Too small (<$10M) means illiquid and manipulable; too large (>$1B) means less explosive moves.
 4. Exchange quality: Prefer NASDAQ and NYSE over OTC/pink sheets.
 5. Price range: Ideal range is $0.50-$10.00. Avoid sub-penny stocks.
+6. Social signal (when available): High StockTwits watchlist count + strong bullish sentiment + trending score > 0 indicate growing retail momentum. Bearish-dominant sentiment or negative trending score is a warning sign.
 
 CANDIDATES:
-{candidates_json}
+{candidates_text}
 
 RESPOND with a JSON array of the top {max_survivors} candidates. Each element must be an object with exactly two keys:
 - "symbol": the stock ticker (string)
@@ -57,7 +109,7 @@ RESPOND with a JSON array of the top {max_survivors} candidates. Each element mu
 
 Example response format:
 [
-  {{"symbol": "ABCD", "reasoning": "High volume surge in tech sector with $120M market cap in the momentum sweet spot"}},
+  {{"symbol": "ABCD", "reasoning": "High volume surge in tech sector, 85% bullish on StockTwits with 45k watchers"}},
   {{"symbol": "EFGH", "reasoning": "Consumer sector breakout with 3x average volume and strong price action"}}
 ]
 
