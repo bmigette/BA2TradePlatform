@@ -506,20 +506,74 @@ class PennyMomentumTraderUI:
 
                         with ui.expansion(' '.join(label_parts), icon='description').classes('w-full mb-1'):
                             if item.text:
-                                # Try to parse as JSON for pretty display
                                 try:
                                     parsed = json.loads(item.text)
+                                except (json.JSONDecodeError, TypeError):
+                                    parsed = None
+
+                                # Render as chat conversation if it has prompt + response
+                                if isinstance(parsed, dict) and 'prompt' in parsed and 'response' in parsed:
+                                    self._render_llm_conversation(parsed)
+                                elif parsed is not None:
+                                    # Regular JSON pretty display
                                     formatted = json.dumps(parsed, indent=2, default=str)
                                     with ui.scroll_area().classes('w-full').style('max-height: 400px;'):
                                         with ui.element('pre').classes(
                                             'whitespace-pre-wrap text-xs p-3 rounded font-mono overflow-x-auto'
                                         ).style('background-color: var(--q-dark-page, #1d1d1d); color: #e0e0e0;'):
                                             ui.label(formatted).style('color: #e0e0e0;')
-                                except (json.JSONDecodeError, TypeError):
+                                else:
                                     with ui.scroll_area().classes('w-full').style('max-height: 400px;'):
                                         ui.markdown(item.text).classes('text-sm')
                             else:
                                 ui.label('No text content').classes('text-grey-6 text-sm')
+
+    # ------------------------------------------------------------------
+    # LLM Conversation renderer
+    # ------------------------------------------------------------------
+
+    def _render_llm_conversation(self, data: Dict[str, Any]):
+        """Render a prompt/response pair as a chat conversation."""
+        prompt_text = data.get('prompt', '')
+        response_text = data.get('response', '')
+
+        with ui.scroll_area().classes('w-full').style('max-height: 600px;'):
+            with ui.column().classes('w-full gap-3 p-2'):
+                # Prompt bubble (user/system side - left aligned)
+                with ui.row().classes('w-full justify-start'):
+                    with ui.card().classes('p-3').style(
+                        'max-width: 85%; background-color: #2d3748; border-radius: 12px 12px 12px 2px;'
+                    ):
+                        with ui.row().classes('items-center gap-2 mb-1'):
+                            ui.icon('person', size='xs').style('color: #90cdf4;')
+                            ui.label('Prompt').classes('text-xs font-bold').style('color: #90cdf4;')
+                        with ui.element('pre').classes(
+                            'whitespace-pre-wrap text-xs font-mono m-0'
+                        ).style('color: #e2e8f0;'):
+                            ui.label(prompt_text).style('color: #e2e8f0;')
+
+                # Response bubble (assistant side - right aligned)
+                with ui.row().classes('w-full justify-end'):
+                    with ui.card().classes('p-3').style(
+                        'max-width: 85%; background-color: #1a365d; border-radius: 12px 12px 2px 12px;'
+                    ):
+                        with ui.row().classes('items-center gap-2 mb-1'):
+                            ui.icon('smart_toy', size='xs').style('color: #68d391;')
+                            ui.label('LLM Response').classes('text-xs font-bold').style('color: #68d391;')
+
+                        # Try to parse response as JSON for pretty display
+                        try:
+                            parsed_response = json.loads(response_text)
+                            formatted = json.dumps(parsed_response, indent=2, default=str)
+                            with ui.element('pre').classes(
+                                'whitespace-pre-wrap text-xs font-mono m-0'
+                            ).style('color: #e2e8f0;'):
+                                ui.label(formatted).style('color: #e2e8f0;')
+                        except (json.JSONDecodeError, TypeError):
+                            with ui.element('pre').classes(
+                                'whitespace-pre-wrap text-xs font-mono m-0'
+                            ).style('color: #e2e8f0;'):
+                                ui.label(response_text).style('color: #e2e8f0;')
 
     # ------------------------------------------------------------------
     # Formatting helpers

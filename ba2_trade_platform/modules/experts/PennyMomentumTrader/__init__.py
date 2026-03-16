@@ -799,6 +799,7 @@ class PennyMomentumTrader(LiveExpertInterface):
                 output_type="json",
                 text=raw_text,
                 symbol="PENNY_SCAN",
+                prompt=prompt,
             )
             return results
 
@@ -890,6 +891,7 @@ class PennyMomentumTrader(LiveExpertInterface):
             output_type="json",
             text=raw_text,
             symbol="PENNY_SCAN",
+            prompt=prompt,
         )
 
         # Return full candidate dicts for survivors
@@ -1074,6 +1076,7 @@ class PennyMomentumTrader(LiveExpertInterface):
                     output_type="json",
                     text=raw_text,
                     symbol=symbol,
+                    prompt=prompt,
                 )
 
             except Exception as e:
@@ -1257,6 +1260,7 @@ class PennyMomentumTrader(LiveExpertInterface):
                     output_type="json",
                     text=raw_text,
                     symbol=symbol,
+                    prompt=prompt,
                 )
 
                 self.logger.info(f"Set entry conditions for {symbol}")
@@ -1617,6 +1621,7 @@ class PennyMomentumTrader(LiveExpertInterface):
                     output_type="json",
                     text=raw_text,
                     symbol=symbol,
+                    prompt=prompt,
                 )
 
                 from ....core.db import log_activity
@@ -1827,9 +1832,14 @@ class PennyMomentumTrader(LiveExpertInterface):
         output_type: str,
         text: str,
         symbol: str,
+        prompt: Optional[str] = None,
     ):
-        """Persist an AnalysisOutput record."""
+        """Persist an AnalysisOutput record. If prompt is provided, stores both as a conversation."""
         try:
+            if prompt is not None:
+                # Store as conversation (prompt + response) for chat-style UI display
+                text = json.dumps({"prompt": prompt, "response": text}, default=str)
+                output_type = "llm_conversation"
             output = AnalysisOutput(
                 market_analysis_id=market_analysis.id,
                 provider_category=provider_category,
