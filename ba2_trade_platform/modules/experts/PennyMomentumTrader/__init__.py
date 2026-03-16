@@ -293,11 +293,11 @@ class PennyMomentumTrader(LiveExpertInterface):
             "vendor_ohlcv": {
                 "type": "list",
                 "required": True,
-                "default": ["yfinance"],
+                "default": ["fmp"],
                 "description": "Data vendor(s) for OHLCV price data",
-                "valid_values": ["yfinance", "alpaca", "alphavantage", "fmp"],
+                "valid_values": ["fmp"],
                 "multiple": True,
-                "tooltip": "OHLCV data providers used for condition monitoring.",
+                "tooltip": "OHLCV data provider for condition monitoring. Restricted to FMP for extended-hours data consistency.",
             },
             "vendor_live_price": {
                 "type": "str",
@@ -1565,11 +1565,14 @@ class PennyMomentumTrader(LiveExpertInterface):
         Fetch real-time quotes from FMP.
 
         During regular market hours (9:30-16:00 ET): uses fmpsdk.quote()
-        During extended hours (pre-market / after-hours): uses
-        FMP /stable/aftermarket-quote endpoint for accurate prices.
+        which returns the current price in a single batch call.
+
+        During extended hours (pre-market / after-hours), tries in order:
+          1. /stable/batch-aftermarket-quote  (one call, Premium+ plans)
+          2. /stable/aftermarket-quote         (per-symbol, Starter+ plans)
+          3. fmpsdk.quote()                    (final fallback)
         """
         import fmpsdk
-        import requests
         from ....config import get_app_setting
 
         api_key = get_app_setting("FMP_API_KEY")
@@ -1582,33 +1585,105 @@ class PennyMomentumTrader(LiveExpertInterface):
         result: Dict[str, Optional[float]] = {s: None for s in symbols}
 
         try:
-            if self._is_regular_session():
-                data = fmpsdk.quote(apikey=api_key, symbol=symbols)
-                if isinstance(data, list):
-                    for item in data:
-                        sym = item.get("symbol", "").upper()
-                        price = item.get("price")
-                        if sym in result and price is not None and price > 0:
-                            result[sym] = float(price)
-            else:
-                # Extended hours: use batch aftermarket-quote endpoint
-                resp = requests.get(
-                    "https://financialmodelingprep.com/stable/batch-aftermarket-quote",
-                    params={"symbol": ",".join(symbols), "apikey": api_key},
-                    timeout=10,
+            if not self._is_regular_session():
+                result = self._get_fmp_aftermarket_quotes(symbols, api_key)
+                if any(v is not None for v in result.values()):
+                    return result
+                self.logger.warning(
+                    "FMP aftermarket quotes unavailable during extended hours, "
+                    "falling back to regular quote (prices may be stale closing prices)"
                 )
+
+            # Regular session or aftermarket fallback: use fmpsdk.quote()
+            data = fmpsdk.quote(apikey=api_key, symbol=symbols)
+            if isinstance(data, list):
+                for item in data:
+                    sym = item.get("symbol", "").upper()
+                    price = item.get("price")
+                    if sym in result and price is not None and price > 0:
+                        result[sym] = float(price)
+        except Exception as e:
+            self.logger.warning(f"FMP quote fetch failed: {e}")
+
+        return result
+
+    def _get_fmp_aftermarket_quotes(
+        self, symbols: List[str], api_key: str
+    ) -> Dict[str, Optional[float]]:
+        """
+        Fetch extended-hours quotes from FMP aftermarket endpoints.
+
+        Tries batch endpoint first (/stable/batch-aftermarket-quote),
+        falls back to single-symbol endpoint (/stable/aftermarket-quote)
+        if the batch returns 402 (plan limitation).
+
+        Returns mid-price computed from bid/ask.
+        Returns all-None dict if both endpoints are unavailable.
+        """
+        import requests
+
+        result: Dict[str, Optional[float]] = {s: None for s in symbols}
+
+        # 1. Try batch endpoint (Premium+ plans)
+        try:
+            resp = requests.get(
+                "https://financialmodelingprep.com/stable/batch-aftermarket-quote",
+                params={"symbol": ",".join(symbols), "apikey": api_key},
+                timeout=10,
+            )
+            if resp.status_code != 402:
                 resp.raise_for_status()
                 data = resp.json()
                 if isinstance(data, list):
                     for item in data:
                         sym = item.get("symbol", "").upper()
-                        price = item.get("price") or item.get("lastPrice")
-                        if sym in result and price is not None and price > 0:
-                            result[sym] = float(price)
+                        price = self._extract_aftermarket_price(item)
+                        if sym in result and price is not None:
+                            result[sym] = price
+                    return result
+            # 402 = plan doesn't include batch, fall through to single
+            self.logger.debug("FMP batch-aftermarket-quote not available (402), trying single endpoint")
         except Exception as e:
-            self.logger.warning(f"FMP quote fetch failed: {e}")
+            self.logger.debug(f"FMP batch aftermarket failed: {e}")
+
+        # 2. Fall back to single-symbol endpoint (Starter+ plans)
+        for symbol in symbols:
+            try:
+                resp = requests.get(
+                    "https://financialmodelingprep.com/stable/aftermarket-quote",
+                    params={"symbol": symbol, "apikey": api_key},
+                    timeout=10,
+                )
+                if resp.status_code == 402:
+                    self.logger.debug("FMP aftermarket-quote not available (402), falling back to regular quote")
+                    return {s: None for s in symbols}
+                resp.raise_for_status()
+                data = resp.json()
+                if isinstance(data, list) and data:
+                    price = self._extract_aftermarket_price(data[0])
+                    if price is not None:
+                        result[symbol] = price
+            except Exception as e:
+                self.logger.debug(f"FMP aftermarket quote failed for {symbol}: {e}")
 
         return result
+
+    @staticmethod
+    def _extract_aftermarket_price(item: Dict[str, Any]) -> Optional[float]:
+        """Compute mid-price from aftermarket bid/ask, or use price field."""
+        bid = item.get("bidPrice")
+        ask = item.get("askPrice")
+        if bid and ask and float(bid) > 0 and float(ask) > 0:
+            return round((float(bid) + float(ask)) / 2, 4)
+        if bid and float(bid) > 0:
+            return float(bid)
+        if ask and float(ask) > 0:
+            return float(ask)
+        # Some responses may include a direct price field
+        price = item.get("price")
+        if price and float(price) > 0:
+            return float(price)
+        return None
 
     # ------------------------------------------------------------------
     # Helpers

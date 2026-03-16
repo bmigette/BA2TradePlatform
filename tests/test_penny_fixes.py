@@ -915,13 +915,59 @@ class TestLivePriceSource:
         assert "fmpsdk.quote(" in method_source
 
     def test_fmp_quotes_uses_aftermarket_endpoint(self):
-        """During extended hours, should use FMP batch-aftermarket-quote endpoint."""
+        """During extended hours, should try FMP aftermarket-quote endpoint."""
+        source = _read_source("__init__.py")
+        assert "def _get_fmp_aftermarket_quotes(" in source
+        idx = source.index("def _get_fmp_quotes(")
+        next_def = source.index("\n    def ", idx + 1)
+        method_source = source[idx:next_def]
+        assert "_get_fmp_aftermarket_quotes" in method_source
+        assert "_is_regular_session" in method_source
+
+    def test_aftermarket_tries_batch_then_single(self):
+        """Should try batch-aftermarket-quote first, then single aftermarket-quote."""
+        source = _read_source("__init__.py")
+        idx = source.index("def _get_fmp_aftermarket_quotes(")
+        next_def = source.index("\n    def ", idx + 1)
+        method_source = source[idx:next_def]
+        assert "batch-aftermarket-quote" in method_source
+        assert "/stable/aftermarket-quote" in method_source
+        batch_pos = method_source.index("batch-aftermarket-quote")
+        single_pos = method_source.index("/stable/aftermarket-quote")
+        assert batch_pos < single_pos
+
+    def test_aftermarket_computes_mid_from_bid_ask(self):
+        """Aftermarket quotes should compute mid-price from bid/ask."""
+        source = _read_source("__init__.py")
+        assert "def _extract_aftermarket_price(" in source
+        idx = source.index("def _extract_aftermarket_price(")
+        method_source = source[idx:idx + 500]
+        assert "bidPrice" in method_source
+        assert "askPrice" in method_source
+
+    def test_aftermarket_handles_402_gracefully(self):
+        """If aftermarket endpoints return 402, should fall back."""
+        source = _read_source("__init__.py")
+        idx = source.index("def _get_fmp_aftermarket_quotes(")
+        next_def = source.index("\n    def ", idx + 1)
+        method_source = source[idx:next_def]
+        assert "402" in method_source
+
+    def test_aftermarket_fallback_logs_warning(self):
+        """When aftermarket is unavailable, should log a warning about stale prices."""
         source = _read_source("__init__.py")
         idx = source.index("def _get_fmp_quotes(")
         next_def = source.index("\n    def ", idx + 1)
         method_source = source[idx:next_def]
-        assert "batch-aftermarket-quote" in method_source
-        assert "_is_regular_session" in method_source
+        assert "prices may be stale" in method_source
+
+    def test_vendor_ohlcv_restricted_to_fmp(self):
+        """vendor_ohlcv should only allow FMP for extended-hours data consistency."""
+        source = _read_source("__init__.py")
+        idx = source.index('"vendor_ohlcv"')
+        block = source[idx:idx + 400]
+        assert '"default": ["fmp"]' in block
+        assert '"valid_values": ["fmp"]' in block
 
     def test_is_regular_session_method_exists(self):
         source = _read_source("__init__.py")

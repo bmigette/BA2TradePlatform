@@ -190,7 +190,7 @@ The structured condition schema supports the following types, combinable with `a
 | `vendor_fundamentals` | `["fmp"]` | alpha_vantage, ai, fmp |
 | `vendor_insider` | `["fmp"]` | fmp |
 | `vendor_social` | `["stocktwits"]` | stocktwits, websearch |
-| `vendor_ohlcv` | `["yfinance"]` | yfinance, alpaca, alphavantage, fmp |
+| `vendor_ohlcv` | `["fmp"]` | fmp |
 | `vendor_live_price` | `fmp` | fmp, account |
 
 ### Scheduling (inherited from LiveExpertInterface)
