@@ -610,13 +610,23 @@ class JobManager:
     # ------------------------------------------------------------------
 
     def _start_live_expert(self, expert_instance: ExpertInstance):
-        """Instantiate and start a LiveExpertInterface thread for the given instance."""
+        """Instantiate and start a LiveExpertInterface thread for the given instance.
+
+        Uses the shared cache so that any code calling get_expert_instance_from_id()
+        (e.g. UI action buttons) operates on the same object as the running thread,
+        ensuring request_manual_start() / request_stop() reach the live thread.
+        The caller must invalidate the cache first when settings have changed so a
+        fresh instance is created here.
+        """
         expert_id = expert_instance.id
         if expert_id in self._live_experts:
             logger.debug(f"Live expert {expert_id} already running, skipping start")
             return
         try:
-            expert = get_expert_instance_from_id(expert_id, use_cache=False)
+            # use_cache=True: shares the instance with the rest of the app so that
+            # request_manual_start() / request_stop() from UI callbacks reach the
+            # same object the thread is running on.
+            expert = get_expert_instance_from_id(expert_id, use_cache=True)
             if expert is None:
                 logger.warning(f"Could not instantiate live expert {expert_id}")
                 return
