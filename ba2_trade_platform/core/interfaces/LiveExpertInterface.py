@@ -185,10 +185,8 @@ class LiveExpertInterface(MarketExpertInterface):
                         _log.info(
                             f"LiveExpert {self.id}: waiting {seconds:.0f}s until kickoff"
                         )
-                        triggered = self._manual_start_event.wait(timeout=seconds)
-                        self._manual_start_event.clear()
-                        if self._stop_event.is_set():
-                            break
+                        if self._wait_with_countdown(seconds, _log):
+                            break  # stop requested
                 else:
                     # Past kickoff — wait for manual start or next kickoff
                     seconds = self._seconds_until_next_kickoff()
@@ -196,11 +194,10 @@ class LiveExpertInterface(MarketExpertInterface):
                         f"LiveExpert {self.id}: past kickoff, waiting for manual start "
                         f"or next kickoff in {seconds:.0f}s"
                     )
-                    triggered = self._manual_start_event.wait(timeout=seconds)
-                    self._manual_start_event.clear()
+                    triggered = self._wait_with_countdown(seconds, _log, return_triggered=True)
                     if self._stop_event.is_set():
                         break
-                    if not triggered:
+                    if triggered is False:
                         # Timed out — loop back to re-evaluate
                         continue
 
@@ -222,8 +219,7 @@ class LiveExpertInterface(MarketExpertInterface):
                             f"LiveExpert {self.id}: pipeline done, sleeping {seconds:.0f}s "
                             f"until next kickoff"
                         )
-                        triggered = self._manual_start_event.wait(timeout=seconds)
-                        self._manual_start_event.clear()
+                        self._wait_with_countdown(seconds, _log)
 
         except Exception as e:
             _log.error(
@@ -232,6 +228,45 @@ class LiveExpertInterface(MarketExpertInterface):
         finally:
             self._current_phase = None
             _log.info(f"LiveExpert {self.id} run loop exited")
+
+    # ------------------------------------------------------------------
+    # Wait helpers
+    # ------------------------------------------------------------------
+
+    def _wait_with_countdown(self, total_seconds: float, _log, return_triggered: bool = False):
+        """Wait for *total_seconds*, logging a countdown every hour.
+
+        Returns:
+            If *return_triggered* is False: True when stop was requested.
+            If *return_triggered* is True: True if manual start triggered,
+            False if timed out, or True (stop) — caller checks _stop_event.
+        """
+        remaining = total_seconds
+        INTERVAL = 3600  # log every hour
+
+        while remaining > 0 and not self._stop_event.is_set():
+            # Log countdown
+            hours = int(remaining // 3600)
+            minutes = int((remaining % 3600) // 60)
+            if hours > 0:
+                _log.info(f"LiveExpert {self.id}: will start in {hours}h {minutes}min")
+            elif minutes > 0:
+                _log.info(f"LiveExpert {self.id}: will start in {minutes}min")
+
+            wait_chunk = min(remaining, INTERVAL)
+            triggered = self._manual_start_event.wait(timeout=wait_chunk)
+            self._manual_start_event.clear()
+
+            if self._stop_event.is_set():
+                return True if not return_triggered else True
+            if triggered:
+                return False if not return_triggered else True
+
+            remaining -= wait_chunk
+
+        if return_triggered:
+            return False  # timed out
+        return self._stop_event.is_set()
 
     # ------------------------------------------------------------------
     # Abstract method
