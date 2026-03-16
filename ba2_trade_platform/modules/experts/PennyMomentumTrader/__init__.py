@@ -1116,8 +1116,7 @@ class PennyMomentumTrader(LiveExpertInterface):
             status=MarketAnalysisStatus.RUNNING,
             state={},
         )
-        ma_id = add_instance(ma)
-        ma.id = ma_id
+        add_instance(ma, expunge_after_flush=True)
         return ma
 
     def _update_state(self, market_analysis: MarketAnalysis, updates: Dict[str, Any]):
