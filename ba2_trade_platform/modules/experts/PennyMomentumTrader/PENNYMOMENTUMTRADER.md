@@ -153,6 +153,7 @@ The structured condition schema supports the following types, combinable with `a
 | `deep_analysis_llm` | `OpenAI/gpt-4o` | Phase 3 deep triage (per symbol) |
 | `websearch_llm` | `NagaAI/gpt-4o-search-preview` | Phase 5 social websearch (if configured) |
 | `entry_definition_llm` | `OpenAI/gpt-4o` | Phase 4 entry/exit condition generation |
+| `exit_update_llm` | `OpenAI/gpt-4o-mini` | Periodic exit condition re-evaluation |
 | `discovery_llm` | `NagaAI/gpt-4o-search-preview` | Phase 1b LLM discovery |
 
 ### Screener Filters
@@ -190,6 +191,7 @@ The structured condition schema supports the following types, combinable with `a
 | `vendor_insider` | `["fmp"]` | fmp |
 | `vendor_social` | `["stocktwits"]` | stocktwits, websearch |
 | `vendor_ohlcv` | `["yfinance"]` | yfinance, alpaca, alphavantage, fmp |
+| `vendor_live_price` | `fmp` | fmp, account |
 
 ### Scheduling (inherited from LiveExpertInterface)
 

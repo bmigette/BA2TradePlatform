@@ -15,6 +15,9 @@ Covers:
 - exc_info cleanup on StockTwits warning
 - Parallel data gathering in Phase 3
 - LLM-driven exit condition updates (__init__.py)
+- Configurable live price source (__init__.py)
+- Exit update LLM setting (__init__.py)
+- Alpaca data_feed setting (AlpacaAccount.py)
 """
 
 import ast
@@ -857,3 +860,161 @@ class TestExitConditionUpdateMethod:
         # Verify it's in the imports
         import_section = source[:source.index("class ")]
         assert "build_exit_update_prompt" in import_section
+
+    def test_uses_exit_update_llm_not_entry(self):
+        """Should use exit_update_llm setting, not entry_definition_llm."""
+        source = _read_source("__init__.py")
+        idx = source.index("def _update_exit_conditions_via_llm(")
+        next_def_search = source[idx + 1:]
+        next_idx = next_def_search.find("\n    def ")
+        if next_idx != -1:
+            method_source = source[idx:idx + 1 + next_idx]
+        else:
+            method_source = source[idx:]
+        assert "exit_update_llm" in method_source
+        assert "entry_definition_llm" not in method_source
+
+
+# ===========================================================================
+# 17. Live price source configuration
+# ===========================================================================
+
+class TestLivePriceSource:
+    """vendor_live_price setting and _get_live_prices/_get_fmp_quotes methods."""
+
+    def test_vendor_live_price_setting_exists(self):
+        source = _read_source("__init__.py")
+        assert '"vendor_live_price"' in source
+
+    def test_vendor_live_price_default_is_fmp(self):
+        source = _read_source("__init__.py")
+        idx = source.index('"vendor_live_price"')
+        block = source[idx:idx + 300]
+        assert '"default": "fmp"' in block
+
+    def test_vendor_live_price_valid_values(self):
+        source = _read_source("__init__.py")
+        idx = source.index('"vendor_live_price"')
+        block = source[idx:idx + 400]
+        assert '"fmp"' in block
+        assert '"account"' in block
+
+    def test_get_live_prices_method_exists(self):
+        source = _read_source("__init__.py")
+        assert "def _get_live_prices(" in source
+
+    def test_get_fmp_quotes_method_exists(self):
+        source = _read_source("__init__.py")
+        assert "def _get_fmp_quotes(" in source
+
+    def test_fmp_quotes_uses_fmpsdk(self):
+        source = _read_source("__init__.py")
+        idx = source.index("def _get_fmp_quotes(")
+        next_def = source.index("\n    def ", idx + 1)
+        method_source = source[idx:next_def]
+        assert "fmpsdk.quote(" in method_source
+
+    def test_phase_5_uses_batch_prices(self):
+        """Phase 5 should batch-fetch prices before the per-symbol loop."""
+        source = _read_source("__init__.py")
+        idx = source.index("def _phase_5_monitor(")
+        next_def = source.index("\n    def ", idx + 1)
+        method_source = source[idx:next_def]
+        assert "_get_live_prices" in method_source
+        assert "live_prices" in method_source
+
+    def test_phase_5_no_per_symbol_account_call(self):
+        """Phase 5 should NOT call account.get_instrument_current_price per symbol."""
+        source = _read_source("__init__.py")
+        idx = source.index("def _phase_5_monitor(")
+        next_def = source.index("\n    def ", idx + 1)
+        method_source = source[idx:next_def]
+        assert "account.get_instrument_current_price" not in method_source
+
+    def test_phase_1b_uses_batch_prices(self):
+        """Phase 1b should batch-fetch prices for discovered symbols."""
+        source = _read_source("__init__.py")
+        idx = source.index("def _phase_1b_llm_discovery(")
+        next_def = source.index("\n    def ", idx + 1)
+        method_source = source[idx:next_def]
+        assert "_get_live_prices" in method_source
+
+    def test_fmp_quotes_fallback_on_missing_key(self):
+        """If FMP_API_KEY not set, should fall back to account prices."""
+        source = _read_source("__init__.py")
+        idx = source.index("def _get_fmp_quotes(")
+        next_def = source.index("\n    def ", idx + 1)
+        method_source = source[idx:next_def]
+        assert "FMP_API_KEY" in method_source
+        assert "falling back to account" in method_source
+
+
+# ===========================================================================
+# 18. Exit update LLM setting
+# ===========================================================================
+
+class TestExitUpdateLLMSetting:
+    """exit_update_llm should be a separate, cheaper model setting."""
+
+    def test_setting_exists(self):
+        source = _read_source("__init__.py")
+        assert '"exit_update_llm"' in source
+
+    def test_default_is_gpt4o_mini(self):
+        source = _read_source("__init__.py")
+        idx = source.index('"exit_update_llm"')
+        block = source[idx:idx + 300]
+        assert "gpt-4o-mini" in block
+
+    def test_is_separate_from_entry_definition(self):
+        source = _read_source("__init__.py")
+        idx_exit = source.index('"exit_update_llm"')
+        idx_entry = source.index('"entry_definition_llm"')
+        assert idx_exit != idx_entry
+
+
+# ===========================================================================
+# 19. Alpaca data_feed setting
+# ===========================================================================
+
+_ALPACA_BASE = os.path.join(
+    os.path.dirname(__file__),
+    "..",
+    "ba2_trade_platform",
+    "modules",
+    "accounts",
+)
+
+
+class TestAlpacaDataFeedSetting:
+    """AlpacaAccount should have a configurable data_feed setting."""
+
+    def _read_alpaca(self):
+        return open(os.path.join(_ALPACA_BASE, "AlpacaAccount.py")).read()
+
+    def test_setting_exists(self):
+        source = self._read_alpaca()
+        assert '"data_feed"' in source
+
+    def test_default_is_delayed_sip(self):
+        source = self._read_alpaca()
+        idx = source.index('"data_feed"')
+        block = source[idx:idx + 400]
+        assert '"default": "delayed_sip"' in block
+
+    def test_valid_values_include_sip(self):
+        source = self._read_alpaca()
+        idx = source.index('"data_feed"')
+        block = source[idx:idx + 400]
+        assert '"sip"' in block
+        assert '"iex"' in block
+
+    def test_no_hardcoded_delayed_sip(self):
+        """DataFeed.DELAYED_SIP should not be hardcoded in the request."""
+        source = self._read_alpaca()
+        idx = source.index("def _get_instrument_current_price_impl(")
+        next_def = source.index("\n    def ", idx + 1)
+        method_source = source[idx:next_def]
+        # Should use feed_map lookup, not hardcoded
+        assert "feed_map" in method_source
+        assert "feed=feed" in method_source

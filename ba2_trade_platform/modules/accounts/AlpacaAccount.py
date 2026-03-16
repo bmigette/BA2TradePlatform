@@ -129,7 +129,15 @@ class AlpacaAccount(AccountInterface):
             "api_key": {"type": 'str', "required": True, "description": "Alpaca API Key ID"},
             "api_secret": {"type": 'str', "required": True, "description": "Alpaca API Secret Key"},
             "paper_account": {"type": 'bool', "required": True, "description": "Is this a paper trading account?"},
-            "drip_enabled": {"type": 'bool', "required": False, "default": False, "description": "Is DRIP (Dividend Reinvestment Plan) enabled?"}
+            "drip_enabled": {"type": 'bool', "required": False, "default": False, "description": "Is DRIP (Dividend Reinvestment Plan) enabled?"},
+            "data_feed": {
+                "type": "str",
+                "required": False,
+                "default": "delayed_sip",
+                "description": "Alpaca market data feed",
+                "valid_values": ["delayed_sip", "sip", "iex", "otc"],
+                "tooltip": "delayed_sip = 15-min delayed (free tier). sip = real-time consolidated (paid). iex = real-time IEX (paid). otc = OTC data.",
+            },
         }
     
     @staticmethod
@@ -1405,7 +1413,15 @@ class AlpacaAccount(AccountInterface):
             symbols_list = [symbol_or_symbols] if is_single_symbol else symbol_or_symbols
             
             # Get latest quotes - Alpaca natively supports bulk fetching
-            request = StockLatestQuoteRequest(symbol_or_symbols=symbols_list, feed=DataFeed.DELAYED_SIP)
+            feed_setting = self.settings.get("data_feed", "delayed_sip").lower()
+            feed_map = {
+                "delayed_sip": DataFeed.DELAYED_SIP,
+                "sip": DataFeed.SIP,
+                "iex": DataFeed.IEX,
+                "otc": DataFeed.OTC,
+            }
+            feed = feed_map.get(feed_setting, DataFeed.DELAYED_SIP)
+            request = StockLatestQuoteRequest(symbol_or_symbols=symbols_list, feed=feed)
             quotes = data_client.get_stock_latest_quote(request)
             
             # Process quotes and calculate prices

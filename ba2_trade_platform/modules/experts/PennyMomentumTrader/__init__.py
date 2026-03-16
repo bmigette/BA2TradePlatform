@@ -117,6 +117,14 @@ class PennyMomentumTrader(LiveExpertInterface):
                 "ui_editor_type": "ModelSelector",
                 "tooltip": "Model used to generate structured entry, stop-loss, and take-profit conditions.",
             },
+            "exit_update_llm": {
+                "type": "str",
+                "required": True,
+                "default": "OpenAI/gpt-4o-mini",
+                "description": "LLM model for periodic exit condition re-evaluation",
+                "ui_editor_type": "ModelSelector",
+                "tooltip": "Lighter model used to periodically adjust exit conditions based on fresh news. Runs every exit_update_interval_ticks monitor cycles.",
+            },
             # Screening filters
             "scan_price_min": {
                 "type": "float",
@@ -290,6 +298,18 @@ class PennyMomentumTrader(LiveExpertInterface):
                 "valid_values": ["yfinance", "alpaca", "alphavantage", "fmp"],
                 "multiple": True,
                 "tooltip": "OHLCV data providers used for condition monitoring.",
+            },
+            "vendor_live_price": {
+                "type": "str",
+                "required": True,
+                "default": "fmp",
+                "description": "Live price quote source for monitoring",
+                "valid_values": ["fmp", "account"],
+                "tooltip": (
+                    "Source for real-time price quotes during monitoring. "
+                    "'fmp' uses FMP /quote-short endpoint (requires FMP premium for real-time). "
+                    "'account' uses the broker account's price API (may be 15-min delayed on Alpaca free tier)."
+                ),
             },
         }
 
@@ -694,17 +714,25 @@ class PennyMomentumTrader(LiveExpertInterface):
             self.logger.info(f"Phase 1b: discovery LLM returned {len(items)} candidates")
 
             # Normalise and validate each item
-            from ....core.utils import get_account_instance_from_id
-            account = get_account_instance_from_id(self.instance.account_id)
-            results: List[Dict[str, Any]] = []
+            # Collect valid symbols first, then batch-fetch prices
+            valid_items: List[Dict[str, Any]] = []
             for item in items:
                 if not isinstance(item, dict):
                     continue
                 symbol = item.get("symbol", "").strip().upper()
                 if not symbol or symbol in all_known:
                     continue
-                # Try to get a live price; fall back to LLM-reported price
-                live_price = account.get_instrument_current_price(symbol)
+                valid_items.append({"symbol": symbol, **item})
+
+            # Batch-fetch live prices for all discovered symbols
+            discovered_symbols = [vi["symbol"] for vi in valid_items]
+            live_prices = self._get_live_prices(discovered_symbols) if discovered_symbols else {}
+
+            results: List[Dict[str, Any]] = []
+            for item in valid_items:
+                symbol = item["symbol"]
+                # Try live price; fall back to LLM-reported price
+                live_price = live_prices.get(symbol)
                 price = live_price if live_price and live_price > 0 else item.get("price")
                 if not price or price <= 0:
                     self.logger.debug(f"Phase 1b: skipping {symbol} (no price)")
@@ -1207,6 +1235,9 @@ class PennyMomentumTrader(LiveExpertInterface):
                     f"{active_symbols} | open positions: {list(open_position_symbols)}"
                 )
 
+            # Batch-fetch live prices for all active symbols in one call
+            live_prices = self._get_live_prices(active_symbols) if active_symbols else {}
+
             for symbol, info in list(monitored.items()):
                 if self._stop_event.is_set():
                     break
@@ -1218,10 +1249,8 @@ class PennyMomentumTrader(LiveExpertInterface):
                 evaluator.clear_cache()
 
                 try:
-                    # Get current price for display
-                    from ....core.utils import get_account_instance_from_id
-                    account = get_account_instance_from_id(self.instance.account_id)
-                    current_price = account.get_instrument_current_price(symbol)
+                    # Use batch-fetched price
+                    current_price = live_prices.get(symbol)
                     if current_price is not None:
                         info["last_price"] = current_price
                     info["last_checked"] = datetime.now(timezone.utc).isoformat()
@@ -1406,8 +1435,8 @@ class PennyMomentumTrader(LiveExpertInterface):
         For each open position, fetch fresh news and ask the LLM whether
         exit conditions should be adjusted (tighten stops, widen TP, etc.).
         """
-        entry_model = self.get_setting_with_interface_default(
-            "entry_definition_llm", log_warning=False
+        exit_model = self.get_setting_with_interface_default(
+            "exit_update_llm", log_warning=False
         )
 
         for symbol in list(open_position_symbols):
@@ -1437,7 +1466,7 @@ class PennyMomentumTrader(LiveExpertInterface):
                 )
 
                 llm = ModelFactory.create_llm(
-                    entry_model,
+                    exit_model,
                     temperature=0.3,
                     expert_instance_id=self.instance.id,
                     use_case="PennyMomentum Exit Update",
@@ -1477,7 +1506,7 @@ class PennyMomentumTrader(LiveExpertInterface):
                 self._save_analysis_output(
                     market_analysis,
                     provider_category="llm",
-                    provider_name=entry_model,
+                    provider_name=exit_model,
                     name=f"exit_update_{symbol}_{datetime.now(timezone.utc).strftime('%H%M')}",
                     output_type="json",
                     text=raw_text,
@@ -1496,6 +1525,64 @@ class PennyMomentumTrader(LiveExpertInterface):
 
             except Exception as e:
                 self.logger.error(f"Exit condition update failed for {symbol}: {e}", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Live price helpers
+    # ------------------------------------------------------------------
+
+    def _get_live_prices(self, symbols: List[str]) -> Dict[str, Optional[float]]:
+        """
+        Batch-fetch live prices for the given symbols using the configured
+        vendor_live_price source.
+
+        Returns:
+            Dict mapping symbol -> price (None if unavailable).
+        """
+        if not symbols:
+            return {}
+
+        source = self.get_setting_with_interface_default(
+            "vendor_live_price", log_warning=False
+        )
+
+        if source == "fmp":
+            return self._get_fmp_quotes(symbols)
+
+        # Fallback: use account (broker) API
+        from ....core.utils import get_account_instance_from_id
+        account = get_account_instance_from_id(self.instance.account_id)
+        return account.get_instrument_current_price(symbols, price_type="mid")
+
+    def _get_fmp_quotes(self, symbols: List[str]) -> Dict[str, Optional[float]]:
+        """
+        Fetch real-time quotes from FMP using fmpsdk.quote().
+        Supports batch requests (comma-separated symbols in one call).
+        Returns the 'price' field which includes pre/after-market quotes.
+        """
+        import fmpsdk
+        from ....config import get_app_setting
+
+        api_key = get_app_setting("FMP_API_KEY")
+        if not api_key:
+            self.logger.warning("FMP_API_KEY not configured, falling back to account prices")
+            from ....core.utils import get_account_instance_from_id
+            account = get_account_instance_from_id(self.instance.account_id)
+            return account.get_instrument_current_price(symbols, price_type="mid")
+
+        result: Dict[str, Optional[float]] = {s: None for s in symbols}
+
+        try:
+            data = fmpsdk.quote(apikey=api_key, symbol=symbols)
+            if isinstance(data, list):
+                for item in data:
+                    sym = item.get("symbol", "").upper()
+                    price = item.get("price")
+                    if sym in result and price is not None and price > 0:
+                        result[sym] = float(price)
+        except Exception as e:
+            self.logger.warning(f"FMP quote fetch failed: {e}")
+
+        return result
 
     # ------------------------------------------------------------------
     # Helpers
