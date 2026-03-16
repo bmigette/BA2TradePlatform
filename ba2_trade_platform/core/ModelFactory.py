@@ -1147,7 +1147,7 @@ class ModelFactory:
             max_iterations = 5  # Prevent infinite loops
             iteration = 0
 
-            with httpx.Client(timeout=120.0) as client:
+            with httpx.Client(timeout=300.0) as client:
                 while finish_reason != "stop" and iteration < max_iterations:
                     iteration += 1
 
