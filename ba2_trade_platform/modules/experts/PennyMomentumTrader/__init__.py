@@ -1553,13 +1553,23 @@ class PennyMomentumTrader(LiveExpertInterface):
         account = get_account_instance_from_id(self.instance.account_id)
         return account.get_instrument_current_price(symbols, price_type="mid")
 
+    def _is_regular_session(self) -> bool:
+        """Return True if current time is within regular market hours (9:30-16:00 ET)."""
+        now = self._get_market_now()
+        regular_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        regular_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+        return regular_open <= now <= regular_close
+
     def _get_fmp_quotes(self, symbols: List[str]) -> Dict[str, Optional[float]]:
         """
-        Fetch real-time quotes from FMP using fmpsdk.quote().
-        Supports batch requests (comma-separated symbols in one call).
-        Returns the 'price' field which includes pre/after-market quotes.
+        Fetch real-time quotes from FMP.
+
+        During regular market hours (9:30-16:00 ET): uses fmpsdk.quote()
+        During extended hours (pre-market / after-hours): uses
+        FMP /stable/aftermarket-quote endpoint for accurate prices.
         """
         import fmpsdk
+        import requests
         from ....config import get_app_setting
 
         api_key = get_app_setting("FMP_API_KEY")
@@ -1572,13 +1582,35 @@ class PennyMomentumTrader(LiveExpertInterface):
         result: Dict[str, Optional[float]] = {s: None for s in symbols}
 
         try:
-            data = fmpsdk.quote(apikey=api_key, symbol=symbols)
-            if isinstance(data, list):
-                for item in data:
-                    sym = item.get("symbol", "").upper()
-                    price = item.get("price")
-                    if sym in result and price is not None and price > 0:
-                        result[sym] = float(price)
+            if self._is_regular_session():
+                data = fmpsdk.quote(apikey=api_key, symbol=symbols)
+                if isinstance(data, list):
+                    for item in data:
+                        sym = item.get("symbol", "").upper()
+                        price = item.get("price")
+                        if sym in result and price is not None and price > 0:
+                            result[sym] = float(price)
+            else:
+                # Extended hours: use aftermarket-quote endpoint per symbol
+                for symbol in symbols:
+                    try:
+                        resp = requests.get(
+                            "https://financialmodelingprep.com/stable/aftermarket-quote",
+                            params={"symbol": symbol, "apikey": api_key},
+                            timeout=10,
+                        )
+                        resp.raise_for_status()
+                        data = resp.json()
+                        if isinstance(data, list) and data:
+                            price = data[0].get("price") or data[0].get("lastPrice")
+                            if price is not None and price > 0:
+                                result[symbol] = float(price)
+                        elif isinstance(data, dict):
+                            price = data.get("price") or data.get("lastPrice")
+                            if price is not None and price > 0:
+                                result[symbol] = float(price)
+                    except Exception as e:
+                        self.logger.debug(f"FMP aftermarket quote failed for {symbol}: {e}")
         except Exception as e:
             self.logger.warning(f"FMP quote fetch failed: {e}")
 
