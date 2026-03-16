@@ -301,13 +301,16 @@ class PennyMomentumTrader(LiveExpertInterface):
     # ------------------------------------------------------------------
 
     def _run_daily_pipeline(self):
+        self.logger.info("=== Daily pipeline starting ===")
         market_analysis = self._create_market_analysis()
+        self.logger.debug(f"Created MarketAnalysis id={market_analysis.id}")
 
         # Phase 0: Review existing positions
         self._current_phase = "review"
         self._update_state(market_analysis, {"phase": "review"})
         self._phase_0_review(market_analysis)
         if self._stop_event.is_set():
+            self.logger.info("Pipeline aborted after phase 0 (stop requested)")
             return
 
         # Check balance for new entries
@@ -316,21 +319,27 @@ class PennyMomentumTrader(LiveExpertInterface):
             self._current_phase = "screen"
             self._update_state(market_analysis, {"phase": "screen"})
             candidates = self._phase_1_screen(market_analysis)
+            self.logger.debug(f"Phase 1 complete: {len(candidates)} tradeable candidates")
             if self._stop_event.is_set():
+                self.logger.info("Pipeline aborted after phase 1 (stop requested)")
                 return
 
             # Phase 2: Quick filter via LLM
             self._current_phase = "quick_filter"
             self._update_state(market_analysis, {"phase": "quick_filter"})
             survivors = self._phase_2_quick_filter(candidates, market_analysis)
+            self.logger.debug(f"Phase 2 complete: {len(survivors)} survivors")
             if self._stop_event.is_set():
+                self.logger.info("Pipeline aborted after phase 2 (stop requested)")
                 return
 
             # Phase 3: Deep triage via LLM
             self._current_phase = "deep_triage"
             self._update_state(market_analysis, {"phase": "deep_triage"})
             finalists = self._phase_3_deep_triage(survivors, market_analysis)
+            self.logger.debug(f"Phase 3 complete: {len(finalists)} finalists")
             if self._stop_event.is_set():
+                self.logger.info("Pipeline aborted after phase 3 (stop requested)")
                 return
         else:
             self.logger.info(
@@ -343,6 +352,7 @@ class PennyMomentumTrader(LiveExpertInterface):
         self._update_state(market_analysis, {"phase": "entry_setup"})
         self._phase_4_entry_conditions(finalists, market_analysis)
         if self._stop_event.is_set():
+            self.logger.info("Pipeline aborted after phase 4 (stop requested)")
             return
 
         # Phase 5: Monitor
@@ -356,6 +366,7 @@ class PennyMomentumTrader(LiveExpertInterface):
         self._phase_6_eod(market_analysis)
         self._current_phase = "complete"
         self._update_state(market_analysis, {"phase": "complete"})
+        self.logger.info("=== Daily pipeline complete ===")
 
     # ------------------------------------------------------------------
     # Phase implementations
@@ -525,6 +536,7 @@ class PennyMomentumTrader(LiveExpertInterface):
         self.logger.info(f"Phase 2: Quick filtering {len(candidates)} candidates")
 
         if not candidates:
+            self.logger.debug("Phase 2: no candidates, skipping LLM call")
             self._update_state(market_analysis, {"quick_filter_survivors": []})
             return []
 
@@ -536,6 +548,7 @@ class PennyMomentumTrader(LiveExpertInterface):
         scanning_model = self.get_setting_with_interface_default(
             "scanning_llm", log_warning=False
         )
+        self.logger.debug(f"Phase 2: calling LLM {scanning_model} (max_survivors={max_survivors})")
         llm = ModelFactory.create_llm(
             scanning_model,
             temperature=0.3,
@@ -598,9 +611,13 @@ class PennyMomentumTrader(LiveExpertInterface):
             self.logger.info(f"Deep triage: analyzing {symbol}")
 
             # Gather data from all configured vendors
+            self.logger.debug(f"Phase 3 [{symbol}]: gathering news")
             news_text = self._gather_news(symbol)
+            self.logger.debug(f"Phase 3 [{symbol}]: gathering fundamentals")
             fundamentals_text = self._gather_fundamentals(symbol)
+            self.logger.debug(f"Phase 3 [{symbol}]: gathering insider data")
             insider_text = self._gather_insider(symbol)
+            self.logger.debug(f"Phase 3 [{symbol}]: gathering social sentiment")
             social_text = self._gather_social(symbol)
 
             # Build prompt and call LLM
@@ -613,6 +630,7 @@ class PennyMomentumTrader(LiveExpertInterface):
             )
 
             try:
+                self.logger.debug(f"Phase 3 [{symbol}]: calling LLM {deep_model}")
                 llm = ModelFactory.create_llm(
                     deep_model,
                     temperature=0.3,
@@ -626,10 +644,11 @@ class PennyMomentumTrader(LiveExpertInterface):
 
                 result = self._parse_json_response(raw_text, expected_type=dict)
                 if not result:
-                    self.logger.warning(f"Failed to parse deep triage for {symbol}")
+                    self.logger.warning(f"Phase 3 [{symbol}]: failed to parse LLM response")
                     continue
 
                 confidence = result.get("confidence", 0)
+                self.logger.debug(f"Phase 3 [{symbol}]: confidence={confidence}, catalyst={result.get('catalyst', '')!r}")
                 if confidence < 40:
                     self.logger.info(
                         f"{symbol} confidence {confidence} too low, skipping"
@@ -905,6 +924,7 @@ class PennyMomentumTrader(LiveExpertInterface):
         ohlcv_provider = get_provider("ohlcv", ohlcv_vendor)
 
         trade_mgr = PennyTradeManager(self.instance.id)
+        monitor_tick = 0
 
         while not self._stop_event.is_set():
             # Check if market is still open
@@ -926,6 +946,15 @@ class PennyMomentumTrader(LiveExpertInterface):
 
             open_positions = trade_mgr.get_open_positions()
             open_position_symbols = {p["symbol"] for p in open_positions}
+
+            active_symbols = [s for s, i in monitored.items() if i.get("status") in ("watching", "triggered")]
+            # Log a summary every 10 ticks to avoid spam
+            monitor_tick += 1
+            if monitor_tick % 10 == 1:
+                self.logger.debug(
+                    f"Monitor tick {monitor_tick}: {len(active_symbols)} active symbol(s): "
+                    f"{active_symbols} | open positions: {list(open_position_symbols)}"
+                )
 
             for symbol, info in list(monitored.items()):
                 if self._stop_event.is_set():
