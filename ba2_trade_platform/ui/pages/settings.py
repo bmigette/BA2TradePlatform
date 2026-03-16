@@ -1493,11 +1493,23 @@ class ExpertSettingsTab:
                 ui.label('Add Expert' if not is_edit else 'Edit Expert').classes('text-h6')
                 
                 # Tabs for different settings sections
+                # Check if expert class has actions
+                expert_actions = []
+                if is_edit:
+                    try:
+                        expert_class = self._get_expert_class(expert_instance.expert)
+                        if expert_class:
+                            expert_actions = expert_class.get_expert_actions()
+                    except Exception:
+                        pass
+
                 with ui.tabs() as settings_tabs:
                     ui.tab('General Settings', icon='schedule')
                     ui.tab('Instruments', icon='trending_up')
                     ui.tab('Expert Settings', icon='settings')
                     ui.tab('Import/Export', icon='download')
+                    if expert_actions:
+                        ui.tab('Actions', icon='play_circle')
                 
                 with ui.tab_panels(settings_tabs, value='General Settings').classes('w-full').style('flex: 1; overflow-y: auto'):
                     # General Settings tab
@@ -1826,7 +1838,11 @@ class ExpertSettingsTab:
                     # Import/Export tab
                     with ui.tab_panel('Import/Export'):
                         self._render_import_export_tab(expert_instance)
-                    
+
+                    if expert_actions:
+                        with ui.tab_panel('Actions'):
+                            self._render_actions_tab(expert_instance, expert_actions)
+
                 # Fill values if editing
                 if is_edit:
                     self.expert_select.value = expert_instance.expert
@@ -2936,6 +2952,47 @@ class ExpertSettingsTab:
         logger.debug(f'Expert type changed to: {event.value if hasattr(event, "value") else event}')
         self._render_expert_settings(expert_instance)
     
+    def _get_expert_class(self, expert_type: str):
+        """Get the expert class by type name."""
+        from ...modules.experts import get_expert_class
+        return get_expert_class(expert_type)
+
+    def _render_actions_tab(self, expert_instance, expert_actions):
+        """Render expert-specific action buttons."""
+        with ui.column().classes('w-full gap-4 p-4'):
+            ui.label('Expert Actions').classes('text-subtitle1')
+            ui.label('Run expert-specific operations. These actions are executed immediately.').classes('text-body2 text-grey-7 mb-2')
+
+            for action in expert_actions:
+                action_name = action.get('name', '')
+                label = action.get('label', action_name)
+                description = action.get('description', '')
+                icon = action.get('icon', 'play_arrow')
+                callback_name = action.get('callback', '')
+
+                with ui.card().classes('w-full'):
+                    with ui.row().classes('w-full items-center gap-4'):
+                        def make_handler(cb_name, ei_id, lbl):
+                            async def handler():
+                                try:
+                                    from ...core.utils import get_expert_instance_from_id
+                                    expert = get_expert_instance_from_id(ei_id)
+                                    if expert and hasattr(expert, cb_name):
+                                        result = getattr(expert, cb_name)()
+                                        ui.notify(f'{lbl}: {result}', type='positive')
+                                    else:
+                                        ui.notify(f'Action not available', type='warning')
+                                except Exception as e:
+                                    ui.notify(f'Error: {e}', type='negative')
+                            return handler
+
+                        ui.button(
+                            label,
+                            icon=icon,
+                            on_click=make_handler(callback_name, expert_instance.id, label),
+                        ).props('outline')
+                        ui.label(description).classes('text-body2 text-grey-7')
+
     def _render_import_export_tab(self, expert_instance=None):
         """Render the import/export tab for expert settings."""
         import json

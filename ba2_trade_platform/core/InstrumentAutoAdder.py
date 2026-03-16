@@ -71,31 +71,39 @@ class InstrumentAutoAdder:
             symbols = task['symbols']
             expert_shortname = task['expert_shortname']
             source = task['source']  # 'expert' or 'ai'
-            
+            extra_labels = task.get('extra_labels', [])
+
             logger.info(f"Processing instrument auto-addition: {len(symbols)} symbols from {source}")
-            
+
             for symbol in symbols:
-                await self._add_instrument_if_missing(symbol, expert_shortname, source)
+                await self._add_instrument_if_missing(symbol, expert_shortname, source, extra_labels)
                 
         except Exception as e:
             logger.error(f"Error processing instrument auto-addition task: {e}", exc_info=True)
     
-    async def _add_instrument_if_missing(self, symbol: str, expert_shortname: str, source: str):
+    async def _add_instrument_if_missing(self, symbol: str, expert_shortname: str, source: str, extra_labels: list = None):
         """Add instrument to database if it doesn't exist."""
         try:
             # Check if instrument already exists
             with get_db() as session:
                 stmt = select(Instrument).where(Instrument.name == symbol)
                 existing = session.exec(stmt).first()
-                
+
                 if existing:
                     logger.debug(f"Instrument {symbol} already exists in database")
                     # Add labels to existing instrument if not already present
+                    updated = False
                     if expert_shortname and expert_shortname not in existing.labels:
                         existing.labels.append(expert_shortname)
+                        updated = True
+                    for lbl in (extra_labels or []):
+                        if lbl not in existing.labels:
+                            existing.labels.append(lbl)
+                            updated = True
+                    if updated:
                         session.add(existing)
                         session.commit()
-                        logger.debug(f"Added expert label '{expert_shortname}' to existing instrument {symbol}")
+                        logger.debug(f"Updated labels for existing instrument {symbol}: {existing.labels}")
                     return
             
             # Instrument doesn't exist - create it
@@ -120,6 +128,9 @@ class InstrumentAutoAdder:
                 labels.append('ai_selected')
             elif source == 'expert':
                 labels.append('expert_selected')
+            for lbl in (extra_labels or []):
+                if lbl not in labels:
+                    labels.append(lbl)
             
             instrument = Instrument(
                 name=symbol,
@@ -208,22 +219,24 @@ class InstrumentAutoAdder:
         else:
             return 'Equity'  # Default for stocks
     
-    def queue_instruments_for_addition(self, symbols: List[str], expert_shortname: str, source: str = 'expert'):
+    def queue_instruments_for_addition(self, symbols: List[str], expert_shortname: str, source: str = 'expert', extra_labels: Optional[List[str]] = None):
         """
         Queue instruments for addition to database.
-        
+
         Args:
             symbols: List of instrument symbols to add
             expert_shortname: Short name of the expert (e.g., 'tradingagents-1')
             source: Source of the symbols ('expert' or 'ai')
+            extra_labels: Additional labels to apply to the instruments
         """
         if not symbols:
             return
-        
+
         task = {
             'symbols': symbols,
             'expert_shortname': expert_shortname,
-            'source': source
+            'source': source,
+            'extra_labels': extra_labels or [],
         }
         
         # Add task to queue (thread-safe)
