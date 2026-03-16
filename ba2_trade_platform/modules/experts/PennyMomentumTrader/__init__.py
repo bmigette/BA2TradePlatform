@@ -719,18 +719,18 @@ class PennyMomentumTrader(LiveExpertInterface):
         known_list = ", ".join(sorted(all_known)) if all_known else "none"
         prompt = (
             f"You are a penny stock momentum trader scanning for today's top movers.\n\n"
-            f"Find {count} US penny stocks with strong momentum catalysts RIGHT NOW.\n\n"
+            f"Search the web and find {count} US penny stocks with strong momentum catalysts RIGHT NOW.\n\n"
             f"Criteria:\n"
-            f"- Price between ${price_min:.2f} and ${price_max:.2f}\n"
-            f"- Volume above {volume_min:,}\n"
+            f"- Price roughly between ${price_min:.2f} and ${price_max:.2f}\n"
+            f"- High trading volume today\n"
             f"- Clear catalyst today (earnings, FDA news, SEC filing, short squeeze, "
             f"unusual options activity, social media buzz, technical breakout)\n"
             f"- US-listed stocks only (NYSE, NASDAQ, OTC)\n\n"
             f"We are ALREADY tracking or holding these symbols — DO NOT include them:\n"
             f"{known_list}\n\n"
+            f"IMPORTANT: Do NOT invent or guess prices or volumes. We will fetch real data ourselves.\n\n"
             f"Return ONLY a JSON array (no explanation, no markdown) of exactly {count} objects:\n"
-            f'[{{"symbol": "ABCD", "price": 1.23, "volume": 1500000, '
-            f'"catalyst": "short description", "reason": "why it has momentum"}}]'
+            f'[{{"symbol": "ABCD", "catalyst": "short description", "reason": "why it has momentum"}}]'
         )
 
         self.logger.debug(
@@ -769,16 +769,14 @@ class PennyMomentumTrader(LiveExpertInterface):
             results: List[Dict[str, Any]] = []
             for item in valid_items:
                 symbol = item["symbol"]
-                # Try live price; fall back to LLM-reported price
                 live_price = live_prices.get(symbol)
-                price = live_price if live_price and live_price > 0 else item.get("price")
-                if not price or price <= 0:
-                    self.logger.debug(f"Phase 1b: skipping {symbol} (no price)")
+                if not live_price or live_price <= 0:
+                    self.logger.debug(f"Phase 1b: skipping {symbol} (no live price)")
                     continue
                 results.append({
                     "symbol": symbol,
-                    "price": price,
-                    "volume": item.get("volume"),
+                    "price": live_price,
+                    "volume": None,
                     "market_cap": None,
                     "sector": None,
                     "industry": None,
