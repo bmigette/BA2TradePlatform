@@ -590,9 +590,9 @@ class PennyMomentumTrader(LiveExpertInterface):
             self._update_state(market_analysis, {"deep_triage_results": {}})
             return []
 
-        max_final = self.get_setting_with_interface_default(
+        max_final = int(self.get_setting_with_interface_default(
             "max_final_candidates", log_warning=False
-        )
+        ))
         deep_model = self.get_setting_with_interface_default(
             "deep_analysis_llm", log_warning=False
         )
