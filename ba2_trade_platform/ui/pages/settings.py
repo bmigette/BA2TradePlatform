@@ -1571,83 +1571,84 @@ class ExpertSettingsTab:
                         ui.separator().classes('my-2')
                         ui.label('General Expert Configuration:').classes('text-subtitle1 mb-4')
                         
-                        # Schedule settings with expandable cards for both types
-                        ui.label('Execution Schedules:').classes('text-subtitle2 mb-2')
-                        ui.label('Configure when the expert should run for different analysis types:').classes('text-body2 mb-2')
-                        
-                        # Enter Market Analysis Schedule
-                        with ui.expansion('📈 Enter Market Analysis Schedule', value=True).classes('w-full mb-4'):
-                            with ui.card().classes('w-full'):
-                                ui.label('Schedule for analyzing new market entry opportunities:').classes('text-body2 mb-2')
-                            
-                                ui.label('Select days when the expert should analyze for new positions:').classes('text-body2 mb-2')
-                                with ui.row().classes('w-full gap-2 mb-4'):
-                                    self.enter_market_schedule_days = {}
-                                    for day in ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']:
-                                        # Default weekdays to True, weekends to False for enter market
-                                        default_value = day not in ['Saturday', 'Sunday']
-                                        self.enter_market_schedule_days[day.lower()] = ui.checkbox(day, value=default_value).classes('mb-2')
-                                
-                                ui.label('Execution times (24-hour format, e.g., 09:30, 15:00):').classes('text-body2 mb-2')
-                                try:
-                                    self.enter_market_times_container = ui.column().classes('w-full mb-4')
+                        # Schedule settings - hidden for live experts
+                        with ui.column().classes('w-full') as self.execution_schedule_section:
+                            ui.label('Execution Schedules:').classes('text-subtitle2 mb-2')
+                            ui.label('Configure when the expert should run for different analysis types:').classes('text-body2 mb-2')
+
+                            # Enter Market Analysis Schedule
+                            with ui.expansion('📈 Enter Market Analysis Schedule', value=True).classes('w-full mb-4'):
+                                with ui.card().classes('w-full'):
+                                    ui.label('Schedule for analyzing new market entry opportunities:').classes('text-body2 mb-2')
+
+                                    ui.label('Select days when the expert should analyze for new positions:').classes('text-body2 mb-2')
+                                    with ui.row().classes('w-full gap-2 mb-4'):
+                                        self.enter_market_schedule_days = {}
+                                        for day in ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']:
+                                            # Default weekdays to True, weekends to False for enter market
+                                            default_value = day not in ['Saturday', 'Sunday']
+                                            self.enter_market_schedule_days[day.lower()] = ui.checkbox(day, value=default_value).classes('mb-2')
+
+                                    ui.label('Execution times (24-hour format, e.g., 09:30, 15:00):').classes('text-body2 mb-2')
+                                    try:
+                                        self.enter_market_times_container = ui.column().classes('w-full mb-4')
+                                        if self.enter_market_times_container is None:
+                                            logger.error("ui.column() returned None for enter_market_times_container")
+                                            self.enter_market_times_container = ui.column()  # Try again without classes
+                                    except Exception as e:
+                                        logger.error(f"Error creating enter_market_times_container: {e}", exc_info=True)
+                                        self.enter_market_times_container = None
+
+                                    self.enter_market_execution_times = []
+
+                                    # Verify container was created successfully
                                     if self.enter_market_times_container is None:
-                                        logger.error("ui.column() returned None for enter_market_times_container")
-                                        self.enter_market_times_container = ui.column()  # Try again without classes
-                                except Exception as e:
-                                    logger.error(f"Error creating enter_market_times_container: {e}", exc_info=True)
-                                    self.enter_market_times_container = None
-                                
-                                self.enter_market_execution_times = []
-                                
-                                # Verify container was created successfully
-                                if self.enter_market_times_container is None:
-                                    logger.error("Failed to create enter_market_times_container, skipping time input setup")
-                                else:
-                                    # Add initial time input
-                                    self._add_time_input_enter_market('09:30')
-                                
-                                # Only create the add time button if we have a valid container
-                                if self.enter_market_times_container is not None:
+                                        logger.error("Failed to create enter_market_times_container, skipping time input setup")
+                                    else:
+                                        # Add initial time input
+                                        self._add_time_input_enter_market('09:30')
+
+                                    # Only create the add time button if we have a valid container
+                                    if self.enter_market_times_container is not None:
+                                        with ui.row().classes('w-full gap-2 mb-4'):
+                                            ui.button('Add Time', on_click=self._add_time_input_enter_market, icon='add_alarm').props('flat')
+
+                            # Open Positions Analysis Schedule
+                            with ui.expansion('💼 Open Positions Analysis Schedule', value=False).classes('w-full mb-4'):
+                                with ui.card().classes('w-full'):
+                                    ui.label('Schedule for analyzing existing open positions:').classes('text-body2 mb-2')
+                                    ui.label('Select days when the expert should analyze open positions:').classes('text-body2 mb-2')
                                     with ui.row().classes('w-full gap-2 mb-4'):
-                                        ui.button('Add Time', on_click=self._add_time_input_enter_market, icon='add_alarm').props('flat')
-                        
-                        # Open Positions Analysis Schedule
-                        with ui.expansion('💼 Open Positions Analysis Schedule', value=False).classes('w-full mb-4'):
-                            with ui.card().classes('w-full'):
-                                ui.label('Schedule for analyzing existing open positions:').classes('text-body2 mb-2')
-                                ui.label('Select days when the expert should analyze open positions:').classes('text-body2 mb-2')
-                                with ui.row().classes('w-full gap-2 mb-4'):
-                                    self.open_positions_schedule_days = {}
-                                    for day in ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']:
-                                        # Default weekdays to True, weekends to False for open positions
-                                        default_value = day not in ['Saturday', 'Sunday']
-                                        self.open_positions_schedule_days[day.lower()] = ui.checkbox(day, value=default_value).classes('mb-2')
-                                
-                                ui.label('Execution times (24-hour format, e.g., 09:30, 15:00):').classes('text-body2 mb-2')
-                                try:
-                                    self.open_positions_times_container = ui.column().classes('w-full mb-4')
+                                        self.open_positions_schedule_days = {}
+                                        for day in ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']:
+                                            # Default weekdays to True, weekends to False for open positions
+                                            default_value = day not in ['Saturday', 'Sunday']
+                                            self.open_positions_schedule_days[day.lower()] = ui.checkbox(day, value=default_value).classes('mb-2')
+
+                                    ui.label('Execution times (24-hour format, e.g., 09:30, 15:00):').classes('text-body2 mb-2')
+                                    try:
+                                        self.open_positions_times_container = ui.column().classes('w-full mb-4')
+                                        if self.open_positions_times_container is None:
+                                            logger.error("ui.column() returned None for open_positions_times_container")
+                                            self.open_positions_times_container = ui.column()  # Try again without classes
+                                    except Exception as e:
+                                        logger.error(f"Error creating open_positions_times_container: {e}", exc_info=True)
+                                        self.open_positions_times_container = None
+
+                                    self.open_positions_execution_times = []
+
+                                    # Verify container was created successfully
                                     if self.open_positions_times_container is None:
-                                        logger.error("ui.column() returned None for open_positions_times_container")
-                                        self.open_positions_times_container = ui.column()  # Try again without classes
-                                except Exception as e:
-                                    logger.error(f"Error creating open_positions_times_container: {e}", exc_info=True)
-                                    self.open_positions_times_container = None
-                                
-                                self.open_positions_execution_times = []
-                                
-                                # Verify container was created successfully
-                                if self.open_positions_times_container is None:
-                                    logger.error("Failed to create open_positions_times_container, skipping time input setup")
-                                else:
-                                    # Add initial time inputs (more frequent for position monitoring)
-                                    for time in ['09:30', '10:30', '11:30', '12:30', '13:30', '14:30', '15:30']:
-                                        self._add_time_input_open_positions(time)
-                                
-                                # Only create the add time button if we have a valid container
-                                if self.open_positions_times_container is not None:
-                                    with ui.row().classes('w-full gap-2 mb-4'):
-                                        ui.button('Add Time', on_click=self._add_time_input_open_positions, icon='add_alarm').props('flat')
+                                        logger.error("Failed to create open_positions_times_container, skipping time input setup")
+                                    else:
+                                        # Add initial time inputs (more frequent for position monitoring)
+                                        for time in ['09:30', '10:30', '11:30', '12:30', '13:30', '14:30', '15:30']:
+                                            self._add_time_input_open_positions(time)
+
+                                    # Only create the add time button if we have a valid container
+                                    if self.open_positions_times_container is not None:
+                                        with ui.row().classes('w-full gap-2 mb-4'):
+                                            ui.button('Add Time', on_click=self._add_time_input_open_positions, icon='add_alarm').props('flat')
                         
                         ui.separator().classes('my-4')
                         
@@ -1875,6 +1876,7 @@ class ExpertSettingsTab:
 
                 self._update_expert_description()
                 self._update_instrument_selection_options()
+                self._update_schedule_visibility()
 
                 # Load general settings if editing
                 if is_edit:
@@ -2539,6 +2541,26 @@ class ExpertSettingsTab:
         self._update_expert_description()
         self._update_instrument_selection_options()
         self._render_expert_settings(expert_instance)
+        self._update_schedule_visibility()
+
+    def _update_schedule_visibility(self):
+        """Hide execution schedule settings for live experts (LiveExpertInterface subclasses)."""
+        if not hasattr(self, 'execution_schedule_section'):
+            return
+        expert_type = self.expert_select.value if hasattr(self, 'expert_select') else None
+        if not expert_type:
+            self.execution_schedule_section.set_visibility(True)
+            return
+        expert_class = self._get_expert_class(expert_type)
+        if expert_class is None:
+            self.execution_schedule_section.set_visibility(True)
+            return
+        try:
+            from ...core.interfaces import LiveExpertInterface
+            is_live = issubclass(expert_class, LiveExpertInterface)
+        except Exception:
+            is_live = False
+        self.execution_schedule_section.set_visibility(not is_live)
     
     def _update_instrument_selection_options(self):
         """Update instrument selection method options based on selected expert's capabilities."""
@@ -2951,6 +2973,7 @@ class ExpertSettingsTab:
         """Handle expert type change."""
         logger.debug(f'Expert type changed to: {event.value if hasattr(event, "value") else event}')
         self._render_expert_settings(expert_instance)
+        self._update_schedule_visibility()
     
     def _get_expert_class(self, expert_type: str):
         """Get the expert class by type name."""
