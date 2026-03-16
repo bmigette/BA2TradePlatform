@@ -316,7 +316,17 @@ class FREDMacroProvider(MacroEconomicsInterface):
                     result_md += "- **📈 NORMAL YIELD CURVE**: Healthy economic expectations\n"
         else:
             result_md += "No recent yield curve data available.\n"
-        
+
+        dict_response = {
+            "source": "FRED",
+            "period": {"start": start_str, "end": end_str},
+            "yield_curve": yield_data,
+        }
+
+        if format_type == "dict":
+            return dict_response
+        if format_type == "both":
+            return {"text": result_md, "data": dict_response}
         return result_md
     
     @log_provider_call
@@ -353,15 +363,16 @@ class FREDMacroProvider(MacroEconomicsInterface):
         # Get recent Fed Funds rate data to show policy trajectory
         fed_data = self._get_fred_data("FEDFUNDS", start_str, end_str)
         
+        rate_history = []
         if "error" not in fed_data:
             observations = fed_data.get("observations", [])
             valid_obs = [obs for obs in observations if obs.get("value") != "."]
-            
+
             if valid_obs and len(valid_obs) >= 2:
                 result_md += "### Recent Federal Funds Rate History\n"
                 result_md += "| Date | Rate (%) | Change |\n"
                 result_md += "|------|----------|--------|\n"
-                
+
                 for i, obs in enumerate(valid_obs[:6]):  # Show last 6 observations
                     rate = float(obs["value"])
                     if i < len(valid_obs) - 1:
@@ -370,11 +381,27 @@ class FREDMacroProvider(MacroEconomicsInterface):
                         change_str = f"{change:+.2f}%" if change != 0 else "No change"
                     else:
                         change_str = "-"
-                    
+                        change = None
+
                     result_md += f"| {obs['date']} | {rate:.2f}% | {change_str} |\n"
-                
+                    rate_history.append({
+                        "date": obs["date"],
+                        "rate": rate,
+                        "change": change,
+                    })
+
                 result_md += "\n"
-        
+
+        dict_response = {
+            "source": "FRED",
+            "period": {"start": start_str, "end": end_str},
+            "rate_history": rate_history,
+        }
+
+        if format_type == "dict":
+            return dict_response
+        if format_type == "both":
+            return {"text": result_md, "data": dict_response}
         return result_md
     
     def get_provider_name(self) -> str:

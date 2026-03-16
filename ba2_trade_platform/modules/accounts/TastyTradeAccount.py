@@ -237,7 +237,8 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
                     found_symbols = {e.symbol for e in equities}
                 else:
                     found_symbols = {equities.symbol}
-            except Exception:
+            except Exception as e:
+                logger.warning(f"[Account {self.id}] Symbol lookup failed: {e}")
                 found_symbols = set()
 
             for s in symbols:
@@ -336,7 +337,8 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
 
             try:
                 drip_transactions = self._run_async(self._account.get_history(self._session, **drip_params))
-            except Exception:
+            except Exception as e:
+                logger.warning(f"[Account {self.id}] DRIP transaction fetch failed: {e}")
                 drip_transactions = []
 
             # Build a map of DRIP by date+symbol for correlation
@@ -382,8 +384,8 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
                     elif net_val < 0 and 'reinvested' not in desc:
                         # Negative entry without "reinvested" = tax withholding
                         wh_map[key] = wh_map.get(key, 0) + abs(net_val)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[Account {self.id}] Money movement fetch failed: {e}")
 
             dividends = []
             for txn in transactions:
