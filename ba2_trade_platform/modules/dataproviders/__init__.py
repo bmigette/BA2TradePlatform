@@ -33,7 +33,8 @@ from ba2_trade_platform.core.interfaces import (
     MarketNewsInterface,
     MacroEconomicsInterface,
     CompanyInsiderInterface,
-    SocialMediaDataProviderInterface
+    SocialMediaDataProviderInterface,
+    ScreenerProviderInterface
 )
 
 # Legacy data provider (to be migrated)
@@ -56,6 +57,7 @@ from .fundamentals import (
 from .macro import FREDMacroProvider
 from .insider import FMPInsiderProvider
 from .socialmedia import AISocialMediaSentiment
+from .screener import FMPScreenerProvider
 
 # Provider registries - will be populated as providers are implemented
 OHLCV_PROVIDERS: Dict[str, Type[DataProviderInterface]] = {
@@ -107,6 +109,10 @@ SOCIALMEDIA_PROVIDERS: Dict[str, Type[SocialMediaDataProviderInterface]] = {
     "ai": AISocialMediaSentiment,
 }
 
+SCREENER_PROVIDERS: Dict[str, Type[ScreenerProviderInterface]] = {
+    "fmp": FMPScreenerProvider,
+}
+
 
 def get_provider(category: str, provider_name: str, **kwargs) -> DataProviderInterface:
     """
@@ -149,8 +155,9 @@ def get_provider(category: str, provider_name: str, **kwargs) -> DataProviderInt
         "macro": MACRO_PROVIDERS,
         "insider": INSIDER_PROVIDERS,
         "socialmedia": SOCIALMEDIA_PROVIDERS,
+        "screener": SCREENER_PROVIDERS,
     }
-    
+
     if category not in registries:
         raise ValueError(
             f"Unknown provider category: {category}. "
@@ -208,8 +215,9 @@ def list_providers(category: str = None) -> Dict[str, list[str]]:
         "macro": MACRO_PROVIDERS,
         "insider": INSIDER_PROVIDERS,
         "socialmedia": SOCIALMEDIA_PROVIDERS,
+        "screener": SCREENER_PROVIDERS,
     }
-    
+
     if category:
         if category not in all_registries:
             raise ValueError(
@@ -243,7 +251,8 @@ __all__ = [
     "FREDMacroProvider",
     "FMPInsiderProvider",
     "AISocialMediaSentiment",
-    
+    "FMPScreenerProvider",
+
     # Interfaces
     "DataProviderInterface",
     "MarketIndicatorsInterface",
@@ -251,6 +260,7 @@ __all__ = [
     "CompanyFundamentalsDetailsInterface",
     "MarketNewsInterface",
     "SocialMediaDataProviderInterface",
+    "ScreenerProviderInterface",
     "MacroEconomicsInterface",
     "CompanyInsiderInterface",
     
@@ -267,4 +277,5 @@ __all__ = [
     "MACRO_PROVIDERS",
     "INSIDER_PROVIDERS",
     "SOCIALMEDIA_PROVIDERS",
+    "SCREENER_PROVIDERS",
 ]
