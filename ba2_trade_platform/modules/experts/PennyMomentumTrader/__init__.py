@@ -192,9 +192,25 @@ class PennyMomentumTrader(LiveExpertInterface):
             "max_monitored_symbols": {
                 "type": "int",
                 "required": True,
-                "default": 20,
+                "default": 40,
                 "description": "Maximum symbols to monitor simultaneously",
                 "tooltip": "Upper bound on the number of symbols being actively monitored.",
+            },
+            "discovery_llm": {
+                "type": "str",
+                "required": True,
+                "default": "NagaAI/gpt-4o-search-preview",
+                "description": "LLM model for discovering additional penny stocks via web search",
+                "ui_editor_type": "ModelSelector",
+                "required_labels": ["websearch"],
+                "tooltip": "Websearch-capable model used to discover extra momentum candidates beyond the screener.",
+            },
+            "max_discovery_candidates": {
+                "type": "int",
+                "required": True,
+                "default": 10,
+                "description": "Number of additional stocks to discover via LLM web search",
+                "tooltip": "How many extra penny stocks the discovery LLM should find each scan.",
             },
             "max_entry_age_days": {
                 "type": "int",
@@ -322,6 +338,22 @@ class PennyMomentumTrader(LiveExpertInterface):
             self.logger.debug(f"Phase 1 complete: {len(candidates)} tradeable candidates")
             if self._stop_event.is_set():
                 self.logger.info("Pipeline aborted after phase 1 (stop requested)")
+                return
+
+            # Phase 1b: LLM-based discovery of additional candidates
+            self._current_phase = "discovery"
+            self._update_state(market_analysis, {"phase": "discovery"})
+            discovered = self._phase_1b_llm_discovery(candidates, market_analysis)
+            if discovered:
+                existing_symbols = {c.get("symbol") for c in candidates}
+                new_ones = [d for d in discovered if d.get("symbol") not in existing_symbols]
+                candidates = candidates + new_ones
+                self.logger.info(
+                    f"Phase 1b added {len(new_ones)} LLM-discovered candidates "
+                    f"(total: {len(candidates)})"
+                )
+            if self._stop_event.is_set():
+                self.logger.info("Pipeline aborted after phase 1b (stop requested)")
                 return
 
             # Phase 2: Quick filter via LLM
@@ -469,6 +501,17 @@ class PennyMomentumTrader(LiveExpertInterface):
         candidates = screener.screen_stocks(filters)
         self.logger.info(f"Screener returned {len(candidates)} candidates")
 
+        # Exclude symbols where we already hold open positions
+        open_position_symbols = {
+            pos["symbol"] for pos in PennyTradeManager(self.instance.id).get_open_positions()
+        }
+        if open_position_symbols:
+            before = len(candidates)
+            candidates = [c for c in candidates if c.get("symbol") not in open_position_symbols]
+            self.logger.debug(
+                f"Excluded {before - len(candidates)} already-held symbols from screener results"
+            )
+
         # Sort by volume descending (highest momentum first) and cap at max_scan_candidates
         candidates.sort(key=lambda c: c.get("volume") or 0, reverse=True)
         if len(candidates) > max_candidates:
@@ -536,6 +579,133 @@ class PennyMomentumTrader(LiveExpertInterface):
             )
 
         return candidates
+
+    def _get_previously_monitored_symbols(self, current_market_analysis_id: int) -> set:
+        """Return symbols from the most recent prior MarketAnalysis (if any)."""
+        try:
+            with get_db() as session:
+                from sqlmodel import select as sql_select
+                statement = (
+                    sql_select(MarketAnalysis)
+                    .where(MarketAnalysis.expert_instance_id == self.instance.id)
+                    .where(MarketAnalysis.id != current_market_analysis_id)
+                    .order_by(MarketAnalysis.created_at.desc())  # type: ignore[union-attr]
+                    .limit(1)
+                )
+                ma = session.exec(statement).first()
+                if ma and ma.state:
+                    return set(ma.state.get("monitored_symbols", {}).keys())
+        except Exception as e:
+            self.logger.warning(f"Failed to load previously monitored symbols: {e}")
+        return set()
+
+    def _phase_1b_llm_discovery(
+        self, screener_candidates: List[Dict[str, Any]], market_analysis: MarketAnalysis
+    ) -> List[Dict[str, Any]]:
+        """Use a websearch LLM to discover additional penny stock candidates."""
+        discovery_model = self.get_setting_with_interface_default(
+            "discovery_llm", log_warning=False
+        )
+        count = int(self.get_setting_with_interface_default(
+            "max_discovery_candidates", log_warning=False
+        ))
+
+        if count <= 0:
+            return []
+
+        # Build the known-symbols set: open positions + previously monitored + screener results
+        open_position_symbols = {
+            pos["symbol"] for pos in PennyTradeManager(self.instance.id).get_open_positions()
+        }
+        prev_monitored = self._get_previously_monitored_symbols(market_analysis.id)
+        screener_symbols = {c.get("symbol") for c in screener_candidates if c.get("symbol")}
+        all_known = open_position_symbols | prev_monitored | screener_symbols
+
+        price_min = self.get_setting_with_interface_default("scan_price_min", log_warning=False)
+        price_max = self.get_setting_with_interface_default("scan_price_max", log_warning=False)
+        volume_min = int(self.get_setting_with_interface_default("scan_volume_min", log_warning=False))
+
+        known_list = ", ".join(sorted(all_known)) if all_known else "none"
+        prompt = (
+            f"You are a penny stock momentum trader scanning for today's top movers.\n\n"
+            f"Find {count} US penny stocks with strong momentum catalysts RIGHT NOW.\n\n"
+            f"Criteria:\n"
+            f"- Price between ${price_min:.2f} and ${price_max:.2f}\n"
+            f"- Volume above {volume_min:,}\n"
+            f"- Clear catalyst today (earnings, FDA news, SEC filing, short squeeze, "
+            f"unusual options activity, social media buzz, technical breakout)\n"
+            f"- US-listed stocks only (NYSE, NASDAQ, OTC)\n\n"
+            f"We are ALREADY tracking or holding these symbols — DO NOT include them:\n"
+            f"{known_list}\n\n"
+            f"Return ONLY a JSON array (no explanation, no markdown) of exactly {count} objects:\n"
+            f'[{{"symbol": "ABCD", "price": 1.23, "volume": 1500000, '
+            f'"catalyst": "short description", "reason": "why it has momentum"}}]'
+        )
+
+        self.logger.debug(
+            f"Phase 1b: calling discovery LLM {discovery_model} for {count} extra candidates "
+            f"(excluding {len(all_known)} known symbols)"
+        )
+
+        try:
+            llm = ModelFactory.create_llm(
+                discovery_model,
+                temperature=0.3,
+                expert_instance_id=self.instance.id,
+                use_case="PennyMomentum LLM Discovery",
+            )
+            response = llm.invoke(prompt)
+            raw_text = response.content if hasattr(response, "content") else str(response)
+
+            items = self._parse_json_response(raw_text, expected_type=list) or []
+            self.logger.info(f"Phase 1b: discovery LLM returned {len(items)} candidates")
+
+            # Normalise and validate each item
+            from ....core.utils import get_account_instance_from_id
+            account = get_account_instance_from_id(self.instance.account_id)
+            results: List[Dict[str, Any]] = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                symbol = item.get("symbol", "").strip().upper()
+                if not symbol or symbol in all_known:
+                    continue
+                # Try to get a live price; fall back to LLM-reported price
+                live_price = account.get_instrument_current_price(symbol)
+                price = live_price if live_price and live_price > 0 else item.get("price")
+                if not price or price <= 0:
+                    self.logger.debug(f"Phase 1b: skipping {symbol} (no price)")
+                    continue
+                results.append({
+                    "symbol": symbol,
+                    "price": price,
+                    "volume": item.get("volume"),
+                    "market_cap": None,
+                    "sector": None,
+                    "industry": None,
+                    "exchange": None,
+                    "beta": None,
+                    "is_actively_trading": True,
+                    "company_name": None,
+                    "country": "US",
+                    "_discovery_catalyst": item.get("catalyst", ""),
+                    "_discovery_reason": item.get("reason", ""),
+                })
+
+            self._save_analysis_output(
+                market_analysis,
+                provider_category="llm",
+                provider_name=discovery_model,
+                name="llm_discovery_response",
+                output_type="json",
+                text=raw_text,
+                symbol="PENNY_SCAN",
+            )
+            return results
+
+        except Exception as e:
+            self.logger.error(f"Phase 1b: discovery LLM failed: {e}", exc_info=True)
+            return []
 
     def _phase_2_quick_filter(
         self, candidates: List[Dict[str, Any]], market_analysis: MarketAnalysis
