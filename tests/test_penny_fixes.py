@@ -915,12 +915,12 @@ class TestLivePriceSource:
         assert "fmpsdk.quote(" in method_source
 
     def test_fmp_quotes_uses_aftermarket_endpoint(self):
-        """During extended hours, should use FMP aftermarket-quote endpoint."""
+        """During extended hours, should use FMP batch-aftermarket-quote endpoint."""
         source = _read_source("__init__.py")
         idx = source.index("def _get_fmp_quotes(")
         next_def = source.index("\n    def ", idx + 1)
         method_source = source[idx:next_def]
-        assert "aftermarket-quote" in method_source
+        assert "batch-aftermarket-quote" in method_source
         assert "_is_regular_session" in method_source
 
     def test_is_regular_session_method_exists(self):
