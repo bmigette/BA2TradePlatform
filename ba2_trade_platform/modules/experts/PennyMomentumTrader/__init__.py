@@ -103,7 +103,7 @@ class PennyMomentumTrader(LiveExpertInterface):
             "websearch_llm": {
                 "type": "str",
                 "required": True,
-                "default": "NagaAI/gpt-4o-search-preview",
+                "default": "OpenAI/gpt5_mini",
                 "description": "LLM model for web search (social sentiment, news)",
                 "ui_editor_type": "ModelSelector",
                 "required_labels": ["websearch"],
@@ -208,7 +208,7 @@ class PennyMomentumTrader(LiveExpertInterface):
             "discovery_llm": {
                 "type": "str",
                 "required": True,
-                "default": "NagaAI/gpt-4o-search-preview",
+                "default": "OpenAI/gpt5_mini",
                 "description": "LLM model for discovering additional penny stocks via web search",
                 "ui_editor_type": "ModelSelector",
                 "required_labels": ["websearch"],
