@@ -57,7 +57,10 @@ class JobManager:
         self._running = False
         self._scheduled_jobs: Dict[str, Job] = {}  # Maps job_id to APScheduler Job
         self._lock = threading.Lock()
-        
+
+        # Running live expert instances keyed by expert_instance_id
+        self._live_experts: Dict[int, Any] = {}
+
         # Control queue for asynchronous operations
         self._control_queue = queue.Queue()
         self._control_thread = None
@@ -92,19 +95,22 @@ class JobManager:
         if not self._running:
             logger.warning("JobManager is not running")
             return
-            
+
         logger.info("Stopping JobManager...")
-        
+
+        # Stop all running live experts
+        self._stop_all_live_experts()
+
         # Stop control thread
         self._stop_control_thread()
-        
+
         with self._lock:
             self._running = False
-            
+
         # Remove all scheduled jobs
         self._scheduler.remove_all_jobs()
         self._scheduled_jobs.clear()
-        
+
         logger.info("JobManager stopped")
     
     def refresh_expert_schedules(self, expert_instance_id: int = None):
@@ -138,21 +144,31 @@ class JobManager:
         """
         Internal method to synchronously refresh scheduled jobs.
         This runs on the control thread to avoid blocking the UI.
-        
+
         Args:
             expert_instance_id: If provided, only refresh this expert's schedule.
                               If None, refresh all expert schedules.
         """
         logger.info(f"Refreshing expert schedules for expert {expert_instance_id or 'all experts'}")
-        
+
+        # Invalidate the expert instance cache so settings are reloaded
+        from .ExpertInstanceCache import ExpertInstanceCache
+        if expert_instance_id:
+            ExpertInstanceCache.invalidate_instance(expert_instance_id)
+        else:
+            ExpertInstanceCache.clear_cache()
+
         with self._lock:
             if expert_instance_id:
-                # Remove existing jobs for this expert by checking job_id pattern
+                # Stop any running live expert for this ID before restarting
+                self._stop_live_expert(expert_instance_id)
+
+                # Remove existing scheduled jobs for this expert
                 logger.debug(f"Current _scheduled_jobs before removal: {list(self._scheduled_jobs.keys())}")
-                jobs_to_remove = [job_id for job_id in self._scheduled_jobs.keys() 
+                jobs_to_remove = [job_id for job_id in self._scheduled_jobs.keys()
                                 if job_id.startswith(f"expert_{expert_instance_id}_")]
                 logger.debug(f"Jobs to remove for expert {expert_instance_id}: {jobs_to_remove}")
-                
+
                 for job_id in jobs_to_remove:
                     try:
                         self._scheduler.remove_job(job_id)
@@ -160,19 +176,21 @@ class JobManager:
                         logger.debug(f"Removed existing job {job_id} for expert {expert_instance_id}")
                     except Exception as e:
                         logger.warning(f"Error removing job {job_id}: {e}")
-                
+
                 logger.debug(f"_scheduled_jobs after removal: {list(self._scheduled_jobs.keys())}")
 
-                # Re-schedule this expert's jobs
+                # Re-schedule this expert's jobs (or restart live thread)
                 logger.debug(f"Re-scheduling jobs for expert {expert_instance_id}")
                 self._schedule_expert_analysis(expert_instance_id)
                 logger.debug(f"_scheduled_jobs after re-scheduling: {list(self._scheduled_jobs.keys())}")
             else:
+                # Stop all live experts before full refresh
+                self._stop_all_live_experts()
                 # Refresh all schedules
                 self._scheduler.remove_all_jobs()
                 self._scheduled_jobs.clear()
                 self._schedule_all_expert_jobs()
-        
+
         logger.info("Expert schedules refreshed successfully")
     
     def _schedule_expert_analysis(self, expert_instance_id: int):
@@ -518,6 +536,19 @@ class JobManager:
         """Schedule jobs for a specific expert instance."""
         try:
             logger.debug(f"Starting job scheduling for expert instance {expert_instance.id}")
+
+            # Live experts manage their own scheduling — start their thread instead
+            from .interfaces import LiveExpertInterface
+            expert_class = None
+            try:
+                from ..modules.experts import get_expert_class
+                expert_class = get_expert_class(expert_instance.expert)
+            except Exception as e:
+                logger.warning(f"Could not resolve expert class for {expert_instance.expert}: {e}")
+
+            if expert_class and issubclass(expert_class, LiveExpertInterface):
+                self._start_live_expert(expert_instance)
+                return
             
             # Schedule jobs for enter_market (depends on instrument selection method)
             enter_market_schedule = self._get_expert_setting(expert_instance.id, "execution_schedule_enter_market")
@@ -557,6 +588,45 @@ class JobManager:
         except Exception as e:
             logger.error(f"Error scheduling jobs for expert instance {expert_instance.id}: {e}", exc_info=True)
             
+    # ------------------------------------------------------------------
+    # Live expert lifecycle helpers
+    # ------------------------------------------------------------------
+
+    def _start_live_expert(self, expert_instance: ExpertInstance):
+        """Instantiate and start a LiveExpertInterface thread for the given instance."""
+        expert_id = expert_instance.id
+        if expert_id in self._live_experts:
+            logger.debug(f"Live expert {expert_id} already running, skipping start")
+            return
+        try:
+            expert = get_expert_instance_from_id(expert_id, use_cache=False)
+            if expert is None:
+                logger.warning(f"Could not instantiate live expert {expert_id}")
+                return
+            expert.start()
+            self._live_experts[expert_id] = expert
+            logger.info(f"Started live expert thread for instance {expert_id}")
+        except Exception as e:
+            logger.error(f"Error starting live expert {expert_id}: {e}", exc_info=True)
+
+    def _stop_live_expert(self, expert_id: int):
+        """Stop a running live expert thread if present."""
+        expert = self._live_experts.pop(expert_id, None)
+        if expert is None:
+            return
+        try:
+            expert.stop()
+            logger.info(f"Stopped live expert thread for instance {expert_id}")
+        except Exception as e:
+            logger.error(f"Error stopping live expert {expert_id}: {e}", exc_info=True)
+
+    def _stop_all_live_experts(self):
+        """Stop all running live expert threads."""
+        for expert_id in list(self._live_experts.keys()):
+            self._stop_live_expert(expert_id)
+
+    # ------------------------------------------------------------------
+
     def _get_expert_setting(self, instance_id: int, key: str) -> Optional[str]:
         """Get a specific setting for an expert instance."""
         try:
