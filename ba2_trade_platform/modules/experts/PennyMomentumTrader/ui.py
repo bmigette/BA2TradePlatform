@@ -53,6 +53,7 @@ class PennyMomentumTraderUI:
                 ui.timer(30.0, _auto_refresh)
 
             with ui.tabs().classes('w-full') as tabs:
+                summary_tab = ui.tab('Summary')
                 scan_tab = ui.tab('Scan Results')
                 filtered_tab = ui.tab('Filtered')
                 triage_tab = ui.tab('Triage')
@@ -60,7 +61,9 @@ class PennyMomentumTraderUI:
                 trades_tab = ui.tab('Trades')
                 raw_tab = ui.tab('Raw Data')
 
-            with ui.tab_panels(tabs, value=scan_tab).classes('w-full'):
+            with ui.tab_panels(tabs, value=summary_tab).classes('w-full'):
+                with ui.tab_panel(summary_tab):
+                    self._render_summary()
                 with ui.tab_panel(scan_tab):
                     self._render_scan_results()
                 with ui.tab_panel(filtered_tab):
@@ -79,6 +82,127 @@ class PennyMomentumTraderUI:
                 ui.icon('error', size='3rem', color='red')
                 ui.label('Error rendering analysis UI').classes('text-h6 text-red-600')
                 ui.label(str(e)).classes('text-caption text-grey-7')
+
+    # ------------------------------------------------------------------
+    # Tab 0: Summary
+    # ------------------------------------------------------------------
+
+    def _render_summary(self):
+        """Pipeline summary: phase timings, current status, and top symbols."""
+        phase = self.state.get('phase', 'unknown')
+        timings: Dict[str, float] = self.state.get('phase_timings', {})
+        total_time = self.state.get('pipeline_total_seconds')
+        deep_triage: Dict[str, Dict] = self.state.get('deep_triage_results', {})
+        monitored: Dict[str, Dict] = self.state.get('monitored_symbols', {})
+        scan_results = self.state.get('scan_results', [])
+        survivors = self.state.get('quick_filter_survivors', [])
+        filtered_stocks: Dict = self.state.get('filtered_stocks', {})
+
+        with ui.card().classes('w-full'):
+            ui.label('Pipeline Summary').classes('text-h5 mb-2')
+
+            # Status line
+            if phase == 'complete':
+                ui.label(
+                    f'Pipeline completed in {total_time:.0f}s' if total_time else 'Pipeline completed'
+                ).classes('text-subtitle1 text-green-700 mb-4')
+            else:
+                ui.label(f'Current phase: {phase}').classes('text-subtitle1 text-orange-700 mb-4')
+
+            # --- Phase timings ---
+            if timings:
+                ui.label('Phase Timings').classes('text-h6 mb-2')
+
+                phase_labels = {
+                    'review': 'Phase 0 - Review Positions',
+                    'screen': 'Phase 1 - Screener',
+                    'quick_filter': 'Phase 2 - Quick Filter (LLM)',
+                    'discovery': 'Phase 1b - LLM Discovery',
+                    'deep_triage': 'Phase 3 - Deep Triage (LLM)',
+                    'entry_setup': 'Phase 4 - Entry Conditions',
+                    'monitoring': 'Phase 5 - Monitoring',
+                    'eod': 'Phase 6 - EOD Wrap-up',
+                }
+
+                # Order phases logically
+                ordered_phases = [
+                    'review', 'screen', 'quick_filter', 'discovery',
+                    'deep_triage', 'entry_setup', 'monitoring', 'eod',
+                ]
+
+                rows = []
+                for p in ordered_phases:
+                    if p in timings:
+                        rows.append({
+                            'phase': phase_labels.get(p, p),
+                            'time': f'{timings[p]:.1f}s',
+                            'seconds': timings[p],
+                        })
+
+                if rows:
+                    columns = [
+                        {'name': 'phase', 'label': 'Phase', 'field': 'phase', 'align': 'left'},
+                        {'name': 'time', 'label': 'Duration', 'field': 'time', 'align': 'right'},
+                    ]
+                    ui.table(columns=columns, rows=rows, row_key='phase').classes('w-full mb-4')
+
+                    if total_time:
+                        ui.label(f'Total: {total_time:.0f}s').classes('text-subtitle2 font-bold')
+            else:
+                ui.label('No timing data yet.').classes('text-grey-7 mb-4')
+
+            ui.separator().classes('my-4')
+
+            # --- Pipeline funnel ---
+            ui.label('Pipeline Funnel').classes('text-h6 mb-2')
+            total_filtered = sum(len(v) for v in filtered_stocks.values()) if filtered_stocks else 0
+            funnel_items = [
+                ('Screener candidates', len(scan_results)),
+                ('Quick filter survivors', len(survivors)),
+                ('Filtered out', total_filtered),
+                ('Deep triage finalists', len(deep_triage)),
+                ('Active monitors', len(monitored)),
+            ]
+            with ui.row().classes('gap-6 flex-wrap mb-4'):
+                for label, count in funnel_items:
+                    with ui.column().classes('items-center'):
+                        ui.label(str(count)).classes('text-h4 font-bold')
+                        ui.label(label).classes('text-caption text-grey-7')
+
+            ui.separator().classes('my-4')
+
+            # --- Top symbols ---
+            ui.label('Top Symbols').classes('text-h6 mb-2')
+            if deep_triage:
+                # Sort by confidence descending
+                sorted_symbols = sorted(
+                    deep_triage.items(),
+                    key=lambda x: x[1].get('confidence', 0),
+                    reverse=True,
+                )
+                rows = []
+                for symbol, data in sorted_symbols:
+                    is_monitored = symbol in monitored
+                    rows.append({
+                        'symbol': symbol,
+                        'confidence': f'{data.get("confidence", 0):.0f}%',
+                        'catalyst': data.get('catalyst', '-'),
+                        'strategy': data.get('strategy', '-'),
+                        'expected_profit': f'+{data.get("expected_profit_pct", 0):.1f}%',
+                        'status': 'Monitoring' if is_monitored else 'Finalist',
+                    })
+
+                columns = [
+                    {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left'},
+                    {'name': 'confidence', 'label': 'Confidence', 'field': 'confidence', 'align': 'right'},
+                    {'name': 'expected_profit', 'label': 'Expected', 'field': 'expected_profit', 'align': 'right'},
+                    {'name': 'strategy', 'label': 'Strategy', 'field': 'strategy', 'align': 'left'},
+                    {'name': 'catalyst', 'label': 'Catalyst', 'field': 'catalyst', 'align': 'left'},
+                    {'name': 'status', 'label': 'Status', 'field': 'status', 'align': 'center'},
+                ]
+                ui.table(columns=columns, rows=rows, row_key='symbol').classes('w-full')
+            else:
+                ui.label('No finalists yet.').classes('text-grey-7')
 
     # ------------------------------------------------------------------
     # Tab 1: Scan Results

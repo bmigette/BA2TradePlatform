@@ -372,16 +372,37 @@ class PennyMomentumTrader(LiveExpertInterface):
     # Daily pipeline (LiveExpertInterface abstract method)
     # ------------------------------------------------------------------
 
+    def _time_phase(self, phase_name: str, market_analysis: MarketAnalysis, func, *args, **kwargs):
+        """Run a phase function and record its elapsed time in state."""
+        start = time.time()
+        result = func(*args, **kwargs)
+        elapsed = round(time.time() - start, 1)
+        self.logger.info(f"{phase_name} completed in {elapsed}s")
+        # Merge timing into state
+        with get_db() as session:
+            ma = session.get(MarketAnalysis, market_analysis.id)
+            if ma:
+                state = ma.state or {}
+                timings = state.get("phase_timings", {})
+                timings[phase_name] = elapsed
+                state["phase_timings"] = timings
+                ma.state = state
+                session.add(ma)
+                session.commit()
+                market_analysis.state = state
+        return result
+
     def _run_daily_pipeline(self):
         self.logger.info("=== Daily pipeline starting ===")
         self._trade_mgr = PennyTradeManager(self.instance.id)
         market_analysis = self._create_market_analysis()
         self.logger.debug(f"Created MarketAnalysis id={market_analysis.id}")
+        pipeline_start = time.time()
 
         # Phase 0: Review existing positions
         self._current_phase = "review"
         self._update_state(market_analysis, {"phase": "review"})
-        self._phase_0_review(market_analysis)
+        self._time_phase("review", market_analysis, self._phase_0_review, market_analysis)
         if self._stop_event.is_set():
             self.logger.info("Pipeline aborted after phase 0 (stop requested)")
             return
@@ -391,7 +412,9 @@ class PennyMomentumTrader(LiveExpertInterface):
             # Phase 1: Screen — no LLM, returns top-N by volume
             self._current_phase = "screen"
             self._update_state(market_analysis, {"phase": "screen"})
-            screener_candidates = self._phase_1_screen(market_analysis)
+            screener_candidates = self._time_phase(
+                "screen", market_analysis, self._phase_1_screen, market_analysis
+            )
             self.logger.debug(f"Phase 1 complete: {len(screener_candidates)} tradeable candidates")
             if self._stop_event.is_set():
                 self.logger.info("Pipeline aborted after phase 1 (stop requested)")
@@ -400,7 +423,9 @@ class PennyMomentumTrader(LiveExpertInterface):
             # Phase 2: Quick filter via LLM — narrows screener results only
             self._current_phase = "quick_filter"
             self._update_state(market_analysis, {"phase": "quick_filter"})
-            survivors = self._phase_2_quick_filter(screener_candidates, market_analysis)
+            survivors = self._time_phase(
+                "quick_filter", market_analysis, self._phase_2_quick_filter, screener_candidates, market_analysis
+            )
             self.logger.debug(f"Phase 2 complete: {len(survivors)} survivors")
             if self._stop_event.is_set():
                 self.logger.info("Pipeline aborted after phase 2 (stop requested)")
@@ -409,7 +434,9 @@ class PennyMomentumTrader(LiveExpertInterface):
             # Phase 1b: LLM discovery — finds additional symbols NOT in screener results
             self._current_phase = "discovery"
             self._update_state(market_analysis, {"phase": "discovery"})
-            discovered = self._phase_1b_llm_discovery(screener_candidates, market_analysis)
+            discovered = self._time_phase(
+                "discovery", market_analysis, self._phase_1b_llm_discovery, screener_candidates, market_analysis
+            )
             if discovered:
                 survivor_symbols = {c.get("symbol") for c in survivors}
                 new_ones = [d for d in discovered if d.get("symbol") not in survivor_symbols]
@@ -429,7 +456,9 @@ class PennyMomentumTrader(LiveExpertInterface):
             # Phase 3: Deep triage via LLM
             self._current_phase = "deep_triage"
             self._update_state(market_analysis, {"phase": "deep_triage"})
-            finalists = self._phase_3_deep_triage(deep_triage_input, market_analysis)
+            finalists = self._time_phase(
+                "deep_triage", market_analysis, self._phase_3_deep_triage, deep_triage_input, market_analysis
+            )
             self.logger.debug(f"Phase 3 complete: {len(finalists)} finalists")
             if self._stop_event.is_set():
                 self.logger.info("Pipeline aborted after phase 3 (stop requested)")
@@ -443,7 +472,9 @@ class PennyMomentumTrader(LiveExpertInterface):
         # Phase 4: Entry condition setup
         self._current_phase = "entry_setup"
         self._update_state(market_analysis, {"phase": "entry_setup"})
-        self._phase_4_entry_conditions(finalists, market_analysis)
+        self._time_phase(
+            "entry_setup", market_analysis, self._phase_4_entry_conditions, finalists, market_analysis
+        )
         if self._stop_event.is_set():
             self.logger.info("Pipeline aborted after phase 4 (stop requested)")
             return
@@ -451,15 +482,19 @@ class PennyMomentumTrader(LiveExpertInterface):
         # Phase 5: Monitor
         self._current_phase = "monitoring"
         self._update_state(market_analysis, {"phase": "monitoring"})
-        self._phase_5_monitor(market_analysis)
+        self._time_phase("monitoring", market_analysis, self._phase_5_monitor, market_analysis)
 
         # Phase 6: EOD
         self._current_phase = "eod"
         self._update_state(market_analysis, {"phase": "eod"})
-        self._phase_6_eod(market_analysis)
+        self._time_phase("eod", market_analysis, self._phase_6_eod, market_analysis)
         self._current_phase = "complete"
-        self._update_state(market_analysis, {"phase": "complete"})
-        self.logger.info("=== Daily pipeline complete ===")
+        total_elapsed = round(time.time() - pipeline_start, 1)
+        self._update_state(market_analysis, {
+            "phase": "complete",
+            "pipeline_total_seconds": total_elapsed,
+        })
+        self.logger.info(f"=== Daily pipeline complete in {total_elapsed}s ===")
 
     # ------------------------------------------------------------------
     # Phase implementations
