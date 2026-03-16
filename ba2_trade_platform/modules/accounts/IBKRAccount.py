@@ -283,7 +283,7 @@ class IBKRAccount(AccountInterface):
                         account_id=self.id,
                         symbol=ib_pos.contract.symbol,
                         quantity=float(ib_pos.position),
-                        average_entry_price=float(ib_pos.avgCost) / float(ib_pos.position) if ib_pos.position != 0 else 0,
+                        average_entry_price=float(ib_pos.avgCost) if ib_pos.avgCost else 0,
                         current_price=float(ib_pos.marketPrice) if ib_pos.marketPrice else 0,
                         market_value=float(ib_pos.marketValue) if ib_pos.marketValue else 0,
                         unrealized_pl=float(ib_pos.unrealizedPNL) if ib_pos.unrealizedPNL else 0,

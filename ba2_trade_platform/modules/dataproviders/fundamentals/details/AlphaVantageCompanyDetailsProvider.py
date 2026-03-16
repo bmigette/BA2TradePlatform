@@ -84,7 +84,7 @@ class AlphaVantageCompanyDetailsProvider(AlphaVantageBaseProvider, CompanyFundam
             result = self.make_api_request("BALANCE_SHEET", params)
             
             # Build dict response (always build it for "both" format support)
-            data = json.loads(result)
+            data = result if isinstance(result, dict) else json.loads(result)
             
             # Filter statements based on frequency and date range
             key = "annualReports" if frequency == "annual" else "quarterlyReports"
@@ -155,7 +155,7 @@ class AlphaVantageCompanyDetailsProvider(AlphaVantageBaseProvider, CompanyFundam
             result = self.make_api_request("INCOME_STATEMENT", params)
             
             # Build dict response (always build it for "both" format support)
-            data = json.loads(result)
+            data = result if isinstance(result, dict) else json.loads(result)
             
             # Filter statements based on frequency and date range
             key = "annualReports" if frequency == "annual" else "quarterlyReports"
@@ -227,7 +227,7 @@ class AlphaVantageCompanyDetailsProvider(AlphaVantageBaseProvider, CompanyFundam
             result = self.make_api_request("CASH_FLOW", params)
             
             # Build dict response (always build it for "both" format support)
-            data = json.loads(result)
+            data = result if isinstance(result, dict) else json.loads(result)
             
             # Filter statements based on frequency and date range
             key = "annualReports" if frequency == "annual" else "quarterlyReports"
@@ -255,8 +255,6 @@ class AlphaVantageCompanyDetailsProvider(AlphaVantageBaseProvider, CompanyFundam
                     "data": dict_response
                 }
             else:  # markdown
-                return result
-                # Return as markdown
                 return result
                 
         except Exception as e:
@@ -389,7 +387,7 @@ class AlphaVantageCompanyDetailsProvider(AlphaVantageBaseProvider, CompanyFundam
             params = {"symbol": symbol}
             result = self.make_api_request("EARNINGS", params)
             
-            data = json.loads(result)
+            data = result if isinstance(result, dict) else json.loads(result)
             
             # Determine which earnings data to use based on frequency
             key = "annualEarnings" if frequency == "annual" else "quarterlyEarnings"
@@ -518,7 +516,7 @@ class AlphaVantageCompanyDetailsProvider(AlphaVantageBaseProvider, CompanyFundam
             params = {"symbol": symbol}
             result = self.make_api_request("EARNINGS", params)
             
-            data = json.loads(result)
+            data = result if isinstance(result, dict) else json.loads(result)
             
             # Determine which earnings data to use based on frequency
             key = "annualEarnings" if frequency == "annual" else "quarterlyEarnings"

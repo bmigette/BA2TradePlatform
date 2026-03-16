@@ -639,7 +639,7 @@ class TradeManager:
             # Get the expert instance
             expert_instance = get_instance(ExpertInstance, recommendation.instance_id)
             if not expert_instance:
-                self.logger.error(f"Expert instance {recommendation.instance_id} not found", exc_info=True)
+                self.logger.error(f"Expert instance {recommendation.instance_id} not found")
                 return None
                 
             # Check if expert is enabled
@@ -694,7 +694,7 @@ class TradeManager:
             from .utils import get_expert_instance_from_id
             expert = get_expert_instance_from_id(expert_instance.id)
             if not expert:
-                self.logger.error(f"Expert instance {expert_instance.id} not found or invalid expert type {expert_instance.expert}", exc_info=True)
+                self.logger.error(f"Expert instance {expert_instance.id} not found or invalid expert type {expert_instance.expert}")
                 return {}
             
             # Check for legacy automatic_trading setting and new settings
@@ -853,12 +853,12 @@ class TradeManager:
             
             account_def = get_instance(AccountDefinition, expert_instance.account_id)
             if not account_def:
-                self.logger.error(f"Account definition {expert_instance.account_id} not found", exc_info=True)
+                self.logger.error(f"Account definition {expert_instance.account_id} not found")
                 return None
-                
+
             account_class = get_account_class(account_def.provider)
             if not account_class:
-                self.logger.error(f"Account provider {account_def.provider} not found", exc_info=True)
+                self.logger.error(f"Account provider {account_def.provider} not found")
                 return None
                 
             account = account_class(account_def.id)
@@ -965,7 +965,7 @@ class TradeManager:
         try:
             self.logger.debug(f"Acquired processing lock for expert {expert_instance_id} (enter_market)")
             
-            from sqlmodel import select, Session
+            from sqlmodel import select
             from .db import get_db
             from .models import Transaction, AccountDefinition
             from .types import AnalysisUseCase, TransactionStatus
@@ -973,19 +973,19 @@ class TradeManager:
             from datetime import timedelta
             from .TradeActionEvaluator import TradeActionEvaluator
             from ..modules.accounts import get_account_class
-            
+
             # Get the expert instance (with loaded settings)
             expert = get_expert_instance_from_id(expert_instance_id)
             if not expert:
-                self.logger.error(f"Expert instance {expert_instance_id} not found", exc_info=True)
+                self.logger.error(f"Expert instance {expert_instance_id} not found")
                 return created_orders
-            
+
             # Get the expert instance model (for ruleset IDs)
             expert_instance = get_instance(ExpertInstance, expert_instance_id)
             if not expert_instance:
-                self.logger.error(f"Expert instance model {expert_instance_id} not found", exc_info=True)
+                self.logger.error(f"Expert instance model {expert_instance_id} not found")
                 return created_orders
-            
+
             # Check if "Allow automated trade opening" is enabled
             allow_automated_trade_opening = expert.get_setting_with_interface_default(
                 'allow_automated_trade_opening', log_warning=False
@@ -993,34 +993,34 @@ class TradeManager:
             if not allow_automated_trade_opening:
                 self.logger.debug(f"Automated trade opening disabled for expert {expert_instance_id}, skipping recommendation processing")
                 return created_orders
-            
+
             # Check if there's an enter_market ruleset configured
             if not expert_instance.enter_market_ruleset_id:
                 self.logger.debug(f"No enter_market ruleset configured for expert {expert_instance_id}, skipping automated order creation")
                 return created_orders
-            
+
             # Check if there are still pending analysis jobs for this expert
             if self._has_pending_analysis_jobs(expert_instance_id):
                 self.logger.debug(f"Still has pending analysis jobs for expert {expert_instance_id}, skipping automated order creation")
                 return created_orders
-            
+
             # Get the account instance for this expert
             account_def = get_instance(AccountDefinition, expert_instance.account_id)
             if not account_def:
-                self.logger.error(f"Account definition {expert_instance.account_id} not found", exc_info=True)
+                self.logger.error(f"Account definition {expert_instance.account_id} not found")
                 return created_orders
-                
+
             account_class = get_account_class(account_def.provider)
             if not account_class:
-                self.logger.error(f"Account provider {account_def.provider} not found", exc_info=True)
+                self.logger.error(f"Account provider {account_def.provider} not found")
                 return created_orders
-                
+
             account = account_class(account_def.id)
-            
+
             # Get recent recommendations based on lookback_days parameter
             cutoff_time = datetime.now(timezone.utc) - timedelta(days=lookback_days)
-            
-            with Session(get_db().bind) as session:
+
+            with get_db() as session:
                 # Get all recommendations for this expert instance within the time window
                 statement = select(ExpertRecommendation).where(
                     ExpertRecommendation.instance_id == expert_instance_id,
@@ -1352,21 +1352,21 @@ class TradeManager:
             }
         """
         try:
-            from sqlmodel import select, Session
+            from sqlmodel import select
             from .db import get_db
             from .models import Transaction, TradingOrder
             from .types import TransactionStatus, OrderStatus
-            
+
             stats = {
                 'orders_deleted': 0,
                 'transactions_closed': 0,
                 'dependents_deleted': 0,
                 'errors': []
             }
-            
+
             self.logger.info("Starting cleanup of pending orders (PENDING and ERROR only - preserving valid WAITING_TRIGGER orders)...")
-            
-            with Session(get_db().bind) as session:
+
+            with get_db() as session:
                 # CRITICAL: Only clean PENDING and ERROR orders - NOT WAITING_TRIGGER
                 # WAITING_TRIGGER orders are preserved unless their parent order is also being deleted
                 # ALSO: Skip orders that have depends_on_order set (dependent orders like TP/SL)
@@ -1547,7 +1547,7 @@ class TradeManager:
         try:
             self.logger.debug(f"Acquired processing lock for expert {expert_instance_id} (open_positions)")
             
-            from sqlmodel import select, Session
+            from sqlmodel import select
             from .db import get_db
             from .models import Transaction, AccountDefinition, ExpertInstance
             from .types import AnalysisUseCase, TransactionStatus
@@ -1555,19 +1555,19 @@ class TradeManager:
             from datetime import timedelta
             from .TradeActionEvaluator import TradeActionEvaluator
             from ..modules.accounts import get_account_class
-            
+
             # Get the expert instance (with loaded settings)
             expert = get_expert_instance_from_id(expert_instance_id)
             if not expert:
-                self.logger.error(f"Expert instance {expert_instance_id} not found", exc_info=True)
+                self.logger.error(f"Expert instance {expert_instance_id} not found")
                 return created_orders
-            
+
             # Get the expert instance model (for ruleset IDs)
             expert_instance = get_instance(ExpertInstance, expert_instance_id)
             if not expert_instance:
-                self.logger.error(f"Expert instance model {expert_instance_id} not found", exc_info=True)
+                self.logger.error(f"Expert instance model {expert_instance_id} not found")
                 return created_orders
-            
+
             # Check if "Allow automated trade modification" is enabled
             allow_automated_trade_modification = expert.get_setting_with_interface_default(
                 'allow_automated_trade_modification', log_warning=False
@@ -1575,29 +1575,29 @@ class TradeManager:
             if not allow_automated_trade_modification:
                 self.logger.debug(f"Automated trade modification disabled for expert {expert_instance_id}, skipping recommendation processing")
                 return created_orders
-            
+
             # Check if there's an open_positions ruleset configured
             if not expert_instance.open_positions_ruleset_id:
                 self.logger.debug(f"No open_positions ruleset configured for expert {expert_instance_id}, skipping automated trade modification")
                 return created_orders
-            
+
             # Get the account instance for this expert
             account_def = get_instance(AccountDefinition, expert_instance.account_id)
             if not account_def:
-                self.logger.error(f"Account definition {expert_instance.account_id} not found", exc_info=True)
+                self.logger.error(f"Account definition {expert_instance.account_id} not found")
                 return created_orders
-                
+
             account_class = get_account_class(account_def.provider)
             if not account_class:
-                self.logger.error(f"Account provider {account_def.provider} not found", exc_info=True)
+                self.logger.error(f"Account provider {account_def.provider} not found")
                 return created_orders
-                
+
             account = account_class(account_def.id)
-            
+
             # Get recent recommendations based on lookback_days parameter
             cutoff_time = datetime.now(timezone.utc) - timedelta(days=lookback_days)
-            
-            with Session(get_db().bind) as session:
+
+            with get_db() as session:
                 # Get all recommendations for this expert instance within the time window
                 statement = select(ExpertRecommendation).where(
                     ExpertRecommendation.instance_id == expert_instance_id,

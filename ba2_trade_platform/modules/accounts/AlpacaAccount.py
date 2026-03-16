@@ -1413,7 +1413,7 @@ class AlpacaAccount(AccountInterface):
             symbols_list = [symbol_or_symbols] if is_single_symbol else symbol_or_symbols
             
             # Get latest quotes - Alpaca natively supports bulk fetching
-            feed_setting = self.settings.get("data_feed", "delayed_sip").lower()
+            feed_setting = (self.settings.get("data_feed") or "delayed_sip").lower()
             feed_map = {
                 "delayed_sip": DataFeed.DELAYED_SIP,
                 "sip": DataFeed.SIP,

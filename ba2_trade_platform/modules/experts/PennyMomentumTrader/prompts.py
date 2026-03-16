@@ -103,17 +103,27 @@ FILTER CRITERIA (apply all):
 CANDIDATES:
 {candidates_text}
 
-RESPOND with a JSON array of the top {max_survivors} candidates. Each element must be an object with exactly two keys:
-- "symbol": the stock ticker (string)
-- "reasoning": one sentence explaining why this candidate was selected (string)
+RESPOND with a JSON object containing two keys:
+- "selected": array of the top {max_survivors} candidates to keep, each with:
+  - "symbol": the stock ticker (string)
+  - "reasoning": one sentence explaining why this candidate was selected (string)
+- "dropped": array of ALL remaining candidates that were NOT selected, each with:
+  - "symbol": the stock ticker (string)
+  - "reason": one sentence explaining why this candidate was dropped (string)
 
 Example response format:
-[
-  {{"symbol": "ABCD", "reasoning": "High volume surge in tech sector, 85% bullish on StockTwits with 45k watchers"}},
-  {{"symbol": "EFGH", "reasoning": "Consumer sector breakout with 3x average volume and strong price action"}}
-]
+{{
+  "selected": [
+    {{"symbol": "ABCD", "reasoning": "High volume surge in tech sector, 85% bullish on StockTwits with 45k watchers"}},
+    {{"symbol": "EFGH", "reasoning": "Consumer sector breakout with 3x average volume and strong price action"}}
+  ],
+  "dropped": [
+    {{"symbol": "IJKL", "reason": "Biotech with pending FDA decision - binary risk too high"}},
+    {{"symbol": "MNOP", "reason": "Below-average volume and bearish social sentiment (72% bearish)"}}
+  ]
+}}
 
-Return ONLY the JSON array, no other text."""
+Return ONLY the JSON object, no other text."""
 
 
 def build_deep_triage_prompt(

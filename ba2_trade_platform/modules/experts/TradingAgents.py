@@ -815,13 +815,16 @@ Analysis completed at: {self._get_current_timestamp()}"""
         self.logger.debug(f"Running TradingAgents propagation for {symbol} on {trade_date}")
 
         # Prefetch current price from broker so the summarization agent has a real price
-        current_price = 0.0
+        current_price = None
         try:
             from ...core.utils import get_account_instance_from_id
             account = get_account_instance_from_id(self.instance.account_id)
             if account:
-                current_price = account.get_instrument_current_price(symbol) or 0.0
-                self.logger.info(f"Prefetched current price for {symbol}: ${current_price:.2f}")
+                current_price = account.get_instrument_current_price(symbol)
+                if current_price:
+                    self.logger.info(f"Prefetched current price for {symbol}: ${current_price:.2f}")
+                else:
+                    self.logger.warning(f"Current price for {symbol} is None")
         except Exception as e:
             self.logger.warning(f"Could not prefetch current price for {symbol}: {e}")
 

@@ -73,6 +73,9 @@ def log_provider_call(func: Callable) -> Callable:
             
             return result
             
+        except ValueError as e:
+            logger.warning(f"{provider_name}.{func.__name__}: {e}")
+            raise
         except Exception as e:
             logger.error(f"{provider_name}.{func.__name__} failed with error: {e}", exc_info=True)
             raise

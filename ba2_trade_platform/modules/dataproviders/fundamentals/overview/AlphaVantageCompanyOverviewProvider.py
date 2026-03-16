@@ -74,7 +74,7 @@ class AlphaVantageCompanyOverviewProvider(AlphaVantageBaseProvider, CompanyFunda
             result = self.make_api_request("OVERVIEW", params)
             
             # Build dict response (always build it for "both" format support)
-            data = json.loads(result)
+            data = result if isinstance(result, dict) else json.loads(result)
             
             # Transform to match interface specification
             dict_response = {

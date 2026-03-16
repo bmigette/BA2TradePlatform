@@ -219,7 +219,7 @@ Confidence = Dominant Score / Total × 100 = {dominant_score:.1f} / {total_weigh
                 symbol=symbol,
                 recommended_action=recommendation_data['signal'],
                 expected_profit_percent=0.0,  # FinnHub doesn't provide profit targets
-                price_at_date=current_price or 0.0,
+                price_at_date=current_price,
                 details=recommendation_data['details'][:100000] if recommendation_data['details'] else None,
                 confidence=round(recommendation_data['confidence'], 1),  # Store as 1-100 scale
                 risk_level=RiskLevel.MEDIUM,  # Always medium risk
@@ -343,7 +343,9 @@ Confidence = Dominant Score / Total × 100 = {dominant_score:.1f} / {total_weigh
             
             # Get current price
             current_price = self._get_current_price(symbol)
-            
+            if not current_price:
+                raise ValueError(f"Unable to get current price for {symbol}")
+
             # Create ExpertRecommendation record
             recommendation_id = self._create_expert_recommendation(
                 recommendation_data, symbol, market_analysis.id, current_price

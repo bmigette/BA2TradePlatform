@@ -131,6 +131,8 @@ class StockTwitsSentiment(SocialMediaDataProviderInterface):
             url = f"{BASE_URL}/_next/data/{build_id}/symbol/{symbol}.json"
             resp = self._session.get(url, params={"symbol": symbol}, headers=headers, timeout=15)
 
+        if resp.status_code == 404:
+            raise ValueError(f"Symbol '{symbol}' not found on StockTwits")
         resp.raise_for_status()
 
         page_props = resp.json().get("pageProps", {})

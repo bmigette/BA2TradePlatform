@@ -358,6 +358,39 @@ class FMPRating(MarketExpertInterface):
         else:
             expected_profit_percent = 0.0
         
+        # Build display values for target prices (any can be None)
+        tc_display = f"${target_consensus:.2f}" if target_consensus is not None else "N/A"
+        th_display = f"${target_high:.2f}" if target_high is not None else "N/A"
+        tl_display = f"${target_low:.2f}" if target_low is not None else "N/A"
+        tm_display = f"${target_median:.2f}" if target_median is not None else "N/A"
+        tp_display = f"${target_price:.2f}" if target_price is not None else "N/A"
+
+        tc_pct = f"{((target_consensus - current_price) / current_price * 100):.1f}% from current" if target_consensus is not None and current_price else "N/A"
+        th_pct = f"{((target_high - current_price) / current_price * 100):.1f}% from current" if target_high is not None and current_price else "N/A"
+        tl_pct = f"{((target_low - current_price) / current_price * 100):.1f}% from current" if target_low is not None and current_price else "N/A"
+        tm_pct = f"{((target_median - current_price) / current_price * 100):.1f}% from current" if target_median is not None and current_price else "N/A"
+
+        # Build profit calculation lines (require target_price and current_price)
+        if target_price is not None and current_price:
+            profit_calc = f"""Expected Profit Calculation (using {target_price_type} target):
+Price Delta = {target_price_type.capitalize()} Target - Current = {tp_display} - ${current_price:.2f} = ${target_price - current_price:.2f}
+Weighted Delta = Price Delta × Confidence × Profit Ratio = ${target_price - current_price:.2f} × {confidence/100:.2f} × {profit_ratio} = ${(target_price - current_price) * (confidence/100) * profit_ratio:.2f}
+Expected Profit % = (Weighted Delta / Current) × 100 = {expected_profit_percent:.1f}%"""
+        else:
+            profit_calc = f"""Expected Profit Calculation (using {target_price_type} target):
+Target price data unavailable - cannot calculate expected profit.
+Expected Profit % = {expected_profit_percent:.1f}%"""
+
+        # Build boost calculation lines (require target_low, target_consensus, current_price)
+        if target_low is not None and target_consensus is not None and current_price:
+            boost_calc = f"""Step 3 - Price Target Boost:
+Boost to Lower Target = (({tl_display} - ${current_price:.2f}) / ${current_price:.2f}) × 100 = {boost_to_lower:.1f}%
+Boost to Consensus = (({tc_display} - ${current_price:.2f}) / ${current_price:.2f}) × 100 = {boost_to_consensus:.1f}%
+Avg Price Target Boost = ({boost_to_lower:.1f}% + {boost_to_consensus:.1f}%) / 2 = {price_target_boost:.1f}%"""
+        else:
+            boost_calc = f"""Step 3 - Price Target Boost:
+Price target data unavailable - boost set to {price_target_boost:.1f}%"""
+
         # Build details string
         details = f"""FMP Analyst Price Target Consensus Analysis
 
@@ -372,10 +405,10 @@ Analyst Ratings:
 Total Analysts: {analyst_count}
 
 Price Targets:
-- Consensus Target: ${target_consensus:.2f} ({((target_consensus - current_price) / current_price * 100):.1f}% from current)
-- High Target: ${target_high:.2f} ({((target_high - current_price) / current_price * 100):.1f}% from current)
-- Low Target: ${target_low:.2f} ({((target_low - current_price) / current_price * 100):.1f}% from current)
-- Median Target: ${target_median:.2f} ({((target_median - current_price) / current_price * 100):.1f}% from current)
+- Consensus Target: {tc_display} ({tc_pct})
+- High Target: {th_display} ({th_pct})
+- Low Target: {tl_display} ({tl_pct})
+- Median Target: {tm_display} ({tm_pct})
 
 Recommendation: {signal.value}
 Confidence: {confidence:.1f}%
@@ -392,18 +425,12 @@ Total Weighted = {total_weighted:.1f}
 Step 2 - Base Confidence from Analyst Ratings:
 Base Confidence = Dominant Score / Total × 100 = {dominant_score:.1f} / {total_weighted:.1f} × 100 = {base_confidence:.1f}%
 
-Step 3 - Price Target Boost:
-Boost to Lower Target = ((${target_low:.2f} - ${current_price:.2f}) / ${current_price:.2f}) × 100 = {boost_to_lower:.1f}%
-Boost to Consensus = ((${target_consensus:.2f} - ${current_price:.2f}) / ${current_price:.2f}) × 100 = {boost_to_consensus:.1f}%
-Avg Price Target Boost = ({boost_to_lower:.1f}% + {boost_to_consensus:.1f}%) / 2 = {price_target_boost:.1f}%
+{boost_calc}
 
 Step 4 - Final Confidence (clamped to 0-100%):
 Final Confidence = Base Confidence + Avg Boost = {base_confidence:.1f}% + {price_target_boost:.1f}% = {confidence:.1f}%
 
-Expected Profit Calculation (using {target_price_type} target):
-Price Delta = {target_price_type.capitalize()} Target - Current = ${target_price:.2f} - ${current_price:.2f} = ${target_price - current_price:.2f}
-Weighted Delta = Price Delta × Confidence × Profit Ratio = ${target_price - current_price:.2f} × {confidence/100:.2f} × {profit_ratio} = ${(target_price - current_price) * (confidence/100) * profit_ratio:.2f}
-Expected Profit % = (Weighted Delta / Current) × 100 = {expected_profit_percent:.1f}%
+{profit_calc}
 """
         
         return {
@@ -442,7 +469,7 @@ Expected Profit % = (Weighted Delta / Current) × 100 = {expected_profit_percent
                 symbol=symbol,
                 recommended_action=recommendation_data['signal'],
                 expected_profit_percent=recommendation_data['expected_profit_percent'],
-                price_at_date=current_price or 0.0,
+                price_at_date=current_price,
                 details=recommendation_data['details'][:100000] if recommendation_data['details'] else None,
                 confidence=round(recommendation_data['confidence'], 1),  # Store as 1-100 scale
                 risk_level=RiskLevel.MEDIUM,  # Always medium risk
@@ -479,11 +506,19 @@ Expected Profit % = (Weighted Delta / Current) × 100 = {expected_profit_percent
             session.add(details_output)
             
             # Store price targets as structured output
+            tc = recommendation_data['target_consensus']
+            th = recommendation_data['target_high']
+            tl = recommendation_data['target_low']
+            tm = recommendation_data['target_median']
+            tc_str = f"${tc:.2f}" if tc is not None else "N/A"
+            th_str = f"${th:.2f}" if th is not None else "N/A"
+            tl_str = f"${tl:.2f}" if tl is not None else "N/A"
+            tm_str = f"${tm:.2f}" if tm is not None else "N/A"
             targets_text = f"""Analyst Price Targets:
-- Consensus: ${recommendation_data['target_consensus']:.2f}
-- High: ${recommendation_data['target_high']:.2f}
-- Low: ${recommendation_data['target_low']:.2f}
-- Median: ${recommendation_data['target_median']:.2f}
+- Consensus: {tc_str}
+- High: {th_str}
+- Low: {tl_str}
+- Median: {tm_str}
 - Analysts: {recommendation_data['analyst_count']}"""
             
             targets_output = AnalysisOutput(

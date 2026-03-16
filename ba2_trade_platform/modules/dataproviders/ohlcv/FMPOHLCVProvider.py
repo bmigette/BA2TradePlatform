@@ -159,13 +159,13 @@ class FMPOHLCVProvider(MarketDataProviderInterface):
             "to": end_date.strftime("%Y-%m-%d")
         }
         
-        logger.debug(f"FMP API request: {url} with params: {params}")
-        
+        logger.debug(f"FMP API request: {url} with params: {{k: v for k, v in params.items() if k != 'apikey'}}")
+
         response = requests.get(url, params=params)
         response.raise_for_status()
-        
+
         data = response.json()
-        
+
         # Extract historical data from response
         if "historical" not in data:
             logger.warning(f"No 'historical' key in FMP response for {symbol}")
@@ -237,11 +237,11 @@ class FMPOHLCVProvider(MarketDataProviderInterface):
             "to": end_date.strftime("%Y-%m-%d")
         }
         
-        logger.debug(f"FMP API request: {url} with params: {params}")
-        
+        logger.debug(f"FMP API request: {url} with params: {{k: v for k, v in params.items() if k != 'apikey'}}")
+
         response = requests.get(url, params=params)
         response.raise_for_status()
-        
+
         data = response.json()
         
         if not data or not isinstance(data, list):

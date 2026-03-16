@@ -890,7 +890,7 @@ class AccountDefinitionsTab:
             if hasattr(self, 'settings_inputs') and self.settings_inputs:
                 for key, inp in self.settings_inputs.items():
                     dynamic_settings[key] = inp.value
-            logger.debug(f'Saving account with provider: {provider}, name: {self.name_input.value}, description: {self.desc_input.value}, dynamic_settings: {dynamic_settings}') 
+            logger.debug(f'Saving account with provider: {provider}, name: {self.name_input.value}, description: {self.desc_input.value}, dynamic_settings_keys: {list(dynamic_settings.keys())}')
             if account:
                 account.provider = provider
                 account.name = self.name_input.value

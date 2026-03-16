@@ -330,8 +330,16 @@ class PennyMomentumTrader(LiveExpertInterface):
 
     def run_analysis(self, symbol, market_analysis):
         self.logger.info(
-            "PennyMomentumTrader uses live pipeline, not scheduled analysis"
+            "PennyMomentumTrader uses live pipeline, not scheduled analysis - skipping"
         )
+        # Mark the analysis as completed so it doesn't stay stuck in "Running"
+        with get_db() as session:
+            ma = session.get(MarketAnalysis, market_analysis.id)
+            if ma:
+                ma.status = MarketAnalysisStatus.COMPLETED
+                ma.state = {"phase": "skipped", "reason": "PennyMomentumTrader uses live pipeline"}
+                session.add(ma)
+                session.commit()
 
     def render_market_analysis(self, market_analysis):
         from .ui import PennyMomentumTraderUI
@@ -554,12 +562,23 @@ class PennyMomentumTrader(LiveExpertInterface):
         candidates = screener.screen_stocks(filters)
         self.logger.info(f"Screener returned {len(candidates)} candidates")
 
+        # Track all filtered stocks with reasons
+        filtered_stocks: Dict[str, Dict[str, Any]] = {}
+
         # Exclude symbols where we already hold open positions
         open_position_symbols = {
             pos["symbol"] for pos in self._trade_mgr.get_open_positions()
         }
         if open_position_symbols:
             before = len(candidates)
+            for c in candidates:
+                sym = c.get("symbol")
+                if sym and sym in open_position_symbols:
+                    filtered_stocks[sym] = {
+                        "phase": "screen",
+                        "reason": "already_held",
+                        "details": "Symbol already in open positions",
+                    }
             candidates = [c for c in candidates if c.get("symbol") not in open_position_symbols]
             self.logger.debug(
                 f"Excluded {before - len(candidates)} already-held symbols from screener results"
@@ -571,6 +590,14 @@ class PennyMomentumTrader(LiveExpertInterface):
             self.logger.info(
                 f"Capping candidates from {len(candidates)} to top {max_candidates} by volume"
             )
+            for c in candidates[max_candidates:]:
+                sym = c.get("symbol")
+                if sym:
+                    filtered_stocks[sym] = {
+                        "phase": "screen",
+                        "reason": "volume_cap",
+                        "details": f"Ranked beyond top {max_candidates} by volume (vol={c.get('volume', 'N/A')})",
+                    }
             candidates = candidates[:max_candidates]
 
         # Filter through account to remove untradeable symbols
@@ -580,6 +607,14 @@ class PennyMomentumTrader(LiveExpertInterface):
             candidate_symbols = [c["symbol"] for c in candidates if c.get("symbol")]
             if candidate_symbols:
                 tradeable = account.symbols_exist(candidate_symbols)
+                for c in candidates:
+                    sym = c.get("symbol")
+                    if sym and not tradeable.get(sym, False):
+                        filtered_stocks[sym] = {
+                            "phase": "screen",
+                            "reason": "not_tradeable",
+                            "details": "Symbol not tradeable on broker account",
+                        }
                 candidates = [
                     c
                     for c in candidates
@@ -607,8 +642,11 @@ class PennyMomentumTrader(LiveExpertInterface):
                             f"Failed to queue instruments for auto-adder: {e}"
                         )
 
-        # Save scan results
-        self._update_state(market_analysis, {"scan_results": candidates})
+        # Save scan results and filtered stocks
+        self._update_state(market_analysis, {
+            "scan_results": candidates,
+            "filtered_stocks": filtered_stocks,
+        })
         self._save_analysis_output(
             market_analysis,
             provider_category="screener",
@@ -804,14 +842,46 @@ class PennyMomentumTrader(LiveExpertInterface):
         response = llm.invoke(prompt)
         raw_text = response.content if hasattr(response, "content") else str(response)
 
-        # Parse JSON response
-        survivors = self._parse_json_response(raw_text, expected_type=list) or []
+        # Parse JSON response — new format returns {selected: [...], dropped: [...]}
+        parsed = self._parse_json_response(raw_text, expected_type=dict)
+        if parsed and "selected" in parsed:
+            survivors = parsed.get("selected", [])
+            dropped_list = parsed.get("dropped", [])
+        else:
+            # Fallback: old format (plain list) or parse failure
+            survivors = self._parse_json_response(raw_text, expected_type=list) or []
+            dropped_list = []
+
         survivor_symbols = [s["symbol"] for s in survivors if isinstance(s, dict) and "symbol" in s]
 
         self.logger.info(f"Quick filter kept {len(survivor_symbols)} candidates")
 
+        # Track LLM-dropped stocks with justification
+        filtered_stocks = dict(market_analysis.state.get("filtered_stocks", {}))
+        survivor_set = set(survivor_symbols)
+        for item in dropped_list:
+            if isinstance(item, dict) and "symbol" in item:
+                sym = item["symbol"]
+                filtered_stocks[sym] = {
+                    "phase": "quick_filter",
+                    "reason": "llm_rejected",
+                    "details": item.get("reason", "Dropped by LLM quick filter"),
+                }
+        # Also catch any candidates not in survivors or dropped (edge case)
+        for c in candidates:
+            sym = c.get("symbol")
+            if sym and sym not in survivor_set and sym not in filtered_stocks:
+                filtered_stocks[sym] = {
+                    "phase": "quick_filter",
+                    "reason": "llm_rejected",
+                    "details": "Not selected by LLM quick filter (no specific reason provided)",
+                }
+
         # Save outputs
-        self._update_state(market_analysis, {"quick_filter_survivors": survivor_symbols})
+        self._update_state(market_analysis, {
+            "quick_filter_survivors": survivor_symbols,
+            "filtered_stocks": filtered_stocks,
+        })
         self._save_analysis_output(
             market_analysis,
             provider_category="llm",
@@ -823,7 +893,6 @@ class PennyMomentumTrader(LiveExpertInterface):
         )
 
         # Return full candidate dicts for survivors
-        survivor_set = set(survivor_symbols)
         return [c for c in candidates if c.get("symbol") in survivor_set]
 
     def _phase_3_deep_triage(
@@ -845,10 +914,12 @@ class PennyMomentumTrader(LiveExpertInterface):
 
         deep_triage_results: Dict[str, Dict[str, Any]] = {}
         finalists: List[Dict[str, Any]] = []
+        filtered_stocks = dict(market_analysis.state.get("filtered_stocks", {}))
 
         # Process ALL candidates (input is already bounded by phase 1+2 limits).
         # max_final_candidates caps the OUTPUT — we take the top N by confidence.
-        for candidate in survivors:
+        total_survivors = len(survivors)
+        for idx, candidate in enumerate(survivors, 1):
             if self._stop_event.is_set():
                 break
 
@@ -856,7 +927,7 @@ class PennyMomentumTrader(LiveExpertInterface):
             if not symbol:
                 continue
 
-            self.logger.info(f"Deep triage: analyzing {symbol}")
+            self.logger.info(f"Phase 3: {idx}/{total_survivors} - deep triage {symbol}")
 
             # Gather data from all configured vendors in parallel
             self.logger.debug(f"Phase 3 [{symbol}]: gathering data (news, fundamentals, insider, social)")
@@ -908,6 +979,11 @@ class PennyMomentumTrader(LiveExpertInterface):
                 result = self._parse_json_response(raw_text, expected_type=dict)
                 if not result:
                     self.logger.warning(f"Phase 3 [{symbol}]: failed to parse LLM response")
+                    filtered_stocks[symbol] = {
+                        "phase": "deep_triage",
+                        "reason": "llm_parse_failed",
+                        "details": "Failed to parse LLM deep triage response",
+                    }
                     continue
 
                 confidence = result.get("confidence", 0)
@@ -919,6 +995,16 @@ class PennyMomentumTrader(LiveExpertInterface):
                     self.logger.info(
                         f"{symbol} confidence {confidence} below threshold {min_confidence}, skipping"
                     )
+                    filtered_stocks[symbol] = {
+                        "phase": "deep_triage",
+                        "reason": "low_confidence",
+                        "details": (
+                            f"Confidence {confidence} below threshold {min_confidence}. "
+                            f"Catalyst: {result.get('catalyst', 'N/A')}. "
+                            f"Risk: {result.get('risk_assessment', 'N/A')}. "
+                            f"Reasoning: {result.get('reasoning', 'N/A')}"
+                        ),
+                    }
                     continue
 
                 # Create ExpertRecommendation
@@ -994,19 +1080,34 @@ class PennyMomentumTrader(LiveExpertInterface):
                 self.logger.error(
                     f"Deep triage failed for {symbol}: {e}", exc_info=True
                 )
+                filtered_stocks[symbol] = {
+                    "phase": "deep_triage",
+                    "reason": "deep_triage_error",
+                    "details": f"Deep triage failed: {e}",
+                }
 
         # Cap finalists to max_final by confidence (highest confidence first)
         if len(finalists) > max_final:
             finalists.sort(key=lambda f: f.get("confidence", 0), reverse=True)
-            dropped = [f["symbol"] for f in finalists[max_final:]]
+            dropped = finalists[max_final:]
             finalists = finalists[:max_final]
+            cutoff_confidence = finalists[-1].get("confidence", 0) if finalists else 0
             self.logger.info(
                 f"Capped finalists to top {max_final} by confidence "
-                f"(dropped: {dropped})"
+                f"(dropped: {[f['symbol'] for f in dropped]})"
             )
             # Remove dropped symbols from deep_triage_results to keep state consistent
-            for sym in dropped:
+            for f in dropped:
+                sym = f["symbol"]
                 deep_triage_results.pop(sym, None)
+                filtered_stocks[sym] = {
+                    "phase": "deep_triage",
+                    "reason": "capped_by_limit",
+                    "details": (
+                        f"Confidence {f.get('confidence', 0)} passed threshold but "
+                        f"ranked beyond top {max_final} finalists (cutoff: {cutoff_confidence})"
+                    ),
+                }
 
         # Calculate position sizes for finalists
         if finalists:
@@ -1018,7 +1119,10 @@ class PennyMomentumTrader(LiveExpertInterface):
                     deep_triage_results[symbol]["qty"] = size_info["qty"]
                     deep_triage_results[symbol]["allocation"] = size_info["allocation"]
 
-        self._update_state(market_analysis, {"deep_triage_results": deep_triage_results})
+        self._update_state(market_analysis, {
+            "deep_triage_results": deep_triage_results,
+            "filtered_stocks": filtered_stocks,
+        })
         self.logger.info(f"Deep triage produced {len(finalists)} finalists")
         return finalists
 
@@ -1061,11 +1165,13 @@ class PennyMomentumTrader(LiveExpertInterface):
             monitored[sym]["status"] = "expired"
 
         # Add new finalists
-        for finalist in finalists:
+        total_finalists = len(finalists)
+        for idx, finalist in enumerate(finalists, 1):
             if self._stop_event.is_set():
                 break
 
             symbol = finalist["symbol"]
+            self.logger.info(f"Phase 4: {idx}/{total_finalists} - setting conditions for {symbol}")
             if symbol in monitored and monitored[symbol].get("status") == "watching":
                 self.logger.debug(f"{symbol} already being monitored, skipping condition generation")
                 continue
@@ -1934,11 +2040,13 @@ class PennyMomentumTrader(LiveExpertInterface):
         )
 
         enriched = []
+        total_candidates = len(candidates)
         for i, candidate in enumerate(candidates):
             symbol = candidate.get("symbol")
             if not symbol:
                 enriched.append(candidate)
                 continue
+            self.logger.debug(f"Phase 2: StockTwits {i + 1}/{total_candidates} - {symbol}")
             try:
                 result = provider.get_social_media_sentiment(
                     symbol,

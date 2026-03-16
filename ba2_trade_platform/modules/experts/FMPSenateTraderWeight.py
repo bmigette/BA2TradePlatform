@@ -1057,7 +1057,7 @@ All {len(trade_details)} trades shown above for transparency.
                 symbol=symbol,
                 recommended_action=recommendation_data['signal'],
                 expected_profit_percent=recommendation_data['expected_profit_percent'],
-                price_at_date=current_price or 0.0,
+                price_at_date=current_price,
                 details=recommendation_data['details'][:100000] if recommendation_data['details'] else None,
                 confidence=round(recommendation_data['confidence'], 1),  # Store as 1-100 scale
                 risk_level=RiskLevel.MEDIUM,  # Senate trades are medium risk

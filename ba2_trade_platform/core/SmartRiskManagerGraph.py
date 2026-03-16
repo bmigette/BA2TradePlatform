@@ -326,6 +326,64 @@ def _format_relative_time(timestamp_str: str) -> str:
         return ""
 
 
+def _build_locked_symbols_section(
+    expert_instance_id: int, trade_summary: Dict[str, Dict[str, float]]
+) -> str:
+    """Build locked symbols section for the research prompt when hedging is disabled."""
+    from datetime import timedelta
+
+    try:
+        with get_db() as session:
+            cutoff_time = datetime.now(timezone.utc) - timedelta(days=7)
+            analyzed_symbols_rows = session.exec(
+                select(MarketAnalysis.symbol)
+                .where(
+                    MarketAnalysis.expert_instance_id == expert_instance_id,
+                    MarketAnalysis.status == MarketAnalysisStatus.COMPLETED,
+                    MarketAnalysis.created_at >= cutoff_time
+                )
+                .distinct()
+            ).all()
+            analyzed_symbols = set(analyzed_symbols_rows)
+
+        all_relevant_symbols = analyzed_symbols | set(trade_summary.keys())
+
+        locked_lines = []
+        for symbol in sorted(all_relevant_symbols):
+            if symbol not in trade_summary:
+                continue
+            buy_qty = trade_summary[symbol]["buy_qty"]
+            sell_qty = trade_summary[symbol]["sell_qty"]
+
+            if buy_qty > 0 and sell_qty == 0:
+                locked_lines.append(
+                    f"- **{symbol}**: Existing BUY position (qty {buy_qty:.0f}) on account "
+                    f"-> only BUY allowed, SELL is BLOCKED"
+                )
+            elif sell_qty > 0 and buy_qty == 0:
+                locked_lines.append(
+                    f"- **{symbol}**: Existing SELL position (qty {sell_qty:.0f}) on account "
+                    f"-> only SELL allowed, BUY is BLOCKED"
+                )
+
+        if locked_lines:
+            section = (
+                "\n**Locked Symbols (account-wide positions, hedging disabled):**\n"
+                "The following symbols already have positions on this account (across all experts). "
+                "You MUST NOT open positions in the opposite direction.\n"
+                + "\n".join(locked_lines)
+                + "\n"
+            )
+            logger.info(f"Built locked symbols section with {len(locked_lines)} locked symbol(s)")
+            return section
+
+        return ""
+
+    except Exception as e:
+        logger.warning(f"Could not build locked symbols section: {e}")
+        return ""
+
+
 def _build_positions_summary(open_positions: List[Dict[str, Any]]) -> str:
     """
     Build a clear, prominent summary of open positions with valid transaction IDs.
@@ -1753,7 +1811,14 @@ def initialize_research_agent(state: SmartRiskManagerState) -> Dict[str, Any]:
         
         # Use global RESEARCH_PROMPT with dynamic context
         agent_scratchpad_content = state.get('agent_scratchpad', 'No prior context')
-        
+
+        # Build locked symbols section when hedging is disabled
+        locked_symbols_section = ""
+        if not allow_hedging and trade_summary:
+            locked_symbols_section = _build_locked_symbols_section(
+                expert_instance_id, trade_summary
+            )
+
         research_system_prompt = RESEARCH_PROMPT.format(
             current_positions_summary=current_positions_summary,
             trade_summary_by_symbol=trade_summary_by_symbol,
@@ -1762,7 +1827,8 @@ def initialize_research_agent(state: SmartRiskManagerState) -> Dict[str, Any]:
             max_position_pct=max_position_pct,
             max_position_equity=max_position_equity,
             hedging_check_note=hedging_check_note,
-            hedging_instructions=hedging_instructions
+            hedging_instructions=hedging_instructions,
+            locked_symbols_section=locked_symbols_section
         )
 
         # Initialize conversation with system prompt
@@ -2844,7 +2910,14 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
         
         # Use global RESEARCH_PROMPT with dynamic context
         agent_scratchpad_content = state.get('agent_scratchpad', 'No prior context')
-        
+
+        # Build locked symbols section when hedging is disabled
+        locked_symbols_section = ""
+        if not allow_hedging and trade_summary:
+            locked_symbols_section = _build_locked_symbols_section(
+                expert_instance_id, trade_summary
+            )
+
         research_system_prompt = RESEARCH_PROMPT.format(
             current_positions_summary=current_positions_summary,
             trade_summary_by_symbol=trade_summary_by_symbol,
@@ -2853,7 +2926,8 @@ def research_node(state: SmartRiskManagerState) -> Dict[str, Any]:
             max_position_pct=max_position_pct,
             max_position_equity=max_position_equity,
             hedging_check_note=hedging_check_note,
-            hedging_instructions=hedging_instructions
+            hedging_instructions=hedging_instructions,
+            locked_symbols_section=locked_symbols_section
         )
 
         # Initialize conversation with system prompt

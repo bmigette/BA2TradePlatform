@@ -32,6 +32,7 @@ class PennyMomentumTraderUI:
         try:
             with ui.tabs().classes('w-full') as tabs:
                 scan_tab = ui.tab('Scan Results')
+                filtered_tab = ui.tab('Filtered')
                 triage_tab = ui.tab('Triage')
                 monitors_tab = ui.tab('Active Monitors')
                 trades_tab = ui.tab('Trades')
@@ -40,6 +41,8 @@ class PennyMomentumTraderUI:
             with ui.tab_panels(tabs, value=scan_tab).classes('w-full'):
                 with ui.tab_panel(scan_tab):
                     self._render_scan_results()
+                with ui.tab_panel(filtered_tab):
+                    self._render_filtered_stocks()
                 with ui.tab_panel(triage_tab):
                     self._render_triage()
                 with ui.tab_panel(monitors_tab):
@@ -116,7 +119,100 @@ class PennyMomentumTraderUI:
             ''')
 
     # ------------------------------------------------------------------
-    # Tab 2: Triage
+    # Tab 2: Filtered Stocks
+    # ------------------------------------------------------------------
+
+    def _render_filtered_stocks(self):
+        """Table showing all stocks that were filtered out and why."""
+        filtered: Dict[str, Dict] = self.state.get('filtered_stocks', {})
+
+        # Reason display labels and colors
+        reason_labels = {
+            'already_held': ('Already Held', 'grey'),
+            'volume_cap': ('Volume Cap', 'blue-grey'),
+            'not_tradeable': ('Not Tradeable', 'orange'),
+            'llm_rejected': ('LLM Rejected', 'purple'),
+            'low_confidence': ('Low Confidence', 'red'),
+            'capped_by_limit': ('Capped by Limit', 'amber'),
+            'llm_parse_failed': ('Parse Failed', 'red'),
+            'deep_triage_error': ('Triage Error', 'red'),
+        }
+
+        phase_labels = {
+            'screen': 'Phase 1: Screen',
+            'quick_filter': 'Phase 2: Quick Filter',
+            'deep_triage': 'Phase 3: Deep Triage',
+        }
+
+        with ui.card().classes('w-full'):
+            ui.label('Filtered Stocks').classes('text-h5 mb-2')
+            ui.label(
+                f'{len(filtered)} stocks filtered out during analysis'
+            ).classes('text-subtitle2 text-grey-7 mb-4')
+
+            if not filtered:
+                ui.label('No filtered stocks recorded yet.').classes('text-grey-7')
+                return
+
+            # Group by phase for display
+            by_phase: Dict[str, List] = {}
+            for symbol, info in filtered.items():
+                phase = info.get('phase', 'unknown')
+                by_phase.setdefault(phase, []).append((symbol, info))
+
+            for phase in ['screen', 'quick_filter', 'deep_triage', 'unknown']:
+                items = by_phase.get(phase, [])
+                if not items:
+                    continue
+
+                phase_label = phase_labels.get(phase, phase)
+                with ui.expansion(
+                    f'{phase_label} ({len(items)} filtered)',
+                    icon='filter_alt',
+                    value=True,
+                ).classes('w-full mb-2'):
+                    columns = [
+                        {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'align': 'left'},
+                        {'name': 'reason', 'label': 'Reason', 'field': 'reason', 'sortable': True, 'align': 'left'},
+                        {'name': 'details', 'label': 'Details', 'field': 'details', 'align': 'left'},
+                    ]
+
+                    rows = []
+                    for symbol, info in items:
+                        reason_key = info.get('reason', 'unknown')
+                        label, _ = reason_labels.get(reason_key, (reason_key, 'grey'))
+                        rows.append({
+                            'symbol': symbol,
+                            'reason': label,
+                            'details': info.get('details', '-'),
+                            '_reason_key': reason_key,
+                        })
+
+                    table = ui.table(
+                        columns=columns,
+                        rows=rows,
+                        row_key='symbol',
+                        pagination={'rowsPerPage': 25},
+                    ).classes('w-full')
+
+                    # Color-code reason badges
+                    table.add_slot('body-cell-reason', r'''
+                        <q-td :props="props">
+                            <q-badge
+                                :color="props.row._reason_key === 'llm_rejected' ? 'purple'
+                                      : props.row._reason_key === 'low_confidence' ? 'red'
+                                      : props.row._reason_key === 'not_tradeable' ? 'orange'
+                                      : props.row._reason_key === 'volume_cap' ? 'blue-grey'
+                                      : props.row._reason_key === 'already_held' ? 'grey'
+                                      : props.row._reason_key === 'capped_by_limit' ? 'amber'
+                                      : 'red'"
+                                :label="props.row.reason"
+                            />
+                        </q-td>
+                    ''')
+
+    # ------------------------------------------------------------------
+    # Tab 3: Triage
     # ------------------------------------------------------------------
 
     def _render_triage(self):
@@ -416,9 +512,9 @@ class PennyMomentumTraderUI:
                                     formatted = json.dumps(parsed, indent=2, default=str)
                                     with ui.scroll_area().classes('w-full').style('max-height: 400px;'):
                                         with ui.element('pre').classes(
-                                            'whitespace-pre-wrap text-xs p-3 bg-grey-1 rounded font-mono overflow-x-auto'
-                                        ):
-                                            ui.label(formatted)
+                                            'whitespace-pre-wrap text-xs p-3 rounded font-mono overflow-x-auto'
+                                        ).style('background-color: var(--q-dark-page, #1d1d1d); color: #e0e0e0;'):
+                                            ui.label(formatted).style('color: #e0e0e0;')
                                 except (json.JSONDecodeError, TypeError):
                                     with ui.scroll_area().classes('w-full').style('max-height: 400px;'):
                                         ui.markdown(item.text).classes('text-sm')

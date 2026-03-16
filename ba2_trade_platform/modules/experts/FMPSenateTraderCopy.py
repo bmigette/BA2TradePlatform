@@ -448,12 +448,12 @@ class FMPSenateTraderCopy(MarketExpertInterface):
             - orders_with_trader_names_count: Count of orders with trader names linked
         """
         try:
-            from sqlmodel import Session, select
+            from sqlmodel import select
             from ...core.db import get_db
             from ...core.models import TradingOrder, ExpertRecommendation
             from ...core.types import OrderStatus
-            
-            with Session(get_db().bind) as session:
+
+            with get_db() as session:
                 # Query for trading orders with this symbol that are open
                 # Orders linked to this expert via recommendations
                 statement = select(TradingOrder).join(
@@ -726,7 +726,7 @@ Note: If multiple trades exist for the same instrument, the most recent trade de
                 symbol=symbol,
                 recommended_action=recommendation_data['signal'],
                 expected_profit_percent=recommendation_data['expected_profit_percent'],
-                price_at_date=current_price or 0.0,
+                price_at_date=current_price,
                 details=recommendation_data['details'][:100000] if recommendation_data['details'] else None,
                 confidence=round(recommendation_data['confidence'], 1),  # Store as 1-100 scale
                 risk_level=RiskLevel.MEDIUM,  # Copy trades are medium risk
@@ -1039,8 +1039,8 @@ Recommendations Generated:"""
                     # Get current price for this symbol
                     current_price = self._get_current_price(trade_symbol)
                     if not current_price:
-                        self.logger.warning(f"Unable to get current price for {trade_symbol}, using 0.0")
-                        current_price = 0.0
+                        self.logger.warning(f"Unable to get current price for {trade_symbol}, skipping")
+                        continue
                     
                     # Generate recommendations for this symbol
                     recommendation_data = self._generate_recommendations(
