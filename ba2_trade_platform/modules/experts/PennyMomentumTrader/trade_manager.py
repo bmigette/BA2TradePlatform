@@ -177,6 +177,27 @@ class PennyTradeManager:
                     f"PennyTradeManager: entry order {submitted.id} placed for "
                     f"{symbol} x{clamped_qty}"
                 )
+                from ba2_trade_platform.core.db import log_activity
+                from ba2_trade_platform.core.types import ActivityLogSeverity, ActivityLogType
+                log_activity(
+                    severity=ActivityLogSeverity.SUCCESS,
+                    activity_type=ActivityLogType.ORDER_SUBMITTED,
+                    description=(
+                        f"PennyMomentumTrader entry order placed: BUY {symbol} "
+                        f"x{clamped_qty} @ ~${current_price:.2f} "
+                        f"| Catalyst: {catalyst}"
+                    ),
+                    data={
+                        "symbol": symbol,
+                        "qty": clamped_qty,
+                        "price": current_price,
+                        "catalyst": catalyst,
+                        "strategy": strategy,
+                        "order_id": submitted.id,
+                    },
+                    source_expert_id=self.expert_instance_id,
+                    source_account_id=self.account_id,
+                )
                 return submitted.id
             logger.error(
                 f"PennyTradeManager: submit_order returned no id for {symbol}"
@@ -254,6 +275,26 @@ class PennyTradeManager:
                         f"for {symbol} x{exit_qty}"
                     )
                     any_success = True
+                    from ba2_trade_platform.core.db import log_activity
+                    from ba2_trade_platform.core.types import ActivityLogSeverity, ActivityLogType
+                    log_activity(
+                        severity=ActivityLogSeverity.INFO,
+                        activity_type=ActivityLogType.ORDER_SUBMITTED,
+                        description=(
+                            f"PennyMomentumTrader exit order placed: SELL {symbol} "
+                            f"x{exit_qty} ({exit_pct:.0f}%) | Reason: {reason}"
+                        ),
+                        data={
+                            "symbol": symbol,
+                            "qty": exit_qty,
+                            "exit_pct": exit_pct,
+                            "reason": reason,
+                            "order_id": submitted.id,
+                            "transaction_id": trans.id,
+                        },
+                        source_expert_id=self.expert_instance_id,
+                        source_account_id=self.account_id,
+                    )
                 else:
                     logger.error(
                         f"PennyTradeManager: submit_order returned no id "

@@ -504,6 +504,18 @@ class PennyMomentumTrader(LiveExpertInterface):
             symbol="PENNY_SCAN",
         )
 
+        if candidates:
+            from ....core.db import log_activity
+            from ....core.types import ActivityLogSeverity, ActivityLogType
+            symbols = [c["symbol"] for c in candidates if c.get("symbol")]
+            log_activity(
+                severity=ActivityLogSeverity.INFO,
+                activity_type=ActivityLogType.ANALYSIS_COMPLETED,
+                description=f"PennyMomentumTrader screened {len(symbols)} tradeable candidates: {', '.join(symbols[:10])}{'...' if len(symbols) > 10 else ''}",
+                data={"symbols": symbols, "total": len(symbols)},
+                source_expert_id=self.instance.id,
+            )
+
         return candidates
 
     def _phase_2_quick_filter(
@@ -648,6 +660,27 @@ class PennyMomentumTrader(LiveExpertInterface):
                     },
                 )
                 add_instance(rec)
+
+                from ....core.db import log_activity
+                from ....core.types import ActivityLogSeverity, ActivityLogType
+                log_activity(
+                    severity=ActivityLogSeverity.SUCCESS,
+                    activity_type=ActivityLogType.EXPERT_RECOMMENDATION,
+                    description=(
+                        f"PennyMomentumTrader recommendation: BUY {symbol} "
+                        f"| Confidence: {confidence}% "
+                        f"| Catalyst: {result.get('catalyst', 'N/A')} "
+                        f"| Expected profit: {result.get('expected_profit_pct', 0):.1f}%"
+                    ),
+                    data={
+                        "symbol": symbol,
+                        "confidence": confidence,
+                        "catalyst": result.get("catalyst", ""),
+                        "strategy": result.get("strategy", ""),
+                        "expected_profit_pct": result.get("expected_profit_pct", 0),
+                    },
+                    source_expert_id=self.instance.id,
+                )
 
                 result["price"] = candidate.get("price")
                 deep_triage_results[symbol] = result
@@ -823,6 +856,25 @@ class PennyMomentumTrader(LiveExpertInterface):
                 )
 
                 self.logger.info(f"Set entry conditions for {symbol}")
+
+                from ....core.db import log_activity
+                from ....core.types import ActivityLogSeverity, ActivityLogType
+                log_activity(
+                    severity=ActivityLogSeverity.INFO,
+                    activity_type=ActivityLogType.ANALYSIS_COMPLETED,
+                    description=(
+                        f"PennyMomentumTrader watching {symbol}: entry conditions set "
+                        f"| Confidence: {finalist.get('confidence', 0)}% "
+                        f"| Catalyst: {finalist.get('catalyst', 'N/A')}"
+                    ),
+                    data={
+                        "symbol": symbol,
+                        "confidence": finalist.get("confidence", 0),
+                        "catalyst": finalist.get("catalyst", ""),
+                        "strategy": finalist.get("strategy", ""),
+                    },
+                    source_expert_id=self.instance.id,
+                )
 
             except Exception as e:
                 self.logger.error(
