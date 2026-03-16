@@ -1356,8 +1356,10 @@ class JobMonitoringTab:
                 recommendation_display = '-'
                 confidence_display = '-'
                 expected_profit_display = '-'
-                
-                if analysis.expert_recommendations and len(analysis.expert_recommendations) > 0:
+
+                # Don't show partial recommendation data while analysis is still running
+                if (analysis.status not in (MarketAnalysisStatus.RUNNING, MarketAnalysisStatus.PENDING)
+                    and analysis.expert_recommendations and len(analysis.expert_recommendations) > 0):
                     recommendations = analysis.expert_recommendations
                     
                     if len(recommendations) == 1:
