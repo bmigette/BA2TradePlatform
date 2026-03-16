@@ -13,6 +13,7 @@ from sqlmodel import select
 
 from ba2_trade_platform.core.db import get_db
 from ba2_trade_platform.core.models import AnalysisOutput, MarketAnalysis
+from ba2_trade_platform.core.types import MarketAnalysisStatus
 from ba2_trade_platform.logger import logger
 
 
@@ -30,6 +31,27 @@ class PennyMomentumTraderUI:
     def render(self):
         """Render the complete PennyMomentumTrader analysis UI with 5 tabs."""
         try:
+            # Auto-refresh while analysis is running
+            if self.market_analysis.status == MarketAnalysisStatus.RUNNING:
+                ui.label('Analysis is running - page will auto-refresh every 30s').classes(
+                    'text-caption text-grey-7 mb-2'
+                )
+                analysis_id = self.market_analysis.id
+
+                async def _auto_refresh():
+                    try:
+                        with get_db() as session:
+                            stmt = select(MarketAnalysis.state).where(
+                                MarketAnalysis.id == analysis_id
+                            )
+                            current_state = session.execute(stmt).scalar()
+                        if current_state != self.state:
+                            await ui.navigate.reload()
+                    except Exception:
+                        pass
+
+                ui.timer(30.0, _auto_refresh)
+
             with ui.tabs().classes('w-full') as tabs:
                 scan_tab = ui.tab('Scan Results')
                 filtered_tab = ui.tab('Filtered')
