@@ -444,6 +444,9 @@ class PennyMomentumTrader(LiveExpertInterface):
             else []
         )
 
+        max_candidates = int(self.get_setting_with_interface_default(
+            "max_scan_candidates", log_warning=False
+        ))
         filters = {
             "price_min": self.get_setting_with_interface_default(
                 "scan_price_min", log_warning=False
@@ -461,13 +464,18 @@ class PennyMomentumTrader(LiveExpertInterface):
                 "scan_market_cap_max", log_warning=False
             ),
             "sector_exclude": sector_exclude,
-            "limit": self.get_setting_with_interface_default(
-                "max_scan_candidates", log_warning=False
-            ),
         }
 
         candidates = screener.screen_stocks(filters)
         self.logger.info(f"Screener returned {len(candidates)} candidates")
+
+        # Sort by volume descending (highest momentum first) and cap at max_scan_candidates
+        candidates.sort(key=lambda c: c.get("volume") or 0, reverse=True)
+        if len(candidates) > max_candidates:
+            self.logger.info(
+                f"Capping candidates from {len(candidates)} to top {max_candidates} by volume"
+            )
+            candidates = candidates[:max_candidates]
 
         # Filter through account to remove untradeable symbols
         if candidates:
