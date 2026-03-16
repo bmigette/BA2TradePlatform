@@ -2102,13 +2102,23 @@ class ManualAnalysisTab:
         with self.instrument_selector_container:
             if selection_method == 'expert':
                 if can_recommend_instruments:
-                    # Expert will select instruments - show message
+                    # Check if this is a live expert to show appropriate message
+                    try:
+                        from ...core.interfaces import LiveExpertInterface
+                        is_live = issubclass(expert.__class__, LiveExpertInterface)
+                    except Exception:
+                        is_live = False
+
                     with ui.card().classes('w-full p-4 alert-banner info'):
                         with ui.row():
-                            ui.icon('auto_awesome').classes('text-[#4dabf7] text-xl mr-3')
+                            ui.icon('play_circle' if is_live else 'auto_awesome').classes('text-[#4dabf7] text-xl mr-3')
                             with ui.column():
-                                ui.label('Expert-Driven Instrument Selection').classes('text-lg font-semibold text-[#4dabf7]')
-                                ui.label('This expert will automatically select the instruments for analysis. No manual selection required.').classes('text-secondary-custom')
+                                if is_live:
+                                    ui.label('Live Expert — Trigger Pipeline').classes('text-lg font-semibold text-[#4dabf7]')
+                                    ui.label('Clicking "Run Analysis" will immediately trigger this expert\'s daily pipeline (screen → triage → monitor).').classes('text-secondary-custom')
+                                else:
+                                    ui.label('Expert-Driven Instrument Selection').classes('text-lg font-semibold text-[#4dabf7]')
+                                    ui.label('This expert will automatically select the instruments for analysis. No manual selection required.').classes('text-secondary-custom')
                     self.instrument_selector = None  # No manual selector needed
                 else:
                     # Expert doesn't support instrument selection - fall back to static
@@ -2347,11 +2357,25 @@ class ManualAnalysisTab:
                 ui.notify("Failed to load expert instance", type='negative')
                 return
             
+            # For live experts, trigger the pipeline directly instead of going through the job queue
+            try:
+                from ...core.interfaces import LiveExpertInterface
+                if issubclass(expert.__class__, LiveExpertInterface):
+                    from ...core.JobManager import get_job_manager
+                    job_manager = get_job_manager()
+                    result = job_manager.trigger_live_expert(int(self.expert_instance_id))
+                    ui.notify(f"Live expert pipeline triggered: {result}", type='positive')
+                    return
+            except Exception as e:
+                logger.error(f"Error triggering live expert: {e}", exc_info=True)
+                ui.notify(f"Error triggering live expert: {e}", type='negative')
+                return
+
             # Get instrument selection method
             instrument_selection_method = expert.settings.get('instrument_selection_method', 'static')
             expert_properties = expert.__class__.get_expert_properties()
             can_recommend_instruments = expert_properties.get('can_recommend_instruments', False)
-            
+
             # Get instruments based on selection method
             if instrument_selection_method == 'expert' and can_recommend_instruments:
                 # Expert-driven selection

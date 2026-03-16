@@ -588,6 +588,23 @@ class JobManager:
         except Exception as e:
             logger.error(f"Error scheduling jobs for expert instance {expert_instance.id}: {e}", exc_info=True)
             
+    def trigger_live_expert(self, expert_instance_id: int) -> str:
+        """
+        Trigger the daily pipeline of a running live expert immediately.
+
+        Returns a status string suitable for display in the UI.
+        """
+        expert = self._live_experts.get(expert_instance_id)
+        if expert is None:
+            return f"Live expert {expert_instance_id} is not running"
+        try:
+            result = expert.request_manual_start()
+            logger.info(f"Manual start triggered for live expert {expert_instance_id}: {result}")
+            return result
+        except Exception as e:
+            logger.error(f"Error triggering live expert {expert_instance_id}: {e}", exc_info=True)
+            return f"Error triggering live expert: {e}"
+
     # ------------------------------------------------------------------
     # Live expert lifecycle helpers
     # ------------------------------------------------------------------
