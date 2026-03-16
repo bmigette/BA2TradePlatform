@@ -139,17 +139,23 @@ class AINewsProvider(MarketNewsInterface):
     ) -> Dict[str, Any] | str:
         """
         Fetch news using LLM web search.
-        
+
         Args:
             symbol: Stock ticker symbol (None for global news)
             news_type: "company" or "global"
             lookback_days: Number of days to look back for news
             max_articles: Maximum number of articles to return
             format_type: Output format - "dict", "markdown", or "both"
-            
+
         Returns:
             News data in requested format
         """
+        if not self.model_string:
+            raise ValueError(
+                "AINewsProvider requires a model with websearch capability. "
+                "Pass model= when creating the provider (e.g. model='NagaAI/gpt-4o-search-preview'). "
+                "For PennyMomentumTrader, configure the 'websearch_llm' expert setting."
+            )
         try:
             # Build the search prompt
             if news_type == "global":

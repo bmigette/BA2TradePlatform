@@ -82,7 +82,14 @@ def load_config_from_env() -> None:
         db_openai_key = get_app_setting('openai_api_key')
         if db_openai_key:
             OPENAI_API_KEY = db_openai_key
-        
+
+        db_finnhub_key = get_app_setting('finnhub_api_key')
+        if db_finnhub_key:
+            FINNHUB_API_KEY = db_finnhub_key
+
+        db_alpha_vantage_key = get_app_setting('alpha_vantage_api_key')
+        if db_alpha_vantage_key:
+            ALPHA_VANTAGE_API_KEY = db_alpha_vantage_key
 
     except Exception:
         # Database might not be initialized yet, ignore errors

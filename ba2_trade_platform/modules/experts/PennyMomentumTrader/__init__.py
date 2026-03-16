@@ -1924,7 +1924,12 @@ class PennyMomentumTrader(LiveExpertInterface):
         all_news: List[str] = []
         for vendor_name in vendor_list:
             try:
-                provider = get_provider("news", vendor_name)
+                kwargs = {}
+                if vendor_name == "ai":
+                    kwargs["model"] = self.get_setting_with_interface_default(
+                        "websearch_llm", log_warning=False
+                    )
+                provider = get_provider("news", vendor_name, **kwargs)
                 news = provider.get_company_news(
                     symbol,
                     end_date=datetime.now(timezone.utc),
@@ -1947,7 +1952,12 @@ class PennyMomentumTrader(LiveExpertInterface):
 
         for vendor_name in vendor_list:
             try:
-                provider = get_provider("fundamentals_overview", vendor_name)
+                kwargs = {}
+                if vendor_name == "ai":
+                    kwargs["model"] = self.get_setting_with_interface_default(
+                        "websearch_llm", log_warning=False
+                    )
+                provider = get_provider("fundamentals_overview", vendor_name, **kwargs)
                 return provider.get_fundamentals_overview(
                     symbol,
                     as_of_date=datetime.now(timezone.utc),
