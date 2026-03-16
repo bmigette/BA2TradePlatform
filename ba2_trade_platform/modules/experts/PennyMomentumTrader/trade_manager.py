@@ -20,9 +20,6 @@ from ba2_trade_platform.core.types import (
     OrderDirection, OrderOpenType, OrderRecommendation, OrderStatus,
     OrderType, RiskLevel, TimeHorizon, TransactionStatus,
 )
-from ba2_trade_platform.core.utils import (
-    get_account_instance_from_id, get_expert_instance_from_id,
-)
 from ba2_trade_platform.logger import logger
 
 
@@ -30,6 +27,7 @@ class PennyTradeManager:
     """Position sizing and trade execution for PennyMomentumTrader."""
 
     def __init__(self, expert_instance_id: int):
+        from ba2_trade_platform.core.utils import get_account_instance_from_id, get_expert_instance_from_id
         self.expert_instance_id = expert_instance_id
         self.expert = get_expert_instance_from_id(expert_instance_id)
         instance = get_instance(ExpertInstance, expert_instance_id)
