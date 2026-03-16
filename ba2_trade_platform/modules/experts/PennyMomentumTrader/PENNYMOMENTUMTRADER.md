@@ -114,8 +114,10 @@ Conditions use the deterministic `ConditionEvaluator` schema (no LLM at evaluati
 Real-time loop that checks every `monitoring_interval_seconds` (default 60s) until market close:
 
 - **Entry**: evaluates `entry_conditions` for watched symbols; executes market buy when met
+- **Intraday EOD hard-exit**: force-exits intraday positions 15 minutes before market close
 - **Stop-loss**: evaluates `stop_loss` condition for open positions; full exit when triggered
-- **Take-profit**: evaluates each tier sequentially; partial or full exit at each tier
+- **Take-profit**: evaluates each tier sequentially; partial or full exit at each tier (already-fired tiers are tracked and skipped)
+- **Exit condition update**: every `exit_update_interval_ticks` monitor cycles (default 30), the LLM re-evaluates exit conditions for open positions using fresh news and social data — can tighten stops, adjust take-profit targets, or add conditions based on intraday events
 
 State (last price, condition status, check timestamp) is persisted to `MarketAnalysis.state` on every tick for UI display.
 
@@ -175,7 +177,9 @@ The structured condition schema supports the following types, combinable with `a
 | `max_final_candidates` | 15 | Max finalists from deep triage (top N by confidence) |
 | `max_monitored_symbols` | 40 | Max simultaneously watched symbols |
 | `max_entry_age_days` | 3 | Days before a watch entry expires |
-| `max_holding_days` | 30 | Max days to hold a position before forced exit |
+| `max_holding_days` | 14 | Max days to hold a position before forced exit |
+| `min_confidence_threshold` | 55 | Minimum confidence (1-100) for deep triage finalists |
+| `exit_update_interval_ticks` | 30 | Monitor ticks between LLM exit-condition re-evaluations (0 = disabled) |
 
 ### Data Vendors
 
@@ -276,5 +280,5 @@ PennyMomentumTrader/
 ├── conditions.py        # Condition type registry + ConditionEvaluator
 ├── trade_manager.py     # Position sizing + trade execution
 ├── ui.py                # NiceGUI renderer for MarketAnalysis view
-└── PENNYMOMENTUTRADER.md  # This file
+└── PENNYMOMENTUMTRADER.md  # This file
 ```

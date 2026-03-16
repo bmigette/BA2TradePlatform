@@ -567,6 +567,31 @@ class ConditionEvaluator:
         self._indicator_cache[cache_key] = result
         return result
 
+    def _filter_today_session(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Filter DataFrame to today's regular market session (9:30-16:00)."""
+        if df.empty or not isinstance(df.index, pd.DatetimeIndex):
+            return df
+
+        tz = pytz.timezone(self.market_timezone)
+        now = datetime.now(tz)
+        today = now.date()
+
+        # Convert index to market timezone
+        if df.index.tz is not None:
+            idx = df.index.tz_convert(tz)
+        else:
+            try:
+                idx = df.index.tz_localize(tz)
+            except Exception:
+                return df
+
+        market_open = tz.localize(datetime(today.year, today.month, today.day, 9, 30))
+        market_close = tz.localize(datetime(today.year, today.month, today.day, 16, 0))
+
+        mask = (idx >= market_open) & (idx <= market_close)
+        filtered = df.loc[mask]
+        return filtered if not filtered.empty else df
+
     def _get_vwap(self, symbol: str, timeframe: str) -> Optional[float]:
         cache_key = f"vwap:{symbol}:{timeframe}"
         if cache_key in self._indicator_cache:
@@ -575,6 +600,11 @@ class ConditionEvaluator:
         lookback = _TIMEFRAME_LOOKBACK.get(timeframe, 5)
         df = self._get_ohlcv(symbol, timeframe, lookback)
         if df is None or df.empty:
+            return None
+
+        # Filter to today's session for proper intraday VWAP
+        df = self._filter_today_session(df)
+        if df.empty:
             return None
 
         typical_price = (df["high"] + df["low"] + df["close"]) / 3.0
@@ -599,7 +629,13 @@ class ConditionEvaluator:
             self._indicator_cache[cache_key] = False
             return False
 
-        # Take first N minutes of today's data
+        # Filter to today's regular session to get the actual opening range
+        df = self._filter_today_session(df)
+        if len(df) < minutes:
+            self._indicator_cache[cache_key] = False
+            return False
+
+        # Take first N minutes of today's session
         opening_high = df["high"].iloc[:minutes].max()
         current_price = self._get_current_price(symbol)
 

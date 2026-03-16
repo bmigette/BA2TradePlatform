@@ -372,16 +372,13 @@ class PennyMomentumTraderUI:
 
             outputs: List[AnalysisOutput] = []
             try:
-                session = get_db()
-                try:
+                with get_db() as session:
                     statement = (
                         select(AnalysisOutput)
                         .where(AnalysisOutput.market_analysis_id == self.market_analysis.id)
                         .order_by(AnalysisOutput.created_at)
                     )
                     outputs = list(session.exec(statement).all())
-                finally:
-                    session.close()
             except Exception as e:
                 logger.error(f"Error querying AnalysisOutput records: {e}", exc_info=True)
                 ui.label(f'Error loading raw data: {e}').classes('text-red-600')

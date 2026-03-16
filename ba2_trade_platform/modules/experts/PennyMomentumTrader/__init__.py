@@ -223,9 +223,23 @@ class PennyMomentumTrader(LiveExpertInterface):
             "max_holding_days": {
                 "type": "int",
                 "required": True,
-                "default": 30,
+                "default": 14,
                 "description": "Maximum days to hold a position before forced exit",
-                "tooltip": "Positions held longer than this are closed automatically.",
+                "tooltip": "Safety net: positions held longer than this are closed automatically. Set high enough to ride multi-day trends; exit conditions handle normal exits.",
+            },
+            "min_confidence_threshold": {
+                "type": "int",
+                "required": True,
+                "default": 55,
+                "description": "Minimum confidence score (1-100) for deep triage finalists",
+                "tooltip": "Candidates below this confidence threshold are dropped after deep triage. Higher = more selective.",
+            },
+            "exit_update_interval_ticks": {
+                "type": "int",
+                "required": True,
+                "default": 30,
+                "description": "Monitor ticks between LLM exit-condition re-evaluations",
+                "tooltip": "Every N monitor cycles, open positions are re-evaluated: fresh news is fetched and the LLM can tighten stops, adjust take-profit, or add new conditions. Set to 0 to disable.",
             },
             # Data vendors
             "vendor_news": {
@@ -332,6 +346,7 @@ class PennyMomentumTrader(LiveExpertInterface):
 
     def _run_daily_pipeline(self):
         self.logger.info("=== Daily pipeline starting ===")
+        self._trade_mgr = PennyTradeManager(self.instance.id)
         market_analysis = self._create_market_analysis()
         self.logger.debug(f"Created MarketAnalysis id={market_analysis.id}")
 
@@ -425,7 +440,7 @@ class PennyMomentumTrader(LiveExpertInterface):
     def _phase_0_review(self, market_analysis: MarketAnalysis):
         """Review existing open positions and record current state."""
         self.logger.info("Phase 0: Reviewing existing positions")
-        trade_mgr = PennyTradeManager(self.instance.id)
+        trade_mgr = self._trade_mgr
         open_positions = trade_mgr.get_open_positions()
 
         self.logger.info(f"Found {len(open_positions)} open positions")
@@ -521,7 +536,7 @@ class PennyMomentumTrader(LiveExpertInterface):
 
         # Exclude symbols where we already hold open positions
         open_position_symbols = {
-            pos["symbol"] for pos in PennyTradeManager(self.instance.id).get_open_positions()
+            pos["symbol"] for pos in self._trade_mgr.get_open_positions()
         }
         if open_position_symbols:
             before = len(candidates)
@@ -633,7 +648,7 @@ class PennyMomentumTrader(LiveExpertInterface):
 
         # Build the known-symbols set: open positions + previously monitored + screener results
         open_position_symbols = {
-            pos["symbol"] for pos in PennyTradeManager(self.instance.id).get_open_positions()
+            pos["symbol"] for pos in self._trade_mgr.get_open_positions()
         }
         prev_monitored = self._get_previously_monitored_symbols(market_analysis.id)
         screener_symbols = {c.get("symbol") for c in screener_candidates if c.get("symbol")}
@@ -815,15 +830,30 @@ class PennyMomentumTrader(LiveExpertInterface):
 
             self.logger.info(f"Deep triage: analyzing {symbol}")
 
-            # Gather data from all configured vendors
-            self.logger.debug(f"Phase 3 [{symbol}]: gathering news")
-            news_text = self._gather_news(symbol)
-            self.logger.debug(f"Phase 3 [{symbol}]: gathering fundamentals")
-            fundamentals_text = self._gather_fundamentals(symbol)
-            self.logger.debug(f"Phase 3 [{symbol}]: gathering insider data")
-            insider_text = self._gather_insider(symbol)
-            self.logger.debug(f"Phase 3 [{symbol}]: gathering social sentiment")
-            social_text = self._gather_social(symbol)
+            # Gather data from all configured vendors in parallel
+            self.logger.debug(f"Phase 3 [{symbol}]: gathering data (news, fundamentals, insider, social)")
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = {
+                    executor.submit(self._gather_news, symbol): "news",
+                    executor.submit(self._gather_fundamentals, symbol): "fundamentals",
+                    executor.submit(self._gather_insider, symbol): "insider",
+                    executor.submit(self._gather_social, symbol): "social",
+                }
+                gathered = {}
+                for future in as_completed(futures):
+                    key = futures[future]
+                    try:
+                        gathered[key] = future.result()
+                    except Exception as e:
+                        self.logger.warning(f"Phase 3 [{symbol}]: {key} gathering failed: {e}")
+                        gathered[key] = f"No {key} data available."
+
+            news_text = gathered.get("news", "No news data available.")
+            fundamentals_text = gathered.get("fundamentals", "No fundamentals data available.")
+            insider_text = gathered.get("insider", "No insider data available.")
+            social_text = gathered.get("social", "No social sentiment data available.")
 
             # Build prompt and call LLM
             prompt = build_deep_triage_prompt(
@@ -854,9 +884,12 @@ class PennyMomentumTrader(LiveExpertInterface):
 
                 confidence = result.get("confidence", 0)
                 self.logger.debug(f"Phase 3 [{symbol}]: confidence={confidence}, catalyst={result.get('catalyst', '')!r}")
-                if confidence < 40:
+                min_confidence = int(self.get_setting_with_interface_default(
+                    "min_confidence_threshold", log_warning=False
+                ))
+                if confidence < min_confidence:
                     self.logger.info(
-                        f"{symbol} confidence {confidence} too low, skipping"
+                        f"{symbol} confidence {confidence} below threshold {min_confidence}, skipping"
                     )
                     continue
 
@@ -949,7 +982,7 @@ class PennyMomentumTrader(LiveExpertInterface):
 
         # Calculate position sizes for finalists
         if finalists:
-            trade_mgr = PennyTradeManager(self.instance.id)
+            trade_mgr = self._trade_mgr
             available = self.get_available_balance() or 0
             sizing = trade_mgr.calculate_position_sizes(finalists, available)
             for symbol, size_info in sizing.items():
@@ -1141,7 +1174,7 @@ class PennyMomentumTrader(LiveExpertInterface):
 
         ohlcv_provider = get_provider("ohlcv", ohlcv_vendor)
 
-        trade_mgr = PennyTradeManager(self.instance.id)
+        trade_mgr = self._trade_mgr
         monitor_tick = 0
 
         while not self._stop_event.is_set():
@@ -1203,6 +1236,25 @@ class PennyMomentumTrader(LiveExpertInterface):
 
                         exit_conds = info.get("exit_conditions", {})
 
+                        # Hard EOD exit for intraday strategies
+                        if info.get("strategy") == "intraday":
+                            market_close = self._get_market_close_today()
+                            market_now = self._get_market_now()
+                            minutes_to_close = (market_close - market_now).total_seconds() / 60
+                            if minutes_to_close <= 15:
+                                self.logger.info(
+                                    f"Intraday EOD hard-exit for {symbol} "
+                                    f"({minutes_to_close:.0f}m to close)"
+                                )
+                                trade_mgr.execute_exit(
+                                    symbol, exit_pct=100.0, reason="intraday EOD hard-exit"
+                                )
+                                info["status"] = "closed"
+                                self._record_trade(
+                                    market_analysis, symbol, "exit", "intraday EOD hard-exit"
+                                )
+                                continue
+
                         # Check stop loss
                         stop_loss = exit_conds.get("stop_loss")
                         if stop_loss and evaluator.evaluate(
@@ -1220,9 +1272,12 @@ class PennyMomentumTrader(LiveExpertInterface):
                             )
                             continue
 
-                        # Check take profit tiers
+                        # Check take profit tiers (skip already-triggered tiers)
                         take_profit = exit_conds.get("take_profit", [])
-                        for tp_tier in take_profit:
+                        triggered_tiers = info.get("triggered_tp_tiers", [])
+                        for tier_idx, tp_tier in enumerate(take_profit):
+                            if tier_idx in triggered_tiers:
+                                continue
                             if not isinstance(tp_tier, dict):
                                 continue
                             tp_condition = tp_tier.get("condition")
@@ -1231,19 +1286,21 @@ class PennyMomentumTrader(LiveExpertInterface):
                                 tp_condition, symbol, entry_price=entry_price
                             ):
                                 self.logger.info(
-                                    f"Take profit triggered for {symbol} "
+                                    f"Take profit tier {tier_idx + 1} triggered for {symbol} "
                                     f"(exit {tp_exit_pct}%)"
                                 )
                                 trade_mgr.execute_exit(
                                     symbol,
                                     exit_pct=tp_exit_pct,
-                                    reason=f"take profit tier ({tp_exit_pct}%)",
+                                    reason=f"take profit tier {tier_idx + 1} ({tp_exit_pct}%)",
                                 )
+                                triggered_tiers.append(tier_idx)
+                                info["triggered_tp_tiers"] = triggered_tiers
                                 self._record_trade(
                                     market_analysis,
                                     symbol,
                                     "partial_exit" if tp_exit_pct < 100 else "exit",
-                                    f"take profit {tp_exit_pct}%",
+                                    f"take profit tier {tier_idx + 1} ({tp_exit_pct}%)",
                                 )
                                 if tp_exit_pct >= 100:
                                     info["status"] = "closed"
@@ -1296,6 +1353,19 @@ class PennyMomentumTrader(LiveExpertInterface):
                         f"Error monitoring {symbol}: {e}", exc_info=True
                     )
 
+            # Periodically re-evaluate exit conditions for open positions via LLM
+            exit_update_interval = int(self.get_setting_with_interface_default(
+                "exit_update_interval_ticks", log_warning=False
+            ))
+            if (
+                exit_update_interval > 0
+                and monitor_tick % exit_update_interval == 0
+                and open_positions
+            ):
+                self._update_exit_conditions_via_llm(
+                    monitored, open_position_symbols, market_analysis
+                )
+
             # Persist updated monitored state
             self._update_state(market_analysis, {"monitored_symbols": monitored})
 
@@ -1321,6 +1391,111 @@ class PennyMomentumTrader(LiveExpertInterface):
                 market_analysis.status = MarketAnalysisStatus.COMPLETED
 
         self.logger.info("Pipeline completed")
+
+    # ------------------------------------------------------------------
+    # Live exit condition updates
+    # ------------------------------------------------------------------
+
+    def _update_exit_conditions_via_llm(
+        self,
+        monitored: Dict[str, Dict[str, Any]],
+        open_position_symbols: set,
+        market_analysis: MarketAnalysis,
+    ):
+        """
+        For each open position, fetch fresh news and ask the LLM whether
+        exit conditions should be adjusted (tighten stops, widen TP, etc.).
+        """
+        entry_model = self.get_setting_with_interface_default(
+            "entry_definition_llm", log_warning=False
+        )
+
+        for symbol in list(open_position_symbols):
+            if self._stop_event.is_set():
+                break
+
+            info = monitored.get(symbol)
+            if not info or info.get("status") not in ("triggered", "watching"):
+                continue
+
+            exit_conds = info.get("exit_conditions")
+            if not exit_conds:
+                continue
+
+            try:
+                self.logger.info(f"Re-evaluating exit conditions for {symbol}")
+
+                # Gather fresh news + social (lightweight check)
+                news_text = self._gather_news(symbol)
+                social_text = self._gather_social(symbol)
+                new_data = f"LATEST NEWS:\n{news_text}\n\nSOCIAL SENTIMENT:\n{social_text}"
+
+                prompt = build_exit_update_prompt(
+                    symbol=symbol,
+                    current_conditions=exit_conds,
+                    new_data=new_data,
+                )
+
+                llm = ModelFactory.create_llm(
+                    entry_model,
+                    temperature=0.3,
+                    expert_instance_id=self.instance.id,
+                    use_case="PennyMomentum Exit Update",
+                )
+                response = llm.invoke(prompt)
+                raw_text = response.content if hasattr(response, "content") else str(response)
+
+                # Check for NO_CHANGE
+                if raw_text.strip().strip('"') == "NO_CHANGE":
+                    self.logger.debug(f"Exit conditions unchanged for {symbol}")
+                    continue
+
+                updated = self._parse_json_response(raw_text, expected_type=dict)
+                if not updated:
+                    self.logger.warning(f"Failed to parse exit update for {symbol}")
+                    continue
+
+                # Validate the updated conditions
+                validation_set = {"stop_loss": updated.get("stop_loss"), "take_profit": updated.get("take_profit")}
+                is_valid, errors = validate_condition_set(
+                    {k: v for k, v in validation_set.items() if v is not None}
+                )
+                if not is_valid:
+                    self.logger.warning(f"Invalid updated exit conditions for {symbol}: {errors}")
+                    continue
+
+                # Apply updates
+                if "stop_loss" in updated:
+                    info["exit_conditions"]["stop_loss"] = updated["stop_loss"]
+                if "take_profit" in updated:
+                    info["exit_conditions"]["take_profit"] = updated["take_profit"]
+                    # Reset triggered tiers since conditions changed
+                    info["triggered_tp_tiers"] = []
+
+                self.logger.info(f"Exit conditions updated for {symbol}")
+
+                self._save_analysis_output(
+                    market_analysis,
+                    provider_category="llm",
+                    provider_name=entry_model,
+                    name=f"exit_update_{symbol}_{datetime.now(timezone.utc).strftime('%H%M')}",
+                    output_type="json",
+                    text=raw_text,
+                    symbol=symbol,
+                )
+
+                from ....core.db import log_activity
+                from ....core.types import ActivityLogSeverity, ActivityLogType
+                log_activity(
+                    severity=ActivityLogSeverity.INFO,
+                    activity_type=ActivityLogType.ANALYSIS_COMPLETED,
+                    description=f"PennyMomentumTrader updated exit conditions for {symbol} based on new market data",
+                    data={"symbol": symbol, "updated_keys": list(updated.keys())},
+                    source_expert_id=self.instance.id,
+                )
+
+            except Exception as e:
+                self.logger.error(f"Exit condition update failed for {symbol}: {e}", exc_info=True)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1393,7 +1568,7 @@ class PennyMomentumTrader(LiveExpertInterface):
                         "action": action,
                         "reason": reason,
                         "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "status": "filled",
+                        "status": "submitted",
                     }
                 )
                 state["executed_trades"] = trades
@@ -1594,7 +1769,7 @@ class PennyMomentumTrader(LiveExpertInterface):
                 enriched.append(enriched_candidate)
             except Exception as e:
                 self.logger.warning(
-                    f"StockTwits enrichment failed for {symbol}: {e}", exc_info=True
+                    f"StockTwits enrichment failed for {symbol}: {e}"
                 )
                 enriched.append(candidate)
 
