@@ -19,18 +19,17 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from ...core.interfaces import LiveExpertInterface
-from ...core.models import (
+from ....core.interfaces import LiveExpertInterface
+from ....core.models import (
     AnalysisOutput,
     ExpertInstance,
     ExpertRecommendation,
     MarketAnalysis,
 )
-from ...core.db import add_instance, get_db, get_instance
-from ...core.types import MarketAnalysisStatus, OrderRecommendation, RiskLevel, TimeHorizon
-from ...core.utils import get_account_instance_from_id
-from ...core.ModelFactory import ModelFactory
-from ...logger import get_expert_logger
+from ....core.db import add_instance, get_db, get_instance
+from ....core.types import MarketAnalysisStatus, OrderRecommendation, RiskLevel, TimeHorizon
+from ....core.ModelFactory import ModelFactory
+from ....logger import get_expert_logger
 
 from .conditions import ConditionEvaluator, get_condition_types_for_llm, validate_condition_set
 from .prompts import (
@@ -377,7 +376,7 @@ class PennyMomentumTrader(LiveExpertInterface):
         for pos in open_positions:
             try:
                 with get_db() as session:
-                    from ...core.models import Transaction
+                    from ....core.models import Transaction
 
                     trans = session.get(Transaction, pos["transaction_id"])
                     if trans and trans.created_at:
@@ -420,7 +419,7 @@ class PennyMomentumTrader(LiveExpertInterface):
             "screener_provider", log_warning=False
         )
 
-        from ...modules.dataproviders import get_provider
+        from ....modules.dataproviders import get_provider
 
         screener = get_provider("screener", screener_name)
 
@@ -461,6 +460,7 @@ class PennyMomentumTrader(LiveExpertInterface):
 
         # Filter through account to remove untradeable symbols
         if candidates:
+            from ....core.utils import get_account_instance_from_id
             account = get_account_instance_from_id(self.instance.account_id)
             candidate_symbols = [c["symbol"] for c in candidates if c.get("symbol")]
             if candidate_symbols:
@@ -478,7 +478,7 @@ class PennyMomentumTrader(LiveExpertInterface):
                 tradeable_symbols = [c["symbol"] for c in candidates]
                 if tradeable_symbols:
                     try:
-                        from ...core.InstrumentAutoAdder import get_instrument_auto_adder
+                        from ....core.InstrumentAutoAdder import get_instrument_auto_adder
 
                         auto_adder = get_instrument_auto_adder()
                         auto_adder.queue_instruments_for_addition(
@@ -848,7 +848,7 @@ class PennyMomentumTrader(LiveExpertInterface):
         )
         ohlcv_vendor = ohlcv_vendor_list[0] if ohlcv_vendor_list else "yfinance"
 
-        from ...modules.dataproviders import get_provider
+        from ....modules.dataproviders import get_provider
 
         ohlcv_provider = get_provider("ohlcv", ohlcv_vendor)
 
@@ -887,6 +887,7 @@ class PennyMomentumTrader(LiveExpertInterface):
 
                 try:
                     # Get current price for display
+                    from ....core.utils import get_account_instance_from_id
                     account = get_account_instance_from_id(self.instance.account_id)
                     current_price = account.get_instrument_current_price(symbol)
                     if current_price is not None:
@@ -1141,7 +1142,7 @@ class PennyMomentumTrader(LiveExpertInterface):
         vendor_list = self.get_setting_with_interface_default(
             "vendor_news", log_warning=False
         )
-        from ...modules.dataproviders import get_provider
+        from ....modules.dataproviders import get_provider
 
         all_news: List[str] = []
         for vendor_name in vendor_list:
@@ -1165,7 +1166,7 @@ class PennyMomentumTrader(LiveExpertInterface):
         vendor_list = self.get_setting_with_interface_default(
             "vendor_fundamentals", log_warning=False
         )
-        from ...modules.dataproviders import get_provider
+        from ....modules.dataproviders import get_provider
 
         for vendor_name in vendor_list:
             try:
@@ -1186,7 +1187,7 @@ class PennyMomentumTrader(LiveExpertInterface):
         vendor_list = self.get_setting_with_interface_default(
             "vendor_insider", log_warning=False
         )
-        from ...modules.dataproviders import get_provider
+        from ....modules.dataproviders import get_provider
 
         for vendor_name in vendor_list:
             try:
