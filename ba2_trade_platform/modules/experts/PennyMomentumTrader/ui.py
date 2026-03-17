@@ -357,6 +357,13 @@ class PennyMomentumTraderUI:
                         </q-td>
                     ''')
 
+                    # Word-wrap the details column
+                    table.add_slot('body-cell-details', r'''
+                        <q-td :props="props" style="white-space: normal; word-break: break-word; min-width: 300px; max-width: 600px;">
+                            {{ props.row.details }}
+                        </q-td>
+                    ''')
+
     # ------------------------------------------------------------------
     # Tab 3: Triage
     # ------------------------------------------------------------------
