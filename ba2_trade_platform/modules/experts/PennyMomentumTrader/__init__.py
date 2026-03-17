@@ -1563,7 +1563,7 @@ class PennyMomentumTrader(LiveExpertInterface):
                         # Update condition status for UI
                         entry_conds = info.get("entry_conditions", {})
                         if entry_conds:
-                            info["entry_conditions_status"] = (
+                            info["conditions_last_eval"] = (
                                 evaluator.get_condition_status(
                                     entry_conds, symbol, entry_price
                                 )
@@ -1572,35 +1572,40 @@ class PennyMomentumTrader(LiveExpertInterface):
                     elif status == "watching":
                         # Check entry conditions for watched symbols
                         entry_conds = info.get("entry_conditions", {})
-                        if entry_conds and evaluator.evaluate(entry_conds, symbol):
-                            self.logger.info(
-                                f"Entry conditions met for {symbol}"
-                            )
-                            qty = info.get("qty", 0)
-                            if qty and qty > 0:
-                                order_id = trade_mgr.execute_entry(
-                                    symbol=symbol,
-                                    qty=qty,
-                                    confidence=info.get("confidence", 50),
-                                    catalyst=info.get("catalyst", ""),
-                                    strategy=info.get("strategy", "swing"),
-                                    exit_conditions=info.get("exit_conditions"),
-                                    market_analysis_id=market_analysis.id,
+                        if not entry_conds:
+                            self.logger.debug(f"No entry_conditions stored for {symbol}, skipping")
+                        else:
+                            # Collect per-condition status for UI and debug logging
+                            cond_status = evaluator.get_condition_status(entry_conds, symbol)
+                            info["conditions_last_eval"] = cond_status
+                            if monitor_tick % 10 == 1:
+                                met = [k for k, v in cond_status.items() if v]
+                                unmet = [k for k, v in cond_status.items() if not v]
+                                self.logger.debug(
+                                    f"{symbol} conditions — met: {met} | unmet: {unmet}"
                                 )
-                                if order_id:
-                                    info["status"] = "triggered"
-                                    self._record_trade(
-                                        market_analysis,
-                                        symbol,
-                                        "entry",
-                                        info.get("catalyst", ""),
+                            # Use evaluate() to respect all/any composite logic
+                            if evaluator.evaluate(entry_conds, symbol):
+                                self.logger.info(f"Entry conditions met for {symbol}")
+                                qty = info.get("qty", 0)
+                                if qty and qty > 0:
+                                    order_id = trade_mgr.execute_entry(
+                                        symbol=symbol,
+                                        qty=qty,
+                                        confidence=info.get("confidence", 50),
+                                        catalyst=info.get("catalyst", ""),
+                                        strategy=info.get("strategy", "swing"),
+                                        exit_conditions=info.get("exit_conditions"),
+                                        market_analysis_id=market_analysis.id,
                                     )
-
-                        # Update condition status for UI
-                        if entry_conds:
-                            info["entry_conditions_status"] = (
-                                evaluator.get_condition_status(entry_conds, symbol)
-                            )
+                                    if order_id:
+                                        info["status"] = "triggered"
+                                        self._record_trade(
+                                            market_analysis,
+                                            symbol,
+                                            "entry",
+                                            info.get("catalyst", ""),
+                                        )
 
                 except Exception as e:
                     self.logger.error(
