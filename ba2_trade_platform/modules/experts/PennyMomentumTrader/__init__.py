@@ -402,7 +402,9 @@ class PennyMomentumTrader(LiveExpertInterface):
         return result
 
     def _run_daily_pipeline(self):
-        self.logger.info("=== Daily pipeline starting ===")
+        is_resume = getattr(self, "_resume_mode", False)
+        mode_label = "RESUME (mid-day restart)" if is_resume else "FULL"
+        self.logger.info(f"=== Daily pipeline starting [{mode_label}] ===")
         self._trade_mgr = PennyTradeManager(self.instance.id)
         market_analysis = self._create_market_analysis()
         self.logger.debug(f"Created MarketAnalysis id={market_analysis.id}")
@@ -416,8 +418,15 @@ class PennyMomentumTrader(LiveExpertInterface):
             self.logger.info("Pipeline aborted after phase 0 (stop requested)")
             return
 
-        # Check balance for new entries
-        if self.has_sufficient_balance_for_entry():
+        if is_resume:
+            # Mid-day restart: skip scan phases, carry over watched symbols via phase 4
+            self.logger.info(
+                "Resume mode: skipping scan phases (1, 1b, 2, 3) — "
+                "phase 4 will carry over monitored symbols from previous run"
+            )
+            finalists = []
+        # Check balance for new entries (only on full runs)
+        elif self.has_sufficient_balance_for_entry():
             # Phase 1: Screen — no LLM, returns top-N by volume
             self._current_phase = "screen"
             self._update_state(market_analysis, {"phase": "screen"})
@@ -1934,8 +1943,11 @@ class PennyMomentumTrader(LiveExpertInterface):
                 market_analysis.state = state
 
     def _get_idle_status(self) -> Optional[str]:
-        """Surface watched symbols and condition match counts in the countdown log."""
+        """Evaluate conditions every 15-min tick and surface results in the countdown log."""
         try:
+            # Refresh condition evaluation so state stays current during idle periods
+            self.evaluate_conditions_now()
+
             from sqlmodel import select as sql_select
             with get_db() as session:
                 statement = (

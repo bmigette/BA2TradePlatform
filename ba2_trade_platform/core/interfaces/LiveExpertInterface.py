@@ -36,6 +36,7 @@ class LiveExpertInterface(MarketExpertInterface):
         self._manual_start_event = threading.Event()
         self._is_running = False
         self._current_phase: Optional[str] = None
+        self._resume_mode: bool = False
 
     # ------------------------------------------------------------------
     # Builtin settings merge
@@ -197,37 +198,55 @@ class LiveExpertInterface(MarketExpertInterface):
 
                 if self._should_auto_start():
                     # Before kickoff — wait until kickoff time (manual can interrupt)
+                    self._resume_mode = False
                     seconds = self._seconds_until_kickoff()
                     if seconds > 0:
                         _log.info(
                             f"LiveExpert {self.id}: waiting {seconds:.0f}s until kickoff"
                         )
-                        if self._wait_with_countdown(seconds, _log):
+                        if self._wait_with_countdown(seconds, _log, waiting_for="next scan in"):
                             break  # stop requested
                 else:
-                    # Past kickoff — wait for manual start or next kickoff
-                    seconds = self._seconds_until_next_kickoff()
-                    _log.info(
-                        f"LiveExpert {self.id}: past kickoff, waiting for manual start "
-                        f"or next kickoff in {seconds:.0f}s"
-                    )
-                    triggered = self._wait_with_countdown(seconds, _log, return_triggered=True)
-                    if self._stop_event.is_set():
-                        break
-                    if triggered is False:
-                        # Timed out — loop back to re-evaluate
-                        continue
+                    # Past kickoff
+                    if self._is_market_open():
+                        # Market is currently open — resume immediately without scan phases
+                        self._resume_mode = True
+                        _log.info(
+                            f"LiveExpert {self.id}: market is open on startup — resuming pipeline "
+                            f"(skipping scan, carrying over monitored symbols)"
+                        )
+                    else:
+                        # Market is closed — wait for next trading day's kickoff
+                        self._resume_mode = False
+                        seconds = self._seconds_until_next_kickoff()
+                        _log.info(
+                            f"LiveExpert {self.id}: past kickoff and market closed, waiting for "
+                            f"manual start or next kickoff in {seconds:.0f}s"
+                        )
+                        triggered = self._wait_with_countdown(
+                            seconds, _log, return_triggered=True, waiting_for="next scan in"
+                        )
+                        if self._stop_event.is_set():
+                            break
+                        if triggered is False:
+                            # Timed out — loop back to re-evaluate
+                            continue
 
                 # Run the daily pipeline
                 if not self._stop_event.is_set():
                     try:
-                        _log.info(f"LiveExpert {self.id}: running daily pipeline")
+                        _log.info(
+                            f"LiveExpert {self.id}: running daily pipeline "
+                            f"(resume_mode={self._resume_mode})"
+                        )
                         self._run_daily_pipeline()
                     except Exception as e:
                         _log.error(
                             f"LiveExpert {self.id}: daily pipeline failed: {e}",
                             exc_info=True,
                         )
+                    finally:
+                        self._resume_mode = False
 
                     # Sleep until next kickoff
                     seconds = self._seconds_until_next_kickoff()
@@ -236,7 +255,7 @@ class LiveExpertInterface(MarketExpertInterface):
                             f"LiveExpert {self.id}: pipeline done, sleeping {seconds:.0f}s "
                             f"until next kickoff"
                         )
-                        self._wait_with_countdown(seconds, _log)
+                        self._wait_with_countdown(seconds, _log, waiting_for="next scan in")
 
         except Exception as e:
             _log.error(
@@ -261,8 +280,18 @@ class LiveExpertInterface(MarketExpertInterface):
         """
         return None
 
-    def _wait_with_countdown(self, total_seconds: float, _log, return_triggered: bool = False):
+    def _wait_with_countdown(
+        self,
+        total_seconds: float,
+        _log,
+        return_triggered: bool = False,
+        waiting_for: str = "next action in",
+    ):
         """Wait for *total_seconds*, logging a countdown every 15 minutes.
+
+        Args:
+            waiting_for: Label used in the countdown log, e.g. "next scan in" or
+                         "market opens in".  Defaults to "next action in".
 
         Returns:
             If *return_triggered* is False: True when stop was requested.
@@ -279,9 +308,9 @@ class LiveExpertInterface(MarketExpertInterface):
             extra = self._get_idle_status()
             suffix = f" | {extra}" if extra else ""
             if hours > 0:
-                _log.info(f"LiveExpert {self.id}: will start in {hours}h {minutes}min{suffix}")
+                _log.info(f"LiveExpert {self.id}: {waiting_for} {hours}h {minutes}min{suffix}")
             elif minutes > 0:
-                _log.info(f"LiveExpert {self.id}: will start in {minutes}min{suffix}")
+                _log.info(f"LiveExpert {self.id}: {waiting_for} {minutes}min{suffix}")
 
             wait_chunk = min(remaining, INTERVAL)
             triggered = self._manual_start_event.wait(timeout=wait_chunk)
