@@ -501,9 +501,10 @@ class ConditionEvaluator:
                     cur = df["volume"].iloc[-1]
                     required = avg * cond["multiplier"]
                     return (
-                        f"{label} (today_vol={self._fmt(cur)} vs "
-                        f"{cond['multiplier']}× avg{cond['window']}d={self._fmt(avg)} "
-                        f"→ need {self._fmt(required)})"
+                        f"{label} (today_vol={self._fmt(cur)} "
+                        f"{'≥' if met else '<'} "
+                        f"need≥{self._fmt(required)} "
+                        f"[{cond['multiplier']}× avg{cond['window']}d={self._fmt(avg)}])"
                     )
 
             if ctype in ("rsi_above", "rsi_below", "rsi_between"):
