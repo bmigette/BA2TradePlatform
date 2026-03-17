@@ -382,11 +382,13 @@ class PennyMomentumTrader(LiveExpertInterface):
         with get_db() as session:
             ma = session.get(MarketAnalysis, market_analysis.id)
             if ma:
+                from sqlalchemy.orm import attributes
                 state = ma.state or {}
                 timings = state.get("phase_timings", {})
                 timings[phase_name] = elapsed
                 state["phase_timings"] = timings
                 ma.state = state
+                attributes.flag_modified(ma, "state")
                 session.add(ma)
                 session.commit()
                 market_analysis.state = state
@@ -1583,11 +1585,13 @@ class PennyMomentumTrader(LiveExpertInterface):
         with get_db() as session:
             ma = session.get(MarketAnalysis, market_analysis.id)
             if ma:
+                from sqlalchemy.orm import attributes
                 ma.status = MarketAnalysisStatus.COMPLETED
                 state = ma.state or {}
                 state["phase"] = "complete"
                 state["completed_at"] = datetime.now(timezone.utc).isoformat()
                 ma.state = state
+                attributes.flag_modified(ma, "state")
                 session.add(ma)
                 session.commit()
                 market_analysis.state = state
@@ -1877,12 +1881,14 @@ class PennyMomentumTrader(LiveExpertInterface):
 
     def _update_state(self, market_analysis: MarketAnalysis, updates: Dict[str, Any]):
         """Merge updates into the market_analysis.state and persist."""
+        from sqlalchemy.orm import attributes
         with get_db() as session:
             ma = session.get(MarketAnalysis, market_analysis.id)
             if ma:
                 state = ma.state or {}
                 state.update(updates)
                 ma.state = state
+                attributes.flag_modified(ma, "state")
                 session.add(ma)
                 session.commit()
                 market_analysis.state = state
@@ -1928,6 +1934,7 @@ class PennyMomentumTrader(LiveExpertInterface):
         with get_db() as session:
             ma = session.get(MarketAnalysis, market_analysis.id)
             if ma:
+                from sqlalchemy.orm import attributes
                 state = ma.state or {}
                 trades = state.get("executed_trades", [])
                 trades.append(
@@ -1941,6 +1948,7 @@ class PennyMomentumTrader(LiveExpertInterface):
                 )
                 state["executed_trades"] = trades
                 ma.state = state
+                attributes.flag_modified(ma, "state")
                 session.add(ma)
                 session.commit()
                 market_analysis.state = state
