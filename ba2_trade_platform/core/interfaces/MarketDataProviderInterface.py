@@ -482,7 +482,7 @@ class MarketDataProviderInterface(DataProviderInterface):
         # Normalize start_date to interval boundary for proper time series alignment
         normalized_start = self.normalize_time_to_interval(start_date, interval)
         
-        logger.info(f"Getting DataFrame for {symbol} from {normalized_start.date()} to {end_date.date()}, interval={interval}")
+        logger.debug(f"Getting DataFrame for {symbol} from {normalized_start.date()} to {end_date.date()}, interval={interval}")
         if normalized_start != start_date:
             logger.debug(f"Start date normalized from {start_date} to {normalized_start} for interval {interval}")
         
@@ -554,7 +554,7 @@ class MarketDataProviderInterface(DataProviderInterface):
         mask = (df['Date'] >= filter_start) & (df['Date'] <= filter_end)
         filtered_df = df[mask].copy()
         
-        logger.info(f"Returning DataFrame with {len(filtered_df)} records")
+        logger.debug(f"Returning DataFrame with {len(filtered_df)} records")
         
         return filtered_df
     
