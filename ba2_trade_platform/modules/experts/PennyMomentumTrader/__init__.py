@@ -362,10 +362,11 @@ class PennyMomentumTrader(LiveExpertInterface):
                 "type": "str",
                 "required": False,
                 "default": "",
-                "description": "StockTwits OAuth token for trending API",
+                "description": "StockTwits OAuth token (optional — public access works without it)",
                 "tooltip": (
-                    "OAuth token for StockTwits API authentication. "
-                    "Obtain from developer.stocktwits.com. Required for use_stocktwits_discovery."
+                    "Optional OAuth token for StockTwits API. "
+                    "The trending endpoints are publicly accessible without authentication. "
+                    "Providing a token gives higher rate limits."
                 ),
                 "ui_editor_type": "password",
             },
@@ -1055,10 +1056,7 @@ class PennyMomentumTrader(LiveExpertInterface):
 
         oauth_token = self.get_setting_with_interface_default(
             "stocktwits_oauth_token", log_warning=False
-        )
-        if not oauth_token:
-            self.logger.debug("Phase 1c: skipped (stocktwits_oauth_token not configured)")
-            return []
+        ) or ""  # empty string = unauthenticated public access (still works)
 
         price_max = float(self.get_setting_with_interface_default(
             "stocktwits_discovery_price_max", log_warning=False

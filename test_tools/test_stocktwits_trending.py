@@ -6,16 +6,18 @@ Tests the three trending discovery endpoints used by StockTwitsTrending:
   - most_active
   - symbols_enhanced
 
+No authentication required — endpoints are publicly accessible.
+An OAuth token can optionally be provided for higher rate limits.
+
 Usage:
-    # Set your OAuth token as env var or edit OAUTH_TOKEN below
-    python test_tools/test_stocktwits_trending.py [--token YOUR_TOKEN] [--price-max 6.0]
+    python test_tools/test_stocktwits_trending.py
+    python test_tools/test_stocktwits_trending.py --token YOUR_TOKEN --price-max 8.0
 
 The script prints a summary table for each endpoint, then shows the full
 deduplicated result from StockTwitsTrending.get_trending_symbols().
 """
 
 import sys
-import json
 import argparse
 from curl_cffi import requests as cf_requests
 
@@ -27,18 +29,12 @@ ENDPOINTS = ["top_watched", "most_active", "symbols_enhanced"]
 # ---------------------------------------------------------------------------
 
 parser = argparse.ArgumentParser(description="Test StockTwits trending endpoints")
-parser.add_argument("--token", default="", help="StockTwits OAuth token")
+parser.add_argument("--token", default="", help="Optional StockTwits OAuth token")
 parser.add_argument("--price-max", type=float, default=6.0, help="Max price filter (default 6.0)")
 parser.add_argument("--limit", type=int, default=100, help="Symbols per endpoint (default 100)")
 args = parser.parse_args()
 
-# Fallback: paste token here for quick testing
-OAUTH_TOKEN = args.token or ""
-
-if not OAUTH_TOKEN:
-    print("ERROR: No OAuth token provided. Use --token YOUR_TOKEN or set OAUTH_TOKEN in the script.")
-    sys.exit(1)
-
+OAUTH_TOKEN = args.token.strip()
 PRICE_MAX = args.price_max
 LIMIT = args.limit
 
@@ -46,8 +42,17 @@ SESSION = cf_requests.Session(impersonate="chrome124")
 HEADERS = {
     "accept": "application/json",
     "accept-language": "en-US,en;q=0.9",
-    "authorization": f"OAuth {OAUTH_TOKEN}",
+    "cache-control": "no-cache",
+    "origin": "https://stocktwits.com",
+    "pragma": "no-cache",
+    "referer": "https://stocktwits.com/",
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-site",
 }
+if OAUTH_TOKEN:
+    HEADERS["authorization"] = f"OAuth {OAUTH_TOKEN}"
+
 PARAMS = {
     "class": "all",
     "limit": LIMIT,
@@ -86,7 +91,8 @@ def extract_change_pct(sym_obj: dict) -> float | None:
 # Test each endpoint individually
 # ---------------------------------------------------------------------------
 
-print(f"\nStockTwits Trending API Test  |  price_max=${PRICE_MAX:.2f}  |  limit={LIMIT} per endpoint")
+auth_mode = f"authenticated (token={OAUTH_TOKEN[:8]}...)" if OAUTH_TOKEN else "unauthenticated (public)"
+print(f"\nStockTwits Trending API Test  |  price_max=${PRICE_MAX:.2f}  |  limit={LIMIT}  |  {auth_mode}")
 print("=" * 80)
 
 all_endpoint_data: dict[str, list] = {}

@@ -7,7 +7,9 @@ Fetches trending/active symbols from StockTwits API endpoints:
   - symbols_enhanced:  StockTwits' own trending score ranking
 
 All endpoints return price data via `payloads=qprices&enable_price_v2=true`.
-Requires a StockTwits OAuth token (obtain from developer.stocktwits.com).
+No authentication required — endpoints are publicly accessible via browser
+TLS impersonation (curl_cffi). An OAuth token can optionally be provided
+for authenticated access, but is not needed.
 """
 
 from typing import Any, Dict, List, Optional
@@ -17,6 +19,18 @@ from ba2_trade_platform.logger import logger
 TRENDING_BASE = "https://api.stocktwits.com/api/2/trending"
 ENDPOINTS = ["top_watched", "most_active", "symbols_enhanced"]
 
+_BROWSER_HEADERS = {
+    "accept": "application/json",
+    "accept-language": "en-US,en;q=0.9",
+    "cache-control": "no-cache",
+    "origin": "https://stocktwits.com",
+    "pragma": "no-cache",
+    "referer": "https://stocktwits.com/",
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-site",
+}
+
 
 class StockTwitsTrending:
     """
@@ -24,12 +38,20 @@ class StockTwitsTrending:
 
     Queries three trending endpoints and deduplicates results, optionally
     filtering by maximum price. Uses curl_cffi for TLS browser impersonation.
+    No OAuth token required for public access.
     """
 
-    def __init__(self, oauth_token: str, price_max: float = 6.0, limit_per_endpoint: int = 100):
+    def __init__(
+        self,
+        oauth_token: str = "",
+        price_max: float = 6.0,
+        limit_per_endpoint: int = 100,
+    ):
         """
         Args:
-            oauth_token: StockTwits OAuth token for API authentication.
+            oauth_token: Optional StockTwits OAuth token. When provided, adds
+                an Authorization header (authenticated rate limits are higher).
+                Leave empty for unauthenticated public access.
             price_max: Only include symbols priced at or below this value.
             limit_per_endpoint: Max symbols to request per endpoint (API max: 100).
         """
@@ -41,22 +63,22 @@ class StockTwitsTrending:
                 "Install it with: pip install curl_cffi"
             ) from exc
 
-        self._token = oauth_token
+        self._token = oauth_token.strip()
         self._price_max = price_max
         self._limit = min(max(1, limit_per_endpoint), 100)
         self._session = cf_requests.Session(impersonate="chrome124")
         logger.debug(
-            f"Initialized StockTwitsTrending (price_max={price_max}, limit={self._limit})"
+            f"Initialized StockTwitsTrending (price_max={price_max}, limit={self._limit}, "
+            f"auth={'yes' if self._token else 'no'})"
         )
 
     def _fetch_endpoint(self, endpoint: str) -> List[Dict[str, Any]]:
         """Fetch one trending endpoint and return raw symbol list."""
         url = f"{TRENDING_BASE}/{endpoint}.json"
-        headers = {
-            "accept": "application/json",
-            "accept-language": "en-US,en;q=0.9",
-            "authorization": f"OAuth {self._token}",
-        }
+        headers = dict(_BROWSER_HEADERS)
+        if self._token:
+            headers["authorization"] = f"OAuth {self._token}"
+
         params = {
             "class": "all",
             "limit": self._limit,
@@ -75,22 +97,14 @@ class StockTwitsTrending:
 
     def _parse_price(self, symbol_obj: Dict[str, Any]) -> Optional[float]:
         """Extract last price from symbol payload (price_v2 or prices)."""
-        # price_v2 payload
-        price_v2 = symbol_obj.get("price_v2") or {}
-        if price_v2.get("last"):
+        for key in ("price_v2", "prices"):
+            p = symbol_obj.get(key) or {}
             try:
-                return float(price_v2["last"])
+                val = float(p.get("last") or 0)
+                if val > 0:
+                    return val
             except (TypeError, ValueError):
                 pass
-
-        # legacy prices payload
-        prices = symbol_obj.get("prices") or {}
-        if prices.get("last"):
-            try:
-                return float(prices["last"])
-            except (TypeError, ValueError):
-                pass
-
         return None
 
     def get_trending_symbols(self) -> List[Dict[str, Any]]:
