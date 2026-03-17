@@ -470,6 +470,7 @@ class PennyMomentumTraderUI:
         status = info.get('status', 'unknown')
         entry_conditions = info.get('entry_conditions', {})
         exit_conditions = info.get('exit_conditions', {})
+        conditions_last_eval = info.get('conditions_last_eval')
         last_checked = info.get('last_checked', '-')
         last_price = info.get('last_price')
         entry_price = info.get('entry_price')
@@ -511,8 +512,16 @@ class PennyMomentumTraderUI:
                 except (ValueError, ZeroDivisionError):
                     pass
 
-            # Entry conditions checklist
-            if entry_conditions:
+            # Last manual evaluation results (from Evaluate Conditions action)
+            if conditions_last_eval:
+                met_count = sum(1 for v in conditions_last_eval.values() if v is True)
+                total_count = len(conditions_last_eval)
+                color = 'text-green-700' if met_count == total_count else 'text-orange-700'
+                ui.label(
+                    f'Last eval: {met_count}/{total_count} conditions met'
+                ).classes(f'text-sm font-bold mt-2 {color}')
+                self._render_condition_checklist('Evaluated Conditions', conditions_last_eval)
+            elif entry_conditions:
                 self._render_condition_checklist('Entry Conditions', entry_conditions)
 
             # Exit conditions checklist

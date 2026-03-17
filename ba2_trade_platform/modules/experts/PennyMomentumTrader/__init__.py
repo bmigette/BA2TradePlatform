@@ -78,6 +78,13 @@ class PennyMomentumTrader(LiveExpertInterface):
                 "icon": "stop",
                 "callback": "request_stop",
             },
+            {
+                "name": "evaluate_conditions",
+                "label": "Evaluate Conditions",
+                "description": "Fetch live prices and evaluate entry conditions for all watched symbols now",
+                "icon": "rule",
+                "callback": "evaluate_conditions_now",
+            },
         ]
 
     @classmethod
@@ -727,6 +734,25 @@ class PennyMomentumTrader(LiveExpertInterface):
             self.logger.warning(f"Failed to load previously monitored symbols: {e}")
         return set()
 
+    def _get_previous_monitored_data(self, current_market_analysis_id: int) -> Dict[str, Dict[str, Any]]:
+        """Return the full monitored_symbols dict from the most recent prior MarketAnalysis."""
+        try:
+            with get_db() as session:
+                from sqlmodel import select as sql_select
+                statement = (
+                    sql_select(MarketAnalysis)
+                    .where(MarketAnalysis.expert_instance_id == self.instance.id)
+                    .where(MarketAnalysis.id != current_market_analysis_id)
+                    .order_by(MarketAnalysis.created_at.desc())  # type: ignore[union-attr]
+                    .limit(1)
+                )
+                ma = session.exec(statement).first()
+                if ma and ma.state:
+                    return dict(ma.state.get("monitored_symbols", {}))
+        except Exception as e:
+            self.logger.warning(f"Failed to load previous monitored data: {e}")
+        return {}
+
     def _phase_1b_llm_discovery(
         self, screener_candidates: List[Dict[str, Any]], market_analysis: MarketAnalysis
     ) -> List[Dict[str, Any]]:
@@ -1206,10 +1232,24 @@ class PennyMomentumTrader(LiveExpertInterface):
         )
         condition_types_str = get_condition_types_for_llm()
 
-        # Load existing monitored symbols from state
+        # Load existing monitored symbols from state; seed from previous run if empty
+        # (handles app restart and daily cycle where a fresh MarketAnalysis is created)
         monitored: Dict[str, Dict[str, Any]] = dict(
             market_analysis.state.get("monitored_symbols", {})
         )
+        if not monitored:
+            prev_data = self._get_previous_monitored_data(market_analysis.id)
+            carried = {
+                sym: info
+                for sym, info in prev_data.items()
+                if info.get("status") == "watching"
+            }
+            if carried:
+                self.logger.info(
+                    f"Phase 4: carrying over {len(carried)} monitored symbols from previous run: "
+                    f"{list(carried.keys())}"
+                )
+                monitored = carried
         max_monitored = int(self.get_setting_with_interface_default(
             "max_monitored_symbols", log_warning=False
         ))
@@ -1892,6 +1932,96 @@ class PennyMomentumTrader(LiveExpertInterface):
                 session.add(ma)
                 session.commit()
                 market_analysis.state = state
+
+    def evaluate_conditions_now(self) -> str:
+        """
+        Manually evaluate entry conditions for all watched/triggered symbols and
+        persist results back to the MarketAnalysis state. Called via expert actions.
+        """
+        try:
+            from sqlmodel import select as sql_select
+            from sqlalchemy.orm import attributes
+
+            # Find the most recent MarketAnalysis for this expert
+            with get_db() as session:
+                statement = (
+                    sql_select(MarketAnalysis)
+                    .where(MarketAnalysis.expert_instance_id == self.instance.id)
+                    .order_by(MarketAnalysis.created_at.desc())  # type: ignore[union-attr]
+                    .limit(1)
+                )
+                ma = session.exec(statement).first()
+                if not ma or not ma.state:
+                    return "No MarketAnalysis found"
+                ma_id = ma.id
+                monitored: Dict[str, Dict[str, Any]] = dict(
+                    ma.state.get("monitored_symbols", {})
+                )
+
+            if not monitored:
+                return "No monitored symbols"
+
+            active_symbols = [
+                s for s, i in monitored.items()
+                if i.get("status") in ("watching", "triggered")
+            ]
+            if not active_symbols:
+                return "No active symbols to evaluate"
+
+            ohlcv_vendor_list = self.get_setting_with_interface_default(
+                "vendor_ohlcv", log_warning=False
+            )
+            ohlcv_vendor = ohlcv_vendor_list[0] if ohlcv_vendor_list else "yfinance"
+            market_tz_str = self.get_setting_with_interface_default(
+                "market_timezone", log_warning=False
+            )
+            from ....modules.dataproviders import get_provider
+            ohlcv_provider = get_provider("ohlcv", ohlcv_vendor)
+            evaluator = ConditionEvaluator(ohlcv_provider, market_timezone=market_tz_str)
+
+            live_prices = self._get_live_prices(active_symbols)
+            now_iso = datetime.now(timezone.utc).isoformat()
+            evaluated = 0
+
+            for symbol in active_symbols:
+                info = monitored[symbol]
+                evaluator.clear_cache()
+                try:
+                    price = live_prices.get(symbol)
+                    if price is not None:
+                        info["last_price"] = price
+                    info["last_checked"] = now_iso
+
+                    entry_conds = info.get("entry_conditions", {})
+                    if entry_conds:
+                        status_map = evaluator.get_condition_status(
+                            entry_conds, symbol, entry_price=info.get("entry_price")
+                        )
+                        info["conditions_last_eval"] = status_map
+
+                    evaluated += 1
+                except Exception as e:
+                    self.logger.error(
+                        f"evaluate_conditions_now: error for {symbol}: {e}", exc_info=True
+                    )
+
+            # Persist back
+            with get_db() as session:
+                ma_db = session.get(MarketAnalysis, ma_id)
+                if ma_db:
+                    state = ma_db.state or {}
+                    state["monitored_symbols"] = monitored
+                    ma_db.state = state
+                    attributes.flag_modified(ma_db, "state")
+                    session.add(ma_db)
+                    session.commit()
+
+            self.logger.info(f"evaluate_conditions_now: evaluated {evaluated} symbols")
+            return f"Evaluated {evaluated} symbols"
+
+        except Exception as e:
+            self.logger.error(f"evaluate_conditions_now failed: {e}", exc_info=True)
+            return f"Error: {e}"
 
     def _save_analysis_output(
         self,
