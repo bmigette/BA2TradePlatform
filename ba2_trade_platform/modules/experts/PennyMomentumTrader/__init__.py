@@ -1100,19 +1100,20 @@ class PennyMomentumTrader(LiveExpertInterface):
             results.append({
                 "symbol": symbol,
                 "price": price,
-                "volume": None,
-                "market_cap": None,
-                "sector": None,
-                "industry": None,
-                "exchange": None,
+                "volume": item.get("volume"),
+                "market_cap": item.get("market_cap"),
+                "sector": item.get("sector"),
+                "industry": item.get("industry"),
+                "exchange": item.get("exchange"),
                 "beta": None,
                 "is_actively_trading": True,
                 "company_name": item.get("company_name"),
                 "country": "US",
+                "rvol": item.get("rvol"),
+                "change_percent": item.get("change_pct"),
                 "_source": "stocktwits_trending",
                 "_stocktwits_sources": item.get("sources", []),
                 "_stocktwits_watchlist_count": item.get("watchlist_count"),
-                "_stocktwits_change_pct": item.get("change_pct"),
             })
             all_known_symbols.add(symbol)
 

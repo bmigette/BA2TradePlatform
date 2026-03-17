@@ -22,7 +22,12 @@ import argparse
 from curl_cffi import requests as cf_requests
 
 TRENDING_BASE = "https://api.stocktwits.com/api/2/trending"
-ENDPOINTS = ["top_watched", "most_active", "symbols_enhanced"]
+# (endpoint_name, json_key_in_response)
+ENDPOINTS = [
+    ("top_watched", "top_watched"),
+    ("most_active", "most_active"),
+    ("symbols_enhanced", "symbols"),
+]
 
 # ---------------------------------------------------------------------------
 # CLI args
@@ -63,27 +68,25 @@ PARAMS = {
 
 
 def extract_price(sym_obj: dict) -> float | None:
-    """Extract last price from symbol payload."""
-    for key in ("price_v2", "prices"):
-        p = sym_obj.get(key) or {}
-        try:
-            val = float(p.get("last") or 0)
-            if val > 0:
-                return val
-        except (TypeError, ValueError):
-            pass
+    """Extract last price from price_data payload."""
+    pd = sym_obj.get("price_data") or {}
+    try:
+        val = float(pd.get("last") or 0)
+        if val > 0:
+            return val
+    except (TypeError, ValueError):
+        pass
     return None
 
 
 def extract_change_pct(sym_obj: dict) -> float | None:
-    for key in ("price_v2", "prices"):
-        p = sym_obj.get(key) or {}
-        try:
-            val = p.get("change_percent")
-            if val is not None:
-                return float(val)
-        except (TypeError, ValueError):
-            pass
+    pd = sym_obj.get("price_data") or {}
+    try:
+        val = pd.get("percent_change")
+        if val is not None:
+            return float(val)
+    except (TypeError, ValueError):
+        pass
     return None
 
 
@@ -97,7 +100,7 @@ print("=" * 80)
 
 all_endpoint_data: dict[str, list] = {}
 
-for endpoint in ENDPOINTS:
+for endpoint, response_key in ENDPOINTS:
     url = f"{TRENDING_BASE}/{endpoint}.json"
     print(f"\n--- {endpoint} ---")
     print(f"GET {url}")
@@ -112,7 +115,7 @@ for endpoint in ENDPOINTS:
         continue
 
     data = resp.json()
-    symbols = data.get("symbols", [])
+    symbols = data.get(response_key, [])
     cursor = data.get("cursor", {})
     print(f"Total symbols returned: {len(symbols)}  |  cursor: {cursor}")
 
@@ -120,17 +123,21 @@ for endpoint in ENDPOINTS:
     under_price = [s for s in symbols if (extract_price(s) or 999) <= PRICE_MAX]
     print(f"Under ${PRICE_MAX:.2f}: {len(under_price)} symbols")
     print()
-    print(f"{'Symbol':<8} {'Price':>7} {'Chg%':>7} {'Watchlist':>10} {'TrendScore':>11}  Company")
-    print("-" * 70)
-    for sym_obj in under_price[:30]:  # show first 30
+    print(f"{'Symbol':<8} {'Price':>7} {'Chg%':>7} {'RVOL':>6} {'Watchlist':>10} {'TrendScore':>11}  Company")
+    print("-" * 80)
+    for sym_obj in under_price[:30]:
         symbol = (sym_obj.get("symbol") or "").upper()
         price = extract_price(sym_obj) or 0.0
         chg = extract_change_pct(sym_obj)
         chg_str = f"{chg:+.1f}%" if chg is not None else "  n/a"
+        fund = sym_obj.get("fundamentals") or {}
+        vol = (sym_obj.get("price_data") or {}).get("volume")
+        avg_vol = fund.get("average_daily_volume_last_month")
+        rvol_str = f"{vol/avg_vol:.1f}x" if vol and avg_vol and avg_vol > 0 else "  n/a"
         wl = sym_obj.get("watchlist_count", "")
         ts = sym_obj.get("trending_score", "")
-        name = (sym_obj.get("title") or sym_obj.get("name") or "")[:30]
-        print(f"{symbol:<8} {price:>7.3f} {chg_str:>7} {str(wl):>10} {str(ts):>11}  {name}")
+        name = (sym_obj.get("title") or "")[:28]
+        print(f"{symbol:<8} {price:>7.3f} {chg_str:>7} {rvol_str:>6} {str(wl):>10} {str(ts):>11}  {name}")
 
     if len(under_price) > 30:
         print(f"  ... and {len(under_price) - 30} more")
@@ -159,16 +166,18 @@ try:
     multi_source = [r for r in results if len(r["sources"]) > 1]
     print(f"Appearing in 2+ endpoints: {len(multi_source)}")
     print()
-    print(f"{'Symbol':<8} {'Price':>7} {'Chg%':>7} {'WatchList':>9} {'Sources':<35}  Company")
-    print("-" * 80)
+    print(f"{'Symbol':<8} {'Price':>7} {'Chg%':>7} {'RVOL':>6} {'WatchList':>9} {'Sources':<35}  Company")
+    print("-" * 85)
     for r in results:
         price = r.get("price") or 0.0
         chg = r.get("change_pct")
         chg_str = f"{chg:+.1f}%" if chg is not None else "  n/a"
+        rvol = r.get("rvol")
+        rvol_str = f"{rvol:.1f}x" if rvol else "  n/a"
         wl = r.get("watchlist_count", "")
         sources = "+".join(r.get("sources", []))
         name = (r.get("company_name") or "")[:25]
-        print(f"{r['symbol']:<8} {price:>7.3f} {chg_str:>7} {str(wl):>9} {sources:<35}  {name}")
+        print(f"{r['symbol']:<8} {price:>7.3f} {chg_str:>7} {rvol_str:>6} {str(wl):>9} {sources:<35}  {name}")
 
     print(f"\nDone. {len(results)} symbols ready for pipeline injection.")
 

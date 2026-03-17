@@ -6,10 +6,15 @@ Fetches trending/active symbols from StockTwits API endpoints:
   - most_active:       symbols with highest message volume
   - symbols_enhanced:  StockTwits' own trending score ranking
 
-All endpoints return price data via `payloads=qprices&enable_price_v2=true`.
+All endpoints return price data (price_data) and fundamentals payloads.
 No authentication required — endpoints are publicly accessible via browser
 TLS impersonation (curl_cffi). An OAuth token can optionally be provided
-for authenticated access, but is not needed.
+for authenticated access / higher rate limits.
+
+Response JSON key per endpoint:
+  - top_watched     → data["top_watched"]
+  - most_active     → data["most_active"]
+  - symbols_enhanced → data["symbols"]
 """
 
 from typing import Any, Dict, List, Optional
@@ -17,7 +22,13 @@ from ba2_trade_platform.logger import logger
 
 
 TRENDING_BASE = "https://api.stocktwits.com/api/2/trending"
-ENDPOINTS = ["top_watched", "most_active", "symbols_enhanced"]
+
+# (endpoint_name, json_key_in_response)
+ENDPOINTS = [
+    ("top_watched", "top_watched"),
+    ("most_active", "most_active"),
+    ("symbols_enhanced", "symbols"),
+]
 
 _BROWSER_HEADERS = {
     "accept": "application/json",
@@ -72,7 +83,7 @@ class StockTwitsTrending:
             f"auth={'yes' if self._token else 'no'})"
         )
 
-    def _fetch_endpoint(self, endpoint: str) -> List[Dict[str, Any]]:
+    def _fetch_endpoint(self, endpoint: str, response_key: str) -> List[Dict[str, Any]]:
         """Fetch one trending endpoint and return raw symbol list."""
         url = f"{TRENDING_BASE}/{endpoint}.json"
         headers = dict(_BROWSER_HEADERS)
@@ -92,19 +103,17 @@ class StockTwitsTrending:
         resp.raise_for_status()
 
         data = resp.json()
-        # Response shape: {"symbols": [...], "cursor": {...}}
-        return data.get("symbols", [])
+        return data.get(response_key, [])
 
     def _parse_price(self, symbol_obj: Dict[str, Any]) -> Optional[float]:
-        """Extract last price from symbol payload (price_v2 or prices)."""
-        for key in ("price_v2", "prices"):
-            p = symbol_obj.get(key) or {}
-            try:
-                val = float(p.get("last") or 0)
-                if val > 0:
-                    return val
-            except (TypeError, ValueError):
-                pass
+        """Extract last price from price_data payload."""
+        pd = symbol_obj.get("price_data") or {}
+        try:
+            val = float(pd.get("last") or 0)
+            if val > 0:
+                return val
+        except (TypeError, ValueError):
+            pass
         return None
 
     def get_trending_symbols(self) -> List[Dict[str, Any]]:
@@ -112,15 +121,16 @@ class StockTwitsTrending:
         Fetch all three trending endpoints and return a deduplicated list of symbols.
 
         Returns:
-            List of dicts with keys: symbol, price, change_pct, watchlist_count,
-            trending_score, sources (list of endpoints where symbol appeared).
+            List of dicts with keys: symbol, price, change_pct, volume,
+            market_cap, float_shares, avg_volume, rvol, watchlist_count,
+            trending_score, sector, industry, exchange, sources.
             Only symbols with price > 0 and price <= price_max are included.
         """
         seen: Dict[str, Dict[str, Any]] = {}  # symbol -> merged record
 
-        for endpoint in ENDPOINTS:
+        for endpoint, response_key in ENDPOINTS:
             try:
-                raw_symbols = self._fetch_endpoint(endpoint)
+                raw_symbols = self._fetch_endpoint(endpoint, response_key)
                 logger.debug(
                     f"StockTwitsTrending [{endpoint}]: got {len(raw_symbols)} symbols"
                 )
@@ -140,20 +150,38 @@ class StockTwitsTrending:
                     continue
 
                 if symbol in seen:
-                    # Already seen from another endpoint — add source tag
                     seen[symbol]["sources"].append(endpoint)
                 else:
-                    price_v2 = sym_obj.get("price_v2") or sym_obj.get("prices") or {}
+                    pd = sym_obj.get("price_data") or {}
+                    fund = sym_obj.get("fundamentals") or {}
+
                     try:
-                        change_pct = float(price_v2.get("change_percent") or 0)
+                        change_pct = float(pd.get("percent_change") or 0)
                     except (TypeError, ValueError):
                         change_pct = 0.0
 
+                    volume = pd.get("volume")
+                    avg_volume = fund.get("average_daily_volume_last_month")
+                    rvol = None
+                    if volume and avg_volume and avg_volume > 0:
+                        try:
+                            rvol = round(float(volume) / float(avg_volume), 2)
+                        except (TypeError, ValueError):
+                            pass
+
                     seen[symbol] = {
                         "symbol": symbol,
-                        "company_name": sym_obj.get("title") or sym_obj.get("name"),
+                        "company_name": sym_obj.get("title"),
                         "price": price,
                         "change_pct": change_pct,
+                        "volume": volume,
+                        "market_cap": fund.get("market_capitalization"),
+                        "float_shares": fund.get("float_current"),
+                        "avg_volume": avg_volume,
+                        "rvol": rvol,
+                        "sector": fund.get("sector_name") or sym_obj.get("sector"),
+                        "industry": fund.get("industry_name") or sym_obj.get("industry"),
+                        "exchange": sym_obj.get("exchange"),
                         "watchlist_count": sym_obj.get("watchlist_count"),
                         "trending_score": sym_obj.get("trending_score"),
                         "sources": [endpoint],
