@@ -90,7 +90,7 @@ class TradeAction(ABC):
     def get_current_position(self) -> Optional[float]:
         """
         Get current position quantity for the instrument.
-        
+
         Returns:
             Position quantity (positive for long, negative for short, None if no position)
         """
@@ -102,6 +102,50 @@ class TradeAction(ABC):
             return None
         except Exception as e:
             logger.error(f"Error getting current position for {self.instrument_name}: {e}", exc_info=True)
+            return None
+
+    def get_expert_position(self) -> Optional[float]:
+        """
+        Get the expert's own position quantity for the instrument from transactions.
+
+        Unlike get_current_position() which returns the total broker position
+        (shared across all experts), this returns only the quantity belonging
+        to the expert that owns this action.
+
+        Returns:
+            Signed quantity (positive for long, negative for short), 0 if no
+            open transactions, or None if expert_id is unavailable.
+        """
+        expert_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
+        if not expert_id:
+            return None
+        try:
+            from sqlmodel import select, Session
+            from .models import Transaction
+            from .types import TransactionStatus
+            from .db import get_db
+
+            with Session(get_db().bind) as session:
+                statement = select(Transaction).where(
+                    Transaction.symbol == self.instrument_name,
+                    Transaction.expert_id == expert_id,
+                    Transaction.status.in_([TransactionStatus.WAITING, TransactionStatus.OPENED]),
+                )
+                transactions = session.exec(statement).all()
+
+            if not transactions:
+                return 0.0
+
+            total = 0.0
+            for t in transactions:
+                qty = abs(float(t.quantity))
+                if t.side == OrderDirection.BUY:
+                    total += qty
+                else:
+                    total -= qty
+            return total
+        except Exception as e:
+            logger.error(f"Error getting expert position for {self.instrument_name}: {e}", exc_info=True)
             return None
     
     def _build_order_data(self, expert_recommendation_id: Optional[int]) -> Optional[Dict[str, Any]]:
@@ -458,15 +502,56 @@ class BuyAction(TradeAction):
 
 class CloseAction(TradeAction):
     """Close existing position (buy to cover short or sell long position)."""
-    
+
     def execute(self) -> "TradeActionResult":
         """
         Close the existing position for the instrument.
-        
+
+        When an existing_order with a transaction_id is available (open_positions
+        use case), delegates to AccountInterface.close_transaction() which:
+        - Uses transaction.quantity (correct per-expert qty, not broker total)
+        - Passes is_closing_order=True to bypass hedging checks
+        - Handles existing close orders, ERROR retries, WAITING_TRIGGER cleanup
+
         Returns:
             TradeActionResult object containing execution results
         """
         try:
+            # Preferred path: delegate to close_transaction() when we have a transaction
+            if self.existing_order and self.existing_order.transaction_id:
+                transaction_id = self.existing_order.transaction_id
+
+                if not self.submit_to_broker:
+                    logger.info(
+                        f"CloseAction: automated trade modification disabled — "
+                        f"skipping close_transaction({transaction_id}) for {self.instrument_name}"
+                    )
+                    return self.create_and_save_action_result(
+                        action_type=ExpertActionType.CLOSE.value,
+                        success=True,
+                        message=f"Close action deferred for {self.instrument_name} (awaiting manual review)",
+                        data={"transaction_id": transaction_id, "status": "PENDING"}
+                    )
+
+                logger.info(
+                    f"CloseAction: delegating to close_transaction({transaction_id}) "
+                    f"for {self.instrument_name}"
+                )
+                result = self.account.close_transaction(transaction_id)
+
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.CLOSE.value,
+                    success=result.get("success", False),
+                    message=result.get("message", "Unknown result"),
+                    data={
+                        "transaction_id": transaction_id,
+                        "close_order_id": result.get("close_order_id"),
+                        "canceled_count": result.get("canceled_count", 0),
+                        "deleted_count": result.get("deleted_count", 0),
+                    }
+                )
+
+            # Fallback: no transaction context — use broker position (legacy path)
             current_position = self.get_current_position()
             if current_position is None or current_position == 0:
                 return self.create_and_save_action_result(
@@ -475,24 +560,14 @@ class CloseAction(TradeAction):
                     message=f"No position to close for {self.instrument_name}",
                     data={}
                 )
-            
-            # Determine order side based on current position
-            if current_position > 0:
-                # Long position - sell to close
-                side = "sell"
-                quantity = current_position
-            else:
-                # Short position - buy to cover
-                side = "buy"
-                quantity = abs(current_position)
-            
-            # Create order record
+            side = "sell" if current_position > 0 else "buy"
+            quantity = abs(current_position)
+
             order_id = self.create_order_record(
                 side=side,
                 quantity=quantity,
                 order_type="market"
             )
-            
             if not order_id:
                 return self.create_and_save_action_result(
                     action_type=ExpertActionType.CLOSE.value,
@@ -500,19 +575,16 @@ class CloseAction(TradeAction):
                     message="Failed to create order record",
                     data={}
                 )
-            
-            # Retrieve the order object for submission (needs to be in a session)
+
             order_record = get_instance(TradingOrder, order_id)
             if not order_record:
-                logger.error(f"Failed to retrieve order {order_id} after creation")
                 return self.create_and_save_action_result(
                     action_type=ExpertActionType.CLOSE.value,
                     success=False,
                     message="Failed to retrieve order record",
                     data={}
                 )
-            
-            # Check if we should submit to broker or leave as PENDING
+
             if not self.submit_to_broker:
                 logger.info(f"Automated trade modification disabled - leaving order {order_id} in PENDING state for manual review")
                 return self.create_and_save_action_result(
@@ -521,12 +593,10 @@ class CloseAction(TradeAction):
                     message=f"Close order created in PENDING state for {self.instrument_name} (awaiting manual review)",
                     data={"order_id": order_id, "status": "PENDING"}
                 )
-            
-            # Submit order through account interface
-            submit_result = self.account.submit_order(order_record)
-            
+
+            submit_result = self.account.submit_order(order_record, is_closing_order=True)
+
             if submit_result is not None:
-                # Update order record with broker order ID (only if not already set)
                 if hasattr(submit_result, 'account_order_id') and submit_result.account_order_id:
                     new_broker_id = str(submit_result.account_order_id)
                     if order_record.broker_order_id and order_record.broker_order_id != new_broker_id:
@@ -538,25 +608,23 @@ class CloseAction(TradeAction):
                         order_record.broker_order_id = new_broker_id
                     order_record.status = OrderStatus.OPEN.value
                     update_instance(order_record)
-                
+
                 return self.create_and_save_action_result(
                     action_type=ExpertActionType.CLOSE.value,
                     success=True,
                     message=f"Close order submitted for {self.instrument_name}",
-                    data={"order_id": order_id, "broker_order_id": submit_result.account_order_id}
+                    data={"order_id": order_id, "broker_order_id": getattr(submit_result, 'account_order_id', None)}
                 )
             else:
-                # Update order status to failed
                 order_record.status = OrderStatus.CANCELED.value
                 update_instance(order_record)
-                
                 return self.create_and_save_action_result(
                     action_type=ExpertActionType.CLOSE.value,
                     success=False,
                     message=f"Failed to submit close order",
                     data={}
                 )
-                
+
         except Exception as e:
             logger.error(f"Error executing close action for {self.instrument_name}: {e}", exc_info=True)
             return self.create_and_save_action_result(
@@ -1477,12 +1545,12 @@ class IncreaseInstrumentShareAction(TradeAction):
             
             # Calculate target position value
             target_value = virtual_equity * (self.target_percent / 100.0)
-            
-            # Get current position value
-            current_position_qty = self.get_current_position()
+
+            # Get expert's own position (not broker total which includes other experts)
+            current_position_qty = self.get_expert_position()
             if current_position_qty is None:
                 current_position_qty = 0.0
-            
+
             current_price = self.get_current_price()
             if current_price is None:
                 return self.create_and_save_action_result(
@@ -1491,12 +1559,12 @@ class IncreaseInstrumentShareAction(TradeAction):
                     message=f"Cannot get current price for {self.instrument_name}",
                     data={}
                 )
-            
+
             current_value = abs(current_position_qty) * current_price
-            
+
             # Calculate additional value needed
             additional_value = target_value - current_value
-            
+
             if additional_value <= 0:
                 logger.info(f"Current position value ${current_value:.2f} already at or above target ${target_value:.2f}")
                 return self.create_and_save_action_result(
@@ -1505,22 +1573,22 @@ class IncreaseInstrumentShareAction(TradeAction):
                     message=f"Position already at target (current: {(current_value/virtual_equity*100):.1f}%, target: {self.target_percent}%)",
                     data={"current_value": current_value, "target_value": target_value}
                 )
-            
+
             # Check available balance
             account_balance = self.account.get_account_info().get('buying_power', 0)
             if additional_value > account_balance:
                 logger.warning(f"Additional value ${additional_value:.2f} exceeds available balance ${account_balance:.2f}")
                 additional_value = account_balance
-            
+
             # Calculate additional quantity needed
             additional_qty = additional_value / current_price
-            
+
             # Round to appropriate lot size (minimum 1 share)
             additional_qty = max(1.0, round(additional_qty))
-            
-            logger.info(f"Increasing {self.instrument_name}: current={current_position_qty}, additional={additional_qty}, "
+
+            logger.info(f"Increasing {self.instrument_name}: expert_qty={current_position_qty}, additional={additional_qty}, "
                        f"target_value=${target_value:.2f} ({self.target_percent}% of ${virtual_equity:.2f})")
-            
+
             # Determine side based on current position or recommendation
             if current_position_qty >= 0:
                 side = "BUY"
@@ -1651,9 +1719,9 @@ class DecreaseInstrumentShareAction(TradeAction):
             
             # Calculate target position value
             target_value = virtual_equity * (self.target_percent / 100.0)
-            
-            # Get current position
-            current_position_qty = self.get_current_position()
+
+            # Get expert's own position (not broker total which includes other experts)
+            current_position_qty = self.get_expert_position()
             if current_position_qty is None or current_position_qty == 0:
                 return self.create_and_save_action_result(
                     action_type=ExpertActionType.DECREASE_INSTRUMENT_SHARE.value,
@@ -1661,7 +1729,7 @@ class DecreaseInstrumentShareAction(TradeAction):
                     message="No position to decrease",
                     data={}
                 )
-            
+
             current_price = self.get_current_price()
             if current_price is None:
                 return self.create_and_save_action_result(
@@ -1670,12 +1738,12 @@ class DecreaseInstrumentShareAction(TradeAction):
                     message=f"Cannot get current price for {self.instrument_name}",
                     data={}
                 )
-            
+
             current_value = abs(current_position_qty) * current_price
-            
+
             # Calculate reduction needed
             reduction_value = current_value - target_value
-            
+
             if reduction_value <= 0:
                 logger.info(f"Current position value ${current_value:.2f} already at or below target ${target_value:.2f}")
                 return self.create_and_save_action_result(
@@ -1684,13 +1752,13 @@ class DecreaseInstrumentShareAction(TradeAction):
                     message=f"Position already at target (current: {(current_value/virtual_equity*100):.1f}%, target: {self.target_percent}%)",
                     data={"current_value": current_value, "target_value": target_value}
                 )
-            
+
             # Calculate quantity to sell
             reduction_qty = reduction_value / current_price
-            
+
             # Round appropriately
             reduction_qty = round(reduction_qty)
-            
+
             # Ensure we keep at least 1 share if not closing completely
             remaining_qty = abs(current_position_qty) - reduction_qty
             if self.target_percent > 0 and remaining_qty < 1:
@@ -1703,10 +1771,10 @@ class DecreaseInstrumentShareAction(TradeAction):
                         message="Cannot reduce position while maintaining minimum 1 share",
                         data={}
                     )
-            
-            logger.info(f"Decreasing {self.instrument_name}: current_qty={current_position_qty}, reduction={reduction_qty}, "
+
+            logger.info(f"Decreasing {self.instrument_name}: expert_qty={current_position_qty}, reduction={reduction_qty}, "
                        f"target_value=${target_value:.2f} ({self.target_percent}% of ${virtual_equity:.2f})")
-            
+
             # Determine side (opposite of current position)
             if current_position_qty > 0:
                 side = "SELL"  # Close long position

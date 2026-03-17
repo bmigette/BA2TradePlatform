@@ -769,7 +769,7 @@ class AlpacaAccount(AccountInterface):
         return orders
 
     @alpaca_api_retry
-    def _submit_order_impl(self, trading_order: TradingOrder, tp_price: Optional[float] = None, sl_price: Optional[float] = None) -> TradingOrder:
+    def _submit_order_impl(self, trading_order: TradingOrder, tp_price: Optional[float] = None, sl_price: Optional[float] = None, is_closing_order: bool = False) -> TradingOrder:
         """
         Submit a new order to Alpaca.
         
@@ -822,7 +822,8 @@ class AlpacaAccount(AccountInterface):
             
             # CRITICAL CHECK: For entry orders of new transactions, verify no opposite-direction positions exist
             # This prevents accidentally closing existing positions when trying to open new ones
-            if trading_order.transaction_id and not trading_order.depends_on_order:
+            # Skip this check for close orders (they intentionally sell/buy against existing positions)
+            if trading_order.transaction_id and not trading_order.depends_on_order and not is_closing_order:
                 from ...core.models import Transaction
                 transaction = get_instance(Transaction, trading_order.transaction_id)
                 

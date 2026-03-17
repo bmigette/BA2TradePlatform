@@ -27,7 +27,7 @@ class AccountInterface(ReadOnlyAccountInterface):
 
 
     @abstractmethod
-    def _submit_order_impl(self, trading_order, tp_price: Optional[float] = None, sl_price: Optional[float] = None) -> Any:
+    def _submit_order_impl(self, trading_order, tp_price: Optional[float] = None, sl_price: Optional[float] = None, is_closing_order: bool = False) -> Any:
         """
         Internal implementation of order submission. This method should be implemented by child classes.
         The public submit_order method will call this after validation.
@@ -36,6 +36,7 @@ class AccountInterface(ReadOnlyAccountInterface):
             trading_order: A validated TradingOrder object containing all order details.
             tp_price: Optional take profit price for bracket orders (broker-specific support).
             sl_price: Optional stop loss price for bracket orders (broker-specific support).
+            is_closing_order: If True, this order closes an existing position (skip hedging checks).
 
         Returns:
             Any: The created order object if successful. Returns None or raises an exception if failed.
@@ -147,7 +148,7 @@ class AccountInterface(ReadOnlyAccountInterface):
         # Call the child class implementation (this will update the order with broker_order_id)
         # Pass tp_price and sl_price for brokers that support bracket orders
         # The trading_order object is now detached but all attributes are accessible
-        result = self._submit_order_impl(trading_order, tp_price=tp_price, sl_price=sl_price)
+        result = self._submit_order_impl(trading_order, tp_price=tp_price, sl_price=sl_price, is_closing_order=is_closing_order)
         
         # Set TP and/or SL if provided and order was successfully submitted
         # Use adjust methods which create OCO/OTO orders (avoids code duplication)
