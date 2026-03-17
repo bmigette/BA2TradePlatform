@@ -1579,10 +1579,13 @@ class PennyMomentumTrader(LiveExpertInterface):
                             cond_status = evaluator.get_condition_status(entry_conds, symbol)
                             info["conditions_last_eval"] = cond_status
                             if monitor_tick % 10 == 1:
-                                met = [k for k, v in cond_status.items() if v]
-                                unmet = [k for k, v in cond_status.items() if not v]
+                                details = evaluator.get_condition_details(entry_conds, symbol)
+                                met_parts = [v for k, v in details.items() if cond_status.get(k)]
+                                unmet_parts = [v for k, v in details.items() if not cond_status.get(k)]
                                 self.logger.debug(
-                                    f"{symbol} conditions — met: {met} | unmet: {unmet}"
+                                    f"{symbol} conditions\n"
+                                    f"  MET:   {met_parts}\n"
+                                    f"  UNMET: {unmet_parts}"
                                 )
                             # Use evaluate() to respect all/any composite logic
                             if evaluator.evaluate(entry_conds, symbol):

@@ -414,6 +414,121 @@ class ConditionEvaluator:
             key = f"{ctype}({params})" if params else ctype
             result[key] = self.evaluate_single(conditions, symbol, entry_price)
 
+    def get_condition_details(
+        self, conditions: dict, symbol: str, entry_price: Optional[float] = None
+    ) -> Dict[str, str]:
+        """
+        Return per-condition evaluation detail strings for debug logging.
+
+        Must be called after get_condition_status() so the indicator cache
+        is already populated. Returns a flat dict: condition_key -> detail_str.
+        E.g. "volume_above_avg(...)" -> "unmet (vol=123k < avg=456k × 1.5 = 684k)"
+        """
+        result: Dict[str, str] = {}
+        self._collect_details(conditions, symbol, entry_price, result)
+        return result
+
+    def _collect_details(
+        self,
+        conditions: dict,
+        symbol: str,
+        entry_price: Optional[float],
+        result: Dict[str, str],
+    ) -> None:
+        if "all" in conditions:
+            for c in conditions["all"]:
+                self._collect_details(c, symbol, entry_price, result)
+        elif "any" in conditions:
+            for c in conditions["any"]:
+                self._collect_details(c, symbol, entry_price, result)
+        else:
+            ctype = conditions.get("type", "unknown")
+            params = {k: v for k, v in conditions.items() if k != "type"}
+            key = f"{ctype}({params})" if params else ctype
+            met = self.evaluate_single(conditions, symbol, entry_price)
+            detail = self._explain_single(conditions, symbol, entry_price, met)
+            result[key] = detail
+
+    def _fmt(self, v: Optional[float]) -> str:
+        """Format a float for display (4 sig figs, no trailing zeros)."""
+        if v is None:
+            return "N/A"
+        if abs(v) >= 1_000_000:
+            return f"{v/1_000_000:.2f}M"
+        if abs(v) >= 1_000:
+            return f"{v/1_000:.1f}k"
+        return f"{v:.4g}"
+
+    def _explain_single(
+        self,
+        cond: dict,
+        symbol: str,
+        entry_price: Optional[float],
+        met: bool,
+    ) -> str:
+        """Return a human-readable detail string for a single condition."""
+        label = "met" if met else "unmet"
+        ctype = cond.get("type", "")
+        try:
+            if ctype in ("price_above", "price_below"):
+                price = self._get_current_price(symbol)
+                op = ">" if ctype == "price_above" else "<"
+                return f"{label} (price={self._fmt(price)} {op} {self._fmt(cond['value'])})"
+
+            if ctype in ("price_above_ema", "price_below_ema"):
+                price = self._get_current_price(symbol)
+                ema = self._get_ema(symbol, cond["period"], cond["timeframe"])
+                op = ">" if ctype == "price_above_ema" else "<"
+                return f"{label} (price={self._fmt(price)} {op} ema{cond['period']}={self._fmt(ema)} [{cond['timeframe']}])"
+
+            if ctype in ("price_above_sma", "price_below_sma"):
+                price = self._get_current_price(symbol)
+                sma = self._get_sma(symbol, cond["period"], cond["timeframe"])
+                op = ">" if ctype == "price_above_sma" else "<"
+                return f"{label} (price={self._fmt(price)} {op} sma{cond['period']}={self._fmt(sma)} [{cond['timeframe']}])"
+
+            if ctype in ("price_above_vwap", "price_below_vwap"):
+                price = self._get_current_price(symbol)
+                vwap = self._get_vwap(symbol, cond["timeframe"])
+                op = ">" if ctype == "price_above_vwap" else "<"
+                return f"{label} (price={self._fmt(price)} {op} vwap={self._fmt(vwap)} [{cond['timeframe']}])"
+
+            if ctype == "volume_above_avg":
+                lookback = _TIMEFRAME_LOOKBACK.get("1d", 365)
+                df = self._get_ohlcv(symbol, "1d", lookback)
+                if df is not None and len(df) >= cond["window"]:
+                    avg = df["volume"].iloc[-cond["window"]:].mean()
+                    cur = df["volume"].iloc[-1]
+                    required = avg * cond["multiplier"]
+                    return (
+                        f"{label} (vol={self._fmt(cur)}, "
+                        f"avg={self._fmt(avg)} × {cond['multiplier']} = {self._fmt(required)})"
+                    )
+
+            if ctype in ("rsi_above", "rsi_below", "rsi_between"):
+                rsi = self._get_rsi(symbol, cond["period"], cond["timeframe"])
+                if ctype == "rsi_between":
+                    return f"{label} (rsi={self._fmt(rsi)} in [{cond['min']}, {cond['max']}] [{cond['timeframe']}])"
+                op = ">" if ctype == "rsi_above" else "<"
+                return f"{label} (rsi={self._fmt(rsi)} {op} {cond['threshold']} [{cond['timeframe']}])"
+
+            if ctype in ("percent_above_entry", "percent_below_entry"):
+                price = self._get_current_price(symbol)
+                if entry_price:
+                    pct = cond["percent"]
+                    target = entry_price * (1.0 + pct / 100.0 if "above" in ctype else 1.0 - pct / 100.0)
+                    return f"{label} (price={self._fmt(price)}, target={self._fmt(target)} [{pct}% from entry={self._fmt(entry_price)}])"
+
+            if ctype in ("time_after", "time_before"):
+                import pytz as _pytz
+                tz = _pytz.timezone(self.market_timezone)
+                now = datetime.now(tz)
+                return f"{label} (now={now.strftime('%H:%M')}, threshold={cond['time']})"
+
+        except Exception:
+            pass
+        return label
+
     # -------------------------------------------------------------------
     # Data fetching helpers (cached per evaluation cycle)
     # -------------------------------------------------------------------
