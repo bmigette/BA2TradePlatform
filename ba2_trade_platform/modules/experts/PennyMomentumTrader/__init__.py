@@ -1283,6 +1283,24 @@ class PennyMomentumTrader(LiveExpertInterface):
             insider_text = gathered.get("insider", "No insider data available.")
             social_text = gathered.get("social", "No social sentiment data available.")
 
+            # Build market context string for strategy timing guidance
+            now_utc = datetime.now(timezone.utc)
+            # EST = UTC-5, EDT = UTC-4 (DST approx Mar–Nov)
+            from datetime import date as _date
+            _month = now_utc.month
+            _et_offset = -4 if 3 <= _month <= 11 else -5
+            now_et = now_utc + timedelta(hours=_et_offset)
+            tz_label = "EDT" if _et_offset == -4 else "EST"
+            is_open = self._is_market_open()
+            market_state = "Regular session open (09:30–16:00 ET)" if is_open else (
+                "Pre-market" if now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30)
+                else "After-hours / post-market"
+            )
+            market_context = (
+                f"{market_state}. "
+                f"Current time: {now_et.strftime('%Y-%m-%d %H:%M')} {tz_label}."
+            )
+
             # Build prompt and call LLM
             prompt = build_deep_triage_prompt(
                 symbol=symbol,
@@ -1290,6 +1308,7 @@ class PennyMomentumTrader(LiveExpertInterface):
                 insider=insider_text,
                 fundamentals=fundamentals_text,
                 social=social_text,
+                market_context=market_context,
             )
 
             try:

@@ -6,6 +6,7 @@ pipeline. The caller is responsible for invoking the LLM with the returned
 prompt.
 """
 
+import re
 import json
 from typing import Any, Dict, List
 
@@ -17,6 +18,46 @@ _SYSTEM_PREAMBLE = (
     "management and always define clear entry, stop-loss, and take-profit "
     "levels. Respond ONLY with valid JSON as specified."
 )
+
+_DEEP_TRIAGE_PREAMBLE = (
+    "You are a professional penny-stock momentum trader specializing in "
+    "catalyst-driven small-cap and micro-cap equities. You evaluate stocks "
+    "based on news catalysts, fundamental support, insider activity, and "
+    "social momentum. Respond ONLY with valid JSON as specified."
+)
+
+# Max chars allowed per data section before truncation in deep triage
+_MAX_SECTION_CHARS = 6000
+
+
+def _clean_section(text: str, max_chars: int = _MAX_SECTION_CHARS) -> str:
+    """
+    Strip AI search-loop noise and truncate oversized sections.
+
+    Removes repetitive LLM self-dialogue patterns like:
+      "I notice the search results... Let me search more specifically..."
+    that appear when websearch agents fail to find useful results.
+    """
+    # Remove lines that are search-loop noise (LLM talking to itself)
+    noise_patterns = [
+        r"(?m)^.*\bLet me search\b.*$",
+        r"(?m)^.*\bI notice the search results\b.*$",
+        r"(?m)^.*\bLet me try\b.*(?:search|query|look).*$",
+        r"(?m)^.*\bSearching for\b.*$",
+        r"(?m)^.*\bI'll search\b.*$",
+        r"(?m)^.*\bI need to search\b.*$",
+    ]
+    for pattern in noise_patterns:
+        text = re.sub(pattern, "", text)
+
+    # Collapse runs of blank lines left behind
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
+    # Truncate if still too long
+    if len(text) > max_chars:
+        text = text[:max_chars] + f"\n[... truncated at {max_chars} chars ...]"
+
+    return text
 
 
 def build_quick_filter_prompt(
@@ -142,6 +183,7 @@ def build_deep_triage_prompt(
     insider: str,
     fundamentals: str,
     social: str,
+    market_context: str = "",
 ) -> str:
     """
     Build the prompt for deep triage analysis of a single stock.
@@ -152,33 +194,46 @@ def build_deep_triage_prompt(
         insider: Insider trading data as a formatted string.
         fundamentals: Fundamental data as a formatted string.
         social: Social media sentiment data as a formatted string.
+        market_context: Optional string describing current date/time and market
+            state (e.g. "Pre-market, 2026-03-17 08:45 ET. Regular session opens
+            in 45 min."). Helps the LLM choose intraday vs swing strategy.
 
     Returns:
         Prompt string for the LLM.
     """
-    return f"""{_SYSTEM_PREAMBLE}
+    news_clean = _clean_section(news)
+    insider_clean = _clean_section(insider)
+    fundamentals_clean = _clean_section(fundamentals)
+    social_clean = _clean_section(social)
 
+    market_context_block = (
+        f"\nMARKET CONTEXT:\n{market_context}\n" if market_context else ""
+    )
+
+    return f"""{_DEEP_TRIAGE_PREAMBLE}
+{market_context_block}
 Perform a deep triage analysis of {symbol} for a potential penny-stock momentum trade. Evaluate all the data below and determine whether this stock has a tradeable setup.
 
 ANALYSIS FRAMEWORK:
 - Catalyst identification: Is there a clear, actionable catalyst (earnings beat, contract win, product launch, short squeeze setup)?
-- News quality: Is the news fresh (last 24-48h) and material, or stale/irrelevant?
-- Insider activity: Are insiders buying (bullish) or selling (bearish)?
+- News quality: Is the news fresh (last 24-48h) and material, or stale/irrelevant? Translate and synthesize any non-English headlines.
+- Insider activity: Distinguish between open-market purchases (bullish signal), open-market sales (bearish signal), and scheduled stock awards/grants such as A-Award transactions (neutral — these are corporate compensation, not a directional bet).
 - Fundamental support: Does revenue/cash position support the current price, or is this purely speculative?
 - Social momentum: Is there growing retail interest that could drive a momentum wave?
 - Risk factors: Dilution risk, reverse split history, SEC issues, or other red flags?
+- Strategy timing: Use the market context above to gauge whether the catalyst favors an intraday gap-and-run or a multi-day swing setup.
 
 --- NEWS ---
-{news}
+{news_clean}
 
 --- INSIDER ACTIVITY ---
-{insider}
+{insider_clean}
 
 --- FUNDAMENTALS ---
-{fundamentals}
+{fundamentals_clean}
 
 --- SOCIAL SENTIMENT ---
-{social}
+{social_clean}
 
 RESPOND with a single JSON object with exactly these keys:
 - "confidence": integer from 1-100 representing how confident you are this is a good trade (1=terrible, 100=exceptional setup)
