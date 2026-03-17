@@ -1933,6 +1933,39 @@ class PennyMomentumTrader(LiveExpertInterface):
                 session.commit()
                 market_analysis.state = state
 
+    def _get_idle_status(self) -> Optional[str]:
+        """Surface watched symbols and condition match counts in the countdown log."""
+        try:
+            from sqlmodel import select as sql_select
+            with get_db() as session:
+                statement = (
+                    sql_select(MarketAnalysis)
+                    .where(MarketAnalysis.expert_instance_id == self.instance.id)
+                    .order_by(MarketAnalysis.created_at.desc())  # type: ignore[union-attr]
+                    .limit(1)
+                )
+                ma = session.exec(statement).first()
+                if not ma or not ma.state:
+                    return None
+                monitored = ma.state.get("monitored_symbols", {})
+
+            watching = {s: i for s, i in monitored.items() if i.get("status") == "watching"}
+            if not watching:
+                return None
+
+            parts = []
+            for sym, info in watching.items():
+                eval_result = info.get("conditions_last_eval")
+                if eval_result:
+                    met = sum(1 for v in eval_result.values() if v is True)
+                    total = len(eval_result)
+                    parts.append(f"{sym} ({met}/{total})")
+                else:
+                    parts.append(sym)
+            return f"watching: {', '.join(parts)}"
+        except Exception:
+            return None
+
     def evaluate_conditions_now(self) -> str:
         """
         Manually evaluate entry conditions for all watched/triggered symbols and

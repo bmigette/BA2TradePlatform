@@ -253,8 +253,16 @@ class LiveExpertInterface(MarketExpertInterface):
     # Wait helpers
     # ------------------------------------------------------------------
 
+    def _get_idle_status(self) -> Optional[str]:
+        """
+        Return an optional status string appended to the countdown log every tick.
+        Subclasses can override this to surface live information (e.g. monitored symbols).
+        Return None to add nothing.
+        """
+        return None
+
     def _wait_with_countdown(self, total_seconds: float, _log, return_triggered: bool = False):
-        """Wait for *total_seconds*, logging a countdown every hour.
+        """Wait for *total_seconds*, logging a countdown every 15 minutes.
 
         Returns:
             If *return_triggered* is False: True when stop was requested.
@@ -262,16 +270,18 @@ class LiveExpertInterface(MarketExpertInterface):
             False if timed out, or True (stop) — caller checks _stop_event.
         """
         remaining = total_seconds
-        INTERVAL = 3600  # log every hour
+        INTERVAL = 900  # log every 15 minutes
 
         while remaining > 0 and not self._stop_event.is_set():
             # Log countdown
             hours = int(remaining // 3600)
             minutes = int((remaining % 3600) // 60)
+            extra = self._get_idle_status()
+            suffix = f" | {extra}" if extra else ""
             if hours > 0:
-                _log.info(f"LiveExpert {self.id}: will start in {hours}h {minutes}min")
+                _log.info(f"LiveExpert {self.id}: will start in {hours}h {minutes}min{suffix}")
             elif minutes > 0:
-                _log.info(f"LiveExpert {self.id}: will start in {minutes}min")
+                _log.info(f"LiveExpert {self.id}: will start in {minutes}min{suffix}")
 
             wait_chunk = min(remaining, INTERVAL)
             triggered = self._manual_start_event.wait(timeout=wait_chunk)
