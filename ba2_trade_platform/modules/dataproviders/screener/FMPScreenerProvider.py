@@ -101,6 +101,7 @@ class FMPScreenerProvider(ScreenerProviderInterface):
             "volume_min": "volumeMoreThan",
             "market_cap_min": "marketCapMoreThan",
             "market_cap_max": "marketCapLowerThan",
+            "float_max": "floatSharesUnder",
         }
 
         for key, fmp_key in filter_map.items():
@@ -133,4 +134,5 @@ class FMPScreenerProvider(ScreenerProviderInterface):
             "beta": item.get("beta"),
             "is_actively_trading": item.get("isActivelyTrading"),
             "country": item.get("country"),
+            "float_shares": item.get("floatShares"),
         }

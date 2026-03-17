@@ -168,6 +168,27 @@ class PennyMomentumTrader(LiveExpertInterface):
                 "description": "Maximum market cap for screener",
                 "tooltip": "Stocks with market cap above this value are excluded.",
             },
+            "scan_float_max": {
+                "type": "float",
+                "required": False,
+                "default": 500000000,
+                "description": "Maximum share float for screener",
+                "tooltip": "Stocks with float above this value are excluded. Lower float stocks move faster on volume. Set to 0 to disable.",
+            },
+            "min_relative_volume": {
+                "type": "float",
+                "required": True,
+                "default": 1.0,
+                "description": "Minimum relative volume (RVOL) to keep a candidate",
+                "tooltip": "RVOL = today's volume / average volume. 1.5 means 50% above average. Candidates below this are dropped. Set to 1.0 to disable filtering.",
+            },
+            "include_gainers": {
+                "type": "bool",
+                "required": False,
+                "default": True,
+                "description": "Merge FMP top gainers into screener results",
+                "tooltip": "Fetch today's biggest gainers from FMP and merge any matching price/mcap criteria into the candidate pool.",
+            },
             "scan_sector_exclude": {
                 "type": "str",
                 "required": False,
@@ -569,7 +590,7 @@ class PennyMomentumTrader(LiveExpertInterface):
         )
 
     def _phase_1_screen(self, market_analysis: MarketAnalysis) -> List[Dict[str, Any]]:
-        """Screen stocks via screener provider and filter for tradability."""
+        """Screen stocks via screener provider, merge gainers, enrich with RVOL, and filter for tradability."""
         self.logger.info("Phase 1: Screening stocks")
 
         screener_name = self.get_setting_with_interface_default(
@@ -593,30 +614,77 @@ class PennyMomentumTrader(LiveExpertInterface):
         max_candidates = int(self.get_setting_with_interface_default(
             "max_scan_candidates", log_warning=False
         ))
+        min_rvol = float(self.get_setting_with_interface_default(
+            "min_relative_volume", log_warning=False
+        ))
+        include_gainers = self.get_setting_with_interface_default(
+            "include_gainers", log_warning=False
+        )
+        price_min = self.get_setting_with_interface_default("scan_price_min", log_warning=False)
+        price_max = self.get_setting_with_interface_default("scan_price_max", log_warning=False)
+        mcap_min = self.get_setting_with_interface_default("scan_market_cap_min", log_warning=False)
+        mcap_max = self.get_setting_with_interface_default("scan_market_cap_max", log_warning=False)
+        float_max = self.get_setting_with_interface_default("scan_float_max", log_warning=False)
+
         filters = {
-            "price_min": self.get_setting_with_interface_default(
-                "scan_price_min", log_warning=False
-            ),
-            "price_max": self.get_setting_with_interface_default(
-                "scan_price_max", log_warning=False
-            ),
+            "price_min": price_min,
+            "price_max": price_max,
             "volume_min": self.get_setting_with_interface_default(
                 "scan_volume_min", log_warning=False
             ),
-            "market_cap_min": self.get_setting_with_interface_default(
-                "scan_market_cap_min", log_warning=False
-            ),
-            "market_cap_max": self.get_setting_with_interface_default(
-                "scan_market_cap_max", log_warning=False
-            ),
+            "market_cap_min": mcap_min,
+            "market_cap_max": mcap_max,
             "sector_exclude": sector_exclude,
         }
+        if float_max and float(float_max) > 0:
+            filters["float_max"] = float_max
 
         candidates = screener.screen_stocks(filters)
         self.logger.info(f"Screener returned {len(candidates)} candidates")
 
         # Track all filtered stocks with reasons
         filtered_stocks: Dict[str, Dict[str, Any]] = {}
+
+        # Merge FMP top gainers into candidate pool
+        seen_symbols = {c.get("symbol", "").upper() for c in candidates if c.get("symbol")}
+        gainers_count = 0
+        if include_gainers:
+            try:
+                raw_gainers = self._fetch_gainers()
+                for g in raw_gainers:
+                    sym = (g.get("symbol") or "").upper()
+                    if not sym or sym in seen_symbols:
+                        continue
+                    g_price = g.get("price", 0) or 0
+                    g_mcap = g.get("marketCap", 0) or 0
+                    if price_min is not None and g_price < float(price_min):
+                        continue
+                    if price_max is not None and g_price > float(price_max):
+                        continue
+                    if mcap_min is not None and g_mcap < float(mcap_min):
+                        continue
+                    if mcap_max is not None and g_mcap > float(mcap_max):
+                        continue
+                    g_sector = (g.get("sector") or "").lower()
+                    if sector_exclude and g_sector in [s.lower() for s in sector_exclude]:
+                        continue
+                    candidates.append({
+                        "symbol": sym,
+                        "company_name": g.get("name", ""),
+                        "price": g_price,
+                        "volume": g.get("volume", 0),
+                        "market_cap": g_mcap,
+                        "sector": g.get("sector", ""),
+                        "industry": g.get("industry", ""),
+                        "exchange": g.get("exchangeShortName") or g.get("exchange", ""),
+                        "_source": "gainers",
+                    })
+                    seen_symbols.add(sym)
+                    gainers_count += 1
+                if gainers_count:
+                    self.logger.info(f"Merged {gainers_count} FMP top gainers into candidate pool")
+            except Exception as e:
+                self.logger.warning(f"Failed to fetch FMP gainers: {e}")
 
         # Exclude symbols where we already hold open positions
         open_position_symbols = {
@@ -637,21 +705,63 @@ class PennyMomentumTrader(LiveExpertInterface):
                 f"Excluded {before - len(candidates)} already-held symbols from screener results"
             )
 
-        # Sort by volume descending (highest momentum first) and cap at max_scan_candidates
-        candidates.sort(key=lambda c: c.get("volume") or 0, reverse=True)
+        # Enrich with RVOL via FMP batch quotes
+        all_symbols = [c["symbol"] for c in candidates if c.get("symbol")]
+        quotes_map = self._fetch_quotes_chunked(all_symbols) if all_symbols else {}
+
+        for c in candidates:
+            sym = c.get("symbol", "").upper()
+            quote = quotes_map.get(sym, {})
+            volume = quote.get("volume") or c.get("volume") or 0
+            avg_vol = quote.get("avgVolume", 0) or 0
+            rvol = round(volume / avg_vol, 2) if avg_vol > 0 else 0.0
+            c["volume"] = volume
+            c["avg_volume"] = avg_vol
+            c["rvol"] = rvol
+            c["change_percent"] = quote.get("changesPercentage", 0) or 0
+            # Update price from quote if available
+            q_price = quote.get("price")
+            if q_price and q_price > 0:
+                c["price"] = q_price
+
+        # Filter by minimum relative volume
+        if min_rvol > 0:
+            before = len(candidates)
+            for c in candidates:
+                if c.get("rvol", 0) < min_rvol:
+                    sym = c.get("symbol")
+                    if sym:
+                        filtered_stocks[sym] = {
+                            "phase": "screen",
+                            "reason": "low_rvol",
+                            "details": f"RVOL {c.get('rvol', 0):.1f}x below minimum {min_rvol:.1f}x",
+                        }
+            candidates = [c for c in candidates if c.get("rvol", 0) >= min_rvol]
+            dropped = before - len(candidates)
+            if dropped:
+                self.logger.info(f"Dropped {dropped} candidates below RVOL {min_rvol:.1f}x")
+
+        # Sort by RVOL descending (unusual volume first) and cap at max_scan_candidates
+        candidates.sort(key=lambda c: c.get("rvol", 0), reverse=True)
         if len(candidates) > max_candidates:
             self.logger.info(
-                f"Capping candidates from {len(candidates)} to top {max_candidates} by volume"
+                f"Capping candidates from {len(candidates)} to top {max_candidates} by RVOL"
             )
             for c in candidates[max_candidates:]:
                 sym = c.get("symbol")
                 if sym:
                     filtered_stocks[sym] = {
                         "phase": "screen",
-                        "reason": "volume_cap",
-                        "details": f"Ranked beyond top {max_candidates} by volume (vol={c.get('volume', 'N/A')})",
+                        "reason": "rvol_cap",
+                        "details": f"Ranked beyond top {max_candidates} by RVOL (rvol={c.get('rvol', 0):.1f}x)",
                     }
             candidates = candidates[:max_candidates]
+
+        self.logger.info(
+            f"Phase 1 after RVOL enrichment: {len(candidates)} candidates "
+            f"(top RVOL: {candidates[0].get('rvol', 0):.1f}x)" if candidates else
+            f"Phase 1 after RVOL enrichment: 0 candidates"
+        )
 
         # Filter through account to remove untradeable symbols
         if candidates:
@@ -1761,6 +1871,53 @@ class PennyMomentumTrader(LiveExpertInterface):
 
             except Exception as e:
                 self.logger.error(f"Exit condition update failed for {symbol}: {e}", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Screener enrichment helpers
+    # ------------------------------------------------------------------
+
+    def _fetch_gainers(self) -> List[Dict[str, Any]]:
+        """Fetch today's top gainers from FMP /api/v3/stock_market/gainers."""
+        import requests
+        from ....config import get_app_setting
+
+        api_key = get_app_setting("FMP_API_KEY")
+        if not api_key:
+            return []
+        resp = requests.get(
+            "https://financialmodelingprep.com/api/v3/stock_market/gainers",
+            params={"apikey": api_key},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, list) else []
+
+    def _fetch_quotes_chunked(
+        self, symbols: List[str], chunk_size: int = 50
+    ) -> Dict[str, Dict[str, Any]]:
+        """Batch-fetch FMP full quotes in chunks. Returns {symbol: quote_dict}."""
+        import fmpsdk
+        from ....config import get_app_setting
+
+        api_key = get_app_setting("FMP_API_KEY")
+        if not api_key:
+            return {}
+
+        result: Dict[str, Dict[str, Any]] = {}
+        for i in range(0, len(symbols), chunk_size):
+            chunk = symbols[i : i + chunk_size]
+            try:
+                data = fmpsdk.quote(apikey=api_key, symbol=chunk)
+                if isinstance(data, list):
+                    for item in data:
+                        sym = item.get("symbol", "").upper()
+                        if sym:
+                            result[sym] = item
+            except Exception as e:
+                self.logger.warning(f"FMP quote chunk {i}-{i+len(chunk)} failed: {e}")
+        self.logger.debug(f"Fetched FMP quotes for {len(result)}/{len(symbols)} symbols")
+        return result
 
     # ------------------------------------------------------------------
     # Live price helpers

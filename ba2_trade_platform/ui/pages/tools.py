@@ -13,6 +13,7 @@ import requests
 
 from ...config import get_app_setting
 from ...logger import logger
+from ...modules.dataproviders import get_provider
 
 
 class FMPSenateTradeTab:
@@ -834,15 +835,343 @@ class AnalystRatingsTab:
                 ui.label('No recent analyst grades available').classes('italic text-sm').style('color: #a0aec0;')
 
 
+class PennyScreenerTab:
+    """
+    Tab for testing penny stock screener parameters live.
+    Runs FMP screener with configurable filters and enriches results with RVOL data.
+    """
+
+    def __init__(self):
+        self.results_table = None
+        self.loading_spinner = None
+
+        # Stats labels
+        self.stat_total = None
+        self.stat_after_rvol = None
+        self.stat_gainers = None
+
+        # Filter state defaults
+        self._price_min = 0.10
+        self._price_max = 5.00
+        self._volume_min = 500000
+        self._mcap_min = 10000000
+        self._mcap_max = 500000000
+        self._float_max = 500000000
+        self._min_rvol = 1.5
+        self._sector_exclude = ""
+        self._max_results = 50
+        self._include_gainers = True
+
+        self._api_key = get_app_setting('FMP_API_KEY')
+
+        self.render()
+
+    def render(self):
+        """Render the Penny Screener tab content."""
+        with ui.card().classes('w-full'):
+            ui.label('Penny Stock Screener').classes('text-lg font-bold')
+            ui.label('Test screener parameters and view relative volume data').classes('text-sm mb-4').style('color: #a0aec0;')
+
+            # API key warning
+            if not self._api_key:
+                with ui.card().classes('w-full alert-banner warning mb-4'):
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon('warning', color='warning')
+                        ui.label('FMP API key not configured. Please set FMP_API_KEY in Settings > App Settings.').classes('text-[#ffd93d]')
+
+            # Filters section
+            with ui.card().classes('w-full mb-4'):
+                ui.label('Filters').classes('text-md font-semibold mb-2')
+
+                with ui.row().classes('w-full gap-4 flex-wrap items-end'):
+                    self.price_min_input = ui.number(
+                        label='Price Min', value=self._price_min, format='%.2f', step=0.01
+                    ).classes('w-28')
+                    self.price_max_input = ui.number(
+                        label='Price Max', value=self._price_max, format='%.2f', step=0.01
+                    ).classes('w-28')
+                    self.volume_min_input = ui.number(
+                        label='Volume Min', value=self._volume_min, format='%.0f', step=100000
+                    ).classes('w-36')
+                    self.mcap_min_input = ui.number(
+                        label='Market Cap Min', value=self._mcap_min, format='%.0f', step=1000000
+                    ).classes('w-36')
+                    self.mcap_max_input = ui.number(
+                        label='Market Cap Max', value=self._mcap_max, format='%.0f', step=10000000
+                    ).classes('w-36')
+                    self.float_max_input = ui.number(
+                        label='Float Max', value=self._float_max, format='%.0f', step=10000000,
+                        placeholder='e.g. 50M'
+                    ).classes('w-36')
+                    self.min_rvol_input = ui.number(
+                        label='Min RVOL', value=self._min_rvol, format='%.1f', step=0.1
+                    ).classes('w-28')
+                    self.sector_exclude_input = ui.input(
+                        label='Sector Exclude', placeholder='e.g. Healthcare,Energy'
+                    ).props('stack-label').classes('w-48')
+                    self.max_results_input = ui.number(
+                        label='Max Results', value=self._max_results, format='%.0f', step=10
+                    ).classes('w-28')
+                    self.include_gainers_checkbox = ui.checkbox(
+                        'Include FMP Gainers', value=self._include_gainers
+                    )
+                    ui.button('Search', on_click=self._search, icon='search').props('color=primary')
+
+            # Stats row
+            with ui.row().classes('w-full gap-6 mb-4 items-center'):
+                self.stat_total = ui.label('Total screened: -')
+                self.stat_after_rvol = ui.label('After RVOL filter: -')
+                self.stat_gainers = ui.label('Gainers merged: -')
+
+            # Results section
+            self.loading_spinner = ui.spinner('dots', size='lg').classes('hidden')
+
+            columns = [
+                {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left', 'sortable': True},
+                {'name': 'company', 'label': 'Company', 'field': 'company', 'align': 'left', 'sortable': True},
+                {'name': 'price', 'label': 'Price', 'field': 'price', 'align': 'right', 'sortable': True},
+                {'name': 'change_pct', 'label': 'Change%', 'field': 'change_pct', 'align': 'right', 'sortable': True},
+                {'name': 'volume', 'label': 'Volume', 'field': 'volume', 'align': 'right', 'sortable': True},
+                {'name': 'avg_vol', 'label': 'Avg Vol', 'field': 'avg_vol', 'align': 'right', 'sortable': True},
+                {'name': 'rvol', 'label': 'RVOL', 'field': 'rvol', 'align': 'right', 'sortable': True},
+                {'name': 'market_cap', 'label': 'Market Cap', 'field': 'market_cap', 'align': 'right', 'sortable': True},
+                {'name': 'sector', 'label': 'Sector', 'field': 'sector', 'align': 'left', 'sortable': True},
+                {'name': 'exchange', 'label': 'Exchange', 'field': 'exchange', 'align': 'center', 'sortable': True},
+            ]
+
+            self.results_table = ui.table(
+                columns=columns,
+                rows=[],
+                row_key='symbol',
+                pagination={'rowsPerPage': 25, 'sortBy': 'rvol_sort', 'descending': True}
+            ).classes('w-full dark-pagination')
+
+            # Custom cell slots for formatting
+            self.results_table.add_slot('body-cell-symbol', '''
+                <q-td :props="props">
+                    <span class="font-bold text-blue-600">{{ props.value }}</span>
+                </q-td>
+            ''')
+
+            self.results_table.add_slot('body-cell-change_pct', '''
+                <q-td :props="props">
+                    <span :style="{color: props.row.change_pct_raw >= 0 ? '#00d4aa' : '#ff6b6b'}">
+                        {{ props.value }}
+                    </span>
+                </q-td>
+            ''')
+
+            self.results_table.add_slot('body-cell-rvol', '''
+                <q-td :props="props">
+                    <span :style="{color: props.row.rvol_raw >= 2.0 ? '#00d4aa' : props.row.rvol_raw >= 1.5 ? '#ffd93d' : 'inherit', fontWeight: props.row.rvol_raw >= 2.0 ? 'bold' : 'normal'}">
+                        {{ props.value }}
+                    </span>
+                </q-td>
+            ''')
+
+    def _search(self):
+        """Trigger async search."""
+        asyncio.create_task(self._async_search())
+
+    async def _async_search(self):
+        """Asynchronously run the screener, fetch gainers, enrich with RVOL, and update the table."""
+        if not self._api_key:
+            ui.notify('FMP API key not configured', type='warning')
+            return
+
+        try:
+            self.loading_spinner.classes(remove='hidden')
+            self.results_table.rows = []
+            self.stat_total.text = 'Total screened: ...'
+            self.stat_after_rvol.text = 'After RVOL filter: ...'
+            self.stat_gainers.text = 'Gainers merged: ...'
+
+            # Read filter values from inputs
+            price_min = self.price_min_input.value
+            price_max = self.price_max_input.value
+            volume_min = self.volume_min_input.value
+            mcap_min = self.mcap_min_input.value
+            mcap_max = self.mcap_max_input.value
+            float_max = self.float_max_input.value
+            min_rvol = self.min_rvol_input.value or 1.5
+            max_results = int(self.max_results_input.value or 50)
+            include_gainers = self.include_gainers_checkbox.value
+
+            sector_exclude_raw = self.sector_exclude_input.value.strip() if self.sector_exclude_input.value else ""
+            sector_exclude = [s.strip() for s in sector_exclude_raw.split(",") if s.strip()] if sector_exclude_raw else []
+
+            filters = {
+                "price_min": price_min,
+                "price_max": price_max,
+                "volume_min": volume_min,
+                "market_cap_min": mcap_min,
+                "market_cap_max": mcap_max,
+                "float_max": float_max,
+                "sector_exclude": sector_exclude,
+                "limit": max_results,
+            }
+
+            # Step 1: Run screener
+            screener_provider = get_provider("screener", "fmp")
+            screener_results = await asyncio.to_thread(screener_provider.screen_stocks, filters)
+
+            # Build symbol set for dedup
+            seen_symbols = {r["symbol"].upper() for r in screener_results if r.get("symbol")}
+
+            # Step 2: Fetch gainers if enabled
+            gainers_merged_count = 0
+            if include_gainers:
+                raw_gainers = await asyncio.to_thread(self._fetch_gainers)
+                for g in raw_gainers:
+                    sym = (g.get("symbol") or "").upper()
+                    if not sym or sym in seen_symbols:
+                        continue
+                    g_price = g.get("price", 0) or 0
+                    g_mcap = g.get("marketCap", 0) or 0
+                    # Only include gainers matching price/mcap filters
+                    if price_min is not None and g_price < price_min:
+                        continue
+                    if price_max is not None and g_price > price_max:
+                        continue
+                    if mcap_min is not None and g_mcap < mcap_min:
+                        continue
+                    if mcap_max is not None and g_mcap > mcap_max:
+                        continue
+                    g_sector = (g.get("sector") or "").lower()
+                    if sector_exclude and g_sector in [s.lower() for s in sector_exclude]:
+                        continue
+                    # Normalise gainer to screener format
+                    screener_results.append({
+                        "symbol": sym,
+                        "company_name": g.get("name", ""),
+                        "price": g_price,
+                        "volume": g.get("volume", 0),
+                        "market_cap": g_mcap,
+                        "sector": g.get("sector", ""),
+                        "industry": g.get("industry", ""),
+                        "exchange": g.get("exchangeShortName") or g.get("exchange", ""),
+                    })
+                    seen_symbols.add(sym)
+                    gainers_merged_count += 1
+
+            total_screened = len(screener_results)
+
+            # Step 3: Fetch FMP quotes for RVOL enrichment
+            all_symbols = [r["symbol"] for r in screener_results if r.get("symbol")]
+            quotes_map = await asyncio.to_thread(self._fetch_quotes_chunked, all_symbols) if all_symbols else {}
+
+            # Step 4: Compute RVOL, filter, sort
+            enriched = []
+            for item in screener_results:
+                sym = (item.get("symbol") or "").upper()
+                quote = quotes_map.get(sym, {})
+
+                volume = quote.get("volume") or item.get("volume") or 0
+                avg_vol = quote.get("avgVolume", 0) or 0
+                rvol = round(volume / avg_vol, 2) if avg_vol > 0 else 0.0
+
+                change_pct = quote.get("changesPercentage", 0) or 0
+                price = quote.get("price") or item.get("price") or 0
+                mcap = quote.get("marketCap") or item.get("market_cap") or 0
+
+                if rvol < min_rvol:
+                    continue
+
+                enriched.append({
+                    "symbol": sym,
+                    "company": item.get("company_name") or quote.get("name") or "",
+                    "price": f"${price:.2f}",
+                    "change_pct": f"{'+' if change_pct >= 0 else ''}{change_pct:.2f}%",
+                    "change_pct_raw": change_pct,
+                    "volume": f"{int(volume):,}",
+                    "avg_vol": f"{int(avg_vol):,}" if avg_vol else "-",
+                    "rvol": f"{rvol:.1f}x",
+                    "rvol_raw": rvol,
+                    "rvol_sort": rvol,
+                    "market_cap": self._format_market_cap(mcap),
+                    "sector": item.get("sector") or quote.get("sector") or "",
+                    "exchange": item.get("exchange") or quote.get("exchange") or "",
+                })
+
+            # Sort by RVOL descending
+            enriched.sort(key=lambda x: x.get("rvol_raw", 0), reverse=True)
+
+            after_rvol_count = len(enriched)
+
+            # Update table and stats
+            self.results_table.rows = enriched
+            self.stat_total.text = f'Total screened: {total_screened}'
+            self.stat_after_rvol.text = f'After RVOL filter: {after_rvol_count}'
+            self.stat_gainers.text = f'Gainers merged: {gainers_merged_count}'
+
+            self.loading_spinner.classes(add='hidden')
+
+        except RuntimeError as e:
+            if "client" in str(e).lower() and "deleted" in str(e).lower():
+                logger.debug("[PennyScreenerTab] Client disconnected during search")
+            else:
+                logger.error(f"Error in penny screener search: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Error in penny screener search: {e}", exc_info=True)
+            self.loading_spinner.classes(add='hidden')
+            ui.notify(f'Error running screener: {str(e)}', type='negative')
+
+    def _fetch_gainers(self) -> List[Dict]:
+        """Fetch today's top gainers from FMP /api/v3/stock_market/gainers"""
+        api_key = get_app_setting('FMP_API_KEY')
+        resp = requests.get(
+            "https://financialmodelingprep.com/api/v3/stock_market/gainers",
+            params={"apikey": api_key},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json() if isinstance(resp.json(), list) else []
+
+    def _fetch_quotes_chunked(self, symbols: List[str], chunk_size: int = 50) -> Dict[str, Dict]:
+        """Fetch FMP full quotes in chunks. Returns {symbol: quote_dict}."""
+        import fmpsdk
+        api_key = get_app_setting('FMP_API_KEY')
+        result = {}
+        for i in range(0, len(symbols), chunk_size):
+            chunk = symbols[i:i + chunk_size]
+            try:
+                data = fmpsdk.quote(apikey=api_key, symbol=chunk)
+                if isinstance(data, list):
+                    for item in data:
+                        sym = item.get("symbol", "").upper()
+                        result[sym] = item
+            except Exception as e:
+                logger.warning(f"FMP quote chunk failed: {e}")
+        return result
+
+    @staticmethod
+    def _format_market_cap(mcap) -> str:
+        """Format market cap as human-readable string (e.g. $12.3M, $1.2B)."""
+        if not mcap or mcap == 0:
+            return "-"
+        mcap = float(mcap)
+        if mcap >= 1_000_000_000:
+            return f"${mcap / 1_000_000_000:.1f}B"
+        if mcap >= 1_000_000:
+            return f"${mcap / 1_000_000:.1f}M"
+        if mcap >= 1_000:
+            return f"${mcap / 1_000:.1f}K"
+        return f"${mcap:.0f}"
+
+
 def content():
     """Render the Tools page with tabbed layout."""
     with ui.tabs().classes('w-full') as tabs:
         fmp_senate_tab = ui.tab('FMP Senate Trade', icon='account_balance')
         analyst_ratings_tab = ui.tab('Analyst Ratings', icon='analytics')
-    
+        penny_screener_tab = ui.tab('Penny Screener', icon='trending_up')
+
     with ui.tab_panels(tabs, value=fmp_senate_tab).classes('w-full'):
         with ui.tab_panel(fmp_senate_tab):
             FMPSenateTradeTab()
-        
+
         with ui.tab_panel(analyst_ratings_tab):
             AnalystRatingsTab()
+
+        with ui.tab_panel(penny_screener_tab):
+            PennyScreenerTab()

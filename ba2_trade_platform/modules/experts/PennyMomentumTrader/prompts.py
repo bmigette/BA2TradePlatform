@@ -59,10 +59,18 @@ def build_quick_filter_prompt(
         st_trend = c.get("st_trending")
         st_tscore = c.get("st_trending_score")
 
+        # RVOL and change % (enriched during phase 1 screening)
+        rvol = c.get("rvol")
+        chg_pct = c.get("change_percent")
+
         line = (
             f'{symbol}: price={price_str}, vol={vol_str}, mktcap={cap_str}, '
             f'sector={sector or "?"}, exchange={exchange or "?"}'
         )
+        if rvol is not None and rvol > 0:
+            line += f", rvol={rvol:.1f}x"
+        if chg_pct is not None and chg_pct != 0:
+            line += f", chg={chg_pct:+.1f}%"
         if st_wl is not None:
             wl_str = f"{st_wl:,}"
             line += f", st_watchlist={wl_str}"
