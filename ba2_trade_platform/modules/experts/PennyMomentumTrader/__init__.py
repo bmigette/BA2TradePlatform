@@ -17,7 +17,7 @@ Pipeline phases:
 
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from ....core.interfaces import LiveExpertInterface
@@ -1973,15 +1973,38 @@ class PennyMomentumTrader(LiveExpertInterface):
             if not watching:
                 return None
 
+            max_age = int(self.get_setting_with_interface_default(
+                "max_entry_age_days", log_warning=False
+            ))
+            now = datetime.now(timezone.utc)
+
             parts = []
             for sym, info in watching.items():
+                # Conditions summary
                 eval_result = info.get("conditions_last_eval")
                 if eval_result:
                     met = sum(1 for v in eval_result.values() if v is True)
                     total = len(eval_result)
-                    parts.append(f"{sym} ({met}/{total})")
+                    cond_str = f"{met}/{total}"
                 else:
-                    parts.append(sym)
+                    cond_str = "?"
+
+                # Age / time remaining
+                age_str = ""
+                created_str = info.get("created_at")
+                if created_str:
+                    try:
+                        created = datetime.fromisoformat(created_str)
+                        if created.tzinfo is None:
+                            created = created.replace(tzinfo=timezone.utc)
+                        age_days = (now - created).days
+                        days_left = max_age - age_days
+                        expire_date = (created + timedelta(days=max_age)).strftime("%m/%d")
+                        age_str = f", day {age_days + 1}/{max_age}, exp {expire_date}"
+                    except (ValueError, TypeError):
+                        pass
+
+                parts.append(f"{sym} ({cond_str}{age_str})")
             return f"watching: {', '.join(parts)}"
         except Exception:
             return None
