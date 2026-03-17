@@ -12,8 +12,10 @@ Available Providers:
 
 from .AISocialMediaSentiment import AISocialMediaSentiment
 from .StockTwitsSentiment import StockTwitsSentiment
+from .StockTwitsTrending import StockTwitsTrending
 
 __all__ = [
     "AISocialMediaSentiment",
     "StockTwitsSentiment",
+    "StockTwitsTrending",
 ]

@@ -339,6 +339,36 @@ class PennyMomentumTrader(LiveExpertInterface):
                     "'account' uses the broker account's price API (may be 15-min delayed on Alpaca free tier)."
                 ),
             },
+            # StockTwits trending discovery
+            "use_stocktwits_discovery": {
+                "type": "bool",
+                "required": False,
+                "default": True,
+                "description": "Enable StockTwits trending symbol discovery (phase 1c)",
+                "tooltip": (
+                    "When enabled, fetches top_watched, most_active, and symbols_enhanced from "
+                    "StockTwits and adds symbols priced below stocktwits_discovery_price_max to the "
+                    "candidate pool. Requires stocktwits_oauth_token."
+                ),
+            },
+            "stocktwits_discovery_price_max": {
+                "type": "float",
+                "required": False,
+                "default": 6.0,
+                "description": "Maximum price for StockTwits trending discovery",
+                "tooltip": "Only StockTwits trending symbols at or below this price are added to the pipeline.",
+            },
+            "stocktwits_oauth_token": {
+                "type": "str",
+                "required": False,
+                "default": "",
+                "description": "StockTwits OAuth token for trending API",
+                "tooltip": (
+                    "OAuth token for StockTwits API authentication. "
+                    "Obtain from developer.stocktwits.com. Required for use_stocktwits_discovery."
+                ),
+                "ui_editor_type": "password",
+            },
         }
 
     # ------------------------------------------------------------------
@@ -489,7 +519,29 @@ class PennyMomentumTrader(LiveExpertInterface):
                 self.logger.info("Pipeline aborted after phase 1b (stop requested)")
                 return
 
-            # Combine survivors + LLM-discovered for deep triage
+            # Phase 1c: StockTwits trending discovery
+            self._current_phase = "stocktwits_discovery"
+            self._update_state(market_analysis, {"phase": "stocktwits_discovery"})
+            social_discovered = self._time_phase(
+                "stocktwits_discovery", market_analysis,
+                self._phase_1c_social_discovery, screener_candidates, survivors, new_ones, market_analysis
+            )
+            if social_discovered:
+                all_known_symbols = (
+                    {c.get("symbol") for c in survivors}
+                    | {c.get("symbol") for c in new_ones}
+                )
+                social_new = [d for d in social_discovered if d.get("symbol") not in all_known_symbols]
+                if social_new:
+                    self.logger.info(
+                        f"Phase 1c added {len(social_new)} StockTwits trending candidates"
+                    )
+                    new_ones = new_ones + social_new
+            if self._stop_event.is_set():
+                self.logger.info("Pipeline aborted after phase 1c (stop requested)")
+                return
+
+            # Combine survivors + LLM-discovered + StockTwits-discovered for deep triage
             deep_triage_input = survivors + new_ones
 
             # Phase 3: Deep triage via LLM
@@ -986,6 +1038,91 @@ class PennyMomentumTrader(LiveExpertInterface):
         except Exception as e:
             self.logger.error(f"Phase 1b: discovery LLM failed: {e}", exc_info=True)
             return []
+
+    def _phase_1c_social_discovery(
+        self,
+        screener_candidates: List[Dict[str, Any]],
+        survivors: List[Dict[str, Any]],
+        llm_discovered: List[Dict[str, Any]],
+        market_analysis: MarketAnalysis,
+    ) -> List[Dict[str, Any]]:
+        """Fetch StockTwits trending symbols and return new candidates not already known."""
+        use_discovery = self.get_setting_with_interface_default(
+            "use_stocktwits_discovery", log_warning=False
+        )
+        if not use_discovery:
+            return []
+
+        oauth_token = self.get_setting_with_interface_default(
+            "stocktwits_oauth_token", log_warning=False
+        )
+        if not oauth_token:
+            self.logger.debug("Phase 1c: skipped (stocktwits_oauth_token not configured)")
+            return []
+
+        price_max = float(self.get_setting_with_interface_default(
+            "stocktwits_discovery_price_max", log_warning=False
+        ))
+
+        # Build set of all already-known symbols to avoid duplicates
+        all_known_symbols = (
+            {c.get("symbol") for c in screener_candidates if c.get("symbol")}
+            | {c.get("symbol") for c in survivors if c.get("symbol")}
+            | {c.get("symbol") for c in llm_discovered if c.get("symbol")}
+            | {pos["symbol"] for pos in self._trade_mgr.get_open_positions()}
+        )
+
+        self.logger.info(
+            f"Phase 1c: fetching StockTwits trending symbols (price_max=${price_max:.2f})"
+        )
+
+        try:
+            from ....modules.dataproviders.socialmedia.StockTwitsTrending import StockTwitsTrending
+
+            provider = StockTwitsTrending(
+                oauth_token=oauth_token,
+                price_max=price_max,
+            )
+            trending = provider.get_trending_symbols()
+            self.logger.info(
+                f"Phase 1c: StockTwits returned {len(trending)} symbols under ${price_max:.2f}"
+            )
+        except Exception as e:
+            self.logger.warning(f"Phase 1c: StockTwits fetch failed: {e}")
+            return []
+
+        results: List[Dict[str, Any]] = []
+        for item in trending:
+            symbol = item.get("symbol", "").upper()
+            if not symbol or symbol in all_known_symbols:
+                continue
+            price = item.get("price")
+            if not price or price <= 0:
+                continue
+            results.append({
+                "symbol": symbol,
+                "price": price,
+                "volume": None,
+                "market_cap": None,
+                "sector": None,
+                "industry": None,
+                "exchange": None,
+                "beta": None,
+                "is_actively_trading": True,
+                "company_name": item.get("company_name"),
+                "country": "US",
+                "_source": "stocktwits_trending",
+                "_stocktwits_sources": item.get("sources", []),
+                "_stocktwits_watchlist_count": item.get("watchlist_count"),
+                "_stocktwits_change_pct": item.get("change_pct"),
+            })
+            all_known_symbols.add(symbol)
+
+        self.logger.info(
+            f"Phase 1c: {len(results)} new StockTwits candidates "
+            f"(not in screener/survivors/llm-discovered)"
+        )
+        return results
 
     def _phase_2_quick_filter(
         self, candidates: List[Dict[str, Any]], market_analysis: MarketAnalysis
