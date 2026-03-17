@@ -552,24 +552,14 @@ class ConditionEvaluator:
                 continue
         return None
 
-    # Provider-level disk cache TTL per interval (hours).
-    # Intraday intervals use 0 so the cache is always bypassed during live monitoring.
-    # Daily is refreshed once per hour so volume/price reflect today's session.
-    _OHLCV_CACHE_AGE: Dict[str, float] = {
-        "1m": 0, "5m": 0, "15m": 0, "30m": 0, "1h": 0, "4h": 0.5, "1d": 1,
-    }
-
     def _get_ohlcv(self, symbol: str, timeframe: str, lookback_days: int) -> Optional[pd.DataFrame]:
         cache_key = f"ohlcv:{symbol}:{timeframe}:{lookback_days}"
         if cache_key in self._indicator_cache:
             return self._indicator_cache[cache_key]
 
-        max_age = self._OHLCV_CACHE_AGE.get(timeframe, 0)
-
         try:
             df = self.ohlcv_provider.get_ohlcv_data(
                 symbol, interval=timeframe, lookback_days=lookback_days,
-                max_cache_age_hours=max_age,
             )
             if df is not None and not df.empty:
                 df.columns = [c.lower() for c in df.columns]

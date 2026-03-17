@@ -21,18 +21,19 @@ from ba2_trade_platform.core.interfaces.DataProviderInterface import DataProvide
 class MarketDataProviderInterface(DataProviderInterface):
     """
     Abstract base class for market data providers.
-    
+
     Provides a standardized interface for fetching historical market data
     with built-in caching capabilities.
-    
+
     Subclasses must implement:
         - _fetch_data_from_source(): Fetch data from the actual data source
     """
-    
+
     # Class-level lock dictionary for per-file locking (shared across all instances)
     _cache_locks: Dict[str, threading.Lock] = {}
     _cache_locks_lock = threading.Lock()  # Lock to protect the locks dictionary
-    
+
+
     def __init__(self):
         """
         Initialize the market data provider.
@@ -328,7 +329,90 @@ class MarketDataProviderInterface(DataProviderInterface):
                 continue
         
         return datapoints
-    
+
+    @staticmethod
+    def _interval_to_timedelta(interval: str) -> timedelta:
+        """Convert an interval string (e.g. '5m', '1h') to a timedelta."""
+        interval = interval.lower().strip()
+        if interval.endswith('m'):
+            return timedelta(minutes=int(interval[:-1]))
+        if interval.endswith('h'):
+            return timedelta(hours=int(interval[:-1]))
+        if interval.endswith('d'):
+            return timedelta(days=int(interval[:-1]))
+        return timedelta(hours=1)  # fallback
+
+    def _refresh_intraday_if_stale(
+        self,
+        df: pd.DataFrame,
+        symbol: str,
+        interval: str,
+        cache_file: str,
+    ) -> pd.DataFrame:
+        """
+        For intraday data loaded from disk cache: if the last cached bar is from
+        today but older than one interval, fetch only the missing bars, append
+        them, update the cache, and return the merged DataFrame.
+
+        This avoids re-fetching the full history on every monitoring tick while
+        still keeping intraday candles current.
+        """
+        df['Date'] = pd.to_datetime(df['Date'])
+        last_bar_dt = df['Date'].iloc[-1]
+
+        # Normalise to a plain datetime for comparison
+        last_bar_naive = (
+            last_bar_dt.to_pydatetime().replace(tzinfo=None)
+            if hasattr(last_bar_dt, 'to_pydatetime')
+            else last_bar_dt
+        )
+        if last_bar_naive.tzinfo is not None:
+            last_bar_naive = last_bar_naive.replace(tzinfo=None)
+
+        now = datetime.now()
+        today = now.date()
+
+        # Only do incremental fetch if the last bar is from today
+        if last_bar_naive.date() != today:
+            return df
+
+        interval_td = self._interval_to_timedelta(interval)
+        expected_latest = self.normalize_time_to_interval(now, interval)
+
+        # Cache is already up to date
+        if last_bar_naive >= expected_latest:
+            return df
+
+        # Fetch only the missing slice
+        fetch_start = last_bar_naive + interval_td
+        fetch_end = now + interval_td  # slightly beyond to capture the current bar
+
+        logger.debug(
+            f"Intraday cache stale for {symbol} ({interval}): "
+            f"last={last_bar_naive.strftime('%H:%M')}, expected>={expected_latest.strftime('%H:%M')}; "
+            f"fetching from {fetch_start.strftime('%H:%M')}"
+        )
+        try:
+            new_df = self._get_ohlcv_data_impl(symbol, fetch_start, fetch_end, interval)
+            if new_df is not None and not new_df.empty:
+                new_df['Date'] = pd.to_datetime(new_df['Date'])
+                df = pd.concat([df, new_df], ignore_index=True)
+                df = (
+                    df.drop_duplicates(subset=['Date'])
+                    .sort_values('Date')
+                    .reset_index(drop=True)
+                )
+                self._save_cache(df, cache_file)
+                logger.debug(
+                    f"Appended {len(new_df)} new bar(s) to {symbol} ({interval}) cache"
+                )
+        except Exception as e:
+            logger.warning(
+                f"Failed to refresh intraday cache for {symbol} ({interval}): {e}"
+            )
+
+        return df
+
     def get_data(
         self,
         symbol: str,
@@ -374,21 +458,19 @@ class MarketDataProviderInterface(DataProviderInterface):
         """
         # Validate and normalize dates with intelligent optional handling
         start_date, end_date = validate_date_range(start_date, end_date, lookback_days)
-        
+
         # Normalize start_date to interval boundary for proper time series alignment
         normalized_start = self.normalize_time_to_interval(start_date, interval)
-        
+
         logger.info(f"Getting data for {symbol} from {normalized_start.date()} to {end_date.date()}, interval={interval}")
-        # if normalized_start != start_date:
-        #     logger.debug(f"Start date normalized from {start_date} to {normalized_start} for interval {interval}")
 
         cache_file = self._get_cache_file_path(symbol, interval)
         df = None
-        
+
         # Try to load from cache if enabled
         if use_cache and self._is_cache_valid(cache_file, max_cache_age_hours):
             df = self._load_cache(cache_file)
-        
+
         # Fetch from source if cache invalid or disabled
         if df is None:
             logger.info(f"Fetching data from source for {symbol}")
@@ -413,11 +495,11 @@ class MarketDataProviderInterface(DataProviderInterface):
             # Save to cache
             if use_cache:
                 self._save_cache(df, cache_file)
-        
+
         # Ensure Date column is datetime
         if 'Date' in df.columns:
             df['Date'] = pd.to_datetime(df['Date'])
-        
+
         # Make start_date and end_date timezone-aware if df['Date'] is timezone-aware
         filter_start = normalized_start
         filter_end = end_date
@@ -428,20 +510,20 @@ class MarketDataProviderInterface(DataProviderInterface):
                 filter_start = normalized_start.replace(tzinfo=tz.utc)
             if end_date.tzinfo is None:
                 filter_end = end_date.replace(tzinfo=tz.utc)
-        
+
         # Filter to requested date range (using normalized start)
         mask = (df['Date'] >= filter_start) & (df['Date'] <= filter_end)
         filtered_df = df[mask].copy()
-        
+
         logger.info(f"Filtered to {len(filtered_df)} records in date range")
-        
+
         # Convert to MarketDataPoint objects
         datapoints = self._dataframe_to_datapoints(filtered_df, symbol, interval)
-        
+
         logger.info(f"Returning {len(datapoints)} MarketDataPoint objects")
-        
+
         return datapoints
-    
+
     def get_ohlcv_data(
         self,
         symbol: str,
@@ -478,21 +560,20 @@ class MarketDataProviderInterface(DataProviderInterface):
         """
         # Validate and normalize dates with intelligent optional handling
         start_date, end_date = validate_date_range(start_date, end_date, lookback_days)
-        
+
         # Normalize start_date to interval boundary for proper time series alignment
         normalized_start = self.normalize_time_to_interval(start_date, interval)
-        
-        # logger.debug(f"Getting DataFrame for {symbol} from {normalized_start.date()} to {end_date.date()}, interval={interval}")
-        # if normalized_start != start_date:
-        #     logger.debug(f"Start date normalized from {start_date} to {normalized_start} for interval {interval}")
 
         cache_file = self._get_cache_file_path(symbol, interval)
         df = None
-        
+
         # Try to load from cache
         if use_cache and self._is_cache_valid(cache_file, max_cache_age_hours):
             df = self._load_cache(cache_file)
-        
+            # For intraday intervals, incrementally fetch any bars missing since the last cached bar
+            if df is not None and interval in ('1m', '5m', '15m', '30m', '1h', '4h'):
+                df = self._refresh_intraday_if_stale(df, symbol, interval, cache_file)
+
         # Fetch from source if needed
         if df is None:
             logger.info(f"Fetching DataFrame from source for {symbol}")
