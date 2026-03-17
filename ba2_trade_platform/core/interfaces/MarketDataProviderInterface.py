@@ -379,9 +379,9 @@ class MarketDataProviderInterface(DataProviderInterface):
         normalized_start = self.normalize_time_to_interval(start_date, interval)
         
         logger.info(f"Getting data for {symbol} from {normalized_start.date()} to {end_date.date()}, interval={interval}")
-        if normalized_start != start_date:
-            # logger.debug(f"Start date normalized from {start_date} to {normalized_start} for interval {interval}")
-        
+        # if normalized_start != start_date:
+        #     logger.debug(f"Start date normalized from {start_date} to {normalized_start} for interval {interval}")
+
         cache_file = self._get_cache_file_path(symbol, interval)
         df = None
         
@@ -483,9 +483,9 @@ class MarketDataProviderInterface(DataProviderInterface):
         normalized_start = self.normalize_time_to_interval(start_date, interval)
         
         # logger.debug(f"Getting DataFrame for {symbol} from {normalized_start.date()} to {end_date.date()}, interval={interval}")
-        if normalized_start != start_date:
-            # logger.debug(f"Start date normalized from {start_date} to {normalized_start} for interval {interval}")
-        
+        # if normalized_start != start_date:
+        #     logger.debug(f"Start date normalized from {start_date} to {normalized_start} for interval {interval}")
+
         cache_file = self._get_cache_file_path(symbol, interval)
         df = None
         
