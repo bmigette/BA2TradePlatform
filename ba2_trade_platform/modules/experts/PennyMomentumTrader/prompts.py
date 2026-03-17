@@ -63,9 +63,11 @@ def build_quick_filter_prompt(
         rvol = c.get("rvol")
         chg_pct = c.get("change_percent")
 
+        industry = c.get("industry", "")
+        sector_industry = f"{sector}/{industry}" if industry and industry != sector else (sector or "?")
         line = (
             f'{symbol}: price={price_str}, vol={vol_str}, mktcap={cap_str}, '
-            f'sector={sector or "?"}, exchange={exchange or "?"}'
+            f'sector={sector_industry}, exchange={exchange or "?"}'
         )
         if rvol is not None and rvol > 0:
             line += f", rvol={rvol:.1f}x"
@@ -98,21 +100,21 @@ Use these as confirmation signals — high watchlist + high bull% + trending str
 
     return f"""{_SYSTEM_PREAMBLE}
 
-You are filtering penny-stock momentum candidates. From the list below, select the top {max_survivors} stocks most likely to produce a profitable momentum trade today or this week.
+You are filtering penny-stock momentum candidates. From the list below, select up to {max_survivors} stocks most likely to produce a profitable momentum trade today or this week. Only include stocks that genuinely meet the criteria — do NOT pad to reach {max_survivors} if fewer stocks qualify.
 {stocktwits_note}
 FILTER CRITERIA (apply all):
-1. Sector quality: Avoid biotech/pharma stocks that appear to be pre-FDA (high risk binary events). Avoid energy stocks unless oil prices are trending up. Favor technology, consumer, and industrial sectors with clear momentum drivers.
-2. Volume/price action: Prefer stocks with unusually high volume relative to their typical levels. Higher volume signals institutional interest or catalyst-driven activity.
-3. Market cap sweet spot: Favor $50M-$500M market cap. Too small (<$10M) means illiquid and manipulable; too large (>$1B) means less explosive moves.
+1. Sector quality: The "sector" field may show "Healthcare/Biotechnology" or "Healthcare/Pharmaceuticals" — treat these as binary-event risk and DROP them unless there is a confirmed catalyst (earnings, not FDA trial). Avoid energy stocks unless oil prices are trending up. Favor Technology, Consumer, and Industrial sectors with clear momentum drivers.
+2. Volume/momentum: Use the "rvol" field (relative volume vs 20-day average) when available. rvol >= 2.0 is a strong signal; rvol < 1.0 means below-average activity — deprioritize. Also factor in "chg" (price change %) as a momentum indicator.
+3. Market cap sweet spot: Favor $50M–$500M market cap. Too small (<$10M) means illiquid and manipulable; too large (>$1B) means less explosive moves.
 4. Exchange quality: Prefer NASDAQ and NYSE over OTC/pink sheets.
-5. Price range: Ideal range is $0.50-$10.00. Avoid sub-penny stocks.
+5. Price range: Ideal range is $0.50–$10.00. Avoid sub-penny stocks.
 6. Social signal (when available): High StockTwits watchlist count + strong bullish sentiment + trending score > 0 indicate growing retail momentum. Bearish-dominant sentiment or negative trending score is a warning sign.
 
 CANDIDATES:
 {candidates_text}
 
 RESPOND with a JSON object containing two keys:
-- "selected": array of the top {max_survivors} candidates to keep, each with:
+- "selected": array of up to {max_survivors} candidates to keep (only include genuinely strong setups), each with:
   - "symbol": the stock ticker (string)
   - "reasoning": one sentence explaining why this candidate was selected (string)
 - "dropped": array of ALL remaining candidates that were NOT selected, each with:
