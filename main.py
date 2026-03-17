@@ -117,25 +117,6 @@ def initialize_system():
     from ba2_trade_platform.core.InstrumentAutoAdder import get_instrument_auto_adder
     get_instrument_auto_adder()  # This starts the service
 
-    # Initialize and start Live Expert instances
-    logger.info("Initializing Live Expert instances...")
-    from ba2_trade_platform.core.interfaces import LiveExpertInterface
-    from ba2_trade_platform.modules.experts import get_expert_class
-    from ba2_trade_platform.core.db import get_all_instances
-    from ba2_trade_platform.core.models import ExpertInstance
-
-    for ei in get_all_instances(ExpertInstance):
-        if not ei.enabled:
-            continue
-        ec = get_expert_class(ei.expert)
-        if ec and issubclass(ec, LiveExpertInterface):
-            try:
-                expert = ec(ei.id)
-                expert.start()
-                logger.info(f"Started LiveExpert: {ei.expert} (ID: {ei.id})")
-            except Exception as e:
-                logger.error(f"Failed to start LiveExpert {ei.id}: {e}", exc_info=True)
-
     logger.info("BA2 Trade Platform initialization complete")
     
     # Log application startup activity

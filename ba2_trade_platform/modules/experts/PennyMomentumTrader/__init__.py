@@ -964,6 +964,16 @@ class PennyMomentumTrader(LiveExpertInterface):
 
             self.logger.info(f"Phase 3: {idx}/{total_survivors} - deep triage {symbol}")
 
+            # Update progress state so UI can show live status during long phase
+            self._update_state(market_analysis, {
+                "deep_triage_progress": {
+                    "current_symbol": symbol,
+                    "processed": idx - 1,
+                    "total": total_survivors,
+                    "passed": len(finalists),
+                },
+            })
+
             # Gather data from all configured vendors in parallel
             self.logger.debug(f"Phase 3 [{symbol}]: gathering data (news, fundamentals, insider, social)")
             from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1040,6 +1050,15 @@ class PennyMomentumTrader(LiveExpertInterface):
                             f"Reasoning: {result.get('reasoning', 'N/A')}"
                         ),
                     }
+                    self._update_state(market_analysis, {
+                        "filtered_stocks": dict(filtered_stocks),
+                        "deep_triage_progress": {
+                            "current_symbol": symbol,
+                            "processed": idx,
+                            "total": total_survivors,
+                            "passed": len(finalists),
+                        },
+                    })
                     continue
 
                 # Create ExpertRecommendation
@@ -1099,6 +1118,18 @@ class PennyMomentumTrader(LiveExpertInterface):
                         "strategy": result.get("strategy", ""),
                     }
                 )
+
+                # Persist incremental results so UI shows progress during long phase
+                self._update_state(market_analysis, {
+                    "deep_triage_results": dict(deep_triage_results),
+                    "filtered_stocks": dict(filtered_stocks),
+                    "deep_triage_progress": {
+                        "current_symbol": symbol,
+                        "processed": idx,
+                        "total": total_survivors,
+                        "passed": len(finalists),
+                    },
+                })
 
                 # Save per-symbol analysis output
                 self._save_analysis_output(

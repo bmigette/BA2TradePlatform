@@ -24,6 +24,11 @@ class LiveExpertInterface(MarketExpertInterface):
     # Override to True in a subclass if it actually delegates to the platform risk manager.
     uses_risk_manager: bool = False
 
+    # Class-level registry: expert_id -> instance currently running.
+    # Guards against duplicate starts across different object instances for the same ID.
+    _running_registry: Dict[int, "LiveExpertInterface"] = {}
+    _registry_lock: threading.Lock = threading.Lock()
+
     def __init__(self, id: int):
         super().__init__(id)
         self._thread: Optional[threading.Thread] = None
@@ -104,18 +109,28 @@ class LiveExpertInterface(MarketExpertInterface):
 
     def start(self):
         """Create and start the background daemon thread."""
-        if self._is_running:
-            self._get_logger().warning(f"LiveExpert {self.id} is already running")
-            return
+        with LiveExpertInterface._registry_lock:
+            existing = LiveExpertInterface._running_registry.get(self.id)
+            if existing is not None:
+                self._get_logger().warning(
+                    f"LiveExpert {self.id} is already running "
+                    f"(registered instance: {id(existing):#x}, this: {id(self):#x}) — skipping duplicate start"
+                )
+                return
+            if self._is_running:
+                self._get_logger().warning(f"LiveExpert {self.id} is already running")
+                return
 
-        self._stop_event.clear()
-        self._manual_start_event.clear()
-        self._thread = threading.Thread(
-            target=self._run_loop,
-            name=f"LiveExpert-{self.id}",
-            daemon=True,
-        )
-        self._is_running = True
+            self._stop_event.clear()
+            self._manual_start_event.clear()
+            self._thread = threading.Thread(
+                target=self._run_loop,
+                name=f"LiveExpert-{self.id}",
+                daemon=True,
+            )
+            self._is_running = True
+            LiveExpertInterface._running_registry[self.id] = self
+
         self._thread.start()
         self._get_logger().info(f"LiveExpert {self.id} started")
 
@@ -140,6 +155,8 @@ class LiveExpertInterface(MarketExpertInterface):
         self._current_phase = None
         self._stop_event.clear()
         self._manual_start_event.clear()
+        with LiveExpertInterface._registry_lock:
+            LiveExpertInterface._running_registry.pop(self.id, None)
         self._get_logger().info(f"LiveExpert {self.id} stopped")
 
     def request_manual_start(self) -> str:
@@ -227,6 +244,9 @@ class LiveExpertInterface(MarketExpertInterface):
             )
         finally:
             self._current_phase = None
+            self._is_running = False
+            with LiveExpertInterface._registry_lock:
+                LiveExpertInterface._running_registry.pop(self.id, None)
             _log.info(f"LiveExpert {self.id} run loop exited")
 
     # ------------------------------------------------------------------
