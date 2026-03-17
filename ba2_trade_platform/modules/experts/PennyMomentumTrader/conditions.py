@@ -444,6 +444,8 @@ class ConditionEvaluator:
             df = self.ohlcv_provider.get_ohlcv_data(
                 symbol, interval=timeframe, lookback_days=lookback_days
             )
+            if df is not None and not df.empty:
+                df.columns = [c.lower() for c in df.columns]
             self._indicator_cache[cache_key] = df
             return df
         except Exception as e:
