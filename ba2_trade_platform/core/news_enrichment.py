@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 
@@ -69,7 +69,7 @@ def _cache_content(url: str, content: str, cache_dir: Path) -> None:
         sub_dir.mkdir(parents=True, exist_ok=True)
         cache_file = sub_dir / f"{h}.json"
         cache_file.write_text(
-            json.dumps({"content": content, "cached_at": datetime.utcnow().isoformat()}),
+            json.dumps({"content": content, "cached_at": datetime.now(tz=timezone.utc).isoformat()}),
             encoding="utf-8"
         )
     except Exception as e:
