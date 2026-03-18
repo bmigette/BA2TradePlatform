@@ -313,8 +313,9 @@ FINAL_SUMMARIZATION_AGENT_PROMPT = """You are the Final Summarization Agent for 
 ⚠️ **COMMON MISTAKES TO AVOID**:
 1. ❌ NO trailing commas: `["item1", "item2",]` ← INVALID
 2. ✅ Correct format: `["item1", "item2"]` ← VALID
-3. ❌ NO comments in JSON: `"confidence": 85.0,  // high confidence` ← INVALID
-4. ✅ Use only data: `"confidence": 85.0` ← VALID
+3. ❌ NO comments in JSON: `"confidence": 50.0,  // high confidence` ← INVALID
+4. ✅ Use only data: `"confidence": 50.0` ← VALID
+5. ⚠️ **DO NOT copy example values** — all numeric fields (confidence, expected_profit_percent, price_at_date, stop_loss, take_profit, sentiment_score) are placeholders. You MUST replace them with values derived from your analysis.
 
 **Examples of INVALID JSON (DO NOT OUTPUT)**:
 ```
