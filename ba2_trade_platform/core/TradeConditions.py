@@ -1043,15 +1043,16 @@ class NewTargetPercentCondition(CompareCondition):
 
 
 class PercentToNewTargetCondition(CompareCondition):
-    """Compare percent from current price to new expert target price."""
-    
+    """Compare percent from current price to new expert target price.
+
+    Works for both enter_market (no existing order) and open_positions rulesets.
+    Calculates: (expert_target - current_price) / current_price * 100
+    For BUY: positive means target is above current price (upside)
+    For SELL: negative means target is below current price (downside potential)
+    """
+
     def evaluate(self) -> bool:
         try:
-            if not self.existing_order:
-                logger.debug(f"No existing order for percent to new target evaluation")
-                self.calculated_value = None
-                return False
-            
             # Get current market price
             current_price = self.get_current_price()
             if current_price is None:
@@ -1101,6 +1102,88 @@ class PercentToNewTargetCondition(CompareCondition):
     def get_description(self) -> str:
         """Get description of percent to new target condition."""
         return f"Check if percent from current price to new expert target for {self.instrument_name} is {self.operator_str} {self.value}%"
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:+.2f}%"
+
+
+class PercentOpenToNewTargetCondition(CompareCondition):
+    """Compare percent from open price to new expert target price.
+
+    For open_positions rulesets only (requires existing order with open price).
+    Calculates: (expert_target - open_price) / open_price * 100
+    Answers: "how much profit does the expert target represent from my entry?"
+    """
+
+    def evaluate(self) -> bool:
+        try:
+            if not self.existing_order:
+                logger.debug(f"No existing order for percent open-to-target evaluation")
+                self.calculated_value = None
+                return False
+
+            # Get open price from transaction
+            from .db import get_db
+            from .models import Transaction
+
+            transaction_id = getattr(self.existing_order, 'transaction_id', None)
+            if not transaction_id:
+                logger.warning(f"Order {self.existing_order.id} has no transaction_id")
+                self.calculated_value = None
+                return False
+
+            with get_db() as session:
+                transaction = session.get(Transaction, transaction_id)
+
+            if not transaction or not transaction.open_price:
+                logger.warning(f"Transaction {transaction_id} not found or has no open_price")
+                self.calculated_value = None
+                return False
+
+            open_price = transaction.open_price
+
+            # Calculate expert target price from recommendation
+            if not self.expert_recommendation:
+                logger.debug(f"No expert recommendation for open-to-target evaluation")
+                self.calculated_value = None
+                return False
+
+            if not hasattr(self.expert_recommendation, 'price_at_date') or not hasattr(self.expert_recommendation, 'expected_profit_percent'):
+                logger.error(f"Expert recommendation missing price_at_date or expected_profit_percent")
+                self.calculated_value = None
+                return False
+
+            base_price = self.expert_recommendation.price_at_date
+            expected_profit = self.expert_recommendation.expected_profit_percent
+
+            from .types import OrderRecommendation
+            if self.expert_recommendation.recommended_action == OrderRecommendation.BUY:
+                new_target_price = base_price * (1 + expected_profit / 100)
+            elif self.expert_recommendation.recommended_action == OrderRecommendation.SELL:
+                new_target_price = base_price * (1 - expected_profit / 100)
+            else:
+                logger.debug(f"Recommendation action is HOLD, cannot calculate target")
+                self.calculated_value = None
+                return False
+
+            # Calculate percent from open price to expert target
+            percent_open_to_target = ((new_target_price - open_price) / open_price) * 100
+
+            self.calculated_value = percent_open_to_target
+
+            logger.info(f"Percent open-to-target for {self.instrument_name}: open=${open_price:.2f}, target=${new_target_price:.2f} (base=${base_price:.2f}, profit={expected_profit:.1f}%), delta={percent_open_to_target:+.2f}%")
+
+            return self.operator_func(percent_open_to_target, self.value)
+
+        except Exception as e:
+            logger.error(f"Error evaluating percent open-to-target condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return f"Check if percent from open price to new expert target for {self.instrument_name} is {self.operator_str} {self.value}%"
 
     def get_actual_value_display(self) -> Optional[str]:
         if self.calculated_value is None:
@@ -1433,6 +1516,7 @@ def create_condition(event_type: ExpertEventType, account: AccountInterface,
         ExpertEventType.N_DAYS_OPENED: DaysOpenedCondition,
         ExpertEventType.N_CONFIDENCE: ConfidenceCondition,
         ExpertEventType.N_INSTRUMENT_ACCOUNT_SHARE: InstrumentAccountShareCondition,
+        ExpertEventType.N_PERCENT_OPEN_TO_NEW_TARGET: PercentOpenToNewTargetCondition,
     }
     condition_class = condition_map.get(event_type)
     if not condition_class:

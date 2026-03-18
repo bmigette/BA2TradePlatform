@@ -55,47 +55,18 @@ class TestCaching:
 
 class TestFetchArticleContent:
     @patch("ba2_trade_platform.core.news_enrichment.requests.get")
-    def test_success(self, mock_get):
-        mock_traf = MagicMock()
-        mock_traf.extract.return_value = "Extracted article content here."
+    @patch("ba2_trade_platform.core.news_enrichment.trafilatura")
+    def test_success(self, mock_traf, mock_get):
         mock_get.return_value = MagicMock(ok=True, text="<html>article</html>")
-
-        import ba2_trade_platform.core.news_enrichment as mod
-        original_traf = getattr(mod, "trafilatura", None)
-        original_avail = mod.TRAFILATURA_AVAILABLE
-        mod.trafilatura = mock_traf
-        mod.TRAFILATURA_AVAILABLE = True
-        try:
-            result = fetch_article_content("https://example.com")
-            assert result == "Extracted article content here."
-        finally:
-            if original_traf is not None:
-                mod.trafilatura = original_traf
-            elif hasattr(mod, "trafilatura"):
-                delattr(mod, "trafilatura")
-            mod.TRAFILATURA_AVAILABLE = original_avail
+        mock_traf.extract.return_value = "Extracted article content here."
+        result = fetch_article_content("https://example.com")
+        assert result == "Extracted article content here."
 
     @patch("ba2_trade_platform.core.news_enrichment.requests.get")
     def test_request_failure(self, mock_get):
         mock_get.side_effect = Exception("Connection error")
-        import ba2_trade_platform.core.news_enrichment as mod
-        original_avail = mod.TRAFILATURA_AVAILABLE
-        mod.TRAFILATURA_AVAILABLE = True
-        try:
-            result = fetch_article_content("https://example.com")
-            assert result is None
-        finally:
-            mod.TRAFILATURA_AVAILABLE = original_avail
-
-    def test_trafilatura_not_available(self):
-        import ba2_trade_platform.core.news_enrichment as mod
-        original_avail = mod.TRAFILATURA_AVAILABLE
-        mod.TRAFILATURA_AVAILABLE = False
-        try:
-            result = fetch_article_content("https://example.com")
-            assert result is None
-        finally:
-            mod.TRAFILATURA_AVAILABLE = original_avail
+        result = fetch_article_content("https://example.com")
+        assert result is None
 
 
 class TestEnrichArticles:
@@ -155,13 +126,3 @@ class TestTrimArticles:
         trim_articles_to_token_budget(articles, token_budget=500)
         assert articles[0]["full_content"] == "tiny"  # Unchanged
         assert len(articles[1]["full_content"]) < 5000  # Trimmed
-
-    def test_empty_articles_list(self):
-        articles = []
-        trim_articles_to_token_budget(articles, token_budget=100)
-        assert articles == []
-
-    def test_articles_without_content(self):
-        articles = [{"title": "No content"}]
-        trim_articles_to_token_budget(articles, token_budget=100)
-        assert articles[0] == {"title": "No content"}

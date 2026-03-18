@@ -159,7 +159,8 @@ class FMPOHLCVProvider(MarketDataProviderInterface):
             "to": end_date.strftime("%Y-%m-%d")
         }
         
-        logger.debug(f"FMP API request: {url} with params: {({k: v for k, v in params.items() if k != 'apikey'})}")
+        safe_params = {k: v for k, v in params.items() if k != "apikey"}
+        logger.debug(f"FMP API request: {url} with params: {safe_params}")
 
         response = requests.get(url, params=params)
         response.raise_for_status()
@@ -237,7 +238,8 @@ class FMPOHLCVProvider(MarketDataProviderInterface):
             "to": end_date.strftime("%Y-%m-%d")
         }
         
-        logger.debug(f"FMP API request: {url} with params: {({k: v for k, v in params.items() if k != 'apikey'})}")
+        safe_params = {k: v for k, v in params.items() if k != "apikey"}
+        logger.debug(f"FMP API request: {url} with params: {safe_params}")
 
         response = requests.get(url, params=params)
         response.raise_for_status()

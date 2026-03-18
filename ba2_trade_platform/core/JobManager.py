@@ -1033,8 +1033,14 @@ class JobManager:
                 logger.warning(f"Expert {expert_instance_id} returned no instrument recommendations")
                 return
             
+            # Deduplicate recommended instruments (preserve order)
+            unique_instruments = list(dict.fromkeys(recommended_instruments))
+            if len(unique_instruments) < len(recommended_instruments):
+                logger.info(f"Deduplicated expert instruments: {len(recommended_instruments)} -> {len(unique_instruments)}")
+            recommended_instruments = unique_instruments
+
             logger.info(f"Expert {expert_instance_id} recommended {len(recommended_instruments)} instruments: {recommended_instruments[:10]}{'...' if len(recommended_instruments) > 10 else ''}")
-            
+
             # Auto-add instruments to database if they don't exist
             try:
                 from .InstrumentAutoAdder import get_instrument_auto_adder

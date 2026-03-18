@@ -70,8 +70,8 @@ class FMPRating(MarketExpertInterface):
                 "required": True,
                 "default": "consensus",
                 "description": "Price target to use for profit calculation",
-                "valid_values": ["low", "consensus", "median", "high"],
-                "tooltip": "Which analyst price target to use for expected profit calculation. Options: 'low' (conservative), 'consensus' (average), 'median' (middle value), 'high' (optimistic). Default is 'consensus'."
+                "valid_values": ["low", "consensus", "median", "high", "low_consensus_avg"],
+                "tooltip": "Which analyst price target to use for expected profit calculation. Options: 'low' (conservative), 'consensus' (average), 'median' (middle value), 'high' (optimistic), 'low_consensus_avg' (average of low and consensus). Default is 'consensus'."
             }
         }
     
@@ -306,6 +306,11 @@ class FMPRating(MarketExpertInterface):
             target_price = target_high
         elif target_price_type == 'median':
             target_price = target_median
+        elif target_price_type == 'low_consensus_avg':
+            if target_low is not None and target_consensus is not None:
+                target_price = (target_low + target_consensus) / 2
+            else:
+                target_price = target_consensus or target_low
         else:  # 'consensus' is default
             target_price = target_consensus
         

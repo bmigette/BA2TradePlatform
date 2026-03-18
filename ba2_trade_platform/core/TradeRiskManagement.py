@@ -150,7 +150,7 @@ class TradeRiskManagement:
             self.logger.debug(f"Existing allocations for expert {expert_instance_id}: {existing_allocations}")
             
             # Step 8: Calculate quantities for prioritized orders
-            orders_to_update, orders_to_delete = self._calculate_order_quantities(
+            orders_to_update, orders_to_delete, symbol_prices = self._calculate_order_quantities(
                 prioritized_orders,
                 total_virtual_balance,
                 max_equity_per_instrument,
@@ -158,13 +158,13 @@ class TradeRiskManagement:
                 account,
                 expert
             )
-            
+
             # Step 9: Update orders in database
             self._update_orders_in_database(orders_to_update)
-            
+
             # Step 10: Delete orders with quantity=0 if automated trade opening is enabled
             if allow_automated_trade_opening and orders_to_delete:
-                self._delete_unfunded_orders(orders_to_delete)
+                self._delete_unfunded_orders(orders_to_delete, symbol_prices, max_equity_per_instrument)
             
             updated_orders = orders_to_update  # For return value compatibility
             
@@ -572,11 +572,11 @@ class TradeRiskManagement:
         # Separate orders into those to update (qty > 0) and those to delete (qty = 0)
         orders_to_update = [o for o in updated_orders if o.quantity > 0]
         orders_to_delete = [o for o in updated_orders if o.quantity == 0]
-        
+
         if orders_to_delete:
             self.logger.info(f"Found {len(orders_to_delete)} orders with quantity=0 that will be deleted")
-        
-        return orders_to_update, orders_to_delete
+
+        return orders_to_update, orders_to_delete, symbol_prices
     
     def _update_orders_in_database(self, orders: List[TradingOrder]) -> None:
         """
@@ -638,29 +638,34 @@ class TradeRiskManagement:
         except Exception as e:
             self.logger.error(f"Error updating orders in database: {e}", exc_info=True)
     
-    def _delete_unfunded_orders(self, orders: List[TradingOrder]) -> None:
+    def _delete_unfunded_orders(self, orders: List[TradingOrder], symbol_prices: Dict[str, float] = None, max_equity_per_instrument: float = None) -> None:
         """
         Delete orders with quantity=0 (insufficient funds) and their linked orders/transactions.
-        
+
         This is called when automated trade opening is enabled and risk management
         determines some orders cannot be funded.
-        
+
         Args:
             orders: List of TradingOrder objects with quantity=0 to delete
+            symbol_prices: Optional dict of symbol -> current price for logging
+            max_equity_per_instrument: Optional max allocation per instrument for logging
         """
         try:
             from .db import delete_instance
-            
+
             deleted_order_count = 0
             deleted_linked_order_count = 0
             deleted_transaction_count = 0
-            
+
             with get_db() as session:
                 for order in orders:
                     try:
-                        # Log the deletion with specific reason
+                        # Log the deletion with price details
+                        price = symbol_prices.get(order.symbol) if symbol_prices else None
+                        price_info = f"price=${price:.2f}" if price else "price=unknown"
+                        limit_info = f", limit=${max_equity_per_instrument:.2f}" if max_equity_per_instrument else ""
                         self.logger.info(f"Deleting unfunded order {order.id} ({order.symbol}, {order.side}) - "
-                                       f"price exceeds per-instrument limit (can't afford 1 share)")
+                                       f"{price_info}{limit_info} (can't afford 1 share)")
                         
                         # Find and delete any linked orders (orders that depend on this order)
                         if order.id:

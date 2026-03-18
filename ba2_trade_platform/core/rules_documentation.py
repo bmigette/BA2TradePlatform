@@ -182,9 +182,9 @@ def get_event_type_documentation() -> dict:
         },
         ExpertEventType.N_PERCENT_TO_NEW_TARGET.value: {
             "name": "Percent to New Expert Target",
-            "description": "For open positions: percentage distance from current price to the new expert's recommended target price. Used with numeric comparisons.",
+            "description": "Percentage distance from current price to the expert's recommended target price. Works for both enter_market and open_positions rules. Positive = target above current (BUY upside), negative = target below current. Use >= 2 to require at least 2% upside before entering.",
             "type": "numeric",
-            "example": "Adjust TP when percent_to_new_target >= 10% (expert sees more upside)"
+            "example": "Only enter when percent_to_new_target >= 2% (target at least 2% above current price)"
         },
         ExpertEventType.N_PROFIT_LOSS_AMOUNT.value: {
             "name": "Profit/Loss Amount",
@@ -215,6 +215,12 @@ def get_event_type_documentation() -> dict:
             "description": "Current market value of the instrument position as a percentage of the expert's virtual equity (available balance). Useful for portfolio rebalancing and position sizing.",
             "type": "numeric",
             "example": "Rebalance when instrument_account_share > 15% (position too large) or < 5% (position too small)"
+        },
+        ExpertEventType.N_PERCENT_OPEN_TO_NEW_TARGET.value: {
+            "name": "Percent Open Price to New Expert Target",
+            "description": "For open positions: percentage from the position's open (entry) price to the expert's new target price. Positive = target above entry (profit potential for longs). Use to gate TP adjustments: only adjust if the expert target represents enough profit from your entry.",
+            "type": "numeric",
+            "example": "Only adjust TP when percent_open_to_new_target >= 2% (expert target at least 2% above entry)"
         }
     }
 

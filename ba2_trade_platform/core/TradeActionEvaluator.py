@@ -142,7 +142,19 @@ class TradeActionEvaluator:
                         logger.info(f"Conditions met for event action: {event_action.name}")
                     else:
                         logger.warning(f"DEBUG MODE: Forcing action generation despite failed conditions for: {event_action.name}")
-                    
+
+                    # Check if this is a STOP_PROCESSING action (guard rule)
+                    is_stop_processing = any(
+                        (ac.get('action_type') or ac.get('type')) == ExpertActionType.STOP_PROCESSING.value
+                        for ac in (event_action.actions or {}).values()
+                    )
+
+                    if is_stop_processing and conditions_met:
+                        logger.info(f"STOP_PROCESSING triggered by {event_action.name} — halting ruleset evaluation")
+                        if self.rule_evaluations:
+                            self.rule_evaluations[-1]['actions'] = [{"action_type": "stop_processing", "message": "Ruleset evaluation halted by guard rule"}]
+                        break
+
                     # Create and store TradeAction objects (with duplicate prevention)
                     new_actions = self._create_and_store_trade_actions(
                         event_action, instrument_name, expert_recommendation, existing_order, generated_actions
@@ -154,7 +166,7 @@ class TradeActionEvaluator:
                     # when stored in TradeActionResult.data.
                     if self.rule_evaluations and new_actions:
                         self.rule_evaluations[-1]['actions'] = _sanitize_for_json(new_actions)
-                    
+
                     # Check if we should continue processing more event actions
                     # In force mode, always continue to see all possible actions
                     if not event_action.continue_processing and not self.force_generate_actions:
