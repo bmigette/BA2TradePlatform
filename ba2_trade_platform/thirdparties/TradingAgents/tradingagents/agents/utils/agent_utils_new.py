@@ -87,6 +87,7 @@ class Toolkit:
         self.provider_map = provider_map
         self.provider_args = provider_args or {}
         self.analyst_context_size = self.provider_args.get("analyst_context_size", 128000)
+        self.current_symbol = None
         self.expert_settings_defaults = expert_settings_defaults or {}
         logger.debug(f"Toolkit initialized with provider_map keys: {list(provider_map.keys())}")
         logger.debug(f"Toolkit initialized with provider_args keys: {list(self.provider_args.keys())}")
@@ -247,10 +248,18 @@ class Toolkit:
             >>> news = get_company_news("AAPL", "2024-03-15", lookback_days=7)
             >>> # Returns news from all configured providers about Apple
         """
+        if not symbol:
+            symbol = getattr(self, "current_symbol", None)
+            if symbol:
+                logger.warning(f"get_company_news called without symbol, falling back to current_symbol: {symbol}")
+            else:
+                logger.error("get_company_news called without symbol and no current_symbol set")
+                return "**Error**: No symbol provided for company news lookup."
+
         if "news" not in self.provider_map or not self.provider_map["news"]:
             logger.warning(f"No news providers configured for get_company_news")
             return "**No Provider Available**\n\nNo news providers are currently configured. Please configure at least one news provider in the expert settings to retrieve company news."
-        
+
         try:
             end_dt = datetime.strptime(end_date, "%Y-%m-%d")
             

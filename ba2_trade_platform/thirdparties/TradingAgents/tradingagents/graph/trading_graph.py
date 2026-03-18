@@ -676,7 +676,8 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         """Run the trading agents graph for a company on a specific date."""
 
         self.ticker = company_name
-        
+        self.toolkit.current_symbol = company_name
+
         # Initialize memories and create graph if not already done
         if self.graph is None:
             self._initialize_memories_and_graph(company_name)

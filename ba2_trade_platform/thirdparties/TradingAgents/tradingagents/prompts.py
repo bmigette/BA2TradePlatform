@@ -313,8 +313,8 @@ FINAL_SUMMARIZATION_AGENT_PROMPT = """You are the Final Summarization Agent for 
 ⚠️ **COMMON MISTAKES TO AVOID**:
 1. ❌ NO trailing commas: `["item1", "item2",]` ← INVALID
 2. ✅ Correct format: `["item1", "item2"]` ← VALID
-3. ❌ NO comments in JSON: `"confidence": 72.0,  // high confidence` ← INVALID
-4. ✅ Use only data: `"confidence": 72.0` ← VALID
+3. ❌ NO comments in JSON: `"confidence": 85.0,  // high confidence` ← INVALID
+4. ✅ Use only data: `"confidence": 85.0` ← VALID
 
 **Examples of INVALID JSON (DO NOT OUTPUT)**:
 ```
