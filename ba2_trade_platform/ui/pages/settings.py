@@ -1063,7 +1063,7 @@ class AccountDefinitionsTab:
         provider_config = providers.get(provider)
         if not provider_config:
             return
-        settings_def = provider_config.get_settings_definitions()
+        settings_def = provider_config.get_merged_settings_definitions()
         
         # Get settings directly from database without creating AccountInterface
         settings_values = {}
@@ -1091,8 +1091,16 @@ class AccountDefinitionsTab:
                         else:
                             display_label = label
 
+                        valid_values = meta.get("valid_values")
+
                         # Create the input field directly in the same container
-                        if meta["type"] == "str":
+                        if meta["type"] == "str" and valid_values:
+                            inp = ui.select(
+                                label=display_label,
+                                options=list(valid_values),
+                                value=value if value in valid_values else (valid_values[0] if valid_values else "")
+                            ).classes('w-full')
+                        elif meta["type"] == "str":
                             inp = ui.input(label=display_label, value=value or "").classes('w-full')
                         elif meta["type"] == "bool":
                             # Proper boolean conversion - handle string "false"/"true" and boolean values
@@ -1105,6 +1113,9 @@ class AccountDefinitionsTab:
                                 else:
                                     bool_value = bool(value)
                             inp = ui.checkbox(text=display_label, value=bool_value)
+                        elif meta["type"] == "float":
+                            float_value = value if value is not None else meta.get("default", "")
+                            inp = ui.number(label=display_label, value=float_value).classes('w-full')
                         else:
                             inp = ui.input(label=display_label, value=value or "").classes('w-full')
 

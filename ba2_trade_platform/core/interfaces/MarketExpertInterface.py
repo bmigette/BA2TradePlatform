@@ -506,8 +506,10 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             if not account:
                 return False, f"Account {expert_instance.account_id} not found"
             
-            # Get threshold from account settings (backward compatible default: 5%)
-            threshold_percent = account.settings.get("minimum_equity_threshold_percent", 5.0)
+            # Get threshold from account settings (default: 5%)
+            threshold_percent = account.settings.get("minimum_equity_threshold_percent")
+            if threshold_percent is None:
+                threshold_percent = 5.0
             min_balance_threshold = virtual_balance * (threshold_percent / 100.0)
             
             # Check if available balance meets threshold
@@ -644,10 +646,12 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         """
         Check if analysis should be skipped for a symbol based on price and balance constraints.
         
-        This function performs two checks:
+        This function performs three checks:
         1. If symbol price is higher than available balance, skip analysis
-        2. If available balance is below threshold % of virtual balance, skip analysis
-           (threshold configurable via minimum_equity_threshold_percent account setting, default 5%)
+        2. If available balance is below minimum_equity_threshold_percent of virtual balance, skip
+           (configurable per account, default 5%)
+        3. If available balance is below min_available_balance_pct of virtual balance, skip
+           (configurable per expert, default 10%)
         
         Note: For expert-recommended instruments (dynamic symbols like "EXPERT"), 
         price checks are bypassed since these don't have real market prices.
@@ -710,6 +714,17 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             # Check 2: If available balance is below threshold percentage of virtual balance, skip
             has_sufficient, reason = self.has_sufficient_equity_for_trading()
             if not has_sufficient:
+                logger.info(f"Skipping analysis for {symbol}: {reason}")
+                return True, reason
+
+            # Check 3: If available balance is below expert min_available_balance_pct, skip
+            if not self.has_sufficient_balance_for_entry():
+                virtual_balance = self.get_virtual_balance()
+                min_pct = self.settings.get('min_available_balance_pct')
+                if min_pct is None:
+                    min_pct = self.__class__._builtin_settings.get('min_available_balance_pct', {}).get('default', 10.0)
+                reason = (f"Available balance ${available_balance:.2f} below "
+                         f"expert min {min_pct}% of virtual balance ${virtual_balance:.2f}")
                 logger.info(f"Skipping analysis for {symbol}: {reason}")
                 return True, reason
             

@@ -25,6 +25,22 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
     # Whether this account supports trading operations
     supports_trading = False
 
+    _builtin_settings: Dict[str, Any] = {}
+
+    @classmethod
+    def _ensure_builtin_settings(cls):
+        """Ensure builtin settings are initialized for account classes."""
+        if not cls._builtin_settings:
+            cls._builtin_settings = {
+                "minimum_equity_threshold_percent": {
+                    "type": "float",
+                    "required": False,
+                    "default": 5.0,
+                    "description": "Minimum equity threshold (%)",
+                    "tooltip": "Minimum percentage of account balance that must remain available across all experts before new positions are blocked. This is an account-wide safety net."
+                },
+            }
+
     # Class-level price cache shared across all instances
     # Structure: {account_id: {symbol: {'price': float, 'timestamp': datetime, 'fetching': bool}}}
     _GLOBAL_PRICE_CACHE: Dict[int, Dict[str, Dict[str, Any]]] = {}
@@ -42,6 +58,7 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         Args:
             id (int): The unique identifier for the account.
         """
+        self._ensure_builtin_settings()
         self.id = id
         # Initialize settings cache to None (will be loaded on first access)
         self._settings_cache = None
