@@ -777,12 +777,19 @@ Analysis completed at: {self._get_current_timestamp()}"""
         economic_data_days = int(self.settings.get('economic_data_days') or settings_def['economic_data_days']['default'])
         news_lookback_days = int(self.settings.get('news_lookback_days') or settings_def['news_lookback_days']['default'])
         social_sentiment_days = int(self.settings.get('social_sentiment_days') or settings_def['social_sentiment_days']['default'])
+        # Get analyst model context size for enrichment trimming
+        # The "deep_think_llm" setting is used for analyst LLMs
+        from ba2_trade_platform.core.models_registry import get_model_context_size, parse_model_selection
+        deep_think_llm = self.settings.get('deep_think_llm') or settings_def['deep_think_llm']['default']
+        _, analyst_model_name = parse_model_selection(deep_think_llm)
+
         provider_args = {
             'websearch_model': websearch_model,
             'alpha_vantage_source': alpha_vantage_source,
             'economic_data_days': economic_data_days,  # Pass expert setting for default lookback_days
             'news_lookback_days': news_lookback_days,  # Pass expert setting for news tools
-            'social_sentiment_days': social_sentiment_days  # Pass expert setting for social media tools
+            'social_sentiment_days': social_sentiment_days,  # Pass expert setting for social media tools
+            'analyst_context_size': get_model_context_size(analyst_model_name),
         }
         
         # Log provider_map configuration

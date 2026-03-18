@@ -86,6 +86,7 @@ class Toolkit:
         """
         self.provider_map = provider_map
         self.provider_args = provider_args or {}
+        self.analyst_context_size = self.provider_args.get("analyst_context_size", 128000)
         self.expert_settings_defaults = expert_settings_defaults or {}
         logger.debug(f"Toolkit initialized with provider_map keys: {list(provider_map.keys())}")
         logger.debug(f"Toolkit initialized with provider_args keys: {list(self.provider_args.keys())}")
@@ -258,16 +259,17 @@ class Toolkit:
                 lookback_days = self.provider_args["news_lookback_days"]
             
             results = []
+            collected_data_dicts = []
             provider_errors = {}  # Track errors for fail-fast
             success_count = 0
-            
+
             for provider_class in self.provider_map["news"]:
                 provider_name = provider_class.__name__
                 try:
                     provider = self._instantiate_provider(provider_class)
-                    
+
                     logger.debug(f"Fetching company news from {provider_name} for {symbol}")
-                    
+
                     # Call provider with format_type="both" to get both markdown and structured data
                     markdown_data, data_dict = self._call_provider_with_both_format(
                         provider,
@@ -276,25 +278,61 @@ class Toolkit:
                         end_date=end_dt,
                         lookback_days=lookback_days
                     )
-                    
+
                     if markdown_data is None:
                         provider_errors[provider_name] = "Failed to fetch news (returned None)"
                         results.append(f"## {provider_name} - Error\n\nFailed to fetch news")
                         continue
-                    
+
                     success_count += 1
+                    collected_data_dicts.append(data_dict)
                     results.append(f"## News from {provider_name.upper()}\n\n{markdown_data}")
-                    
+
                 except Exception as e:
                     error_msg = str(e)
                     logger.error(f"Error fetching company news from {provider_name}: {e}")
                     provider_errors[provider_name] = error_msg
                     results.append(f"## {provider_name} - Error\n\nFailed to fetch news: {error_msg}")
-            
+
             # If ALL providers failed, raise exception to stop the graph
             if success_count == 0 and provider_errors:
                 raise AllProvidersFailedError("news", provider_errors)
-            
+
+            # Collect all articles from data_dicts for enrichment
+            all_articles = []
+            for data_dict in collected_data_dicts:
+                if data_dict and "articles" in data_dict:
+                    all_articles.extend(data_dict["articles"])
+
+            # Enrich articles with full content (trafilatura + cache)
+            if all_articles:
+                from ba2_trade_platform.core.news_enrichment import enrich_articles, trim_articles_to_token_budget
+                enrich_articles(all_articles)
+
+                # Calculate token budget for news content
+                # Reserve tokens for system prompt + other tool results
+                NEWS_PROMPT_RESERVE = 4000  # tokens for system/analyst prompt overhead
+                token_budget = self.analyst_context_size - NEWS_PROMPT_RESERVE
+                # Use ~40% of remaining context for news (other tools need space too)
+                news_token_budget = int(token_budget * 0.4)
+                trim_articles_to_token_budget(all_articles, news_token_budget)
+
+                # Rebuild markdown with enriched content
+                enriched_parts = []
+                for article in all_articles:
+                    title = article.get("title", "No Title")
+                    content = article.get("full_content") or article.get("summary", "No content available.")
+                    source = article.get("source", "Unknown")
+                    published = article.get("published_at", "")
+                    url = article.get("url", "")
+                    md = f"### {title}\n**Source:** {source} | **Published:** {published}\n\n{content}"
+                    if url:
+                        md += f"\n\n[Read more]({url})"
+                    enriched_parts.append(md)
+
+                enriched_markdown = f"# News for {symbol}\n**Articles:** {len(all_articles)}\n\n" + "\n\n---\n\n".join(enriched_parts)
+                return enriched_markdown
+
             return "\n\n---\n\n".join(results) if results else "No news data available"
             
         except AllProvidersFailedError:
@@ -345,16 +383,17 @@ class Toolkit:
                 lookback_days = self.provider_args["news_lookback_days"]
             
             results = []
+            collected_data_dicts = []
             provider_errors = {}  # Track errors for fail-fast
             success_count = 0
-            
+
             for provider_class in self.provider_map["news"]:
                 provider_name = provider_class.__name__
                 try:
                     provider = self._instantiate_provider(provider_class)
-                    
+
                     logger.debug(f"Fetching global news from {provider_name}")
-                    
+
                     # Call provider with format_type="both" to get both markdown and structured data
                     markdown_data, data_dict = self._call_provider_with_both_format(
                         provider,
@@ -362,25 +401,61 @@ class Toolkit:
                         end_date=end_dt,
                         lookback_days=lookback_days
                     )
-                    
+
                     if markdown_data is None:
                         provider_errors[provider_name] = "Failed to fetch news (returned None)"
                         results.append(f"## {provider_name} - Error\n\nFailed to fetch news")
                         continue
-                    
+
                     success_count += 1
+                    collected_data_dicts.append(data_dict)
                     results.append(f"## Global News from {provider_name.upper()}\n\n{markdown_data}")
-                    
+
                 except Exception as e:
                     error_msg = str(e)
                     logger.error(f"Error fetching global news from {provider_name}: {e}")
                     provider_errors[provider_name] = error_msg
                     results.append(f"## {provider_name} - Error\n\nFailed to fetch global news: {error_msg}")
-            
+
             # If ALL providers failed, raise exception to stop the graph
             if success_count == 0 and provider_errors:
                 raise AllProvidersFailedError("news", provider_errors)
-            
+
+            # Collect all articles from data_dicts for enrichment
+            all_articles = []
+            for data_dict in collected_data_dicts:
+                if data_dict and "articles" in data_dict:
+                    all_articles.extend(data_dict["articles"])
+
+            # Enrich articles with full content (trafilatura + cache)
+            if all_articles:
+                from ba2_trade_platform.core.news_enrichment import enrich_articles, trim_articles_to_token_budget
+                enrich_articles(all_articles)
+
+                # Calculate token budget for news content
+                # Reserve tokens for system prompt + other tool results
+                NEWS_PROMPT_RESERVE = 4000  # tokens for system/analyst prompt overhead
+                token_budget = self.analyst_context_size - NEWS_PROMPT_RESERVE
+                # Use ~40% of remaining context for news (other tools need space too)
+                news_token_budget = int(token_budget * 0.4)
+                trim_articles_to_token_budget(all_articles, news_token_budget)
+
+                # Rebuild markdown with enriched content
+                enriched_parts = []
+                for article in all_articles:
+                    title = article.get("title", "No Title")
+                    content = article.get("full_content") or article.get("summary", "No content available.")
+                    source = article.get("source", "Unknown")
+                    published = article.get("published_at", "")
+                    url = article.get("url", "")
+                    md = f"### {title}\n**Source:** {source} | **Published:** {published}\n\n{content}"
+                    if url:
+                        md += f"\n\n[Read more]({url})"
+                    enriched_parts.append(md)
+
+                enriched_markdown = f"# Global News\n**Articles:** {len(all_articles)}\n\n" + "\n\n---\n\n".join(enriched_parts)
+                return enriched_markdown
+
             return "\n\n---\n\n".join(results) if results else "No global news data available"
             
         except AllProvidersFailedError:
@@ -388,90 +463,6 @@ class Toolkit:
         except Exception as e:
             logger.error(f"Error in get_global_news: {e}")
             return f"Error retrieving global news: {str(e)}"
-    
-    def extract_web_content(
-        self,
-        urls: Annotated[List[str], "List of news article URLs to extract full content from. Provide URLs from news articles to get complete article text for deeper analysis."],
-        max_tokens: Annotated[int, "Maximum total tokens to extract across all URLs. Default is 128000 (128K tokens). Content extraction stops when this limit is reached."] = 128000
-    ) -> str:
-        """
-        Extract full article content from multiple news URLs in parallel.
-        
-        This tool fetches and extracts the main content from news article URLs,
-        filtering out ads, navigation, and boilerplate to provide clean article text.
-        Ideal for deep analysis of specific news articles beyond summaries.
-        
-        The extraction:
-        - Runs in parallel for fast processing (up to 5 URLs simultaneously)
-        - Automatically manages token limits (stops at max_tokens)
-        - Returns clean markdown format for LLM analysis
-        - Skips URLs that would exceed the token limit
-        - Handles errors gracefully (blocked sites, timeouts, etc.)
-        
-        Use this when you need full article details beyond the summary provided by
-        news APIs. Particularly useful for analyzing detailed earnings reports,
-        in-depth investigative pieces, or comprehensive market analysis articles.
-        
-        Args:
-            urls: List of article URLs to extract (e.g., from get_company_news results)
-            max_tokens: Maximum total tokens across all articles (default: 128000)
-        
-        Returns:
-            str: Markdown-formatted content with all extracted articles and metadata
-        
-        Example:
-            >>> # Get news URLs first
-            >>> news = get_company_news("AAPL", "2024-03-15", lookback_days=3)
-            >>> # Extract full articles (you would parse URLs from news first)
-            >>> content = extract_web_content(
-            ...     urls=["https://example.com/article1", "https://example.com/article2"],
-            ...     max_tokens=50000
-            ... )
-            >>> # Returns full article text for deeper analysis
-        
-        Note:
-            - Some sites block automated access (403/401 errors) - these will be skipped
-            - Extraction stops automatically when token limit is reached
-            - Results are logged as Analysis Output in the database
-        """
-        from ...utils.web_content_extractor import extract_urls_parallel
-        
-        # Defensive check: ensure urls is a list, not a string
-        if isinstance(urls, str):
-            logger.warning(f"extract_web_content received a string instead of list, wrapping: {urls[:100]}")
-            urls = [urls]
-        
-        if not urls:
-            logger.warning("extract_web_content called with empty URL list")
-            return "**No URLs Provided**\n\nPlease provide at least one URL to extract content from."
-        
-        logger.info(f"Extracting web content from {len(urls)} URLs (max_tokens={max_tokens})")
-        
-        try:
-            # Extract content in parallel
-            result = extract_urls_parallel(
-                urls=urls,
-                max_workers=5,
-                max_tokens=max_tokens
-            )
-            
-            if not result["success"]:
-                error_msg = result.get("error", "Unknown error")
-                logger.error(f"Web content extraction failed: {error_msg}")
-                return f"**Extraction Failed**\n\n{error_msg}"
-            
-            # Log success metrics
-            logger.info(
-                f"Web content extraction complete: {result['extracted_count']}/{len(urls)} URLs, "
-                f"{result['total_tokens']:,} tokens in {result['duration']:.2f}s"
-            )
-            
-            # Return markdown content
-            return result["content_markdown"]
-            
-        except Exception as e:
-            logger.error(f"Error in extract_web_content: {e}", exc_info=True)
-            return f"**Error Extracting Web Content**\n\n{str(e)}"
     
     # ========================================================================
     # SOCIAL MEDIA PROVIDERS - Aggregate results from all providers

@@ -28,6 +28,9 @@ LABEL_VISION = "vision"           # Models with vision/image capabilities
 LABEL_CODING = "coding"           # Models optimized for code generation
 LABEL_TOOL_CALLING = "tool_calling"  # Models that support tool/function calling
 
+# Default context window size (in tokens) for models not explicitly configured
+DEFAULT_CONTEXT_SIZE = 128000
+
 
 # Provider definitions
 PROVIDER_OPENAI = "openai"
@@ -121,6 +124,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "openai/gpt-5-2025-08-07",
         },
         "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "context_size": 128000,
     },
     "gpt5_mini": {
         "native_provider": PROVIDER_OPENAI,
@@ -132,6 +136,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "openai/gpt-5-mini",
         },
         "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "context_size": 128000,
     },
     "gpt5_nano": {
         "native_provider": PROVIDER_OPENAI,
@@ -143,6 +148,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "openai/gpt-5-nano-2025-08-07",
         },
         "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "context_size": 128000,
     },
     "gpt5_chat": {
         "native_provider": PROVIDER_OPENAI,
@@ -152,6 +158,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_NAGAAI: "gpt-5-chat-latest",
         },
         "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING],
+        "context_size": 128000,
     },
     "gpt5_codex": {
         "native_provider": PROVIDER_OPENAI,
@@ -161,8 +168,9 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_NAGAAI: "gpt-5-codex",
         },
         "labels": [LABEL_CODING, LABEL_TOOL_CALLING],
+        "context_size": 128000,
     },
-    
+
     # =========================================================================
     # GPT-5.1 Family (with reasoning effort parameter)
     # =========================================================================
@@ -177,8 +185,9 @@ MODELS: Dict[str, Dict[str, Any]] = {
         },
         "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
         "supports_parameters": ["reasoning_effort"],  # Supports {reasoning=effort:low/medium/high}
+        "context_size": 1000000,
     },
-    
+
     # =========================================================================
     # GPT-5.2 Family (latest with enhanced reasoning)
     # =========================================================================
@@ -193,8 +202,9 @@ MODELS: Dict[str, Dict[str, Any]] = {
         },
         "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
         "supports_parameters": ["reasoning_effort"],  # Supports {reasoning_effort:low/medium/high}
+        "context_size": 1000000,
     },
-    
+
     # =========================================================================
     # GPT-4o Family
     # =========================================================================
@@ -208,6 +218,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "openai/gpt-4o",
         },
         "labels": [LABEL_HIGH_COST, LABEL_VISION, LABEL_TOOL_CALLING],
+        "context_size": 128000,
     },
     "gpt4o_mini": {
         "native_provider": PROVIDER_OPENAI,
@@ -219,8 +230,9 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "openai/gpt-4o-mini",
         },
         "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_VISION, LABEL_TOOL_CALLING],
+        "context_size": 128000,
     },
-    
+
     # =========================================================================
     # O-Series (Reasoning Models)
     # =========================================================================
@@ -234,6 +246,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
         },
         "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_TOOL_CALLING],
         "no_temperature": True,  # O-series models don't support temperature parameter
+        "context_size": 200000,
     },
     "o1_mini": {
         "native_provider": PROVIDER_OPENROUTER,
@@ -244,6 +257,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
         },
         "labels": [LABEL_LOW_COST, LABEL_THINKING, LABEL_FAST, LABEL_TOOL_CALLING],
         "no_temperature": True,  # O-series models don't support temperature parameter
+        "context_size": 128000,
     },
     "o3_mini": {
         "native_provider": PROVIDER_OPENAI,
@@ -255,6 +269,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
         },
         "labels": [LABEL_LOW_COST, LABEL_THINKING, LABEL_FAST, LABEL_TOOL_CALLING],
         "no_temperature": True,  # O-series models don't support temperature parameter
+        "context_size": 200000,
     },
     "o4_mini": {
         "native_provider": PROVIDER_OPENAI,
@@ -266,8 +281,9 @@ MODELS: Dict[str, Dict[str, Any]] = {
         },
         "labels": [LABEL_LOW_COST, LABEL_THINKING, LABEL_FAST, LABEL_TOOL_CALLING],
         "no_temperature": True,  # O-series models don't support temperature parameter
+        "context_size": 200000,
     },
-    
+
     # =========================================================================
     # Grok Family (xAI)
     # =========================================================================
@@ -281,6 +297,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "x-ai/grok-4-0709",
         },
         "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "context_size": 131072,
     },
     "grok4_fast": {
         "native_provider": PROVIDER_XAI,
@@ -292,6 +309,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "x-ai/grok-4-fast",
         },
         "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "context_size": 131072,
     },
     "grok4_fast_reasoning": {
         "native_provider": PROVIDER_XAI,
@@ -303,6 +321,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "x-ai/grok-4-fast-reasoning",
         },
         "labels": [LABEL_THINKING, LABEL_FAST, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "context_size": 131072,
     },
     "grok4.1_fast_reasoning": {
         "native_provider": PROVIDER_XAI,
@@ -314,6 +333,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "x-ai/grok-4-1-fast-reasoning",
         },
         "labels": [LABEL_THINKING, LABEL_FAST, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "context_size": 131072,
     },
     "grok4.1_fast": {
         "native_provider": PROVIDER_XAI,
@@ -325,6 +345,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "x-ai/grok-4-1-fast-non-reasoning",
         },
         "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "context_size": 131072,
     },
     "grok3": {
         "native_provider": PROVIDER_XAI,
@@ -336,6 +357,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "x-ai/grok-3",
         },
         "labels": [LABEL_THINKING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "context_size": 131072,
     },
     "grok3_mini": {
         "native_provider": PROVIDER_XAI,
@@ -347,8 +369,9 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "x-ai/grok-3-mini",
         },
         "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "context_size": 131072,
     },
-    
+
     # =========================================================================
     # Qwen Family (Alibaba)
     # =========================================================================
@@ -361,6 +384,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "qwen/qwen3-max",
         },
         "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_TOOL_CALLING],
+        "context_size": 128000,
     },
     "qwen3_80b": {
         "native_provider": PROVIDER_NAGAAI,
@@ -371,6 +395,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "qwen/qwen3-80b-instruct",
         },
         "labels": [LABEL_HIGH_COST, LABEL_TOOL_CALLING],
+        "context_size": 128000,
     },
     "qwen3_80b_thinking": {
         "native_provider": PROVIDER_NAGAAI,
@@ -381,8 +406,9 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "qwen/qwen3-80b-thinking",
         },
         "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_TOOL_CALLING],
+        "context_size": 128000,
     },
-    
+
     # =========================================================================
     # DeepSeek Family
     # =========================================================================
@@ -396,6 +422,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "deepseek/deepseek-chat",
         },
         "labels": [LABEL_LOW_COST, LABEL_CODING, LABEL_TOOL_CALLING, LABEL_THINKING],
+        "context_size": 128000,
         # Note: thinking parameter not supported by langchain-deepseek yet
     },
     "deepseek_chat": {
@@ -408,6 +435,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "deepseek/deepseek-chat",
         },
         "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING, LABEL_THINKING],
+        "context_size": 128000,
         # Note: thinking parameter not supported by langchain-deepseek yet
     },
     "deepseek_reasoner": {
@@ -420,6 +448,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "deepseek/deepseek-reasoner",
         },
         "labels": [LABEL_LOW_COST, LABEL_THINKING, LABEL_TOOL_CALLING],
+        "context_size": 128000,
     },
     "deepseek_coder": {
         "native_provider": PROVIDER_DEEPSEEK,
@@ -430,8 +459,9 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "deepseek/deepseek-coder",
         },
         "labels": [LABEL_LOW_COST, LABEL_CODING, LABEL_TOOL_CALLING],
+        "context_size": 128000,
     },
-    
+
     # =========================================================================
     # Kimi (Moonshot AI)
     # =========================================================================
@@ -445,6 +475,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "moonshot/kimi-k2",
         },
         "labels": [LABEL_LOW_COST, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "context_size": 131072,
     },
     "kimi_k2_thinking": {
         "native_provider": PROVIDER_MOONSHOT,
@@ -456,6 +487,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "moonshot/kimi-k2-thinking",
         },
         "labels": [LABEL_LOW_COST, LABEL_THINKING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "context_size": 131072,
     },
     "kimi_k2_thinking_turbo": {
         "native_provider": PROVIDER_MOONSHOT,
@@ -467,6 +499,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "moonshot/kimi-k2-thinking-turbo",
         },
         "labels": [LABEL_LOW_COST, LABEL_THINKING, LABEL_FAST, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "context_size": 131072,
     },
     "kimi_k1.5": {
         "native_provider": PROVIDER_MOONSHOT,
@@ -477,6 +510,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "moonshot/moonshot-v1-128k",
         },
         "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING],
+        "context_size": 131072,
     },
     "kimi_k2.5": {
         "native_provider": PROVIDER_MOONSHOT,
@@ -490,6 +524,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "labels": [LABEL_LOW_COST, LABEL_VISION, LABEL_CODING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING, LABEL_THINKING],
         "fixed_temperature": 1.0,  # Kimi K2.5 thinking mode requires temperature=1
         "fixed_top_p": 0.95,  # Kimi K2.5 only accepts top_p=0.95
+        "context_size": 262144,
     },
     "kimi_k2.5-nonthinking": {
         "native_provider": PROVIDER_MOONSHOT,
@@ -506,6 +541,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "fixed_top_p": 0.95,  # Kimi K2.5 only accepts top_p=0.95
         # Disable thinking mode for instant responses
         "default_model_kwargs": {"thinking": {"type": "disabled"}},
+        "context_size": 262144,
     },
 
     # =========================================================================
@@ -523,6 +559,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "labels": [LABEL_LOW_COST, LABEL_THINKING, LABEL_FAST, LABEL_VISION, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
         "supports_parameters": ["reasoning_effort"],
         "default_parameters": {"reasoning_effort": "medium"},
+        "context_size": 1000000,
     },
     "gemini_3_pro": {
         "native_provider": PROVIDER_GOOGLE,
@@ -534,6 +571,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "google/gemini-3-pro-preview",
         },
         "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_VISION, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "context_size": 1000000,
     },
     "gemini_2.5_pro": {
         "native_provider": PROVIDER_GOOGLE,
@@ -545,6 +583,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "google/gemini-2.5-pro-preview",
         },
         "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_VISION, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "context_size": 1048576,
     },
     "gemini_2.5_flash": {
         "native_provider": PROVIDER_GOOGLE,
@@ -556,6 +595,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "google/gemini-2.5-flash-preview",
         },
         "labels": [LABEL_LOW_COST, LABEL_THINKING, LABEL_FAST, LABEL_VISION, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "context_size": 1048576,
     },
     "gemini_2.0_flash": {
         "native_provider": PROVIDER_GOOGLE,
@@ -567,8 +607,9 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "google/gemini-2.0-flash",
         },
         "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_VISION, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "context_size": 1048576,
     },
-    
+
     # =========================================================================
     # Anthropic Claude Family
     # =========================================================================
@@ -583,6 +624,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_BEDROCK: "anthropic.claude-opus-4-5-20251101-v1:0",
         },
         "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_CODING, LABEL_TOOL_CALLING],
+        "context_size": 200000,
     },
     "claude_4_opus": {
         "native_provider": PROVIDER_ANTHROPIC,
@@ -595,6 +637,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_BEDROCK: "anthropic.claude-opus-4-20250514-v1:0",
         },
         "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_CODING, LABEL_TOOL_CALLING],
+        "context_size": 200000,
     },
     "claude_4_sonnet": {
         "native_provider": PROVIDER_ANTHROPIC,
@@ -607,6 +650,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_BEDROCK: "anthropic.claude-sonnet-4-20250514-v1:0",
         },
         "labels": [LABEL_THINKING, LABEL_CODING, LABEL_TOOL_CALLING],
+        "context_size": 200000,
     },
     "claude_3.5_sonnet": {
         "native_provider": PROVIDER_ANTHROPIC,
@@ -618,6 +662,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_BEDROCK: "anthropic.claude-3-5-sonnet-20241022-v2:0",
         },
         "labels": [LABEL_CODING, LABEL_TOOL_CALLING],
+        "context_size": 200000,
     },
     "claude_3.5_haiku": {
         "native_provider": PROVIDER_ANTHROPIC,
@@ -629,8 +674,9 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_BEDROCK: "anthropic.claude-3-5-haiku-20241022-v1:0",
         },
         "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING],
+        "context_size": 200000,
     },
-    
+
     # =========================================================================
     # AWS Bedrock Native Models (Amazon Titan, Meta Llama, Mistral)
     # =========================================================================
@@ -643,6 +689,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "meta-llama/llama-3.3-70b-instruct",
         },
         "labels": [LABEL_THINKING, LABEL_CODING, LABEL_TOOL_CALLING],
+        "context_size": 128000,
     },
     "llama3_2_90b_vision": {
         "native_provider": PROVIDER_BEDROCK,
@@ -653,6 +700,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "meta-llama/llama-3.2-90b-vision-instruct",
         },
         "labels": [LABEL_HIGH_COST, LABEL_VISION, LABEL_TOOL_CALLING],
+        "context_size": 128000,
     },
     "llama3_2_11b_vision": {
         "native_provider": PROVIDER_BEDROCK,
@@ -663,6 +711,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "meta-llama/llama-3.2-11b-vision-instruct",
         },
         "labels": [LABEL_LOW_COST, LABEL_VISION, LABEL_TOOL_CALLING],
+        "context_size": 128000,
     },
     "llama3_1_405b": {
         "native_provider": PROVIDER_BEDROCK,
@@ -673,6 +722,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "meta-llama/llama-3.1-405b-instruct",
         },
         "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_CODING, LABEL_TOOL_CALLING],
+        "context_size": 128000,
     },
     "llama3_1_70b": {
         "native_provider": PROVIDER_BEDROCK,
@@ -683,6 +733,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "meta-llama/llama-3.1-70b-instruct",
         },
         "labels": [LABEL_THINKING, LABEL_CODING, LABEL_TOOL_CALLING],
+        "context_size": 128000,
     },
     "llama3_1_8b": {
         "native_provider": PROVIDER_BEDROCK,
@@ -693,6 +744,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "meta-llama/llama-3.1-8b-instruct",
         },
         "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING],
+        "context_size": 128000,
     },
     "mistral_large_2": {
         "native_provider": PROVIDER_BEDROCK,
@@ -703,6 +755,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "mistralai/mistral-large-2407",
         },
         "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_CODING, LABEL_TOOL_CALLING],
+        "context_size": 128000,
     },
     "mistral_small": {
         "native_provider": PROVIDER_BEDROCK,
@@ -713,6 +766,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "mistralai/mistral-small-2402",
         },
         "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING],
+        "context_size": 32000,
     },
     "amazon_nova_pro": {
         "native_provider": PROVIDER_BEDROCK,
@@ -722,6 +776,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_BEDROCK: "amazon.nova-pro-v1:0",
         },
         "labels": [LABEL_VISION, LABEL_TOOL_CALLING],
+        "context_size": 300000,
     },
     "amazon_nova_lite": {
         "native_provider": PROVIDER_BEDROCK,
@@ -731,6 +786,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_BEDROCK: "amazon.nova-lite-v1:0",
         },
         "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_VISION, LABEL_TOOL_CALLING],
+        "context_size": 300000,
     },
     "amazon_nova_micro": {
         "native_provider": PROVIDER_BEDROCK,
@@ -740,6 +796,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_BEDROCK: "amazon.nova-micro-v1:0",
         },
         "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING],
+        "context_size": 128000,
     },
     "amazon_titan_premier": {
         "native_provider": PROVIDER_BEDROCK,
@@ -749,6 +806,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_BEDROCK: "amazon.titan-text-premier-v1:0",
         },
         "labels": [LABEL_TOOL_CALLING],
+        "context_size": 32000,
     },
     "cohere_command_r_plus": {
         "native_provider": PROVIDER_BEDROCK,
@@ -759,6 +817,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "cohere/command-r-plus",
         },
         "labels": [LABEL_THINKING, LABEL_TOOL_CALLING],
+        "context_size": 128000,
     },
     "cohere_command_r": {
         "native_provider": PROVIDER_BEDROCK,
@@ -769,6 +828,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "cohere/command-r",
         },
         "labels": [LABEL_LOW_COST, LABEL_TOOL_CALLING],
+        "context_size": 128000,
     },
 }
 
@@ -1013,3 +1073,19 @@ def model_supports_temperature(friendly_name: str) -> bool:
         return True  # Default to supporting temperature for unknown models
     
     return not model_info.get("no_temperature", False)
+
+
+def get_model_context_size(friendly_name: str) -> int:
+    """
+    Get the context window size (in tokens) for a model.
+
+    Args:
+        friendly_name: The friendly model name (e.g., "gpt5", "claude_4_sonnet")
+
+    Returns:
+        Context size in tokens. Returns DEFAULT_CONTEXT_SIZE for unknown models.
+    """
+    model_info = MODELS.get(friendly_name)
+    if not model_info:
+        return DEFAULT_CONTEXT_SIZE
+    return model_info.get("context_size", DEFAULT_CONTEXT_SIZE)

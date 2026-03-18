@@ -448,15 +448,6 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             return self.toolkit.get_global_news(end_date, lookback_days)
         
         @tool
-        def extract_web_content(
-            url: str
-        ) -> str:
-            """Extract full content from a web page URL for detailed article reading."""
-            # Ensure url is wrapped in a list if passed as string
-            urls = [url] if isinstance(url, str) else url
-            return self.toolkit.extract_web_content(urls)
-        
-        @tool
         def get_social_media_sentiment(
             end_date: str,
             symbol: Optional[str] = None,
@@ -598,7 +589,6 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                 [
                     get_company_news,  # For company-specific news
                     get_global_news,  # For global/macro news
-                    extract_web_content,  # For extracting full article content from URLs
                 ],
                 self.market_analysis_id,
                 model_info=model_info

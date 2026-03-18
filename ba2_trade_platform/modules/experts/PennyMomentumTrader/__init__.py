@@ -2556,13 +2556,16 @@ class PennyMomentumTrader(LiveExpertInterface):
     # ------------------------------------------------------------------
 
     def _gather_news(self, symbol: str) -> str:
-        """Aggregate news from all configured news vendors."""
+        """Aggregate news from all configured news vendors, enriched with full article content."""
         vendor_list = self.get_setting_with_interface_default(
             "vendor_news", log_warning=False
         )
         from ....modules.dataproviders import get_provider
+        from ....core.news_enrichment import enrich_articles
 
-        all_news: List[str] = []
+        all_articles = []
+        all_news_markdown: List[str] = []
+
         for vendor_name in vendor_list:
             try:
                 kwargs = {}
@@ -2571,18 +2574,39 @@ class PennyMomentumTrader(LiveExpertInterface):
                         "websearch_llm", log_warning=False
                     )
                 provider = get_provider("news", vendor_name, **kwargs)
-                news = provider.get_company_news(
+                result = provider.get_company_news(
                     symbol,
                     end_date=datetime.now(timezone.utc),
                     lookback_days=3,
-                    format_type="markdown",
+                    format_type="both",
                 )
-                all_news.append(f"--- {vendor_name} ---\n{news}")
+                if isinstance(result, dict) and "data" in result:
+                    articles = result["data"].get("articles", [])
+                    all_articles.extend(articles)
+                elif isinstance(result, str):
+                    all_news_markdown.append(f"--- {vendor_name} ---\n{result}")
             except Exception as e:
                 self.logger.warning(
                     f"News provider {vendor_name} failed for {symbol}: {e}"
                 )
-        return "\n\n".join(all_news) if all_news else "No news data available."
+
+        # Enrich articles with full content
+        if all_articles:
+            enrich_articles(all_articles)
+
+            # Build markdown from enriched articles
+            for article in all_articles:
+                title = article.get("title", "No Title")
+                content = article.get("full_content") or article.get("summary", "")
+                source = article.get("source", "")
+                pub = article.get("published_at", "")
+                url = article.get("url", "")
+                md = f"### {title}\n**Source:** {source} | **Published:** {pub}\n\n{content}"
+                if url:
+                    md += f"\n[Read more]({url})"
+                all_news_markdown.append(md)
+
+        return "\n\n---\n\n".join(all_news_markdown) if all_news_markdown else "No news data available."
 
     def _gather_fundamentals(self, symbol: str) -> str:
         """Get fundamentals from configured vendors."""
