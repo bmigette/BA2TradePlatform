@@ -1,0 +1,43 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:platform.moonshot.ai)",
+      "WebFetch(domain:build.nvidia.com)",
+      "Bash(.venvScriptspython.exe test_tools/test_models.py --model kimi_k2.5 --tool-call --websearch --verbose)",
+      "Bash(python test_tools/test_models.py:*)",
+      "Bash(where:*)",
+      "Bash(\"c:/Users/basti/Documents/dev/BA2TradePlatform/.venv/Scripts/python.exe\" \"c:/Users/basti/Documents/dev/BA2TradePlatform/test_tools/test_models.py\" --model kimi_k2.5 --tool-call --websearch --verbose)",
+      "Bash(\"c:/Users/basti/Documents/dev/BA2TradePlatform/.venv/Scripts/python.exe\":*)",
+      "Bash(\"c:/Users/basti/Documents/dev/BA2TradePlatform/.venv/Scripts/python.exe\" -c:*)",
+      "Bash(.venv/Scripts/python.exe:*)",
+      "Bash(.venv/Scripts/pip.exe show:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(.venv\\\\Scripts\\\\pip.exe show:*)",
+      "Bash(.venv/Scripts/pip.exe:*)",
+      "Bash(powershell -Command \"cd ''C:\\\\Users\\\\basti\\\\Documents\\\\dev\\\\BA2TradePlatform''; .\\\\.venv\\\\Scripts\\\\python.exe -c ''import sqlalchemy; print\\(sqlalchemy.__version__\\)''\")",
+      "Bash(powershell -Command:*)",
+      "WebFetch(domain:platform.moonshot.cn)",
+      "Bash(.venvScriptspython.exe -c \"import importlib.metadata; print\\(importlib.metadata.version\\(''pandas''\\)\\)\")",
+      "Bash(cmd /c \".venv\\\\Scripts\\\\pip.exe install --force-reinstall pandas\")",
+      "Bash(ls:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nImprove UI performance and fix cleanup bugs\n\n- Fix N+1 queries in performance.py \\(batch pre-fetch expert instances\\)\n- Add database-level pagination to market analysis page \\(LIMIT/OFFSET\\)\n- Increase auto-refresh intervals from 30s to 60s across all tabs\n- Replace full page reload on account filter change with soft navigation\n- Smart status polling on analysis detail page \\(check status, not full reload\\)\n- Cache expert options with 60s TTL \\(shared across tabs and pages\\)\n- Cache account filter data with 60s TTL\n- Fix auto-refresh not honoring filters \\(remove stale caching logic\\)\n- Fix cleanup.py: ActivityLog.timestamp → created_at, activity_type → type\n- Fix cleanup batch preview N+1: batch query for open transaction checks\n- Add eager loading \\(selectinload\\) for cleanup preview relationships\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git push)",
+      "Bash(.venvScriptspython.exe settings_export_import.py export test_settings_export.json)",
+      "Bash(.venvScriptspython.exe -m py_compile ba2_trade_platformuiutilsperf_logger.py)",
+      "Bash(.venvScriptspython.exe -m py_compile ba2_trade_platformconfig.py)",
+      "Bash(C:UsersbastiDocumentsdevBA2TradePlatform.venvScriptspython.exe -m py_compile:*)",
+      "Bash(python -m py_compile:*)",
+      "Bash(git commit:*)",
+      "WebFetch(domain:developer.tastytrade.com)",
+      "Bash(\".venv\\\\Scripts\\\\python.exe\":*)",
+      "Bash(.venv\\\\Scripts\\\\python.exe:*)",
+      "Bash(python:*)",
+      "Bash(xargs grep -l \"AccountGrowthTab\\\\|account.*growth\")",
+      "Bash(grep -rn \"NO STOP LOSS\\\\|NO TAKE PROFIT\" c:/Users/basti/Documents/dev/BA2TradePlatform/ --include=*.py)",
+      "Bash(.venv/Scripts/python.exe -c \"from ba2_trade_platform.modules.experts.PennyMomentumTrader.prompts import build_quick_filter_prompt; p = build_quick_filter_prompt\\([{''''symbol'''':''''TEST'''',''''price'''':2.5,''''volume'''':5000000,''''market_cap'''':100000000,''''sector'''':''''Healthcare'''',''''industry'''':''''Biotechnology'''',''''exchange'''':''''NASDAQ'''',''''rvol'''':3.2,''''change_percent'''':12.5}], 15\\); print\\([l for l in p.split\\(''''\\\\n''''\\) if ''''TEST'''' in l][0]\\)\")",
+      "Bash(grep -n \"websearch\" c:/Users/basti/Documents/dev/BA2TradePlatform/ba2_trade_platform/modules/experts/PennyMomentumTrader/*.py)",
+      "Bash(grep -r \"cache\\\\|Cache\" c:/Users/basti/Documents/dev/BA2TradePlatform/ba2_trade_platform/thirdparties/TradingAgents/tradingagents/utils/ --include=*.py)"
+    ]
+  }
+}
