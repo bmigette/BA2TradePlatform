@@ -470,14 +470,23 @@ class PennyMomentumTrader(LiveExpertInterface):
             self.logger.info("Pipeline aborted after phase 0 (stop requested)")
             return
 
-        if is_resume:
-            # Mid-day restart: skip scan phases, carry over watched symbols via phase 4
+        # In resume mode, skip scan only if we're already at the monitored-symbols cap
+        max_monitored = int(self.get_setting_with_interface_default(
+            "max_monitored_symbols", log_warning=False
+        ))
+        prev_monitored = self._get_previous_monitored_data(market_analysis.id)
+        prev_watching = sum(
+            1 for info in prev_monitored.values() if info.get("status") == "watching"
+        )
+        at_capacity = is_resume and prev_watching >= max_monitored
+
+        if at_capacity:
             self.logger.info(
-                "Resume mode: skipping scan phases (1, 1b, 2, 3) — "
-                "phase 4 will carry over monitored symbols from previous run"
+                f"Resume mode: already at monitor capacity ({prev_watching}/{max_monitored}) — "
+                "skipping scan phases, phase 4 will carry over monitored symbols"
             )
             finalists = []
-        # Check balance for new entries (only on full runs)
+        # Check balance for new entries
         elif self.has_sufficient_balance_for_entry():
             # Phase 1: Screen — no LLM, returns top-N by volume
             self._current_phase = "screen"
