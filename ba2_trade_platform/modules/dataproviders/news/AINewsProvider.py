@@ -267,6 +267,23 @@ IMPORTANT: Respond in English only.
 """
         return prompt
 
+    @staticmethod
+    def _sanitize_response(text: str) -> str:
+        """Strip leaked model internal tokens and non-English artifacts from LLM output."""
+        import re
+
+        # Remove tool-call markers (e.g. kimi_k2.5 leaking <|tool_call_begin|> ... <|tool_call_end|>)
+        text = re.sub(r'<\|tool_call_begin\|>.*?<\|tool_call_end\|>', '', text, flags=re.DOTALL)
+        # Remove any remaining special tokens
+        text = re.sub(r'<\|[a-z_]+\|>', '', text)
+        # Remove lines that are predominantly CJK characters (leaked Chinese/Japanese tool descriptions)
+        text = re.sub(r'^[^\n]*[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]{3,}[^\n]*$', '', text, flags=re.MULTILINE)
+        # Remove "Let me search for more" / "Let me try another search" filler lines
+        text = re.sub(r'^Let me (?:search|try|conduct).*$', '', text, flags=re.MULTILINE)
+        # Collapse multiple blank lines
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        return text.strip()
+
     def _format_response(
         self,
         symbol: str,
@@ -274,7 +291,9 @@ IMPORTANT: Respond in English only.
         format_type: Literal["dict", "markdown", "both"],
     ) -> Dict[str, Any] | str:
         """Format the LLM response based on format_type."""
-        
+
+        response_text = self._sanitize_response(response_text)
+
         # Build structured data
         structured_data = {
             "symbol": symbol,
