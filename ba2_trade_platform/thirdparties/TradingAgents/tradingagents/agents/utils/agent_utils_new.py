@@ -313,37 +313,24 @@ class Toolkit:
                 if data_dict and "articles" in data_dict:
                     all_articles.extend(data_dict["articles"])
 
-            # Enrich articles with full content (trafilatura + cache)
+            # Enrich articles with full content via interface-level enrichment
             if all_articles:
-                from ba2_trade_platform.core.news_enrichment import enrich_articles, trim_articles_to_token_budget
-                enrich_articles(all_articles)
+                from ba2_trade_platform.core.interfaces.MarketNewsInterface import MarketNewsInterface
 
-                # Calculate token budget for news content
-                # Reserve tokens for system prompt + other tool results
-                NEWS_PROMPT_RESERVE = 4000  # tokens for system/analyst prompt overhead
-                token_budget = self.analyst_context_size - NEWS_PROMPT_RESERVE
-                # Use ~40% of remaining context for news (other tools need space too)
-                news_token_budget = int(token_budget * 0.4)
-                trim_articles_to_token_budget(all_articles, news_token_budget)
+                # Calculate token budget: reserve space for prompt overhead, use ~40% for news
+                NEWS_PROMPT_RESERVE = 4000
+                news_token_budget = int((self.analyst_context_size - NEWS_PROMPT_RESERVE) * 0.4)
 
-                # Rebuild markdown with enriched content
-                enriched_parts = []
-                for article in all_articles:
-                    title = article.get("title", "No Title")
-                    content = article.get("full_content") or article.get("summary", "No content available.")
-                    source = article.get("source", "Unknown")
-                    published = article.get("published_at", "")
-                    url = article.get("url", "")
-                    md = f"### {title}\n**Source:** {source} | **Published:** {published}\n\n{content}"
-                    if url:
-                        md += f"\n\n[Read more]({url})"
-                    enriched_parts.append(md)
-
-                enriched_markdown = f"# News for {symbol}\n**Articles:** {len(all_articles)}\n\n" + "\n\n---\n\n".join(enriched_parts)
-                return enriched_markdown
+                MarketNewsInterface.enrich_news_result(
+                    {"articles": all_articles},
+                    token_budget=news_token_budget,
+                )
+                return MarketNewsInterface.rebuild_markdown_from_articles(
+                    all_articles, heading=f"News for {symbol}"
+                )
 
             return "\n\n---\n\n".join(results) if results else "No news data available"
-            
+
         except AllProvidersFailedError:
             raise  # Re-raise to propagate up
         except Exception as e:
@@ -436,37 +423,24 @@ class Toolkit:
                 if data_dict and "articles" in data_dict:
                     all_articles.extend(data_dict["articles"])
 
-            # Enrich articles with full content (trafilatura + cache)
+            # Enrich articles with full content via interface-level enrichment
             if all_articles:
-                from ba2_trade_platform.core.news_enrichment import enrich_articles, trim_articles_to_token_budget
-                enrich_articles(all_articles)
+                from ba2_trade_platform.core.interfaces.MarketNewsInterface import MarketNewsInterface
 
-                # Calculate token budget for news content
-                # Reserve tokens for system prompt + other tool results
-                NEWS_PROMPT_RESERVE = 4000  # tokens for system/analyst prompt overhead
-                token_budget = self.analyst_context_size - NEWS_PROMPT_RESERVE
-                # Use ~40% of remaining context for news (other tools need space too)
-                news_token_budget = int(token_budget * 0.4)
-                trim_articles_to_token_budget(all_articles, news_token_budget)
+                # Calculate token budget: reserve space for prompt overhead, use ~40% for news
+                NEWS_PROMPT_RESERVE = 4000
+                news_token_budget = int((self.analyst_context_size - NEWS_PROMPT_RESERVE) * 0.4)
 
-                # Rebuild markdown with enriched content
-                enriched_parts = []
-                for article in all_articles:
-                    title = article.get("title", "No Title")
-                    content = article.get("full_content") or article.get("summary", "No content available.")
-                    source = article.get("source", "Unknown")
-                    published = article.get("published_at", "")
-                    url = article.get("url", "")
-                    md = f"### {title}\n**Source:** {source} | **Published:** {published}\n\n{content}"
-                    if url:
-                        md += f"\n\n[Read more]({url})"
-                    enriched_parts.append(md)
-
-                enriched_markdown = f"# Global News\n**Articles:** {len(all_articles)}\n\n" + "\n\n---\n\n".join(enriched_parts)
-                return enriched_markdown
+                MarketNewsInterface.enrich_news_result(
+                    {"articles": all_articles},
+                    token_budget=news_token_budget,
+                )
+                return MarketNewsInterface.rebuild_markdown_from_articles(
+                    all_articles, heading="Global News"
+                )
 
             return "\n\n---\n\n".join(results) if results else "No global news data available"
-            
+
         except AllProvidersFailedError:
             raise  # Re-raise to propagate up
         except Exception as e:

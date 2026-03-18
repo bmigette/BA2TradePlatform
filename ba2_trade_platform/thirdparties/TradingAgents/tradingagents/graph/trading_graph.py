@@ -722,10 +722,10 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                     # but still update important state keys like expert_recommendation
                     accumulated_state.update(chunk)
                     step_count += 1
-                    
+
                     # Get current message count in this chunk
                     current_message_count = len(chunk.get("messages", []))
-                    
+
                     # Log NEW messages (messages we haven't logged yet)
                     if current_message_count > logged_message_count:
                         # Log all new messages since last chunk
@@ -733,9 +733,11 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                             self._log_message(msg)
                         logged_message_count = current_message_count
                         trace.append(chunk)
-                        
-                        # Sync state after each step with new messages in debug mode
-                        self._sync_state_to_market_analysis(accumulated_state, f"debug_step_{step_count}")
+
+                    # Sync state after EVERY step (not just when new messages arrive)
+                    # Analyst nodes update state keys (market_report, sentiment_report, etc.)
+                    # without adding messages, so we must sync on every chunk
+                    self._sync_state_to_market_analysis(accumulated_state, f"debug_step_{step_count}")
 
                 final_state = accumulated_state  # Use accumulated state instead of just the last chunk
             else:

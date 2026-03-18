@@ -2561,7 +2561,7 @@ class PennyMomentumTrader(LiveExpertInterface):
             "vendor_news", log_warning=False
         )
         from ....modules.dataproviders import get_provider
-        from ....core.news_enrichment import enrich_articles
+        from ....core.interfaces.MarketNewsInterface import MarketNewsInterface
 
         all_articles = []
         all_news_markdown: List[str] = []
@@ -2590,21 +2590,14 @@ class PennyMomentumTrader(LiveExpertInterface):
                     f"News provider {vendor_name} failed for {symbol}: {e}"
                 )
 
-        # Enrich articles with full content
+        # Enrich articles with full content via interface-level enrichment
         if all_articles:
-            enrich_articles(all_articles)
-
-            # Build markdown from enriched articles
-            for article in all_articles:
-                title = article.get("title", "No Title")
-                content = article.get("full_content") or article.get("summary", "")
-                source = article.get("source", "")
-                pub = article.get("published_at", "")
-                url = article.get("url", "")
-                md = f"### {title}\n**Source:** {source} | **Published:** {pub}\n\n{content}"
-                if url:
-                    md += f"\n[Read more]({url})"
-                all_news_markdown.append(md)
+            MarketNewsInterface.enrich_news_result({"articles": all_articles})
+            all_news_markdown.append(
+                MarketNewsInterface.rebuild_markdown_from_articles(
+                    all_articles, heading=f"News for {symbol}"
+                )
+            )
 
         return "\n\n---\n\n".join(all_news_markdown) if all_news_markdown else "No news data available."
 
