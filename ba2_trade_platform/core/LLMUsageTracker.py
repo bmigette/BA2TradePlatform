@@ -94,7 +94,7 @@ class LLMUsageContext:
             
             # Parse model selection to get provider and model name
             try:
-                provider, friendly_name = parse_model_selection(self.model_selection)
+                provider, friendly_name, _ = parse_model_selection(self.model_selection)
                 
                 # Get provider model name
                 from .ModelFactory import ModelFactory
@@ -350,7 +350,7 @@ class LLMUsageCallback(BaseCallbackHandler):
             
             # Parse model selection
             try:
-                provider, friendly_name = parse_model_selection(self.model_selection)
+                provider, friendly_name, _ = parse_model_selection(self.model_selection)
                 
                 # Get provider model name
                 from .ModelFactory import ModelFactory

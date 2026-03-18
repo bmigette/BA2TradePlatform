@@ -34,6 +34,32 @@ from ..config import get_app_setting, OPENAI_ENABLE_STREAMING, OPENAI_BACKEND_UR
 from ..logger import logger
 
 
+# Map of inline parameter names to their API-specific nested format.
+# e.g. "reasoning_effort" -> reasoning={"effort": value}  (direct ChatOpenAI kwarg)
+_INLINE_PARAM_RESOLVERS = {
+    "reasoning_effort": lambda value: {"reasoning": {"effort": value}},
+}
+
+
+def _resolve_inline_params(inline_params: dict) -> dict:
+    """
+    Convert flat inline parameters from model selection strings
+    into the nested format expected by the LLM APIs.
+
+    Example:
+        {"reasoning_effort": "high"} -> {"reasoning": {"effort": "high"}}
+    """
+    resolved = {}
+    for key, value in inline_params.items():
+        resolver = _INLINE_PARAM_RESOLVERS.get(key)
+        if resolver:
+            resolved.update(resolver(value))
+        else:
+            # Unknown params pass through as-is
+            resolved[key] = value
+    return resolved
+
+
 class ModelFactory:
     """
     Factory class for creating LLM instances from model selection strings.
@@ -122,10 +148,22 @@ class ModelFactory:
             >>> llm = ModelFactory.create_llm("nagaai/gpt5", temperature=0.7)
             >>> llm = ModelFactory.create_llm("native/gpt5.1", model_kwargs={"reasoning": {"effort": "low"}})
         """
-        # Parse the selection string
-        provider, friendly_name = parse_model_selection(model_selection)
-        logger.debug(f"Creating LLM: provider={provider}, model={friendly_name}")
-        
+        # Parse the selection string (may include inline params like {reasoning_effort:high})
+        provider, friendly_name, inline_params = parse_model_selection(model_selection)
+        logger.debug(f"Creating LLM: provider={provider}, model={friendly_name}, inline_params={inline_params}")
+
+        # Merge inline params into model_kwargs (inline params take precedence over defaults,
+        # but explicit model_kwargs from caller take precedence over inline params)
+        if inline_params:
+            # Convert inline param format to model_kwargs format
+            # e.g. {reasoning_effort: high} -> {reasoning: {effort: high}} for OpenAI API
+            resolved_params = _resolve_inline_params(inline_params)
+            logger.debug(f"Resolved inline params {inline_params} -> {resolved_params}")
+            if model_kwargs:
+                # Caller kwargs win over inline params
+                resolved_params.update(model_kwargs)
+            model_kwargs = resolved_params
+
         # Get model info
         model_info = MODELS.get(friendly_name)
         if not model_info:
@@ -675,8 +713,8 @@ class ModelFactory:
             - base_url: Provider's API base URL
             - api_key_setting: App setting key for API key
         """
-        provider, friendly_name = parse_model_selection(model_selection)
-        
+        provider, friendly_name, _ = parse_model_selection(model_selection)
+
         model_info = MODELS.get(friendly_name)
         if not model_info:
             return {
@@ -719,8 +757,8 @@ class ModelFactory:
             - (False, "error message") if invalid
         """
         try:
-            provider, friendly_name = parse_model_selection(model_selection)
-            
+            provider, friendly_name, _ = parse_model_selection(model_selection)
+
             # Check model exists
             model_info = MODELS.get(friendly_name)
             if not model_info:
@@ -827,8 +865,8 @@ class ModelFactory:
         from openai import OpenAI
         
         # Parse the model selection string
-        provider, friendly_name = parse_model_selection(model_selection)
-    
+        provider, friendly_name, _ = parse_model_selection(model_selection)
+
         # Try to resolve friendly name to actual model name via registry
         model_info = MODELS.get(friendly_name)
         if model_info:

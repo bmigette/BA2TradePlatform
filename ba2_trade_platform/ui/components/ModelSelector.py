@@ -18,9 +18,9 @@ Usage:
 from nicegui import ui
 from typing import Optional, Dict, List, Callable, Any
 from ...core.models_registry import (
-    MODELS, PROVIDER_CONFIG, 
+    MODELS, PROVIDER_CONFIG,
     get_all_labels, get_all_providers, get_model_display_info,
-    format_model_string, get_model_for_provider,
+    format_model_string, get_model_for_provider, parse_model_selection,
     LABEL_LOW_COST, LABEL_HIGH_COST, LABEL_THINKING, LABEL_WEBSEARCH,
     LABEL_FAST, LABEL_VISION, LABEL_CODING, LABEL_TOOL_CALLING
 )
@@ -90,12 +90,17 @@ class ModelSelector:
         self.selected_model: Optional[str] = None  # Friendly name
         self.selected_provider: str = default_provider
         
+        # Inline parameter state
+        self.selected_reasoning_effort: Optional[str] = None  # none/low/medium/high
+
         # UI components
         self.table = None
         self.search_input = None
         self.provider_select = None
         self.label_checkboxes: Dict[str, Any] = {}
         self.provider_dropdown = None
+        self.reasoning_dropdown = None
+        self.reasoning_container = None
         self.selected_display = None
         self.result_display = None
         
@@ -424,6 +429,36 @@ class ModelSelector:
                     self.selected_provider = dropdown_value
                     self.provider_dropdown.bind_value(self, 'selected_provider')
                     self.provider_dropdown.on('update:model-value', handle_provider_change)
+
+                # Reasoning effort dropdown (visible only for models that support it)
+                def handle_reasoning_change():
+                    """Handle reasoning effort change."""
+                    logger.debug(f'Reasoning effort changed to: {self.selected_reasoning_effort}')
+                    result = self.get_selected_model()
+                    if self.result_display:
+                        self.result_display.text = result if result else ''
+                    if self.on_selection_change:
+                        self.on_selection_change(result)
+
+                show_reasoning = self._model_supports_reasoning(self.selected_model)
+                self.reasoning_container = ui.column().classes('w-48')
+                self.reasoning_container.set_visibility(show_reasoning)
+                with self.reasoning_container:
+                    ui.label('Reasoning Level:').classes('text-caption').style('color: #a0aec0;')
+                    reasoning_options = {
+                        '': 'Default',
+                        'none': 'None',
+                        'low': 'Low',
+                        'medium': 'Medium',
+                        'high': 'High',
+                    }
+                    self.reasoning_dropdown = ui.select(
+                        options=reasoning_options,
+                        value=self.selected_reasoning_effort or '',
+                        label=''
+                    ).classes('w-full').style('color: #e2e8f0;')
+                    self.reasoning_dropdown.bind_value(self, 'selected_reasoning_effort')
+                    self.reasoning_dropdown.on('update:model-value', handle_reasoning_change)
             
             # Result display
             with ui.row().classes('w-full mt-4 items-center'):
@@ -461,44 +496,69 @@ class ModelSelector:
             if self.provider_dropdown:
                 self.provider_dropdown.options = {"_placeholder_": "(Select a model first)"}
             self.selected_provider = "_placeholder_"
-        
+
+        # Show/hide reasoning dropdown based on model support
+        if self.reasoning_container:
+            supports = self._model_supports_reasoning(self.selected_model)
+            self.reasoning_container.set_visibility(supports)
+            if not supports:
+                self.selected_reasoning_effort = None
+                if self.reasoning_dropdown:
+                    self.reasoning_dropdown.value = ''
+
         # Update result display
         result = self.get_selected_model()
         if self.result_display:
             self.result_display.text = result if result else ''
     
+    def _model_supports_reasoning(self, friendly_name: Optional[str]) -> bool:
+        """Check if a model supports reasoning_effort parameter."""
+        if not friendly_name:
+            return False
+        model_info = MODELS.get(friendly_name)
+        if not model_info:
+            return False
+        return "reasoning_effort" in model_info.get("supports_parameters", [])
+
     def get_selected_model(self) -> Optional[str]:
         """
         Get the currently selected model in provider/model format.
-        
+
         Returns:
             String in format "provider/friendly_name" (e.g., "nagaai/gpt5")
-            or None if no model is selected
+            or "provider/model{reasoning_effort:high}" if reasoning level is set.
+            None if no model is selected.
         """
         if not self.selected_model:
             return None
-        
-        return format_model_string(self.selected_model, self.selected_provider)
+
+        result = format_model_string(self.selected_model, self.selected_provider)
+
+        # Append inline params if set
+        if self.selected_reasoning_effort and self._model_supports_reasoning(self.selected_model):
+            result += f"{{reasoning_effort:{self.selected_reasoning_effort}}}"
+
+        return result
     
     def set_selected_model(self, model_string: Optional[str]):
         """
         Set the selected model from a provider/model string.
-        
+
         Args:
-            model_string: String like "nagaai/gpt5" or just "gpt5" (uses default provider)
+            model_string: String like "nagaai/gpt5", "nagaai/gpt5.4{reasoning_effort:high}",
+                          or just "gpt5" (uses default provider)
         """
         if not model_string:
             self.selected_model = None
             self.selected_provider = self.default_provider
+            self.selected_reasoning_effort = None
             return
-        
-        if "/" in model_string:
-            provider, friendly_name = model_string.split("/", 1)
-            self.selected_provider = provider.lower()
-            self.selected_model = friendly_name
-        else:
-            self.selected_model = model_string
-            self.selected_provider = self.default_provider
+
+        # Parse using the central parser which handles inline params
+        provider, friendly_name, inline_params = parse_model_selection(model_string)
+        self.selected_provider = provider
+        self.selected_model = friendly_name
+        self.selected_reasoning_effort = inline_params.get("reasoning_effort") or None
         
         # Update table selection if rendered
         if self.table:
@@ -612,23 +672,26 @@ class ModelSelectorInput:
         """Get the display value for the input field."""
         if not self._value:
             return ""
-        
-        # Parse and get display name
-        if "/" in self._value:
-            provider, friendly_name = self._value.split("/", 1)
-        else:
-            provider = "native"
-            friendly_name = self._value
-        
+
+        # Parse using central parser (handles inline params like {reasoning_effort:high})
+        provider, friendly_name, inline_params = parse_model_selection(self._value)
+
         model_info = get_model_display_info(friendly_name)
         display_name = model_info.get("display_name", friendly_name)
         provider_display = PROVIDER_CONFIG.get(provider, {}).get("display_name", provider)
-        
+
         if provider == "native":
             native_provider = model_info.get("native_provider", "")
             provider_display = f"Native ({PROVIDER_CONFIG.get(native_provider, {}).get('display_name', native_provider)})"
-        
-        return f"{display_name} ({provider_display})"
+
+        result = f"{display_name} ({provider_display})"
+
+        # Show reasoning level if set
+        reasoning = inline_params.get("reasoning_effort")
+        if reasoning:
+            result += f" [reasoning: {reasoning}]"
+
+        return result
     
     def _open_selector_dialog(self):
         """Open the model selector dialog."""
@@ -664,14 +727,7 @@ class ModelSelectorInput:
             
             # Pre-set selection BEFORE render so UI reflects current value
             if self._value:
-                # Parse the value to set selected_model and selected_provider
-                if "/" in self._value:
-                    provider, friendly_name = self._value.split("/", 1)
-                    self.selector.selected_provider = provider.lower()
-                    self.selector.selected_model = friendly_name
-                else:
-                    self.selector.selected_model = self._value
-                    self.selector.selected_provider = self.default_provider
+                self.selector.set_selected_model(self._value)
             
             self.selector.render()
             

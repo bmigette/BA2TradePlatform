@@ -109,9 +109,10 @@ def test_model_registry():
         
         # Test format parsing
         test_formats = [
-            ("nagaai/gpt5", ("nagaai", "gpt5")),
-            ("native/gpt5_mini", ("native", "gpt5_mini")),
-            ("gpt5", ("native", "gpt5")),  # Legacy format
+            ("nagaai/gpt5", ("nagaai", "gpt5", {})),
+            ("native/gpt5_mini", ("native", "gpt5_mini", {})),
+            ("gpt5", ("native", "gpt5", {})),  # Legacy format
+            ("nagaai/gpt5.4{reasoning_effort:high}", ("nagaai", "gpt5.4", {"reasoning_effort": "high"})),
         ]
         for input_str, expected in test_formats:
             try:
@@ -591,7 +592,7 @@ def test_end_to_end_integration():
         print(f"\n  Testing complete flow for: {test_selection}")
         
         # Step 1: Parse selection
-        provider, friendly_name = parse_model_selection(test_selection)
+        provider, friendly_name, _ = parse_model_selection(test_selection)
         log_test("1. Parse selection", True, f"Provider: {provider}, Friendly name: {friendly_name}")
         
         # Step 2: Get provider-specific model name

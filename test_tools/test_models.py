@@ -6,6 +6,7 @@ This script tests LLM providers and models from the registry:
 2. Native API calls (direct SDK usage)
 3. Tool calling capability
 4. Websearch capability
+5. Reasoning effort levels (for models that support it)
 
 Usage:
     python test_tools/test_models.py                           # Quick test (1 model/provider)
@@ -14,7 +15,8 @@ Usage:
     python test_tools/test_models.py --model kimi_k2.5         # Test specific model
     python test_tools/test_models.py --tool-call               # Test tool calling only
     python test_tools/test_models.py --websearch               # Test websearch only
-    python test_tools/test_models.py --model kimi_k2.5 --tool-call --websearch  # Combined
+    python test_tools/test_models.py --reasoning               # Test reasoning effort levels
+    python test_tools/test_models.py --model gpt5.4_mini --reasoning  # Test reasoning for specific model
 
 Options:
     --all           Test all model/provider combinations
@@ -22,6 +24,7 @@ Options:
     --model         Comma-separated list of models to test
     --tool-call     Include tool calling tests
     --websearch     Include websearch tests
+    --reasoning     Include reasoning effort level tests (none/low/medium/high)
     --verbose       Show detailed error messages
     --output        Output file path for JSON results
 """
@@ -89,6 +92,8 @@ class ProviderSummary:
     tool_call_failed: int = 0
     websearch_passed: int = 0
     websearch_failed: int = 0
+    reasoning_passed: int = 0
+    reasoning_failed: int = 0
     results: List[TestResult] = field(default_factory=list)
 
 
@@ -115,8 +120,8 @@ def get_models_for_provider(provider: str) -> List[Tuple[str, str, Dict]]:
     """
     # Priority order for test models per provider (most reliable first)
     preferred_order = {
-        PROVIDER_OPENAI: ["gpt4o_mini", "gpt4o", "gpt5_mini", "gpt5"],
-        PROVIDER_NAGAAI: ["gpt4o_mini", "grok3_mini", "gpt5_mini", "gpt5"],
+        PROVIDER_OPENAI: ["gpt4o_mini", "gpt4o", "gpt5_mini", "gpt5", "gpt5.4_nano", "gpt5.4_mini", "gpt5.4"],
+        PROVIDER_NAGAAI: ["gpt4o_mini", "grok3_mini", "gpt5_mini", "gpt5", "gpt5.4_nano", "gpt5.4_mini", "gpt5.4"],
         PROVIDER_GOOGLE: ["gemini_2.0_flash", "gemini_2.5_flash", "gemini_3_flash"],
         PROVIDER_ANTHROPIC: ["claude_3.5_haiku", "claude_3.5_sonnet", "claude_4_sonnet"],
         PROVIDER_XAI: ["grok3_mini", "grok3", "grok4_fast"],
@@ -381,12 +386,89 @@ def test_websearch(provider: str, model_name: str, model_info: Dict, verbose: bo
     return result
 
 
+def test_reasoning(provider: str, model_name: str, model_info: Dict, effort: str, verbose: bool = False) -> TestResult:
+    """Test inference with a specific reasoning effort level."""
+    provider_model_name = get_model_for_provider(model_name, provider) or "unknown"
+
+    result = TestResult(
+        model=model_name,
+        provider=provider,
+        provider_model_name=provider_model_name,
+        test_type=f"reasoning_{effort}",
+        success=False,
+        labels=model_info.get("labels", [])
+    )
+
+    # Check if model supports reasoning_effort
+    if "reasoning_effort" not in model_info.get("supports_parameters", []):
+        result.error = "Model doesn't support reasoning_effort parameter"
+        return result
+
+    try:
+        # Use inline param syntax
+        model_selection = f"{provider}/{model_name}{{reasoning_effort:{effort}}}"
+        start = time.time()
+
+        llm = ModelFactory.create_llm(model_selection, temperature=0.0 if effort == "none" else None)
+        response = llm.invoke("What is the square root of 144? Reply with just the number.")
+
+        result.duration_ms = (time.time() - start) * 1000
+
+        if hasattr(response, 'content'):
+            result.response = str(response.content)[:100]
+        else:
+            result.response = str(response)[:100]
+
+        result.success = True
+
+    except Exception as e:
+        result.error = str(e)[:300]
+        if verbose:
+            import traceback
+            traceback.print_exc()
+
+    return result
+
+
+def _run_single_test(provider: str, model_name: str, model_info: Dict, test_type: str, verbose: bool) -> TestResult:
+    """Dispatch a single test by type."""
+    if test_type == "inference":
+        return test_inference(provider, model_name, model_info, verbose)
+    elif test_type == "tool_call":
+        return test_tool_call(provider, model_name, model_info, verbose)
+    elif test_type == "websearch":
+        return test_websearch(provider, model_name, model_info, verbose)
+    elif test_type.startswith("reasoning_"):
+        effort = test_type.split("_", 1)[1]
+        return test_reasoning(provider, model_name, model_info, effort, verbose)
+    else:
+        return TestResult(model=model_name, provider=provider, provider_model_name="unknown",
+                         test_type=test_type, success=False, error=f"Unknown test type: {test_type}")
+
+
+def _update_counters(summary: ProviderSummary, test_type: str, success: bool):
+    """Update provider summary counters for a test result."""
+    if test_type == "inference":
+        if success: summary.inference_passed += 1
+        else: summary.inference_failed += 1
+    elif test_type == "tool_call":
+        if success: summary.tool_call_passed += 1
+        else: summary.tool_call_failed += 1
+    elif test_type == "websearch":
+        if success: summary.websearch_passed += 1
+        else: summary.websearch_failed += 1
+    elif test_type.startswith("reasoning_"):
+        if success: summary.reasoning_passed += 1
+        else: summary.reasoning_failed += 1
+
+
 def run_tests(
     providers: Optional[List[str]] = None,
     models: Optional[List[str]] = None,
     test_all: bool = False,
     include_tool_call: bool = False,
     include_websearch: bool = False,
+    include_reasoning: bool = False,
     verbose: bool = False
 ) -> Dict[str, ProviderSummary]:
     """Run tests for specified model/provider combinations."""
@@ -452,6 +534,11 @@ def run_tests(
             if include_websearch:
                 test_queue.append((provider, model_name, model_info, "websearch"))
 
+            # Optionally test reasoning effort levels
+            if include_reasoning and "reasoning_effort" in model_info.get("supports_parameters", []):
+                for effort in ["none", "low", "medium", "high"]:
+                    test_queue.append((provider, model_name, model_info, f"reasoning_{effort}"))
+
     total_tests = len(test_queue)
     if RICH_AVAILABLE:
         console.print(f"\n[bold]Running {total_tests} tests...[/bold]\n")
@@ -473,31 +560,9 @@ def run_tests(
             for provider, model_name, model_info, test_type in test_queue:
                 progress.update(task, description=f"{test_type}: {provider}/{model_name}")
 
-                if test_type == "inference":
-                    result = test_inference(provider, model_name, model_info, verbose)
-                elif test_type == "tool_call":
-                    result = test_tool_call(provider, model_name, model_info, verbose)
-                elif test_type == "websearch":
-                    result = test_websearch(provider, model_name, model_info, verbose)
-
+                result = _run_single_test(provider, model_name, model_info, test_type, verbose)
                 results[provider].results.append(result)
-
-                # Update counters
-                if test_type == "inference":
-                    if result.success:
-                        results[provider].inference_passed += 1
-                    else:
-                        results[provider].inference_failed += 1
-                elif test_type == "tool_call":
-                    if result.success:
-                        results[provider].tool_call_passed += 1
-                    else:
-                        results[provider].tool_call_failed += 1
-                elif test_type == "websearch":
-                    if result.success:
-                        results[provider].websearch_passed += 1
-                    else:
-                        results[provider].websearch_failed += 1
+                _update_counters(results[provider], test_type, result.success)
 
                 completed += 1
                 progress.update(task, completed=completed)
@@ -505,13 +570,7 @@ def run_tests(
         for provider, model_name, model_info, test_type in test_queue:
             print(f"  {test_type}: {provider}/{model_name}...", end=" ", flush=True)
 
-            if test_type == "inference":
-                result = test_inference(provider, model_name, model_info, verbose)
-            elif test_type == "tool_call":
-                result = test_tool_call(provider, model_name, model_info, verbose)
-            elif test_type == "websearch":
-                result = test_websearch(provider, model_name, model_info, verbose)
-
+            result = _run_single_test(provider, model_name, model_info, test_type, verbose)
             results[provider].results.append(result)
 
             if result.success:
@@ -520,27 +579,12 @@ def run_tests(
                 error_preview = result.error[:50] + "..." if len(result.error) > 50 else result.error
                 print(f"FAIL ({error_preview})")
 
-            # Update counters
-            if test_type == "inference":
-                if result.success:
-                    results[provider].inference_passed += 1
-                else:
-                    results[provider].inference_failed += 1
-            elif test_type == "tool_call":
-                if result.success:
-                    results[provider].tool_call_passed += 1
-                else:
-                    results[provider].tool_call_failed += 1
-            elif test_type == "websearch":
-                if result.success:
-                    results[provider].websearch_passed += 1
-                else:
-                    results[provider].websearch_failed += 1
+            _update_counters(results[provider], test_type, result.success)
 
     return results
 
 
-def print_results(results: Dict[str, ProviderSummary], show_tool_call: bool, show_websearch: bool):
+def print_results(results: Dict[str, ProviderSummary], show_tool_call: bool, show_websearch: bool, show_reasoning: bool = False):
     """Print test results."""
 
     if RICH_AVAILABLE:
@@ -553,6 +597,8 @@ def print_results(results: Dict[str, ProviderSummary], show_tool_call: bool, sho
             summary_table.add_column("Tool Call", justify="center")
         if show_websearch:
             summary_table.add_column("Websearch", justify="center")
+        if show_reasoning:
+            summary_table.add_column("Reasoning", justify="center")
 
         for provider, summary in sorted(results.items()):
             key_status = "[green]OK[/green]" if summary.api_key_configured else "[red]NO[/red]"
@@ -571,6 +617,11 @@ def print_results(results: Dict[str, ProviderSummary], show_tool_call: bool, sho
                 ws_total = summary.websearch_passed + summary.websearch_failed
                 websearch = f"[green]{summary.websearch_passed}[/green]/{ws_total}" if ws_total > 0 else "-"
                 row.append(websearch)
+
+            if show_reasoning:
+                r_total = summary.reasoning_passed + summary.reasoning_failed
+                reasoning = f"[green]{summary.reasoning_passed}[/green]/{r_total}" if r_total > 0 else "-"
+                row.append(reasoning)
 
             summary_table.add_row(*row)
 
@@ -619,6 +670,10 @@ def print_results(results: Dict[str, ProviderSummary], show_tool_call: bool, sho
                 ws_total = summary.websearch_passed + summary.websearch_failed
                 line += f"  Websearch:{summary.websearch_passed}/{ws_total}"
 
+            if show_reasoning:
+                r_total = summary.reasoning_passed + summary.reasoning_failed
+                line += f"  Reasoning:{summary.reasoning_passed}/{r_total}"
+
             print(line)
 
 
@@ -640,6 +695,8 @@ def save_results(results: Dict[str, ProviderSummary], output_path: str):
             "tool_call_failed": summary.tool_call_failed,
             "websearch_passed": summary.websearch_passed,
             "websearch_failed": summary.websearch_failed,
+            "reasoning_passed": summary.reasoning_passed,
+            "reasoning_failed": summary.reasoning_failed,
             "results": [asdict(r) for r in summary.results]
         }
 
@@ -656,6 +713,7 @@ def main():
     parser.add_argument("--model", type=str, help="Comma-separated models to test")
     parser.add_argument("--tool-call", action="store_true", help="Include tool calling tests")
     parser.add_argument("--websearch", action="store_true", help="Include websearch tests")
+    parser.add_argument("--reasoning", action="store_true", help="Include reasoning effort level tests (none/low/medium/high)")
     parser.add_argument("--verbose", action="store_true", help="Show detailed errors")
     parser.add_argument("--output", type=str, default="test_tools/test_models_results.json", help="Output JSON file")
 
@@ -672,6 +730,8 @@ def main():
         tests.append("tool_call")
     if args.websearch:
         tests.append("websearch")
+    if args.reasoning:
+        tests.append("reasoning")
 
     if RICH_AVAILABLE:
         console.print(Panel.fit(
@@ -696,16 +756,17 @@ def main():
         test_all=args.all or bool(models),
         include_tool_call=args.tool_call,
         include_websearch=args.websearch,
+        include_reasoning=args.reasoning,
         verbose=args.verbose
     )
 
     # Print and save
-    print_results(results, args.tool_call, args.websearch)
+    print_results(results, args.tool_call, args.websearch, args.reasoning)
     save_results(results, args.output)
 
     # Summary
-    total_passed = sum(s.inference_passed + s.tool_call_passed + s.websearch_passed for s in results.values())
-    total_failed = sum(s.inference_failed + s.tool_call_failed + s.websearch_failed for s in results.values())
+    total_passed = sum(s.inference_passed + s.tool_call_passed + s.websearch_passed + s.reasoning_passed for s in results.values())
+    total_failed = sum(s.inference_failed + s.tool_call_failed + s.websearch_failed + s.reasoning_failed for s in results.values())
     total = total_passed + total_failed
 
     if RICH_AVAILABLE:

@@ -735,7 +735,7 @@ Analysis completed at: {self._get_current_timestamp()}"""
         # The "deep_think_llm" setting is used for analyst LLMs
         from ba2_trade_platform.core.models_registry import get_model_context_size, parse_model_selection
         deep_think_llm = self.settings.get('deep_think_llm') or settings_def['deep_think_llm']['default']
-        _, analyst_model_name = parse_model_selection(deep_think_llm)
+        _, analyst_model_name, _ = parse_model_selection(deep_think_llm)
 
         provider_args = {
             'websearch_model': websearch_model,

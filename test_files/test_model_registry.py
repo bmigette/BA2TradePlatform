@@ -71,8 +71,8 @@ def test_model_registry():
     formatted = format_model_string("gpt5", "nagaai")
     print(f"\n✓ Format model string: {formatted}")
     
-    provider, model = parse_model_selection(formatted)
-    print(f"  Parsed back: provider={provider}, model={model}")
+    provider, model, inline_params = parse_model_selection(formatted)
+    print(f"  Parsed back: provider={provider}, model={model}, inline_params={inline_params}")
     
     # Test 9: Get display info
     display_info = get_model_display_info("grok4")

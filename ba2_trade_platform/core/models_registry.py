@@ -206,6 +206,49 @@ MODELS: Dict[str, Dict[str, Any]] = {
     },
 
     # =========================================================================
+    # GPT-5.4 Family (with reasoning effort: none/low/medium/high)
+    # =========================================================================
+    "gpt5.4": {
+        "native_provider": PROVIDER_OPENAI,
+        "display_name": "GPT-5.4",
+        "description": "GPT-5.4 with configurable thinking levels (none/low/medium/high)",
+        "provider_names": {
+            PROVIDER_OPENAI: "gpt-5.4",
+            PROVIDER_NAGAAI: "gpt-5.4",
+            PROVIDER_OPENROUTER: "openai/gpt-5.4",
+        },
+        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "supports_parameters": ["reasoning_effort"],
+        "context_size": 1000000,
+    },
+    "gpt5.4_mini": {
+        "native_provider": PROVIDER_OPENAI,
+        "display_name": "GPT-5.4 Mini",
+        "description": "Smaller GPT-5.4 with configurable thinking levels (none/low/medium/high)",
+        "provider_names": {
+            PROVIDER_OPENAI: "gpt-5.4-mini",
+            PROVIDER_NAGAAI: "gpt-5.4-mini",
+            PROVIDER_OPENROUTER: "openai/gpt-5.4-mini",
+        },
+        "labels": [LABEL_LOW_COST, LABEL_THINKING, LABEL_FAST, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "supports_parameters": ["reasoning_effort"],
+        "context_size": 1000000,
+    },
+    "gpt5.4_nano": {
+        "native_provider": PROVIDER_OPENAI,
+        "display_name": "GPT-5.4 Nano",
+        "description": "Ultra-light GPT-5.4 with configurable thinking levels (none/low/medium/high)",
+        "provider_names": {
+            PROVIDER_OPENAI: "gpt-5.4-nano",
+            PROVIDER_NAGAAI: "gpt-5.4-nano",
+            PROVIDER_OPENROUTER: "openai/gpt-5.4-nano",
+        },
+        "labels": [LABEL_LOW_COST, LABEL_THINKING, LABEL_FAST, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "supports_parameters": ["reasoning_effort"],
+        "context_size": 1000000,
+    },
+
+    # =========================================================================
     # GPT-4o Family
     # =========================================================================
     "gpt4o": {
@@ -986,22 +1029,43 @@ def format_model_string(friendly_name: str, provider: str) -> str:
     return f"{provider.lower()}/{friendly_name}"
 
 
-def parse_model_selection(model_string: str) -> tuple[str, str]:
+def parse_model_selection(model_string: str) -> tuple[str, str, dict]:
     """
-    Parse a model selection string back to provider and friendly name.
-    
+    Parse a model selection string back to provider, friendly name, and inline parameters.
+
+    Supports inline parameter syntax: ``provider/model{key:value,key2:value2}``
+
+    Examples::
+
+        "nagaai/gpt5.4{reasoning_effort:high}"  -> ("nagaai", "gpt5.4", {"reasoning_effort": "high"})
+        "native/gpt5.4_mini{reasoning_effort:low}" -> ("native", "gpt5.4_mini", {"reasoning_effort": "low"})
+        "nagaai/gpt5"                            -> ("nagaai", "gpt5", {})
+
     Args:
-        model_string: String like "nagaai/gpt5" or "native/gpt5"
-        
+        model_string: String like "nagaai/gpt5" or "native/gpt5.4{reasoning_effort:high}"
+
     Returns:
-        Tuple of (provider, friendly_name)
+        Tuple of (provider, friendly_name, inline_params)
     """
+    import re
+
+    # Extract inline params from {key:value,...} suffix
+    inline_params = {}
+    params_match = re.search(r'\{([^}]+)\}', model_string)
+    if params_match:
+        params_str = params_match.group(1)
+        model_string = model_string[:params_match.start()] + model_string[params_match.end():]
+        for pair in params_str.split(","):
+            pair = pair.strip()
+            if ":" in pair:
+                k, v = pair.split(":", 1)
+                inline_params[k.strip()] = v.strip()
+
     if "/" in model_string:
         provider, friendly_name = model_string.split("/", 1)
-        return provider.lower(), friendly_name
+        return provider.lower(), friendly_name, inline_params
     else:
-        # Assume native provider if no prefix
-        return "native", model_string
+        return "native", model_string, inline_params
 
 
 def get_model_display_info(friendly_name: str) -> Dict[str, Any]:
