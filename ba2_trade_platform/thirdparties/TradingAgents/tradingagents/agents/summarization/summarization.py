@@ -37,8 +37,7 @@ def clean_json_string(json_str: str) -> str:
 class AnalysisSummary(BaseModel):
     """Summary of different analysis components"""
     market_trend: str = Field(description="BULLISH|BEARISH|NEUTRAL")
-    fundamental_strength: str = Field(description="STRONG|MODERATE|WEAK") 
-    sentiment_score: float = Field(description="Overall sentiment (-100 to 100)")
+    fundamental_strength: str = Field(description="STRONG|MODERATE|WEAK")
     macro_environment: str = Field(description="FAVORABLE|NEUTRAL|UNFAVORABLE")
     technical_signals: str = Field(description="BUY|SELL|NEUTRAL")
 
@@ -48,7 +47,6 @@ class ExpertRecommendation(BaseModel):
     symbol: str = Field(description="Stock ticker symbol")
     recommended_action: str = Field(description="BUY|SELL|HOLD")
     expected_profit_percent: float = Field(description="Expected profit percentage from the trade. ALWAYS POSITIVE for BUY and SELL (it represents profit, not price direction). For BUY: ((take_profit - price_at_date) / price_at_date) * 100. For SELL: ((price_at_date - stop_loss) / price_at_date) * 100. For HOLD: 0.0. Example: SELL at $100 with target $87 = 13.0 (NOT -13.0)")
-    price_at_date: float = Field(description="Current stock price at analysis")
     confidence: float = Field(description="Confidence level (0-100)")
     details: str = Field(description="Detailed explanation of recommendation", max_length=2000)
     risk_level: str = Field(description="LOW|MEDIUM|HIGH")
@@ -115,7 +113,10 @@ def create_final_summarization_agent(llm):
             
             # recommendation is already parsed as dict from JsonOutputParser
             recommendation_dict = recommendation
-            
+
+            # Inject price_at_date from state (not LLM output — broker price is authoritative)
+            recommendation_dict["price_at_date"] = current_price
+
             # Store in state
             state["expert_recommendation"] = recommendation_dict
             state["final_analysis_summary"] = recommendation_dict.get("analysis_summary", {})
@@ -284,30 +285,6 @@ def _log_analysis_failure(state: Dict[str, Any], symbol: str, error_msg: str) ->
         logger.warning(f"Failed to log analysis failure activity: {log_error}")
 
 
-def _create_fallback_recommendation(state: Dict[str, Any], symbol: str, current_price: float, error_msg: str) -> Dict[str, Any]:
-    """Create a fallback recommendation when structured output fails"""
-    logger.error(f"Creating fallback recommendation due to error: {error_msg}")
-    return {
-        "symbol": symbol,
-        "recommended_action": "HOLD",
-        "expected_profit_percent": 0.0,
-        "price_at_date": current_price,
-        "confidence": 0.0,
-        "details": f"Error generating structured recommendation: {error_msg}. Defaulting to HOLD.",
-        "risk_level": "MEDIUM",
-        "time_horizon": "MEDIUM_TERM",
-        "key_factors": ["Analysis error occurred"],
-        "stop_loss": 0.0,
-        "take_profit": 0.0,
-        "analysis_summary": {
-            "market_trend": "NEUTRAL",
-            "fundamental_strength": "MODERATE",
-            "sentiment_score": 0.0,
-            "macro_environment": "NEUTRAL", 
-            "technical_signals": "NEUTRAL"
-        }
-    }
-
 
 
 
@@ -348,14 +325,4 @@ def create_langgraph_summarization_node(config: Dict[str, Any]):
         return create_final_summarization_agent(llm)
     except KeyError as e:
         logger.error(f"Missing required configuration key: {e}", exc_info=True)
-        
-        def error_node(state: Dict[str, Any]) -> Dict[str, Any]:
-            state["expert_recommendation"] = _create_fallback_recommendation(
-                state, 
-                state.get("company_of_interest", "UNKNOWN"), 
-                state.get("current_price", 0.0),
-                f"Configuration error: {e}"
-            )
-            return state
-        
-        return error_node
+        raise

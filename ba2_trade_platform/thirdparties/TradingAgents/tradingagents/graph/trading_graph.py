@@ -888,7 +888,6 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                     logger.info("Analysis Summary:")
                     logger.info(f"   Market Trend: {analysis_summary.get('market_trend', 'Unknown')}")
                     logger.info(f"   Fundamental Strength: {analysis_summary.get('fundamental_strength', 'Unknown')}")
-                    logger.info(f"   Sentiment Score: {analysis_summary.get('sentiment_score', 0)}")
                     logger.info(f"   Macro Environment: {analysis_summary.get('macro_environment', 'Unknown')}")
                     logger.info(f"   Technical Signals: {analysis_summary.get('technical_signals', 'Unknown')}")
                     logger.info("="*70)

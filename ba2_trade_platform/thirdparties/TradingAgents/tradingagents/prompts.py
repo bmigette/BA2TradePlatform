@@ -291,7 +291,6 @@ FINAL_SUMMARIZATION_AGENT_PROMPT = """You are the Final Summarization Agent for 
     "symbol": "TICKER",
     "recommended_action": "BUY|SELL|HOLD",
     "expected_profit_percent": 0.0,
-    "price_at_date": 0.0,
     "confidence": 0.0,
     "details": "Detailed explanation (max 2000 chars)",
     "risk_level": "LOW|MEDIUM|HIGH",
@@ -302,7 +301,6 @@ FINAL_SUMMARIZATION_AGENT_PROMPT = """You are the Final Summarization Agent for 
     "analysis_summary": {{
         "market_trend": "BULLISH|BEARISH|NEUTRAL",
         "fundamental_strength": "STRONG|MODERATE|WEAK",
-        "sentiment_score": 0.0,
         "macro_environment": "FAVORABLE|NEUTRAL|UNFAVORABLE",
         "technical_signals": "BUY|SELL|NEUTRAL"
     }}
@@ -315,7 +313,7 @@ FINAL_SUMMARIZATION_AGENT_PROMPT = """You are the Final Summarization Agent for 
 2. ✅ Correct format: `["item1", "item2"]` ← VALID
 3. ❌ NO comments in JSON: `"confidence": 50.0,  // high confidence` ← INVALID
 4. ✅ Use only data: `"confidence": 50.0` ← VALID
-5. ⚠️ **DO NOT copy example values** — all numeric fields (confidence, expected_profit_percent, price_at_date, stop_loss, take_profit, sentiment_score) are placeholders. You MUST replace them with values derived from your analysis.
+5. ⚠️ **DO NOT copy example values** — all numeric fields (confidence, expected_profit_percent, stop_loss, take_profit) are placeholders. You MUST replace them with values derived from your analysis.
 
 **Examples of INVALID JSON (DO NOT OUTPUT)**:
 ```
