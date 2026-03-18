@@ -49,7 +49,7 @@ class BalanceUsagePerExpertChart:
             from ...core.utils import get_account_instance_from_id, get_expert_instance_from_id
 
             # Get all active expert instances (with account filter)
-            expert_query = select(ExpertInstance).where(ExpertInstance.active == True)
+            expert_query = select(ExpertInstance).where(ExpertInstance.enabled == True)
             if account_expert_ids is not None:
                 if account_expert_ids:
                     expert_query = expert_query.where(ExpertInstance.id.in_(account_expert_ids))
