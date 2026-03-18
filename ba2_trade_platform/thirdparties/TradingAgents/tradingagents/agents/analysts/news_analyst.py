@@ -3,6 +3,7 @@ import time
 import json
 from typing import List
 from ...prompts import format_analyst_prompt, get_prompt
+from ba2_trade_platform.core.text_utils import extract_text_from_llm_response
 
 
 def create_news_analyst(llm, toolkit, tools, parallel_tool_calls=False):
@@ -48,7 +49,7 @@ def create_news_analyst(llm, toolkit, tools, parallel_tool_calls=False):
         report = ""
 
         if len(result.tool_calls) == 0:
-            report = result.content
+            report = extract_text_from_llm_response(result.content)
 
         return {
             "messages": [result],

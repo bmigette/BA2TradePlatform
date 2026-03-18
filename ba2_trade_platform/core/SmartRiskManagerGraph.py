@@ -1414,10 +1414,9 @@ FILLED Positions (Live Trades - {num_open_positions} total):
         if isinstance(current_scratchpad, list):
             current_scratchpad = "\n".join(str(item) for item in current_scratchpad)
         
-        # Handle case where response.content might be a list
-        response_content = response.content
-        if isinstance(response_content, list):
-            response_content = "\n".join(str(item) for item in response_content)
+        # Handle case where response.content might be a list (Responses API / reasoning models)
+        from .text_utils import extract_text_from_llm_response
+        response_content = extract_text_from_llm_response(response.content)
         
         scratchpad = current_scratchpad + "\n\n## Initial Portfolio Analysis\n" + response_content
         
@@ -3132,8 +3131,9 @@ Provide a concise 2-3 paragraph explanation.""")
                 
                 research_messages.append(explanation_prompt)
                 explanation_response = llm_no_tools.invoke(research_messages)
-                no_action_explanation = explanation_response.content
-                
+                from ..core.text_utils import extract_text_from_llm_response as _extract_text
+                no_action_explanation = _extract_text(explanation_response.content)
+
                 logger.info("=" * 70)
                 logger.info("LLM EXPLANATION FOR NO ACTIONS:")
                 logger.info("=" * 70)
@@ -4275,7 +4275,8 @@ class SmartRiskManagerGraph:
                 # Check if research is complete
                 if not response.tool_calls:
                     logger.info("Research agent finished without tool calls")
-                    final_summary = response.content
+                    from ..core.text_utils import extract_text_from_llm_response as _extract
+                    final_summary = _extract(response.content)
                     research_complete = True
                 else:
                     # Execute tool calls

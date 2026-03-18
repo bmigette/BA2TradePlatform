@@ -43,6 +43,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ba2_trade_platform.config import get_app_setting
 from ba2_trade_platform.core.ModelFactory import ModelFactory
+from ba2_trade_platform.core.text_utils import extract_text_from_llm_response
 from ba2_trade_platform.core.models_registry import (
     MODELS, PROVIDER_CONFIG, get_all_providers, get_model_for_provider,
     LABEL_WEBSEARCH, LABEL_TOOL_CALLING,
@@ -171,7 +172,7 @@ def test_inference(provider: str, model_name: str, model_info: Dict, verbose: bo
         result.duration_ms = (time.time() - start) * 1000
 
         if hasattr(response, 'content'):
-            result.response = str(response.content)[:100]
+            result.response = extract_text_from_llm_response(response.content)[:100]
         else:
             result.response = str(response)[:100]
 
@@ -415,7 +416,7 @@ def test_reasoning(provider: str, model_name: str, model_info: Dict, effort: str
         result.duration_ms = (time.time() - start) * 1000
 
         if hasattr(response, 'content'):
-            result.response = str(response.content)[:100]
+            result.response = extract_text_from_llm_response(response.content)[:100]
         else:
             result.response = str(response)[:100]
 

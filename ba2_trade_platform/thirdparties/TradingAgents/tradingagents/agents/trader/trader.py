@@ -2,6 +2,7 @@ import functools
 import time
 import json
 from ...prompts import format_trader_context_prompt, format_trader_system_prompt
+from ba2_trade_platform.core.text_utils import extract_text_from_llm_response
 
 
 def create_trader(llm, memory):
@@ -43,7 +44,7 @@ def create_trader(llm, memory):
 
         return {
             "messages": [result],
-            "trader_investment_plan": result.content,
+            "trader_investment_plan": extract_text_from_llm_response(result.content),
             "sender": name,
         }
 

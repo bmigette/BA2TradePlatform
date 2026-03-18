@@ -5,6 +5,7 @@ from langchain_core.prompts import ChatPromptTemplate
 import time
 import json
 from ..prompts import get_prompt
+from ba2_trade_platform.core.text_utils import extract_text_from_llm_response
 
 
 class SignalProcessor:
@@ -32,4 +33,4 @@ class SignalProcessor:
             ("human", full_signal),
         ]
 
-        return self.quick_thinking_llm.invoke(messages).content
+        return extract_text_from_llm_response(self.quick_thinking_llm.invoke(messages).content)
