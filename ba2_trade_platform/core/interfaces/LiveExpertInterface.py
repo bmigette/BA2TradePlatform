@@ -37,6 +37,7 @@ class LiveExpertInterface(MarketExpertInterface):
         self._is_running = False
         self._current_phase: Optional[str] = None
         self._resume_mode: bool = False
+        self._force_full_scan: bool = False
 
     # ------------------------------------------------------------------
     # Builtin settings merge
@@ -162,6 +163,7 @@ class LiveExpertInterface(MarketExpertInterface):
 
     def request_manual_start(self) -> str:
         """Trigger the daily pipeline immediately (unblock the wait)."""
+        self._force_full_scan = True  # override resume mode for this run
         self._manual_start_event.set()
         return "Manual scan started"
 
@@ -235,6 +237,10 @@ class LiveExpertInterface(MarketExpertInterface):
                 # Run the daily pipeline
                 if not self._stop_event.is_set():
                     try:
+                        if self._force_full_scan:
+                            self._resume_mode = False
+                            self._force_full_scan = False
+                            _log.info(f"LiveExpert {self.id}: manual start — forcing full scan")
                         _log.info(
                             f"LiveExpert {self.id}: running daily pipeline "
                             f"(resume_mode={self._resume_mode})"
