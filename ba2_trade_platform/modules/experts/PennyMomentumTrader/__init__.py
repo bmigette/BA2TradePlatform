@@ -478,11 +478,17 @@ class PennyMomentumTrader(LiveExpertInterface):
         prev_watching = sum(
             1 for info in prev_monitored.values() if info.get("status") == "watching"
         )
-        at_capacity = is_resume and prev_watching >= max_monitored
+        scan_done_today = is_resume and self._full_scan_completed_today(market_analysis.id)
+        at_capacity = is_resume and (prev_watching >= max_monitored or scan_done_today)
 
         if at_capacity:
+            reason = (
+                f"scan already ran today"
+                if scan_done_today
+                else f"already at monitor capacity ({prev_watching}/{max_monitored})"
+            )
             self.logger.info(
-                f"Resume mode: already at monitor capacity ({prev_watching}/{max_monitored}) — "
+                f"Resume mode: {reason} — "
                 "skipping scan phases, phase 4 will carry over monitored symbols"
             )
             finalists = []
@@ -914,6 +920,31 @@ class PennyMomentumTrader(LiveExpertInterface):
         except Exception as e:
             self.logger.warning(f"Failed to load previously monitored symbols: {e}")
         return set()
+
+    def _full_scan_completed_today(self, current_market_analysis_id: int) -> bool:
+        """Return True if a full (non-resume) scan was already completed today."""
+        try:
+            today = datetime.utcnow().date()
+            with get_db() as session:
+                from sqlmodel import select as sql_select
+                statement = (
+                    sql_select(MarketAnalysis)
+                    .where(MarketAnalysis.expert_instance_id == self.instance.id)
+                    .where(MarketAnalysis.id != current_market_analysis_id)
+                    .order_by(MarketAnalysis.created_at.desc())  # type: ignore[union-attr]
+                    .limit(10)
+                )
+                for ma in session.exec(statement).all():
+                    if not ma.state or not ma.created_at:
+                        continue
+                    if ma.created_at.date() != today:
+                        break  # records are newest-first; stop at first record from a prior day
+                    # deep_triage_results is only written during a full scan
+                    if ma.state.get("deep_triage_results") is not None:
+                        return True
+        except Exception as e:
+            self.logger.warning(f"Failed to check today's scan history: {e}")
+        return False
 
     def _get_previous_monitored_data(self, current_market_analysis_id: int) -> Dict[str, Dict[str, Any]]:
         """Return the full monitored_symbols dict from the most recent prior MarketAnalysis."""
