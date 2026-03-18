@@ -370,6 +370,17 @@ class PennyMomentumTrader(LiveExpertInterface):
                 ),
                 "ui_editor_type": "password",
             },
+            "premarket_minutes": {
+                "type": "int",
+                "required": False,
+                "default": 150,
+                "description": "Minutes before market open (09:30 ET) to start the daily scan pipeline.",
+                "tooltip": (
+                    "How early before market open to begin screening and analysis. "
+                    "Default 150 = start at 07:00 ET (2.5 hours pre-market). "
+                    "Set to 0 to use the start_time setting instead."
+                ),
+            },
         }
 
     # ------------------------------------------------------------------

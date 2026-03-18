@@ -51,7 +51,7 @@ class LiveExpertInterface(MarketExpertInterface):
                 "type": "str",
                 "required": False,
                 "default": "07:00",
-                "description": "Daily kick-off time (in market timezone)",
+                "description": "Daily kick-off time in market timezone (ET by default). Ignored when premarket_minutes > 0.",
             },
             "market_timezone": {
                 "type": "str",
@@ -86,11 +86,27 @@ class LiveExpertInterface(MarketExpertInterface):
                 "default": 60,
                 "description": "Interval in seconds between monitoring checks",
             },
+            "market_open_time": {
+                "type": "str",
+                "required": False,
+                "default": "09:30",
+                "description": "Regular market open time in ET (HH:MM). Used together with premarket_minutes to compute kickoff.",
+            },
             "market_close_time": {
                 "type": "str",
                 "required": False,
                 "default": "16:00",
-                "description": "Market close time (in market timezone)",
+                "description": "Market close time in ET (HH:MM).",
+            },
+            "premarket_minutes": {
+                "type": "int",
+                "required": False,
+                "default": 0,
+                "description": (
+                    "Minutes before market open (ET) to start the daily pipeline. "
+                    "When > 0, overrides start_time. "
+                    "Example: 150 starts at 07:00 ET when market opens at 09:30 ET."
+                ),
             },
         }
 
@@ -363,12 +379,33 @@ class LiveExpertInterface(MarketExpertInterface):
         """Return the current datetime in the market timezone."""
         return datetime.now(self._get_market_tz())
 
+    def _get_kickoff_hour_minute(self) -> tuple:
+        """
+        Return (hour, minute) for the daily kickoff.
+
+        If premarket_minutes > 0, computes kickoff as market_open - premarket_minutes.
+        Otherwise falls back to the start_time setting.
+        """
+        premarket_minutes = int(self.get_setting_with_interface_default(
+            "premarket_minutes", log_warning=False
+        ))
+        if premarket_minutes > 0:
+            open_str = self.get_setting_with_interface_default(
+                "market_open_time", log_warning=False
+            )
+            open_hour, open_minute = (int(p) for p in open_str.split(":"))
+            total_minutes = open_hour * 60 + open_minute - premarket_minutes
+            return total_minutes // 60, total_minutes % 60
+        else:
+            start_time_str = self.get_setting_with_interface_default(
+                "start_time", log_warning=False
+            )
+            hour, minute = (int(p) for p in start_time_str.split(":"))
+            return hour, minute
+
     def _get_kickoff_time_today(self) -> datetime:
-        """Parse start_time setting and return today's kickoff as a tz-aware datetime."""
-        start_time_str = self.get_setting_with_interface_default(
-            "start_time", log_warning=False
-        )
-        hour, minute = (int(p) for p in start_time_str.split(":"))
+        """Return today's kickoff as a tz-aware datetime."""
+        hour, minute = self._get_kickoff_hour_minute()
         tz = self._get_market_tz()
         now = self._get_market_now()
         return tz.localize(
@@ -419,10 +456,7 @@ class LiveExpertInterface(MarketExpertInterface):
         """
         tz = self._get_market_tz()
         now = self._get_market_now()
-        start_time_str = self.get_setting_with_interface_default(
-            "start_time", log_warning=False
-        )
-        hour, minute = (int(p) for p in start_time_str.split(":"))
+        hour, minute = self._get_kickoff_hour_minute()
 
         for days_ahead in range(1, 8):
             candidate = now + timedelta(days=days_ahead)
