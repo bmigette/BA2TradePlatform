@@ -67,15 +67,13 @@ class BalanceUsagePerExpertChart:
                     continue
 
                 virtual_balance = expert_interface.get_virtual_balance()
-                available_balance = expert_interface.get_available_balance()
-
-                if virtual_balance is None or available_balance is None:
+                if virtual_balance is None:
                     continue
 
                 balance_data[expert_name] = {
                     'pending': 0.0,
                     'filled': 0.0,
-                    'available': max(0, available_balance),
+                    'available': 0.0,  # Will be computed as total - filled - pending
                     'total': virtual_balance
                 }
 
@@ -171,6 +169,10 @@ class BalanceUsagePerExpertChart:
                 except Exception as e:
                     logger.error(f"Error calculating balance usage for transaction {transaction.id}: {e}")
                     continue
+
+            # Compute available = total - filled - pending (ensures stack adds up)
+            for name, data in balance_data.items():
+                data['available'] = max(0, data['total'] - data['filled'] - data['pending'])
 
             # Sort by total balance (highest to lowest)
             balance_data = dict(sorted(
