@@ -999,41 +999,48 @@ class AdjustTakeProfitAction(TradeAction):
             return preview
         
         # Try to calculate reference price
-        if self.reference_value and self.existing_order:
-            from .types import ReferenceValue
-            
+        if self.reference_value:
+            from .types import ReferenceValue, OrderRecommendation
+
             try:
                 if self.reference_value == ReferenceValue.ORDER_OPEN_PRICE.value:
-                    preview["reference_price"] = self.existing_order.limit_price
+                    if self.existing_order:
+                        preview["reference_price"] = self.existing_order.limit_price
                 elif self.reference_value == ReferenceValue.CURRENT_PRICE.value:
                     preview["reference_price"] = self.get_current_price()
                 elif self.reference_value == ReferenceValue.EXPERT_TARGET_PRICE.value:
-                    if self.existing_order and self.existing_order.expert_recommendation_id:
+                    # Try expert_recommendation directly first (works for enter_market),
+                    # fall back to looking up via existing_order
+                    expert_rec = self.expert_recommendation
+                    if not expert_rec and self.existing_order and self.existing_order.expert_recommendation_id:
                         from .db import get_instance
                         from .models import ExpertRecommendation
                         expert_rec = get_instance(ExpertRecommendation, self.existing_order.expert_recommendation_id)
-                        if expert_rec and hasattr(expert_rec, 'price_at_date') and hasattr(expert_rec, 'expected_profit_percent'):
-                            base_price = expert_rec.price_at_date
-                            expected_profit = expert_rec.expected_profit_percent
-                            
-                            from .types import OrderRecommendation
-                            if expert_rec.recommended_action == OrderRecommendation.BUY:
-                                preview["reference_price"] = base_price * (1 + expected_profit / 100)
-                            elif expert_rec.recommended_action == OrderRecommendation.SELL:
-                                preview["reference_price"] = base_price * (1 - expected_profit / 100)
-                
+
+                    if expert_rec and hasattr(expert_rec, 'price_at_date') and hasattr(expert_rec, 'expected_profit_percent'):
+                        base_price = expert_rec.price_at_date
+                        expected_profit = expert_rec.expected_profit_percent
+
+                        if expert_rec.recommended_action == OrderRecommendation.BUY:
+                            preview["reference_price"] = base_price * (1 + expected_profit / 100)
+                        elif expert_rec.recommended_action == OrderRecommendation.SELL:
+                            preview["reference_price"] = base_price * (1 - expected_profit / 100)
+
                 # Calculate final price
-                if preview["reference_price"] and self.percent:
-                    # For BUY orders, TP is above entry; for SELL orders, TP is below entry
-                    order_side = str(self.existing_order.side.value if hasattr(self.existing_order.side, 'value') else self.existing_order.side).upper()
-                    if order_side == "BUY":
+                if preview["reference_price"] and self.percent is not None:
+                    is_long = (self.order_recommendation == OrderRecommendation.BUY)
+                    if not is_long and self.existing_order:
+                        order_side = str(self.existing_order.side.value if hasattr(self.existing_order.side, 'value') else self.existing_order.side).upper()
+                        is_long = (order_side == "BUY")
+
+                    if is_long:
                         preview["calculated_price"] = preview["reference_price"] * (1 + self.percent / 100)
-                    else:  # sell
+                    else:
                         preview["calculated_price"] = preview["reference_price"] * (1 - self.percent / 100)
-                        
+
             except Exception as e:
                 logger.debug(f"Error calculating TP preview: {e}")
-        
+
         return preview
 
 
@@ -1433,37 +1440,46 @@ class AdjustStopLossAction(TradeAction):
             return preview
         
         # Try to calculate reference price
-        if self.reference_value and self.existing_order:
-            from .types import ReferenceValue
-            
+        if self.reference_value:
+            from .types import ReferenceValue, OrderRecommendation
+
             try:
                 if self.reference_value == ReferenceValue.ORDER_OPEN_PRICE.value:
-                    preview["reference_price"] = self.existing_order.limit_price
+                    if self.existing_order:
+                        preview["reference_price"] = self.existing_order.limit_price
                 elif self.reference_value == ReferenceValue.CURRENT_PRICE.value:
                     preview["reference_price"] = self.get_current_price()
                 elif self.reference_value == ReferenceValue.EXPERT_TARGET_PRICE.value:
-                    if self.existing_order and self.existing_order.expert_recommendation_id:
+                    # Try expert_recommendation directly first (works for enter_market),
+                    # fall back to looking up via existing_order
+                    expert_rec = self.expert_recommendation
+                    if not expert_rec and self.existing_order and self.existing_order.expert_recommendation_id:
                         from .db import get_instance
                         from .models import ExpertRecommendation
                         expert_rec = get_instance(ExpertRecommendation, self.existing_order.expert_recommendation_id)
-                        if expert_rec and hasattr(expert_rec, 'price_at_date') and hasattr(expert_rec, 'expected_profit_percent'):
-                            base_price = expert_rec.price_at_date
-                            expected_profit = expert_rec.expected_profit_percent
-                            
-                            from .types import OrderRecommendation
-                            if expert_rec.recommended_action == OrderRecommendation.BUY:
-                                preview["reference_price"] = base_price * (1 + expected_profit / 100)
-                            elif expert_rec.recommended_action == OrderRecommendation.SELL:
-                                preview["reference_price"] = base_price * (1 - expected_profit / 100)
-                
+
+                    if expert_rec and hasattr(expert_rec, 'price_at_date') and hasattr(expert_rec, 'expected_profit_percent'):
+                        base_price = expert_rec.price_at_date
+                        expected_profit = expert_rec.expected_profit_percent
+
+                        if expert_rec.recommended_action == OrderRecommendation.BUY:
+                            preview["reference_price"] = base_price * (1 + expected_profit / 100)
+                        elif expert_rec.recommended_action == OrderRecommendation.SELL:
+                            preview["reference_price"] = base_price * (1 - expected_profit / 100)
+
                 # Calculate final price
-                if preview["reference_price"] and self.percent:
-                    # For BUY orders, SL is below entry; for SELL orders, SL is above entry
-                    if self.existing_order.side.upper() == "BUY":
+                if preview["reference_price"] and self.percent is not None:
+                    is_long = (self.order_recommendation == OrderRecommendation.BUY)
+                    if not is_long and self.existing_order:
+                        order_side = str(self.existing_order.side.value if hasattr(self.existing_order.side, 'value') else self.existing_order.side).upper()
+                        is_long = (order_side == "BUY")
+
+                    # For SL: BUY orders have SL below (negative percent), SELL orders have SL above
+                    if is_long:
                         preview["calculated_price"] = preview["reference_price"] * (1 + self.percent / 100)
-                    else:  # sell
+                    else:
                         preview["calculated_price"] = preview["reference_price"] * (1 - self.percent / 100)
-                        
+
             except Exception as e:
                 logger.debug(f"Error calculating SL preview: {e}")
         
