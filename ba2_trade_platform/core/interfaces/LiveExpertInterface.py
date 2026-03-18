@@ -270,6 +270,13 @@ class LiveExpertInterface(MarketExpertInterface):
                     finally:
                         self._resume_mode = False
 
+                    # Consume any manual-start event that was set while the
+                    # pipeline was running (not during a wait).  Without this,
+                    # the post-pipeline wait below returns immediately and the
+                    # while-loop re-runs the pipeline because _is_market_open()
+                    # is still True.
+                    self._manual_start_event.clear()
+
                     # Sleep until next kickoff
                     seconds = self._seconds_until_next_kickoff()
                     if seconds > 0 and not self._stop_event.is_set():
@@ -287,7 +294,10 @@ class LiveExpertInterface(MarketExpertInterface):
             self._current_phase = None
             self._is_running = False
             with LiveExpertInterface._registry_lock:
-                LiveExpertInterface._running_registry.pop(self.id, None)
+                # Only remove our own entry — a new instance may already be
+                # registered under the same ID if stop()+start() raced.
+                if LiveExpertInterface._running_registry.get(self.id) is self:
+                    LiveExpertInterface._running_registry.pop(self.id, None)
             _log.info(f"LiveExpert {self.id} run loop exited")
 
     # ------------------------------------------------------------------
