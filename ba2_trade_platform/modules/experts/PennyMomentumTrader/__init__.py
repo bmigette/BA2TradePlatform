@@ -666,7 +666,8 @@ class PennyMomentumTrader(LiveExpertInterface):
 
                     trans = session.get(Transaction, pos["transaction_id"])
                     if trans and trans.created_at:
-                        age_days = (datetime.now(timezone.utc) - trans.created_at).days
+                        created = trans.created_at.replace(tzinfo=timezone.utc) if trans.created_at.tzinfo is None else trans.created_at
+                        age_days = (datetime.now(timezone.utc) - created).days
                         if age_days >= max_holding:
                             self.logger.info(
                                 f"Position {pos['symbol']} held for {age_days} days "
