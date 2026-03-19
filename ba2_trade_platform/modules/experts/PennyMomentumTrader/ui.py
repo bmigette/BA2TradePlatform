@@ -46,7 +46,7 @@ class PennyMomentumTraderUI:
                             )
                             current_state = session.execute(stmt).scalar()
                         if current_state != self.state:
-                            await ui.navigate.reload()
+                            ui.navigate.reload()
                     except Exception:
                         pass
 
@@ -589,7 +589,7 @@ class PennyMomentumTraderUI:
                         logger.info(f'Removed {symbol} from monitored symbols (analysis {analysis_id})')
                     else:
                         logger.warning(f'{symbol} not found in monitored symbols')
-            await ui.navigate.reload()
+            ui.navigate.reload()
         except Exception as e:
             logger.error(f'Error removing {symbol} from monitors: {e}', exc_info=True)
             ui.notify(f'Error removing {symbol}: {e}', type='negative')
