@@ -470,8 +470,30 @@ class PennyMomentumTrader(LiveExpertInterface):
         mode_label = "RESUME (mid-day restart)" if is_resume else "FULL"
         self.logger.info(f"=== Daily pipeline starting [{mode_label}] ===")
         self._trade_mgr = PennyTradeManager(self.instance.id)
-        market_analysis = self._create_market_analysis()
-        self.logger.debug(f"Created MarketAnalysis id={market_analysis.id}")
+
+        # In resume mode, reuse today's existing MarketAnalysis to preserve
+        # monitored symbols and other state across restarts
+        market_analysis = None
+        if is_resume:
+            market_analysis = self._get_todays_market_analysis()
+            if market_analysis:
+                self.logger.info(
+                    f"Resuming existing MarketAnalysis id={market_analysis.id} "
+                    f"(state keys: {list((market_analysis.state or {}).keys())})"
+                )
+                # Mark as running again
+                with get_db() as session:
+                    from sqlalchemy.orm import attributes
+                    ma = session.get(MarketAnalysis, market_analysis.id)
+                    if ma:
+                        ma.status = MarketAnalysisStatus.RUNNING
+                        session.add(ma)
+                        session.commit()
+                        market_analysis.status = MarketAnalysisStatus.RUNNING
+
+        if market_analysis is None:
+            market_analysis = self._create_market_analysis()
+            self.logger.debug(f"Created MarketAnalysis id={market_analysis.id}")
         pipeline_start = time.time()
 
         # Phase 0: Review existing positions
@@ -2413,6 +2435,33 @@ class PennyMomentumTrader(LiveExpertInterface):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _get_todays_market_analysis(self) -> "MarketAnalysis | None":
+        """Find an existing MarketAnalysis from today that has monitored symbols.
+
+        Returns the most recent one with state data, or None if no suitable
+        analysis exists for today.
+        """
+        try:
+            today = datetime.utcnow().date()
+            with get_db() as session:
+                from sqlmodel import select as sql_select
+                statement = (
+                    sql_select(MarketAnalysis)
+                    .where(MarketAnalysis.expert_instance_id == self.instance.id)
+                    .order_by(MarketAnalysis.created_at.desc())
+                    .limit(5)
+                )
+                for ma in session.exec(statement).all():
+                    if not ma.created_at or ma.created_at.date() != today:
+                        break
+                    if ma.state and ma.state.get("monitored_symbols"):
+                        # Detach from session so it can be used outside
+                        session.expunge(ma)
+                        return ma
+        except Exception as e:
+            self.logger.warning(f"Failed to find today's MarketAnalysis: {e}")
+        return None
 
     def _create_market_analysis(self) -> MarketAnalysis:
         """Create a new MarketAnalysis record for this pipeline run."""
