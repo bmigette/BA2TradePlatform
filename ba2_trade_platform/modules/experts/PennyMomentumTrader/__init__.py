@@ -944,7 +944,7 @@ class PennyMomentumTrader(LiveExpertInterface):
         return candidates
 
     def _get_previously_monitored_symbols(self, current_market_analysis_id: int) -> set:
-        """Return symbols from the most recent prior MarketAnalysis (if any)."""
+        """Return symbols from the most recent prior MarketAnalysis that has monitored data."""
         try:
             with get_db() as session:
                 from sqlmodel import select as sql_select
@@ -952,12 +952,12 @@ class PennyMomentumTrader(LiveExpertInterface):
                     sql_select(MarketAnalysis)
                     .where(MarketAnalysis.expert_instance_id == self.instance.id)
                     .where(MarketAnalysis.id != current_market_analysis_id)
-                    .order_by(MarketAnalysis.created_at.desc())  # type: ignore[union-attr]
-                    .limit(1)
+                    .order_by(MarketAnalysis.created_at.desc())
+                    .limit(5)
                 )
-                ma = session.exec(statement).first()
-                if ma and ma.state:
-                    return set(ma.state.get("monitored_symbols", {}).keys())
+                for ma in session.exec(statement).all():
+                    if ma.state and ma.state.get("monitored_symbols"):
+                        return set(ma.state["monitored_symbols"].keys())
         except Exception as e:
             self.logger.warning(f"Failed to load previously monitored symbols: {e}")
         return set()
@@ -988,7 +988,12 @@ class PennyMomentumTrader(LiveExpertInterface):
         return False
 
     def _get_previous_monitored_data(self, current_market_analysis_id: int) -> Dict[str, Dict[str, Any]]:
-        """Return the full monitored_symbols dict from the most recent prior MarketAnalysis."""
+        """Return the full monitored_symbols dict from the most recent prior MarketAnalysis.
+
+        Searches through the last few analyses (newest first) to find one
+        that actually has monitored symbols, since a very recent restart
+        may have created an intermediate analysis with an empty set.
+        """
         try:
             with get_db() as session:
                 from sqlmodel import select as sql_select
@@ -996,12 +1001,22 @@ class PennyMomentumTrader(LiveExpertInterface):
                     sql_select(MarketAnalysis)
                     .where(MarketAnalysis.expert_instance_id == self.instance.id)
                     .where(MarketAnalysis.id != current_market_analysis_id)
-                    .order_by(MarketAnalysis.created_at.desc())  # type: ignore[union-attr]
-                    .limit(1)
+                    .order_by(MarketAnalysis.created_at.desc())
+                    .limit(5)
                 )
-                ma = session.exec(statement).first()
-                if ma and ma.state:
-                    return dict(ma.state.get("monitored_symbols", {}))
+                for ma in session.exec(statement).all():
+                    if not ma.state:
+                        continue
+                    monitored = ma.state.get("monitored_symbols", {})
+                    if monitored:
+                        self.logger.debug(
+                            f"Found monitored_symbols in MarketAnalysis id={ma.id} "
+                            f"({len(monitored)} symbols)"
+                        )
+                        return dict(monitored)
+                    self.logger.debug(
+                        f"MarketAnalysis id={ma.id} has no monitored_symbols, checking older"
+                    )
         except Exception as e:
             self.logger.warning(f"Failed to load previous monitored data: {e}")
         return {}
@@ -1647,6 +1662,17 @@ class PennyMomentumTrader(LiveExpertInterface):
                     f"{list(carried.keys())}"
                 )
                 monitored = carried
+            elif prev_data:
+                statuses = {}
+                for sym, info in prev_data.items():
+                    s = info.get("status", "unknown")
+                    statuses[s] = statuses.get(s, 0) + 1
+                self.logger.warning(
+                    f"Phase 4: found {len(prev_data)} symbols in previous analysis "
+                    f"but none with status=watching (statuses: {statuses})"
+                )
+            else:
+                self.logger.warning("Phase 4: no previous monitored symbols found in any recent analysis")
         max_monitored = int(self.get_setting_with_interface_default(
             "max_monitored_symbols", log_warning=False
         ))
