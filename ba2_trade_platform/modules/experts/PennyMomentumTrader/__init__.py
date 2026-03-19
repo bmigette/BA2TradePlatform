@@ -521,7 +521,13 @@ class PennyMomentumTrader(LiveExpertInterface):
         prev_watching = sum(
             1 for info in prev_monitored.values() if info.get("status") == "watching"
         )
-        scan_done_today = is_resume and self._full_scan_completed_today(market_analysis.id)
+        # Check if a full scan already ran today — either in the current (reused)
+        # analysis or in a separate one
+        own_state = market_analysis.state or {}
+        scan_done_today = is_resume and (
+            own_state.get("deep_triage_results") is not None
+            or self._full_scan_completed_today(market_analysis.id)
+        )
         at_capacity = is_resume and (prev_watching >= max_monitored or scan_done_today)
 
         if at_capacity:
