@@ -200,10 +200,43 @@ class LiveExpertInterface(MarketExpertInterface):
     # Thread loop
     # ------------------------------------------------------------------
 
+    def _mark_stale_running_analyses(self):
+        """Mark any RUNNING MarketAnalysis records for this expert as CANCELLED.
+
+        On app restart, previously RUNNING analyses are stale (their pipeline
+        was interrupted). Marking them ensures they don't block resume logic
+        and their state is still available for carry-over queries.
+        """
+        try:
+            from ba2_trade_platform.core.db import get_db
+            from ba2_trade_platform.core.models import MarketAnalysis
+            from ba2_trade_platform.core.types import MarketAnalysisStatus
+            from sqlmodel import select as sql_select
+
+            with get_db() as session:
+                statement = (
+                    sql_select(MarketAnalysis)
+                    .where(MarketAnalysis.expert_instance_id == self.id)
+                    .where(MarketAnalysis.status == MarketAnalysisStatus.RUNNING)
+                )
+                stale = session.exec(statement).all()
+                if stale:
+                    for ma in stale:
+                        ma.status = MarketAnalysisStatus.CANCELLED
+                        session.add(ma)
+                    session.commit()
+                    self._get_logger().info(
+                        f"Marked {len(stale)} stale RUNNING analyses as CANCELLED: "
+                        f"{[ma.id for ma in stale]}"
+                    )
+        except Exception as e:
+            self._get_logger().warning(f"Failed to mark stale analyses: {e}")
+
     def _run_loop(self):
         """Main loop executed in the background thread."""
         _log = self._get_logger()
         _log.info(f"LiveExpert {self.id} run loop entered")
+        self._mark_stale_running_analyses()
         try:
             while not self._stop_event.is_set():
                 # Check if today is a trading day
