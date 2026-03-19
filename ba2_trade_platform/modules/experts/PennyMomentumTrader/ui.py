@@ -453,8 +453,9 @@ class PennyMomentumTraderUI:
     def _render_monitors(self):
         """Per-symbol cards from monitored_symbols with condition checklists."""
         monitored: Dict[str, Dict] = self.state.get('monitored_symbols', {})
+        analysis_id = self.market_analysis.id
 
-        with ui.card().classes('w-full'):
+        with ui.card().classes('w-full') as monitors_container:
             ui.label('Active Monitors').classes('text-h5 mb-2')
             ui.label(f'{len(monitored)} symbols being monitored').classes('text-subtitle2 text-grey-7 mb-4')
 
@@ -463,10 +464,10 @@ class PennyMomentumTraderUI:
                 return
 
             for symbol, info in monitored.items():
-                self._render_monitor_card(symbol, info)
+                self._render_monitor_card(symbol, info, analysis_id)
 
-    def _render_monitor_card(self, symbol: str, info: Dict[str, Any]):
-        """Render a single monitor card with status badge and condition checklist."""
+    def _render_monitor_card(self, symbol: str, info: Dict[str, Any], analysis_id: int):
+        """Render a single monitor card with status badge, condition checklist, and remove button."""
         status = info.get('status', 'unknown')
         entry_conditions = info.get('entry_conditions', {})
         exit_conditions = info.get('exit_conditions', {})
@@ -493,6 +494,14 @@ class PennyMomentumTraderUI:
                 ui.space()
                 if days_remaining is not None:
                     ui.label(f'{days_remaining} days remaining').classes('text-sm text-grey-7')
+
+                # Remove button
+                async def remove_symbol(sym=symbol):
+                    await self._remove_monitored_symbol(analysis_id, sym)
+
+                ui.button(
+                    icon='delete', on_click=remove_symbol
+                ).props('flat dense color=red size=sm').tooltip(f'Remove {symbol} from monitors')
 
             # Price info
             with ui.row().classes('w-full gap-6 mt-2'):
@@ -561,6 +570,29 @@ class PennyMomentumTraderUI:
             else:
                 # Fallback: render as JSON
                 ui.label(json.dumps(conditions, indent=2, default=str)).classes('text-sm font-mono')
+
+    async def _remove_monitored_symbol(self, analysis_id: int, symbol: str):
+        """Remove a symbol from the monitored_symbols state and reload the page."""
+        try:
+            from sqlalchemy.orm import attributes
+
+            with get_db() as session:
+                ma = session.get(MarketAnalysis, analysis_id)
+                if ma and ma.state and 'monitored_symbols' in ma.state:
+                    monitored = ma.state.get('monitored_symbols', {})
+                    if symbol in monitored:
+                        del monitored[symbol]
+                        ma.state['monitored_symbols'] = monitored
+                        attributes.flag_modified(ma, 'state')
+                        session.add(ma)
+                        session.commit()
+                        logger.info(f'Removed {symbol} from monitored symbols (analysis {analysis_id})')
+                    else:
+                        logger.warning(f'{symbol} not found in monitored symbols')
+            await ui.navigate.reload()
+        except Exception as e:
+            logger.error(f'Error removing {symbol} from monitors: {e}', exc_info=True)
+            ui.notify(f'Error removing {symbol}: {e}', type='negative')
 
     # ------------------------------------------------------------------
     # Tab 4: Trades
