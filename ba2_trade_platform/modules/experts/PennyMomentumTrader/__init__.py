@@ -508,7 +508,16 @@ class PennyMomentumTrader(LiveExpertInterface):
         max_monitored = int(self.get_setting_with_interface_default(
             "max_monitored_symbols", log_warning=False
         ))
-        prev_monitored = self._get_previous_monitored_data(market_analysis.id)
+        # If we reused today's analysis, its own state already has monitored data
+        own_monitored = (market_analysis.state or {}).get("monitored_symbols", {})
+        if own_monitored:
+            prev_monitored = own_monitored
+            self.logger.info(
+                f"Using {len(own_monitored)} monitored symbols from current "
+                f"MarketAnalysis id={market_analysis.id}"
+            )
+        else:
+            prev_monitored = self._get_previous_monitored_data(market_analysis.id)
         prev_watching = sum(
             1 for info in prev_monitored.values() if info.get("status") == "watching"
         )
