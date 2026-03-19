@@ -974,8 +974,8 @@ class PennyMomentumTrader(LiveExpertInterface):
                     sql_select(MarketAnalysis)
                     .where(MarketAnalysis.expert_instance_id == self.instance.id)
                     .where(MarketAnalysis.id != current_market_analysis_id)
-                    .order_by(MarketAnalysis.created_at.desc())
-                    .limit(5)
+                    .order_by(MarketAnalysis.id.desc())
+                    .limit(10)
                 )
                 for ma in session.exec(statement).all():
                     if ma.state and ma.state.get("monitored_symbols"):
@@ -994,7 +994,7 @@ class PennyMomentumTrader(LiveExpertInterface):
                     sql_select(MarketAnalysis)
                     .where(MarketAnalysis.expert_instance_id == self.instance.id)
                     .where(MarketAnalysis.id != current_market_analysis_id)
-                    .order_by(MarketAnalysis.created_at.desc())  # type: ignore[union-attr]
+                    .order_by(MarketAnalysis.id.desc())
                     .limit(10)
                 )
                 for ma in session.exec(statement).all():
@@ -1012,9 +1012,9 @@ class PennyMomentumTrader(LiveExpertInterface):
     def _get_previous_monitored_data(self, current_market_analysis_id: int) -> Dict[str, Dict[str, Any]]:
         """Return the full monitored_symbols dict from the most recent prior MarketAnalysis.
 
-        Searches through the last few analyses (newest first) to find one
-        that actually has monitored symbols, since a very recent restart
-        may have created an intermediate analysis with an empty set.
+        Searches through recent analyses (newest first by ID) to find one
+        that actually has monitored symbols, since restarts may have created
+        intermediate analyses with an empty set.
         """
         try:
             with get_db() as session:
@@ -1023,8 +1023,8 @@ class PennyMomentumTrader(LiveExpertInterface):
                     sql_select(MarketAnalysis)
                     .where(MarketAnalysis.expert_instance_id == self.instance.id)
                     .where(MarketAnalysis.id != current_market_analysis_id)
-                    .order_by(MarketAnalysis.created_at.desc())
-                    .limit(5)
+                    .order_by(MarketAnalysis.id.desc())
+                    .limit(10)
                 )
                 for ma in session.exec(statement).all():
                     if not ma.state:
@@ -2449,8 +2449,8 @@ class PennyMomentumTrader(LiveExpertInterface):
                 statement = (
                     sql_select(MarketAnalysis)
                     .where(MarketAnalysis.expert_instance_id == self.instance.id)
-                    .order_by(MarketAnalysis.created_at.desc())
-                    .limit(5)
+                    .order_by(MarketAnalysis.id.desc())
+                    .limit(10)
                 )
                 for ma in session.exec(statement).all():
                     if not ma.created_at or ma.created_at.date() != today:
