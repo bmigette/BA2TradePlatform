@@ -568,7 +568,24 @@ class PennyMomentumTrader(LiveExpertInterface):
                 self.logger.info("Pipeline aborted after phase 1c (stop requested)")
                 return
 
-            # Combine survivors + LLM-discovered + StockTwits-discovered for deep triage
+            # Phase 2b: Quick filter discovered candidates (1b + 1c) before deep triage
+            if new_ones:
+                self.logger.info(f"Phase 2b: Quick filtering {len(new_ones)} discovered candidates (1b+1c)")
+                self._current_phase = "quick_filter_discovered"
+                self._update_state(market_analysis, {"phase": "quick_filter_discovered"})
+                filtered_new = self._time_phase(
+                    "quick_filter_discovered", market_analysis,
+                    self._phase_2_quick_filter, new_ones, market_analysis
+                )
+                self.logger.info(
+                    f"Phase 2b: {len(filtered_new)}/{len(new_ones)} discovered candidates survived quick filter"
+                )
+                if self._stop_event.is_set():
+                    self.logger.info("Pipeline aborted after phase 2b (stop requested)")
+                    return
+                new_ones = filtered_new
+
+            # Combine survivors + filtered discovered for deep triage
             deep_triage_input = survivors + new_ones
 
             # Phase 3: Deep triage via LLM
