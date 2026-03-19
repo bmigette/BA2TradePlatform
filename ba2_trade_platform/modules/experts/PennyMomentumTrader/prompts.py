@@ -260,6 +260,8 @@ def build_entry_conditions_prompt(
     symbol: str,
     analysis_summary: str,
     condition_types_str: str,
+    current_price: float = None,
+    current_rvol: float = None,
 ) -> str:
     """
     Build the prompt for generating structured entry/exit conditions.
@@ -269,27 +271,88 @@ def build_entry_conditions_prompt(
         analysis_summary: Summary from the deep triage analysis.
         condition_types_str: Formatted string of available condition types
             from get_condition_types_for_llm().
+        current_price: Current market price of the symbol (for context).
+        current_rvol: Current RVOL from Phase 1 screening (for context).
 
     Returns:
         Prompt string for the LLM.
     """
+    # Build market context section
+    market_context_lines = []
+    if current_price is not None:
+        market_context_lines.append(f"Current price: ${current_price:.4f}")
+    if current_rvol is not None:
+        market_context_lines.append(f"Current RVOL: {current_rvol:.1f}x (relative to 20-day avg)")
+    market_context = "\n".join(market_context_lines)
+    market_context_block = f"\nCURRENT MARKET DATA:\n{market_context}\n" if market_context_lines else ""
+
     return f"""{_SYSTEM_PREAMBLE}
 
 Define structured entry, stop-loss, and take-profit conditions for a momentum trade on {symbol}.
 
 ANALYSIS SUMMARY:
 {analysis_summary}
-
+{market_context_block}
 {condition_types_str}
 
+PARAMETER CONSTRAINTS — you MUST pick values from these ranges:
+
+VOLUME CONDITIONS (prefer rvol_above over volume_above_avg):
+  rvol_above.threshold: pick from [1.5, 2.0, 2.5, 3.0, 4.0, 5.0]
+    - 1.5x = mild interest, 2.0x = solid, 3.0x+ = strong surge
+    - Use the current RVOL above as context: set threshold BELOW the current RVOL so the condition is achievable
+  volume_above_avg: AVOID — compares intraday cumulative volume against full-day averages, making it nearly impossible to meet early in the session. Use rvol_above instead.
+  volume_spike.multiplier: pick from [1.5, 2.0, 3.0]; minutes: pick from [3, 5, 10]
+
+MOVING AVERAGES:
+  EMA/SMA period: pick from [5, 9, 13, 20, 50]
+  timeframe: pick from ["1m", "5m", "15m"]
+    - 1m = ultra short-term noise, use sparingly
+    - 5m = good for intraday momentum confirmation
+    - 15m = stronger trend signal, slower to react
+
+VWAP:
+  timeframe: pick from ["1m", "5m"]
+
+RSI:
+  period: pick from [7, 14]
+  timeframe: pick from ["5m", "15m"]
+  threshold for rsi_above: pick from [50, 55, 60]  (momentum confirmation, NOT overbought filter)
+  threshold for rsi_below: pick from [40, 45, 50]
+
+MACD / EMA CROSSOVER:
+  timeframe: pick from ["5m", "15m"]
+  ema_cross fast_period/slow_period: pick from [5/13, 9/21, 8/20]
+
+PRICE THRESHOLDS:
+  price_above / price_below: set relative to the CURRENT PRICE above, e.g. within 1-3% of current price
+  Do NOT set price_above thresholds more than 5% above current price for entry conditions
+
+STOP-LOSS (percent_below_entry):
+  percent: pick from [4.0, 5.0, 6.0, 8.0, 10.0]
+    - 4-5% = tight (intraday), 6-8% = moderate (swing), 10% = wide
+
+TAKE-PROFIT (percent_above_entry):
+  Tier 1: pick from [3.0, 5.0, 7.0]
+  Tier 2: pick from [8.0, 10.0, 12.0]
+  Tier 3: pick from [15.0, 18.0, 25.0]
+
+OPENING RANGE BREAKOUT:
+  minutes: pick from [5, 10, 15, 30]
+
+TIME CONDITIONS:
+  time_after: use for waiting until consolidation (e.g. "09:45", "10:00")
+  time_before: use for intraday exit deadline (e.g. "15:30", "15:45")
+
 GUIDELINES:
-- Entry conditions should confirm momentum is real before entering (e.g., price above VWAP + volume surge + price above a key EMA).
-- Stop-loss should use "percent_below_entry" with a tight stop (5-8% for penny stocks) OR a technical level. Use "any" logic so any single stop condition triggers an exit.
+- Entry conditions should confirm momentum is real before entering. Use 2-4 conditions with "all" logic.
+- PREFERRED entry pattern: rvol_above (volume confirmation) + price_above_vwap (trend) + price_above_ema (momentum)
+- Stop-loss: use "any" logic so any single stop condition triggers an exit.
 - Take-profit should be TIERED with 3 levels to lock in gains progressively:
   - Tier 1: Conservative target, exit 33% of position
   - Tier 2: Moderate target, exit 50% of remaining position
   - Tier 3: Aggressive target, exit 100% of remaining position
-- For intraday trades, include a time-based stop (e.g., exit before 15:45 market close).
+- For intraday trades, include a time_before stop (exit before 15:45).
 - Each condition is a dict with a "type" key plus the required parameters for that type.
 
 RESPOND with a single JSON object with this exact structure:
@@ -308,7 +371,7 @@ Example response:
   "entry": {{
     "all": [
       {{"type": "price_above_vwap", "timeframe": "5m"}},
-      {{"type": "volume_above_avg", "multiplier": 2.0, "window": 20}},
+      {{"type": "rvol_above", "threshold": 2.0}},
       {{"type": "price_above_ema", "period": 9, "timeframe": "5m"}}
     ]
   }},
@@ -357,6 +420,21 @@ CURRENT EXIT CONDITIONS:
 NEW MARKET DATA / NEWS:
 {new_data}
 
+VALID CONDITION TYPES (use ONLY these exact type names and required params):
+  {{"type": "percent_below_entry", "percent": <float>}}   — stop loss: X% below entry
+  {{"type": "percent_above_entry", "percent": <float>}}   — take profit: X% above entry
+  {{"type": "price_above", "value": <float>}}             — price > specific value (value is REQUIRED)
+  {{"type": "price_below", "value": <float>}}             — price < specific value (value is REQUIRED)
+  {{"type": "price_below_vwap", "timeframe": "<1m|5m>"}} — price drops below VWAP
+  {{"type": "price_above_vwap", "timeframe": "<1m|5m>"}} — price breaks above VWAP
+  {{"type": "rsi_above", "threshold": <float>, "period": <int>, "timeframe": "<5m|15m>"}}
+  {{"type": "rsi_below", "threshold": <float>, "period": <int>, "timeframe": "<5m|15m>"}}
+  {{"type": "time_before", "time": "<HH:MM>"}}            — exit before this time (e.g. "15:45")
+  {{"type": "rvol_above", "threshold": <float>}}          — relative volume above threshold
+
+DO NOT invent condition types. "price_at_or_above" does not exist — use "price_above".
+Every condition must have ALL required params listed above.
+
 ADJUSTMENT GUIDELINES:
 - Tighten stop-loss if the stock has moved significantly in your favor (trail the stop up).
 - Widen take-profit targets if a new positive catalyst has emerged.
@@ -380,3 +458,66 @@ OPTION 2 - If no changes are needed, return exactly:
 "NO_CHANGE"
 
 Return ONLY the JSON object or the string "NO_CHANGE", no other text."""
+
+
+# Sorted list of all valid condition type names for fix prompts
+_VALID_CONDITION_TYPES = (
+    "price_above, price_below, price_above_ema, price_below_ema, "
+    "price_above_sma, price_below_sma, price_above_vwap, price_below_vwap, "
+    "opening_range_breakout, volume_above_avg, rvol_above, volume_spike, "
+    "rsi_above, rsi_below, rsi_between, macd_bullish_cross, macd_bearish_cross, "
+    "ema_cross_above, ema_cross_below, percent_above_entry, percent_below_entry, "
+    "time_after, time_before"
+)
+
+_CONDITION_PARAMS_REFERENCE = """\
+Required params per type:
+  price_above / price_below                        → value (float)
+  price_above_ema / price_below_ema                → period (int), timeframe (str)
+  price_above_sma / price_below_sma                → period (int), timeframe (str)
+  price_above_vwap / price_below_vwap              → timeframe (str)
+  opening_range_breakout                           → minutes (int)
+  volume_above_avg                                 → multiplier (float), window (int)
+  rvol_above                                       → threshold (float)
+  volume_spike                                     → multiplier (float), minutes (int)
+  rsi_above / rsi_below                            → threshold (float), period (int), timeframe (str)
+  rsi_between                                      → min (float), max (float), period (int), timeframe (str)
+  macd_bullish_cross / macd_bearish_cross          → timeframe (str)
+  ema_cross_above / ema_cross_below                → fast_period (int), slow_period (int), timeframe (str)
+  percent_above_entry / percent_below_entry        → percent (float)
+  time_after / time_before                         → time (str, "HH:MM")"""
+
+
+def build_conditions_fix_prompt(
+    previous_response: str,
+    errors: List[str],
+) -> str:
+    """
+    Build a correction prompt fed back to the LLM when generated conditions
+    fail JSON parsing or schema validation.
+
+    Args:
+        previous_response: The raw LLM output that was invalid.
+        errors: List of validation error messages from validate_condition_set().
+
+    Returns:
+        Prompt string asking the LLM to fix the specific errors.
+    """
+    errors_text = "\n".join(f"  - {e}" for e in errors)
+
+    return f"""{_SYSTEM_PREAMBLE}
+
+Your previous response contained invalid trading conditions. Fix ONLY the errors listed below and return the corrected JSON.
+
+PREVIOUS RESPONSE:
+{previous_response}
+
+VALIDATION ERRORS TO FIX:
+{errors_text}
+
+VALID CONDITION TYPE NAMES (use EXACTLY these strings, no others):
+  {_VALID_CONDITION_TYPES}
+
+{_CONDITION_PARAMS_REFERENCE}
+
+Return ONLY the corrected JSON object, no other text."""

@@ -83,6 +83,12 @@ CONDITION_TYPES: Dict[str, Dict[str, Any]] = {
         },
         "description": "Current volume is above the average volume by the given multiplier",
     },
+    "rvol_above": {
+        "params": {
+            "threshold": {"type": "float", "required": True, "description": "Minimum RVOL ratio (e.g. 2.0 means 2x normal volume for this time of day)"},
+        },
+        "description": "Relative Volume (RVOL) is above the threshold. RVOL normalizes today's cumulative volume by elapsed market time so it works correctly at any point during the trading day.",
+    },
     "volume_spike": {
         "params": {
             "multiplier": {"type": "float", "required": True, "description": "Multiplier above recent average volume"},
@@ -507,6 +513,10 @@ class ConditionEvaluator:
                         f"[{cond['multiplier']}× avg{cond['window']}d={self._fmt(avg)}])"
                     )
 
+            if ctype == "rvol_above":
+                rvol = self._get_rvol(symbol)
+                return f"{label} (rvol={self._fmt(rvol)} {'≥' if met else '<'} {cond['threshold']}x)"
+
             if ctype in ("rsi_above", "rsi_below", "rsi_between"):
                 rsi = self._get_rsi(symbol, cond["period"], cond["timeframe"])
                 if ctype == "rsi_between":
@@ -766,6 +776,56 @@ class ConditionEvaluator:
         self._indicator_cache[cache_key] = result
         return result
 
+    def _get_rvol(self, symbol: str) -> Optional[float]:
+        """
+        Compute Relative Volume (RVOL) normalized by time-of-day.
+
+        RVOL = (today_cumulative_volume / avg_daily_volume) / fraction_of_trading_day_elapsed
+
+        This ensures that at 10:00 AM (30 min into session = 7.7% of day),
+        a stock only needs ~7.7% of its average daily volume to have RVOL=1.0,
+        making it a fair comparison at any point during the trading day.
+
+        Returns None if data is unavailable.
+        """
+        cache_key = f"rvol:{symbol}"
+        if cache_key in self._indicator_cache:
+            return self._indicator_cache[cache_key]
+
+        # Get today's cumulative volume from 1-day data
+        df_daily = self._get_ohlcv(symbol, "1d", 30)
+        if df_daily is None or len(df_daily) < 2:
+            return None
+
+        today_volume = float(df_daily["volume"].iloc[-1])
+        # 20-day average daily volume (excluding today)
+        lookback = min(20, len(df_daily) - 1)
+        avg_daily_volume = float(df_daily["volume"].iloc[-(lookback + 1):-1].mean())
+
+        if avg_daily_volume <= 0:
+            return None
+
+        # Calculate fraction of trading day elapsed (6.5 hour session = 390 min)
+        tz = pytz.timezone(self.market_timezone)
+        now = datetime.now(tz)
+        market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+
+        if now <= market_open:
+            # Pre-market: use a small fraction to avoid division by near-zero
+            fraction_elapsed = 0.01
+        elif now >= market_close:
+            fraction_elapsed = 1.0
+        else:
+            elapsed_minutes = (now - market_open).total_seconds() / 60.0
+            fraction_elapsed = max(elapsed_minutes / 390.0, 0.01)
+
+        raw_rvol = today_volume / avg_daily_volume
+        rvol = raw_rvol / fraction_elapsed
+
+        self._indicator_cache[cache_key] = rvol
+        return rvol
+
     def _check_volume_spike(self, symbol: str, multiplier: float, minutes: int) -> bool:
         cache_key = f"vol_spike:{symbol}:{multiplier}:{minutes}"
         if cache_key in self._indicator_cache:
@@ -859,6 +919,12 @@ class ConditionEvaluator:
             return False
         return current_vol >= avg_vol * cond["multiplier"]
 
+    def _handle_rvol_above(self, cond: dict, symbol: str, entry_price: Optional[float]) -> bool:
+        rvol = self._get_rvol(symbol)
+        if rvol is None:
+            return False
+        return rvol >= cond["threshold"]
+
     def _handle_volume_spike(self, cond: dict, symbol: str, entry_price: Optional[float]) -> bool:
         return self._check_volume_spike(symbol, cond["multiplier"], cond["minutes"])
 
@@ -940,6 +1006,7 @@ class ConditionEvaluator:
         "price_below_vwap": _handle_price_below_vwap,
         "opening_range_breakout": _handle_opening_range_breakout,
         "volume_above_avg": _handle_volume_above_avg,
+        "rvol_above": _handle_rvol_above,
         "volume_spike": _handle_volume_spike,
         "rsi_above": _handle_rsi_above,
         "rsi_below": _handle_rsi_below,

@@ -494,7 +494,6 @@ class LiveTradesTab:
                 try:
                     current_price = current_prices.get(txn.symbol)
                     if current_price:
-                        from ...core.TransactionHelper import TransactionHelper
                         current_price_str = f"${current_price:.2f}"
                         pnl = TransactionHelper.calculate_pnl(txn, current_price)
                         if pnl:

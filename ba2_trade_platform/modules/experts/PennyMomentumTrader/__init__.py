@@ -34,6 +34,7 @@ from ....logger import get_expert_logger
 
 from .conditions import ConditionEvaluator, get_condition_types_for_llm, validate_condition_set
 from .prompts import (
+    build_conditions_fix_prompt,
     build_deep_triage_prompt,
     build_entry_conditions_prompt,
     build_exit_update_prompt,
@@ -585,6 +586,17 @@ class PennyMomentumTrader(LiveExpertInterface):
                     return
                 new_ones = filtered_new
 
+            # Strip discovered symbols not supported by the OHLCV provider
+            # (LLM/StockTwits may surface crypto, OTC, or delisted tickers)
+            if new_ones:
+                before_ohlcv = len(new_ones)
+                new_ones = self._filter_by_ohlcv_support(new_ones)
+                if len(new_ones) < before_ohlcv:
+                    self.logger.info(
+                        f"OHLCV filter: {len(new_ones)}/{before_ohlcv} discovered candidates "
+                        f"have OHLCV data and will proceed to deep triage"
+                    )
+
             # Combine survivors + filtered discovered for deep triage
             deep_triage_input = survivors + new_ones
 
@@ -992,6 +1004,47 @@ class PennyMomentumTrader(LiveExpertInterface):
         except Exception as e:
             self.logger.warning(f"Failed to load previous monitored data: {e}")
         return {}
+
+    def _filter_by_ohlcv_support(
+        self, candidates: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Filter out candidates whose symbols are not supported by the configured OHLCV provider.
+
+        This prevents LLM-discovered or StockTwits symbols (e.g. XRP.X, 401JK.X, crypto tickers)
+        that have no OHLCV data from wasting deep triage LLM calls and always failing condition
+        checks in Phase 5.
+
+        Returns the filtered list with unsupported symbols removed.
+        """
+        ohlcv_vendor_list = self.get_setting_with_interface_default(
+            "vendor_ohlcv", log_warning=False
+        )
+        ohlcv_vendor = ohlcv_vendor_list[0] if ohlcv_vendor_list else "yfinance"
+
+        from ....modules.dataproviders import get_provider
+        ohlcv_provider = get_provider("ohlcv", ohlcv_vendor)
+
+        supported = []
+        dropped = []
+        for candidate in candidates:
+            symbol = candidate.get("symbol")
+            if not symbol:
+                continue
+            try:
+                df = ohlcv_provider.get_ohlcv_data(symbol, interval="1d", lookback_days=5)
+                if df is not None and not df.empty and len(df) >= 1:
+                    supported.append(candidate)
+                else:
+                    dropped.append(symbol)
+            except Exception:
+                dropped.append(symbol)
+
+        if dropped:
+            self.logger.info(
+                f"OHLCV filter: dropped {len(dropped)} unsupported symbols: {dropped}"
+            )
+        return supported
 
     def _phase_1b_llm_discovery(
         self, screener_candidates: List[Dict[str, Any]], market_analysis: MarketAnalysis
@@ -1478,6 +1531,7 @@ class PennyMomentumTrader(LiveExpertInterface):
                 )
 
                 result["price"] = candidate.get("price")
+                result["rvol"] = candidate.get("rvol")
                 deep_triage_results[symbol] = result
                 finalists.append(
                     {
@@ -1654,6 +1708,8 @@ class PennyMomentumTrader(LiveExpertInterface):
                 symbol=symbol,
                 analysis_summary=analysis_summary,
                 condition_types_str=condition_types_str,
+                current_price=triage_data.get("price"),
+                current_rvol=triage_data.get("rvol"),
             )
 
             try:
@@ -1663,25 +1719,13 @@ class PennyMomentumTrader(LiveExpertInterface):
                     expert_instance_id=self.instance.id,
                     use_case="PennyMomentum Entry Conditions",
                 )
-                response = llm.invoke(prompt)
-                raw_text = (
-                    response.content
-                    if hasattr(response, "content")
-                    else str(response)
-                )
 
-                conditions = self._parse_json_response(raw_text, expected_type=dict)
+                conditions = self._invoke_conditions_with_retry(
+                    llm, prompt, symbol=symbol
+                )
                 if not conditions:
                     self.logger.warning(
-                        f"Failed to parse entry conditions for {symbol}"
-                    )
-                    continue
-
-                # Validate conditions
-                is_valid, errors = validate_condition_set(conditions)
-                if not is_valid:
-                    self.logger.warning(
-                        f"Invalid conditions for {symbol}: {errors}"
+                        f"Failed to generate valid entry conditions for {symbol} after retries"
                     )
                     continue
 
@@ -1706,7 +1750,7 @@ class PennyMomentumTrader(LiveExpertInterface):
                     provider_name=entry_model,
                     name=f"entry_conditions_{symbol}",
                     output_type="json",
-                    text=raw_text,
+                    text=json.dumps(conditions),
                     symbol=symbol,
                     prompt=prompt,
                 )
@@ -2039,26 +2083,64 @@ class PennyMomentumTrader(LiveExpertInterface):
                     expert_instance_id=self.instance.id,
                     use_case="PennyMomentum Exit Update",
                 )
+                # First call — check for NO_CHANGE before entering retry loop
                 response = llm.invoke(prompt)
                 raw_text = response.content if hasattr(response, "content") else str(response)
-
-                # Check for NO_CHANGE
                 if raw_text.strip().strip('"') == "NO_CHANGE":
                     self.logger.debug(f"Exit conditions unchanged for {symbol}")
                     continue
 
-                updated = self._parse_json_response(raw_text, expected_type=dict)
-                if not updated:
-                    self.logger.warning(f"Failed to parse exit update for {symbol}")
-                    continue
+                # Parse and validate with retry on failure
+                # Wrap the already-fetched response into the retry loop:
+                # attempt 0 uses raw_text, subsequent attempts call the LLM again.
+                updated = None
+                current_raw = raw_text
+                current_prompt = prompt
+                for attempt in range(3):  # up to 2 retries after first attempt
+                    parsed = self._parse_json_response(current_raw, expected_type=dict)
+                    if not parsed:
+                        errors = ["Response was not valid JSON or had unexpected structure"]
+                    else:
+                        validation_set = {
+                            k: v for k, v in {
+                                "stop_loss": parsed.get("stop_loss"),
+                                "take_profit": parsed.get("take_profit"),
+                            }.items() if v is not None
+                        }
+                        is_valid, errors = validate_condition_set(validation_set)
+                        if is_valid:
+                            updated = parsed
+                            if attempt > 0:
+                                self.logger.info(
+                                    f"Exit conditions for {symbol} fixed after {attempt + 1} attempts"
+                                )
+                            break
 
-                # Validate the updated conditions
-                validation_set = {"stop_loss": updated.get("stop_loss"), "take_profit": updated.get("take_profit")}
-                is_valid, errors = validate_condition_set(
-                    {k: v for k, v in validation_set.items() if v is not None}
-                )
-                if not is_valid:
-                    self.logger.warning(f"Invalid updated exit conditions for {symbol}: {errors}")
+                    if attempt < 2:
+                        self.logger.warning(
+                            f"[{symbol}] Exit update attempt {attempt + 1}: {errors}, retrying"
+                        )
+                        current_prompt = build_conditions_fix_prompt(current_raw, errors)
+                        try:
+                            retry_response = llm.invoke(current_prompt)
+                            current_raw = (
+                                retry_response.content
+                                if hasattr(retry_response, "content")
+                                else str(retry_response)
+                            )
+                            # If the retry says NO_CHANGE, accept it
+                            if current_raw.strip().strip('"') == "NO_CHANGE":
+                                self.logger.debug(f"Exit conditions unchanged for {symbol} after retry")
+                                break
+                        except Exception as e:
+                            self.logger.warning(f"[{symbol}] Exit update retry LLM call failed: {e}")
+                            break
+                    else:
+                        self.logger.warning(
+                            f"[{symbol}] All exit update attempts produced invalid conditions: {errors}"
+                        )
+
+                if not updated:
                     continue
 
                 # Apply updates
@@ -2077,7 +2159,7 @@ class PennyMomentumTrader(LiveExpertInterface):
                     provider_name=exit_model,
                     name=f"exit_update_{symbol}_{datetime.now(timezone.utc).strftime('%H%M')}",
                     output_type="json",
-                    text=raw_text,
+                    text=json.dumps(updated),
                     symbol=symbol,
                     prompt=prompt,
                 )
@@ -2567,6 +2649,72 @@ class PennyMomentumTrader(LiveExpertInterface):
             self.logger.warning(f"Failed to parse JSON response: {e}")
             self.logger.debug(f"Raw response: {raw_text[:500]}")
             return None
+
+    def _invoke_conditions_with_retry(
+        self,
+        llm,
+        initial_prompt: str,
+        symbol: str = "",
+        max_retries: int = 2,
+    ) -> Optional[dict]:
+        """
+        Invoke an LLM to generate a condition set, retrying with targeted error
+        feedback when the response fails JSON parsing or schema validation.
+
+        On each failure the validation errors are fed back to the LLM via
+        build_conditions_fix_prompt() so it can correct only the broken parts
+        rather than regenerating from scratch.
+
+        Args:
+            llm: LangChain-compatible LLM instance.
+            initial_prompt: The full prompt to use on the first attempt.
+            symbol: Ticker symbol (used in log messages only).
+            max_retries: How many correction attempts to make after the first
+                         failure (default 2, so up to 3 total LLM calls).
+
+        Returns:
+            Validated conditions dict, or None if all attempts fail.
+        """
+        prompt = initial_prompt
+        for attempt in range(max_retries + 1):
+            try:
+                response = llm.invoke(prompt)
+                raw_text = response.content if hasattr(response, "content") else str(response)
+            except Exception as e:
+                self.logger.warning(f"[{symbol}] Attempt {attempt + 1}: LLM call failed: {e}")
+                return None
+
+            conditions = self._parse_json_response(raw_text, expected_type=dict)
+            if not conditions:
+                errors = ["Response was not valid JSON or had unexpected structure"]
+                if attempt < max_retries:
+                    self.logger.warning(
+                        f"[{symbol}] Attempt {attempt + 1}: JSON parse failed, retrying with fix prompt"
+                    )
+                    prompt = build_conditions_fix_prompt(raw_text, errors)
+                    continue
+                self.logger.warning(f"[{symbol}] All {max_retries + 1} attempts failed to produce valid JSON")
+                return None
+
+            is_valid, errors = validate_condition_set(conditions)
+            if is_valid:
+                if attempt > 0:
+                    self.logger.info(f"[{symbol}] Conditions fixed after {attempt + 1} attempts")
+                return conditions
+
+            if attempt < max_retries:
+                self.logger.warning(
+                    f"[{symbol}] Attempt {attempt + 1}: invalid conditions {errors}, retrying with fix prompt"
+                )
+                prompt = build_conditions_fix_prompt(raw_text, errors)
+            else:
+                self.logger.warning(
+                    f"[{symbol}] All {max_retries + 1} attempts produced invalid conditions. "
+                    f"Last errors: {errors}"
+                )
+                return None
+
+        return None
 
     # ------------------------------------------------------------------
     # Data gathering helpers

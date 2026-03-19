@@ -699,6 +699,75 @@ class TestVolumeConditions:
         assert result is True
 
 
+class TestRVOLConditions:
+    """Tests for the rvol_above condition type."""
+
+    def test_rvol_above_true(self):
+        """RVOL should be high when today's volume is much larger than average."""
+        # 20 historical days with 1000 volume each, today has 5000
+        volumes = [1000] * 20 + [5000]
+        df = _make_ohlcv_df([10.0] * 21, volumes=volumes)
+        provider = MockOHLCVProvider()
+        provider.set_default(df)
+        ev = ConditionEvaluator(provider)
+
+        # Mock datetime to be mid-session (12:30 ET = 3 hours in = ~46% of day)
+        with patch("ba2_trade_platform.modules.experts.PennyMomentumTrader.conditions.datetime") as mock_dt:
+            import pytz
+            et = pytz.timezone("US/Eastern")
+            mock_now = et.localize(datetime(2026, 3, 19, 12, 30, 0))
+            mock_dt.now.return_value = mock_now
+            mock_dt.side_effect = lambda *args, **kw: datetime(*args, **kw)
+
+            result = ev.evaluate_single(
+                {"type": "rvol_above", "threshold": 2.0}, "X"
+            )
+            # raw_rvol = 5000/1000 = 5.0, fraction ~= 180/390 ~= 0.46
+            # rvol = 5.0 / 0.46 ~= 10.8 >> 2.0
+            assert result is True
+
+    def test_rvol_above_false(self):
+        """RVOL should be low when today's volume is below average."""
+        # 20 historical days with 1000 volume each, today has only 200
+        volumes = [1000] * 20 + [200]
+        df = _make_ohlcv_df([10.0] * 21, volumes=volumes)
+        provider = MockOHLCVProvider()
+        provider.set_default(df)
+        ev = ConditionEvaluator(provider)
+
+        with patch("ba2_trade_platform.modules.experts.PennyMomentumTrader.conditions.datetime") as mock_dt:
+            import pytz
+            et = pytz.timezone("US/Eastern")
+            mock_now = et.localize(datetime(2026, 3, 19, 12, 30, 0))
+            mock_dt.now.return_value = mock_now
+            mock_dt.side_effect = lambda *args, **kw: datetime(*args, **kw)
+
+            result = ev.evaluate_single(
+                {"type": "rvol_above", "threshold": 2.0}, "X"
+            )
+            # raw_rvol = 200/1000 = 0.2, fraction ~= 0.46
+            # rvol = 0.2 / 0.46 ~= 0.43 < 2.0
+            assert result is False
+
+    def test_rvol_above_no_data(self):
+        """RVOL should return False when no data is available."""
+        provider = MockOHLCVProvider()  # no data
+        ev = ConditionEvaluator(provider)
+        result = ev.evaluate_single(
+            {"type": "rvol_above", "threshold": 1.5}, "X"
+        )
+        assert result is False
+
+    def test_rvol_validation(self):
+        """rvol_above should validate correctly."""
+        valid, msg = validate_condition({"type": "rvol_above", "threshold": 2.0})
+        assert valid is True
+
+        valid, msg = validate_condition({"type": "rvol_above"})
+        assert valid is False
+        assert "threshold" in msg
+
+
 class TestOpeningRangeBreakout:
     def test_breakout_true(self):
         # First 5 bars high = 10.5, current price = 15.0
