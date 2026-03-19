@@ -1,8 +1,244 @@
 {
-  "timestamp": "2026-01-29T15:46:20.645892",
+  "timestamp": "2026-03-18T16:59:16.570197",
   "providers": {
-    "moonshot": {
-      "display_name": "Moonshot",
+    "openai": {
+      "display_name": "OpenAI",
+      "api_key_configured": true,
+      "total_models": 1,
+      "inference_passed": 1,
+      "inference_failed": 0,
+      "tool_call_passed": 0,
+      "tool_call_failed": 0,
+      "websearch_passed": 1,
+      "websearch_failed": 0,
+      "reasoning_passed": 4,
+      "reasoning_failed": 0,
+      "results": [
+        {
+          "model": "gpt5.2",
+          "provider": "openai",
+          "provider_model_name": "gpt-5.2",
+          "test_type": "inference",
+          "success": true,
+          "response": "4",
+          "error": "",
+          "duration_ms": 2000.7009506225586,
+          "labels": [
+            "high_cost",
+            "thinking",
+            "websearch",
+            "tool_calling"
+          ]
+        },
+        {
+          "model": "gpt5.2",
+          "provider": "openai",
+          "provider_model_name": "gpt-5.2",
+          "test_type": "websearch",
+          "success": true,
+          "response": "Today\u2019s date is **Wednesday, March 18, 2026**.",
+          "error": "",
+          "duration_ms": 1774.2910385131836,
+          "labels": [
+            "high_cost",
+            "thinking",
+            "websearch",
+            "tool_calling"
+          ]
+        },
+        {
+          "model": "gpt5.2",
+          "provider": "openai",
+          "provider_model_name": "gpt-5.2",
+          "test_type": "reasoning_none",
+          "success": true,
+          "response": "[{'type': 'text', 'text': '12', 'index': 0, 'id': 'msg_0303e5a87ab33c7c0069bacbcc60ec819596468ae52c3",
+          "error": "",
+          "duration_ms": 693.0027008056641,
+          "labels": [
+            "high_cost",
+            "thinking",
+            "websearch",
+            "tool_calling"
+          ]
+        },
+        {
+          "model": "gpt5.2",
+          "provider": "openai",
+          "provider_model_name": "gpt-5.2",
+          "test_type": "reasoning_low",
+          "success": true,
+          "response": "[{'type': 'text', 'text': '12', 'index': 0, 'id': 'msg_07b7a2ea4f6ac0500069bacbcd0b988199adc32b92606",
+          "error": "",
+          "duration_ms": 672.1203327178955,
+          "labels": [
+            "high_cost",
+            "thinking",
+            "websearch",
+            "tool_calling"
+          ]
+        },
+        {
+          "model": "gpt5.2",
+          "provider": "openai",
+          "provider_model_name": "gpt-5.2",
+          "test_type": "reasoning_medium",
+          "success": true,
+          "response": "[{'type': 'text', 'text': '12', 'index': 0, 'id': 'msg_05e84f930bdf9fb00069bacbcdc5fc8199b164a537a0a",
+          "error": "",
+          "duration_ms": 791.6221618652344,
+          "labels": [
+            "high_cost",
+            "thinking",
+            "websearch",
+            "tool_calling"
+          ]
+        },
+        {
+          "model": "gpt5.2",
+          "provider": "openai",
+          "provider_model_name": "gpt-5.2",
+          "test_type": "reasoning_high",
+          "success": true,
+          "response": "[{'type': 'text', 'text': '12', 'index': 0, 'id': 'msg_0a04f9ce1b0ba6650069bacbce92a481999296ae9c002",
+          "error": "",
+          "duration_ms": 774.6767997741699,
+          "labels": [
+            "high_cost",
+            "thinking",
+            "websearch",
+            "tool_calling"
+          ]
+        }
+      ]
+    },
+    "nagaai": {
+      "display_name": "NagaAI",
+      "api_key_configured": true,
+      "total_models": 1,
+      "inference_passed": 1,
+      "inference_failed": 0,
+      "tool_call_passed": 0,
+      "tool_call_failed": 0,
+      "websearch_passed": 1,
+      "websearch_failed": 0,
+      "reasoning_passed": 4,
+      "reasoning_failed": 0,
+      "results": [
+        {
+          "model": "gpt5.2",
+          "provider": "nagaai",
+          "provider_model_name": "gpt-5.2-2025-12-11",
+          "test_type": "inference",
+          "success": true,
+          "response": "4",
+          "error": "",
+          "duration_ms": 1182.2912693023682,
+          "labels": [
+            "high_cost",
+            "thinking",
+            "websearch",
+            "tool_calling"
+          ]
+        },
+        {
+          "model": "gpt5.2",
+          "provider": "nagaai",
+          "provider_model_name": "gpt-5.2-2025-12-11",
+          "test_type": "websearch",
+          "success": true,
+          "response": "Today is **Wednesday, March 18, 2026**.",
+          "error": "",
+          "duration_ms": 1455.3885459899902,
+          "labels": [
+            "high_cost",
+            "thinking",
+            "websearch",
+            "tool_calling"
+          ]
+        },
+        {
+          "model": "gpt5.2",
+          "provider": "nagaai",
+          "provider_model_name": "gpt-5.2-2025-12-11",
+          "test_type": "reasoning_none",
+          "success": true,
+          "response": "[{'type': 'text', 'text': '12', 'index': 0, 'id': 'msg_bPh8kmFeVSDhNlPJ58Qw78CgRYd9'}]",
+          "error": "",
+          "duration_ms": 749.8800754547119,
+          "labels": [
+            "high_cost",
+            "thinking",
+            "websearch",
+            "tool_calling"
+          ]
+        },
+        {
+          "model": "gpt5.2",
+          "provider": "nagaai",
+          "provider_model_name": "gpt-5.2-2025-12-11",
+          "test_type": "reasoning_low",
+          "success": true,
+          "response": "[{'type': 'text', 'text': '12', 'index': 0, 'id': 'msg_THxHYWEfMh3SN1mDNPHmvUvu1ZoX'}]",
+          "error": "",
+          "duration_ms": 849.38645362854,
+          "labels": [
+            "high_cost",
+            "thinking",
+            "websearch",
+            "tool_calling"
+          ]
+        },
+        {
+          "model": "gpt5.2",
+          "provider": "nagaai",
+          "provider_model_name": "gpt-5.2-2025-12-11",
+          "test_type": "reasoning_medium",
+          "success": true,
+          "response": "[{'type': 'text', 'text': '12', 'index': 0, 'id': 'msg_4UDud2TvW6xEKcz5mKqAbOfqGXfv'}]",
+          "error": "",
+          "duration_ms": 857.2535514831543,
+          "labels": [
+            "high_cost",
+            "thinking",
+            "websearch",
+            "tool_calling"
+          ]
+        },
+        {
+          "model": "gpt5.2",
+          "provider": "nagaai",
+          "provider_model_name": "gpt-5.2-2025-12-11",
+          "test_type": "reasoning_high",
+          "success": true,
+          "response": "[{'type': 'text', 'text': '12', 'index': 0, 'id': 'msg_bbul1fsi8rcRG5bV0kQOHQ2pAQtn'}]",
+          "error": "",
+          "duration_ms": 801.7559051513672,
+          "labels": [
+            "high_cost",
+            "thinking",
+            "websearch",
+            "tool_calling"
+          ]
+        }
+      ]
+    },
+    "google": {
+      "display_name": "Google",
+      "api_key_configured": true,
+      "total_models": 0,
+      "inference_passed": 0,
+      "inference_failed": 0,
+      "tool_call_passed": 0,
+      "tool_call_failed": 0,
+      "websearch_passed": 0,
+      "websearch_failed": 0,
+      "reasoning_passed": 0,
+      "reasoning_failed": 0,
+      "results": []
+    },
+    "anthropic": {
+      "display_name": "Anthropic",
       "api_key_configured": false,
       "total_models": 0,
       "inference_passed": 0,
@@ -11,6 +247,78 @@
       "tool_call_failed": 0,
       "websearch_passed": 0,
       "websearch_failed": 0,
+      "reasoning_passed": 0,
+      "reasoning_failed": 0,
+      "results": []
+    },
+    "openrouter": {
+      "display_name": "OpenRouter",
+      "api_key_configured": false,
+      "total_models": 0,
+      "inference_passed": 0,
+      "inference_failed": 0,
+      "tool_call_passed": 0,
+      "tool_call_failed": 0,
+      "websearch_passed": 0,
+      "websearch_failed": 0,
+      "reasoning_passed": 0,
+      "reasoning_failed": 0,
+      "results": []
+    },
+    "xai": {
+      "display_name": "xAI",
+      "api_key_configured": true,
+      "total_models": 0,
+      "inference_passed": 0,
+      "inference_failed": 0,
+      "tool_call_passed": 0,
+      "tool_call_failed": 0,
+      "websearch_passed": 0,
+      "websearch_failed": 0,
+      "reasoning_passed": 0,
+      "reasoning_failed": 0,
+      "results": []
+    },
+    "moonshot": {
+      "display_name": "Moonshot",
+      "api_key_configured": true,
+      "total_models": 0,
+      "inference_passed": 0,
+      "inference_failed": 0,
+      "tool_call_passed": 0,
+      "tool_call_failed": 0,
+      "websearch_passed": 0,
+      "websearch_failed": 0,
+      "reasoning_passed": 0,
+      "reasoning_failed": 0,
+      "results": []
+    },
+    "deepseek": {
+      "display_name": "DeepSeek",
+      "api_key_configured": true,
+      "total_models": 0,
+      "inference_passed": 0,
+      "inference_failed": 0,
+      "tool_call_passed": 0,
+      "tool_call_failed": 0,
+      "websearch_passed": 0,
+      "websearch_failed": 0,
+      "reasoning_passed": 0,
+      "reasoning_failed": 0,
+      "results": []
+    },
+    "bedrock": {
+      "display_name": "AWS Bedrock",
+      "api_key_configured": false,
+      "total_models": 0,
+      "inference_passed": 0,
+      "inference_failed": 0,
+      "tool_call_passed": 0,
+      "tool_call_failed": 0,
+      "websearch_passed": 0,
+      "websearch_failed": 0,
+      "reasoning_passed": 0,
+      "reasoning_failed": 0,
       "results": []
     }
   }
