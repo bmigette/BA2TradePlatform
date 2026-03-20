@@ -2001,14 +2001,41 @@ class PennyMomentumTrader(LiveExpertInterface):
                                     info["status"] = "closed"
                                 break
 
-                        # Update condition status for UI
-                        entry_conds = info.get("entry_conditions", {})
-                        if entry_conds:
-                            info["conditions_last_eval"] = (
-                                evaluator.get_condition_status(
-                                    entry_conds, symbol, entry_price
+                        # Debug log and update condition status for UI (exit conditions)
+                        exit_cond_status = {}
+                        if stop_loss:
+                            sl_details = evaluator.get_condition_details(stop_loss, symbol, entry_price)
+                            sl_status = evaluator.get_condition_status(stop_loss, symbol, entry_price)
+                            for k, v in sl_status.items():
+                                exit_cond_status[f"SL:{k}"] = v
+                            if monitor_tick % 10 == 1:
+                                sl_met = [v for k, v in sl_details.items() if sl_status.get(k)]
+                                sl_unmet = [v for k, v in sl_details.items() if not sl_status.get(k)]
+                                self.logger.debug(
+                                    f"{symbol} EXIT conditions (entry=${entry_price:.4f})\n"
+                                    f"  STOP_LOSS MET:   {sl_met}\n"
+                                    f"  STOP_LOSS UNMET: {sl_unmet}"
                                 )
-                            )
+                        for tier_idx, tp_tier in enumerate(take_profit):
+                            if not isinstance(tp_tier, dict):
+                                continue
+                            tp_condition = tp_tier.get("condition")
+                            if not tp_condition:
+                                continue
+                            tp_exit_pct = tp_tier.get("exit_pct", 100.0)
+                            already_triggered = tier_idx in triggered_tiers
+                            tp_details = evaluator.get_condition_details(tp_condition, symbol, entry_price)
+                            tp_status = evaluator.get_condition_status(tp_condition, symbol, entry_price)
+                            for k, v in tp_status.items():
+                                exit_cond_status[f"TP{tier_idx + 1}:{k}"] = v
+                            if monitor_tick % 10 == 1:
+                                prefix = "✓ " if already_triggered else ""
+                                tp_met = [v for k, v in tp_details.items() if tp_status.get(k)]
+                                tp_unmet = [v for k, v in tp_details.items() if not tp_status.get(k)]
+                                self.logger.debug(
+                                    f"  TP{tier_idx + 1} ({tp_exit_pct}%){prefix} MET: {tp_met} | UNMET: {tp_unmet}"
+                                )
+                        info["conditions_last_eval"] = exit_cond_status
 
                     elif status == "watching":
                         # Check entry conditions for watched symbols
