@@ -382,6 +382,32 @@ class PennyMomentumTrader(LiveExpertInterface):
                     "Set to 0 to use the start_time setting instead."
                 ),
             },
+            # Entry execution
+            "entry_rvol_decay_threshold": {
+                "type": "float",
+                "required": False,
+                "default": 0.30,
+                "description": "Minimum RVOL ratio (vs peak RVOL) required at entry trigger",
+                "tooltip": (
+                    "Guards against entering after momentum has already faded. "
+                    "At entry trigger time, current RVOL must be at least this fraction of the "
+                    "highest RVOL seen for that symbol during monitoring. "
+                    "0.30 = current RVOL must be ≥ 30% of peak. "
+                    "Set to 0.0 to disable the guard."
+                ),
+            },
+            "entry_limit_slippage_pct": {
+                "type": "float",
+                "required": False,
+                "default": 1.0,
+                "description": "Max slippage % above current price for limit buy orders",
+                "tooltip": (
+                    "Entry orders are placed as limit orders at current_price × (1 + slippage_pct / 100). "
+                    "Prevents filling at a severely inflated price during a fast-moving spike. "
+                    "1.0 = limit 1% above the current quote. "
+                    "Set to 0.0 to use market orders instead."
+                ),
+            },
         }
 
     # ------------------------------------------------------------------
@@ -2038,6 +2064,13 @@ class PennyMomentumTrader(LiveExpertInterface):
                         info["conditions_last_eval"] = exit_cond_status
 
                     elif status == "watching":
+                        # Track peak RVOL observed for this symbol (for decay guard)
+                        current_rvol = evaluator._get_rvol(symbol)
+                        if current_rvol is not None:
+                            prev_peak = info.get("peak_rvol")
+                            if prev_peak is None or current_rvol > prev_peak:
+                                info["peak_rvol"] = current_rvol
+
                         # Check entry conditions for watched symbols
                         entry_conds = info.get("entry_conditions", {})
                         if not entry_conds:
@@ -2057,26 +2090,52 @@ class PennyMomentumTrader(LiveExpertInterface):
                                 )
                             # Use evaluate() to respect all/any composite logic
                             if evaluator.evaluate(entry_conds, symbol):
-                                self.logger.info(f"Entry conditions met for {symbol}")
-                                qty = info.get("qty", 0)
-                                if qty and qty > 0:
-                                    order_id = trade_mgr.execute_entry(
-                                        symbol=symbol,
-                                        qty=qty,
-                                        confidence=info.get("confidence", 50),
-                                        catalyst=info.get("catalyst", ""),
-                                        strategy=info.get("strategy", "swing"),
-                                        exit_conditions=info.get("exit_conditions"),
-                                        market_analysis_id=market_analysis.id,
+                                # RVOL decay guard: skip if momentum has faded
+                                rvol_decay_threshold = float(
+                                    self.get_setting_with_interface_default(
+                                        "entry_rvol_decay_threshold", log_warning=False
                                     )
-                                    if order_id:
-                                        info["status"] = "triggered"
-                                        self._record_trade(
-                                            market_analysis,
-                                            symbol,
-                                            "entry",
-                                            info.get("catalyst", ""),
+                                )
+                                peak_rvol = info.get("peak_rvol")
+                                rvol_decayed = (
+                                    rvol_decay_threshold > 0
+                                    and peak_rvol is not None
+                                    and current_rvol is not None
+                                    and current_rvol < peak_rvol * rvol_decay_threshold
+                                )
+                                if rvol_decayed:
+                                    self.logger.info(
+                                        f"Entry skipped for {symbol}: RVOL decay "
+                                        f"(current={current_rvol:.1f}x, peak={peak_rvol:.1f}x, "
+                                        f"threshold={rvol_decay_threshold:.0%})"
+                                    )
+                                else:
+                                    self.logger.info(f"Entry conditions met for {symbol}")
+                                    slippage_pct = float(
+                                        self.get_setting_with_interface_default(
+                                            "entry_limit_slippage_pct", log_warning=False
                                         )
+                                    )
+                                    qty = info.get("qty", 0)
+                                    if qty and qty > 0:
+                                        order_id = trade_mgr.execute_entry(
+                                            symbol=symbol,
+                                            qty=qty,
+                                            confidence=info.get("confidence", 50),
+                                            catalyst=info.get("catalyst", ""),
+                                            strategy=info.get("strategy", "swing"),
+                                            exit_conditions=info.get("exit_conditions"),
+                                            market_analysis_id=market_analysis.id,
+                                            limit_slippage_pct=slippage_pct,
+                                        )
+                                        if order_id:
+                                            info["status"] = "triggered"
+                                            self._record_trade(
+                                                market_analysis,
+                                                symbol,
+                                                "entry",
+                                                info.get("catalyst", ""),
+                                            )
 
                 except Exception as e:
                     self.logger.error(

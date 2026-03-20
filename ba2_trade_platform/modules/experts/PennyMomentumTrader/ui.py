@@ -711,13 +711,13 @@ class PennyMomentumTraderUI:
                                 elif parsed is not None:
                                     # Regular JSON pretty display
                                     formatted = json.dumps(parsed, indent=2, default=str)
-                                    with ui.scroll_area().classes('w-full').style('max-height: 400px;'):
+                                    with ui.scroll_area().classes('w-full').style('min-height: 50vh; max-height: 80vh;'):
                                         with ui.element('pre').classes(
                                             'whitespace-pre-wrap text-xs p-3 rounded font-mono overflow-x-auto'
                                         ).style('background-color: var(--q-dark-page, #1d1d1d); color: #e0e0e0;'):
                                             ui.label(formatted).style('color: #e0e0e0;')
                                 else:
-                                    with ui.scroll_area().classes('w-full').style('max-height: 400px;'):
+                                    with ui.scroll_area().classes('w-full').style('min-height: 50vh; max-height: 80vh;'):
                                         ui.markdown(item.text).classes('text-sm')
                             else:
                                 ui.label('No text content').classes('text-grey-6 text-sm')
@@ -731,7 +731,7 @@ class PennyMomentumTraderUI:
         prompt_text = data.get('prompt', '')
         response_text = data.get('response', '')
 
-        with ui.scroll_area().classes('w-full').style('max-height: 600px;'):
+        with ui.scroll_area().classes('w-full').style('min-height: 50vh; max-height: 80vh;'):
             with ui.column().classes('w-full gap-3 p-2'):
                 # Prompt bubble (user/system side - left aligned)
                 with ui.row().classes('w-full justify-start'):

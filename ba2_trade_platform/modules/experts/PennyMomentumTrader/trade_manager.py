@@ -93,6 +93,7 @@ class PennyTradeManager:
         strategy: str,
         exit_conditions: Optional[dict] = None,
         market_analysis_id: Optional[int] = None,
+        limit_slippage_pct: float = 1.0,
     ) -> Optional[int]:
         """
         Execute a buy entry for *symbol*.
@@ -158,12 +159,20 @@ class PennyTradeManager:
         rec_id = add_instance(rec)
 
         # --- TradingOrder (submit_order handles persistence + broker call) ---
+        if limit_slippage_pct > 0:
+            order_type = OrderType.BUY_LIMIT
+            limit_price = round(current_price * (1 + limit_slippage_pct / 100.0), 4)
+        else:
+            order_type = OrderType.MARKET
+            limit_price = None
+
         order = TradingOrder(
             account_id=self.account_id,
             symbol=symbol,
             quantity=clamped_qty,
             side=OrderDirection.BUY,
-            order_type=OrderType.MARKET,
+            order_type=order_type,
+            limit_price=limit_price,
             status=OrderStatus.PENDING,
             open_type=OrderOpenType.AUTOMATIC,
             comment=f"PennyMomentum entry: {catalyst}",
@@ -173,9 +182,10 @@ class PennyTradeManager:
         try:
             submitted = self.account.submit_order(order)
             if submitted and submitted.id:
+                order_type_label = f"LIMIT@${limit_price:.4f}" if limit_price else "MARKET"
                 logger.info(
                     f"PennyTradeManager: entry order {submitted.id} placed for "
-                    f"{symbol} x{clamped_qty}"
+                    f"{symbol} x{clamped_qty} ({order_type_label})"
                 )
                 from ba2_trade_platform.core.db import log_activity
                 from ba2_trade_platform.core.types import ActivityLogSeverity, ActivityLogType
@@ -184,7 +194,7 @@ class PennyTradeManager:
                     activity_type=ActivityLogType.ORDER_SUBMITTED,
                     description=(
                         f"PennyMomentumTrader entry order placed: BUY {symbol} "
-                        f"x{clamped_qty} @ ~${current_price:.2f} "
+                        f"x{clamped_qty} {order_type_label} (quote=${current_price:.2f}) "
                         f"| Catalyst: {catalyst}"
                     ),
                     data={
