@@ -93,7 +93,7 @@ class PennyTradeManager:
         strategy: str,
         exit_conditions: Optional[dict] = None,
         market_analysis_id: Optional[int] = None,
-        limit_slippage_pct: float = 1.0,
+        limit_slippage_pct: float = 3.0,
     ) -> Optional[int]:
         """
         Execute a buy entry for *symbol*.

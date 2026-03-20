@@ -399,12 +399,12 @@ class PennyMomentumTrader(LiveExpertInterface):
             "entry_limit_slippage_pct": {
                 "type": "float",
                 "required": False,
-                "default": 1.0,
+                "default": 3.0,
                 "description": "Max slippage % above current price for limit buy orders",
                 "tooltip": (
                     "Entry orders are placed as limit orders at current_price × (1 + slippage_pct / 100). "
                     "Prevents filling at a severely inflated price during a fast-moving spike. "
-                    "1.0 = limit 1% above the current quote. "
+                    "3.0 = limit 3% above the current quote. "
                     "Set to 0.0 to use market orders instead."
                 ),
             },
