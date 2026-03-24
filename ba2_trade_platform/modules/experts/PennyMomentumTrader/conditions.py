@@ -778,13 +778,14 @@ class ConditionEvaluator:
 
     def _get_rvol(self, symbol: str) -> Optional[float]:
         """
-        Compute Relative Volume (RVOL) normalized by time-of-day.
+        Compute Relative Volume (RVOL) using 30-minute bars.
 
-        RVOL = (today_cumulative_volume / avg_daily_volume) / fraction_of_trading_day_elapsed
+        RVOL = current_30m_bar_volume / avg_30m_bar_volume_at_same_time_slot
 
-        This ensures that at 10:00 AM (30 min into session = 7.7% of day),
-        a stock only needs ~7.7% of its average daily volume to have RVOL=1.0,
-        making it a fair comparison at any point during the trading day.
+        Compares the most recent 30-minute bar's volume against the historical
+        average for that same time slot across the last 20 trading days. This
+        approach works correctly at any time of day including pre-market, and
+        avoids the fraction_elapsed amplification issue of the daily method.
 
         Returns None if data is unavailable.
         """
@@ -792,37 +793,52 @@ class ConditionEvaluator:
         if cache_key in self._indicator_cache:
             return self._indicator_cache[cache_key]
 
-        # Get today's cumulative volume from 1-day data
-        df_daily = self._get_ohlcv(symbol, "1d", 30)
-        if df_daily is None or len(df_daily) < 2:
+        df = self._get_ohlcv(symbol, "30m", 30)
+        if df is None or df.empty:
             return None
 
-        today_volume = float(df_daily["volume"].iloc[-1])
-        # 20-day average daily volume (excluding today)
-        lookback = min(20, len(df_daily) - 1)
-        avg_daily_volume = float(df_daily["volume"].iloc[-(lookback + 1):-1].mean())
-
-        if avg_daily_volume <= 0:
-            return None
-
-        # Calculate fraction of trading day elapsed (6.5 hour session = 390 min)
+        # Ensure datetime index in market timezone
         tz = pytz.timezone(self.market_timezone)
-        now = datetime.now(tz)
-        market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
-        market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
-
-        if now <= market_open:
-            # Pre-market: use a small fraction to avoid division by near-zero
-            fraction_elapsed = 0.01
-        elif now >= market_close:
-            fraction_elapsed = 1.0
+        idx = df.index
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC").tz_convert(tz)
         else:
-            elapsed_minutes = (now - market_open).total_seconds() / 60.0
-            fraction_elapsed = max(elapsed_minutes / 390.0, 0.01)
+            idx = idx.tz_convert(tz)
+        df = df.copy()
+        df.index = idx
 
-        raw_rvol = today_volume / avg_daily_volume
-        rvol = raw_rvol / fraction_elapsed
+        if len(df) < 2:
+            return None
 
+        # Current bar: most recent completed or in-progress 30m bar
+        current_bar = df.iloc[-1]
+        current_vol = float(current_bar["volume"])
+        current_time = df.index[-1]
+
+        # Time slot = (hour, minute) of the bar open
+        slot_hour = current_time.hour
+        slot_minute = current_time.minute
+
+        # Historical bars at the same time slot (excluding today's bar)
+        today_date = current_time.date()
+        historical = df.iloc[:-1]
+        same_slot = historical[
+            (historical.index.hour == slot_hour)
+            & (historical.index.minute == slot_minute)
+            & (historical.index.date != today_date)
+        ]
+
+        if len(same_slot) < 1:
+            # No history at all for this slot — fall back to None
+            self._indicator_cache[cache_key] = None
+            return None
+
+        avg_slot_vol = float(same_slot["volume"].mean())
+        if avg_slot_vol <= 0:
+            self._indicator_cache[cache_key] = None
+            return None
+
+        rvol = current_vol / avg_slot_vol
         self._indicator_cache[cache_key] = rvol
         return rvol
 
