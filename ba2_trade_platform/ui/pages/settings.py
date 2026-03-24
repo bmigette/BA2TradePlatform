@@ -1692,13 +1692,12 @@ class ExpertSettingsTab:
                             )
                             ui.label('Allows the expert to automatically modify or close existing positions').classes('text-body2 text-grey-7 ml-6')
                         
-                        # Risk manager section - hidden for experts that manage their own risk
-                        with ui.column().classes('w-full') as self.risk_manager_section:
+                        # Position sizing section - always visible for all experts
+                        with ui.column().classes('w-full'):
                             ui.separator().classes('my-4')
 
-                            # Risk Management settings
-                            ui.label('Risk Management:').classes('text-subtitle2 mb-2')
-                            ui.label('Configure risk management parameters for this expert:').classes('text-body2 mb-2')
+                            ui.label('Position Sizing:').classes('text-subtitle2 mb-2')
+                            ui.label('Configure position sizing parameters for this expert:').classes('text-body2 mb-2')
 
                             with ui.column().classes('w-full gap-2'):
                                 # Max Virtual Equity Per Instrument
@@ -1721,6 +1720,8 @@ class ExpertSettingsTab:
                                     ui.label('%').classes('text-sm')
                                 ui.label('Minimum available balance percentage required to enter new market positions. Lower values (5-10%) allow more aggressive trading, higher values (15-25%) provide more conservative risk management.').classes('text-body2 text-grey-7 ml-2')
 
+                        # Risk manager section - hidden for experts that manage their own risk
+                        with ui.column().classes('w-full') as self.risk_manager_section:
                             ui.separator().classes('my-4')
 
                             # AI Model Settings
