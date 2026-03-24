@@ -197,22 +197,25 @@ class AccountInterface(ReadOnlyAccountInterface):
         Raises:
             ValueError: If order requirements are not met
         """
-        # Check if order type is market
-        is_market_order = (hasattr(trading_order, 'order_type') and 
-                          trading_order.order_type == OrderType.MARKET)
-        
+        # Entry order types that can auto-create a transaction (opening a new position)
+        entry_order_types = {OrderType.MARKET, OrderType.BUY_LIMIT, OrderType.SELL_LIMIT,
+                             OrderType.BUY_STOP, OrderType.SELL_STOP,
+                             OrderType.BUY_STOP_LIMIT, OrderType.SELL_STOP_LIMIT}
+        is_entry_order = (hasattr(trading_order, 'order_type') and
+                          trading_order.order_type in entry_order_types)
+
         # Check if transaction_id is provided
-        has_transaction = (hasattr(trading_order, 'transaction_id') and 
+        has_transaction = (hasattr(trading_order, 'transaction_id') and
                           trading_order.transaction_id is not None)
-        
-        if is_market_order and not has_transaction:
-            # Automatically create Transaction for market orders without transaction_id
+
+        if is_entry_order and not has_transaction:
+            # Automatically create Transaction for entry orders without transaction_id
             self._create_transaction_for_order(trading_order)
-            logger.info(f"Automatically created transaction {trading_order.transaction_id} for market order")
-            
-        elif not is_market_order and not has_transaction:
-            # All non-market orders must have an existing transaction
-            raise ValueError(f"Non-market orders ({trading_order.order_type.value if trading_order.order_type else 'unknown'}) must be attached to an existing transaction. No transaction_id provided.")
+            logger.info(f"Automatically created transaction {trading_order.transaction_id} for {trading_order.order_type.value} order")
+
+        elif not is_entry_order and not has_transaction:
+            # Exit/close orders must be attached to an existing transaction
+            raise ValueError(f"Non-entry orders ({trading_order.order_type.value if trading_order.order_type else 'unknown'}) must be attached to an existing transaction. No transaction_id provided.")
         
         elif has_transaction:
             # Validate that the transaction exists
