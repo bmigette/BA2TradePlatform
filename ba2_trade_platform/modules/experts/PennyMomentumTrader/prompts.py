@@ -281,6 +281,9 @@ def build_entry_conditions_prompt(
     market_context_lines = []
     if current_price is not None:
         market_context_lines.append(f"Current price: ${current_price:.4f}")
+        pcts = [5, 10, 15, 25, 50, 100]
+        levels = "  |  ".join(f"+{p}% = ${current_price * (1 + p / 100):.4f}" for p in pcts)
+        market_context_lines.append(f"Price levels:  {levels}")
     if current_rvol is not None:
         market_context_lines.append(f"Current RVOL: {current_rvol:.1f}x (relative to 20-day avg)")
     market_context = "\n".join(market_context_lines)
