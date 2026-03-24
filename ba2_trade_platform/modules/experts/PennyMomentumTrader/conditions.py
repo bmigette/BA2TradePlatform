@@ -799,12 +799,22 @@ class ConditionEvaluator:
 
         # Ensure datetime index in market timezone
         tz = pytz.timezone(self.market_timezone)
+        df = df.copy()
+        if not isinstance(df.index, pd.DatetimeIndex):
+            # Try to find a datetime column and use it as index
+            for col in ("date", "Date", "datetime", "Datetime", "timestamp", "Timestamp"):
+                if col in df.columns:
+                    df.index = pd.to_datetime(df[col])
+                    df.index.name = col
+                    break
+            else:
+                self._indicator_cache[cache_key] = None
+                return None
         idx = df.index
         if idx.tz is None:
             idx = idx.tz_localize("UTC").tz_convert(tz)
         else:
             idx = idx.tz_convert(tz)
-        df = df.copy()
         df.index = idx
 
         if len(df) < 2:
