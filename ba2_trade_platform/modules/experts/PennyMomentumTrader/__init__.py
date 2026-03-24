@@ -271,6 +271,17 @@ class PennyMomentumTrader(LiveExpertInterface):
                 "description": "Minimum confidence score (1-100) for deep triage finalists",
                 "tooltip": "Candidates below this confidence threshold are dropped after deep triage. Higher = more selective.",
             },
+            "max_virtual_equity_per_instrument_percent": {
+                "type": "float",
+                "required": False,
+                "default": 10.0,
+                "description": "Maximum virtual equity allocation per instrument (%)",
+                "tooltip": (
+                    "Maximum percentage of virtual trading balance that can be allocated to a single instrument. "
+                    "Caps the confidence-weighted position size calculated at entry time. "
+                    "Recommended: 10-30% for penny stocks (higher concentration given small position count)."
+                ),
+            },
             "exit_update_interval_ticks": {
                 "type": "int",
                 "required": True,
