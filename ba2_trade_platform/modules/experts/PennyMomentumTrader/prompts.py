@@ -344,7 +344,11 @@ OPENING RANGE BREAKOUT:
   minutes: pick from [5, 10, 15, 30]
 
 TIME CONDITIONS:
-  time_after: use for waiting until consolidation (e.g. "09:45", "10:00")
+  time_after: optional gate based on the catalyst and strategy — choose the time that best fits:
+    - "09:30" = enter immediately at market open (pre-market catalyst already confirmed)
+    - "09:45" / "10:00" = wait for opening volatility to settle before entering
+    - "10:30" / "11:00" = wait for broader market direction to establish
+    Omit entirely if a price/volume condition already provides sufficient timing control.
   time_before: use for intraday exit deadline (e.g. "15:30", "15:45")
 
 GUIDELINES:
