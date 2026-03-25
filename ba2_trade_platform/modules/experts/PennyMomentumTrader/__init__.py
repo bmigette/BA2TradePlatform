@@ -1947,6 +1947,31 @@ class PennyMomentumTrader(LiveExpertInterface):
                         info["last_price"] = current_price
                     info["last_checked"] = datetime.now(timezone.utc).isoformat()
 
+                    # Cancel stale pending entry orders that never filled
+                    if status == "triggered" and symbol not in open_position_symbols:
+                        pending_order_id = info.get("pending_order_id")
+                        triggered_at_str = info.get("triggered_at")
+                        max_age_days = int(self.get_setting_with_interface_default(
+                            "max_entry_age_days", log_warning=False
+                        ))
+                        if pending_order_id and triggered_at_str:
+                            try:
+                                triggered_at = datetime.fromisoformat(triggered_at_str)
+                                if triggered_at.tzinfo is None:
+                                    triggered_at = triggered_at.replace(tzinfo=timezone.utc)
+                                age_days = (datetime.now(timezone.utc) - triggered_at).total_seconds() / 86400
+                                if age_days >= max_age_days:
+                                    self.logger.info(
+                                        f"Cancelling stale pending entry order {pending_order_id} for {symbol} "
+                                        f"(age={age_days:.1f}d >= max={max_age_days}d)"
+                                    )
+                                    trade_mgr.account.cancel_order(str(pending_order_id))
+                                    info["status"] = "expired"
+                                    info.pop("pending_order_id", None)
+                                    continue
+                            except Exception as e:
+                                self.logger.warning(f"Error checking pending order age for {symbol}: {e}")
+
                     if symbol in open_position_symbols:
                         # Check exit conditions for open positions
                         pos = next(
@@ -2130,6 +2155,8 @@ class PennyMomentumTrader(LiveExpertInterface):
                                         )
                                         if order_id:
                                             info["status"] = "triggered"
+                                            info["pending_order_id"] = order_id
+                                            info["triggered_at"] = datetime.now(timezone.utc).isoformat()
                                             self._record_trade(
                                                 market_analysis,
                                                 symbol,
