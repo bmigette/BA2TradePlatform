@@ -537,9 +537,28 @@ class ConditionEvaluator:
                 now = datetime.now(tz)
                 return f"{label} (now={now.strftime('%H:%M')}, threshold={cond['time']})"
 
-        except Exception:
-            pass
-        return label
+            if ctype == "opening_range_breakout":
+                minutes = cond.get("minutes", "?")
+                price = self._get_current_price(symbol)
+                return f"{label} (orb{minutes}m, price={self._fmt(price)})"
+
+            if ctype == "volume_spike":
+                return f"{label} (volume_spike multiplier={cond.get('multiplier')}x over {cond.get('minutes')}m)"
+
+            if ctype in ("macd_bullish_cross", "macd_bearish_cross"):
+                tf = cond.get("timeframe", "?")
+                return f"{label} ({ctype} [{tf}])"
+
+            if ctype in ("ema_cross_above", "ema_cross_below"):
+                tf = cond.get("timeframe", "?")
+                fast = cond.get("fast_period", "?")
+                slow = cond.get("slow_period", "?")
+                return f"{label} (ema{fast}/ema{slow} cross [{tf}])"
+
+        except Exception as e:
+            logger.debug(f"_explain_single failed for {ctype}: {e}")
+        params = {k: v for k, v in cond.items() if k != "type"}
+        return f"{label} ({ctype}: {params})" if params else f"{label} ({ctype})"
 
     # -------------------------------------------------------------------
     # Data fetching helpers (cached per evaluation cycle)

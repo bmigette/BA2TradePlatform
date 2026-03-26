@@ -446,11 +446,11 @@ class TestSettingsDefaults:
         source = self._get_settings_ast()
         assert '"min_confidence_threshold"' in source
 
-    def test_min_confidence_threshold_default_is_55(self):
+    def test_min_confidence_threshold_default_is_45(self):
         source = self._get_settings_ast()
         idx = source.index('"min_confidence_threshold"')
         block = source[idx:idx + 300]
-        assert '"default": 55,' in block
+        assert '"default": 45,' in block
 
     def test_min_confidence_threshold_type_is_int(self):
         source = self._get_settings_ast()

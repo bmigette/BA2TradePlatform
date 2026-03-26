@@ -209,7 +209,7 @@ class PennyMomentumTrader(LiveExpertInterface):
             "max_scan_candidates": {
                 "type": "int",
                 "required": True,
-                "default": 50,
+                "default": 100,
                 "description": "Maximum candidates from screener",
                 "tooltip": "Limit the number of stocks returned by the screener.",
             },
@@ -267,7 +267,7 @@ class PennyMomentumTrader(LiveExpertInterface):
             "min_confidence_threshold": {
                 "type": "int",
                 "required": True,
-                "default": 55,
+                "default": 45,
                 "description": "Minimum confidence score (1-100) for deep triage finalists",
                 "tooltip": "Candidates below this confidence threshold are dropped after deep triage. Higher = more selective.",
             },
@@ -841,17 +841,46 @@ class PennyMomentumTrader(LiveExpertInterface):
                     if not sym or sym in seen_symbols:
                         continue
                     g_price = g.get("price", 0) or 0
+                    # NOTE: The FMP /stock_market/gainers endpoint does NOT return marketCap.
+                    # When g_mcap is 0 (unknown), skip the mcap bounds check — the stock
+                    # will receive its real market cap from the quote enrichment step below,
+                    # and any out-of-range stocks will be caught by the post-enrichment filter.
                     g_mcap = g.get("marketCap", 0) or 0
                     if price_min is not None and g_price < float(price_min):
+                        filtered_stocks[sym] = {
+                            "phase": "screen",
+                            "reason": "gainer_price_too_low",
+                            "details": f"Gainer price ${g_price:.3f} below minimum ${price_min}",
+                        }
                         continue
                     if price_max is not None and g_price > float(price_max):
+                        filtered_stocks[sym] = {
+                            "phase": "screen",
+                            "reason": "gainer_price_too_high",
+                            "details": f"Gainer price ${g_price:.3f} above maximum ${price_max}",
+                        }
                         continue
-                    if mcap_min is not None and g_mcap < float(mcap_min):
+                    if mcap_min is not None and g_mcap > 0 and g_mcap < float(mcap_min):
+                        filtered_stocks[sym] = {
+                            "phase": "screen",
+                            "reason": "gainer_mcap_too_low",
+                            "details": f"Gainer market cap ${g_mcap/1e6:.1f}M below minimum ${float(mcap_min)/1e6:.0f}M",
+                        }
                         continue
-                    if mcap_max is not None and g_mcap > float(mcap_max):
+                    if mcap_max is not None and g_mcap > 0 and g_mcap > float(mcap_max):
+                        filtered_stocks[sym] = {
+                            "phase": "screen",
+                            "reason": "gainer_mcap_too_high",
+                            "details": f"Gainer market cap ${g_mcap/1e6:.1f}M above maximum ${float(mcap_max)/1e6:.0f}M",
+                        }
                         continue
                     g_sector = (g.get("sector") or "").lower()
                     if sector_exclude and g_sector in [s.lower() for s in sector_exclude]:
+                        filtered_stocks[sym] = {
+                            "phase": "screen",
+                            "reason": "gainer_sector_excluded",
+                            "details": f"Gainer sector '{g_sector}' is in exclusion list",
+                        }
                         continue
                     candidates.append({
                         "symbol": sym,
@@ -908,6 +937,11 @@ class PennyMomentumTrader(LiveExpertInterface):
             q_price = quote.get("price")
             if q_price and q_price > 0:
                 c["price"] = q_price
+            # Update market_cap from quote — critical for gainers whose mcap was
+            # unknown (0) when added from the FMP gainers API
+            q_mcap = quote.get("marketCap")
+            if q_mcap and q_mcap > 0:
+                c["market_cap"] = q_mcap
 
         # Filter by minimum relative volume
         if min_rvol > 0:

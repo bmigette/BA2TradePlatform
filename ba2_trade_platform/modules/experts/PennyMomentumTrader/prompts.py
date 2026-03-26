@@ -144,7 +144,7 @@ Use these as confirmation signals — high watchlist + high bull% + trending str
 You are filtering penny-stock momentum candidates. From the list below, select up to {max_survivors} stocks most likely to produce a profitable momentum trade today or this week. Only include stocks that genuinely meet the criteria — do NOT pad to reach {max_survivors} if fewer stocks qualify.
 {stocktwits_note}
 FILTER CRITERIA (apply all):
-1. Sector quality: The "sector" field may show "Healthcare/Biotechnology" or "Healthcare/Pharmaceuticals" — treat these as binary-event risk and DROP them unless there is a confirmed catalyst (earnings, not FDA trial). Avoid energy stocks unless oil prices are trending up. Favor Technology, Consumer, and Industrial sectors with clear momentum drivers.
+1. Sector quality: The "sector" field may show "Healthcare/Biotechnology" or "Healthcare/Pharmaceuticals" — these carry binary-event risk and warrant extra scrutiny. FDA trial readouts and clinical data events are high-risk. However, use your judgment: Healthcare/Biotech stocks with clear business catalysts (such as earnings beats, strategic transactions, M&A, partnership agreements, contract wins, or product launches) can be strong momentum setups. This list of example catalysts is not exhaustive — if a confirmed, material catalyst exists, weigh it accordingly. Avoid energy stocks unless oil prices are trending up. Favor Technology, Consumer, and Industrial sectors with clear momentum drivers.
 2. Volume/momentum: Use the "rvol" field (relative volume vs 20-day average) when available. rvol >= 2.0 is a strong signal; rvol < 1.0 means below-average activity — deprioritize. Also factor in "chg" (price change %) as a momentum indicator.
 3. Market cap sweet spot: Favor $50M–$500M market cap. Too small (<$10M) means illiquid and manipulable; too large (>$1B) means less explosive moves.
 4. Exchange quality: Prefer NASDAQ and NYSE over OTC/pink sheets.
@@ -215,8 +215,8 @@ def build_deep_triage_prompt(
 Perform a deep triage analysis of {symbol} for a potential penny-stock momentum trade. Evaluate all the data below and determine whether this stock has a tradeable setup.
 
 ANALYSIS FRAMEWORK:
-- Catalyst identification: Is there a clear, actionable catalyst (earnings beat, contract win, product launch, short squeeze setup)?
-- News quality: Is the news fresh (last 24-48h) and material, or stale/irrelevant? Translate and synthesize any non-English headlines.
+- Catalyst identification: Is there a clear, actionable catalyst driving this move? Common examples include earnings beats, contract wins, product launches, short squeeze setups, M&A/strategic transactions, regulatory approvals, or partnership announcements — but this list is not exhaustive. Exercise your own judgment to identify any material catalyst.
+- News quality: Is the news fresh and material, or stale/irrelevant? Pay particular attention to after-hours and pre-market releases from the prior evening, as these often drive gap-up moves that may not yet appear in standard news feeds. Translate and synthesize any non-English headlines.
 - Insider activity: Distinguish between open-market purchases (bullish signal), open-market sales (bearish signal), and scheduled stock awards/grants such as A-Award transactions (neutral — these are corporate compensation, not a directional bet).
 - Fundamental support: Does revenue/cash position support the current price, or is this purely speculative?
 - Social momentum: Is there growing retail interest that could drive a momentum wave?
