@@ -408,6 +408,19 @@ class PennyMomentumTrader(LiveExpertInterface):
                     "Set to 0.0 to use market orders instead."
                 ),
             },
+            "max_already_moved_pct": {
+                "type": "float",
+                "required": False,
+                "default": 25.0,
+                "description": "Max % move from prev close allowed at entry trigger",
+                "tooltip": (
+                    "Guards against chasing stocks that have already made their move. "
+                    "At entry trigger time, if the stock has already risen more than this % "
+                    "from yesterday's close, the entry is skipped. "
+                    "25.0 = skip if stock is up more than 25% on the day. "
+                    "Set to 0.0 to disable the guard."
+                ),
+            },
         }
 
     # ------------------------------------------------------------------
@@ -1499,6 +1512,15 @@ class PennyMomentumTrader(LiveExpertInterface):
                 f"{market_state}. "
                 f"Current time: {now_et.strftime('%Y-%m-%d %H:%M')} {tz_label}."
             )
+            cand_price = candidate.get("price")
+            cand_chg = candidate.get("change_percent")
+            if cand_price is not None:
+                sign = "+" if (cand_chg or 0) >= 0 else ""
+                chg_str = f" Today's change: {sign}{cand_chg:.1f}%" if cand_chg is not None else ""
+                if cand_chg is not None and cand_chg != -100:
+                    prev_close = cand_price / (1 + cand_chg / 100)
+                    chg_str += f" (prev close ~${prev_close:.4f})"
+                market_context += f" Current price: ${cand_price:.4f}.{chg_str}."
 
             # Build prompt and call LLM
             prompt = build_deep_triage_prompt(
@@ -1611,6 +1633,10 @@ class PennyMomentumTrader(LiveExpertInterface):
 
                 result["price"] = candidate.get("price")
                 result["rvol"] = candidate.get("rvol")
+                _p = candidate.get("price")
+                _chg = candidate.get("change_percent")
+                if _p is not None and _chg is not None and _chg != -100:
+                    result["prev_close"] = _p / (1 + _chg / 100)
                 deep_triage_results[symbol] = result
                 finalists.append(
                     {
@@ -1831,6 +1857,7 @@ class PennyMomentumTrader(LiveExpertInterface):
                     "strategy": finalist.get("strategy", ""),
                     "qty": triage_data.get("qty"),
                     "allocation": triage_data.get("allocation"),
+                    "prev_close": triage_data.get("prev_close"),
                     "created_at": now.isoformat(),
                 }
 
@@ -2128,11 +2155,36 @@ class PennyMomentumTrader(LiveExpertInterface):
                                     and current_rvol is not None
                                     and current_rvol < peak_rvol * rvol_decay_threshold
                                 )
+                                # Already-moved guard: skip if stock is up too much from prev close
+                                max_moved_pct = float(
+                                    self.get_setting_with_interface_default(
+                                        "max_already_moved_pct", log_warning=False
+                                    )
+                                )
+                                prev_close = info.get("prev_close")
+                                already_moved_pct = (
+                                    (current_price - prev_close) / prev_close * 100
+                                    if prev_close and current_price
+                                    else None
+                                )
+                                already_moved = (
+                                    max_moved_pct > 0
+                                    and already_moved_pct is not None
+                                    and already_moved_pct >= max_moved_pct
+                                )
+
                                 if rvol_decayed:
                                     self.logger.info(
                                         f"Entry skipped for {symbol}: RVOL decay "
                                         f"(current={current_rvol:.1f}x, peak={peak_rvol:.1f}x, "
                                         f"threshold={rvol_decay_threshold:.0%})"
+                                    )
+                                elif already_moved:
+                                    self.logger.info(
+                                        f"Entry skipped for {symbol}: already moved "
+                                        f"{already_moved_pct:.1f}% from prev close "
+                                        f"(prev=${prev_close:.4f}, now=${current_price:.4f}, "
+                                        f"threshold={max_moved_pct:.0f}%)"
                                     )
                                 else:
                                     self.logger.info(f"Entry conditions met for {symbol}")
