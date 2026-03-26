@@ -158,7 +158,7 @@ class PennyMomentumTrader(LiveExpertInterface):
             "scan_market_cap_min": {
                 "type": "float",
                 "required": True,
-                "default": 10000000,
+                "default": 8000000,
                 "description": "Minimum market cap for screener",
                 "tooltip": "Stocks with market cap below this value are excluded.",
             },
