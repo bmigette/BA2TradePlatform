@@ -424,22 +424,22 @@ class StockScreener:
                     )
                     continue
 
-                # Use the close from lookback_days ago as the reference
-                # bars are oldest-first; pick the bar closest to lookback_days ago
-                ref_idx = max(0, len(bars) - lookback_days)
-                old_close = bars[ref_idx].get("close")
+                # Find peak price (max of high and low) over the lookback window
+                lookback_bars = bars[-lookback_days:] if lookback_days < len(bars) else bars
+                peak_price = max(
+                    max(b.get("high") or 0, b.get("low") or 0)
+                    for b in lookback_bars
+                )
 
                 # Use live price from quote enrichment (current),
                 # fall back to last bar's close if not available
                 current_price = c.get("price") or bars[-1].get("close")
 
-                if old_close is None or current_price is None:
-                    continue
-                if old_close <= 0:
+                if peak_price <= 0 or current_price is None:
                     continue
 
                 drop_pct = round(
-                    ((old_close - current_price) / old_close) * 100, 2
+                    ((peak_price - current_price) / peak_price) * 100, 2
                 )
                 c["price_drop_pct"] = drop_pct
 
