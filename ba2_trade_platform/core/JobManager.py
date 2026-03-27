@@ -1152,7 +1152,8 @@ class JobManager:
             # Run the stock screener with expert's settings
             from .StockScreener import StockScreener
             screener = StockScreener(expert.settings)
-            selected_stocks = screener.screen()
+            screen_result = screener.screen()
+            selected_stocks = screen_result["results"]
 
             if not selected_stocks:
                 logger.warning(f"Screener returned no stocks for expert {expert_instance_id}")

@@ -2876,15 +2876,37 @@ class ExpertSettingsTab:
 
             import asyncio
             loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(None, screener.screen)
+            screen_data = await loop.run_in_executor(None, screener.screen)
+
+            result = screen_data["results"]
+            stats = screen_data.get("stats", {})
 
             if hasattr(self, 'test_screener_button'):
                 self.test_screener_button.props(remove='loading disable')
 
-            if result:
-                with ui.dialog() as result_dialog, ui.card().classes('w-full').style('max-width: 900px'):
-                    ui.label(f'Screener Results ({len(result)} stocks)').classes('text-lg font-semibold mb-4')
+            with ui.dialog() as result_dialog, ui.card().classes('w-full').style('max-width: 900px'):
+                ui.label(f'Screener Results ({len(result)} stocks)').classes('text-lg font-semibold mb-2')
 
+                # Filter summary
+                candidates = stats.get('screener_candidates', 0)
+                stat_items = [f'Screener: {candidates}']
+                dropped_rvol = stats.get('dropped_rvol', 0)
+                stat_items.append(f'RVOL: -{dropped_rvol}')
+                dropped_float = stats.get('dropped_float', 0)
+                stat_items.append(f'Float: -{dropped_float}')
+                dropped_vol = stats.get('dropped_volume_max', 0)
+                stat_items.append(f'Vol max: -{dropped_vol}')
+                dropped_drop = stats.get('dropped_price_drop', 0)
+                drop_checked = stats.get('price_drop_checked', 0)
+                if drop_checked > 0:
+                    stat_items.append(f'Price drop: -{dropped_drop}/{drop_checked} checked')
+                else:
+                    stat_items.append(f'Price drop: disabled')
+                stat_items.append(f'Result: {len(result)}')
+
+                ui.label(' | '.join(stat_items)).classes('text-body2 text-grey-6 mb-4')
+
+                if result:
                     columns = [
                         {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left'},
                         {'name': 'company_name', 'label': 'Company', 'field': 'company_name', 'align': 'left'},
@@ -2921,12 +2943,12 @@ class ExpertSettingsTab:
                         })
 
                     ui.table(columns=columns, rows=rows).classes('w-full').props('dense')
+                else:
+                    ui.label('No stocks matched the filters. Try adjusting the criteria.').classes('text-body1 text-grey-6 mt-4')
 
-                    with ui.row().classes('w-full justify-end mt-4'):
-                        ui.button('Close', on_click=result_dialog.close)
-                result_dialog.open()
-            else:
-                ui.notify('Screener returned no results. Try adjusting the filters.', type='warning')
+                with ui.row().classes('w-full justify-end mt-4'):
+                    ui.button('Close', on_click=result_dialog.close)
+            result_dialog.open()
 
         except Exception as e:
             if hasattr(self, 'test_screener_button'):

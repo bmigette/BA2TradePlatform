@@ -104,18 +104,18 @@ class StockScreener:
     # Public API
     # ------------------------------------------------------------------
 
-    def screen(self) -> List[Dict[str, Any]]:
+    def screen(self) -> Dict[str, Any]:
         """
         Execute the full screen/enrich/rank pipeline.
 
         Returns:
-            Sorted list of stock dicts, length <= screener_max_stocks.
-            Each dict contains at minimum: symbol, company_name, price,
-            volume, market_cap, sector, industry, exchange, float_shares.
-            If RVOL enrichment ran, also: avg_volume, relative_volume.
-            If price-drop filter ran, also: price_drop_pct.
+            Dict with keys:
+                results: Sorted list of stock dicts, length <= screener_max_stocks.
+                stats: Dict of per-filter drop counts and totals.
         """
         from ..modules.dataproviders import get_provider
+
+        stats: Dict[str, int] = {}
 
         provider_name = self._settings["screener_provider"]
         screener = get_provider("screener", provider_name)
@@ -126,24 +126,28 @@ class StockScreener:
             f"StockScreener: screening via '{provider_name}' with filters: {filters}"
         )
         candidates = screener.screen_stocks(filters)
+        stats["screener_candidates"] = len(candidates)
         logger.info(
             f"StockScreener: screener returned {len(candidates)} candidates"
         )
 
         if not candidates:
-            return []
+            return {"results": [], "stats": stats}
 
         # --- Stage 2: RVOL enrichment + client-side filters ---
         rvol_min = self._settings["screener_relative_volume_min"]
         if rvol_min > 0:
-            candidates = self._enrich_with_rvol(candidates, rvol_min)
+            candidates, enrich_stats = self._enrich_with_rvol(
+                candidates, rvol_min
+            )
+            stats.update(enrich_stats)
             logger.info(
                 f"StockScreener: {len(candidates)} candidates after RVOL "
                 f"enrichment (min RVOL={rvol_min})"
             )
 
         if not candidates:
-            return []
+            return {"results": [], "stats": stats}
 
         # --- Stage 3: rank ---
         ranked = self._rank(candidates)
@@ -153,9 +157,10 @@ class StockScreener:
         drop_pct = self._settings["screener_price_drop_pct"]
         drop_days = self._settings["screener_price_drop_days"]
         if drop_pct > 0 and drop_days > 0:
-            result = self._filter_by_price_drop_lazy(
+            result, drop_stats = self._filter_by_price_drop_lazy(
                 ranked, drop_pct, max_stocks
             )
+            stats.update(drop_stats)
             logger.info(
                 f"StockScreener: {len(result)} stocks after price-drop "
                 f"filter (>={drop_pct}% over {drop_days}d, "
@@ -163,12 +168,13 @@ class StockScreener:
             )
         else:
             result = ranked[:max_stocks]
-            logger.info(
-                f"StockScreener: returning top {len(result)} stocks "
-                f"(sorted by {self._settings['screener_sort_metric']})"
-            )
 
-        return result
+        stats["final_count"] = len(result)
+        logger.info(
+            f"StockScreener: returning {len(result)} stocks "
+            f"(sorted by {self._settings['screener_sort_metric']})"
+        )
+        return {"results": result, "stats": stats}
 
     # ------------------------------------------------------------------
     # Static helper – extracted from PennyMomentumTrader for reuse
@@ -265,7 +271,7 @@ class StockScreener:
         self,
         candidates: List[Dict[str, Any]],
         min_rvol: float,
-    ) -> List[Dict[str, Any]]:
+    ) -> tuple:
         """
         Enrich candidates with FMP quote data, compute relative volume,
         and apply client-side filters that the screener API does not support
@@ -276,7 +282,7 @@ class StockScreener:
             min_rvol: Minimum relative volume threshold (> 0).
 
         Returns:
-            Filtered and enriched list of candidates.
+            Tuple of (filtered list, stats dict with per-filter drop counts).
         """
         all_symbols = [
             c["symbol"].upper()
@@ -284,12 +290,16 @@ class StockScreener:
             if c.get("symbol")
         ]
         if not all_symbols:
-            return []
+            return [], {"dropped_rvol": 0, "dropped_float": 0, "dropped_volume_max": 0}
 
         quotes_map = self._fetch_quotes_chunked(all_symbols)
 
         float_min = self._settings["screener_float_min"]
         volume_max = self._settings["screener_volume_max"]
+
+        dropped_rvol = 0
+        dropped_float = 0
+        dropped_volume_max = 0
 
         enriched: List[Dict[str, Any]] = []
         for c in candidates:
@@ -327,6 +337,7 @@ class StockScreener:
                 logger.debug(
                     f"StockScreener: dropping {sym} — RVOL {rvol} < {min_rvol}"
                 )
+                dropped_rvol += 1
                 continue
 
             # Filter: float_min (not supported by FMP screener API)
@@ -338,6 +349,7 @@ class StockScreener:
                         f"StockScreener: dropping {sym} — float "
                         f"{stock_float:,} < {float_min:,}"
                     )
+                    dropped_float += 1
                     continue
 
             # Filter: volume_max (not supported by FMP screener API)
@@ -347,18 +359,24 @@ class StockScreener:
                         f"StockScreener: dropping {sym} — volume "
                         f"{volume:,} > {volume_max:,}"
                     )
+                    dropped_volume_max += 1
                     continue
 
             enriched.append(c)
 
-        return enriched
+        stats = {
+            "dropped_rvol": dropped_rvol,
+            "dropped_float": dropped_float,
+            "dropped_volume_max": dropped_volume_max,
+        }
+        return enriched, stats
 
     def _filter_by_price_drop_lazy(
         self,
         ranked_candidates: List[Dict[str, Any]],
         min_drop_pct: float,
         max_results: int,
-    ) -> List[Dict[str, Any]]:
+    ) -> tuple:
         """
         Fetch historical prices in bulk chunks from the ranked list,
         check price drops, and stop once we have max_results stocks.
@@ -372,13 +390,14 @@ class StockScreener:
             max_results: Stop once we have this many passing stocks.
 
         Returns:
-            List of up to max_results stocks with price_drop_pct annotated.
+            Tuple of (filtered list, stats dict).
         """
         lookback_days = self._settings["screener_price_drop_days"]
         chunk_size = max(max_results * 3, 30)
 
         passed: List[Dict[str, Any]] = []
         checked = 0
+        dropped_price_drop = 0
 
         for i in range(0, len(ranked_candidates), chunk_size):
             if len(passed) >= max_results:
@@ -423,6 +442,7 @@ class StockScreener:
                 if drop_pct >= min_drop_pct:
                     passed.append(c)
                 else:
+                    dropped_price_drop += 1
                     logger.debug(
                         f"StockScreener: dropping {symbol} — price drop "
                         f"{drop_pct}% < {min_drop_pct}%"
@@ -432,7 +452,11 @@ class StockScreener:
             f"StockScreener: price-drop filter checked {checked} symbols, "
             f"{len(passed)} passed"
         )
-        return passed
+        stats = {
+            "price_drop_checked": checked,
+            "dropped_price_drop": dropped_price_drop,
+        }
+        return passed, stats
 
     @staticmethod
     def _fetch_history_bulk(
