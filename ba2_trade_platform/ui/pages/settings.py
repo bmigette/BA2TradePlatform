@@ -1823,12 +1823,12 @@ class ExpertSettingsTab:
                     with ui.tab_panel('Instruments').style('display: flex; flex-direction: column; flex: 1; overflow: hidden'):
                         # Instrument selection method dropdown at top of tab
                         self.instrument_selection_method_select = ui.select(
-                            options=["static", "dynamic", "expert", "screener"],
+                            options=["static", "dynamic", "screener"],
                             label='Instrument Selection Method',
                             value="static",
                             on_change=self._on_instrument_selection_method_change
                         ).classes('w-full mb-4').props('dense').tooltip(
-                            "Static (manual), Dynamic (AI prompt), Expert (expert-driven), Screener (automated stock screener)"
+                            "Static (manual), Dynamic (AI prompt), Screener (automated stock screener)"
                         )
 
                         # Container for dynamic instrument UI content
@@ -2608,25 +2608,28 @@ class ExpertSettingsTab:
         try:
             # Get expert properties to check capabilities
             expert_properties = expert_class.get_expert_properties()
-            can_recommend_instruments = expert_properties.get('can_recommend_instruments', False)
-            
-            # Base options (screener is always available)
-            options = ["static", "dynamic", "screener"]
+            required_method = expert_properties.get('required_instrument_selection_method')
 
-            # Add "expert" option only if the expert can recommend instruments
-            if can_recommend_instruments:
-                options.append("expert")
-            
-            # Update the select options
-            current_value = self.instrument_selection_method_select.value
-            self.instrument_selection_method_select.options = options
-            
-            # Reset value if current value is no longer valid
-            if current_value not in options:
-                self.instrument_selection_method_select.value = "static"
-                
-            logger.debug(f'Updated instrument selection options for {expert_type}: {options}')
-            
+            if required_method:
+                # Expert requires a specific method — force it and disable dropdown
+                self.instrument_selection_method_select.options = [required_method]
+                self.instrument_selection_method_select.value = required_method
+                self.instrument_selection_method_select.props('disable')
+                logger.debug(f'Instrument selection forced to "{required_method}" for {expert_type}')
+            else:
+                # Build available options (no "expert" — only via required_instrument_selection_method)
+                options = ["static", "dynamic", "screener"]
+
+                current_value = self.instrument_selection_method_select.value
+                self.instrument_selection_method_select.options = options
+                self.instrument_selection_method_select.props(remove='disable')
+
+                # Reset value if current value is no longer valid
+                if current_value not in options:
+                    self.instrument_selection_method_select.value = "static"
+
+                logger.debug(f'Updated instrument selection options for {expert_type}: {options}')
+
         except Exception as e:
             logger.debug(f'Could not update instrument selection options: {e}')
 

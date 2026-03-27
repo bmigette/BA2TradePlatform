@@ -56,8 +56,9 @@ class FMPSenateTraderCopy(MarketExpertInterface):
             Dict[str, Any]: Dictionary containing expert properties and capabilities
         """
         return {
-            "can_recommend_instruments": True,  # Reserved for future job expansion functionality
-            "should_expand_instrument_jobs": False,  # Prevent job duplication - expert processes all instruments at once
+            "can_recommend_instruments": True,
+            "should_expand_instrument_jobs": False,
+            "required_instrument_selection_method": "expert",
         }
     
 

@@ -60,6 +60,7 @@ class PennyMomentumTrader(LiveExpertInterface):
         return {
             "can_recommend_instruments": True,
             "should_expand_instrument_jobs": False,
+            "required_instrument_selection_method": "expert",
         }
 
     @classmethod
