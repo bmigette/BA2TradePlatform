@@ -2464,28 +2464,12 @@ class PennyMomentumTrader(LiveExpertInterface):
     def _fetch_quotes_chunked(
         self, symbols: List[str], chunk_size: int = 50
     ) -> Dict[str, Dict[str, Any]]:
-        """Batch-fetch FMP full quotes in chunks. Returns {symbol: quote_dict}."""
-        import fmpsdk
-        from ....config import get_app_setting
+        """Batch-fetch FMP full quotes in chunks. Returns {symbol: quote_dict}.
 
-        api_key = get_app_setting("FMP_API_KEY")
-        if not api_key:
-            return {}
-
-        result: Dict[str, Dict[str, Any]] = {}
-        for i in range(0, len(symbols), chunk_size):
-            chunk = symbols[i : i + chunk_size]
-            try:
-                data = fmpsdk.quote(apikey=api_key, symbol=chunk)
-                if isinstance(data, list):
-                    for item in data:
-                        sym = item.get("symbol", "").upper()
-                        if sym:
-                            result[sym] = item
-            except Exception as e:
-                self.logger.warning(f"FMP quote chunk {i}-{i+len(chunk)} failed: {e}")
-        self.logger.debug(f"Fetched FMP quotes for {len(result)}/{len(symbols)} symbols")
-        return result
+        Delegates to StockScreener._fetch_quotes_chunked for code reuse.
+        """
+        from ....core.StockScreener import StockScreener
+        return StockScreener._fetch_quotes_chunked(symbols, chunk_size)
 
     # ------------------------------------------------------------------
     # Live price helpers
