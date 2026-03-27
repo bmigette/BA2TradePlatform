@@ -147,7 +147,8 @@ class StockScreener:
 
         # --- Stage 3: price-drop filter ---
         drop_pct = self._settings["screener_price_drop_pct"]
-        if drop_pct > 0:
+        drop_days = self._settings["screener_price_drop_days"]
+        if drop_pct > 0 and drop_days > 0:
             candidates = self._filter_by_price_drop(candidates, drop_pct)
             logger.info(
                 f"StockScreener: {len(candidates)} candidates after "
@@ -442,7 +443,7 @@ class StockScreener:
             def sort_key(c: Dict[str, Any]) -> float:
                 mcap = c.get("market_cap") or 0
                 vol = c.get("volume") or 0
-                flt = c.get("float_shares") or 0
+                flt = c.get("float_shares") or 1
                 return mcap * vol * flt
         else:
             def sort_key(c: Dict[str, Any]) -> float:

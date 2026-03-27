@@ -2610,9 +2610,9 @@ class ExpertSettingsTab:
             expert_properties = expert_class.get_expert_properties()
             can_recommend_instruments = expert_properties.get('can_recommend_instruments', False)
             
-            # Base options
-            options = ["static", "dynamic"]
-            
+            # Base options (screener is always available)
+            options = ["static", "dynamic", "screener"]
+
             # Add "expert" option only if the expert can recommend instruments
             if can_recommend_instruments:
                 options.append("expert")
