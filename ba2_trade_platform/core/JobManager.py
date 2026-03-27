@@ -238,7 +238,7 @@ class JobManager:
         """
         
         # Handle special symbols - if manually triggered, queue expansion task to worker
-        if symbol in ["DYNAMIC", "EXPERT", "OPEN_POSITIONS"]:
+        if symbol in ["DYNAMIC", "EXPERT", "OPEN_POSITIONS", "SCREENER"]:
             logger.info(f"Special symbol '{symbol}' detected - queuing instrument expansion task")
             
             # Queue expansion task to worker instead of executing synchronously
@@ -699,6 +699,10 @@ class JobManager:
                 # At execution time, JobManager will always expand into individual instrument jobs
                 logger.info(f"Expert {instance_id} uses dynamic instrument selection - creating DYNAMIC job")
                 return ["DYNAMIC"]
+            elif instrument_selection_method == 'screener':
+                # Screener-based selection - create job with SCREENER symbol
+                logger.info(f"Expert {instance_id} uses screener instrument selection - creating SCREENER job")
+                return ["SCREENER"]
             
             # For static methods, check should_expand_instrument_jobs property
             if can_recommend_instruments:
@@ -823,7 +827,7 @@ class JobManager:
             batch_id = f"{expert_instance_id}_{time_str}_{date_str}"
             
             # Handle special symbols for dynamic and expert-driven selection - queue to worker
-            if symbol in ["DYNAMIC", "EXPERT", "OPEN_POSITIONS"]:
+            if symbol in ["DYNAMIC", "EXPERT", "OPEN_POSITIONS", "SCREENER"]:
                 logger.info(f"Special symbol '{symbol}' detected in scheduled analysis - queuing expansion task with batch_id={batch_id}")
                 try:
                     worker_queue = get_worker_queue()
@@ -1134,6 +1138,84 @@ class JobManager:
         except Exception as e:
             logger.error(f"Error in open positions analysis for expert {expert_instance_id}: {e}", exc_info=True)
     
+    def _execute_screener_analysis(self, expert_instance_id: int, subtype: str, batch_id: Optional[str] = None):
+        """Execute screener-based instrument selection and analysis."""
+        try:
+            logger.info(f"Executing screener analysis for expert {expert_instance_id}, batch_id={batch_id}")
+
+            from .utils import get_expert_instance_from_id
+            expert = get_expert_instance_from_id(expert_instance_id)
+            if not expert:
+                logger.error(f"Expert instance {expert_instance_id} not found for screener analysis")
+                return
+
+            # Run the stock screener with expert's settings
+            from .StockScreener import StockScreener
+            screener = StockScreener(expert.settings)
+            selected_stocks = screener.screen()
+
+            if not selected_stocks:
+                logger.warning(f"Screener returned no stocks for expert {expert_instance_id}")
+                return
+
+            selected_instruments = [s["symbol"] for s in selected_stocks if s.get("symbol")]
+
+            # Filter out symbols not supported by the broker
+            from .db import get_instance
+            from .models import ExpertInstance
+            from .utils import get_account_instance_from_id
+            expert_instance = get_instance(ExpertInstance, expert_instance_id)
+            if not expert_instance:
+                logger.error(f"Expert instance {expert_instance_id} not found in database")
+                return
+
+            account = get_account_instance_from_id(expert_instance.account_id)
+            if account:
+                selected_instruments = account.filter_supported_symbols(
+                    selected_instruments,
+                    log_prefix=f"StockScreener-{expert_instance_id}"
+                )
+                if not selected_instruments:
+                    logger.warning(f"No supported symbols remain after broker filter for expert {expert_instance_id}")
+                    return
+
+            logger.info(f"Screener selected {len(selected_instruments)} instruments for expert {expert_instance_id}: {selected_instruments[:10]}{'...' if len(selected_instruments) > 10 else ''}")
+
+            # Auto-add instruments to database
+            try:
+                from .InstrumentAutoAdder import get_instrument_auto_adder
+                auto_adder = get_instrument_auto_adder()
+                auto_adder.queue_instruments_for_addition(
+                    symbols=selected_instruments,
+                    expert_shortname=expert.shortname,
+                    source='screener'
+                )
+            except Exception as e:
+                logger.warning(f"Could not queue instruments for auto-addition: {e}")
+
+            # Submit analysis jobs for selected instruments
+            for instrument in selected_instruments:
+                try:
+                    if subtype == AnalysisUseCase.OPEN_POSITIONS:
+                        if not self._has_open_transactions_for_symbol(expert_instance_id, instrument):
+                            logger.debug(f"Skipping OPEN_POSITIONS analysis for expert {expert_instance_id}, symbol {instrument}: no open transactions")
+                            continue
+
+                    task_id = self.submit_market_analysis(
+                        expert_instance_id=expert_instance_id,
+                        symbol=instrument,
+                        subtype=subtype,
+                        priority=0,
+                        batch_id=batch_id
+                    )
+                    logger.debug(f"Submitted screener analysis for {instrument}: {task_id}")
+
+                except Exception as e:
+                    logger.error(f"Error submitting screener analysis for {instrument}: {e}")
+
+        except Exception as e:
+            logger.error(f"Error in screener analysis for expert {expert_instance_id}: {e}", exc_info=True)
+
     def _has_open_transactions_for_symbol(self, expert_instance_id: int, symbol: str) -> bool:
         """Check if there are open transactions for a specific expert and symbol."""
         try:
