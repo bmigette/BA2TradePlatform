@@ -8,11 +8,11 @@ matching user-defined criteria. Designed to be consumed by any expert
 Pipeline stages:
     1. Screen  – call screener provider with basic filters
     2. Enrich  – batch-fetch FMP quotes for RVOL + client-side filters
-    3. Filter  – price-drop lookback filter via OHLCV provider
-    4. Rank    – sort by chosen metric and return top N
+    3. Rank    – sort by chosen metric
+    4. Filter  – bulk price-drop check on ranked list, stop at N
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from ..config import get_app_setting
@@ -360,9 +360,11 @@ class StockScreener:
         max_results: int,
     ) -> List[Dict[str, Any]]:
         """
-        Iterate through pre-ranked candidates, fetch OHLCV one by one,
-        and collect those with sufficient price drop until we have
-        max_results stocks. Avoids unnecessary API calls.
+        Fetch historical prices in bulk chunks from the ranked list,
+        check price drops, and stop once we have max_results stocks.
+
+        Uses FMP's multi-symbol historical-price-full endpoint directly
+        to avoid the base provider's caching over-fetch.
 
         Args:
             ranked_candidates: Already-sorted candidates (best first).
@@ -372,73 +374,127 @@ class StockScreener:
         Returns:
             List of up to max_results stocks with price_drop_pct annotated.
         """
-        from ..modules.dataproviders import get_provider
-
         lookback_days = self._settings["screener_price_drop_days"]
-        ohlcv_provider = get_provider("ohlcv", "fmp")
-        now = datetime.now(timezone.utc)
+        chunk_size = max(max_results * 3, 30)
 
         passed: List[Dict[str, Any]] = []
         checked = 0
-        for c in ranked_candidates:
+
+        for i in range(0, len(ranked_candidates), chunk_size):
             if len(passed) >= max_results:
                 break
 
-            symbol = c.get("symbol")
-            if not symbol:
+            chunk = ranked_candidates[i: i + chunk_size]
+            symbols = [c["symbol"] for c in chunk if c.get("symbol")]
+            if not symbols:
                 continue
 
-            checked += 1
-            try:
-                result = ohlcv_provider.get_ohlcv_data_formatted(
-                    symbol=symbol,
-                    end_date=now,
-                    lookback_days=lookback_days + 5,
-                    interval="1d",
-                    format_type="dict",
-                )
-                bars = result.get("data", []) if isinstance(result, dict) else []
-            except Exception as e:
-                logger.warning(
-                    f"StockScreener: OHLCV fetch failed for {symbol}: {e}"
-                )
-                continue
+            history_map = self._fetch_history_bulk(symbols, lookback_days)
+            checked += len(symbols)
 
-            if len(bars) < 2:
-                logger.debug(
-                    f"StockScreener: not enough OHLCV bars for {symbol} "
-                    f"({len(bars)} bars)"
+            for c in chunk:
+                if len(passed) >= max_results:
+                    break
+
+                symbol = (c.get("symbol") or "").upper()
+                bars = history_map.get(symbol, [])
+
+                if len(bars) < 2:
+                    logger.debug(
+                        f"StockScreener: not enough bars for {symbol} "
+                        f"({len(bars)} bars)"
+                    )
+                    continue
+
+                lookback_idx = max(0, len(bars) - 1 - lookback_days)
+                old_close = bars[lookback_idx].get("close")
+                new_close = bars[-1].get("close")
+
+                if old_close is None or new_close is None:
+                    continue
+                if old_close <= 0:
+                    continue
+
+                drop_pct = round(
+                    ((old_close - new_close) / old_close) * 100, 2
                 )
-                continue
+                c["price_drop_pct"] = drop_pct
 
-            lookback_idx = max(0, len(bars) - 1 - lookback_days)
-            old_close = bars[lookback_idx].get("close")
-            new_close = bars[-1].get("close")
-
-            if old_close is None or new_close is None:
-                logger.debug(
-                    f"StockScreener: missing close prices for {symbol}"
-                )
-                continue
-            if old_close <= 0:
-                continue
-
-            drop_pct = round(((old_close - new_close) / old_close) * 100, 2)
-            c["price_drop_pct"] = drop_pct
-
-            if drop_pct >= min_drop_pct:
-                passed.append(c)
-            else:
-                logger.debug(
-                    f"StockScreener: dropping {symbol} — price drop "
-                    f"{drop_pct}% < {min_drop_pct}%"
-                )
+                if drop_pct >= min_drop_pct:
+                    passed.append(c)
+                else:
+                    logger.debug(
+                        f"StockScreener: dropping {symbol} — price drop "
+                        f"{drop_pct}% < {min_drop_pct}%"
+                    )
 
         logger.info(
             f"StockScreener: price-drop filter checked {checked} symbols, "
             f"{len(passed)} passed"
         )
         return passed
+
+    @staticmethod
+    def _fetch_history_bulk(
+        symbols: List[str],
+        lookback_days: int,
+        chunk_size: int = 5,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Batch-fetch daily OHLCV from FMP for multiple symbols with a
+        tight date range (no multi-year caching over-fetch).
+
+        FMP's /historical-price-full/SYM1,SYM2 endpoint supports
+        comma-separated symbols. We chunk to avoid URL-length limits.
+
+        Returns:
+            Dict mapping uppercase symbol -> list of bar dicts
+            (oldest-first), each with keys: date, open, high, low, close, volume.
+        """
+        import requests
+
+        api_key = get_app_setting("FMP_API_KEY")
+        if not api_key:
+            logger.warning("StockScreener: FMP_API_KEY not configured")
+            return {}
+
+        now = datetime.now(timezone.utc)
+        from_date = (now - timedelta(days=lookback_days + 5)).strftime("%Y-%m-%d")
+        to_date = now.strftime("%Y-%m-%d")
+
+        result: Dict[str, List[Dict[str, Any]]] = {}
+        for i in range(0, len(symbols), chunk_size):
+            chunk = symbols[i: i + chunk_size]
+            joined = ",".join(chunk)
+            url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{joined}"
+            params = {"apikey": api_key, "from": from_date, "to": to_date}
+
+            try:
+                resp = requests.get(url, params=params, timeout=15)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as e:
+                logger.warning(
+                    f"StockScreener: bulk OHLCV fetch failed for "
+                    f"{joined}: {e}"
+                )
+                continue
+
+            # Single symbol → {"symbol": ..., "historical": [...]}
+            # Multi symbol → {"historicalStockList": [{...}, ...]}
+            stock_list = data.get("historicalStockList", [data] if "historical" in data else [])
+            for entry in stock_list:
+                sym = (entry.get("symbol") or "").upper()
+                bars = entry.get("historical", [])
+                # FMP returns newest-first; reverse to oldest-first
+                bars = list(reversed(bars))
+                result[sym] = bars
+
+        logger.debug(
+            f"StockScreener: bulk OHLCV fetched {len(result)}/{len(symbols)} "
+            f"symbols ({from_date} to {to_date})"
+        )
+        return result
 
     def _rank(
         self, candidates: List[Dict[str, Any]]
