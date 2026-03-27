@@ -284,9 +284,9 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "tooltip": "Maximum stock price. Set to 0 to disable this filter."
                 },
                 "screener_relative_volume_min": {
-                    "type": "float", "required": False, "default": 1.5,
+                    "type": "float", "required": False, "default": 1.05,
                     "description": "Min relative volume (0 = disabled)",
-                    "tooltip": "Minimum relative volume (today's volume / avg volume). 1.5 means 50% above average. Set to 0 to disable. Enabling triggers extra API calls to fetch live quotes."
+                    "tooltip": "Minimum relative volume (today's volume / avg volume). 1.05 means 5% above average. Set to 0 to disable. Enabling triggers extra API calls to fetch live quotes."
                 },
                 "screener_price_drop_pct": {
                     "type": "float", "required": False, "default": 15.0,

@@ -33,7 +33,7 @@ class StockScreener:
         screener_float_max         int   0  (0 = disabled)
         screener_price_min         float 20.0
         screener_price_max         float 0  (0 = disabled)
-        screener_relative_volume_min float 1.5  (0 = disabled)
+        screener_relative_volume_min float 1.05 (0 = disabled)
         screener_price_drop_pct    float 15.0 (0 = disabled)
         screener_price_drop_days   int   1
         screener_max_stocks        int   10
@@ -51,7 +51,7 @@ class StockScreener:
         "screener_float_max": 0,
         "screener_price_min": 20.0,
         "screener_price_max": 0,
-        "screener_relative_volume_min": 1.5,
+        "screener_relative_volume_min": 1.05,
         "screener_price_drop_pct": 15.0,
         "screener_price_drop_days": 1,
         "screener_max_stocks": 10,
@@ -145,28 +145,29 @@ class StockScreener:
         if not candidates:
             return []
 
-        # --- Stage 3: price-drop filter ---
+        # --- Stage 3: rank ---
+        ranked = self._rank(candidates)
+        max_stocks = self._settings["screener_max_stocks"]
+
+        # --- Stage 4: price-drop filter (lazy, on ranked list) ---
         drop_pct = self._settings["screener_price_drop_pct"]
         drop_days = self._settings["screener_price_drop_days"]
         if drop_pct > 0 and drop_days > 0:
-            candidates = self._filter_by_price_drop(candidates, drop_pct)
+            result = self._filter_by_price_drop_lazy(
+                ranked, drop_pct, max_stocks
+            )
             logger.info(
-                f"StockScreener: {len(candidates)} candidates after "
-                f"price-drop filter (>={drop_pct}% over "
-                f"{self._settings['screener_price_drop_days']}d)"
+                f"StockScreener: {len(result)} stocks after price-drop "
+                f"filter (>={drop_pct}% over {drop_days}d, "
+                f"sorted by {self._settings['screener_sort_metric']})"
+            )
+        else:
+            result = ranked[:max_stocks]
+            logger.info(
+                f"StockScreener: returning top {len(result)} stocks "
+                f"(sorted by {self._settings['screener_sort_metric']})"
             )
 
-        if not candidates:
-            return []
-
-        # --- Stage 4: rank and trim ---
-        ranked = self._rank(candidates)
-        max_stocks = self._settings["screener_max_stocks"]
-        result = ranked[:max_stocks]
-        logger.info(
-            f"StockScreener: returning top {len(result)} stocks "
-            f"(sorted by {self._settings['screener_sort_metric']})"
-        )
         return result
 
     # ------------------------------------------------------------------
@@ -255,6 +256,9 @@ class StockScreener:
         if float_max > 0:
             filters["float_max"] = float_max
 
+        # Request a high limit to avoid FMP's default cap of 1000
+        filters["limit"] = 10_000
+
         return filters
 
     def _enrich_with_rvol(
@@ -326,9 +330,10 @@ class StockScreener:
                 continue
 
             # Filter: float_min (not supported by FMP screener API)
+            # A value of 0 means data is unavailable — don't filter those out
             if float_min > 0:
                 stock_float = c.get("float_shares") or 0
-                if stock_float < float_min:
+                if stock_float > 0 and stock_float < float_min:
                     logger.debug(
                         f"StockScreener: dropping {sym} — float "
                         f"{stock_float:,} < {float_min:,}"
@@ -348,21 +353,24 @@ class StockScreener:
 
         return enriched
 
-    def _filter_by_price_drop(
+    def _filter_by_price_drop_lazy(
         self,
-        candidates: List[Dict[str, Any]],
+        ranked_candidates: List[Dict[str, Any]],
         min_drop_pct: float,
+        max_results: int,
     ) -> List[Dict[str, Any]]:
         """
-        Keep only candidates whose price dropped >= min_drop_pct over
-        the configured lookback period.
+        Iterate through pre-ranked candidates, fetch OHLCV one by one,
+        and collect those with sufficient price drop until we have
+        max_results stocks. Avoids unnecessary API calls.
 
         Args:
-            candidates: Enriched screener results.
+            ranked_candidates: Already-sorted candidates (best first).
             min_drop_pct: Minimum percentage drop required.
+            max_results: Stop once we have this many passing stocks.
 
         Returns:
-            Filtered list with price_drop_pct annotated on each dict.
+            List of up to max_results stocks with price_drop_pct annotated.
         """
         from ..modules.dataproviders import get_provider
 
@@ -371,16 +379,21 @@ class StockScreener:
         now = datetime.now(timezone.utc)
 
         passed: List[Dict[str, Any]] = []
-        for c in candidates:
+        checked = 0
+        for c in ranked_candidates:
+            if len(passed) >= max_results:
+                break
+
             symbol = c.get("symbol")
             if not symbol:
                 continue
 
+            checked += 1
             try:
                 result = ohlcv_provider.get_ohlcv_data_formatted(
                     symbol=symbol,
                     end_date=now,
-                    lookback_days=lookback_days + 5,  # extra margin for weekends/holidays
+                    lookback_days=lookback_days + 5,
                     interval="1d",
                     format_type="dict",
                 )
@@ -398,8 +411,6 @@ class StockScreener:
                 )
                 continue
 
-            # Use the close from lookback_days ago vs. latest close
-            # bars are sorted oldest-first from the provider
             lookback_idx = max(0, len(bars) - 1 - lookback_days)
             old_close = bars[lookback_idx].get("close")
             new_close = bars[-1].get("close")
@@ -423,6 +434,10 @@ class StockScreener:
                     f"{drop_pct}% < {min_drop_pct}%"
                 )
 
+        logger.info(
+            f"StockScreener: price-drop filter checked {checked} symbols, "
+            f"{len(passed)} passed"
+        )
         return passed
 
     def _rank(
