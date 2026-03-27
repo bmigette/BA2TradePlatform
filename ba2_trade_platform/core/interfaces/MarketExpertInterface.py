@@ -95,8 +95,8 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 },
                 "instrument_selection_method": {
                     "type": "str", "required": False, "default": "static",
-                    "description": "Method for selecting instruments: static (manual), dynamic (AI prompt), expert (expert-driven)",
-                    "choices": ["static", "dynamic", "expert"]
+                    "description": "Method for selecting instruments: static (manual), dynamic (AI prompt), expert (expert-driven), screener (filter-based)",
+                    "choices": ["static", "dynamic", "expert", "screener"]
                 },
                 # Balance Management Settings
                 "min_available_balance_pct": {
@@ -233,8 +233,83 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "description": "Smart Risk Manager Model Parameters (JSON)",
                     "help": "Custom model parameters in JSON format. Example: {\"thinking\": {\"type\": \"enabled\"}} for DeepSeek thinking mode, or {\"reasoning\": {\"effort\": \"high\"}} for OpenAI O-series.",
                     "tooltip": "Advanced JSON configuration for model-specific parameters. For DeepSeek, use {\"thinking\": {\"type\": \"enabled\"}}. For OpenAI O-series, use {\"reasoning\": {\"effort\": \"low|medium|high\"}}. Leave empty to use model defaults from registry. Only used when risk_manager_mode is set to 'smart'."
-                }
-                
+                },
+                # --- Screener instrument selection settings ---
+                # These settings are only active when instrument_selection_method is "screener".
+                # Setting a value to 0 (or None) disables that filter (whether min or max).
+                "screener_provider": {
+                    "type": "str", "required": False, "default": "fmp",
+                    "description": "Screener data provider",
+                    "valid_values": ["fmp"],
+                    "tooltip": "The screener provider to use for stock discovery."
+                },
+                "screener_market_cap_min": {
+                    "type": "int", "required": False, "default": 1000000000,
+                    "description": "Min market cap (0 = disabled)",
+                    "tooltip": "Minimum market capitalization. Set to 0 to disable this filter."
+                },
+                "screener_market_cap_max": {
+                    "type": "int", "required": False, "default": 0,
+                    "description": "Max market cap (0 = disabled)",
+                    "tooltip": "Maximum market capitalization. Set to 0 to disable this filter."
+                },
+                "screener_volume_min": {
+                    "type": "int", "required": False, "default": 500000,
+                    "description": "Min avg volume (0 = disabled)",
+                    "tooltip": "Minimum average daily volume. Set to 0 to disable this filter."
+                },
+                "screener_volume_max": {
+                    "type": "int", "required": False, "default": 0,
+                    "description": "Max avg volume (0 = disabled)",
+                    "tooltip": "Maximum average daily volume. Set to 0 to disable this filter."
+                },
+                "screener_float_min": {
+                    "type": "int", "required": False, "default": 10000000,
+                    "description": "Min share float (0 = disabled)",
+                    "tooltip": "Minimum share float (shares available for trading). Set to 0 to disable this filter."
+                },
+                "screener_float_max": {
+                    "type": "int", "required": False, "default": 0,
+                    "description": "Max share float (0 = disabled)",
+                    "tooltip": "Maximum share float. Set to 0 to disable this filter."
+                },
+                "screener_price_min": {
+                    "type": "float", "required": False, "default": 20.0,
+                    "description": "Min price (0 = disabled)",
+                    "tooltip": "Minimum stock price. Set to 0 to disable this filter."
+                },
+                "screener_price_max": {
+                    "type": "float", "required": False, "default": 0,
+                    "description": "Max price (0 = disabled)",
+                    "tooltip": "Maximum stock price. Set to 0 to disable this filter."
+                },
+                "screener_relative_volume_min": {
+                    "type": "float", "required": False, "default": 1.5,
+                    "description": "Min relative volume (0 = disabled)",
+                    "tooltip": "Minimum relative volume (today's volume / avg volume). 1.5 means 50% above average. Set to 0 to disable. Enabling triggers extra API calls to fetch live quotes."
+                },
+                "screener_price_drop_pct": {
+                    "type": "float", "required": False, "default": 15.0,
+                    "description": "Min price drop % (0 = disabled)",
+                    "tooltip": "Minimum price drop percentage over the lookback period. Set to 0 to disable. Enabling triggers extra API calls to fetch OHLCV data."
+                },
+                "screener_price_drop_days": {
+                    "type": "int", "required": False, "default": 1,
+                    "description": "Price drop lookback days",
+                    "tooltip": "Number of trading days to look back for the price drop calculation."
+                },
+                "screener_max_stocks": {
+                    "type": "int", "required": False, "default": 10,
+                    "description": "Max stocks to select",
+                    "tooltip": "Maximum number of stocks to return from the screener after ranking."
+                },
+                "screener_sort_metric": {
+                    "type": "str", "required": False, "default": "market_cap",
+                    "description": "Ranking metric for stock selection",
+                    "valid_values": ["market_cap", "volume", "float_shares", "relative_volume", "composite"],
+                    "tooltip": "How to rank and select stocks when more match than the limit. 'composite' uses market_cap * volume * float_shares."
+                },
+
             }
 
     @classmethod
@@ -314,6 +389,9 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             if instrument_selection_method == 'expert' and can_recommend_instruments:
                 # Expert-driven selection - return EXPERT symbol
                 return ["EXPERT"]
+            elif instrument_selection_method == 'screener':
+                # Screener-based selection - return SCREENER symbol
+                return ["SCREENER"]
             elif instrument_selection_method == 'dynamic':
                 # Dynamic AI selection - return DYNAMIC symbol
                 return ["DYNAMIC"]
