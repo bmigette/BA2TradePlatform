@@ -77,10 +77,10 @@ class SmartRiskManagerTask:
 
 @dataclass
 class InstrumentExpansionTask:
-    """Represents an instrument expansion task (DYNAMIC/EXPERT/OPEN_POSITIONS) to be executed by a worker."""
+    """Represents an instrument expansion task (DYNAMIC/EXPERT/OPEN_POSITIONS/SCREENER) to be executed by a worker."""
     id: str
     expert_instance_id: int
-    expansion_type: str  # "DYNAMIC", "EXPERT", or "OPEN_POSITIONS"
+    expansion_type: str  # "DYNAMIC", "EXPERT", "OPEN_POSITIONS", or "SCREENER"
     subtype: str = AnalysisUseCase.ENTER_MARKET  # Analysis use case for expanded instruments
     priority: int = 5  # Lower priority than individual analysis to allow processing
     status: WorkerTaskStatus = WorkerTaskStatus.PENDING
@@ -1351,6 +1351,9 @@ class WorkerQueue:
             elif task.expansion_type == "OPEN_POSITIONS":
                 job_manager._execute_open_positions_analysis(task.expert_instance_id, task.subtype, batch_id=task.batch_id)
                 logger.info(f"Open positions analysis expansion completed for expert {task.expert_instance_id}")
+            elif task.expansion_type == "SCREENER":
+                job_manager._execute_screener_analysis(task.expert_instance_id, task.subtype, batch_id=task.batch_id)
+                logger.info(f"Screener analysis expansion completed for expert {task.expert_instance_id}")
             else:
                 raise ValueError(f"Unknown expansion type: {task.expansion_type}")
             
