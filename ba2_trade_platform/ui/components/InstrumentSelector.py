@@ -186,7 +186,7 @@ class InstrumentSelector:
         """Render the InstrumentSelector component."""
         logger.debug('Rendering InstrumentSelector component')
         
-        with ui.card().classes('w-full'):
+        with ui.card().classes('w-full').style('display: flex; flex-direction: column; flex: 1; overflow: hidden'):
             ui.label('Instrument Selection').classes('text-h6')
             
             # Filter controls
@@ -249,7 +249,7 @@ class InstrumentSelector:
                 row_key='id',
                 selection='multiple',
                 on_select=self._on_selection_change
-            ).classes('w-full').style('max-height: 300px; overflow-y: auto')
+            ).classes('w-full').style('flex: 1; overflow-y: auto')
             
             
             # Add weight slot and event handler only if weights are not hidden

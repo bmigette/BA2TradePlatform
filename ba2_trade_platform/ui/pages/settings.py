@@ -1820,7 +1820,7 @@ class ExpertSettingsTab:
                             ui.label('Ruleset to evaluate when managing existing open positions').classes('text-body2 text-grey-7 ml-2')
                     
                     # Instruments tab
-                    with ui.tab_panel('Instruments'):
+                    with ui.tab_panel('Instruments').style('display: flex; flex-direction: column; flex: 1; overflow: hidden'):
                         # Instrument selection method dropdown at top of tab
                         self.instrument_selection_method_select = ui.select(
                             options=["static", "dynamic", "expert", "screener"],
@@ -1832,7 +1832,7 @@ class ExpertSettingsTab:
                         )
 
                         # Container for dynamic instrument UI content
-                        self.instruments_content_container = ui.column().classes('w-full')
+                        self.instruments_content_container = ui.column().classes('w-full').style('flex: 1; overflow-y: auto')
 
                         # Initialize with static content
                         self._render_instrument_content(expert_instance, is_edit)
