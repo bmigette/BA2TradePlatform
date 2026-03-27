@@ -1570,15 +1570,6 @@ class ExpertSettingsTab:
                                     value=initial_account
                                 ).classes('flex-1').props('dense')
 
-                                self.instrument_selection_method_select = ui.select(
-                                    options=["static", "dynamic", "expert"],
-                                    label='Instrument Selection Method',
-                                    value="static",
-                                    on_change=self._on_instrument_selection_method_change
-                                ).classes('flex-1').props('dense').tooltip(
-                                    "Static (manual), Dynamic (AI prompt), Expert (expert-driven)"
-                                )
-
                         ui.separator().classes('my-2')
                         ui.label('General Expert Configuration:').classes('text-subtitle1 mb-4')
                         
@@ -1830,11 +1821,19 @@ class ExpertSettingsTab:
                     
                     # Instruments tab
                     with ui.tab_panel('Instruments'):
-                        ui.label('Select and configure instruments for this expert:').classes('text-subtitle1 mb-4')
-                        
+                        # Instrument selection method dropdown at top of tab
+                        self.instrument_selection_method_select = ui.select(
+                            options=["static", "dynamic", "expert", "screener"],
+                            label='Instrument Selection Method',
+                            value="static",
+                            on_change=self._on_instrument_selection_method_change
+                        ).classes('w-full mb-4').props('dense').tooltip(
+                            "Static (manual), Dynamic (AI prompt), Expert (expert-driven), Screener (automated stock screener)"
+                        )
+
                         # Container for dynamic instrument UI content
                         self.instruments_content_container = ui.column().classes('w-full')
-                        
+
                         # Initialize with static content
                         self._render_instrument_content(expert_instance, is_edit)
                     
@@ -2725,7 +2724,19 @@ class ExpertSettingsTab:
                         self.test_ai_button = ui.button('Test AI Selection', on_click=self._test_ai_selection, icon='auto_awesome').props('color=positive')
 
                 self.instrument_selector = None  # Will be created after AI selection
-                
+
+            elif selection_method == 'screener':
+                # Screener-based selection - show screener settings
+                with ui.card().classes('w-full p-4 alert-banner info'):
+                    with ui.row():
+                        ui.icon('filter_list').classes('text-[#4dabf7] text-xl mr-3')
+                        with ui.column():
+                            ui.label('Stock Screener Instrument Selection').classes('text-lg font-semibold text-[#4dabf7]')
+                            ui.label('Stocks are automatically selected using configurable screening criteria. Set a value to 0 (or None) to disable that filter.').classes('text-secondary-custom')
+
+                self._render_screener_settings(expert_instance)
+                self.instrument_selector = None
+
             else:  # static (default)
                 self._render_static_instrument_selector(expert_instance, is_edit)
 
@@ -2739,6 +2750,186 @@ class ExpertSettingsTab:
         # Load current instrument configuration if editing
         if is_edit and expert_instance:
             self._load_expert_instrument_config(expert_instance)
+
+    def _render_screener_settings(self, expert_instance):
+        """Render screener-specific settings in a compact 2-column grid."""
+        from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
+        MarketExpertInterface._ensure_builtin_settings()
+        builtin = MarketExpertInterface._builtin_settings
+
+        # Load current values if editing
+        current_settings = {}
+        if expert_instance:
+            from ...core.utils import get_expert_instance_from_id
+            expert = get_expert_instance_from_id(expert_instance.id)
+            if expert:
+                current_settings = expert.settings
+
+        self.screener_settings_inputs = {}
+
+        # Screener setting keys in display order
+        screener_keys = [
+            "screener_provider",
+            "screener_market_cap_min", "screener_market_cap_max",
+            "screener_volume_min", "screener_volume_max",
+            "screener_float_min", "screener_float_max",
+            "screener_price_min", "screener_price_max",
+            "screener_relative_volume_min",
+            "screener_price_drop_pct", "screener_price_drop_days",
+            "screener_max_stocks", "screener_sort_metric",
+        ]
+
+        with self.instruments_content_container:
+            with ui.column().classes('w-full mt-4'):
+                for key in screener_keys:
+                    meta = builtin.get(key)
+                    if not meta:
+                        continue
+
+                    label_text = meta.get("description", key)
+                    current_value = current_settings.get(key)
+                    default_value = meta.get("default")
+                    valid_values = meta.get("valid_values")
+                    tooltip_text = meta.get("tooltip")
+
+                    # 2-column grid (same style as expert settings)
+                    setting_container = ui.element('div').classes('w-full mb-2').style(
+                        'display: grid; grid-template-columns: 60% 40%; align-items: center; gap: 8px'
+                    )
+                    with setting_container:
+                        # Label with tooltip
+                        if tooltip_text:
+                            with ui.row().classes('items-center gap-1'):
+                                ui.label(label_text).classes('text-xs')
+                                with ui.icon('help_outline', size='xs').classes('text-gray-500 cursor-help'):
+                                    ui.tooltip(tooltip_text).style('font-size: 14px; max-width: 400px; line-height: 1.4')
+                        else:
+                            ui.label(label_text).classes('text-xs')
+
+                        # Input field based on type
+                        if meta["type"] == "str" and valid_values:
+                            value = current_value if current_value is not None else default_value or ""
+                            inp = ui.select(
+                                options=valid_values,
+                                label='',
+                                value=value if value in valid_values else valid_values[0]
+                            ).classes('w-full').props('dense')
+                        elif meta["type"] == "int":
+                            if current_value is not None and current_value != "":
+                                try:
+                                    value = int(current_value)
+                                except (ValueError, TypeError):
+                                    value = default_value or 0
+                            else:
+                                value = default_value or 0
+                            inp = ui.input(label='', value=str(value)).classes('w-full').props('dense')
+                        elif meta["type"] == "float":
+                            value = current_value if current_value is not None else default_value or 0.0
+                            inp = ui.input(label='', value=str(value)).classes('w-full').props('dense')
+                        else:
+                            value = current_value if current_value is not None else default_value or ""
+                            inp = ui.input(label='', value=str(value)).classes('w-full').props('dense')
+
+                    self.screener_settings_inputs[key] = inp
+
+                # Test Screener button
+                with ui.row().classes('w-full justify-end mt-4'):
+                    self.test_screener_button = ui.button(
+                        'Test Screener',
+                        on_click=self._test_screener,
+                        icon='filter_list'
+                    ).props('color=positive')
+
+    async def _test_screener(self):
+        """Test stock screener with current (unsaved) form values."""
+        try:
+            if hasattr(self, 'test_screener_button'):
+                self.test_screener_button.props('loading disable')
+
+            # Build settings dict from current form values
+            settings = {}
+            if hasattr(self, 'screener_settings_inputs'):
+                from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
+                MarketExpertInterface._ensure_builtin_settings()
+                builtin = MarketExpertInterface._builtin_settings
+
+                for key, inp in self.screener_settings_inputs.items():
+                    meta = builtin.get(key, {})
+                    if meta.get("type") == "int":
+                        try:
+                            settings[key] = int(inp.value) if inp.value else 0
+                        except (ValueError, TypeError):
+                            settings[key] = 0
+                    elif meta.get("type") == "float":
+                        try:
+                            settings[key] = float(inp.value) if inp.value else 0.0
+                        except (ValueError, TypeError):
+                            settings[key] = 0.0
+                    else:
+                        settings[key] = inp.value
+
+            from ...core.StockScreener import StockScreener
+            screener = StockScreener(settings)
+
+            import asyncio
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, screener.screen)
+
+            if hasattr(self, 'test_screener_button'):
+                self.test_screener_button.props(remove='loading disable')
+
+            if result:
+                with ui.dialog() as result_dialog, ui.card().classes('w-full').style('max-width: 900px'):
+                    ui.label(f'Screener Results ({len(result)} stocks)').classes('text-lg font-semibold mb-4')
+
+                    columns = [
+                        {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'align': 'left'},
+                        {'name': 'company_name', 'label': 'Company', 'field': 'company_name', 'align': 'left'},
+                        {'name': 'price', 'label': 'Price', 'field': 'price', 'align': 'right'},
+                        {'name': 'market_cap', 'label': 'Market Cap', 'field': 'market_cap_fmt', 'align': 'right'},
+                        {'name': 'volume', 'label': 'Volume', 'field': 'volume_fmt', 'align': 'right'},
+                        {'name': 'float_shares', 'label': 'Float', 'field': 'float_fmt', 'align': 'right'},
+                        {'name': 'relative_volume', 'label': 'RVOL', 'field': 'rvol_fmt', 'align': 'right'},
+                        {'name': 'price_drop_pct', 'label': 'Drop %', 'field': 'drop_fmt', 'align': 'right'},
+                    ]
+
+                    def fmt_number(n, suffix=''):
+                        if n is None:
+                            return '-'
+                        if abs(n) >= 1e9:
+                            return f'{n/1e9:.1f}B{suffix}'
+                        if abs(n) >= 1e6:
+                            return f'{n/1e6:.1f}M{suffix}'
+                        if abs(n) >= 1e3:
+                            return f'{n/1e3:.0f}K{suffix}'
+                        return f'{n:.0f}{suffix}'
+
+                    rows = []
+                    for s in result:
+                        rows.append({
+                            'symbol': s.get('symbol', ''),
+                            'company_name': (s.get('company_name') or '')[:30],
+                            'price': f"${s.get('price', 0):.2f}" if s.get('price') else '-',
+                            'market_cap_fmt': fmt_number(s.get('market_cap')),
+                            'volume_fmt': fmt_number(s.get('volume')),
+                            'float_fmt': fmt_number(s.get('float_shares')),
+                            'rvol_fmt': f"{s.get('relative_volume', 0):.1f}x" if s.get('relative_volume') else '-',
+                            'drop_fmt': f"{s.get('price_drop_pct', 0):.1f}%" if s.get('price_drop_pct') else '-',
+                        })
+
+                    ui.table(columns=columns, rows=rows).classes('w-full').props('dense')
+
+                    with ui.row().classes('w-full justify-end mt-4'):
+                        ui.button('Close', on_click=result_dialog.close)
+                result_dialog.open()
+            else:
+                ui.notify('Screener returned no results. Try adjusting the filters.', type='warning')
+
+        except Exception as e:
+            if hasattr(self, 'test_screener_button'):
+                self.test_screener_button.props(remove='loading disable')
+            logger.error(f'Error testing screener: {e}', exc_info=True)
+            ui.notify(f'Error testing screener: {str(e)}', type='negative')
 
     async def _test_ai_selection(self):
         """Test AI instrument selection with current prompt."""
@@ -3482,7 +3673,10 @@ class ExpertSettingsTab:
                     expert_properties = expert_class.get_expert_properties()
                     can_recommend = expert_properties.get('can_recommend_instruments', False)
                     has_instruments = can_recommend
-            
+            elif selection_method == 'screener':
+                # Screener mode - always considered configured
+                has_instruments = True
+
             # Save instrument configuration
             self._save_instrument_configuration(expert_id)
             
@@ -3673,7 +3867,33 @@ class ExpertSettingsTab:
             # The expert will determine instruments automatically
             logger.debug(f'Expert {expert_id} uses expert-driven instrument selection - no static configuration saved')
             return
-            
+
+        elif selection_method == 'screener':
+            # Save screener settings
+            if hasattr(self, 'screener_settings_inputs'):
+                from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
+                MarketExpertInterface._ensure_builtin_settings()
+                builtin = MarketExpertInterface._builtin_settings
+
+                for key, inp in self.screener_settings_inputs.items():
+                    meta = builtin.get(key, {})
+                    if meta.get("type") == "int":
+                        try:
+                            value = int(inp.value) if inp.value and str(inp.value).strip() != "" else 0
+                        except (ValueError, TypeError):
+                            value = 0
+                        expert.save_setting(key, value, setting_type="int")
+                    elif meta.get("type") == "float":
+                        try:
+                            value = float(inp.value) if inp.value and str(inp.value).strip() != "" else 0.0
+                        except (ValueError, TypeError):
+                            value = 0.0
+                        expert.save_setting(key, value, setting_type="float")
+                    else:
+                        expert.save_setting(key, inp.value or "", setting_type="str")
+                logger.debug(f'Saved screener settings for expert {expert_id}')
+            return
+
         else:  # static
             # Traditional static instrument selection
             if not self.instrument_selector:
