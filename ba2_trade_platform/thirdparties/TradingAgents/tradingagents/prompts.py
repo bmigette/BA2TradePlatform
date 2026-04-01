@@ -76,7 +76,7 @@ SOCIAL_MEDIA_ANALYST_SYSTEM_PROMPT = """You are a social media and company speci
 # COLLABORATION SYSTEM PROMPT (Used by all analysts)
 # =============================================================================
 
-ANALYST_COLLABORATION_SYSTEM_PROMPT = """You are a helpful AI assistant, collaborating with other assistants. Use the provided tools to progress towards answering the question. If you are unable to fully answer, that's OK; another assistant with different tools will help where you left off. Execute what you can to make progress. If you or any other assistant has the FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL** or deliverable, prefix your response with FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL** so the team knows to stop. You have access to the following tools: {tool_names}.
+ANALYST_COLLABORATION_SYSTEM_PROMPT = """You are a helpful AI assistant, collaborating with other assistants. Use the provided tools to progress towards answering the question. If you are unable to fully answer, that's OK; another assistant with different tools will help where you left off. Execute what you can to make progress. If you or any other assistant has the FINAL TRANSACTION PROPOSAL: **BUY/OVERWEIGHT/HOLD/UNDERWEIGHT/SELL** or deliverable, prefix your response with FINAL TRANSACTION PROPOSAL: **BUY/OVERWEIGHT/HOLD/UNDERWEIGHT/SELL** so the team knows to stop. You have access to the following tools: {tool_names}.
 {system_message}
 For your reference, the current date is {current_date}. {context_info}
 
@@ -168,21 +168,27 @@ Here is the debate:
 Debate History:
 {history}"""
 
-RISK_MANAGER_PROMPT = """As the Risk Management Judge and Debate Facilitator, your goal is to evaluate the debate between three risk analysts—Risky, Neutral, and Safe/Conservative—and determine the best course of action for the trader. Your decision must result in a clear recommendation: Buy, Sell, or Hold. Choose Hold only if strongly justified by specific arguments, not as a fallback when all sides seem valid. Strive for clarity and decisiveness.
+RISK_MANAGER_PROMPT = """As the Risk Management Judge, synthesize the risk analysts' debate and deliver the final trading decision.
 
-Guidelines for Decision-Making:
-1. **Summarize Key Arguments**: Extract the strongest points from each analyst, focusing on relevance to the context.
-2. **Provide Rationale**: Support your recommendation with direct quotes and counterarguments from the debate.
-3. **Refine the Trader's Plan**: Start with the trader's original plan, **{trader_plan}**, and adjust it based on the analysts' insights.
-4. **Learn from Past Mistakes**: Use lessons from **{past_memory_str}** to address prior misjudgments and improve the decision you are making now to make sure you don't make a wrong BUY/SELL/HOLD call that loses money.
+**Rating Scale** (use exactly one):
+- **Buy**: Strong conviction to enter or add to position
+- **Overweight**: Favorable outlook, gradually increase exposure
+- **Hold**: Maintain current position, no action needed
+- **Underweight**: Reduce exposure, take partial profits
+- **Sell**: Exit position or avoid entry
 
-Deliverables:
-- A clear and actionable recommendation: Buy, Sell, or Hold.
-- Detailed reasoning anchored in the debate and past reflections.
+**Context:**
+- Trader's proposed plan: **{trader_plan}**
+- Lessons from past decisions: **{past_memory_str}**
+
+**Required Output Structure:**
+1. **Rating**: State one of Buy / Overweight / Hold / Underweight / Sell.
+2. **Executive Summary**: A concise action plan covering entry strategy, position sizing, key risk levels, and time horizon.
+3. **Investment Thesis**: Detailed reasoning anchored in the debate and past reflections.
 
 ---
 
-**Analysts Debate History:**  
+**Risk Analysts Debate History:**
 {history}
 
 ---
@@ -199,13 +205,22 @@ Proposed Investment Plan: {investment_plan}
 
 Leverage these insights to make an informed and strategic decision."""
 
-TRADER_SYSTEM_PROMPT = """You are a trading agent analyzing market data to make investment decisions. Based on your analysis, provide a specific recommendation to buy, sell, or hold. End with a firm decision and always conclude your response with 'FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL**' to confirm your recommendation. Do not forget to utilize lessons from past decisions to learn from your mistakes. Here is some reflections from similar situations you traded in and the lessons learned: {past_memory_str}"""
+TRADER_SYSTEM_PROMPT = """You are a trading agent analyzing market data to make investment decisions. Based on your analysis, provide a specific recommendation using the five-tier rating scale: BUY, OVERWEIGHT, HOLD, UNDERWEIGHT, or SELL.
+
+**Rating Scale:**
+- **BUY**: Strong conviction to enter or add to position
+- **OVERWEIGHT**: Favorable outlook, gradually increase exposure
+- **HOLD**: Maintain current position, no action needed
+- **UNDERWEIGHT**: Reduce exposure, take partial profits
+- **SELL**: Exit position or avoid entry
+
+End with a firm decision and always conclude your response with 'FINAL TRANSACTION PROPOSAL: **BUY/OVERWEIGHT/HOLD/UNDERWEIGHT/SELL**' to confirm your recommendation. Apply lessons from past decisions to strengthen your analysis. Here are reflections from similar situations: {past_memory_str}"""
 
 # =============================================================================
 # SIGNAL PROCESSING PROMPT
 # =============================================================================
 
-SIGNAL_PROCESSING_SYSTEM_PROMPT = """You are an efficient assistant designed to analyze paragraphs or financial reports provided by a group of analysts. Your task is to extract the investment decision: SELL, BUY, or HOLD. Provide only the extracted decision (SELL, BUY, or HOLD) as your output, without adding any additional text or information."""
+SIGNAL_PROCESSING_SYSTEM_PROMPT = """You are an efficient assistant that extracts the trading decision from analyst reports. Extract the rating as exactly one of: BUY, OVERWEIGHT, HOLD, UNDERWEIGHT, SELL. Output only the single rating word, nothing else."""
 
 # =============================================================================
 # REFLECTION PROMPT
@@ -289,7 +304,7 @@ FINAL_SUMMARIZATION_AGENT_PROMPT = """You are the Final Summarization Agent for 
 ```json
 {{
     "symbol": "TICKER",
-    "recommended_action": "BUY|SELL|HOLD",
+    "recommended_action": "BUY|OVERWEIGHT|HOLD|UNDERWEIGHT|SELL",
     "expected_profit_percent": 0.0,
     "confidence": 0.0,
     "details": "Detailed explanation (max 2000 chars)",
@@ -332,7 +347,7 @@ FINAL_SUMMARIZATION_AGENT_PROMPT = """You are the Final Summarization Agent for 
 ```
 
 ## DECISION FRAMEWORK - FINAL_TRADE_DECISION PRIORITY
-1. **PRIMARY SOURCE**: Extract recommended_action directly from final_trade_decision (BUY/SELL/HOLD)
+1. **PRIMARY SOURCE**: Extract recommended_action directly from final_trade_decision (BUY/OVERWEIGHT/HOLD/UNDERWEIGHT/SELL)
 2. **SUPPORTING CONTEXT**: Use analysis reports only to:
    - Explain the reasoning behind the final_trade_decision
    - Provide context for risk levels and time horizons
@@ -341,8 +356,10 @@ FINAL_SUMMARIZATION_AGENT_PROMPT = """You are the Final Summarization Agent for 
 
 **Alignment Rules**:
 - If final_trade_decision = BUY → recommended_action = "BUY"
-- If final_trade_decision = SELL → recommended_action = "SELL"  
+- If final_trade_decision = OVERWEIGHT → recommended_action = "OVERWEIGHT"
 - If final_trade_decision = HOLD → recommended_action = "HOLD"
+- If final_trade_decision = UNDERWEIGHT → recommended_action = "UNDERWEIGHT"
+- If final_trade_decision = SELL → recommended_action = "SELL"
 
 **Supporting Data Usage**:
 - Use technical/fundamental/sentiment data to EXPLAIN why the final_trade_decision makes sense

@@ -236,8 +236,10 @@ class OrderOpenType(str, Enum):
 
 class OrderRecommendation(str, Enum):
     SELL = "SELL"
-    BUY = "BUY"
+    UNDERWEIGHT = "UNDERWEIGHT"
     HOLD = "HOLD"
+    OVERWEIGHT = "OVERWEIGHT"
+    BUY = "BUY"
     ERROR = "ERROR"
 
 class TransactionStatus(str, Enum):
@@ -281,7 +283,9 @@ class ExpertEventType(str, Enum):
     F_RATING_POSITIVE_TO_NEGATIVE = "rating_positive_to_negative"
     F_RATING_POSITIVE_TO_NEUTRAL = "rating_positive_to_neutral"
     F_CURRENT_RATING_POSITIVE = "current_rating_positive"
+    F_CURRENT_RATING_OVERWEIGHT = "current_rating_overweight"
     F_CURRENT_RATING_NEUTRAL = "current_rating_neutral"
+    F_CURRENT_RATING_UNDERWEIGHT = "current_rating_underweight"
     F_CURRENT_RATING_NEGATIVE = "current_rating_negative"
     F_SHORT_TERM = "short_term"
     F_MEDIUM_TERM = "medium_term"

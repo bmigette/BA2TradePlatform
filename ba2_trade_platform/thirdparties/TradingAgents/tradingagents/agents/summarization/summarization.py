@@ -45,7 +45,7 @@ class AnalysisSummary(BaseModel):
 class ExpertRecommendation(BaseModel):
     """Structured expert recommendation output"""
     symbol: str = Field(description="Stock ticker symbol")
-    recommended_action: str = Field(description="BUY|SELL|HOLD")
+    recommended_action: str = Field(description="BUY|OVERWEIGHT|HOLD|UNDERWEIGHT|SELL")
     expected_profit_percent: float = Field(description="Expected profit percentage from the trade. ALWAYS POSITIVE for BUY and SELL (it represents profit, not price direction). For BUY: ((take_profit - price_at_date) / price_at_date) * 100. For SELL: ((price_at_date - stop_loss) / price_at_date) * 100. For HOLD: 0.0. Example: SELL at $100 with target $87 = 13.0 (NOT -13.0)")
     confidence: float = Field(description="Confidence level (0-100)")
     details: str = Field(description="Detailed explanation of recommendation", max_length=2000)

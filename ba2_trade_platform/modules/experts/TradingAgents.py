@@ -505,7 +505,7 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                     self.logger.error(f"Error fetching account price for {symbol}: {e}", exc_info=True)
 
             return {
-                'signal': processed_signal if processed_signal in ['BUY', 'SELL', 'HOLD'] else OrderRecommendation.ERROR,
+                'signal': processed_signal if processed_signal in ['BUY', 'OVERWEIGHT', 'HOLD', 'UNDERWEIGHT', 'SELL'] else OrderRecommendation.ERROR,
                 'confidence': 0.0,
                 'expected_profit': 0.0,
                 'details': f"TradingAgents analysis: {processed_signal}",

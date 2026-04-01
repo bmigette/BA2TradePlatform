@@ -5,16 +5,53 @@ This module provides helper functions for validating inputs, managing cache,
 and working with provider outputs.
 """
 
-from typing import Dict, Any, Optional, List, Literal, Callable
+from typing import Dict, Any, Optional, List, Literal, Callable, TypeVar
 from datetime import datetime, timezone, timedelta
 import json
 import functools
 import inspect
+import time
 
 from ba2_trade_platform.core.models import AnalysisOutput
 from ba2_trade_platform.core.db import get_db
 from ba2_trade_platform.logger import logger
 from sqlmodel import Session, select, or_, and_
+
+T = TypeVar("T")
+
+
+def yf_retry(func: Callable[[], T], max_retries: int = 3, base_delay: float = 2.0) -> T:
+    """
+    Retry a yfinance call with exponential backoff on rate limit errors (HTTP 429).
+
+    Args:
+        func: Zero-argument callable that performs the yfinance API call
+        max_retries: Maximum number of retry attempts (default: 3)
+        base_delay: Base delay in seconds, doubled each retry (default: 2.0)
+
+    Returns:
+        The result of the callable
+
+    Raises:
+        The last exception if all retries are exhausted
+    """
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            return func()
+        except Exception as e:
+            err_str = str(e).lower()
+            is_rate_limit = "too many requests" in err_str or "429" in err_str or "rate" in err_str
+            if not is_rate_limit or attempt == max_retries:
+                raise
+            last_exc = e
+            delay = base_delay * (2 ** attempt)
+            logger.warning(
+                f"yfinance rate limited (attempt {attempt + 1}/{max_retries + 1}), "
+                f"retrying in {delay:.1f}s: {e}"
+            )
+            time.sleep(delay)
+    raise last_exc
 
 
 def log_provider_call(func: Callable) -> Callable:

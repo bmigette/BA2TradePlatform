@@ -11,7 +11,7 @@ import yfinance as yf
 import pandas as pd
 
 from ba2_trade_platform.core.interfaces import CompanyFundamentalsDetailsInterface
-from ba2_trade_platform.core.provider_utils import log_provider_call
+from ba2_trade_platform.core.provider_utils import log_provider_call, yf_retry
 from ba2_trade_platform.logger import logger
 
 
@@ -134,12 +134,12 @@ class YFinanceCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
         
         try:
             ticker_obj = yf.Ticker(symbol.upper())
-            
+
             if frequency.lower() == "quarterly":
-                data = ticker_obj.quarterly_balance_sheet
+                data = yf_retry(lambda: ticker_obj.quarterly_balance_sheet)
             else:
-                data = ticker_obj.balance_sheet
-                
+                data = yf_retry(lambda: ticker_obj.balance_sheet)
+
             if data.empty:
                 error_msg = f"No balance sheet data found for symbol '{symbol}'"
                 logger.warning(error_msg)
@@ -254,12 +254,12 @@ class YFinanceCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
         
         try:
             ticker_obj = yf.Ticker(symbol.upper())
-            
+
             if frequency.lower() == "quarterly":
-                data = ticker_obj.quarterly_income_stmt
+                data = yf_retry(lambda: ticker_obj.quarterly_income_stmt)
             else:
-                data = ticker_obj.income_stmt
-                
+                data = yf_retry(lambda: ticker_obj.income_stmt)
+
             if data.empty:
                 error_msg = f"No income statement data found for symbol '{symbol}'"
                 logger.warning(error_msg)
@@ -374,12 +374,12 @@ class YFinanceCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
         
         try:
             ticker_obj = yf.Ticker(symbol.upper())
-            
+
             if frequency.lower() == "quarterly":
-                data = ticker_obj.quarterly_cashflow
+                data = yf_retry(lambda: ticker_obj.quarterly_cashflow)
             else:
-                data = ticker_obj.cashflow
-                
+                data = yf_retry(lambda: ticker_obj.cashflow)
+
             if data.empty:
                 error_msg = f"No cash flow data found for symbol '{symbol}'"
                 logger.warning(error_msg)
@@ -579,9 +579,9 @@ class YFinanceCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             
             # Get earnings history using the new yfinance method
             if frequency.lower() == "quarterly":
-                data = ticker_obj.get_earnings(freq='quarterly')
+                data = yf_retry(lambda: ticker_obj.get_earnings(freq='quarterly'))
             else:
-                data = ticker_obj.get_earnings(freq='yearly')
+                data = yf_retry(lambda: ticker_obj.get_earnings(freq='yearly'))
             
             if data is None or data.empty:
                 error_msg = f"No earnings data found for symbol '{symbol}'"
@@ -691,10 +691,10 @@ class YFinanceCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             
             # Get earnings estimates
             if frequency.lower() == "quarterly":
-                data = ticker_obj.get_earnings_estimate()
+                data = yf_retry(lambda: ticker_obj.get_earnings_estimate())
             else:
                 # For annual, we use the earnings estimate with yearly aggregation
-                data = ticker_obj.get_earnings_estimate()
+                data = yf_retry(lambda: ticker_obj.get_earnings_estimate())
             
             if data is None or data.empty:
                 error_msg = f"No earnings estimates found for symbol '{symbol}'"

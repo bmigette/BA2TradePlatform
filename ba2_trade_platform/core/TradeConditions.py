@@ -523,6 +523,38 @@ class CurrentRatingNegativeCondition(FlagCondition):
         return f"Current rating: {action.value}" if action else None
 
 
+class CurrentRatingOverweightCondition(FlagCondition):
+    """Check if current recommendation is OVERWEIGHT."""
+    def evaluate(self) -> bool:
+        try:
+            return self.expert_recommendation.recommended_action == OrderRecommendation.OVERWEIGHT
+        except Exception as e:
+            logger.error(f"Error evaluating current rating overweight condition: {e}", exc_info=True)
+            return False
+    def get_description(self) -> str:
+        return f"Check if current recommendation for {self.instrument_name} is OVERWEIGHT"
+
+    def get_actual_value_display(self) -> Optional[str]:
+        action = getattr(self.expert_recommendation, 'recommended_action', None)
+        return f"Current rating: {action.value}" if action else None
+
+
+class CurrentRatingUnderweightCondition(FlagCondition):
+    """Check if current recommendation is UNDERWEIGHT."""
+    def evaluate(self) -> bool:
+        try:
+            return self.expert_recommendation.recommended_action == OrderRecommendation.UNDERWEIGHT
+        except Exception as e:
+            logger.error(f"Error evaluating current rating underweight condition: {e}", exc_info=True)
+            return False
+    def get_description(self) -> str:
+        return f"Check if current recommendation for {self.instrument_name} is UNDERWEIGHT"
+
+    def get_actual_value_display(self) -> Optional[str]:
+        action = getattr(self.expert_recommendation, 'recommended_action', None)
+        return f"Current rating: {action.value}" if action else None
+
+
 # Risk Level Flag Conditions
 class HighRiskCondition(FlagCondition):
     """Check if expert recommendation has high risk."""
@@ -626,9 +658,9 @@ class NewTargetHigherCondition(FlagCondition):
             
             # Calculate new target based on recommendation direction
             from .types import OrderRecommendation
-            if self.expert_recommendation.recommended_action == OrderRecommendation.BUY:
+            if self.expert_recommendation.recommended_action in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
                 new_target_price = base_price * (1 + expected_profit / 100)
-            elif self.expert_recommendation.recommended_action == OrderRecommendation.SELL:
+            elif self.expert_recommendation.recommended_action in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
                 new_target_price = base_price * (1 - expected_profit / 100)
             else:
                 logger.debug(f"Recommendation action is HOLD, cannot calculate target")
@@ -722,9 +754,9 @@ class NewTargetLowerCondition(FlagCondition):
             
             # Calculate new target based on recommendation direction
             from .types import OrderRecommendation
-            if self.expert_recommendation.recommended_action == OrderRecommendation.BUY:
+            if self.expert_recommendation.recommended_action in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
                 new_target_price = base_price * (1 + expected_profit / 100)
-            elif self.expert_recommendation.recommended_action == OrderRecommendation.SELL:
+            elif self.expert_recommendation.recommended_action in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
                 new_target_price = base_price * (1 - expected_profit / 100)
             else:
                 logger.debug(f"Recommendation action is HOLD, cannot calculate target")
@@ -1009,9 +1041,9 @@ class NewTargetPercentCondition(CompareCondition):
             
             # Calculate new target based on recommendation direction
             from .types import OrderRecommendation
-            if self.expert_recommendation.recommended_action == OrderRecommendation.BUY:
+            if self.expert_recommendation.recommended_action in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
                 new_target_price = base_price * (1 + expected_profit / 100)
-            elif self.expert_recommendation.recommended_action == OrderRecommendation.SELL:
+            elif self.expert_recommendation.recommended_action in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
                 new_target_price = base_price * (1 - expected_profit / 100)
             else:
                 logger.debug(f"Recommendation action is HOLD, cannot calculate target")
@@ -1076,9 +1108,9 @@ class PercentToNewTargetCondition(CompareCondition):
             
             # Calculate new target based on recommendation direction
             from .types import OrderRecommendation
-            if self.expert_recommendation.recommended_action == OrderRecommendation.BUY:
+            if self.expert_recommendation.recommended_action in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
                 new_target_price = base_price * (1 + expected_profit / 100)
-            elif self.expert_recommendation.recommended_action == OrderRecommendation.SELL:
+            elif self.expert_recommendation.recommended_action in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
                 new_target_price = base_price * (1 - expected_profit / 100)
             else:
                 logger.debug(f"Recommendation action is HOLD, cannot calculate target")
@@ -1159,9 +1191,9 @@ class PercentOpenToNewTargetCondition(CompareCondition):
             expected_profit = self.expert_recommendation.expected_profit_percent
 
             from .types import OrderRecommendation
-            if self.expert_recommendation.recommended_action == OrderRecommendation.BUY:
+            if self.expert_recommendation.recommended_action in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
                 new_target_price = base_price * (1 + expected_profit / 100)
-            elif self.expert_recommendation.recommended_action == OrderRecommendation.SELL:
+            elif self.expert_recommendation.recommended_action in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
                 new_target_price = base_price * (1 - expected_profit / 100)
             else:
                 logger.debug(f"Recommendation action is HOLD, cannot calculate target")
@@ -1500,7 +1532,9 @@ def create_condition(event_type: ExpertEventType, account: AccountInterface,
         ExpertEventType.F_MEDIUM_TERM: MediumTermCondition,
         ExpertEventType.F_SHORT_TERM: ShortTermCondition,
         ExpertEventType.F_CURRENT_RATING_POSITIVE: CurrentRatingPositiveCondition,
+        ExpertEventType.F_CURRENT_RATING_OVERWEIGHT: CurrentRatingOverweightCondition,
         ExpertEventType.F_CURRENT_RATING_NEUTRAL: CurrentRatingNeutralCondition,
+        ExpertEventType.F_CURRENT_RATING_UNDERWEIGHT: CurrentRatingUnderweightCondition,
         ExpertEventType.F_CURRENT_RATING_NEGATIVE: CurrentRatingNegativeCondition,
         ExpertEventType.F_HIGHRISK: HighRiskCondition,
         ExpertEventType.F_MEDIUMRISK: MediumRiskCondition,

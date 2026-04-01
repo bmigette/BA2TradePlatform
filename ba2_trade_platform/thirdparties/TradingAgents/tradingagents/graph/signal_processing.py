@@ -23,7 +23,7 @@ class SignalProcessor:
             full_signal: Complete trading signal text
 
         Returns:
-            Extracted decision (BUY, SELL, or HOLD)
+            Extracted decision (BUY, OVERWEIGHT, HOLD, UNDERWEIGHT, or SELL)
         """
         messages = [
             (

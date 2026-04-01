@@ -10,7 +10,7 @@ from typing import Optional
 import pandas as pd
 import yfinance as yf
 from ba2_trade_platform.core.interfaces.MarketDataProviderInterface import MarketDataProviderInterface
-from ba2_trade_platform.core.provider_utils import log_provider_call
+from ba2_trade_platform.core.provider_utils import log_provider_call, yf_retry
 from ba2_trade_platform.logger import logger
 
 
@@ -88,16 +88,18 @@ class YFinanceDataProvider(MarketDataProviderInterface):
             logger.info(f"Fetching {symbol} data from Yahoo Finance: "
                        f"{start_date.date()} to {end_date.date()}, interval={interval}")
             
-            # Download data from Yahoo Finance
-            data = yf.download(
+            # Download data from Yahoo Finance (with retry on rate limit)
+            norm_start = self.normalize_time_to_interval(start_date, interval)
+            norm_end = self.normalize_time_to_interval(end_date, interval)
+            data = yf_retry(lambda: yf.download(
                 symbol,
-                start=self.normalize_time_to_interval(start_date, interval), #.strftime("%Y-%m-%d"),
-                end=self.normalize_time_to_interval(end_date, interval), #.strftime("%Y-%m-%d"),
+                start=norm_start,
+                end=norm_end,
                 interval=interval,
                 multi_level_index=False,
                 progress=False,
                 auto_adjust=True  # Adjust for splits and dividends
-            )
+            ))
             
             if data.empty:
                 raise Exception(f"No data returned for {symbol}")

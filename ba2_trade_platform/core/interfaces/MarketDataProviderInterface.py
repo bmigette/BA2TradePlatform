@@ -121,6 +121,54 @@ class MarketDataProviderInterface(DataProviderInterface):
             logger.warning(f"Unknown interval format '{interval}', returning time with seconds zeroed")
             return dt.replace(second=0, microsecond=0)
     
+    @staticmethod
+    def _clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Clean and harden an OHLCV DataFrame against malformed data.
+
+        Handles:
+        - Coerces Date column to datetime, dropping unparseable rows
+        - Coerces OHLCV columns to numeric, replacing failures with NaN
+        - Drops rows where Close is missing (essential for analysis)
+        - Forward-fills then back-fills remaining price gaps
+        """
+        if df.empty:
+            return df
+
+        # Coerce Date to datetime
+        if 'Date' in df.columns:
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+            before_len = len(df)
+            df = df.dropna(subset=['Date'])
+            dropped = before_len - len(df)
+            if dropped > 0:
+                logger.warning(f"Dropped {dropped} rows with invalid dates")
+
+        # Coerce price/volume columns to numeric
+        numeric_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        # Drop rows missing Close (essential)
+        if 'Close' in df.columns:
+            before_len = len(df)
+            df = df.dropna(subset=['Close'])
+            dropped = before_len - len(df)
+            if dropped > 0:
+                logger.warning(f"Dropped {dropped} rows with missing Close price")
+
+        # Forward-fill then back-fill remaining price gaps
+        price_cols = [c for c in ['Open', 'High', 'Low', 'Close'] if c in df.columns]
+        if price_cols:
+            df[price_cols] = df[price_cols].ffill().bfill()
+
+        # Fill missing volume with 0
+        if 'Volume' in df.columns:
+            df['Volume'] = df['Volume'].fillna(0)
+
+        return df.reset_index(drop=True)
+
     @abstractmethod
     def _get_ohlcv_data_impl(
         self,
@@ -213,16 +261,17 @@ class MarketDataProviderInterface(DataProviderInterface):
                     self._delete_cache_file(cache_file)
                     return None
                 
-                df = pd.read_csv(cache_file)
-                
+                df = pd.read_csv(cache_file, on_bad_lines="skip")
+
                 # Validate that the DataFrame has expected columns
                 if df.empty or 'Date' not in df.columns:
                     logger.warning(f"Cache file has no valid data/columns, deleting: {cache_file}")
                     if delete_if_corrupted:
                         self._delete_cache_file(cache_file)
                     return None
-                    
-                df['Date'] = pd.to_datetime(df['Date'])
+
+                # Clean and harden against malformed data
+                df = self._clean_dataframe(df)
                 # logger.debug(f"Loaded {len(df)} records from cache: {cache_file}")
                 return df
             except Exception as e:
@@ -488,10 +537,13 @@ class MarketDataProviderInterface(DataProviderInterface):
             fetch_end = end_date if end_date else datetime.now()
             
             df = self._get_ohlcv_data_impl(symbol, fetch_start, fetch_end, interval)
-            
+
             if df is None or df.empty:
                 raise Exception(f"Failed to fetch data for {symbol}")
-            
+
+            # Clean and harden against malformed data
+            df = self._clean_dataframe(df)
+
             # Save to cache
             if use_cache:
                 self._save_cache(df, cache_file)
@@ -591,18 +643,21 @@ class MarketDataProviderInterface(DataProviderInterface):
             fetch_end = datetime.now()
             
             df = self._get_ohlcv_data_impl(symbol, fetch_start, fetch_end, interval)
-            
+
             if df is None or df.empty:
                 raise Exception(f"Failed to fetch data for {symbol}")
-            
+
+            # Clean and harden against malformed data
+            df = self._clean_dataframe(df)
+
             # Save to cache
             if use_cache:
                 self._save_cache(df, cache_file)
-        
+
         # Ensure Date column is datetime
         if 'Date' in df.columns:
             df['Date'] = pd.to_datetime(df['Date'])
-        
+
         # Handle timezone compatibility between DataFrame and filter dates
         from datetime import timezone as tz
         

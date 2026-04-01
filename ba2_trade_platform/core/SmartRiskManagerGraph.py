@@ -1519,7 +1519,7 @@ def check_recent_analyses(state: SmartRiskManagerState) -> Dict[str, Any]:
                         analysis_recommendations[rec.market_analysis_id] = rec
         
         # First group by action type (BUY/SELL/HOLD), then by symbol
-        by_action_and_symbol = {'BUY': {}, 'SELL': {}, 'HOLD': {}, 'UNKNOWN': {}}
+        by_action_and_symbol = {'BUY': {}, 'OVERWEIGHT': {}, 'HOLD': {}, 'UNDERWEIGHT': {}, 'SELL': {}, 'UNKNOWN': {}}
         for analysis in all_analyses:
             sym = analysis['symbol']
             analysis_id = analysis['analysis_id']
@@ -1603,12 +1603,14 @@ def check_recent_analyses(state: SmartRiskManagerState) -> Dict[str, Any]:
         # Show summary grouped by action type, then symbol
         action_labels = {
             'BUY': '🟢 Strong BUY Signals',
-            'SELL': '🔴 SELL Signals',
+            'OVERWEIGHT': '🟩 OVERWEIGHT Signals',
             'HOLD': '🟡 HOLD Recommendations',
+            'UNDERWEIGHT': '🟧 UNDERWEIGHT Signals',
+            'SELL': '🔴 SELL Signals',
             'UNKNOWN': '⚪ Other Analyses'
         }
-        
-        for action in ['BUY', 'SELL', 'HOLD', 'UNKNOWN']:
+
+        for action in ['BUY', 'OVERWEIGHT', 'HOLD', 'UNDERWEIGHT', 'SELL', 'UNKNOWN']:
             symbols_dict = by_action_and_symbol[action]
             if not symbols_dict:
                 continue

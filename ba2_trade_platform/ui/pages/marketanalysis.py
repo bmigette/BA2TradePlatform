@@ -3496,7 +3496,7 @@ class OrderRecommendationsTab:
                 
                 # Action filter
                 self.action_filter = ui.select(
-                    options=['All', 'BUY', 'SELL', 'HOLD'],
+                    options=['All', 'BUY', 'OVERWEIGHT', 'HOLD', 'UNDERWEIGHT', 'SELL'],
                     label='Action',
                     value='All'
                 ).classes('w-28').props('dense outlined')
@@ -3617,8 +3617,8 @@ class OrderRecommendationsTab:
                     select(
                         ExpertRecommendation.symbol,
                         func.count(ExpertRecommendation.id).label('total_recommendations'),
-                        func.sum(case((ExpertRecommendation.recommended_action == OrderRecommendation.BUY, 1), else_=0)).label('buy_count'),
-                        func.sum(case((ExpertRecommendation.recommended_action == OrderRecommendation.SELL, 1), else_=0)).label('sell_count'),
+                        func.sum(case((ExpertRecommendation.recommended_action.in_([OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT]), 1), else_=0)).label('buy_count'),
+                        func.sum(case((ExpertRecommendation.recommended_action.in_([OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT]), 1), else_=0)).label('sell_count'),
                         func.sum(case((ExpertRecommendation.recommended_action == OrderRecommendation.HOLD, 1), else_=0)).label('hold_count'),
                         func.avg(ExpertRecommendation.confidence).label('avg_confidence'),
                         func.max(ExpertRecommendation.created_at).label('latest_created_at')
@@ -3945,9 +3945,11 @@ class OrderRecommendationsTab:
                         
                     # Convert enum values to readable text
                     action_mapping = {
-                        OrderRecommendation.BUY.value: 'Buy', 
-                        OrderRecommendation.SELL.value: 'Sell', 
+                        OrderRecommendation.BUY.value: 'Buy',
+                        OrderRecommendation.OVERWEIGHT.value: 'Overweight',
                         OrderRecommendation.HOLD.value: 'Hold',
+                        OrderRecommendation.UNDERWEIGHT.value: 'Underweight',
+                        OrderRecommendation.SELL.value: 'Sell',
                         OrderRecommendation.ERROR.value: 'Error'
                     }
                     action = action_mapping.get(action_raw, action_raw)
@@ -3971,7 +3973,7 @@ class OrderRecommendationsTab:
                         'id': recommendation.id,
                         'symbol': recommendation.symbol,
                         'action': action,
-                        'action_color': {'Buy': 'green', 'Sell': 'red', 'Hold': 'orange', 'Error': 'red'}.get(action, 'grey'),
+                        'action_color': {'Buy': 'green', 'Overweight': 'light-green', 'Hold': 'orange', 'Underweight': 'deep-orange', 'Sell': 'red', 'Error': 'red'}.get(action, 'grey'),
                         'confidence': f"{recommendation.confidence:.1f}%" if recommendation.confidence is not None else 'N/A',
                         'expected_profit': f"{recommendation.expected_profit_percent:.2f}%" if recommendation.expected_profit_percent else 'N/A',
                         'price_at_date': f"${recommendation.price_at_date:.2f}" if recommendation.price_at_date else 'N/A',
@@ -4208,9 +4210,11 @@ class OrderRecommendationsTab:
                         
                     # Convert enum values to readable text
                     action_mapping = {
-                        OrderRecommendation.BUY.value: 'Buy', 
-                        OrderRecommendation.SELL.value: 'Sell', 
+                        OrderRecommendation.BUY.value: 'Buy',
+                        OrderRecommendation.OVERWEIGHT.value: 'Overweight',
                         OrderRecommendation.HOLD.value: 'Hold',
+                        OrderRecommendation.UNDERWEIGHT.value: 'Underweight',
+                        OrderRecommendation.SELL.value: 'Sell',
                         OrderRecommendation.ERROR.value: 'Error'
                     }
                     action = action_mapping.get(action_raw, action_raw)

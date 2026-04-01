@@ -753,10 +753,10 @@ class AdjustTakeProfitAction(TradeAction):
                             logger.info(f"TP Reference: EXPERT_TARGET_PRICE - base_price: ${base_price:.2f}, expected_profit: {expected_profit:.1f}%, action: {expert_rec.recommended_action}")
                             
                             # Calculate target price based on recommendation direction
-                            if expert_rec.recommended_action == OrderRecommendation.BUY:
+                            if expert_rec.recommended_action in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
                                 reference_price = base_price * (1 + expected_profit / 100)
                                 logger.info(f"TP Target (BUY): ${base_price:.2f} * (1 + {expected_profit:.1f}/100) = ${reference_price:.2f}")
-                            elif expert_rec.recommended_action == OrderRecommendation.SELL:
+                            elif expert_rec.recommended_action in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
                                 reference_price = base_price * (1 - expected_profit / 100)
                                 logger.info(f"TP Target (SELL): ${base_price:.2f} * (1 - {expected_profit:.1f}/100) = ${reference_price:.2f}")
                             else:
@@ -799,11 +799,11 @@ class AdjustTakeProfitAction(TradeAction):
                 
                 # Determine if we're going LONG (BUY) or SHORT (SELL)
                 is_long_position = False
-                if self.order_recommendation == OrderRecommendation.BUY:
+                if self.order_recommendation in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
                     # Expert recommends BUY = going LONG
                     is_long_position = True
                     logger.info(f"TP Direction: Using order_recommendation={self.order_recommendation.value} → LONG position")
-                elif self.order_recommendation == OrderRecommendation.SELL:
+                elif self.order_recommendation in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
                     # Expert recommends SELL = going SHORT
                     is_long_position = False
                     logger.info(f"TP Direction: Using order_recommendation={self.order_recommendation.value} → SHORT position")
@@ -954,17 +954,17 @@ class AdjustTakeProfitAction(TradeAction):
                 if expert_rec and hasattr(expert_rec, 'price_at_date') and hasattr(expert_rec, 'expected_profit_percent'):
                     base_price = expert_rec.price_at_date
                     expected_profit = expert_rec.expected_profit_percent
-                    if expert_rec.recommended_action == OrderRecommendation.BUY:
+                    if expert_rec.recommended_action in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
                         reference_price = base_price * (1 + expected_profit / 100)
-                    elif expert_rec.recommended_action == OrderRecommendation.SELL:
+                    elif expert_rec.recommended_action in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
                         reference_price = base_price * (1 - expected_profit / 100)
 
         if reference_price is None:
             return None
 
-        if self.order_recommendation == OrderRecommendation.BUY:
+        if self.order_recommendation in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
             is_long = True
-        elif self.order_recommendation == OrderRecommendation.SELL:
+        elif self.order_recommendation in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
             is_long = False
         else:
             order_side = str(order.side.value if hasattr(order.side, 'value') else order.side).upper()
@@ -1021,14 +1021,14 @@ class AdjustTakeProfitAction(TradeAction):
                         base_price = expert_rec.price_at_date
                         expected_profit = expert_rec.expected_profit_percent
 
-                        if expert_rec.recommended_action == OrderRecommendation.BUY:
+                        if expert_rec.recommended_action in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
                             preview["reference_price"] = base_price * (1 + expected_profit / 100)
-                        elif expert_rec.recommended_action == OrderRecommendation.SELL:
+                        elif expert_rec.recommended_action in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
                             preview["reference_price"] = base_price * (1 - expected_profit / 100)
 
                 # Calculate final price
                 if preview["reference_price"] and self.percent is not None:
-                    is_long = (self.order_recommendation == OrderRecommendation.BUY)
+                    is_long = (self.order_recommendation in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT))
                     if not is_long and self.existing_order:
                         order_side = str(self.existing_order.side.value if hasattr(self.existing_order.side, 'value') else self.existing_order.side).upper()
                         is_long = (order_side == "BUY")
@@ -1158,10 +1158,10 @@ class AdjustStopLossAction(TradeAction):
                             logger.info(f"SL Reference: EXPERT_TARGET_PRICE - base_price: ${base_price:.2f}, expected_profit: {expected_profit:.1f}%, action: {expert_rec.recommended_action}")
                             
                             # Calculate target price based on recommendation direction
-                            if expert_rec.recommended_action == OrderRecommendation.BUY:
+                            if expert_rec.recommended_action in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
                                 reference_price = base_price * (1 + expected_profit / 100)
                                 logger.info(f"SL Target (BUY): ${base_price:.2f} * (1 + {expected_profit:.1f}/100) = ${reference_price:.2f}")
-                            elif expert_rec.recommended_action == OrderRecommendation.SELL:
+                            elif expert_rec.recommended_action in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
                                 reference_price = base_price * (1 - expected_profit / 100)
                                 logger.info(f"SL Target (SELL): ${base_price:.2f} * (1 - {expected_profit:.1f}/100) = ${reference_price:.2f}")
                             else:
@@ -1204,11 +1204,11 @@ class AdjustStopLossAction(TradeAction):
                 
                 # Determine if we're going LONG (BUY) or SHORT (SELL)
                 is_long_position = False
-                if self.order_recommendation == OrderRecommendation.BUY:
+                if self.order_recommendation in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
                     # Expert recommends BUY = going LONG
                     is_long_position = True
                     logger.info(f"SL Direction: Using order_recommendation={self.order_recommendation.value} → LONG position")
-                elif self.order_recommendation == OrderRecommendation.SELL:
+                elif self.order_recommendation in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
                     # Expert recommends SELL = going SHORT
                     is_long_position = False
                     logger.info(f"SL Direction: Using order_recommendation={self.order_recommendation.value} → SHORT position")
@@ -1379,17 +1379,17 @@ class AdjustStopLossAction(TradeAction):
                 if expert_rec and hasattr(expert_rec, 'price_at_date') and hasattr(expert_rec, 'expected_profit_percent'):
                     base_price = expert_rec.price_at_date
                     expected_profit = expert_rec.expected_profit_percent
-                    if expert_rec.recommended_action == OrderRecommendation.BUY:
+                    if expert_rec.recommended_action in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
                         reference_price = base_price * (1 + expected_profit / 100)
-                    elif expert_rec.recommended_action == OrderRecommendation.SELL:
+                    elif expert_rec.recommended_action in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
                         reference_price = base_price * (1 - expected_profit / 100)
 
         if reference_price is None:
             return None
 
-        if self.order_recommendation == OrderRecommendation.BUY:
+        if self.order_recommendation in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
             is_long = True
-        elif self.order_recommendation == OrderRecommendation.SELL:
+        elif self.order_recommendation in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
             is_long = False
         else:
             order_side = str(order.side.value if hasattr(order.side, 'value') else order.side).upper()
@@ -1462,14 +1462,14 @@ class AdjustStopLossAction(TradeAction):
                         base_price = expert_rec.price_at_date
                         expected_profit = expert_rec.expected_profit_percent
 
-                        if expert_rec.recommended_action == OrderRecommendation.BUY:
+                        if expert_rec.recommended_action in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
                             preview["reference_price"] = base_price * (1 + expected_profit / 100)
-                        elif expert_rec.recommended_action == OrderRecommendation.SELL:
+                        elif expert_rec.recommended_action in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
                             preview["reference_price"] = base_price * (1 - expected_profit / 100)
 
                 # Calculate final price
                 if preview["reference_price"] and self.percent is not None:
-                    is_long = (self.order_recommendation == OrderRecommendation.BUY)
+                    is_long = (self.order_recommendation in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT))
                     if not is_long and self.existing_order:
                         order_side = str(self.existing_order.side.value if hasattr(self.existing_order.side, 'value') else self.existing_order.side).upper()
                         is_long = (order_side == "BUY")

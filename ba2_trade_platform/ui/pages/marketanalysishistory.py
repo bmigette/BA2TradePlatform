@@ -424,15 +424,19 @@ class MarketAnalysisHistoryPage:
             # Define colors and icons for different actions
             action_colors = {
                 'BUY': '#10b981',
-                'SELL': '#ef4444',
+                'OVERWEIGHT': '#6ee7b7',
                 'HOLD': '#f59e0b',
+                'UNDERWEIGHT': '#fb923c',
+                'SELL': '#ef4444',
                 'ERROR': '#6b7280'
             }
-            
+
             action_icons = {
                 'BUY': '📈',
-                'SELL': '📉',
+                'OVERWEIGHT': '📊',
                 'HOLD': '➖',
+                'UNDERWEIGHT': '📉',
+                'SELL': '🔻',
                 'ERROR': '❌'
             }
             

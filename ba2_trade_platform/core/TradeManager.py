@@ -738,7 +738,11 @@ class TradeManager:
         """
         if action == OrderRecommendation.BUY:
             return permissions.get('enable_buy', False)
+        elif action == OrderRecommendation.OVERWEIGHT:
+            return permissions.get('enable_buy', False)
         elif action == OrderRecommendation.SELL:
+            return permissions.get('enable_sell', False)
+        elif action == OrderRecommendation.UNDERWEIGHT:
             return permissions.get('enable_sell', False)
         elif action == OrderRecommendation.HOLD:
             return True  # HOLD is always allowed as it means no action
@@ -795,12 +799,12 @@ class TradeManager:
         try:
             if recommendation.recommended_action == OrderRecommendation.HOLD:
                 return None  # No order needed for HOLD
-                
+
             # Map recommendation action to order direction
-            if recommendation.recommended_action == OrderRecommendation.BUY:
-                side = "buy"
-            elif recommendation.recommended_action == OrderRecommendation.SELL:
-                side = "sell"
+            if recommendation.recommended_action in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
+                side = "buy"  # Both BUY and OVERWEIGHT open long positions
+            elif recommendation.recommended_action in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
+                side = "sell"  # Both SELL and UNDERWEIGHT open short/close positions
             else:
                 return None
 
