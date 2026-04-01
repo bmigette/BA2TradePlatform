@@ -2151,6 +2151,40 @@ class PennyMomentumTrader(LiveExpertInterface):
                         info["conditions_last_eval"] = exit_cond_status
 
                     elif status == "watching":
+                        # Daily refresh: reset stale per-day metrics on each new trading day.
+                        # peak_rvol and prev_close are only meaningful within a single session —
+                        # carrying them across days causes the RVOL-decay guard (peak may have
+                        # been an extreme spike) and the already-moved guard (prev_close is stale)
+                        # to permanently block entry on carried-over watching symbols.
+                        today_date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                        if info.get("peak_rvol_date") != today_date_str:
+                            old_peak = info.get("peak_rvol")
+                            if old_peak is not None:
+                                self.logger.info(
+                                    f"New trading day: resetting peak_rvol for {symbol} "
+                                    f"(was {old_peak:.1f}x)"
+                                )
+                            info["peak_rvol"] = None
+                            info["peak_rvol_date"] = today_date_str
+
+                        if info.get("prev_close_date") != today_date_str:
+                            try:
+                                quotes = self._fetch_quotes_chunked([symbol])
+                                q = quotes.get(symbol, {})
+                                new_prev_close = q.get("previousClose")
+                                if new_prev_close and float(new_prev_close) > 0:
+                                    old_prev = info.get("prev_close", 0) or 0
+                                    info["prev_close"] = float(new_prev_close)
+                                    info["prev_close_date"] = today_date_str
+                                    self.logger.info(
+                                        f"Refreshed prev_close for {symbol}: "
+                                        f"${old_prev:.4f} -> ${float(new_prev_close):.4f}"
+                                    )
+                            except Exception as _e:
+                                self.logger.warning(
+                                    f"Failed to refresh prev_close for {symbol}: {_e}"
+                                )
+
                         # Track peak RVOL observed for this symbol (for decay guard)
                         current_rvol = evaluator._get_rvol(symbol)
                         if current_rvol is not None:
