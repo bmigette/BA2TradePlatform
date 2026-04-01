@@ -215,6 +215,7 @@ def build_deep_triage_prompt(
 Perform a deep triage analysis of {symbol} for a potential penny-stock momentum trade. Evaluate all the data below and determine whether this stock has a tradeable setup.
 
 ANALYSIS FRAMEWORK:
+- Ticker confusion check: CRITICAL — verify that the news and catalysts actually belong to THIS company ({symbol}), not a different company with a similar or identical ticker on another exchange. If the catalyst is about a different entity (e.g., crypto token, foreign company, or similarly-named stock), assign confidence <= 10 and explain the mismatch.
 - Catalyst identification: Is there a clear, actionable catalyst driving this move? Common examples include earnings beats, contract wins, product launches, short squeeze setups, M&A/strategic transactions, regulatory approvals, or partnership announcements — but this list is not exhaustive. Exercise your own judgment to identify any material catalyst.
 - News quality: Is the news fresh and material, or stale/irrelevant? Pay particular attention to after-hours and pre-market releases from the prior evening, as these often drive gap-up moves that may not yet appear in standard news feeds. Translate and synthesize any non-English headlines.
 - Insider activity: Distinguish between open-market purchases (bullish signal), open-market sales (bearish signal), and scheduled stock awards/grants such as A-Award transactions (neutral — these are corporate compensation, not a directional bet).
@@ -300,11 +301,13 @@ ANALYSIS SUMMARY:
 
 PARAMETER CONSTRAINTS — you MUST pick values from these ranges:
 
-VOLUME CONDITIONS (prefer rvol_above over volume_above_avg):
+VOLUME CONDITIONS (ALWAYS use rvol_above — do NOT use volume_above_avg):
   rvol_above.threshold: pick from [1.5, 2.0, 2.5, 3.0, 4.0, 5.0]
-    - 1.5x = mild interest, 2.0x = solid, 3.0x+ = strong surge
+    - 1.5x = mild interest (good for swing setups), 2.0x = solid (standard intraday), 3.0x+ = strong surge
+    - For swing strategies: prefer 1.5x-2.0x (sustained interest matters more than a spike)
+    - For intraday strategies: prefer 2.0x-3.0x (need immediate momentum)
     - Use the current RVOL above as context: set threshold BELOW the current RVOL so the condition is achievable
-  volume_above_avg: AVOID — compares intraday cumulative volume against full-day averages, making it nearly impossible to meet early in the session. Use rvol_above instead.
+  volume_above_avg: DO NOT USE — compares intraday cumulative volume against full-day averages, making it nearly impossible to meet early in the session. Always use rvol_above instead.
   volume_spike.multiplier: pick from [1.5, 2.0, 3.0]; minutes: pick from [3, 5, 10]
 
 MOVING AVERAGES:
@@ -354,18 +357,23 @@ TIME CONDITIONS:
 GUIDELINES:
 - Entry conditions should confirm momentum is real before entering. Use 2-4 conditions with "all" logic.
 - PREFERRED entry pattern: rvol_above (volume confirmation) + price_above_vwap (trend) + price_above_ema (momentum)
-- Stop-loss: use "any" logic so any single stop condition triggers an exit.
+- Stop-loss structure: use a TWO-LAYER structure to avoid premature exits:
+  - Outer: "all" (AND) — ALL groups must agree before triggering exit
+  - First element: hard stop (percent_below_entry) — always protects against catastrophic loss
+  - Second element: "any" containing signal-based stops (VWAP, time, etc.) — confirms momentum is truly lost
+  This prevents VWAP dips alone from stopping you out during normal penny-stock volatility.
+- For intraday trades, include a time_after EOD exit (e.g. time_after "15:45") inside the signal group.
+  IMPORTANT: use "time_after" (not "time_before") for end-of-day exits — "time_after 15:45" means "exit after 15:45".
 - Take-profit should be TIERED with 3 levels to lock in gains progressively:
   - Tier 1: Conservative target, exit 33% of position
   - Tier 2: Moderate target, exit 50% of remaining position
   - Tier 3: Aggressive target, exit 100% of remaining position
-- For intraday trades, include a time_before stop (exit before 15:45).
 - Each condition is a dict with a "type" key plus the required parameters for that type.
 
 RESPOND with a single JSON object with this exact structure:
 {{
   "entry": {{"all": [<list of condition dicts>]}},
-  "stop_loss": {{"any": [<list of condition dicts>]}},
+  "stop_loss": {{"all": [{{"type": "percent_below_entry", "percent": <float>}}, {{"any": [<signal-based condition dicts>]}}]}},
   "take_profit": [
     {{"condition": <condition dict or composite>, "exit_pct": 33}},
     {{"condition": <condition dict or composite>, "exit_pct": 50}},
@@ -383,9 +391,12 @@ Example response:
     ]
   }},
   "stop_loss": {{
-    "any": [
-      {{"type": "percent_below_entry", "percent": 6.0}},
-      {{"type": "price_below_vwap", "timeframe": "5m"}}
+    "all": [
+      {{"type": "percent_below_entry", "percent": 5.0}},
+      {{"any": [
+        {{"type": "price_below_vwap", "timeframe": "5m"}},
+        {{"type": "time_after", "time": "15:45"}}
+      ]}}
     ]
   }},
   "take_profit": [
@@ -451,9 +462,12 @@ ADJUSTMENT GUIDELINES:
 
 RESPOND with one of two options:
 
+STOP-LOSS STRUCTURE:
+The stop-loss uses a TWO-LAYER structure: "all" containing a hard percent_below_entry stop AND an "any" group of signal-based conditions. This ensures both a price threshold AND a momentum signal must agree before exiting.
+
 OPTION 1 - If conditions should be updated, return a JSON object with the same structure as the current conditions (with "stop_loss" and "take_profit" keys):
 {{
-  "stop_loss": {{"any": [<updated condition dicts>]}},
+  "stop_loss": {{"all": [{{"type": "percent_below_entry", "percent": <float>}}, {{"any": [<signal-based conditions>]}}]}},
   "take_profit": [
     {{"condition": <condition>, "exit_pct": 33}},
     {{"condition": <condition>, "exit_pct": 50}},

@@ -268,7 +268,7 @@ class PennyMomentumTrader(LiveExpertInterface):
             "min_confidence_threshold": {
                 "type": "int",
                 "required": True,
-                "default": 45,
+                "default": 65,
                 "description": "Minimum confidence score (1-100) for deep triage finalists",
                 "tooltip": "Candidates below this confidence threshold are dropped after deep triage. Higher = more selective.",
             },
@@ -412,7 +412,7 @@ class PennyMomentumTrader(LiveExpertInterface):
             "max_already_moved_pct": {
                 "type": "float",
                 "required": False,
-                "default": 25.0,
+                "default": 15.0,
                 "description": "Max % move from prev close allowed at entry trigger",
                 "tooltip": (
                     "Guards against chasing stocks that have already made their move. "
@@ -2050,9 +2050,12 @@ class PennyMomentumTrader(LiveExpertInterface):
                             market_now = self._get_market_now()
                             minutes_to_close = (market_close - market_now).total_seconds() / 60
                             if minutes_to_close <= 15:
+                                eod_pnl = ((current_price - entry_price) / entry_price * 100) if current_price and entry_price else None
+                                eod_pnl_str = f", P&L={eod_pnl:+.2f}%" if eod_pnl is not None else ""
                                 self.logger.info(
                                     f"Intraday EOD hard-exit for {symbol} "
-                                    f"({minutes_to_close:.0f}m to close)"
+                                    f"({minutes_to_close:.0f}m to close"
+                                    f", entry=${entry_price:.4f}, now=${current_price:.4f}{eod_pnl_str})"
                                 )
                                 trade_mgr.execute_exit(
                                     symbol, exit_pct=100.0, reason="intraday EOD hard-exit"
@@ -2063,22 +2066,96 @@ class PennyMomentumTrader(LiveExpertInterface):
                                 )
                                 continue
 
-                        # Check stop loss
+                        # Check stop loss (with grace period after entry)
                         stop_loss = exit_conds.get("stop_loss")
-                        if stop_loss and evaluator.evaluate(
-                            stop_loss, symbol, entry_price=entry_price
-                        ):
-                            self.logger.info(
-                                f"Stop loss triggered for {symbol}"
-                            )
-                            trade_mgr.execute_exit(
-                                symbol, exit_pct=100.0, reason="stop loss triggered"
-                            )
-                            info["status"] = "closed"
-                            self._record_trade(
-                                market_analysis, symbol, "exit", "stop loss"
-                            )
-                            continue
+                        if stop_loss:
+                            # Grace period: skip signal-based stop-loss for the first
+                            # 10 minutes after entry to avoid whipsaws from opening
+                            # volatility.  The hard percent_below_entry stop still
+                            # fires during the grace period to cap downside.
+                            skip_signal_stops = False
+                            triggered_at_str = info.get("triggered_at")
+                            if triggered_at_str:
+                                try:
+                                    triggered_at = datetime.fromisoformat(triggered_at_str)
+                                    if triggered_at.tzinfo is None:
+                                        triggered_at = triggered_at.replace(tzinfo=timezone.utc)
+                                    mins_since_entry = (datetime.now(timezone.utc) - triggered_at).total_seconds() / 60
+                                    if mins_since_entry < 10:
+                                        skip_signal_stops = True
+                                except Exception:
+                                    pass
+
+                            if skip_signal_stops:
+                                self.logger.debug(
+                                    f"[GRACE] {symbol}: grace period active "
+                                    f"({mins_since_entry:.1f}m since entry), "
+                                    f"skipping signal-based stops"
+                                )
+                                # During grace period, only evaluate the hard
+                                # percent_below_entry stop (ignore VWAP/time signals)
+                                hard_stops = []
+                                conditions = stop_loss.get("any", [])
+                                if not conditions:
+                                    conditions = stop_loss.get("all", [])
+                                    if not conditions and stop_loss.get("type"):
+                                        conditions = [stop_loss]
+                                for cond in conditions:
+                                    if isinstance(cond, dict):
+                                        if cond.get("type") == "percent_below_entry":
+                                            hard_stops.append(cond)
+                                        elif "all" in cond or "any" in cond:
+                                            # Nested composite — check inner conditions
+                                            inner = cond.get("all", cond.get("any", []))
+                                            if any(
+                                                isinstance(c, dict) and c.get("type") == "percent_below_entry"
+                                                for c in inner
+                                            ):
+                                                hard_stops.append(cond)
+                                if hard_stops:
+                                    grace_sl = {"any": hard_stops}
+                                    if evaluator.evaluate(grace_sl, symbol, entry_price=entry_price):
+                                        pnl_pct = ((current_price - entry_price) / entry_price * 100) if current_price and entry_price else None
+                                        pnl_str = f", P&L={pnl_pct:+.2f}%" if pnl_pct is not None else ""
+                                        self.logger.info(
+                                            f"Hard stop loss triggered for {symbol} during grace period"
+                                            f" (entry=${entry_price:.4f}, now=${current_price:.4f}{pnl_str})"
+                                        )
+                                        trade_mgr.execute_exit(
+                                            symbol, exit_pct=100.0, reason="stop loss triggered (hard stop during grace)"
+                                        )
+                                        info["status"] = "closed"
+                                        self._record_trade(
+                                            market_analysis, symbol, "exit", "stop loss (grace)"
+                                        )
+                                        continue
+                            elif evaluator.evaluate(
+                                stop_loss, symbol, entry_price=entry_price
+                            ):
+                                pnl_pct = ((current_price - entry_price) / entry_price * 100) if current_price and entry_price else None
+                                pnl_str = f", P&L={pnl_pct:+.2f}%" if pnl_pct is not None else ""
+                                hold_min_str = ""
+                                if triggered_at_str:
+                                    try:
+                                        ta = datetime.fromisoformat(triggered_at_str)
+                                        if ta.tzinfo is None:
+                                            ta = ta.replace(tzinfo=timezone.utc)
+                                        hold_min = (datetime.now(timezone.utc) - ta).total_seconds() / 60
+                                        hold_min_str = f", held={hold_min:.0f}m"
+                                    except Exception:
+                                        pass
+                                self.logger.info(
+                                    f"Stop loss triggered for {symbol}"
+                                    f" (entry=${entry_price:.4f}, now=${current_price:.4f}{pnl_str}{hold_min_str})"
+                                )
+                                trade_mgr.execute_exit(
+                                    symbol, exit_pct=100.0, reason="stop loss triggered"
+                                )
+                                info["status"] = "closed"
+                                self._record_trade(
+                                    market_analysis, symbol, "exit", "stop loss"
+                                )
+                                continue
 
                         # Check take profit tiers (skip already-triggered tiers)
                         take_profit = exit_conds.get("take_profit", [])
@@ -2093,9 +2170,11 @@ class PennyMomentumTrader(LiveExpertInterface):
                             if tp_condition and evaluator.evaluate(
                                 tp_condition, symbol, entry_price=entry_price
                             ):
+                                tp_pnl = ((current_price - entry_price) / entry_price * 100) if current_price and entry_price else None
+                                tp_pnl_str = f", P&L={tp_pnl:+.2f}%" if tp_pnl is not None else ""
                                 self.logger.info(
                                     f"Take profit tier {tier_idx + 1} triggered for {symbol} "
-                                    f"(exit {tp_exit_pct}%)"
+                                    f"(exit {tp_exit_pct}%{tp_pnl_str})"
                                 )
                                 trade_mgr.execute_exit(
                                     symbol,
@@ -2244,19 +2323,29 @@ class PennyMomentumTrader(LiveExpertInterface):
 
                                 if rvol_decayed:
                                     self.logger.info(
-                                        f"Entry skipped for {symbol}: RVOL decay "
+                                        f"[SKIP] Entry skipped for {symbol}: RVOL decay "
                                         f"(current={current_rvol:.1f}x, peak={peak_rvol:.1f}x, "
                                         f"threshold={rvol_decay_threshold:.0%})"
+                                        f" | conf={info.get('confidence', '?')}"
+                                        f", strategy={info.get('strategy', '?')}"
                                     )
                                 elif already_moved:
                                     self.logger.info(
-                                        f"Entry skipped for {symbol}: already moved "
+                                        f"[SKIP] Entry skipped for {symbol}: already moved "
                                         f"{already_moved_pct:.1f}% from prev close "
                                         f"(prev=${prev_close:.4f}, now=${current_price:.4f}, "
                                         f"threshold={max_moved_pct:.0f}%)"
+                                        f" | conf={info.get('confidence', '?')}"
+                                        f", strategy={info.get('strategy', '?')}"
                                     )
                                 else:
-                                    self.logger.info(f"Entry conditions met for {symbol}")
+                                    gap_str = f", gap={already_moved_pct:+.1f}%" if already_moved_pct is not None else ""
+                                    rvol_str = f", rvol={current_rvol:.1f}x" if current_rvol is not None else ""
+                                    self.logger.info(
+                                        f"Entry conditions met for {symbol}"
+                                        f" (price=${current_price:.4f}, conf={info.get('confidence', '?')}"
+                                        f", strategy={info.get('strategy', '?')}{gap_str}{rvol_str})"
+                                    )
                                     slippage_pct = float(
                                         self.get_setting_with_interface_default(
                                             "entry_limit_slippage_pct", log_warning=False
