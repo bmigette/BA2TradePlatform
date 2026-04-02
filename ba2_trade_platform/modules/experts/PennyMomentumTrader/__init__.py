@@ -2341,9 +2341,10 @@ class PennyMomentumTrader(LiveExpertInterface):
                                 else:
                                     gap_str = f", gap={already_moved_pct:+.1f}%" if already_moved_pct is not None else ""
                                     rvol_str = f", rvol={current_rvol:.1f}x" if current_rvol is not None else ""
+                                    price_str = f"${current_price:.4f}" if current_price is not None else "?"
                                     self.logger.info(
                                         f"Entry conditions met for {symbol}"
-                                        f" (price=${current_price:.4f}, conf={info.get('confidence', '?')}"
+                                        f" (price={price_str}, conf={info.get('confidence', '?')}"
                                         f", strategy={info.get('strategy', '?')}{gap_str}{rvol_str})"
                                     )
                                     slippage_pct = float(
