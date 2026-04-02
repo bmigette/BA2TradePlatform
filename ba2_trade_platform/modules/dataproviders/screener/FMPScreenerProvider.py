@@ -75,6 +75,17 @@ class FMPScreenerProvider(ScreenerProviderInterface):
             logger.warning(f"FMP screener returned unexpected response type: {type(data)}")
             return []
 
+        # FMP occasionally returns a list of plain strings (ticker symbols) instead of
+        # dicts, e.g. when the plan limit is reached or on certain filter combinations.
+        # Filter them out before normalisation to avoid AttributeError on item.get().
+        non_dict = [item for item in data if not isinstance(item, dict)]
+        if non_dict:
+            logger.warning(
+                f"FMP screener: dropping {len(non_dict)} non-dict items "
+                f"(first: {non_dict[0]!r})"
+            )
+            data = [item for item in data if isinstance(item, dict)]
+
         # Apply client-side sector exclusion (FMP doesn't support it natively)
         sector_exclude = filters.get("sector_exclude", [])
         if sector_exclude:
