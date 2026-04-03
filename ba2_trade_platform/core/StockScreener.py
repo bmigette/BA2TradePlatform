@@ -416,6 +416,7 @@ class StockScreener:
         """
         lookback_days = self._settings["screener_price_drop_days"]
         chunk_size = max(max_results * 3, 30)
+        total = len(ranked_candidates)
 
         passed: List[Dict[str, Any]] = []
         checked = 0
@@ -432,6 +433,15 @@ class StockScreener:
 
             history_map = self._fetch_history_bulk(symbols, lookback_days)
             checked += len(symbols)
+
+            # Report progress within the 0.8–1.0 range after each chunk
+            if total > 0:
+                fraction = min(checked / total, 1.0)
+                self._report_progress(
+                    f"Checking price history... {checked}/{total} symbols"
+                    f" ({len(passed)} passed so far)",
+                    0.8 + 0.19 * fraction,
+                )
 
             for c in chunk:
                 if len(passed) >= max_results:
