@@ -2838,7 +2838,7 @@ class ExpertSettingsTab:
 
                     self.screener_settings_inputs[key] = inp
 
-                # Test Screener button
+                # Test Screener button + progress bar
                 with ui.row().classes('w-full justify-end mt-4'):
                     self.test_screener_button = ui.button(
                         'Test Screener',
@@ -2846,11 +2846,36 @@ class ExpertSettingsTab:
                         icon='filter_list'
                     ).props('color=positive')
 
+                with ui.column().classes('w-full mt-2 gap-1') as self.screener_progress_container:
+                    self.screener_progress_bar = ui.linear_progress(value=0, show_value=False).classes('w-full')
+                    self.screener_progress_label = ui.label('').classes('text-xs text-grey-6')
+                self.screener_progress_container.set_visibility(False)
+
     async def _test_screener(self):
         """Test stock screener with current (unsaved) form values."""
+        progress_timer = None
         try:
             if hasattr(self, 'test_screener_button'):
                 self.test_screener_button.props('loading disable')
+
+            # Show progress bar
+            progress_state = {'step': 'Starting...', 'value': 0.0}
+            if hasattr(self, 'screener_progress_container'):
+                self.screener_progress_bar.set_value(0)
+                self.screener_progress_label.set_text('Starting...')
+                self.screener_progress_container.set_visibility(True)
+
+            def on_progress(step: str, value: float):
+                progress_state['step'] = step
+                progress_state['value'] = value
+
+            def poll_progress():
+                if hasattr(self, 'screener_progress_bar'):
+                    self.screener_progress_bar.set_value(progress_state['value'])
+                if hasattr(self, 'screener_progress_label'):
+                    self.screener_progress_label.set_text(progress_state['step'])
+
+            progress_timer = ui.timer(0.3, poll_progress)
 
             # Build settings dict from current form values
             settings = {}
@@ -2875,7 +2900,7 @@ class ExpertSettingsTab:
                         settings[key] = inp.value
 
             from ...core.StockScreener import StockScreener
-            screener = StockScreener(settings)
+            screener = StockScreener(settings, progress_callback=on_progress)
 
             import asyncio
             loop = asyncio.get_event_loop()
@@ -2883,6 +2908,11 @@ class ExpertSettingsTab:
 
             result = screen_data["results"]
             stats = screen_data.get("stats", {})
+
+            if progress_timer:
+                progress_timer.cancel()
+            if hasattr(self, 'screener_progress_container'):
+                self.screener_progress_container.set_visibility(False)
 
             if hasattr(self, 'test_screener_button'):
                 self.test_screener_button.props(remove='loading disable')
@@ -2954,6 +2984,10 @@ class ExpertSettingsTab:
             result_dialog.open()
 
         except Exception as e:
+            if progress_timer:
+                progress_timer.cancel()
+            if hasattr(self, 'screener_progress_container'):
+                self.screener_progress_container.set_visibility(False)
             if hasattr(self, 'test_screener_button'):
                 self.test_screener_button.props(remove='loading disable')
             logger.error(f'Error testing screener: {e}', exc_info=True)

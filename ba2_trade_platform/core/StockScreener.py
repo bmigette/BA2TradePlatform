@@ -67,7 +67,7 @@ class StockScreener:
         "composite",
     }
 
-    def __init__(self, settings: Dict[str, Any]):
+    def __init__(self, settings: Dict[str, Any], progress_callback=None):
         """
         Initialise the screener from a settings dict.
 
@@ -75,7 +75,10 @@ class StockScreener:
 
         Args:
             settings: Dict of screener settings.
+            progress_callback: Optional callable(step: str, value: float) called at
+                each pipeline stage.  ``value`` is in [0, 1].
         """
+        self._progress_callback = progress_callback
         self._settings: Dict[str, Any] = {}
         for key, default in self._DEFAULTS.items():
             raw = settings.get(key)
@@ -104,6 +107,14 @@ class StockScreener:
     # Public API
     # ------------------------------------------------------------------
 
+    def _report_progress(self, step: str, value: float) -> None:
+        """Fire the progress callback if one was provided."""
+        if self._progress_callback:
+            try:
+                self._progress_callback(step, value)
+            except Exception:
+                pass
+
     def screen(self) -> Dict[str, Any]:
         """
         Execute the full screen/enrich/rank pipeline.
@@ -125,6 +136,7 @@ class StockScreener:
         logger.info(
             f"StockScreener: screening via '{provider_name}' with filters: {filters}"
         )
+        self._report_progress("Fetching candidates from screener...", 0.05)
         candidates = screener.screen_stocks(filters)
         stats["screener_candidates"] = len(candidates)
         logger.info(
@@ -132,11 +144,15 @@ class StockScreener:
         )
 
         if not candidates:
+            self._report_progress("No candidates found.", 1.0)
             return {"results": [], "stats": stats}
 
         # --- Stage 2: RVOL enrichment + client-side filters ---
         rvol_min = self._settings["screener_relative_volume_min"]
         if rvol_min > 0:
+            self._report_progress(
+                f"Fetching live prices for {len(candidates)} candidates (RVOL)...", 0.2
+            )
             candidates, enrich_stats = self._enrich_with_rvol(
                 candidates, rvol_min
             )
@@ -147,9 +163,11 @@ class StockScreener:
             )
 
         if not candidates:
+            self._report_progress("No candidates after RVOL filter.", 1.0)
             return {"results": [], "stats": stats}
 
         # --- Stage 3: rank ---
+        self._report_progress("Ranking candidates...", 0.7)
         ranked = self._rank(candidates)
         max_stocks = self._settings["screener_max_stocks"]
 
@@ -157,6 +175,9 @@ class StockScreener:
         drop_pct = self._settings["screener_price_drop_pct"]
         drop_days = self._settings["screener_price_drop_days"]
         if drop_pct > 0 and drop_days > 0:
+            self._report_progress(
+                f"Checking price history (>={drop_pct}% drop over {drop_days}d)...", 0.8
+            )
             result, drop_stats = self._filter_by_price_drop_lazy(
                 ranked, drop_pct, max_stocks
             )
@@ -170,6 +191,7 @@ class StockScreener:
             result = ranked[:max_stocks]
 
         stats["final_count"] = len(result)
+        self._report_progress(f"Done — {len(result)} stock(s) matched.", 1.0)
         logger.info(
             f"StockScreener: returning {len(result)} stocks "
             f"(sorted by {self._settings['screener_sort_metric']})"
