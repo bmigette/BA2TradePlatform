@@ -2638,11 +2638,14 @@ class ExpertSettingsTab:
         try:
             selection_method = event.value if hasattr(event, 'value') else event
             logger.debug(f'Instrument selection method changed to: {selection_method}')
-            
-            # Update instruments tab content
+
+            # Update instruments tab content, passing current expert instance so saved
+            # values are loaded (instead of defaults) when the dialog opens in screener mode.
             if hasattr(self, 'instruments_content_container'):
-                self._render_instrument_content(None, False)
-                
+                expert_instance = getattr(self, 'current_expert_instance', None)
+                is_edit = expert_instance is not None
+                self._render_instrument_content(expert_instance, is_edit)
+
         except Exception as e:
             logger.error(f'Error handling instrument selection method change: {e}', exc_info=True)
 
