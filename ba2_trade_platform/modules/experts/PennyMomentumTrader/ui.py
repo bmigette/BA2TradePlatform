@@ -405,6 +405,7 @@ class PennyMomentumTraderUI:
         strategy = data.get('strategy', 'unknown')
         expected_profit = data.get('expected_profit_pct', 0)
         reasoning = data.get('reasoning', '')
+        detailed_report = data.get('detailed_report', '')
         qty = data.get('qty', '-')
         allocation = data.get('allocation', '-')
 
@@ -445,6 +446,11 @@ class PennyMomentumTraderUI:
             if reasoning:
                 with ui.expansion('Reasoning', icon='psychology').classes('w-full mt-2'):
                     ui.markdown(reasoning).classes('text-sm')
+
+            # Expandable detailed analysis report
+            if detailed_report:
+                with ui.expansion('Detailed Analysis', icon='article').classes('w-full mt-1'):
+                    ui.markdown(detailed_report).classes('text-sm')
 
     # ------------------------------------------------------------------
     # Tab 3: Active Monitors

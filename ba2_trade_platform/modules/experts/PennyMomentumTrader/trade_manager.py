@@ -177,6 +177,7 @@ class PennyTradeManager:
             open_type=OrderOpenType.AUTOMATIC,
             comment=f"PennyMomentum entry: {catalyst}",
             expert_recommendation_id=rec_id,
+            good_for='day',  # Expire at EOD; re-evaluated each day by the monitor
         )
 
         try:

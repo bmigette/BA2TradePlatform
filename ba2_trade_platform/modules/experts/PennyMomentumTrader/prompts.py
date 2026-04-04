@@ -238,11 +238,13 @@ ANALYSIS FRAMEWORK:
 
 RESPOND with a single JSON object with exactly these keys:
 - "confidence": integer from 1-100 representing how confident you are this is a good trade (1=terrible, 100=exceptional setup)
-- "catalyst": brief description of the primary catalyst driving this stock (string)
+- "catalyst": brief one-line description of the primary catalyst driving this stock (string)
 - "strategy": either "intraday" (day trade, close by EOD) or "swing" (hold 2-5 days) based on the catalyst type and expected move timeline (string)
 - "expected_profit_pct": realistic expected profit percentage if the trade works (float, e.g. 8.5 for 8.5%)
 - "risk_assessment": brief description of the main risks (string)
 - "reasoning": 2-3 sentence explanation of your overall assessment (string)
+- "detailed_report": a thorough markdown-formatted report structured with these exact sections:
+    ## News & Sentiment\n<most notable headlines, after-hours/pre-market items, overall sentiment tone>\n\n## Fundamentals\n<revenue, cash, burn rate, dilution history, share structure>\n\n## Technicals\n<price action, volume pattern, RVOL, float dynamics>\n\n## Conclusion\n<overall verdict, key risk/reward, recommended approach>
 
 Example response:
 {{
@@ -251,7 +253,8 @@ Example response:
   "strategy": "swing",
   "expected_profit_pct": 12.0,
   "risk_assessment": "Low float could cause sharp reversal; company has history of secondary offerings",
-  "reasoning": "Strong earnings catalyst with genuine revenue growth. Social sentiment is building but not yet peaked. The low float amplifies both upside and downside risk."
+  "reasoning": "Strong earnings catalyst with genuine revenue growth. Social sentiment is building but not yet peaked. The low float amplifies both upside and downside risk.",
+  "detailed_report": "## News & Sentiment\\nQ3 earnings released after-hours beat EPS by $0.12. Revenue up 40% YoY. Multiple headlines on major financial sites. Social sentiment strongly positive with 85% bullish mentions.\\n\\n## Fundamentals\\nRevenue $22M, cash $8M runway ~12 months. No recent dilution. Float 4.2M shares.\\n\\n## Technicals\\nGapped up 18% pre-market on heavy volume. RVOL 8.5x. Clean breakout above prior resistance.\\n\\n## Conclusion\\nStrong multi-factor setup. Primary risk is low float volatility and potential morning sell-the-news. Target +12% within 2 days."
 }}
 
 Return ONLY the JSON object, no other text."""

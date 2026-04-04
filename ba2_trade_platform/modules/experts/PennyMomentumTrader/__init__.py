@@ -1641,6 +1641,7 @@ class PennyMomentumTrader(LiveExpertInterface):
                         "catalyst": result.get("catalyst", ""),
                         "strategy": result.get("strategy", ""),
                         "risk_assessment": result.get("risk_assessment", ""),
+                        "detailed_report": result.get("detailed_report", ""),
                     },
                 )
                 add_instance(rec)
@@ -2031,6 +2032,30 @@ class PennyMomentumTrader(LiveExpertInterface):
                                     info["status"] = "expired"
                                     info.pop("pending_order_id", None)
                                     continue
+                                else:
+                                    # Order is still within max age — check if it was already
+                                    # cancelled by the broker (e.g. day order expired at EOD).
+                                    # If so, reset to "watching" so entry conditions are
+                                    # re-evaluated on the next monitoring tick.
+                                    try:
+                                        from ....core.models import TradingOrder as TradingOrderModel
+                                        from ....core.types import OrderStatus as OS
+                                        db_order = get_instance(TradingOrderModel, pending_order_id)
+                                        if db_order and db_order.status in (
+                                            OS.CANCELED.value, OS.EXPIRED.value,
+                                            "canceled", "cancelled", "expired",
+                                        ):
+                                            self.logger.info(
+                                                f"Day entry order {pending_order_id} for {symbol} was "
+                                                f"cancelled/expired by broker — resetting monitor to 'watching'"
+                                            )
+                                            info["status"] = "watching"
+                                            info.pop("pending_order_id", None)
+                                            info.pop("triggered_at", None)
+                                    except Exception as e_inner:
+                                        self.logger.debug(
+                                            f"Could not check order status for {pending_order_id}: {e_inner}"
+                                        )
                             except Exception as e:
                                 self.logger.warning(f"Error checking pending order age for {symbol}: {e}")
 
