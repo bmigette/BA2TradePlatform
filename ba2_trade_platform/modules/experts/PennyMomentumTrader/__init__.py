@@ -1972,23 +1972,43 @@ class PennyMomentumTrader(LiveExpertInterface):
         if missing_syms:
             self.logger.info(
                 f"Phase 5 startup: {len(missing_syms)} open position(s) not in monitored_symbols, "
-                f"recovering exit conditions from previous session: {missing_syms}"
+                f"recovering exit conditions from previous sessions: {missing_syms}"
             )
-            prev_data = self._get_previous_monitored_data(market_analysis.id)
-            injected = {
-                sym: info
-                for sym, info in prev_data.items()
-                if sym in missing_syms and info.get("status") == "triggered"
-            }
+            # Search through ALL recent previous MAs until every missing symbol is found,
+            # since positions may have been entered in sessions several days ago.
+            injected = {}
+            remaining = set(missing_syms)
+            try:
+                with get_db() as session:
+                    from sqlmodel import select as sql_select
+                    statement = (
+                        sql_select(MarketAnalysis)
+                        .where(MarketAnalysis.expert_instance_id == self.instance.id)
+                        .where(MarketAnalysis.id != market_analysis.id)
+                        .order_by(MarketAnalysis.id.desc())
+                        .limit(30)
+                    )
+                    for ma_prev in session.exec(statement).all():
+                        if not remaining:
+                            break
+                        if not ma_prev.state:
+                            continue
+                        prev_monitored = ma_prev.state.get("monitored_symbols", {})
+                        for sym in list(remaining):
+                            info = prev_monitored.get(sym)
+                            if info and info.get("status") == "triggered":
+                                injected[sym] = info
+                                remaining.discard(sym)
+            except Exception as e:
+                self.logger.warning(f"Phase 5 startup: error searching previous sessions: {e}")
             if injected:
                 current_monitored_init.update(injected)
                 self._update_state(market_analysis, {"monitored_symbols": current_monitored_init})
                 self.logger.info(f"Phase 5 startup: injected {list(injected.keys())} into monitored_symbols")
-            unrecovered = missing_syms - set(injected.keys())
-            if unrecovered:
+            if remaining:
                 self.logger.warning(
-                    f"Phase 5 startup: could not recover exit conditions for {unrecovered} "
-                    f"(not found in previous session with status=triggered)"
+                    f"Phase 5 startup: could not recover exit conditions for {remaining} "
+                    f"(not found in any recent session with status=triggered)"
                 )
 
         while not self._stop_event.is_set():
