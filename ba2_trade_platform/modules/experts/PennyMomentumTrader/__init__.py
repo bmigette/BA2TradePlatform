@@ -1779,7 +1779,7 @@ class PennyMomentumTrader(LiveExpertInterface):
             carried = {
                 sym: info
                 for sym, info in prev_data.items()
-                if info.get("status") == "watching"
+                if info.get("status") in ("watching", "triggered")
             }
             if carried:
                 self.logger.info(
