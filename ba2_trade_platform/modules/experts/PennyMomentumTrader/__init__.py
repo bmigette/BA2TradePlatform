@@ -2281,8 +2281,8 @@ class PennyMomentumTrader(LiveExpertInterface):
                                 sl_unmet = [v for k, v in sl_details.items() if not sl_status.get(k)]
                                 self.logger.debug(
                                     f"{symbol} EXIT conditions (entry=${entry_price:.4f})\n"
-                                    f"  STOP_LOSS MET:   {sl_met}\n"
-                                    f"  STOP_LOSS UNMET: {sl_unmet}"
+                                    f"  SL   MET:   {sl_met}\n"
+                                    f"  SL   UNMET: {sl_unmet}"
                                 )
                         for tier_idx, tp_tier in enumerate(take_profit):
                             if not isinstance(tp_tier, dict):
@@ -2297,11 +2297,12 @@ class PennyMomentumTrader(LiveExpertInterface):
                             for k, v in tp_status.items():
                                 exit_cond_status[f"TP{tier_idx + 1}:{k}"] = v
                             if monitor_tick % 10 == 1:
-                                prefix = "✓ " if already_triggered else ""
+                                prefix = " ✓" if already_triggered else ""
                                 tp_met = [v for k, v in tp_details.items() if tp_status.get(k)]
                                 tp_unmet = [v for k, v in tp_details.items() if not tp_status.get(k)]
                                 self.logger.debug(
-                                    f"  TP{tier_idx + 1} ({tp_exit_pct}%){prefix} MET: {tp_met} | UNMET: {tp_unmet}"
+                                    f"  TP{tier_idx + 1} ({tp_exit_pct}%){prefix} MET:   {tp_met}\n"
+                                    f"  TP{tier_idx + 1} ({tp_exit_pct}%){prefix} UNMET: {tp_unmet}"
                                 )
                         info["conditions_last_eval"] = exit_cond_status
 
