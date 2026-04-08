@@ -1960,6 +1960,37 @@ class PennyMomentumTrader(LiveExpertInterface):
         trade_mgr = self._trade_mgr
         monitor_tick = 0
 
+        # One-time startup check: open positions opened in a previous session may not
+        # be present in this session's monitored_symbols (their status was "triggered"
+        # and the phase-4 carry-over only picked up "watching" symbols at the time).
+        # Inject them now so exit conditions are evaluated from the first tick.
+        with get_db() as session:
+            ma_init = session.get(MarketAnalysis, market_analysis.id)
+            current_monitored_init = dict(ma_init.state.get("monitored_symbols", {})) if ma_init and ma_init.state else {}
+        open_positions_init = trade_mgr.get_open_positions()
+        missing_syms = {p["symbol"] for p in open_positions_init} - set(current_monitored_init.keys())
+        if missing_syms:
+            self.logger.info(
+                f"Phase 5 startup: {len(missing_syms)} open position(s) not in monitored_symbols, "
+                f"recovering exit conditions from previous session: {missing_syms}"
+            )
+            prev_data = self._get_previous_monitored_data(market_analysis.id)
+            injected = {
+                sym: info
+                for sym, info in prev_data.items()
+                if sym in missing_syms and info.get("status") == "triggered"
+            }
+            if injected:
+                current_monitored_init.update(injected)
+                self._update_state(market_analysis, {"monitored_symbols": current_monitored_init})
+                self.logger.info(f"Phase 5 startup: injected {list(injected.keys())} into monitored_symbols")
+            unrecovered = missing_syms - set(injected.keys())
+            if unrecovered:
+                self.logger.warning(
+                    f"Phase 5 startup: could not recover exit conditions for {unrecovered} "
+                    f"(not found in previous session with status=triggered)"
+                )
+
         while not self._stop_event.is_set():
             # Check if market is still open
             if not self._is_market_open():
