@@ -51,7 +51,8 @@ def layout_render(navigation_title: str):
         # Version info at bottom
         with ui.column().classes('absolute bottom-4 left-4 right-4'):
             ui.separator().classes('mb-4')
-            ui.label('v2.0.0').classes('text-xs text-secondary-custom text-center w-full')
+            from ..version import APP_VERSION
+            ui.label(APP_VERSION).classes('text-xs text-secondary-custom text-center w-full')
 
     # Help button
     with ui.page_sticky(position='bottom-right', x_offset=20, y_offset=20):
