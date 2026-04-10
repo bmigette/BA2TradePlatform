@@ -8,7 +8,6 @@ from Alpha Vantage API.
 from typing import Dict, Any, Literal, Optional, Annotated
 from datetime import datetime
 import json
-import requests
 
 from ba2_trade_platform.core.interfaces import CompanyFundamentalsDetailsInterface
 from ba2_trade_platform.core.provider_utils import log_provider_call
@@ -16,7 +15,6 @@ from ba2_trade_platform.logger import logger
 from ba2_trade_platform.config import get_app_setting
 from ba2_trade_platform.modules.dataproviders.alpha_vantage_common import (
     AlphaVantageBaseProvider,
-    AlphaVantageRateLimitError
 )
 
 

@@ -15,9 +15,6 @@ from ib_async import IB, Stock, Order, LimitOrder, MarketOrder, StopOrder, Trade
 from ib_async import Contract, Position as IBPosition, AccountValue
 from typing import Any, Dict, Optional, List
 from datetime import datetime, timezone, timedelta
-import asyncio
-from decimal import Decimal
-
 from ...logger import logger
 from ...core.models import TradingOrder, Position, Transaction
 from ...core.types import OrderDirection, OrderStatus, OrderOpenType, OrderType as CoreOrderType

@@ -221,21 +221,3 @@ def _build_action_params(action_config: Dict[str, Any]) -> List[str]:
         params.append(f"Stop: ${action_config['stop_price']}")
     
     return params
-
-
-def render_evaluation_summary(evaluation_details: Dict[str, Any]):
-    """
-    Render a compact summary of evaluation results.
-    
-    Args:
-        evaluation_details: Dictionary containing evaluation summary
-    """
-    summary = evaluation_details.get('summary', {})
-    
-    if summary:
-        with ui.row().classes('gap-4'):
-            ui.label(f"Rules: {summary.get('total_rules', 0)}").classes('text-sm')
-            ui.label(f"Executed: {summary.get('executed_rules', 0)}").classes('text-sm text-green-600')
-            ui.label(f"Conditions: {summary.get('total_conditions', 0)}").classes('text-sm')
-            ui.label(f"Passed: {summary.get('passed_conditions', 0)}").classes('text-sm text-green-600')
-            ui.label(f"Failed: {summary.get('failed_conditions', 0)}").classes('text-sm text-orange-600')

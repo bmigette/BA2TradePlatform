@@ -7,8 +7,6 @@ including profit-based prioritization, position sizing, and diversification.
 
 from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP
-import logging
 
 from .interfaces import AccountInterface
 from ..logger import logger

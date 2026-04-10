@@ -15,9 +15,12 @@ logger.handlers.clear()
 # Prevent propagation to root logger to avoid duplicate logs
 logger.propagate = False
 
+# Shared constants
+LOG_FORMAT = '%(asctime)s - %(name)s - %(module)s - %(levelname)s - %(message)s'
+LOGS_DIR = os.path.join(HOME_PARENT, "logs")
+
 # Configure our handlers
-formatter = logging.Formatter(
-    '%(asctime)s - %(name)s - %(module)s - %(levelname)s - %(message)s')
+formatter = logging.Formatter(LOG_FORMAT)
 
 if STDOUT_LOGGING:
     # Create a safe StreamHandler that handles Unicode characters
@@ -28,17 +31,16 @@ if STDOUT_LOGGING:
 
 if FILE_LOGGING:
     # Ensure logs directory exists
-    logs_dir = os.path.join(HOME_PARENT, "logs")
-    os.makedirs(logs_dir, exist_ok=True)
-    
+    os.makedirs(LOGS_DIR, exist_ok=True)
+
     handlerfile = RotatingFileHandler(
-        os.path.join(logs_dir, "app.debug.log"), maxBytes=(1024*1024*10), backupCount=7, encoding='utf-8'
+        os.path.join(LOGS_DIR, "app.debug.log"), maxBytes=(1024*1024*10), backupCount=7, encoding='utf-8'
     )
     handlerfile.setFormatter(formatter)
     handlerfile.setLevel(logging.DEBUG)
     logger.addHandler(handlerfile)
     handlerfile2 = RotatingFileHandler(
-        os.path.join(logs_dir, "app.log"), maxBytes=(1024*1024*10), backupCount=7, encoding='utf-8'
+        os.path.join(LOGS_DIR, "app.log"), maxBytes=(1024*1024*10), backupCount=7, encoding='utf-8'
     )
     handlerfile2.setFormatter(formatter)
     handlerfile2.setLevel(logging.INFO)
@@ -68,19 +70,16 @@ def _get_all_debug_handler() -> Optional[RotatingFileHandler]:
         return None
     
     # Create the shared handler
-    logs_dir = os.path.join(HOME_PARENT, "logs")
-    os.makedirs(logs_dir, exist_ok=True)
-    
+    os.makedirs(LOGS_DIR, exist_ok=True)
+
     _all_debug_handler = RotatingFileHandler(
-        os.path.join(logs_dir, "all.debug.log"),
+        os.path.join(LOGS_DIR, "all.debug.log"),
         maxBytes=(1024*1024*10),  # 10MB
         backupCount=7,
         encoding='utf-8'
     )
     
-    fmt_string = '%(asctime)s - %(name)s - %(module)s - %(levelname)s - %(message)s'
-    all_debug_formatter = logging.Formatter(fmt_string)
-    _all_debug_handler.setFormatter(all_debug_formatter)
+    _all_debug_handler.setFormatter(logging.Formatter(LOG_FORMAT))
     _all_debug_handler.setLevel(logging.DEBUG)
     
     return _all_debug_handler
@@ -103,19 +102,16 @@ def _get_all_error_handler() -> Optional[RotatingFileHandler]:
         return None
     
     # Create the shared handler
-    logs_dir = os.path.join(HOME_PARENT, "logs")
-    os.makedirs(logs_dir, exist_ok=True)
-    
+    os.makedirs(LOGS_DIR, exist_ok=True)
+
     _all_error_handler = RotatingFileHandler(
-        os.path.join(logs_dir, "all.error.log"),
+        os.path.join(LOGS_DIR, "all.error.log"),
         maxBytes=(1024*1024*10),  # 10MB
         backupCount=7,
         encoding='utf-8'
     )
     
-    fmt_string = '%(asctime)s - %(name)s - %(module)s - %(levelname)s - %(message)s'
-    all_error_formatter = logging.Formatter(fmt_string)
-    _all_error_handler.setFormatter(all_error_formatter)
+    _all_error_handler.setFormatter(logging.Formatter(LOG_FORMAT))
     _all_error_handler.setLevel(logging.ERROR)  # Only ERROR and above
     
     return _all_error_handler
@@ -187,14 +183,9 @@ def get_expert_logger(expert_class: str, expert_id: int) -> logging.Logger:
     # Prevent propagation to avoid duplicate logs
     expert_logger.propagate = False
     
-    # Base format string
-    fmt_string = '%(asctime)s - %(name)s - %(module)s - %(levelname)s - %(message)s'
-    
-    # Create custom formatter with expert prefix for console
-    console_formatter = ExpertFormatter(expert_class, expert_id, fmt_string)
-    
-    # File formatter (same as console)
-    file_formatter = ExpertFormatter(expert_class, expert_id, fmt_string)
+    # Create custom formatter with expert prefix
+    console_formatter = ExpertFormatter(expert_class, expert_id, LOG_FORMAT)
+    file_formatter = ExpertFormatter(expert_class, expert_id, LOG_FORMAT)
     
     # Add console handler if STDOUT logging is enabled
     if STDOUT_LOGGING:
@@ -207,12 +198,11 @@ def get_expert_logger(expert_class: str, expert_id: int) -> logging.Logger:
     
     # Add file handler if FILE logging is enabled
     if FILE_LOGGING:
-        logs_dir = os.path.join(HOME_PARENT, "logs")
-        os.makedirs(logs_dir, exist_ok=True)
-        
+        os.makedirs(LOGS_DIR, exist_ok=True)
+
         # Expert-specific log file: expert_class-expXX.log
         log_filename = f"{expert_class}-exp{expert_id}.log"
-        log_filepath = os.path.join(logs_dir, log_filename)
+        log_filepath = os.path.join(LOGS_DIR, log_filename)
         
         file_handler = RotatingFileHandler(
             log_filepath,

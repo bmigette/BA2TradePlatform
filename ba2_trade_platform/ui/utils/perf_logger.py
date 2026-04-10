@@ -214,19 +214,3 @@ def perf_timer(category: str, operation: str, component: Optional[str] = None):
             return sync_wrapper
     
     return decorator
-
-
-# Convenience decorators for common patterns
-def page_render(component: str):
-    """Decorator for page render methods."""
-    return perf_timer(PerfLogger.PAGE, PerfLogger.RENDER, component)
-
-
-def table_load(component: str):
-    """Decorator for table data loading."""
-    return perf_timer(PerfLogger.TABLE, PerfLogger.LOAD, component)
-
-
-def data_fetch(component: str):
-    """Decorator for data fetching operations."""
-    return perf_timer(PerfLogger.DATA, PerfLogger.FETCH, component)

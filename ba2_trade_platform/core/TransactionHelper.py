@@ -172,37 +172,6 @@ class TransactionHelper:
                 session.close()
     
     @staticmethod
-    def get_dependent_orders(
-        transaction: Transaction,
-        session: Optional[Session] = None
-    ) -> List[TradingOrder]:
-        """
-        Get all dependent orders (TP/SL) for a transaction.
-        
-        Args:
-            transaction: The transaction to find dependent orders for
-            session: Optional database session
-        
-        Returns:
-            List[TradingOrder]: List of dependent orders
-        """
-        close_session = False
-        if session is None:
-            session = Session(get_db().bind)
-            close_session = True
-        
-        try:
-            statement = select(TradingOrder).where(
-                TradingOrder.transaction_id == transaction.id,
-                TradingOrder.depends_on_order.isnot(None)
-            )
-            dependent_orders = session.exec(statement).all()
-            return dependent_orders
-        finally:
-            if close_session:
-                session.close()
-    
-    @staticmethod
     def is_tpsl_order(order: TradingOrder) -> bool:
         """
         Check if an order is a TP/SL order.
@@ -410,51 +379,6 @@ class TransactionHelper:
         return result['all']
     
     @staticmethod
-    def get_tpsl_prices(
-        transaction: Transaction,
-        session: Optional[Session] = None
-    ) -> Dict[str, Optional[float]]:
-        """
-        Get the current TP and SL prices from active orders for a transaction.
-        
-        If multiple orders exist, returns the first found price for each.
-        
-        Args:
-            transaction: The transaction to get TP/SL prices for
-            session: Optional database session
-        
-        Returns:
-            Dict with 'tp_price' and 'sl_price' keys (None if not found)
-        """
-        tpsl_orders = TransactionHelper.get_tpsl_orders(transaction, session, include_terminal=False)
-        
-        tp_price = None
-        sl_price = None
-        
-        # Check OCO orders first (they have both)
-        for order in tpsl_orders['oco']:
-            if tp_price is None and order.limit_price:
-                tp_price = order.limit_price
-            if sl_price is None and order.stop_price:
-                sl_price = order.stop_price
-        
-        # Check individual TP orders
-        if tp_price is None:
-            for order in tpsl_orders['tp']:
-                if order.limit_price:
-                    tp_price = order.limit_price
-                    break
-        
-        # Check individual SL orders
-        if sl_price is None:
-            for order in tpsl_orders['sl']:
-                if order.stop_price:
-                    sl_price = order.stop_price
-                    break
-        
-        return {'tp_price': tp_price, 'sl_price': sl_price}
-
-    @staticmethod
     def get_tpsl_order_dicts(
         transaction: Transaction,
         session: Optional[Session] = None
@@ -517,29 +441,6 @@ class TransactionHelper:
                     break
 
         return {"tp_order": tp_order_dict, "sl_order": sl_order_dict}
-
-    @staticmethod
-    def validate_entry_order_qty(entry_order: Optional[TradingOrder]) -> bool:
-        """
-        Validate that an entry order has a valid (non-zero, positive) quantity.
-        
-        Args:
-            entry_order: The entry order to validate
-        
-        Returns:
-            bool: True if quantity is valid, False otherwise
-        """
-        if not entry_order:
-            logger.warning("Cannot validate entry order: order is None")
-            return False
-        
-        if entry_order.quantity is None or entry_order.quantity <= 0:
-            logger.warning(
-                f"Entry order {entry_order.id} has invalid quantity: {entry_order.quantity}"
-            )
-            return False
-        
-        return True
 
     @staticmethod
     def adjust_quantity_with_tpsl(

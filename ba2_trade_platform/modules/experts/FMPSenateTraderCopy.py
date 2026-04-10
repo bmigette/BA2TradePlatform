@@ -243,73 +243,6 @@ class FMPSenateTraderCopy(MarketExpertInterface):
             self.logger.error(f"Error getting current price for {symbol}: {e}", exc_info=True)
             return None
     
-    def _filter_trades_by_age(self, trades: List[Dict[str, Any]], 
-                             max_disclose_days: int, 
-                             max_exec_days: int,
-                             symbol: str) -> List[Dict[str, Any]]:
-        """
-        Filter trades based on age criteria.
-        
-        Args:
-            trades: List of trade records
-            max_disclose_days: Maximum days since disclosure
-            max_exec_days: Maximum days since execution
-            symbol: Stock symbol to filter for
-            
-        Returns:
-            Filtered list of trades
-        """
-        now = datetime.now(timezone.utc)
-        filtered_trades = []
-        max_exec_days = int(max_exec_days)
-        max_disclose_days = int(max_disclose_days)
-        
-        for trade in trades:
-            try:
-                # Parse dates
-                disclose_date_str = trade.get('disclosureDate', '')
-                exec_date_str = trade.get('transactionDate', '')
-                
-                trader_name = f"{trade.get('firstName', '')} {trade.get('lastName', '')}".strip() or 'Unknown'
-
-                if not disclose_date_str or not exec_date_str:
-                    self.logger.debug(f"Trade missing dates, skipping: {trader_name}")
-                    continue
-                
-                # Parse dates (FMP returns YYYY-MM-DD format)
-                disclose_date = datetime.strptime(disclose_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                exec_date = datetime.strptime(exec_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-
-                # Check if this is the correct symbol (case insensitive)
-                trade_symbol = trade.get('symbol', '').upper()
-                if trade_symbol != symbol.upper():
-                    continue
-                
-                # Check disclose date
-                days_since_disclose = (now - disclose_date).days
-                if days_since_disclose > max_disclose_days:
-                    continue
-                
-                # Check execution date
-                days_since_exec = (now - exec_date).days
-                if days_since_exec > max_exec_days:
-                    continue
-                
-                # Add calculated fields to trade
-                trade['days_since_disclose'] = days_since_disclose
-                trade['days_since_exec'] = days_since_exec
-                trade['disclose_date'] = disclose_date_str
-                trade['exec_date'] = exec_date_str
-                
-                filtered_trades.append(trade)
-                
-            except Exception as e:
-                self.logger.error(f"Error processing trade: {e}", exc_info=True)
-                continue
-        
-        self.logger.info(f"Filtered {len(filtered_trades)} trades from {len(trades)} total based on age criteria")
-        return filtered_trades
-    
     def _filter_trades(self, trades: List[Dict[str, Any]], 
                       copy_trade_names: List[str],
                       max_disclose_days: int, 
@@ -1267,16 +1200,8 @@ Recommendations Generated:"""
                 # else: has_orders_with_trader_names is True, continue with same_trader mode
             
             # Generate close recommendations based on effective mode
-            if effective_close_only_for_same_trader:
-                # NEW MODE: Check for same trader reversals
-                recommendation_data = self._generate_close_recommendations_same_trader(
-                    symbol_trades, symbol
-                )
-            else:
-                # OLD MODE: Use averaging logic (or fallback mode)
-                recommendation_data = self._generate_close_recommendations_averaging(
-                    symbol_trades, symbol
-                )
+            # TODO: Implement same-trader reversal detection and averaging logic
+            recommendation_data = None
             
             if not recommendation_data:
                 # No recommendation in this mode - return HOLD
@@ -1390,29 +1315,6 @@ Recommendations Generated:"""
             market_analysis.status = MarketAnalysisStatus.FAILED
             update_instance(market_analysis)
             raise
-    
-    def _generate_close_recommendations_same_trader(self, symbol_trades: List[Dict[str, Any]], 
-                                                    symbol: str) -> Optional[Dict[str, Any]]:
-        """
-        Generate close recommendations only if same trader reverses direction.
-        
-        Returns None if no valid reversal found.
-        """
-        # TODO: Implement same-trader reversal detection
-        # This requires checking historical positions and matching trader names
-        # For now, return None to skip recommendations in this mode
-        return None
-    
-    def _generate_close_recommendations_averaging(self, symbol_trades: List[Dict[str, Any]], 
-                                                 symbol: str) -> Optional[Dict[str, Any]]:
-        """
-        Generate close recommendations using standard averaging logic.
-        
-        Compare BUY vs SELL counts in the lookback period to generate recommendations.
-        """
-        # TODO: Implement averaging logic
-        # Count BUY vs SELL trades and generate opposite signal if one dominates
-        return None
     
     def render_market_analysis(self, market_analysis: MarketAnalysis) -> None:
         """

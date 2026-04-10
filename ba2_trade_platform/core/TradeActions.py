@@ -8,11 +8,10 @@ based on expert recommendations and market conditions.
 from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
-import uuid
 
 from .interfaces import AccountInterface
 from .models import TradingOrder, ExpertRecommendation, TradeActionResult
-from .types import OrderRecommendation, ExpertActionType, OrderDirection, OrderType, OrderStatus
+from .types import OrderRecommendation, ExpertActionType, OrderDirection, OrderStatus
 from .db import get_db, add_instance, update_instance, get_instance
 from ..logger import logger
 
@@ -269,36 +268,7 @@ class TradeAction(ABC):
             logger.error(f"Error creating order record: {e}", exc_info=True)
             return None
     
-    def create_action_result(self, action_type: str, success: bool, message: str, 
-                           data: Optional[Dict[str, Any]] = None,
-                           expert_recommendation_id: Optional[int] = None) -> "TradeActionResult":
-        """
-        Create a TradeActionResult instance for this action.
-        
-        Args:
-            action_type: Type of action (buy, sell, close, etc.)
-            success: Whether the action was successful
-            message: Human-readable message about the result
-            data: Additional data from the action
-            expert_recommendation_id: Optional expert recommendation ID to link
-            
-        Returns:
-            TradeActionResult instance (not yet saved to database)
-        """
-        if data is None:
-            data = {}
-            
-        result = TradeActionResult(
-            action_type=action_type,
-            success=success,
-            message=message,
-            data=data,
-            expert_recommendation_id=expert_recommendation_id
-        )
-        
-        return result
-    
-    def create_and_save_action_result(self, action_type: str, success: bool, message: str, 
+    def create_and_save_action_result(self, action_type: str, success: bool, message: str,
                                        data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Create and save a TradeActionResult, returning a dictionary of attributes.

@@ -1,6 +1,5 @@
 from nicegui import ui, run
 from typing import Optional, Dict, Any, List
-import json
 from datetime import datetime, timezone
 
 from ...core.db import get_instance, get_db

@@ -13,7 +13,7 @@ from datetime import datetime
 from io import StringIO
 from typing import Optional
 
-from ba2_trade_platform.config import ALPHA_VANTAGE_API_KEY
+from ba2_trade_platform.config import get_app_setting
 from ba2_trade_platform.logger import logger
 
 API_BASE_URL = "https://www.alphavantage.co/query"
@@ -66,9 +66,10 @@ class AlphaVantageBaseProvider:
 
 def get_api_key() -> str:
     """Retrieve the API key for Alpha Vantage from configuration."""
-    if not ALPHA_VANTAGE_API_KEY:
+    api_key = get_app_setting("alpha_vantage_api_key")
+    if not api_key:
         raise ValueError("ALPHA_VANTAGE_API_KEY is not set in BA2 Platform configuration.")
-    return ALPHA_VANTAGE_API_KEY
+    return api_key
 
 
 def format_datetime_for_api(date_input) -> str:

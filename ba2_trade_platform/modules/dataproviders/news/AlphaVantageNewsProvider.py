@@ -18,7 +18,6 @@ from ba2_trade_platform.core.provider_utils import (
 from ba2_trade_platform.modules.dataproviders.alpha_vantage_common import (
     AlphaVantageBaseProvider,
     format_datetime_for_api,
-    AlphaVantageRateLimitError
 )
 from ba2_trade_platform.logger import logger
 

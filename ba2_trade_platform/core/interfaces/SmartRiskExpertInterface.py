@@ -1,6 +1,5 @@
 from abc import abstractmethod
 from typing import Dict, Optional
-from ...logger import logger
 
 
 class SmartRiskExpertInterface:

@@ -10,7 +10,6 @@ It handles:
 
 import threading
 import time
-import json
 import queue
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timedelta

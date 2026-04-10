@@ -6,7 +6,7 @@ from typing import Optional, List, TYPE_CHECKING, Dict, Any
 from datetime import datetime, timezone
 import time
 from .db import get_instance, get_db
-from .models import ExpertInstance, TradingOrder, ExpertRecommendation, MarketAnalysis, Transaction
+from .models import ExpertInstance, TradingOrder, ExpertRecommendation, Transaction
 from .types import OrderStatus, TransactionStatus, ActivityLogSeverity, ActivityLogType, OrderDirection
 from ..modules.experts import get_expert_class
 from ..modules.accounts import get_account_class
@@ -68,46 +68,6 @@ def get_expert_instance_from_id(expert_instance_id: int, use_cache: bool = True)
         return expert_class(expert_instance_id)
 
 
-def get_expert_instance_id_from_order_id(order_id: int) -> Optional[int]:
-    """
-    Get the expert instance ID associated with an order via its linked recommendation.
-    
-    Args:
-        order_id (int): The ID of the trading order
-        
-    Returns:
-        Optional[int]: The expert instance ID, or None if no link exists
-    """
-    try:
-        with Session(get_db().bind) as session:
-            # Query order with joined recommendation
-            statement = (
-                select(ExpertRecommendation.instance_id)
-                .join(TradingOrder, TradingOrder.expert_recommendation_id == ExpertRecommendation.id)
-                .where(TradingOrder.id == order_id)
-            )
-            result = session.exec(statement).first()
-            return result
-    except Exception:
-        return None
-
-
-def get_expert_from_order_id(order_id: int) -> Optional["MarketExpertInterface"]:
-    """
-    Get the expert instance associated with an order via its linked recommendation.
-    
-    Args:
-        order_id (int): The ID of the trading order
-        
-    Returns:
-        Optional[MarketExpertInterface]: The expert instance, or None if no link exists
-    """
-    expert_instance_id = get_expert_instance_id_from_order_id(order_id)
-    if expert_instance_id:
-        return get_expert_instance_from_id(expert_instance_id)
-    return None
-
-
 def get_market_analysis_id_from_order_id(order_id: int) -> Optional[int]:
     """
     Get the market analysis ID associated with an order via its linked recommendation.
@@ -130,42 +90,6 @@ def get_market_analysis_id_from_order_id(order_id: int) -> Optional[int]:
             return result
     except Exception:
         return None
-
-
-def has_existing_orders_for_expert_and_symbol(expert_instance_id: int, symbol: str, 
-                                             statuses: List[OrderStatus] = None) -> bool:
-    """
-    Check if there are existing orders for a specific expert and symbol in given statuses.
-    
-    Args:
-        expert_instance_id (int): The expert instance ID
-        symbol (str): The trading symbol
-        statuses (List[OrderStatus], optional): List of order statuses to check. 
-                                              Defaults to [PENDING, OPEN, FILLED]
-        
-    Returns:
-        bool: True if orders exist, False otherwise
-    """
-    if statuses is None:
-        statuses = [OrderStatus.PENDING, OrderStatus.OPEN, OrderStatus.FILLED]
-    
-    try:
-        with Session(get_db().bind) as session:
-            # Query orders linked to the expert via recommendations
-            statement = (
-                select(TradingOrder.id)
-                .join(ExpertRecommendation, TradingOrder.expert_recommendation_id == ExpertRecommendation.id)
-                .where(
-                    ExpertRecommendation.instance_id == expert_instance_id,
-                    TradingOrder.symbol == symbol,
-                    TradingOrder.status.in_(statuses)
-                )
-                .limit(1)  # We only need to know if any exist
-            )
-            result = session.exec(statement).first()
-            return result is not None
-    except Exception:
-        return False
 
 
 def has_existing_transactions_for_expert_and_symbol(expert_instance_id: int, symbol: str) -> bool:
@@ -197,39 +121,6 @@ def has_existing_transactions_for_expert_and_symbol(expert_instance_id: int, sym
             return result is not None
     except Exception:
         return False
-
-
-def get_orders_for_expert_and_symbol(expert_instance_id: int, symbol: str = None, 
-                                   statuses: List[OrderStatus] = None) -> List[TradingOrder]:
-    """
-    Get all orders for a specific expert instance, optionally filtered by symbol and statuses.
-    
-    Args:
-        expert_instance_id (int): The expert instance ID
-        symbol (str, optional): Filter by trading symbol
-        statuses (List[OrderStatus], optional): Filter by order statuses
-        
-    Returns:
-        List[TradingOrder]: List of matching orders
-    """
-    try:
-        with Session(get_db().bind) as session:
-            # Query orders linked to the expert via recommendations
-            statement = (
-                select(TradingOrder)
-                .join(ExpertRecommendation, TradingOrder.expert_recommendation_id == ExpertRecommendation.id)
-                .where(ExpertRecommendation.instance_id == expert_instance_id)
-            )
-            
-            # Add optional filters
-            if symbol:
-                statement = statement.where(TradingOrder.symbol == symbol)
-            if statuses:
-                statement = statement.where(TradingOrder.status.in_(statuses))
-            
-            return list(session.exec(statement).all())
-    except Exception:
-        return []
 
 
 def get_account_instance_from_id(account_id: int, session=None, use_cache: bool = True):
@@ -616,35 +507,6 @@ def log_trade_action_activity(
         logger.warning(f"Failed to log trade action activity: {e}")
 
 
-def is_transaction_orphaned(transaction_id: int, session: Optional[Session] = None) -> bool:
-    """
-    Check if a transaction is orphaned (has no associated orders).
-    
-    Args:
-        transaction_id: The ID of the transaction to check
-        session: Optional database session (if None, creates a new one)
-        
-    Returns:
-        bool: True if the transaction has no orders, False otherwise
-    """
-    try:
-        # Use provided session or get database connection
-        if session is None:
-            session = get_db()
-        
-        # Check if transaction has any orders
-        orders_statement = select(TradingOrder).where(
-            TradingOrder.transaction_id == transaction_id
-        ).limit(1)
-        first_order = session.exec(orders_statement).first()
-        
-        return first_order is None
-        
-    except Exception as e:
-        logger.error(f"Error checking if transaction {transaction_id} is orphaned: {e}", exc_info=True)
-        return False
-
-
 def get_account_instance_from_transaction(transaction_id: int, session: Optional[Session] = None):
     """
     Get an account instance from a transaction ID by finding the first order's account.
@@ -661,7 +523,6 @@ def get_account_instance_from_transaction(transaction_id: int, session: Optional
         
     Note:
         Logs specific error messages to help debug transaction/order relationship issues.
-        Use is_transaction_orphaned() to check if transaction has no orders before calling this.
         Returns None for FAILED transactions since they shouldn't be processed.
     """
     from .models import AccountDefinition, Transaction
@@ -703,122 +564,6 @@ def get_account_instance_from_transaction(transaction_id: int, session: Optional
     except Exception as e:
         logger.error(f"Error getting account for transaction {transaction_id}: {e}", exc_info=True)
         return None
-
-
-def log_tp_sl_adjustment_activity(
-    trading_order: TradingOrder,
-    account_id: int,
-    adjustment_type: str,  # "tp" or "sl"
-    new_price: Optional[float] = None,
-    percent: Optional[float] = None,
-    order_id: Optional[int] = None,
-    success: bool = True,
-    error_message: Optional[str] = None
-) -> None:
-    """
-    Log activity for TP/SL adjustment (success or failure).
-    
-    This centralized function should be used by all code paths that adjust TP/SL
-    to ensure consistent activity logging.
-    
-    Args:
-        trading_order: The trading order whose TP/SL is being adjusted
-        account_id: The account ID for activity logging
-        adjustment_type: Type of adjustment ("tp" or "sl")
-        new_price: The new TP/SL price
-        percent: The TP/SL percentage
-        order_id: The ID of the TP/SL order
-        success: Whether the adjustment was successful
-        error_message: Error message if adjustment failed (optional)
-    """
-    try:
-        from .db import log_activity, get_instance
-        from .models import Transaction
-        
-        # Get transaction for expert_id
-        transaction = None
-        if trading_order and trading_order.transaction_id:
-            transaction = get_instance(Transaction, trading_order.transaction_id)
-        
-        adjustment_name = "TP" if adjustment_type == "tp" else "SL"
-        
-        if success:
-            description = f"Changed {adjustment_name} for {trading_order.symbol}"
-            if new_price is not None:
-                description += f" to ${new_price:.2f}"
-            if percent is not None:
-                description += f" ({percent:.2f}%)"
-            
-            activity_data = {
-                "order_id": order_id,
-                "symbol": trading_order.symbol,
-                "transaction_id": trading_order.transaction_id
-            }
-            if new_price is not None:
-                activity_data[f"new_{adjustment_type}"] = new_price
-            if percent is not None:
-                activity_data[f"{adjustment_type}_percent"] = percent
-            
-            severity = ActivityLogSeverity.SUCCESS
-            activity_type = ActivityLogType.TRANSACTION_TP_CHANGED if adjustment_type == "tp" else ActivityLogType.TRANSACTION_SL_CHANGED
-        else:
-            description = f"Failed to set {adjustment_name} for {trading_order.symbol}: {error_message or 'Unknown error'}"
-            activity_data = {
-                "order_id": trading_order.id if trading_order else None,
-                "symbol": trading_order.symbol if trading_order else None,
-                "transaction_id": trading_order.transaction_id if trading_order else None
-            }
-            if error_message:
-                activity_data["error"] = error_message
-            
-            severity = ActivityLogSeverity.FAILURE
-            activity_type = ActivityLogType.TRANSACTION_TP_CHANGED if adjustment_type == "tp" else ActivityLogType.TRANSACTION_SL_CHANGED
-        
-        # Log activity
-        log_activity(
-            severity=severity,
-            activity_type=activity_type,
-            description=description,
-            data=activity_data,
-            source_expert_id=transaction.expert_id if transaction else None,
-            source_account_id=account_id
-        )
-        
-    except Exception as e:
-        logger.warning(f"Failed to log {adjustment_type.upper()} adjustment activity: {e}")
-
-
-def convert_utc_to_local(utc_datetime: datetime) -> datetime:
-    """
-    Convert UTC datetime to local time.
-    
-    Args:
-        utc_datetime: UTC datetime object (with timezone.utc)
-        
-    Returns:
-        Local datetime object (without timezone, local time)
-        
-    Example:
-        >>> utc_time = datetime.now(timezone.utc)
-        >>> local_time = convert_utc_to_local(utc_time)
-        >>> print(local_time)  # Displays in local timezone
-    """
-    try:
-        if not utc_datetime:
-            return utc_datetime
-        
-        # If naive datetime, assume UTC
-        if utc_datetime.tzinfo is None:
-            utc_datetime = utc_datetime.replace(tzinfo=timezone.utc)
-        
-        # Convert to local time
-        local_time = utc_datetime.astimezone()
-        
-        # Remove timezone info for display (we want naive local time)
-        return local_time.replace(tzinfo=None)
-    except Exception as e:
-        logger.warning(f"Failed to convert UTC time to local: {e}")
-        return utc_datetime
 
 
 def get_risk_manager_mode(settings: dict, default: str = "classic") -> str:
@@ -1304,205 +1049,3 @@ def get_setting_safe(settings: dict, key: str, default, as_type=None):
                 value = as_type(value) if default is not None else None
     
     return value
-
-
-def get_setting_default_from_interface(interface_class, setting_key: str):
-    """
-    Get the default value for a setting from an interface class definition.
-    
-    This function retrieves the default value defined in the interface's builtin settings
-    (via get_settings_definitions() or _builtin_settings). This ensures we always use
-    the official default from the interface definition, not hardcoded values scattered
-    in the codebase.
-    
-    Args:
-        interface_class: The interface class (MarketExpertInterface, AccountInterface, etc.)
-        setting_key: The setting key to look up (e.g., "max_virtual_equity_per_instrument_percent")
-        
-    Returns:
-        The default value from the interface definition, or None if not found
-        
-    Raises:
-        ValueError: If the setting is not found in the interface definition
-        
-    Example:
-        >>> from ba2_trade_platform.core.interfaces import MarketExpertInterface
-        >>> default = get_setting_default_from_interface(MarketExpertInterface, "max_virtual_equity_per_instrument_percent")
-        >>> print(default)  # 10.0
-    """
-    try:
-        # Get merged settings definitions (builtin + implementation-specific)
-        settings_defs = interface_class.get_merged_settings_definitions()
-        
-        if not settings_defs or setting_key not in settings_defs:
-            raise ValueError(f"Setting '{setting_key}' not found in {interface_class.__name__} interface definition")
-        
-        setting_def = settings_defs[setting_key]
-        default_value = setting_def.get("default")
-        
-        if default_value is None:
-            logger.warning(f"Setting '{setting_key}' in {interface_class.__name__} has no default value defined")
-        
-        return default_value
-        
-    except Exception as e:
-        logger.error(f"Error getting default for setting '{setting_key}' from {interface_class.__name__}: {e}", exc_info=True)
-        raise
-
-
-def parse_model_config(model_string: str) -> dict:
-    """
-    Parse model string to extract provider, model name, and parameters.
-    
-    Format: Provider/ModelName{key=subkey:value} or Provider/ModelName{key=value} or Provider/ModelName{key:value}
-    Examples: 
-        - "OpenAI/gpt-5-mini" (no parameters)
-        - "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:low}" (nested parameter)
-        - "OpenAI/gpt-4{temperature=0.7}" (simple key=value)
-        - "OpenAI/gpt-4{temperature:0.7}" (legacy key:value)
-    
-    Args:
-        model_string: Model configuration string
-        
-    Returns:
-        dict with keys: 'provider', 'model', 'base_url', 'api_key_setting', 'model_kwargs'
-        
-    Example:
-        >>> config = parse_model_config("NagaAC/gpt-5.1-2025-11-13{reasoning=effort:low}")
-        >>> config['model']
-        'gpt-5.1-2025-11-13'
-        >>> config['model_kwargs']
-        {'reasoning': {'effort': 'low'}}
-        
-        >>> config = parse_model_config("OpenAI/gpt-4{temperature=0.7}")
-        >>> config['model_kwargs']
-        {'temperature': '0.7'}
-    """
-    import re
-    
-    # Extract parameters from model string (e.g., {reasoning=effort:low})
-    model_kwargs = {}
-    param_match = re.search(r'\{([^}]+)\}', model_string)
-    if param_match:
-        params_str = param_match.group(1)
-        # Remove parameters from model string to get clean model name
-        model_string = model_string[:param_match.start()]
-        # Parse parameters (format: key=subkey:value, key=value, or key:value)
-        for param in params_str.split(','):
-            if '=' in param:
-                # Format with equals: key=subkey:value or key=value
-                key, nested_part = param.split('=', 1)
-                key = key.strip()
-                if ':' in nested_part:
-                    # Nested format: key=subkey:value (e.g., reasoning=effort:low)
-                    subkey, value = nested_part.split(':', 1)
-                    model_kwargs[key] = {subkey.strip(): value.strip()}
-                else:
-                    # Simple key=value format (e.g., temperature=0.7)
-                    model_kwargs[key] = nested_part.strip()
-            elif ':' in param:
-                # Flat format: key:value (legacy support)
-                key, value = param.split(':', 1)
-                model_kwargs[key.strip()] = value.strip()
-        
-        # Log parsed parameters for visibility
-        if model_kwargs:
-            logger.info(f"Parsed model parameters from '{model_string}': {model_kwargs}")
-    
-    # Handle legacy format (no provider prefix)
-    if '/' not in model_string:
-        # Default to OpenAI for backward compatibility
-        result = {
-            'provider': 'OpenAI',
-            'model': model_string,
-            'base_url': 'https://api.openai.com/v1',
-            'api_key_setting': 'openai_api_key',
-            'model_kwargs': model_kwargs
-        }
-        logger.debug(f"Parsed legacy model string '{model_string}' -> provider={result['provider']}, model={result['model']}")
-        return result
-    
-    # Parse Provider/Model format
-    provider, model = model_string.split('/', 1)
-    
-    # Normalize provider to lowercase for consistent matching
-    provider_lower = provider.lower()
-    
-    # Provider configuration mapping (supports both legacy and new formats)
-    PROVIDER_CONFIGS = {
-        'openai': {
-            'provider': 'OpenAI',
-            'base_url': 'https://api.openai.com/v1',
-            'api_key_setting': 'openai_api_key',
-        },
-        'nagaai': {
-            'provider': 'NagaAI',
-            'base_url': 'https://api.naga.ac/v1',
-            'api_key_setting': 'naga_ai_api_key',
-        },
-        'nagaac': {
-            'provider': 'NagaAC',
-            'base_url': 'https://api.naga.ac/v1',
-            'api_key_setting': 'naga_ai_api_key',
-        },
-        'native': {
-            # Native provider - uses the new model registry format
-            # Model should be friendly_name, which ModelFactory resolves
-            'provider': 'native',
-            'base_url': None,  # Will be resolved by ModelFactory
-            'api_key_setting': None,  # Will be resolved by ModelFactory
-        },
-        'google': {
-            'provider': 'Google',
-            'base_url': None,  # Google uses direct API
-            'api_key_setting': 'google_api_key',
-        },
-        'anthropic': {
-            'provider': 'Anthropic',
-            'base_url': 'https://api.anthropic.com',
-            'api_key_setting': 'anthropic_api_key',
-        },
-        'openrouter': {
-            'provider': 'OpenRouter',
-            'base_url': 'https://openrouter.ai/api/v1',
-            'api_key_setting': 'openrouter_api_key',
-        },
-        'xai': {
-            'provider': 'xAI',
-            'base_url': 'https://api.x.ai/v1',
-            'api_key_setting': 'xai_api_key',
-        },
-        'deepseek': {
-            'provider': 'DeepSeek',
-            'base_url': 'https://api.deepseek.com',
-            'api_key_setting': 'deepseek_api_key',
-        },
-        'moonshot': {
-            'provider': 'Moonshot',
-            'base_url': 'https://api.moonshot.ai/v1',  # International endpoint
-            'api_key_setting': 'moonshot_api_key',
-        },
-    }
-    
-    if provider_lower in PROVIDER_CONFIGS:
-        config = PROVIDER_CONFIGS[provider_lower]
-        result = {
-            'provider': config['provider'],
-            'model': model,
-            'base_url': config['base_url'],
-            'api_key_setting': config['api_key_setting'],
-            'model_kwargs': model_kwargs
-        }
-    else:
-        # Unknown provider, default to OpenAI and use just the model name
-        logger.warning(f"Unknown provider '{provider}' in model string '{model_string}', defaulting to OpenAI")
-        result = {
-            'provider': 'OpenAI',
-            'model': model,  # Use just the model part, not the full string
-            'base_url': 'https://api.openai.com/v1',
-            'api_key_setting': 'openai_api_key',
-            'model_kwargs': model_kwargs
-        }
-    
-    logger.debug(f"Parsed model string '{model_string}' -> provider={result['provider']}, model={result['model']}, kwargs={result['model_kwargs']}")
-    return result

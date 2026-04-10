@@ -2,10 +2,7 @@ from nicegui import ui
 from datetime import datetime, timedelta, timezone
 from sqlmodel import select, func
 from typing import Dict, Any, Optional, List
-import requests
-import aiohttp
 import asyncio
-import json
 
 from ...core.db import get_all_instances, get_db, get_instance, update_instance
 from ...core.models import AccountDefinition, MarketAnalysis, ExpertRecommendation, ExpertInstance, AppSetting, TradingOrder, Transaction
@@ -175,98 +172,6 @@ class OverviewTab:
         
         except Exception as e:
             logger.error(f"Error checking for pending orders: {e}", exc_info=True)
-        finally:
-            session.close()
-    
-    def _check_and_display_quantity_mismatches(self):
-        """Check for quantity mismatches between broker positions and transactions.
-        
-        DEPRECATED: This synchronous version blocks the UI. Use _check_and_display_quantity_mismatches_async() instead.
-        """
-        from ...core.models import Transaction
-        from ...core.types import TransactionStatus
-        
-        session = get_db()
-        mismatches = []
-        
-        try:
-            # Get all accounts
-            accounts = get_all_instances(AccountDefinition)
-            
-            for acc in accounts:
-                try:
-                    provider_obj = get_account_instance_from_id(acc.id)
-                    if not provider_obj:
-                        continue
-                    
-                    # Get positions from broker
-                    positions = provider_obj.get_positions()
-                    
-                    # Create a map of symbol -> broker quantity
-                    broker_positions = {}
-                    for pos in positions:
-                        pos_dict = pos if isinstance(pos, dict) else dict(pos)
-                        symbol = pos_dict.get('symbol')
-                        qty = pos_dict.get('qty', 0)
-                        if symbol and qty:
-                            broker_positions[symbol] = float(qty)
-                    
-                    # Get all open transactions for this account
-                    # First, get all trading orders for this account to find their transaction IDs
-                    orders_stmt = select(TradingOrder).where(
-                        TradingOrder.account_id == acc.id,
-                        TradingOrder.transaction_id.isnot(None)
-                    )
-                    account_orders = session.exec(orders_stmt).all()
-                    
-                    # Get unique transaction IDs
-                    transaction_ids = list(set(o.transaction_id for o in account_orders if o.transaction_id))
-                    
-                    # Get transactions
-                    if transaction_ids:
-                        txn_stmt = select(Transaction).where(
-                            Transaction.id.in_(transaction_ids),
-                            Transaction.status == TransactionStatus.OPENED
-                        )
-                        transactions = session.exec(txn_stmt).all()
-                        
-                        # Calculate total quantity per symbol from transactions
-                        transaction_quantities = {}
-                        for txn in transactions:
-                            if txn.symbol and txn.quantity:
-                                if txn.symbol not in transaction_quantities:
-                                    transaction_quantities[txn.symbol] = 0
-                                transaction_quantities[txn.symbol] += float(txn.quantity)
-                        
-                        # Compare broker positions with transaction quantities
-                        for symbol, broker_qty in broker_positions.items():
-                            txn_qty = transaction_quantities.get(symbol, 0)
-                            
-                            # Check if broker quantity is less than transaction quantity (potential issue)
-                            if abs(broker_qty) < abs(txn_qty) - 0.01:  # 0.01 tolerance for float comparison
-                                # Get all transactions for this symbol
-                                symbol_txns = [t for t in transactions if t.symbol == symbol]
-                                
-                                mismatches.append({
-                                    'account': acc.name,
-                                    'account_id': acc.id,
-                                    'symbol': symbol,
-                                    'broker_qty': broker_qty,
-                                    'transaction_qty': txn_qty,
-                                    'difference': txn_qty - broker_qty,
-                                    'transactions': symbol_txns
-                                })
-                
-                except Exception as e:
-                    logger.error(f"Error checking quantity mismatch for account {acc.name}: {e}", exc_info=True)
-            
-            # Display alerts for mismatches
-            if mismatches:
-                for mismatch in mismatches:
-                    self._render_quantity_mismatch_alert(mismatch)
-        
-        except Exception as e:
-            logger.error(f"Error checking for quantity mismatches: {e}", exc_info=True)
         finally:
             session.close()
     

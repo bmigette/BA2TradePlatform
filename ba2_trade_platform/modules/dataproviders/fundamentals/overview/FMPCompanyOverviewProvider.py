@@ -7,7 +7,6 @@ Documentation: https://site.financialmodelingprep.com/developer/docs#company
 
 from typing import Dict, Any, Literal, Annotated
 from datetime import datetime
-import json
 
 import fmpsdk
 

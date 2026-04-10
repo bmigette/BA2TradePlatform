@@ -13,7 +13,6 @@ from ba2_trade_platform.core.interfaces import MarketIndicatorsInterface
 from ba2_trade_platform.core.provider_utils import validate_date_range, log_provider_call
 from ba2_trade_platform.modules.dataproviders.alpha_vantage_common import (
     AlphaVantageBaseProvider,
-    AlphaVantageRateLimitError
 )
 from ba2_trade_platform.logger import logger
 
@@ -369,54 +368,6 @@ class AlphaVantageIndicatorsProvider(AlphaVantageBaseProvider, MarketIndicatorsI
         result_data.sort(key=lambda x: x["date"])
         
         return result_data
-    
-    def _parse_indicator_result(self, result_str: str, indicator: str) -> list[Dict[str, Any]]:
-        """
-        Parse indicator result string into structured data points.
-        
-        DEPRECATED: This method is kept for backwards compatibility.
-        Use _parse_csv_data instead.
-        
-        Args:
-            result_str: Raw indicator result from Alpha Vantage
-            indicator: Indicator name
-        
-        Returns:
-            List of data points with date and value
-        """
-        data_points = []
-        
-        # The result format from TradingAgents is:
-        # "## INDICATOR values from YYYY-MM-DD to YYYY-MM-DD:\n\nYYYY-MM-DD: value\n..."
-        lines = result_str.strip().split('\n')
-        
-        for line in lines:
-            if ':' in line and not line.startswith('#'):
-                parts = line.split(':')
-                if len(parts) >= 2:
-                    date_str = parts[0].strip()
-                    try:
-                        # Try to parse date
-                        date_obj = datetime.strptime(date_str, "%Y-%m-%d")
-                        # Extract numeric value
-                        value_str = parts[1].strip()
-                        # Handle "N/A" or non-numeric values
-                        if value_str.lower() == 'n/a' or 'not available' in value_str.lower():
-                            continue
-                        try:
-                            value = float(value_str)
-                            data_points.append({
-                                "date": date_obj.isoformat(),
-                                "value": round(value, 4)
-                            })
-                        except ValueError:
-                            # Skip non-numeric values
-                            continue
-                    except ValueError:
-                        # Skip lines that don't match date format
-                        continue
-        
-        return data_points
     
     def _format_markdown(self, data: Dict[str, Any]) -> str:
         """Format indicator data as markdown."""

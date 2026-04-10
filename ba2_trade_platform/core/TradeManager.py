@@ -7,11 +7,9 @@ expert settings, rulesets, and trading permissions.
 
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timezone
-import logging
 import threading
 from ..logger import logger
 from .models import ExpertRecommendation, ExpertInstance, TradingOrder, Ruleset, Transaction
-from .interfaces import MarketExpertInterface
 from .types import OrderRecommendation, OrderStatus, OrderDirection, OrderOpenType, OrderType
 from .db import get_instance, get_all_instances, add_instance, update_instance
 
@@ -39,26 +37,6 @@ class TradeManager:
         self._processing_locks: Dict[str, threading.Lock] = {}
         self._locks_dict_lock = threading.Lock()  # Lock for accessing the locks dictionary
     
-    def trigger_and_place_order(self, account, order: TradingOrder, parent_status: OrderStatus, trigger_status: OrderStatus):
-        """
-        Place the order using the account's submit_order if the parent_status matches the trigger_status.
-        If successful, set the order status to OPEN and update in the database.
-        """
-        from .db import update_instance
-        if parent_status == trigger_status:
-            submitted_order = account.submit_order(order)
-            if submitted_order:
-                order.status = OrderStatus.OPEN
-                update_instance(order)
-                self.logger.info(f"Order {order.id} placed and status set to OPEN.")
-                return order
-            else:
-                self.logger.error(f"Order {order.id} failed to place.")
-                return None
-        else:
-            self.logger.info(f"Order {order.id} not triggered. Parent status: {parent_status}, trigger: {trigger_status}")
-            return None
-        
     def refresh_accounts(self):
         """
         Refresh account information for all registered accounts.
@@ -749,42 +727,6 @@ class TradeManager:
         else:
             return False  # ERROR and unknown actions are not allowed
             
-    def _get_ruleset_with_relations(self, ruleset_id: int) -> Optional[Ruleset]:
-        """
-        Get a ruleset with its event_actions relationship eagerly loaded.
-        
-        Args:
-            ruleset_id: The ID of the ruleset to fetch
-            
-        Returns:
-            Ruleset with event_actions loaded, or None if not found
-        """
-        try:
-            from sqlmodel import select
-            from sqlalchemy.orm import selectinload
-            from .db import get_db
-            
-            with get_db() as session:
-                # Use selectinload to eagerly load the event_actions relationship
-                statement = select(Ruleset).where(Ruleset.id == ruleset_id).options(
-                    selectinload(Ruleset.event_actions)
-                )
-                ruleset = session.scalars(statement).first()
-                
-                if not ruleset:
-                    self.logger.warning(f"Ruleset {ruleset_id} not found")
-                    return None
-                
-                # Make the ruleset persistent by expunging it from the session
-                # This allows it to be used outside the session context
-                session.expunge(ruleset)
-                
-                return ruleset
-                
-        except Exception as e:
-            self.logger.error(f"Error fetching ruleset {ruleset_id}: {e}", exc_info=True)
-            return None
-            
     def _create_order_from_recommendation(self, recommendation: ExpertRecommendation, expert_instance: ExpertInstance) -> Optional[TradingOrder]:
         """
         Create a trading order from an expert recommendation.
@@ -894,39 +836,6 @@ class TradeManager:
             
         return None
         
-    def process_pending_recommendations(self) -> List[TradingOrder]:
-        """
-        Process all pending expert recommendations.
-        
-        Returns:
-            List of orders that were placed
-        """
-        placed_orders = []
-        
-        try:
-            # Get all recent recommendations that haven't been processed
-            # This is a simplified query - in production you'd want to track processing status
-            from datetime import timedelta
-            from sqlmodel import select, Session
-            from .db import engine
-            
-            cutoff_time = datetime.now(timezone.utc) - timedelta(hours=1)  # Process recommendations from last hour
-            
-            with Session(engine) as session:
-                statement = select(ExpertRecommendation).where(ExpertRecommendation.created_at >= cutoff_time)
-                recent_recommendations = session.exec(statement).all()
-            
-            for recommendation in recent_recommendations:
-                if recommendation.recommended_action != OrderRecommendation.HOLD:
-                    order = self.process_recommendation(recommendation)
-                    if order:
-                        placed_orders.append(order)
-                        
-        except Exception as e:
-            self.logger.error(f"Error processing pending recommendations: {e}", exc_info=True)
-            
-        return placed_orders
-    
     def process_expert_recommendations_after_analysis(self, expert_instance_id: int, lookback_days: int = 1) -> List[TradingOrder]:
         """
         Process expert recommendations after all market analysis jobs for enter_market are completed.

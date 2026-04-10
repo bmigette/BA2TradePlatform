@@ -15,7 +15,7 @@ Key Principles:
 
 from datetime import datetime, timezone, timedelta
 import pytz
-from typing import Optional, Tuple
+from typing import Optional
 from ..logger import logger
 
 
@@ -109,38 +109,6 @@ def utc_to_local(utc_dt: Optional[datetime]) -> Optional[datetime]:
     except Exception as e:
         logger.error(f"Error converting UTC to local timezone: {e}", exc_info=True)
         return utc_dt
-
-
-def local_to_utc(local_dt: Optional[datetime]) -> Optional[datetime]:
-    """
-    Convert a local timezone datetime to UTC.
-    
-    Args:
-        local_dt: Datetime in local timezone (or naive datetime assumed to be local)
-        
-    Returns:
-        Datetime in UTC timezone, or None if input is None
-        
-    Example:
-        user_input = datetime(2025, 10, 22, 14, 30, 0)  # User enters 2:30 PM
-        utc_dt = local_to_utc(user_input)
-        save_to_database(utc_dt)  # Save UTC time to DB
-    """
-    if local_dt is None:
-        return None
-    
-    try:
-        # If datetime is naive, assume it's in local timezone
-        if local_dt.tzinfo is None:
-            local_tz = get_user_local_timezone()
-            local_dt = local_dt.replace(tzinfo=local_tz)
-        
-        # Convert to UTC
-        utc_dt = local_dt.astimezone(timezone.utc)
-        return utc_dt
-    except Exception as e:
-        logger.error(f"Error converting local to UTC timezone: {e}", exc_info=True)
-        return local_dt
 
 
 def format_for_display(dt: Optional[datetime], format_string: str = "%Y-%m-%d %H:%M:%S %Z") -> str:
@@ -255,47 +223,3 @@ def format_relative(dt: Optional[datetime]) -> str:
     except Exception as e:
         logger.error(f"Error formatting relative datetime: {e}", exc_info=True)
         return str(dt)
-
-
-def get_utc_now() -> datetime:
-    """
-    Get current time in UTC.
-    
-    Use this instead of datetime.now() when you need UTC time.
-    
-    Returns:
-        Current time in UTC timezone
-        
-    Example:
-        >>> created_at = get_utc_now()
-        >>> db_model.created_at = created_at
-    """
-    return datetime.now(timezone.utc)
-
-
-def ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
-    """
-    Ensure a datetime is in UTC timezone.
-    
-    If the datetime is naive, assumes it's already in UTC.
-    If the datetime is timezone-aware, converts it to UTC.
-    
-    Args:
-        dt: Datetime to ensure is UTC
-        
-    Returns:
-        Datetime in UTC timezone, or None if input is None
-    """
-    if dt is None:
-        return None
-    
-    try:
-        if dt.tzinfo is None:
-            # Naive datetime - assume it's already UTC
-            return dt.replace(tzinfo=timezone.utc)
-        else:
-            # Timezone-aware - convert to UTC
-            return dt.astimezone(timezone.utc)
-    except Exception as e:
-        logger.error(f"Error ensuring datetime is UTC: {e}", exc_info=True)
-        return dt

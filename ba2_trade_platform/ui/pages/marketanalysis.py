@@ -12,7 +12,6 @@ from ...core.types import MarketAnalysisStatus, WorkerTaskStatus, OrderDirection
 from ...core.models import TradingOrder
 from ...core.types import OrderStatus
 from ...core.models import AccountDefinition
-from ...modules.accounts import get_account_class
 from ...core.db import add_instance
 from ...logger import logger
 from ...core.utils import get_account_instance_from_id

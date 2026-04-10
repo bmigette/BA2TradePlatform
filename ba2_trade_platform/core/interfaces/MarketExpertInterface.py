@@ -1,6 +1,5 @@
 from abc import abstractmethod
 from typing import Any, Dict, List, Optional
-from unittest import result
 from sqlmodel import Session, select
 from ...logger import logger
 from ...core.models import ExpertSetting, MarketAnalysis, Transaction, ExpertInstance

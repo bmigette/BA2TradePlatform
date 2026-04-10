@@ -5,7 +5,7 @@ import requests
 
 from ...core.interfaces import MarketExpertInterface
 from ...core.models import ExpertInstance, MarketAnalysis, AnalysisOutput, ExpertRecommendation
-from ...core.db import get_db, get_instance, update_instance, add_instance, get_setting
+from ...core.db import get_db, get_instance, update_instance, add_instance
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, RiskLevel, TimeHorizon
 from ...logger import get_expert_logger
 from ...config import get_app_setting

@@ -391,29 +391,6 @@ def _get_analysis_ids_with_open_transactions(session: Session, analysis_ids: Lis
         return set()
 
 
-def _has_open_transaction(session: Session, market_analysis_id: int) -> bool:
-    """
-    Check if a MarketAnalysis has any linked open transactions.
-
-    NOTE: For batch operations, use _get_analysis_ids_with_open_transactions() instead
-    to avoid N+1 query issues.
-
-    Args:
-        session: Database session
-        market_analysis_id: ID of the MarketAnalysis to check
-
-    Returns:
-        True if there are any open transactions linked to this analysis, False otherwise
-    """
-    try:
-        result = _get_analysis_ids_with_open_transactions(session, [market_analysis_id])
-        return market_analysis_id in result
-    except Exception as e:
-        # If we can't determine transaction status, err on the side of caution and protect the analysis
-        logger.warning(f"Could not check transaction status for analysis {market_analysis_id}: {e}")
-        return True
-
-
 def get_cleanup_statistics(expert_instance_id: Optional[int] = None) -> Dict[str, Any]:
     """
     Get statistics about cleanable data.

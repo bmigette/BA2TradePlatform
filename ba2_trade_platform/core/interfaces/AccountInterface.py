@@ -5,7 +5,7 @@ from ba2_trade_platform.logger import logger
 from ...core.models import TradingOrder, Transaction, ExpertRecommendation, ExpertInstance
 from ...core.types import OrderOpenType, OrderDirection, OrderType, OrderStatus, TransactionStatus
 from .ReadOnlyAccountInterface import ReadOnlyAccountInterface
-from ...core.db import add_instance, get_instance, update_instance
+from ...core.db import add_instance, get_db, get_instance, update_instance
 
 
 class AccountInterface(ReadOnlyAccountInterface):
@@ -131,8 +131,6 @@ class AccountInterface(ReadOnlyAccountInterface):
         # CRITICAL: Save order to database BEFORE broker submission
         # This ensures the order has an ID for error tracking
         # Use expunge_after_flush=True to allow normal attribute access after save
-        from ..db import add_instance, update_instance
-        
         if not trading_order.id:
             # Save to database - object will be expunged and can be used like a normal Pydantic object
             order_id = add_instance(trading_order, expunge_after_flush=True)
@@ -306,7 +304,6 @@ class AccountInterface(ReadOnlyAccountInterface):
         """
         try:
             from sqlmodel import select
-            from ..db import get_db, update_instance, get_instance
             from ..models import Transaction
             
             transaction = get_instance(Transaction, transaction_id)
@@ -381,8 +378,7 @@ class AccountInterface(ReadOnlyAccountInterface):
         """
         try:
             from ..types import OrderType
-            from ..db import update_instance
-            
+
             # Skip if no data field or already has tp_percent/sl_percent
             if not tp_or_sl_order.data:
                 tp_or_sl_order.data = {}

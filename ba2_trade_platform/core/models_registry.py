@@ -5,16 +5,13 @@ This module provides a unified registry of all LLM models supported by the platf
 with provider-specific model names, labels, and configuration details.
 
 Usage:
-    from ba2_trade_platform.core.models_registry import MODELS, get_model_for_provider, get_models_by_label
-    
+    from ba2_trade_platform.core.models_registry import MODELS, get_model_for_provider
+
     # Get a model's provider-specific name
     model_name = get_model_for_provider("gpt5", "nagaai")  # Returns "gpt-5-2025-08-07"
-    
-    # Get all models with a specific label
-    cheap_models = get_models_by_label("low_cost")
 """
 
-from typing import Dict, List, Any, Optional, Literal, Set
+from typing import Dict, List, Any, Optional, Set
 from ..logger import logger
 
 
@@ -945,36 +942,6 @@ def get_model_default_kwargs(friendly_name: str) -> Optional[Dict[str, Any]]:
     return model_info.get("default_model_kwargs")
 
 
-def get_models_by_label(label: str) -> List[str]:
-    """
-    Get all models that have a specific label.
-    
-    Args:
-        label: The label to filter by (e.g., "low_cost", "thinking")
-        
-    Returns:
-        List of friendly model names with that label
-    """
-    return [name for name, info in MODELS.items() if label in info.get("labels", [])]
-
-
-def get_models_by_provider(provider: str) -> List[str]:
-    """
-    Get all models available for a specific provider.
-    
-    Args:
-        provider: The provider name (e.g., "nagaai", "openai")
-        
-    Returns:
-        List of friendly model names available for that provider
-    """
-    provider = provider.lower()
-    return [
-        name for name, info in MODELS.items() 
-        if provider in info.get("provider_names", {})
-    ]
-
-
 def get_all_labels() -> Set[str]:
     """
     Get all unique labels across all models.
@@ -1118,25 +1085,6 @@ def model_supports_websearch(friendly_name: str) -> bool:
     
     labels = model_info.get("labels", [])
     return LABEL_WEBSEARCH in labels
-
-
-def model_supports_temperature(friendly_name: str) -> bool:
-    """
-    Check if a model supports the temperature parameter.
-    
-    Some reasoning models (O-series) don't support temperature.
-    
-    Args:
-        friendly_name: The friendly model name (e.g., "o1", "gpt5")
-        
-    Returns:
-        True if model supports temperature, False otherwise
-    """
-    model_info = MODELS.get(friendly_name)
-    if not model_info:
-        return True  # Default to supporting temperature for unknown models
-    
-    return not model_info.get("no_temperature", False)
 
 
 def get_model_context_size(friendly_name: str) -> int:

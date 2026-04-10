@@ -7,7 +7,6 @@ Analyzes portfolio status, recent market analyses, and executes risk management 
 
 from typing import Dict, Any, List, Annotated, TypedDict, Optional
 from datetime import datetime, timezone
-from operator import add
 import sys
 import time
 from io import StringIO
@@ -17,11 +16,9 @@ from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AI
 from langchain_core.tools import tool
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_openai import ChatOpenAI
-from langgraph.graph import StateGraph, END, START
-from langgraph.prebuilt import ToolNode
+from langgraph.graph import StateGraph, END
 from sqlmodel import select
 import json
-import os
 import langchain
 
 from ..logger import logger
@@ -32,7 +29,6 @@ from .db import get_db, add_instance, update_instance, get_instance
 from .models import AppSetting
 from .SmartRiskManagerToolkit import SmartRiskManagerToolkit
 from .utils import get_expert_instance_from_id
-from .interfaces import MarketExpertInterface
 
 
 # ==================== HELPER FUNCTIONS ====================

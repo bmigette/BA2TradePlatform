@@ -2,7 +2,6 @@ import asyncio
 import threading
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone, date, timedelta
-from decimal import Decimal
 
 from ...logger import logger
 from ...core.models import Position

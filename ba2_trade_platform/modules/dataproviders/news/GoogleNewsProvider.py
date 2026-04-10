@@ -40,11 +40,6 @@ class GoogleNewsProvider(MarketNewsInterface):
         super().__init__()
         logger.info("GoogleNewsProvider initialized successfully")
     
-    @staticmethod
-    def _is_rate_limited(response):
-        """Check if the response indicates rate limiting (status code 429)."""
-        return response.status_code == 429
-    
     @retry(
         retry=(retry_if_result(lambda r: r.status_code == 429)),
         wait=wait_exponential(multiplier=1, min=4, max=60),

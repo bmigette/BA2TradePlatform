@@ -6,9 +6,6 @@ Supports web search via provider-specific configurations.
 import json
 from typing import List, Optional
 from ..logger import logger
-from .db import get_instance, get_db
-from .models import AppSetting
-from .. import config
 
 
 class AIInstrumentSelector:
@@ -328,65 +325,3 @@ Your response:"""
             logger.error(f"Error extracting symbols from text: {e}", exc_info=True)
             return None
 
-    def validate_instruments(self, instruments: List[str]) -> List[str]:
-        """
-        Validate and clean instrument symbols.
-        
-        Args:
-            instruments (List[str]): List of instrument symbols to validate
-            
-        Returns:
-            List[str]: List of validated and cleaned instrument symbols
-        """
-        validated = []
-        
-        for instrument in instruments:
-            if not isinstance(instrument, str):
-                logger.warning(f"Skipping non-string instrument: {instrument}")
-                continue
-                
-            # Clean and validate symbol
-            symbol = instrument.strip().upper()
-            
-            # Basic validation rules
-            if (len(symbol) >= 1 and len(symbol) <= 10 and 
-                symbol.replace('.', '').replace('-', '').isalnum()):
-                validated.append(symbol)
-            else:
-                logger.warning(f"Skipping invalid symbol: {symbol}")
-        
-        return validated
-
-    def test_connection(self) -> bool:
-        """
-        Test the AI API connection with a simple request.
-        
-        Returns:
-            bool: True if connection successful, False otherwise
-        """
-        if not self.llm:
-            return False
-            
-        try:
-            from langchain_core.messages import HumanMessage
-            
-            # Simple test prompt
-            response = self.llm.invoke([HumanMessage(content="Hello")])
-            return bool(response)
-        except Exception as e:
-            logger.error(f"LLM connection test failed for {self.model_string}: {e}")
-            return False
-
-
-def get_ai_instrument_selector(model_string: Optional[str] = None) -> AIInstrumentSelector:
-    """
-    Factory function to get an AI instrument selector instance.
-    
-    Args:
-        model_string: Model to use in format "Provider/ModelName" (e.g., "NagaAI/gpt-5-2025-08-07")
-                     REQUIRED - no default fallback allowed
-    
-    Returns:
-        AIInstrumentSelector: Configured AI instrument selector instance
-    """
-    return AIInstrumentSelector(model_string=model_string)

@@ -11,11 +11,11 @@ from datetime import datetime, timezone, timedelta
 import operator
 
 from .interfaces import AccountInterface
-from .models import TradingOrder, ExpertRecommendation, ExpertInstance
+from .models import TradingOrder, ExpertRecommendation
 from .types import OrderRecommendation, ExpertEventType, RiskLevel, TimeHorizon
 from .db import get_db
 from ..logger import logger
-from sqlmodel import select, Session
+from sqlmodel import select
 
 
 class TradeCondition(ABC):
@@ -124,16 +124,6 @@ class TradeCondition(ABC):
         except Exception as e:
             logger.error(f"Error getting current price: {e}", exc_info=True)
             return None
-    
-    def has_position(self) -> bool:
-        """
-        Check if there's an open position for this instrument.
-        
-        Returns:
-            True if position exists, False otherwise
-        """
-        position = self.get_current_position()
-        return position is not None and position != 0
     
     def has_expert_position(self) -> bool:
         """

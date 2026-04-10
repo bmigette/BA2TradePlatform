@@ -12,7 +12,7 @@ from ba2_trade_platform.core.types import TransactionStatus
 from ba2_trade_platform.core.utils import calculate_transaction_pnl
 from ba2_trade_platform.ui.components.performance_charts import (
     MetricCard, PerformanceBarChart, TimeSeriesChart, PieChartComponent,
-    PerformanceTable, MultiMetricDashboard, ComboChart,
+    PerformanceTable, MultiMetricDashboard,
     calculate_sharpe_ratio, calculate_win_loss_ratio, calculate_max_drawdown, calculate_profit_factor
 )
 from datetime import datetime, timedelta

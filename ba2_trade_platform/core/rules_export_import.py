@@ -6,7 +6,6 @@ and import them back into the system.
 """
 
 import json
-import os
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
 from sqlmodel import select, Session

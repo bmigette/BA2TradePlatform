@@ -7,12 +7,11 @@ from the current page, preserving filters and state.
 
 from nicegui import ui, run
 from typing import Optional, Dict, Any, List, Callable
-import json
 from datetime import datetime, timezone
 
 from ...core.db import get_instance, get_db
-from ...core.models import MarketAnalysis, ExpertInstance, AnalysisOutput, Instrument, TradingOrder, ExpertRecommendation
-from ...core.types import MarketAnalysisStatus, OrderStatus
+from ...core.models import MarketAnalysis, ExpertInstance, Instrument
+from ...core.types import MarketAnalysisStatus
 from ...core.MarketAnalysisPDFExport import export_market_analysis_pdf
 from ...logger import logger
 from sqlmodel import select
@@ -336,26 +335,3 @@ class MarketAnalysisDetailDialog:
             with ui.card().classes('w-full'):
                 ui.label('Error rendering expert analysis').classes('text-h5').style('color: #ff6b6b;')
                 ui.label(str(e)).style('color: #a0aec0;')
-
-
-# Singleton instance for use across the application
-_dialog_instance: Optional[MarketAnalysisDetailDialog] = None
-
-
-def get_analysis_dialog() -> MarketAnalysisDetailDialog:
-    """Get or create the singleton dialog instance."""
-    global _dialog_instance
-    if _dialog_instance is None:
-        _dialog_instance = MarketAnalysisDetailDialog()
-    return _dialog_instance
-
-
-def open_analysis_dialog(analysis_id: int):
-    """
-    Convenience function to open the analysis dialog.
-    
-    Args:
-        analysis_id: The ID of the MarketAnalysis to display
-    """
-    dialog = get_analysis_dialog()
-    dialog.open(analysis_id)

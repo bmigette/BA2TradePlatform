@@ -1,4 +1,3 @@
-import logging
 from nicegui import ui, Client, app
 from .pages import overview, settings, marketanalysis, market_analysis_detail, rulesettest, marketanalysishistory, smart_risk_manager_detail, activity_monitor, live_trades, tools
 from .layout import layout_render

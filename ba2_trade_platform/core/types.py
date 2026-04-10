@@ -1,8 +1,6 @@
 from enum import Enum
-from sqlmodel import Field, Session, SQLModel
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
 
 
 class TimeInterval(str, Enum):
@@ -25,25 +23,6 @@ class TimeInterval(str, Enum):
     D1 = "1d"   # 1 day (daily)
     W1 = "1wk"  # 1 week (weekly)
     MO1 = "1mo" # 1 month (monthly)
-    
-    @classmethod
-    def to_yfinance_interval(cls, interval: str) -> str:
-        """
-        Convert interval to yfinance-compatible format.
-        
-        Args:
-            interval: TimeInterval value or string
-        
-        Returns:
-            yfinance-compatible interval string
-        
-        Note: Most intervals are passed through as-is. 
-        If a specific provider doesn't support an interval, 
-        the provider implementation should handle the conversion.
-        """
-        # Return interval as-is - let provider handle any necessary conversions
-        return interval
-    
     
     @classmethod
     def get_all_intervals(cls) -> list:

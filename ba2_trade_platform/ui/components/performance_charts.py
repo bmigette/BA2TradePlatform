@@ -7,7 +7,6 @@ All components use Plotly for consistent, interactive visualizations.
 
 from nicegui import ui
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 import pandas as pd
@@ -368,105 +367,6 @@ class MultiMetricDashboard:
                     color=metric.get('color', 'primary')
                 )
                 card.render()
-
-
-class ComboChart:
-    """Combined bar and line chart for comparing metrics."""
-    
-    def __init__(self, title: str, categories: List[str],
-                 bar_data: Dict[str, List[float]],
-                 line_data: Dict[str, List[float]],
-                 height: int = 500):
-        """
-        Args:
-            title: Chart title
-            categories: X-axis categories (e.g., months)
-            bar_data: Dict of {series_name: [values]} for bars
-            line_data: Dict of {series_name: [values]} for lines
-            height: Chart height in pixels
-        """
-        self.title = title
-        self.categories = categories
-        self.bar_data = bar_data
-        self.line_data = line_data
-        self.height = height
-    
-    # Modern color palette for dark theme
-    BAR_COLORS = ['#00d4aa', '#74c0fc', '#ffa94d', '#b197fc']
-    LINE_COLORS = ['#ff6b6b', '#ffd43b', '#63e6be', '#da77f2']
-    
-    def render(self):
-        """Render the combo chart."""
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
-        
-        # Add bar traces
-        for idx, (series_name, values) in enumerate(self.bar_data.items()):
-            fig.add_trace(
-                go.Bar(
-                    name=series_name, 
-                    x=self.categories, 
-                    y=values,
-                    marker=dict(color=self.BAR_COLORS[idx % len(self.BAR_COLORS)])
-                ),
-                secondary_y=False
-            )
-        
-        # Add line traces
-        for idx, (series_name, values) in enumerate(self.line_data.items()):
-            color = self.LINE_COLORS[idx % len(self.LINE_COLORS)]
-            fig.add_trace(
-                go.Scatter(
-                    name=series_name, 
-                    x=self.categories, 
-                    y=values, 
-                    mode='lines+markers',
-                    line=dict(color=color, width=2),
-                    marker=dict(size=6, color=color)
-                ),
-                secondary_y=True
-            )
-        
-        fig.update_layout(
-            title=dict(text=self.title, font=dict(color='#e2e8f0', size=14)),
-            height=self.height,
-            hovermode='x unified',
-            barmode='group',
-            plot_bgcolor='rgba(0,0,0,0)',
-            paper_bgcolor='rgba(0,0,0,0)',
-            legend=dict(
-                font=dict(color='#a0aec0', size=10),
-                bgcolor='rgba(0,0,0,0)'
-            ),
-            margin=dict(l=60, r=60, t=50, b=60),
-            hoverlabel=dict(
-                bgcolor='#1a1f2e',
-                font_size=12,
-                font_color='#e2e8f0',
-                bordercolor='#3d4a5c'
-            )
-        )
-        
-        fig.update_xaxes(
-            title_text="Period",
-            title_font=dict(color='#a0aec0'),
-            tickfont=dict(color='#a0aec0', size=10),
-            gridcolor='rgba(160,174,192,0.2)'
-        )
-        fig.update_yaxes(
-            title_text="Count", 
-            secondary_y=False,
-            title_font=dict(color='#a0aec0'),
-            tickfont=dict(color='#a0aec0', size=10),
-            gridcolor='rgba(160,174,192,0.2)'
-        )
-        fig.update_yaxes(
-            title_text="Amount", 
-            secondary_y=True,
-            title_font=dict(color='#a0aec0'),
-            tickfont=dict(color='#a0aec0', size=10)
-        )
-        
-        ui.plotly(fig).classes('w-full')
 
 
 # Utility functions for performance calculations

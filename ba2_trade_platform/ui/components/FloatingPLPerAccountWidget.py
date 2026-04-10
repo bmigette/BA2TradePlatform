@@ -5,7 +5,6 @@ Displays unrealized profit/loss for open positions grouped by account.
 from nicegui import ui
 import asyncio
 from typing import Dict, Optional, List
-from datetime import datetime, timezone
 from sqlmodel import select
 from ...logger import logger
 from ...core.db import get_db

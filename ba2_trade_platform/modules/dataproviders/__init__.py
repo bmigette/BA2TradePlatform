@@ -185,50 +185,6 @@ def get_provider(category: str, provider_name: str, **kwargs) -> DataProviderInt
         return provider_class()
 
 
-def list_providers(category: str = None) -> Dict[str, list[str]]:
-    """
-    List available providers by category.
-    
-    Args:
-        category: Optional category to filter by. If None, returns all categories.
-    
-    Returns:
-        Dict mapping category names to lists of provider names
-    
-    Example:
-        >>> list_providers("news")
-        {'news': ['alpaca', 'alphavantage', 'google', 'finnhub', 'reddit']}
-        
-        >>> list_providers()
-        {
-            'indicators': ['alphavantage', 'yfinance'],
-            'news': ['alpaca', 'alphavantage', 'google'],
-            ...
-        }
-    """
-    all_registries = {
-        "ohlcv": OHLCV_PROVIDERS,
-        "indicators": INDICATORS_PROVIDERS,
-        "fundamentals_overview": FUNDAMENTALS_OVERVIEW_PROVIDERS,
-        "fundamentals_details": FUNDAMENTALS_DETAILS_PROVIDERS,
-        "news": NEWS_PROVIDERS,
-        "macro": MACRO_PROVIDERS,
-        "insider": INSIDER_PROVIDERS,
-        "socialmedia": SOCIALMEDIA_PROVIDERS,
-        "screener": SCREENER_PROVIDERS,
-    }
-
-    if category:
-        if category not in all_registries:
-            raise ValueError(
-                f"Unknown provider category: {category}. "
-                f"Available categories: {', '.join(all_registries.keys())}"
-            )
-        return {category: list(all_registries[category].keys())}
-    
-    return {cat: list(registry.keys()) for cat, registry in all_registries.items()}
-
-
 __all__ = [
     # Provider classes
     "YFinanceDataProvider",
@@ -253,29 +209,6 @@ __all__ = [
     "AISocialMediaSentiment",
     "FMPScreenerProvider",
 
-    # Interfaces
-    "DataProviderInterface",
-    "MarketIndicatorsInterface",
-    "CompanyFundamentalsOverviewInterface",
-    "CompanyFundamentalsDetailsInterface",
-    "MarketNewsInterface",
-    "SocialMediaDataProviderInterface",
-    "ScreenerProviderInterface",
-    "MacroEconomicsInterface",
-    "CompanyInsiderInterface",
-    
     # Helper functions
     "get_provider",
-    "list_providers",
-    
-    # Provider registries
-    "OHLCV_PROVIDERS",
-    "INDICATORS_PROVIDERS",
-    "FUNDAMENTALS_OVERVIEW_PROVIDERS",
-    "FUNDAMENTALS_DETAILS_PROVIDERS",
-    "NEWS_PROVIDERS",
-    "MACRO_PROVIDERS",
-    "INSIDER_PROVIDERS",
-    "SOCIALMEDIA_PROVIDERS",
-    "SCREENER_PROVIDERS",
 ]

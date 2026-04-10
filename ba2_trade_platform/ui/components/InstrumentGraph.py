@@ -5,7 +5,6 @@ Displays interactive price action charts with technical indicators using multipl
 from nicegui import ui
 from typing import Dict, List, Any, Optional
 import pandas as pd
-import json
 from ...logger import logger
 
 
