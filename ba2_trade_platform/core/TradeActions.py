@@ -667,7 +667,7 @@ class AdjustTakeProfitAction(TradeAction):
     
     def execute(self) -> "TradeActionResult":
         """
-        Adjust take profit for existing order using account's _set_order_tp method.
+        Adjust take profit for existing order using account's adjust_tp method.
         
         Returns:
             TradeActionResult object containing execution results
