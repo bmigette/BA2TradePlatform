@@ -52,12 +52,7 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
             self._api_key_error = str(e)
     
     def _load_expert_instance(self, id: int) -> None:
-        """Load and validate expert instance from database."""
-        self.instance = get_instance(ExpertInstance, id)
-        if not self.instance:
-            raise ValueError(f"ExpertInstance with ID {id} not found")
-        
-        # Log API key setup error if it occurred
+        super()._load_expert_instance(id)
         if hasattr(self, '_api_key_error'):
             self.logger.warning(f"Could not load API keys from database: {self._api_key_error}")
     

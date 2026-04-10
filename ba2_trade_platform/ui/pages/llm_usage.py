@@ -11,6 +11,7 @@ import asyncio
 from typing import Dict, Any
 
 from ba2_trade_platform.ui.utils.perf_logger import PerfLogger
+from ba2_trade_platform.ui.components.echart_theme import make_chart_options, MUTED_TEXT
 from ba2_trade_platform.core.LLMUsageQueries import (
     get_usage_summary,
     get_usage_by_day,
@@ -60,68 +61,42 @@ class LLMUsagePage:
     
     def create_tokens_over_time_chart(self, data: list):
         """Create line chart for tokens over time."""
-        
-        chart_options = {
-            'backgroundColor': 'transparent',
-            'title': {
+
+        chart_options = make_chart_options(
+            title={
                 'text': 'Daily Token Usage',
                 'left': 'center',
                 'textStyle': {
-                    'color': '#a0aec0',
+                    'color': MUTED_TEXT,
                     'fontSize': 16,
                     'fontWeight': 'normal'
                 }
             },
-            'tooltip': {
+            tooltip={
                 'trigger': 'axis',
-                'backgroundColor': 'rgba(37, 43, 59, 0.95)',
-                'borderColor': 'rgba(255, 255, 255, 0.1)',
-                'textStyle': {
-                    'color': '#ffffff'
-                }
             },
-            'grid': {
-                'left': '3%',
-                'right': '4%',
+            grid={
                 'bottom': '10%',
                 'top': '20%',
-                'containLabel': True
             },
-            'xAxis': {
+            xAxis={
                 'type': 'category',
                 'data': [d['date'] for d in data],
                 'axisLabel': {
-                    'color': '#a0aec0',
                     'fontSize': 11
                 },
-                'axisLine': {
-                    'lineStyle': {
-                        'color': 'rgba(255, 255, 255, 0.1)'
-                    }
-                }
             },
-            'yAxis': {
+            yAxis={
                 'type': 'value',
                 'name': 'Tokens',
                 'nameTextStyle': {
-                    'color': '#a0aec0'
+                    'color': MUTED_TEXT
                 },
                 'axisLabel': {
-                    'color': '#a0aec0',
                     'formatter': '{value}'
                 },
-                'axisLine': {
-                    'lineStyle': {
-                        'color': 'rgba(255, 255, 255, 0.1)'
-                    }
-                },
-                'splitLine': {
-                    'lineStyle': {
-                        'color': 'rgba(255, 255, 255, 0.05)'
-                    }
-                }
             },
-            'series': [{
+            series=[{
                 'name': 'Total Tokens',
                 'type': 'line',
                 'smooth': True,
@@ -151,7 +126,7 @@ class LLMUsagePage:
                     'borderColor': '#ffffff'
                 }
             }]
-        }
+        )
         
         chart = ui.echart(chart_options).classes('w-full h-96')
         self.charts['tokens_over_time'] = chart
@@ -159,72 +134,44 @@ class LLMUsagePage:
     
     def create_usage_by_model_chart(self, data: list):
         """Create bar chart for usage by model."""
-        
-        chart_options = {
-            'backgroundColor': 'transparent',
-            'title': {
+
+        chart_options = make_chart_options(
+            title={
                 'text': 'Token Usage by Model',
                 'left': 'center',
                 'textStyle': {
-                    'color': '#a0aec0',
+                    'color': MUTED_TEXT,
                     'fontSize': 16,
                     'fontWeight': 'normal'
                 }
             },
-            'tooltip': {
+            tooltip={
                 'trigger': 'axis',
-                'backgroundColor': 'rgba(37, 43, 59, 0.95)',
-                'borderColor': 'rgba(255, 255, 255, 0.1)',
-                'textStyle': {
-                    'color': '#ffffff'
-                },
                 'axisPointer': {
                     'type': 'shadow'
                 }
             },
-            'grid': {
-                'left': '3%',
-                'right': '4%',
+            grid={
                 'bottom': '20%',
                 'top': '20%',
-                'containLabel': True
             },
-            'xAxis': {
+            xAxis={
                 'type': 'category',
                 'data': [d['model'] for d in data],
                 'axisLabel': {
                     'rotate': 45,
                     'interval': 0,
-                    'color': '#a0aec0',
                     'fontSize': 10
                 },
-                'axisLine': {
-                    'lineStyle': {
-                        'color': 'rgba(255, 255, 255, 0.1)'
-                    }
-                }
             },
-            'yAxis': {
+            yAxis={
                 'type': 'value',
                 'name': 'Tokens',
                 'nameTextStyle': {
-                    'color': '#a0aec0'
+                    'color': MUTED_TEXT
                 },
-                'axisLabel': {
-                    'color': '#a0aec0'
-                },
-                'axisLine': {
-                    'lineStyle': {
-                        'color': 'rgba(255, 255, 255, 0.1)'
-                    }
-                },
-                'splitLine': {
-                    'lineStyle': {
-                        'color': 'rgba(255, 255, 255, 0.05)'
-                    }
-                }
             },
-            'series': [{
+            series=[{
                 'name': 'Total Tokens',
                 'type': 'bar',
                 'data': [
@@ -248,7 +195,7 @@ class LLMUsagePage:
                 ],
                 'barMaxWidth': 40
             }]
-        }
+        )
         
         chart = ui.echart(chart_options).classes('w-full h-96')
         self.charts['usage_by_model'] = chart
@@ -256,38 +203,29 @@ class LLMUsagePage:
     
     def create_usage_by_provider_chart(self, data: list):
         """Create pie chart for usage by provider."""
-        
+
         # Color palette for providers
         colors = ['#5470C6', '#91CC75', '#FAC858', '#EE6666', '#73C0DE', '#3BA272', '#FC8452', '#9A60B4']
-        
-        chart_options = {
-            'backgroundColor': 'transparent',
-            'title': {
+
+        chart_options = make_chart_options(
+            title={
                 'text': 'Token Usage by Provider',
                 'left': 'center',
                 'textStyle': {
-                    'color': '#a0aec0',
+                    'color': MUTED_TEXT,
                     'fontSize': 16,
                     'fontWeight': 'normal'
                 }
             },
-            'tooltip': {
+            tooltip={
                 'trigger': 'item',
                 'formatter': '{b}: {c} tokens ({d}%)',
-                'backgroundColor': 'rgba(37, 43, 59, 0.95)',
-                'borderColor': 'rgba(255, 255, 255, 0.1)',
-                'textStyle': {
-                    'color': '#ffffff'
-                }
             },
-            'legend': {
+            legend={
                 'bottom': '5%',
-                'textStyle': {
-                    'color': '#a0aec0'
-                }
             },
-            'color': colors,
-            'series': [{
+            color=colors,
+            series=[{
                 'name': 'Tokens',
                 'type': 'pie',
                 'radius': ['40%', '65%'],
@@ -297,7 +235,7 @@ class LLMUsagePage:
                     for d in data
                 ],
                 'label': {
-                    'color': '#a0aec0',
+                    'color': MUTED_TEXT,
                     'fontSize': 12
                 },
                 'emphasis': {
@@ -317,7 +255,7 @@ class LLMUsagePage:
                     'borderWidth': 2
                 }
             }]
-        }
+        )
         
         chart = ui.echart(chart_options).classes('w-full h-96')
         self.charts['usage_by_provider'] = chart
@@ -325,72 +263,44 @@ class LLMUsagePage:
     
     def create_usage_by_use_case_chart(self, data: list):
         """Create bar chart for usage by use case."""
-        
-        chart_options = {
-            'backgroundColor': 'transparent',
-            'title': {
+
+        chart_options = make_chart_options(
+            title={
                 'text': 'Token Usage by Use Case',
                 'left': 'center',
                 'textStyle': {
-                    'color': '#a0aec0',
+                    'color': MUTED_TEXT,
                     'fontSize': 16,
                     'fontWeight': 'normal'
                 }
             },
-            'tooltip': {
+            tooltip={
                 'trigger': 'axis',
-                'backgroundColor': 'rgba(37, 43, 59, 0.95)',
-                'borderColor': 'rgba(255, 255, 255, 0.1)',
-                'textStyle': {
-                    'color': '#ffffff'
-                },
                 'axisPointer': {
                     'type': 'shadow'
                 }
             },
-            'grid': {
-                'left': '3%',
-                'right': '4%',
+            grid={
                 'bottom': '20%',
                 'top': '20%',
-                'containLabel': True
             },
-            'xAxis': {
+            xAxis={
                 'type': 'category',
                 'data': [d['use_case'] for d in data],
                 'axisLabel': {
                     'rotate': 45,
                     'interval': 0,
-                    'color': '#a0aec0',
                     'fontSize': 10
                 },
-                'axisLine': {
-                    'lineStyle': {
-                        'color': 'rgba(255, 255, 255, 0.1)'
-                    }
-                }
             },
-            'yAxis': {
+            yAxis={
                 'type': 'value',
                 'name': 'Tokens',
                 'nameTextStyle': {
-                    'color': '#a0aec0'
+                    'color': MUTED_TEXT
                 },
-                'axisLabel': {
-                    'color': '#a0aec0'
-                },
-                'axisLine': {
-                    'lineStyle': {
-                        'color': 'rgba(255, 255, 255, 0.1)'
-                    }
-                },
-                'splitLine': {
-                    'lineStyle': {
-                        'color': 'rgba(255, 255, 255, 0.05)'
-                    }
-                }
             },
-            'series': [{
+            series=[{
                 'name': 'Total Tokens',
                 'type': 'bar',
                 'data': [
@@ -414,7 +324,7 @@ class LLMUsagePage:
                 ],
                 'barMaxWidth': 40
             }]
-        }
+        )
         
         chart = ui.echart(chart_options).classes('w-full h-96')
         self.charts['usage_by_use_case'] = chart
@@ -422,72 +332,44 @@ class LLMUsagePage:
     
     def create_usage_by_expert_chart(self, data: list):
         """Create bar chart for usage by expert."""
-        
-        chart_options = {
-            'backgroundColor': 'transparent',
-            'title': {
+
+        chart_options = make_chart_options(
+            title={
                 'text': 'Token Usage by Expert',
                 'left': 'center',
                 'textStyle': {
-                    'color': '#a0aec0',
+                    'color': MUTED_TEXT,
                     'fontSize': 16,
                     'fontWeight': 'normal'
                 }
             },
-            'tooltip': {
+            tooltip={
                 'trigger': 'axis',
-                'backgroundColor': 'rgba(37, 43, 59, 0.95)',
-                'borderColor': 'rgba(255, 255, 255, 0.1)',
-                'textStyle': {
-                    'color': '#ffffff'
-                },
                 'axisPointer': {
                     'type': 'shadow'
                 }
             },
-            'grid': {
-                'left': '3%',
-                'right': '4%',
+            grid={
                 'bottom': '20%',
                 'top': '20%',
-                'containLabel': True
             },
-            'xAxis': {
+            xAxis={
                 'type': 'category',
                 'data': [d['expert_name'] for d in data],
                 'axisLabel': {
                     'rotate': 45,
                     'interval': 0,
-                    'color': '#a0aec0',
                     'fontSize': 10
                 },
-                'axisLine': {
-                    'lineStyle': {
-                        'color': 'rgba(255, 255, 255, 0.1)'
-                    }
-                }
             },
-            'yAxis': {
+            yAxis={
                 'type': 'value',
                 'name': 'Tokens',
                 'nameTextStyle': {
-                    'color': '#a0aec0'
+                    'color': MUTED_TEXT
                 },
-                'axisLabel': {
-                    'color': '#a0aec0'
-                },
-                'axisLine': {
-                    'lineStyle': {
-                        'color': 'rgba(255, 255, 255, 0.1)'
-                    }
-                },
-                'splitLine': {
-                    'lineStyle': {
-                        'color': 'rgba(255, 255, 255, 0.05)'
-                    }
-                }
             },
-            'series': [{
+            series=[{
                 'name': 'Total Tokens',
                 'type': 'bar',
                 'data': [
@@ -511,7 +393,7 @@ class LLMUsagePage:
                 ],
                 'barMaxWidth': 40
             }]
-        }
+        )
         
         chart = ui.echart(chart_options).classes('w-full h-96')
         self.charts['usage_by_expert'] = chart

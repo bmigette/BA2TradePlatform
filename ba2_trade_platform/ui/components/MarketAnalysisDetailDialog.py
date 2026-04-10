@@ -5,16 +5,23 @@ A full-screen dialog that displays market analysis details without navigating aw
 from the current page, preserving filters and state.
 """
 
-from nicegui import ui, run
-from typing import Optional, Dict, Any, List, Callable
-from datetime import datetime, timezone
+from nicegui import ui
+from typing import Optional, Callable
+from datetime import timezone
 
-from ...core.db import get_instance, get_db
-from ...core.models import MarketAnalysis, ExpertInstance, Instrument
+from ...core.db import get_instance
+from ...core.models import MarketAnalysis, ExpertInstance
 from ...core.types import MarketAnalysisStatus
-from ...core.MarketAnalysisPDFExport import export_market_analysis_pdf
 from ...logger import logger
-from sqlmodel import select
+from .market_analysis_content import (
+    check_for_analysis_errors,
+    extract_error_message,
+    render_cancelled_state,
+    render_error_banner,
+    render_expert_analysis,
+    export_to_pdf,
+    get_instrument_details,
+)
 
 
 class MarketAnalysisDetailDialog:
@@ -123,7 +130,7 @@ class MarketAnalysisDetailDialog:
         self.header_label.set_text(f'Market Analysis - {market_analysis.symbol}')
         
         # Load instrument details
-        instrument = self._get_instrument_details(market_analysis.symbol)
+        instrument = get_instrument_details(market_analysis.symbol)
         
         # Header section
         with ui.card().classes('w-full mb-4'):
@@ -158,58 +165,26 @@ class MarketAnalysisDetailDialog:
                     ui.label(f'Created: {created_display}').classes('text-subtitle2')
                 
                 with ui.column().classes('gap-2'):
-                    ui.button('Export PDF', on_click=lambda: self._export_to_pdf(analysis_id), icon='picture_as_pdf').classes('bg-blue-600')
+                    ui.button('Export PDF', on_click=lambda: export_to_pdf(analysis_id), icon='picture_as_pdf').classes('bg-blue-600')
         
         # Handle different states based on analysis status
         if market_analysis.status == MarketAnalysisStatus.PENDING:
             self._render_pending_state(market_analysis)
             return
         elif market_analysis.status == MarketAnalysisStatus.CANCELLED:
-            self._render_cancelled_state(market_analysis)
+            render_cancelled_state(market_analysis, use_explicit_dark_colors=True)
             return
         elif market_analysis.status in [MarketAnalysisStatus.FAILED]:
             self._render_error_state(market_analysis)
             return
-        
+
         # Check for failed analysis even if status is not ERROR
-        has_error = self._check_for_analysis_errors(market_analysis)
+        has_error = check_for_analysis_errors(market_analysis)
         if has_error:
-            self._render_error_banner(market_analysis)
-        
+            render_error_banner(market_analysis, use_explicit_dark_colors=True)
+
         # Main content - render expert analysis
-        self._render_expert_analysis(market_analysis, expert)
-    
-    def _get_instrument_details(self, symbol: str) -> Optional[Instrument]:
-        """Get instrument details by symbol."""
-        try:
-            session = get_db()
-            statement = select(Instrument).where(Instrument.name == symbol)
-            instrument = session.exec(statement).first()
-            session.close()
-            return instrument
-        except Exception as e:
-            logger.error(f"Error loading instrument details for {symbol}: {e}", exc_info=True)
-            return None
-    
-    async def _export_to_pdf(self, analysis_id: int):
-        """Export the market analysis to PDF and trigger download."""
-        try:
-            logger.info(f"PDF export button clicked for analysis {analysis_id}")
-            notification = ui.notification('Generating PDF...', type='ongoing', timeout=None)
-            
-            try:
-                pdf_path = await run.cpu_bound(export_market_analysis_pdf, analysis_id)
-                notification.dismiss()
-                ui.notification(f'PDF generated successfully!', type='positive')
-                ui.download(pdf_path)
-                logger.info(f"PDF export completed for analysis {analysis_id}: {pdf_path}")
-            except Exception as e:
-                notification.dismiss()
-                ui.notification(f'Error generating PDF: {str(e)}', type='negative')
-                logger.error(f"Error exporting analysis {analysis_id} to PDF: {e}", exc_info=True)
-        except Exception as e:
-            ui.notification(f'Error starting PDF export: {str(e)}', type='negative')
-            logger.error(f"Error starting PDF export for analysis {analysis_id}: {e}", exc_info=True)
+        render_expert_analysis(market_analysis, expert, use_explicit_dark_colors=True)
     
     def _render_pending_state(self, market_analysis: MarketAnalysis):
         """Render UI for pending analysis."""
@@ -220,14 +195,6 @@ class MarketAnalysisDetailDialog:
             
             # Refresh button instead of auto-reload (preserves parent page state)
             ui.button('Refresh', icon='refresh', on_click=lambda: self._load_content(market_analysis.id)).classes('mt-4')
-    
-    def _render_cancelled_state(self, market_analysis: MarketAnalysis):
-        """Render UI for cancelled analysis."""
-        with ui.card().classes('w-full p-8 text-center'):
-            ui.icon('cancel', size='3rem', color='orange').classes('mb-4')
-            ui.label('Analysis was cancelled').classes('text-h5')
-            created_str = market_analysis.created_at.strftime("%Y-%m-%d %H:%M:%S") if market_analysis.created_at else "Unknown"
-            ui.label(f'Cancelled on: {created_str}').style('color: #a0aec0;')
     
     def _render_error_state(self, market_analysis: MarketAnalysis):
         """Render UI for error analysis."""
@@ -248,7 +215,7 @@ class MarketAnalysisDetailDialog:
                 ui.icon('error', size='3rem', color='negative').classes('mb-4')
                 ui.label('Analysis encountered an error').classes('text-h5').style('color: #ff6b6b;')
                 
-                error_message = self._extract_error_message(market_analysis.state)
+                error_message = extract_error_message(market_analysis.state)
                 if error_message:
                     with ui.card().classes('w-full max-w-4xl mt-4 alert-banner danger'):
                         with ui.row().classes('items-start p-4'):
@@ -257,81 +224,3 @@ class MarketAnalysisDetailDialog:
                                 ui.label('Error Details:').classes('font-medium mb-2').style('color: #ff6b6b;')
                                 with ui.element('pre').classes('bg-white/5 p-3 rounded text-sm overflow-auto max-h-48 whitespace-pre-wrap font-mono').style('color: #ff6b6b;'):
                                     ui.label(error_message)
-    
-    def _check_for_analysis_errors(self, market_analysis: MarketAnalysis) -> bool:
-        """Check if the analysis has errors even if status is not ERROR."""
-        if not market_analysis.state or not isinstance(market_analysis.state, dict):
-            return False
-        
-        error_keys = ['error', 'exception', 'failure', 'failed']
-        for key in error_keys:
-            if key in market_analysis.state and market_analysis.state[key]:
-                return True
-        
-        trading_agent_state = market_analysis.state.get('trading_agent_graph', {})
-        if isinstance(trading_agent_state, dict):
-            for agent_state in trading_agent_state.values():
-                if isinstance(agent_state, dict):
-                    for key in error_keys:
-                        if key in agent_state and agent_state[key]:
-                            return True
-        return False
-    
-    def _extract_error_message(self, state: Optional[Dict]) -> Optional[str]:
-        """Extract error message from analysis state."""
-        if not state or not isinstance(state, dict):
-            return None
-        
-        error_keys = ['error', 'exception', 'failure', 'failed']
-        for key in error_keys:
-            if key in state and state[key]:
-                error_value = state[key]
-                if isinstance(error_value, str):
-                    return error_value
-                elif isinstance(error_value, dict):
-                    if 'message' in error_value:
-                        return error_value['message']
-                    elif 'error' in error_value:
-                        return str(error_value['error'])
-                    else:
-                        return str(error_value)
-                else:
-                    return str(error_value)
-        
-        trading_agent_state = state.get('trading_agent_graph', {})
-        if isinstance(trading_agent_state, dict):
-            for agent_name, agent_state in trading_agent_state.items():
-                if isinstance(agent_state, dict):
-                    for key in error_keys:
-                        if key in agent_state and agent_state[key]:
-                            error_value = agent_state[key]
-                            if isinstance(error_value, str):
-                                return f"[{agent_name}] {error_value}"
-                            else:
-                                return f"[{agent_name}] {str(error_value)}"
-        return None
-    
-    def _render_error_banner(self, market_analysis: MarketAnalysis):
-        """Render an error banner for failed analyses."""
-        error_message = self._extract_error_message(market_analysis.state)
-        
-        with ui.card().classes('w-full mb-4 alert-banner danger'):
-            with ui.row().classes('items-start p-4'):
-                ui.icon('error_outline', color='negative', size='lg').classes('mt-1 mr-3')
-                with ui.column().classes('flex-1'):
-                    ui.label('Analysis Failed').classes('text-h6 font-medium mb-2').style('color: #ff6b6b;')
-                    if error_message:
-                        with ui.element('pre').classes('bg-white/5 p-3 rounded text-sm overflow-auto max-h-32 whitespace-pre-wrap font-mono border border-white/10').style('color: #ff6b6b;'):
-                            ui.label(error_message)
-                    else:
-                        ui.label('The analysis encountered an error during execution.').style('color: #ff6b6b;')
-    
-    def _render_expert_analysis(self, market_analysis: MarketAnalysis, expert):
-        """Render the expert-specific analysis."""
-        try:
-            expert.render_market_analysis(market_analysis)
-        except Exception as e:
-            logger.error(f"Error rendering expert analysis: {e}", exc_info=True)
-            with ui.card().classes('w-full'):
-                ui.label('Error rendering expert analysis').classes('text-h5').style('color: #ff6b6b;')
-                ui.label(str(e)).style('color: #a0aec0;')

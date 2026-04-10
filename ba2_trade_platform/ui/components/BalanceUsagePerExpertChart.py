@@ -13,6 +13,7 @@ from ...core.models import TradingOrder, ExpertInstance, Transaction
 from ...core.types import OrderStatus
 from ...logger import logger
 from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
+from .echart_theme import make_chart_options, MUTED_TEXT
 
 
 class BalanceUsagePerExpertChart:
@@ -220,68 +221,39 @@ class BalanceUsagePerExpertChart:
             total_available = sum(available_values)
             total_all = sum(total_values)
 
-            options = {
-                'backgroundColor': 'transparent',
-                'tooltip': {
+            options = make_chart_options(
+                tooltip={
                     'trigger': 'axis',
                     'axisPointer': {
                         'type': 'shadow'
                     },
-                    'backgroundColor': 'rgba(37, 43, 59, 0.95)',
-                    'borderColor': 'rgba(255, 255, 255, 0.1)',
-                    'textStyle': {
-                        'color': '#ffffff'
-                    }
                 },
-                'legend': {
+                legend={
                     'data': ['Filled Positions', 'Pending Orders', 'Available'],
                     'bottom': 0,
-                    'textStyle': {
-                        'color': '#a0aec0'
-                    }
                 },
-                'grid': {
-                    'left': '3%',
-                    'right': '4%',
+                grid={
                     'bottom': '18%',
                     'top': '18%',
-                    'containLabel': True
                 },
-                'xAxis': {
+                xAxis={
                     'type': 'category',
                     'data': expert_names,
                     'axisLabel': {
                         'rotate': 45,
                         'interval': 0,
                         'fontSize': 9,
-                        'color': '#a0aec0',
                         'width': 80,
                         'overflow': 'truncate'
                     },
-                    'axisLine': {
-                        'lineStyle': {
-                            'color': 'rgba(255, 255, 255, 0.1)'
-                        }
-                    }
                 },
-                'yAxis': {
+                yAxis={
                     'type': 'value',
                     'axisLabel': {
                         'formatter': '${value}',
-                        'color': '#a0aec0'
                     },
-                    'axisLine': {
-                        'lineStyle': {
-                            'color': 'rgba(255, 255, 255, 0.1)'
-                        }
-                    },
-                    'splitLine': {
-                        'lineStyle': {
-                            'color': 'rgba(255, 255, 255, 0.05)'
-                        }
-                    }
                 },
-                'series': [
+                series=[
                     {
                         'name': 'Filled Positions',
                         'type': 'bar',
@@ -330,7 +302,7 @@ class BalanceUsagePerExpertChart:
                                     'show': True,
                                     'position': 'top',
                                     'fontSize': 9,
-                                    'color': '#a0aec0',
+                                    'color': MUTED_TEXT,
                                     'formatter': f'${total_values[i]:,.0f}'
                                 }
                             } for i in range(len(expert_names))
@@ -341,7 +313,7 @@ class BalanceUsagePerExpertChart:
                         }
                     }
                 ]
-            }
+            )
 
             self.chart = ui.echart(options).classes('w-full h-64')
 

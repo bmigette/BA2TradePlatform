@@ -14,6 +14,7 @@ from ...core.types import TransactionStatus
 from ...core.utils import calculate_transaction_pnl
 from ...logger import logger
 from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
+from .echart_theme import make_chart_options, MUTED_TEXT
 
 
 class ProfitPerExpertChart:
@@ -147,66 +148,40 @@ class ProfitPerExpertChart:
                 })
 
             # Create echart options
-            options = {
-                'backgroundColor': 'transparent',
-                'tooltip': {
+            options = make_chart_options(
+                tooltip={
                     'trigger': 'axis',
                     'axisPointer': {
                         'type': 'shadow'
                     },
                     'formatter': '{b}<br/>Profit: ${c}',
-                    'backgroundColor': 'rgba(37, 43, 59, 0.95)',
-                    'borderColor': 'rgba(255, 255, 255, 0.1)',
-                    'textStyle': {
-                        'color': '#ffffff'
-                    }
                 },
-                'grid': {
-                    'left': '3%',
-                    'right': '4%',
+                grid={
                     'bottom': '20%',
                     'top': '15%',
-                    'containLabel': True
                 },
-                'xAxis': {
+                xAxis={
                     'type': 'category',
                     'data': expert_names,
                     'axisLabel': {
                         'rotate': 45,
                         'interval': 0,
                         'fontSize': 9,
-                        'color': '#a0aec0',
                         'width': 80,
                         'overflow': 'truncate'
                     },
-                    'axisLine': {
-                        'lineStyle': {
-                            'color': 'rgba(255, 255, 255, 0.1)'
-                        }
-                    }
                 },
-                'yAxis': {
+                yAxis={
                     'type': 'value',
                     'name': 'Profit ($)',
                     'nameTextStyle': {
-                        'color': '#a0aec0'
+                        'color': MUTED_TEXT
                     },
                     'axisLabel': {
                         'formatter': '${value}',
-                        'color': '#a0aec0'
                     },
-                    'axisLine': {
-                        'lineStyle': {
-                            'color': 'rgba(255, 255, 255, 0.1)'
-                        }
-                    },
-                    'splitLine': {
-                        'lineStyle': {
-                            'color': 'rgba(255, 255, 255, 0.05)'
-                        }
-                    }
                 },
-                'series': [{
+                series=[{
                     'name': 'Profit',
                     'type': 'bar',
                     'data': chart_data,
@@ -216,10 +191,10 @@ class ProfitPerExpertChart:
                         'position': 'top',
                         'formatter': '${c}',
                         'fontSize': 9,
-                        'color': '#a0aec0'
+                        'color': MUTED_TEXT
                     }
                 }]
-            }
+            )
 
             # Create the chart
             self.chart = ui.echart(options).classes('w-full h-64')

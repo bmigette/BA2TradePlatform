@@ -11,6 +11,7 @@ from collections import defaultdict
 from ...core.db import get_db
 from ...core.models import Position, Instrument
 from ...logger import logger
+from .echart_theme import make_chart_options, MUTED_TEXT
 
 
 class InstrumentDistributionChart:
@@ -139,22 +140,16 @@ class InstrumentDistributionChart:
         ]
         
         # Create echart options
-        options = {
-            'backgroundColor': 'transparent',
-            'color': colors,
-            'tooltip': {
+        options = make_chart_options(
+            color=colors,
+            tooltip={
                 'trigger': 'item',
                 'formatter': '{b}<br/>${c:,.2f}<br/>{d}%',
-                'backgroundColor': 'rgba(37, 43, 59, 0.95)',
-                'borderColor': 'rgba(255, 255, 255, 0.1)',
-                'textStyle': {
-                    'color': '#ffffff'
-                }
             },
-            'legend': {
+            legend={
                 'show': False  # Hide legend, use labels instead
             },
-            'series': [{
+            series=[{
                 'name': 'Position Distribution',
                 'type': 'pie',
                 'radius': ['35%', '55%'],
@@ -169,7 +164,7 @@ class InstrumentDistributionChart:
                     'show': True,
                     'position': 'outside',
                     'fontSize': 9,
-                    'color': '#a0aec0',
+                    'color': MUTED_TEXT,
                     'formatter': '{b}\n{d}%',
                     'lineHeight': 12,
                     'overflow': 'truncate',
@@ -198,7 +193,7 @@ class InstrumentDistributionChart:
                 },
                 'data': pie_data
             }]
-        }
+        )
         
         # Create the chart - use w-full for responsive width
         self.chart = ui.echart(options).style('width: 100%; height: 300px;')

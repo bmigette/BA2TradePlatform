@@ -311,6 +311,31 @@ class MarketExpertInterface(ExtendableSettingsInterface):
 
             }
 
+    def _load_expert_instance(self, id: int) -> None:
+        """Load and validate expert instance from database."""
+        self.instance = get_instance(ExpertInstance, id)
+        if not self.instance:
+            raise ValueError(f"ExpertInstance with ID {id} not found")
+
+    def _get_current_price(self, symbol: str):
+        """Get current price for the symbol from the account."""
+        try:
+            from ..utils import get_account_instance_from_id
+
+            expert_instance = get_instance(ExpertInstance, self.id)
+            if not expert_instance:
+                return None
+
+            account = get_account_instance_from_id(expert_instance.account_id)
+            if not account:
+                return None
+
+            return account.get_instrument_current_price(symbol)
+
+        except Exception as e:
+            logger.error(f"Error getting current price for {symbol}: {e}", exc_info=True)
+            return None
+
     @classmethod
     @abstractmethod
     def description(cls) -> str:

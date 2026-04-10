@@ -4,8 +4,8 @@ import json
 import requests
 
 from ...core.interfaces import MarketExpertInterface
-from ...core.models import ExpertInstance, MarketAnalysis, AnalysisOutput, ExpertRecommendation
-from ...core.db import get_db, get_instance, update_instance, add_instance
+from ...core.models import MarketAnalysis, AnalysisOutput, ExpertRecommendation
+from ...core.db import get_db, update_instance, add_instance
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, RiskLevel, TimeHorizon
 from ...logger import get_expert_logger
 from ...config import get_app_setting
@@ -33,12 +33,6 @@ class FMPRating(MarketExpertInterface):
         
         # Initialize expert-specific logger
         self.logger = get_expert_logger("FMPRating", id)
-    
-    def _load_expert_instance(self, id: int) -> None:
-        """Load and validate expert instance from database."""
-        self.instance = get_instance(ExpertInstance, id)
-        if not self.instance:
-            raise ValueError(f"ExpertInstance with ID {id} not found")
     
     def _get_fmp_api_key(self) -> Optional[str]:
         """Get FMP API key from app settings."""
@@ -561,25 +555,6 @@ Final Confidence = Base Confidence + Avg Boost = {base_confidence:.1f}% + {price
             raise
         finally:
             session.close()
-    
-    def _get_current_price(self, symbol: str) -> Optional[float]:
-        """Get current price for the symbol from the account."""
-        try:
-            from ...core.utils import get_account_instance_from_id
-            
-            expert_instance = get_instance(ExpertInstance, self.id)
-            if not expert_instance:
-                return None
-            
-            account = get_account_instance_from_id(expert_instance.account_id)
-            if not account:
-                return None
-            
-            return account.get_instrument_current_price(symbol)
-            
-        except Exception as e:
-            self.logger.error(f"Error getting current price for {symbol}: {e}", exc_info=True)
-            return None
     
     def run_analysis(self, symbol: str, market_analysis: MarketAnalysis) -> None:
         """
