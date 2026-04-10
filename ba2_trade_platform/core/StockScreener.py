@@ -65,6 +65,7 @@ class StockScreener:
         "float_shares",
         "relative_volume",
         "composite",
+        "price_drop_pct",
     }
 
     def __init__(self, settings: Dict[str, Any], progress_callback=None):
@@ -166,29 +167,49 @@ class StockScreener:
             self._report_progress("No candidates after RVOL filter.", 1.0)
             return {"results": [], "stats": stats}
 
-        # --- Stage 3: rank ---
-        self._report_progress("Ranking candidates...", 0.7)
-        ranked = self._rank(candidates)
+        metric = self._settings["screener_sort_metric"]
         max_stocks = self._settings["screener_max_stocks"]
-
-        # --- Stage 4: price-drop filter (lazy, on ranked list) ---
         drop_pct = self._settings["screener_price_drop_pct"]
         drop_days = self._settings["screener_price_drop_days"]
-        if drop_pct > 0 and drop_days > 0:
+
+        if metric == "price_drop_pct":
+            # Ranking by price drop: fetch history for ALL candidates, compute
+            # price_drop_pct, then sort by drop descending and trim.
             self._report_progress(
-                f"Checking price history (>={drop_pct}% drop over {drop_days}d)...", 0.8
+                f"Fetching price history for {len(candidates)} candidates (sort by drop)...", 0.7
             )
             result, drop_stats = self._filter_by_price_drop_lazy(
-                ranked, drop_pct, max_stocks
+                candidates,
+                min_drop_pct=drop_pct if drop_pct > 0 else 0,
+                max_results=len(candidates),  # fetch all — trim after sorting
             )
             stats.update(drop_stats)
+            result = sorted(result, key=lambda c: c.get("price_drop_pct") or 0, reverse=True)
+            result = result[:max_stocks]
             logger.info(
-                f"StockScreener: {len(result)} stocks after price-drop "
-                f"filter (>={drop_pct}% over {drop_days}d, "
-                f"sorted by {self._settings['screener_sort_metric']})"
+                f"StockScreener: {len(result)} stocks ranked by price_drop_pct descending"
             )
         else:
-            result = ranked[:max_stocks]
+            # --- Stage 3: rank ---
+            self._report_progress("Ranking candidates...", 0.7)
+            ranked = self._rank(candidates)
+
+            # --- Stage 4: price-drop filter (lazy, on ranked list) ---
+            if drop_pct > 0 and drop_days > 0:
+                self._report_progress(
+                    f"Checking price history (>={drop_pct}% drop over {drop_days}d)...", 0.8
+                )
+                result, drop_stats = self._filter_by_price_drop_lazy(
+                    ranked, drop_pct, max_stocks
+                )
+                stats.update(drop_stats)
+                logger.info(
+                    f"StockScreener: {len(result)} stocks after price-drop "
+                    f"filter (>={drop_pct}% over {drop_days}d, "
+                    f"sorted by {metric})"
+                )
+            else:
+                result = ranked[:max_stocks]
 
         stats["final_count"] = len(result)
         self._report_progress(f"Done — {len(result)} stock(s) matched.", 1.0)

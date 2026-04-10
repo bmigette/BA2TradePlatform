@@ -306,8 +306,8 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 "screener_sort_metric": {
                     "type": "str", "required": False, "default": "market_cap",
                     "description": "Ranking metric for stock selection",
-                    "valid_values": ["market_cap", "volume", "float_shares", "relative_volume", "composite"],
-                    "tooltip": "How to rank and select stocks when more match than the limit. 'composite' uses market_cap * volume * float_shares."
+                    "valid_values": ["market_cap", "volume", "float_shares", "relative_volume", "composite", "price_drop_pct"],
+                    "tooltip": "How to rank and select stocks when more match than the limit. 'composite' uses market_cap * volume * float_shares. 'price_drop_pct' ranks by largest recent price drop first (requires price drop filter or fetches history for all candidates)."
                 },
 
             }
