@@ -206,3 +206,15 @@ Configure in `.env` file:
 - `PRICE_CACHE_TIME` - Cache duration in seconds (default: 60)
 
 Most configuration is done via the web UI Settings page rather than environment variables.
+
+## Versioning
+
+The application version is a static string in `ba2_trade_platform/version.py`:
+
+```python
+APP_VERSION = "YYYY.MM.NNNNN"
+```
+
+**Before every `git push`, increment the build number (NNNNN) by 1.**
+Update the year/month when they change.
+Current version is visible in the UI sidebar (bottom-left).
