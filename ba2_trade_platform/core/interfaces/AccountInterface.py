@@ -1047,7 +1047,7 @@ class AccountInterface(ReadOnlyAccountInterface):
             f"Broker {self.__class__.__name__} must implement adjust_tp_sl() for TP/SL management."
         )
 
-    def set_order_tp(self, trading_order: TradingOrder, tp_price: float) -> TradingOrder:
+    def _set_order_tp(self, trading_order: TradingOrder, tp_price: float) -> TradingOrder:
         """
         Set take profit for an existing order.
         
@@ -1318,7 +1318,7 @@ class AccountInterface(ReadOnlyAccountInterface):
             
             raise
 
-    def set_order_sl(self, trading_order: TradingOrder, sl_price: float) -> TradingOrder:
+    def _set_order_sl(self, trading_order: TradingOrder, sl_price: float) -> TradingOrder:
         """
         Set stop loss for an existing order.
         
@@ -1636,7 +1636,7 @@ class AccountInterface(ReadOnlyAccountInterface):
         """
         pass
 
-    def set_order_tp_sl(self, trading_order: TradingOrder, tp_price: float, sl_price: float) -> tuple[TradingOrder, TradingOrder]:
+    def _set_order_tp_sl(self, trading_order: TradingOrder, tp_price: float, sl_price: float) -> tuple[TradingOrder, TradingOrder]:
         """
         Set both take profit and stop loss for an existing order simultaneously.
         
@@ -1853,8 +1853,8 @@ class AccountInterface(ReadOnlyAccountInterface):
         Returns:
             TradingOrder: The updated or new TP order
         """
-        logger.warning(f"Broker {self.__class__.__name__} does not implement _replace_tp_order, using set_order_tp instead")
-        return self.set_order_tp(existing_tp, new_tp_price)
+        logger.warning(f"Broker {self.__class__.__name__} does not implement _replace_tp_order, using _set_order_tp instead")
+        return self._set_order_tp(existing_tp, new_tp_price)
     
     def _replace_sl_order(self, existing_sl: TradingOrder, new_sl_price: float) -> TradingOrder:
         """
@@ -1868,8 +1868,8 @@ class AccountInterface(ReadOnlyAccountInterface):
         Returns:
             TradingOrder: The updated or new SL order
         """
-        logger.warning(f"Broker {self.__class__.__name__} does not implement _replace_sl_order, using set_order_sl instead")
-        return self.set_order_sl(existing_sl, new_sl_price)
+        logger.warning(f"Broker {self.__class__.__name__} does not implement _replace_sl_order, using _set_order_sl instead")
+        return self._set_order_sl(existing_sl, new_sl_price)
     
     def _replace_order_with_stop_limit(self, existing_order: TradingOrder, tp_price: float, sl_price: float) -> TradingOrder:
         """

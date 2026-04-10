@@ -1951,7 +1951,7 @@ class AlpacaAccount(AccountInterface):
         """
         Broker-specific implementation for Alpaca take profit orders.
         
-        The base class AccountInterface.set_order_tp() handles:
+        The base class AccountInterface._set_order_tp() handles:
         - Enforcing minimum TP percent
         - Creating/updating WAITING_TRIGGER order in database
         - Updating transaction's take_profit value
@@ -1966,7 +1966,7 @@ class AlpacaAccount(AccountInterface):
         """
         Broker-specific implementation for Alpaca stop loss orders.
         
-        The base class AccountInterface.set_order_sl() handles:
+        The base class AccountInterface._set_order_sl() handles:
         - Enforcing minimum SL percent
         - Creating/updating WAITING_TRIGGER order in database
         - Updating transaction's stop_loss value
