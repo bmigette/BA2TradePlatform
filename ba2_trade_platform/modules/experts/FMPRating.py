@@ -123,8 +123,11 @@ class FMPRating(MarketExpertInterface):
                 return data[0]
             elif isinstance(data, dict):
                 return data
+            elif isinstance(data, list) and len(data) == 0:
+                self.logger.warning(f"No price target consensus data for {symbol} (empty list — likely no analyst coverage)")
+                return None
             else:
-                self.logger.warning(f"Unexpected price target consensus format for {symbol}: {type(data)}")
+                self.logger.warning(f"Unexpected price target consensus format for {symbol}: {type(data)} — {data!r:.200}")
                 return None
             
         except ValueError:
@@ -585,7 +588,7 @@ Final Confidence = Base Confidence + Avg Boost = {base_confidence:.1f}% + {price
             consensus_data = self._fetch_price_target_consensus(symbol)
             
             if consensus_data is None:
-                raise ValueError("Failed to fetch price target consensus from FMP API")
+                raise ValueError(f"No price target consensus available for {symbol} from FMP API (no analyst coverage or API error — check debug logs)")
             
             # Fetch upgrade/downgrade data
             upgrade_data = self._fetch_upgrade_downgrade(symbol)
