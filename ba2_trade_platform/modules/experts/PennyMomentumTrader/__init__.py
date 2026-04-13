@@ -37,6 +37,7 @@ from .prompts import (
     build_conditions_fix_prompt,
     build_deep_triage_prompt,
     build_entry_conditions_prompt,
+    build_exit_generate_prompt,
     build_exit_update_prompt,
     build_quick_filter_prompt,
 )
@@ -2547,20 +2548,35 @@ class PennyMomentumTrader(LiveExpertInterface):
                 continue
 
             exit_conds = info.get("exit_conditions")
+            generating_fresh = not exit_conds  # True when conditions were lost across restart
 
             try:
-                self.logger.info(f"Re-evaluating exit conditions for {symbol}")
-
                 # Gather fresh news + social (lightweight check)
                 news_text = self._gather_news(symbol)
                 social_text = self._gather_social(symbol)
-                new_data = f"LATEST NEWS:\n{news_text}\n\nSOCIAL SENTIMENT:\n{social_text}"
+                market_data = f"LATEST NEWS:\n{news_text}\n\nSOCIAL SENTIMENT:\n{social_text}"
 
-                prompt = build_exit_update_prompt(
-                    symbol=symbol,
-                    current_conditions=exit_conds,
-                    new_data=new_data,
-                )
+                if generating_fresh:
+                    # No existing conditions — generate from scratch using current position context
+                    entry_price = info.get("entry_price") or 0.0
+                    current_price = info.get("last_price") or entry_price
+                    self.logger.info(
+                        f"Generating initial exit conditions for {symbol} "
+                        f"(entry=${entry_price:.4f}, current=${current_price:.4f})"
+                    )
+                    prompt = build_exit_generate_prompt(
+                        symbol=symbol,
+                        entry_price=entry_price,
+                        current_price=current_price,
+                        market_data=market_data,
+                    )
+                else:
+                    self.logger.info(f"Re-evaluating exit conditions for {symbol}")
+                    prompt = build_exit_update_prompt(
+                        symbol=symbol,
+                        current_conditions=exit_conds,
+                        new_data=market_data,
+                    )
 
                 llm = ModelFactory.create_llm(
                     exit_model,
@@ -2571,7 +2587,7 @@ class PennyMomentumTrader(LiveExpertInterface):
                 # First call — check for NO_CHANGE before entering retry loop
                 response = llm.invoke(prompt)
                 raw_text = response.content if hasattr(response, "content") else str(response)
-                if raw_text.strip().strip('"') == "NO_CHANGE":
+                if not generating_fresh and raw_text.strip().strip('"') == "NO_CHANGE":
                     self.logger.debug(f"Exit conditions unchanged for {symbol}")
                     continue
 

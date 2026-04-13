@@ -412,6 +412,65 @@ Example response:
 Return ONLY the JSON object, no other text."""
 
 
+def build_exit_generate_prompt(
+    symbol: str,
+    entry_price: float,
+    current_price: float,
+    market_data: str,
+) -> str:
+    """
+    Build a prompt to generate fresh SL/TP exit conditions for an already-open
+    position whose original conditions were lost (e.g. after an app restart
+    before the session could persist them).
+
+    Args:
+        symbol: Ticker symbol.
+        entry_price: Price at which the position was opened.
+        current_price: Current market price.
+        market_data: Recent news/social summary string.
+
+    Returns:
+        Prompt string for the LLM.
+    """
+    pnl_pct = (current_price - entry_price) / entry_price * 100
+    pct_levels = "  |  ".join(
+        f"+{p}% = ${current_price * (1 + p / 100):.4f}" for p in [5, 10, 15, 25, 50]
+    )
+    return f"""{_SYSTEM_PREAMBLE}
+
+An open momentum position on {symbol} has no recorded exit conditions (they were lost across an app restart). Generate appropriate stop-loss and take-profit conditions based on the current situation.
+
+POSITION DETAILS:
+  Entry price:   ${entry_price:.4f}
+  Current price: ${current_price:.4f}  ({pnl_pct:+.1f}% unrealised P&L)
+  TP price levels (from current): {pct_levels}
+
+RECENT MARKET DATA:
+{market_data}
+
+{_CONDITION_PARAMS_REFERENCE}
+
+STOP-LOSS STRUCTURE:
+The stop-loss uses a TWO-LAYER structure: "all" containing a hard percent_below_entry stop AND an "any" group of signal-based conditions.
+
+Guidelines:
+- If the position is already profitable, trail the stop-loss to protect gains (e.g. stop below a recent support level, not back at entry).
+- Set take-profit tiers as percent_above_entry using the CURRENT price as reference point.
+- Use 3 TP tiers: partial exits at ~5-10%, ~15-20%, and final at ~30-50% above current price.
+
+Return a JSON object with "stop_loss" and "take_profit" keys:
+{{
+  "stop_loss": {{"all": [{{"type": "percent_below_entry", "percent": <float>}}, {{"any": [<signal conditions>]}}]}},
+  "take_profit": [
+    {{"condition": {{"type": "percent_above_entry", "percent": <float>}}, "exit_pct": 33}},
+    {{"condition": {{"type": "percent_above_entry", "percent": <float>}}, "exit_pct": 50}},
+    {{"condition": {{"type": "percent_above_entry", "percent": <float>}}, "exit_pct": 100}}
+  ]
+}}
+
+Return ONLY the JSON object, no other text."""
+
+
 def build_exit_update_prompt(
     symbol: str,
     current_conditions: Dict[str, Any],
