@@ -2008,8 +2008,30 @@ class PennyMomentumTrader(LiveExpertInterface):
             if remaining:
                 self.logger.warning(
                     f"Phase 5 startup: could not recover exit conditions for {remaining} "
-                    f"(not found in any recent session with status=triggered)"
+                    f"(not found in any recent session with status=triggered) — "
+                    f"synthesizing minimal entries so exit conditions are evaluated"
                 )
+                # Synthesize minimal triggered entries so the exit monitoring loop
+                # still evaluates these positions. entry_price comes from the live
+                # transaction; exit_conditions will be populated on the next LLM
+                # re-evaluation cycle.
+                synthesized = {}
+                for pos in open_positions_init:
+                    sym = pos["symbol"]
+                    if sym in remaining:
+                        synthesized[sym] = {
+                            "status": "triggered",
+                            "entry_price": pos["entry_price"],
+                            "qty": pos["qty"],
+                            "exit_conditions": {},
+                        }
+                        self.logger.info(
+                            f"Phase 5 startup: synthesized monitored entry for {sym} "
+                            f"(entry_price={pos['entry_price']}, qty={pos['qty']})"
+                        )
+                if synthesized:
+                    current_monitored_init.update(synthesized)
+                    self._update_state(market_analysis, {"monitored_symbols": current_monitored_init})
 
         while not self._stop_event.is_set():
             # Check if market is still open
@@ -2525,8 +2547,6 @@ class PennyMomentumTrader(LiveExpertInterface):
                 continue
 
             exit_conds = info.get("exit_conditions")
-            if not exit_conds:
-                continue
 
             try:
                 self.logger.info(f"Re-evaluating exit conditions for {symbol}")
