@@ -588,7 +588,14 @@ Final Confidence = Base Confidence + Avg Boost = {base_confidence:.1f}% + {price
             consensus_data = self._fetch_price_target_consensus(symbol)
             
             if consensus_data is None:
-                raise ValueError(f"No price target consensus available for {symbol} from FMP API (no analyst coverage or API error — check debug logs)")
+                self.logger.warning(f"Skipping FMPRating analysis for {symbol}: no analyst coverage available from FMP API")
+                market_analysis.state = {
+                    'skip_reason': 'no_analyst_coverage',
+                    'skip_message': f"No price target consensus available for {symbol} — stock likely has no analyst coverage on FMP"
+                }
+                market_analysis.status = MarketAnalysisStatus.SKIPPED
+                update_instance(market_analysis)
+                return
             
             # Fetch upgrade/downgrade data
             upgrade_data = self._fetch_upgrade_downgrade(symbol)
@@ -764,8 +771,8 @@ Final Confidence = Base Confidence + Avg Boost = {base_confidence:.1f}% + {price
                 ui.label('Analysis Skipped').classes('text-h5 text-orange ml-2')
             
             if market_analysis.state and isinstance(market_analysis.state, dict):
-                skip_reason = market_analysis.state.get('skip_reason', 'Analysis was skipped')
-                ui.label(f'Reason: {skip_reason}').classes('text-grey-8')
+                skip_msg = market_analysis.state.get('skip_message') or market_analysis.state.get('skip_reason', 'Analysis was skipped')
+                ui.label(f'Reason: {skip_msg}').classes('text-grey-8')
     
     def _render_completed(self, market_analysis: MarketAnalysis) -> None:
         """Render completed analysis with beautiful UI."""
