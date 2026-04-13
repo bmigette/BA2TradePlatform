@@ -2084,6 +2084,16 @@ class PennyMomentumTrader(LiveExpertInterface):
                         info["last_price"] = current_price
                     info["last_checked"] = datetime.now(timezone.utc).isoformat()
 
+                    # Detect external close: position was closed outside the monitoring loop
+                    # (manual close, broker liquidation, etc.) — stop monitoring it.
+                    if status == "triggered" and symbol not in open_position_symbols and not info.get("pending_order_id"):
+                        self.logger.info(
+                            f"{symbol} position no longer open and no pending entry order — "
+                            f"likely closed externally. Marking as closed."
+                        )
+                        info["status"] = "closed"
+                        continue
+
                     # Cancel stale pending entry orders that never filled
                     if status == "triggered" and symbol not in open_position_symbols:
                         pending_order_id = info.get("pending_order_id")
