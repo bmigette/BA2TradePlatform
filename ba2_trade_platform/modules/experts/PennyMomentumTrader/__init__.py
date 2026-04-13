@@ -2156,13 +2156,18 @@ class PennyMomentumTrader(LiveExpertInterface):
                                     f"({minutes_to_close:.0f}m to close"
                                     f", entry=${entry_price:.4f}, now=${current_price:.4f}{eod_pnl_str})"
                                 )
-                                trade_mgr.execute_exit(
+                                eod_ok = trade_mgr.execute_exit(
                                     symbol, exit_pct=100.0, reason="intraday EOD hard-exit"
                                 )
-                                info["status"] = "closed"
-                                self._record_trade(
-                                    market_analysis, symbol, "exit", "intraday EOD hard-exit"
-                                )
+                                if eod_ok:
+                                    info["status"] = "closed"
+                                    self._record_trade(
+                                        market_analysis, symbol, "exit", "intraday EOD hard-exit"
+                                    )
+                                else:
+                                    self.logger.error(
+                                        f"Intraday EOD exit failed for {symbol} — will retry next tick"
+                                    )
                                 continue
 
                         # Check stop loss (with grace period after entry)
@@ -2220,13 +2225,18 @@ class PennyMomentumTrader(LiveExpertInterface):
                                             f"Hard stop loss triggered for {symbol} during grace period"
                                             f" (entry=${entry_price:.4f}, now=${current_price:.4f}{pnl_str})"
                                         )
-                                        trade_mgr.execute_exit(
+                                        sl_ok = trade_mgr.execute_exit(
                                             symbol, exit_pct=100.0, reason="stop loss triggered (hard stop during grace)"
                                         )
-                                        info["status"] = "closed"
-                                        self._record_trade(
-                                            market_analysis, symbol, "exit", "stop loss (grace)"
-                                        )
+                                        if sl_ok:
+                                            info["status"] = "closed"
+                                            self._record_trade(
+                                                market_analysis, symbol, "exit", "stop loss (grace)"
+                                            )
+                                        else:
+                                            self.logger.error(
+                                                f"Hard stop loss exit failed for {symbol} — will retry next tick"
+                                            )
                                         continue
                             elif evaluator.evaluate(
                                 stop_loss, symbol, entry_price=entry_price
@@ -2247,13 +2257,18 @@ class PennyMomentumTrader(LiveExpertInterface):
                                     f"Stop loss triggered for {symbol}"
                                     f" (entry=${entry_price:.4f}, now=${current_price:.4f}{pnl_str}{hold_min_str})"
                                 )
-                                trade_mgr.execute_exit(
+                                sl_ok = trade_mgr.execute_exit(
                                     symbol, exit_pct=100.0, reason="stop loss triggered"
                                 )
-                                info["status"] = "closed"
-                                self._record_trade(
-                                    market_analysis, symbol, "exit", "stop loss"
-                                )
+                                if sl_ok:
+                                    info["status"] = "closed"
+                                    self._record_trade(
+                                        market_analysis, symbol, "exit", "stop loss"
+                                    )
+                                else:
+                                    self.logger.error(
+                                        f"Stop loss exit failed for {symbol} — will retry next tick"
+                                    )
                                 continue
 
                         # Check take profit tiers (skip already-triggered tiers)
@@ -2275,21 +2290,27 @@ class PennyMomentumTrader(LiveExpertInterface):
                                     f"Take profit tier {tier_idx + 1} triggered for {symbol} "
                                     f"(exit {tp_exit_pct}%{tp_pnl_str})"
                                 )
-                                trade_mgr.execute_exit(
+                                exit_ok = trade_mgr.execute_exit(
                                     symbol,
                                     exit_pct=tp_exit_pct,
                                     reason=f"take profit tier {tier_idx + 1} ({tp_exit_pct}%)",
                                 )
-                                triggered_tiers.append(tier_idx)
-                                info["triggered_tp_tiers"] = triggered_tiers
-                                self._record_trade(
-                                    market_analysis,
-                                    symbol,
-                                    "partial_exit" if tp_exit_pct < 100 else "exit",
-                                    f"take profit tier {tier_idx + 1} ({tp_exit_pct}%)",
-                                )
-                                if tp_exit_pct >= 100:
-                                    info["status"] = "closed"
+                                if exit_ok:
+                                    triggered_tiers.append(tier_idx)
+                                    info["triggered_tp_tiers"] = triggered_tiers
+                                    self._record_trade(
+                                        market_analysis,
+                                        symbol,
+                                        "partial_exit" if tp_exit_pct < 100 else "exit",
+                                        f"take profit tier {tier_idx + 1} ({tp_exit_pct}%)",
+                                    )
+                                    if tp_exit_pct >= 100:
+                                        info["status"] = "closed"
+                                else:
+                                    self.logger.error(
+                                        f"TP tier {tier_idx + 1} exit failed for {symbol} — "
+                                        f"position remains open, will retry next tick"
+                                    )
                                 break
 
                         # Debug log and update condition status for UI (exit conditions)
