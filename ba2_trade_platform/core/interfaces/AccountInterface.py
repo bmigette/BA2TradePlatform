@@ -1090,26 +1090,27 @@ class AccountInterface(ReadOnlyAccountInterface):
                 unsent_statuses = OrderStatus.get_unsent_statuses()
                 has_filled = False
                 existing_close_order = None
-                
+                last_broker_canceled_order_id = None  # Track for deferred close trigger
+
                 for order in all_orders:
                     # Check if this is a filled entry order
                     if order.status in executed_statuses and not order.depends_on_order:
                         has_filled = True
-                    
+
                     # Check if this is a closing order (market order to close position)
                     # Closing orders are typically MARKET orders with opposite side to position
                     # and have a comment indicating they're closing orders
                     is_closing_order = (
                         order.order_type == OrderType.MARKET and
-                        order.comment and 
+                        order.comment and
                         'closing' in order.comment.lower()
                     )
-                    
+
                     if is_closing_order:
                         existing_close_order = order
                         logger.info(f"Found existing closing order {order.id} with status {order.status}")
                         continue
-                    
+
                     # Handle unsent orders (PENDING, WAITING_TRIGGER) - just mark as CLOSED
                     if order.status in unsent_statuses:
                         try:
@@ -1120,13 +1121,14 @@ class AccountInterface(ReadOnlyAccountInterface):
                         except Exception as e:
                             logger.error(f"Error marking unsent order {order.id} as CLOSED: {e}")
                         continue
-                    
+
                     # Cancel unfilled orders at broker (only if they were sent to broker)
                     if order.status in unfilled_statuses and not is_closing_order:
                         try:
                             if hasattr(self, 'cancel_order') and order.broker_order_id:
                                 self.cancel_order(order.broker_order_id)
                                 result['canceled_count'] += 1
+                                last_broker_canceled_order_id = order.id
                                 logger.info(f"Canceled unfilled order {order.id} (broker: {order.broker_order_id})")
                         except Exception as e:
                             logger.error(f"Error canceling order {order.id}: {e}")
@@ -1250,58 +1252,89 @@ class AccountInterface(ReadOnlyAccountInterface):
                                 result['message'] += f' ({result["deleted_count"]} waiting orders deleted)'
                     else:
                         # No existing close order - create a new one
-                        logger.info(f"Creating new closing order for transaction {transaction_id}")
                         # Determine closing side (opposite of position side)
                         # BUY position closes with SELL, SELL position closes with BUY
                         close_side = OrderDirection.SELL if transaction.side == OrderDirection.BUY else OrderDirection.BUY
-                        
+                        current_qty = abs(transaction.get_current_open_qty()) or transaction.quantity
+
                         close_order = TradingOrder(
                             account_id=self.id,
                             symbol=transaction.symbol,
-                            quantity=transaction.quantity,  # Already positive
+                            quantity=current_qty,
                             side=close_side,
                             order_type=OrderType.MARKET,
                             transaction_id=transaction.id,
                             comment=f'Closing position for transaction {transaction.id}'
                         )
-                        
-                        # Submit the closing order (skip position size validation)
-                        submitted_order = self.submit_order(close_order, is_closing_order=True)
-                        
-                        if submitted_order:
+
+                        if last_broker_canceled_order_id:
+                            # TP/SL orders were just canceled — broker may not have released the
+                            # shares yet.  Create the close order as PENDING and let the dependency
+                            # mechanism submit it once the canceled order reaches CANCELED status.
+                            close_order.status = OrderStatus.PENDING
+                            close_order.depends_on_order = last_broker_canceled_order_id
+                            close_order.depends_order_status_trigger = OrderStatus.CANCELED
+                            order_id = add_instance(close_order, expunge_after_flush=True)
+                            logger.info(
+                                f"Created deferred closing order {order_id} for {transaction.symbol} "
+                                f"(depends on order {last_broker_canceled_order_id} reaching CANCELED)"
+                            )
                             result['success'] = True
-                            result['close_order_id'] = submitted_order.id if hasattr(submitted_order, 'id') else None
-                            result['message'] = f'Closing order submitted for {transaction.symbol}'
+                            result['close_order_id'] = order_id
+                            result['message'] = (
+                                f'Close order queued for {transaction.symbol} — '
+                                f'will submit once TP/SL cancellation is confirmed'
+                            )
                             if result['canceled_count'] > 0:
                                 result['message'] += f' ({result["canceled_count"]} orders canceled)'
-                            if result['deleted_count'] > 0:
-                                result['message'] += f' ({result["deleted_count"]} waiting orders deleted)'
-                            
-                            # Log successful close order submission
                             from ..utils import log_close_order_activity
                             log_close_order_activity(
                                 transaction=transaction,
                                 account_id=self.id,
                                 success=True,
-                                close_order_id=result['close_order_id'],
-                                quantity=transaction.quantity,  # Already positive
+                                close_order_id=order_id,
+                                quantity=current_qty,
                                 side=close_side,
                                 canceled_count=result['canceled_count'],
                                 deleted_count=result['deleted_count']
                             )
                         else:
-                            result['message'] = 'Failed to submit closing order'
-                            
-                            # Log failed close order submission
-                            from ..utils import log_close_order_activity
-                            log_close_order_activity(
-                                transaction=transaction,
-                                account_id=self.id,
-                                success=False,
-                                error_message="Order submission returned None",
-                                canceled_count=result['canceled_count'],
-                                deleted_count=result['deleted_count']
-                            )
+                            # No TP/SL were active — submit immediately
+                            logger.info(f"Creating new closing order for transaction {transaction_id}")
+                            submitted_order = self.submit_order(close_order, is_closing_order=True)
+
+                            if submitted_order:
+                                result['success'] = True
+                                result['close_order_id'] = submitted_order.id if hasattr(submitted_order, 'id') else None
+                                result['message'] = f'Closing order submitted for {transaction.symbol}'
+                                if result['canceled_count'] > 0:
+                                    result['message'] += f' ({result["canceled_count"]} orders canceled)'
+                                if result['deleted_count'] > 0:
+                                    result['message'] += f' ({result["deleted_count"]} waiting orders deleted)'
+
+                                from ..utils import log_close_order_activity
+                                log_close_order_activity(
+                                    transaction=transaction,
+                                    account_id=self.id,
+                                    success=True,
+                                    close_order_id=result['close_order_id'],
+                                    quantity=current_qty,
+                                    side=close_side,
+                                    canceled_count=result['canceled_count'],
+                                    deleted_count=result['deleted_count']
+                                )
+                            else:
+                                result['message'] = 'Failed to submit closing order'
+
+                                from ..utils import log_close_order_activity
+                                log_close_order_activity(
+                                    transaction=transaction,
+                                    account_id=self.id,
+                                    success=False,
+                                    error_message="Order submission returned None",
+                                    canceled_count=result['canceled_count'],
+                                    deleted_count=result['deleted_count']
+                                )
                 else:
                     # No filled position, just report cleanup
                     result['success'] = True
