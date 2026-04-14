@@ -3339,7 +3339,7 @@ class ExpertSettingsTab:
                             'alias': self.alias_input.value,
                             'user_description': self.user_description_textarea.value,
                             'enabled': self.enabled_checkbox.value,
-                            'virtual_equity': float(self.virtual_equity_input.value),
+                            'virtual_equity_pct': float(self.virtual_equity_input.value),
                         }
                     
                     # Export expert settings if editing
@@ -3458,7 +3458,7 @@ class ExpertSettingsTab:
                         expert_instance.alias = general.get('alias', expert_instance.alias)
                         expert_instance.user_description = general.get('user_description', '')
                         expert_instance.enabled = False  # Always disabled for safety
-                        expert_instance.virtual_equity = general.get('virtual_equity', 10000.0)
+                        expert_instance.virtual_equity_pct = float(general.get('virtual_equity_pct', general.get('virtual_equity', 100.0)))
                         
                         # Resolve and set rulesets by name
                         session = get_db()
