@@ -1142,9 +1142,11 @@ class WorkerQueue:
 
             # Check if all analysis tasks are completed/failed for this expert
             # This must run on both success AND failure so the SmartRiskManager triggers
-            # even when the last task in a batch fails
-            if task.status == WorkerTaskStatus.FAILED:
-                logger.debug(f"[RISK_MGR_TRIGGER] Task '{task.id}' (expert {task.expert_instance_id}, {task.subtype}) failed. Checking for SmartRiskManager trigger...")
+            # even when the last task in a batch fails.
+            # Also covers skipped tasks (status=COMPLETED but returned early without triggering above)
+            is_skipped_task = isinstance(task.result, dict) and task.result.get("status") == "skipped"
+            if task.status == WorkerTaskStatus.FAILED or is_skipped_task:
+                logger.debug(f"[RISK_MGR_TRIGGER] Task '{task.id}' (expert {task.expert_instance_id}, {task.subtype}) {'failed' if task.status == WorkerTaskStatus.FAILED else 'skipped'}. Checking for SmartRiskManager trigger...")
                 if task.subtype == AnalysisUseCase.ENTER_MARKET:
                     self._check_and_process_expert_recommendations(task.expert_instance_id, AnalysisUseCase.ENTER_MARKET)
                 elif task.subtype == AnalysisUseCase.OPEN_POSITIONS:

@@ -590,6 +590,7 @@ Final Confidence = Base Confidence + Avg Boost = {base_confidence:.1f}% + {price
             if consensus_data is None:
                 self.logger.warning(f"Skipping FMPRating analysis for {symbol}: no analyst coverage available from FMP API")
                 market_analysis.state = {
+                    'skipped': True,
                     'skip_reason': 'no_analyst_coverage',
                     'skip_message': f"No price target consensus available for {symbol} — stock likely has no analyst coverage on FMP"
                 }

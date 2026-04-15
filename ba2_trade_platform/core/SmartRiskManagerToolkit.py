@@ -1948,9 +1948,9 @@ class SmartRiskManagerToolkit:
                         self.logger.info(f"Hedging enabled: Opening {direction} position while {existing_direction.value} position exists for {symbol}")
             
             # Check if symbol is enabled in expert settings
-            # Skip check for dynamic/expert instrument selection modes
+            # Skip check for dynamic/expert/screener instrument selection modes (runtime-determined)
             enabled_instruments = self.expert.get_enabled_instruments()
-            if enabled_instruments not in [["DYNAMIC"], ["EXPERT"]] and symbol not in enabled_instruments:
+            if enabled_instruments not in [["DYNAMIC"], ["EXPERT"], ["SCREENER"]] and symbol not in enabled_instruments:
                 return {
                     "success": False,
                     "message": f"Symbol {symbol} is not enabled in expert settings",
@@ -1960,6 +1960,38 @@ class SmartRiskManagerToolkit:
                     "quantity": quantity,
                     "direction": direction
                 }
+
+            # For screener mode: enforce that symbol was actually selected by the screener
+            # (i.e., has a recent completed MarketAnalysis). This prevents the smart risk
+            # manager from opening trades on arbitrary symbols outside the screener results.
+            if enabled_instruments == ["SCREENER"]:
+                screener_window_hours = 24
+                cutoff_time = datetime.now(timezone.utc) - timedelta(hours=screener_window_hours)
+                with get_db() as session:
+                    recent_analysis = session.exec(
+                        select(MarketAnalysis)
+                        .where(MarketAnalysis.expert_instance_id == self.expert_instance_id)
+                        .where(MarketAnalysis.symbol == symbol)
+                        .where(MarketAnalysis.status == MarketAnalysisStatus.COMPLETED)
+                        .where(MarketAnalysis.created_at >= cutoff_time)
+                        .limit(1)
+                    ).first()
+                if not recent_analysis:
+                    logger.warning(f"Smart Risk Manager blocked opening {direction} position for {symbol}: "
+                                   f"no completed screener analysis found in the last {screener_window_hours}h")
+                    return {
+                        "success": False,
+                        "message": (
+                            f"Cannot open {direction} position for {symbol}: "
+                            f"symbol was not selected by the screener in the last {screener_window_hours} hours. "
+                            f"The smart risk manager can only open positions for symbols that were analyzed in the current screener run."
+                        ),
+                        "transaction_id": None,
+                        "order_id": None,
+                        "symbol": symbol,
+                        "quantity": quantity,
+                        "direction": direction
+                    }
             
             # Check enable_buy/enable_sell settings
             settings = self.expert.settings
