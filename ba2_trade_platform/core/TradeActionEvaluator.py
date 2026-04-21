@@ -344,9 +344,9 @@ class TradeActionEvaluator:
             # Phase 1.5: Create transactions for newly created orders (required for TP/SL)
             if created_order_ids and adjustment_actions:
                 logger.info(f"Creating transactions for {len(created_order_ids)} new orders before TP/SL adjustments")
-                from .db import get_instance, update_instance
+                from .db import update_instance
                 from .models import TradingOrder
-                
+
                 for order_id in created_order_ids:
                     order = get_instance(TradingOrder, order_id)
                     if order and not order.transaction_id:
@@ -366,9 +366,8 @@ class TradeActionEvaluator:
                 
                 if created_order_ids:
                     # entering_markets: Use newly created orders (refresh from DB to get transaction_id)
-                    from .db import get_instance
                     from .models import TradingOrder
-                    
+
                     for order_id in created_order_ids:
                         order = get_instance(TradingOrder, order_id)
                         if order:
