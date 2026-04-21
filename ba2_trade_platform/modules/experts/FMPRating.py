@@ -55,9 +55,9 @@ class FMPRating(MarketExpertInterface):
             "min_analysts": {
                 "type": "int",
                 "required": True,
-                "default": 3,
-                "description": "Minimum number of analysts required for valid recommendation",
-                "tooltip": "Recommendations with fewer analysts than this threshold will result in HOLD with low confidence."
+                "default": 10,
+                "description": "Minimum total analyst ratings required to run analysis",
+                "tooltip": "Total analyst count (Strong Buy + Buy + Hold + Sell + Strong Sell) must meet this threshold. If below, the analysis is skipped entirely. Default 10 avoids acting on thinly-covered stocks."
             },
             "target_price_type": {
                 "type": "str",
@@ -600,7 +600,33 @@ Final Confidence = Base Confidence + Avg Boost = {base_confidence:.1f}% + {price
             
             # Fetch upgrade/downgrade data
             upgrade_data = self._fetch_upgrade_downgrade(symbol)
-            
+
+            # Check minimum analyst threshold before running analysis
+            analyst_count = 0
+            if upgrade_data and len(upgrade_data) > 0:
+                latest_grade = upgrade_data[0]
+                analyst_count = (
+                    latest_grade.get('strongBuy', 0) + latest_grade.get('buy', 0) +
+                    latest_grade.get('hold', 0) + latest_grade.get('sell', 0) +
+                    latest_grade.get('strongSell', 0)
+                )
+            if analyst_count < min_analysts:
+                self.logger.info(
+                    f"Skipping FMPRating analysis for {symbol}: insufficient analyst coverage "
+                    f"({analyst_count} analysts, minimum {min_analysts} required)"
+                )
+                market_analysis.state = {
+                    'skipped': True,
+                    'skip_reason': 'insufficient_analyst_coverage',
+                    'skip_message': (
+                        f"Insufficient analyst coverage for {symbol}: {analyst_count} analysts found, "
+                        f"minimum {min_analysts} required"
+                    )
+                }
+                market_analysis.status = MarketAnalysisStatus.SKIPPED
+                update_instance(market_analysis)
+                return
+
             # Calculate recommendation
             recommendation_data = self._calculate_recommendation(
                 consensus_data, upgrade_data, current_price, profit_ratio, min_analysts
