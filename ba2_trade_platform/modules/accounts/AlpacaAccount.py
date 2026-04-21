@@ -5,6 +5,7 @@ from alpaca.common.exceptions import APIError
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone, timedelta
 import time
+import threading
 import functools
 
 from ...logger import logger
@@ -79,10 +80,18 @@ class AlpacaAccount(AccountInterface):
             Exception: If initialization of Alpaca TradingClient fails.
         """
         super().__init__(id)
-        
+
         # Initialize client as None first
         self.client = None
         self._authentication_error = None
+
+        # Balance cache (60s TTL; serves stale value on rate-limit)
+        self._balance_cache: Optional[float] = None
+        self._balance_cache_time: float = 0.0
+        self._balance_cache_lock = threading.Lock()
+        self._balance_retry_thread: Optional[threading.Thread] = None
+        self._BALANCE_CACHE_TTL = 60.0
+        self._BALANCE_RETRY_DELAYS = [15.0, 30.0, 60.0]
 
         try:
             # Check if we have the required settings
@@ -1287,22 +1296,81 @@ class AlpacaAccount(AccountInterface):
     def get_balance(self) -> Optional[float]:
         """
         Get the current account balance/equity from Alpaca.
-        
+
+        Caches the result for 60 seconds. On a rate-limit error (429) returns
+        the cached value (if any) and starts a background thread that retries
+        with 15 / 30 / 60 s backoff to refresh the cache.
+
         Returns:
             Optional[float]: The current account equity if available, None if error occurred
         """
+        # Serve from cache if still fresh
+        with self._balance_cache_lock:
+            if self._balance_cache is not None and (time.time() - self._balance_cache_time) < self._BALANCE_CACHE_TTL:
+                logger.debug(f"Alpaca account balance (cached): ${self._balance_cache}")
+                return self._balance_cache
+
         try:
             account = self.client.get_account()
             if account and hasattr(account, 'equity'):
                 balance = float(account.equity)
+                with self._balance_cache_lock:
+                    self._balance_cache = balance
+                    self._balance_cache_time = time.time()
                 logger.debug(f"Alpaca account balance: ${balance}")
                 return balance
             else:
                 logger.warning("No equity field found in Alpaca account info")
                 return None
+        except APIError as e:
+            error_message = str(e).lower()
+            if "too many requests" in error_message or "429" in error_message or "rate limit" in error_message:
+                with self._balance_cache_lock:
+                    cached = self._balance_cache
+                    retry_running = self._balance_retry_thread is not None and self._balance_retry_thread.is_alive()
+                if cached is not None:
+                    logger.warning(f"Alpaca rate limit on get_balance, returning cached value ${cached}")
+                else:
+                    logger.warning("Alpaca rate limit on get_balance, no cached value available")
+                if not retry_running:
+                    self._start_balance_retry()
+                return cached
+            logger.error(f"Error getting Alpaca account balance: {e}", exc_info=True)
+            return None
         except Exception as e:
             logger.error(f"Error getting Alpaca account balance: {e}", exc_info=True)
             return None
+
+    def _start_balance_retry(self) -> None:
+        """Start a background thread that retries fetching balance with backoff."""
+        def _retry():
+            for delay in self._BALANCE_RETRY_DELAYS:
+                time.sleep(delay)
+                try:
+                    account = self.client.get_account()
+                    if account and hasattr(account, 'equity'):
+                        balance = float(account.equity)
+                        with self._balance_cache_lock:
+                            self._balance_cache = balance
+                            self._balance_cache_time = time.time()
+                        logger.info(f"Balance cache refreshed after rate-limit backoff: ${balance}")
+                        return
+                except APIError as e:
+                    error_message = str(e).lower()
+                    if "too many requests" in error_message or "429" in error_message or "rate limit" in error_message:
+                        logger.warning(f"Balance retry still rate-limited after {delay}s backoff, will retry again")
+                        continue
+                    logger.error(f"Non-rate-limit error during balance retry: {e}")
+                    return
+                except Exception as e:
+                    logger.error(f"Error during balance retry: {e}")
+                    return
+            logger.error("Balance cache refresh failed after all retries (rate limit persisted)")
+
+        thread = threading.Thread(target=_retry, name="AlpacaBalanceRetry", daemon=True)
+        with self._balance_cache_lock:
+            self._balance_retry_thread = thread
+        thread.start()
 
     @alpaca_api_retry
     def get_account_info(self):
