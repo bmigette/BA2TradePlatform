@@ -2127,10 +2127,12 @@ class SmartRiskManagerToolkit:
             transaction_id = add_instance(transaction)
             logger.info(f"Created transaction {transaction_id} for {symbol} {direction} position (expert_id={self.expert_instance_id})")
 
-            # Create an ExpertRecommendation so the order shows the ℹ button and links to analysis
+            # Link the order to an ExpertRecommendation so it shows the ℹ button in Live Trades.
+            # Prefer reusing the recommendation already created by the expert's analysis phase
+            # (e.g. TradingAgents OVERWEIGHT rec) rather than creating a duplicate.
             rec_id = None
             try:
-                # If no market_analysis_id provided, find the most recent completed one for this symbol
+                # Resolve the analysis to link to
                 resolved_analysis_id = market_analysis_id
                 if resolved_analysis_id is None:
                     with get_db() as session:
@@ -2147,23 +2149,41 @@ class SmartRiskManagerToolkit:
                         if latest_analysis:
                             resolved_analysis_id = latest_analysis.id
 
-                recommended_action = OrderRecommendation.BUY if order_direction == OrderDirection.BUY else OrderRecommendation.SELL
-                recommendation = ExpertRecommendation(
-                    instance_id=self.expert_instance_id,
-                    market_analysis_id=resolved_analysis_id,
-                    symbol=symbol,
-                    recommended_action=recommended_action,
-                    expected_profit_percent=0.0,
-                    price_at_date=current_price,
-                    details=reason or f"Smart Risk Manager opened {direction} position",
-                    confidence=confidence,
-                    risk_level=RiskLevel.MEDIUM,
-                    time_horizon=TimeHorizon.SHORT_TERM,
-                )
-                rec_id = add_instance(recommendation)
-                logger.info(f"Created ExpertRecommendation {rec_id} for {symbol} {direction} (analysis_id={resolved_analysis_id})")
+                # Reuse existing recommendation from the analysis if one already exists
+                if resolved_analysis_id is not None:
+                    with get_db() as session:
+                        existing_rec = session.exec(
+                            select(ExpertRecommendation)
+                            .where(ExpertRecommendation.market_analysis_id == resolved_analysis_id)
+                            .order_by(ExpertRecommendation.id.asc())
+                            .limit(1)
+                        ).first()
+                        if existing_rec:
+                            rec_id = existing_rec.id
+                            logger.info(
+                                f"Reusing ExpertRecommendation {rec_id} for {symbol} {direction} "
+                                f"(analysis_id={resolved_analysis_id})"
+                            )
+
+                if rec_id is None:
+                    # No existing recommendation — create one (standalone SRM usage)
+                    recommended_action = OrderRecommendation.BUY if order_direction == OrderDirection.BUY else OrderRecommendation.SELL
+                    recommendation = ExpertRecommendation(
+                        instance_id=self.expert_instance_id,
+                        market_analysis_id=resolved_analysis_id,
+                        symbol=symbol,
+                        recommended_action=recommended_action,
+                        expected_profit_percent=0.0,
+                        price_at_date=current_price,
+                        details=reason or f"Smart Risk Manager opened {direction} position",
+                        confidence=confidence,
+                        risk_level=RiskLevel.MEDIUM,
+                        time_horizon=TimeHorizon.SHORT_TERM,
+                    )
+                    rec_id = add_instance(recommendation)
+                    logger.info(f"Created ExpertRecommendation {rec_id} for {symbol} {direction} (analysis_id={resolved_analysis_id})")
             except Exception as e:
-                logger.warning(f"Could not create ExpertRecommendation for {symbol}: {e}")
+                logger.warning(f"Could not resolve ExpertRecommendation for {symbol}: {e}")
 
             # Create and submit market order linked to transaction
             entry_order = self._create_trading_order(
