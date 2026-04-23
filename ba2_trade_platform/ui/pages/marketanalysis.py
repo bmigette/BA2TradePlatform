@@ -1396,7 +1396,9 @@ class JobMonitoringTab:
                             for action, count in sorted(action_counts.items()):
                                 icon = action_icons.get(action, '')
                                 action_summary.append(f'{icon}{count}')
-                            recommendation_display = ' '.join(action_summary) + f' ({len(recommendations)} symbols)'
+                            unique_rec_symbols = len(set(r.symbol for r in recommendations if r.symbol))
+                            label = 'symbols' if unique_rec_symbols > 1 else 'recs'
+                            recommendation_display = ' '.join(action_summary) + f' ({len(recommendations)} {label})'
                         
                         if confidences:
                             avg_confidence = sum(confidences) / len(confidences)
@@ -1410,7 +1412,11 @@ class JobMonitoringTab:
                 # Format symbol
                 symbol_display = analysis.symbol
                 if analysis.expert_recommendations and len(analysis.expert_recommendations) > 1:
-                    rec_symbols = [rec.symbol for rec in analysis.expert_recommendations if rec.symbol]
+                    # Deduplicate while preserving order (single-symbol analyses can have
+                    # multiple recs from different stages, e.g. TradingAgents + SmartRiskManager)
+                    rec_symbols = list(dict.fromkeys(
+                        rec.symbol for rec in analysis.expert_recommendations if rec.symbol
+                    ))
                     if rec_symbols:
                         if len(rec_symbols) <= 3:
                             symbol_display = ', '.join(rec_symbols)
