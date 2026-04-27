@@ -1452,19 +1452,18 @@ class AlpacaAccount(AccountInterface):
             
         try:
             from alpaca.data.historical import StockHistoricalDataClient
-            from alpaca.data.requests import StockLatestQuoteRequest
+            from alpaca.data.requests import StockLatestQuoteRequest, StockLatestTradeRequest
             from alpaca.data.enums import DataFeed
             # Create data client for market data
             data_client = StockHistoricalDataClient(
                 api_key=self.settings["api_key"],
                 secret_key=self.settings["api_secret"]
             )
-            
+
             # Normalize input to list for uniform processing
             is_single_symbol = isinstance(symbol_or_symbols, str)
             symbols_list = [symbol_or_symbols] if is_single_symbol else symbol_or_symbols
-            
-            # Get latest quotes - Alpaca natively supports bulk fetching
+
             feed_setting = (self.settings.get("data_feed") or "delayed_sip").lower()
             feed_map = {
                 "delayed_sip": DataFeed.DELAYED_SIP,
@@ -1473,70 +1472,75 @@ class AlpacaAccount(AccountInterface):
                 "otc": DataFeed.OTC,
             }
             feed = feed_map.get(feed_setting, DataFeed.DELAYED_SIP)
-            request = StockLatestQuoteRequest(symbol_or_symbols=symbols_list, feed=feed)
-            quotes = data_client.get_stock_latest_quote(request)
-            
-            # Process quotes and calculate prices
-            def calculate_price(quote):
-                """
-                Calculate price from quote using bid/ask prices.
-                
-                Args:
-                    quote: Alpaca quote object with bid_price, ask_price
-                    
-                Returns:
-                    Optional[float]: Calculated price based on price_type, or None if unavailable
-                """
+
+            # Fetch last trade prices — these match what the Alpaca broker displays and are
+            # reliable even for thinly traded stocks where bid/ask can be stale.
+            trade_request = StockLatestTradeRequest(symbol_or_symbols=symbols_list, feed=feed)
+            trades = data_client.get_stock_latest_trade(trade_request)
+
+            # Fetch quotes as fallback for symbols with no trade data
+            quote_request = StockLatestQuoteRequest(symbol_or_symbols=symbols_list, feed=feed)
+            quotes = data_client.get_stock_latest_quote(quote_request)
+
+            def get_trade_price(symbol):
+                """Return last trade price for symbol, or None if unavailable."""
+                if symbol in trades:
+                    trade = trades[symbol]
+                    price = float(trade.price) if trade.price else None
+                    return price if price and price > 0 else None
+                return None
+
+            def get_quote_price(symbol):
+                """Return quote-based price for symbol using price_type, or None if unavailable."""
+                if symbol not in quotes:
+                    return None
+                quote = quotes[symbol]
                 bid_price = float(quote.bid_price) if quote.bid_price else None
                 ask_price = float(quote.ask_price) if quote.ask_price else None
-                
                 if price_type == 'bid':
-                    # Return bid price, fallback to ask if bid not available
                     return bid_price if bid_price else ask_price
                 elif price_type == 'ask':
-                    # Return ask price, fallback to bid if ask not available
                     return ask_price if ask_price else bid_price
                 elif price_type in ('avg', 'mid'):
-                    # Return average of both prices (support both 'avg' and 'mid')
                     if bid_price and ask_price:
                         return (bid_price + ask_price) / 2
-                    elif bid_price:
-                        return bid_price
-                    elif ask_price:
-                        return ask_price
-                    else:
-                        return None
+                    return bid_price or ask_price
                 else:
-                    # Invalid price_type, default to bid behavior
-                    logger.warning(f"Invalid price_type '{price_type}', defaulting to 'bid'")
+                    logger.warning(f"Invalid price_type '{price_type}', defaulting to trade/bid")
                     return bid_price if bid_price else ask_price
-            
+
+            def resolve_price(symbol):
+                """Use last trade price primarily; fall back to quote if trade unavailable."""
+                trade_price = get_trade_price(symbol)
+                if trade_price is not None:
+                    return trade_price
+                quote_price = get_quote_price(symbol)
+                if quote_price is not None:
+                    logger.debug(f"No trade data for {symbol}, using quote price {quote_price}")
+                return quote_price
+
             # Handle single symbol case (backward compatibility)
             if is_single_symbol:
                 symbol = symbol_or_symbols
-                if symbol in quotes:
-                    quote = quotes[symbol]
-                    current_price = calculate_price(quote)
-                    logger.debug(f"Current {price_type} price for {symbol}: {current_price}")
-                    return current_price
+                current_price = resolve_price(symbol)
+                if current_price is not None:
+                    logger.debug(f"Current price for {symbol}: {current_price}")
                 else:
-                    logger.warning(f"No quote data found for symbol {symbol}")
-                    return None
-            
+                    logger.warning(f"No price data found for symbol {symbol}")
+                return current_price
+
             # Handle multiple symbols case
             else:
                 result = {}
                 for symbol in symbols_list:
-                    if symbol in quotes:
-                        quote = quotes[symbol]
-                        current_price = calculate_price(quote)
-                        result[symbol] = current_price
-                        logger.debug(f"Bulk fetch - Current {price_type} price for {symbol}: {current_price}")
+                    current_price = resolve_price(symbol)
+                    result[symbol] = current_price
+                    if current_price is not None:
+                        logger.debug(f"Bulk fetch - Current price for {symbol}: {current_price}")
                     else:
-                        result[symbol] = None
-                        logger.warning(f"Bulk fetch - No quote data found for symbol {symbol}")
-                
-                logger.info(f"Bulk fetched {price_type} prices for {len(symbols_list)} symbols in single API call")
+                        logger.warning(f"Bulk fetch - No price data found for symbol {symbol}")
+
+                logger.info(f"Bulk fetched prices for {len(symbols_list)} symbols in single API call")
                 return result
                 
         except Exception as e:
