@@ -1,222 +1,101 @@
 {
-  "timestamp": "2026-03-18T16:59:16.570197",
+  "timestamp": "2026-05-07T16:28:44.167271",
   "providers": {
     "openai": {
       "display_name": "OpenAI",
       "api_key_configured": true,
-      "total_models": 1,
-      "inference_passed": 1,
+      "total_models": 0,
+      "inference_passed": 0,
       "inference_failed": 0,
       "tool_call_passed": 0,
       "tool_call_failed": 0,
-      "websearch_passed": 1,
+      "websearch_passed": 0,
       "websearch_failed": 0,
-      "reasoning_passed": 4,
+      "reasoning_passed": 0,
       "reasoning_failed": 0,
-      "results": [
-        {
-          "model": "gpt5.2",
-          "provider": "openai",
-          "provider_model_name": "gpt-5.2",
-          "test_type": "inference",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 2000.7009506225586,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gpt5.2",
-          "provider": "openai",
-          "provider_model_name": "gpt-5.2",
-          "test_type": "websearch",
-          "success": true,
-          "response": "Today\u2019s date is **Wednesday, March 18, 2026**.",
-          "error": "",
-          "duration_ms": 1774.2910385131836,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gpt5.2",
-          "provider": "openai",
-          "provider_model_name": "gpt-5.2",
-          "test_type": "reasoning_none",
-          "success": true,
-          "response": "[{'type': 'text', 'text': '12', 'index': 0, 'id': 'msg_0303e5a87ab33c7c0069bacbcc60ec819596468ae52c3",
-          "error": "",
-          "duration_ms": 693.0027008056641,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gpt5.2",
-          "provider": "openai",
-          "provider_model_name": "gpt-5.2",
-          "test_type": "reasoning_low",
-          "success": true,
-          "response": "[{'type': 'text', 'text': '12', 'index': 0, 'id': 'msg_07b7a2ea4f6ac0500069bacbcd0b988199adc32b92606",
-          "error": "",
-          "duration_ms": 672.1203327178955,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gpt5.2",
-          "provider": "openai",
-          "provider_model_name": "gpt-5.2",
-          "test_type": "reasoning_medium",
-          "success": true,
-          "response": "[{'type': 'text', 'text': '12', 'index': 0, 'id': 'msg_05e84f930bdf9fb00069bacbcdc5fc8199b164a537a0a",
-          "error": "",
-          "duration_ms": 791.6221618652344,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gpt5.2",
-          "provider": "openai",
-          "provider_model_name": "gpt-5.2",
-          "test_type": "reasoning_high",
-          "success": true,
-          "response": "[{'type': 'text', 'text': '12', 'index': 0, 'id': 'msg_0a04f9ce1b0ba6650069bacbce92a481999296ae9c002",
-          "error": "",
-          "duration_ms": 774.6767997741699,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "websearch",
-            "tool_calling"
-          ]
-        }
-      ]
+      "results": []
     },
     "nagaai": {
       "display_name": "NagaAI",
       "api_key_configured": true,
-      "total_models": 1,
+      "total_models": 2,
       "inference_passed": 1,
-      "inference_failed": 0,
-      "tool_call_passed": 0,
-      "tool_call_failed": 0,
-      "websearch_passed": 1,
+      "inference_failed": 1,
+      "tool_call_passed": 1,
+      "tool_call_failed": 1,
+      "websearch_passed": 0,
       "websearch_failed": 0,
-      "reasoning_passed": 4,
+      "reasoning_passed": 0,
       "reasoning_failed": 0,
       "results": [
         {
-          "model": "gpt5.2",
+          "model": "kimi_k2.6",
           "provider": "nagaai",
-          "provider_model_name": "gpt-5.2-2025-12-11",
+          "provider_model_name": "kimi-k2.6",
           "test_type": "inference",
           "success": true,
           "response": "4",
           "error": "",
-          "duration_ms": 1182.2912693023682,
+          "duration_ms": 3815.3934478759766,
           "labels": [
-            "high_cost",
-            "thinking",
+            "low_cost",
+            "vision",
+            "coding",
+            "websearch",
+            "tool_calling",
+            "thinking"
+          ]
+        },
+        {
+          "model": "kimi_k2.6",
+          "provider": "nagaai",
+          "provider_model_name": "kimi-k2.6",
+          "test_type": "tool_call",
+          "success": true,
+          "response": "Tool: get_weather, Args: {'city': 'San Francisco'}",
+          "error": "",
+          "duration_ms": 2312.1376037597656,
+          "labels": [
+            "low_cost",
+            "vision",
+            "coding",
+            "websearch",
+            "tool_calling",
+            "thinking"
+          ]
+        },
+        {
+          "model": "kimi_k2.6-nonthinking",
+          "provider": "nagaai",
+          "provider_model_name": "kimi-k2.6",
+          "test_type": "inference",
+          "success": false,
+          "response": "",
+          "error": "Error code: 400 - {'error': {'type': 'invalid_request_error', 'message': 'We got a bad response from the source. Status 400. Error message: {\"error\":{\"message\":\"invalid temperature: only 1 is allowed for this model\",\"type\":\"invalid_request_error\"}}'}}",
+          "duration_ms": 0.0,
+          "labels": [
+            "low_cost",
+            "fast",
+            "vision",
+            "coding",
             "websearch",
             "tool_calling"
           ]
         },
         {
-          "model": "gpt5.2",
+          "model": "kimi_k2.6-nonthinking",
           "provider": "nagaai",
-          "provider_model_name": "gpt-5.2-2025-12-11",
-          "test_type": "websearch",
-          "success": true,
-          "response": "Today is **Wednesday, March 18, 2026**.",
-          "error": "",
-          "duration_ms": 1455.3885459899902,
+          "provider_model_name": "kimi-k2.6",
+          "test_type": "tool_call",
+          "success": false,
+          "response": "",
+          "error": "Error code: 400 - {'error': {'type': 'invalid_request_error', 'message': 'We got a bad response from the source. Status 400. Error message: {\"error\":{\"message\":\"invalid temperature: only 1 is allowed for this model\",\"type\":\"invalid_request_error\"}}'}}",
+          "duration_ms": 0.0,
           "labels": [
-            "high_cost",
-            "thinking",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gpt5.2",
-          "provider": "nagaai",
-          "provider_model_name": "gpt-5.2-2025-12-11",
-          "test_type": "reasoning_none",
-          "success": true,
-          "response": "[{'type': 'text', 'text': '12', 'index': 0, 'id': 'msg_bPh8kmFeVSDhNlPJ58Qw78CgRYd9'}]",
-          "error": "",
-          "duration_ms": 749.8800754547119,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gpt5.2",
-          "provider": "nagaai",
-          "provider_model_name": "gpt-5.2-2025-12-11",
-          "test_type": "reasoning_low",
-          "success": true,
-          "response": "[{'type': 'text', 'text': '12', 'index': 0, 'id': 'msg_THxHYWEfMh3SN1mDNPHmvUvu1ZoX'}]",
-          "error": "",
-          "duration_ms": 849.38645362854,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gpt5.2",
-          "provider": "nagaai",
-          "provider_model_name": "gpt-5.2-2025-12-11",
-          "test_type": "reasoning_medium",
-          "success": true,
-          "response": "[{'type': 'text', 'text': '12', 'index': 0, 'id': 'msg_4UDud2TvW6xEKcz5mKqAbOfqGXfv'}]",
-          "error": "",
-          "duration_ms": 857.2535514831543,
-          "labels": [
-            "high_cost",
-            "thinking",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "gpt5.2",
-          "provider": "nagaai",
-          "provider_model_name": "gpt-5.2-2025-12-11",
-          "test_type": "reasoning_high",
-          "success": true,
-          "response": "[{'type': 'text', 'text': '12', 'index': 0, 'id': 'msg_bbul1fsi8rcRG5bV0kQOHQ2pAQtn'}]",
-          "error": "",
-          "duration_ms": 801.7559051513672,
-          "labels": [
-            "high_cost",
-            "thinking",
+            "low_cost",
+            "fast",
+            "vision",
+            "coding",
             "websearch",
             "tool_calling"
           ]
@@ -282,16 +161,89 @@
     "moonshot": {
       "display_name": "Moonshot",
       "api_key_configured": true,
-      "total_models": 0,
-      "inference_passed": 0,
+      "total_models": 2,
+      "inference_passed": 2,
       "inference_failed": 0,
-      "tool_call_passed": 0,
+      "tool_call_passed": 2,
       "tool_call_failed": 0,
       "websearch_passed": 0,
       "websearch_failed": 0,
       "reasoning_passed": 0,
       "reasoning_failed": 0,
-      "results": []
+      "results": [
+        {
+          "model": "kimi_k2.6",
+          "provider": "moonshot",
+          "provider_model_name": "kimi-k2.6",
+          "test_type": "inference",
+          "success": true,
+          "response": "4",
+          "error": "",
+          "duration_ms": 3371.7446327209473,
+          "labels": [
+            "low_cost",
+            "vision",
+            "coding",
+            "websearch",
+            "tool_calling",
+            "thinking"
+          ]
+        },
+        {
+          "model": "kimi_k2.6",
+          "provider": "moonshot",
+          "provider_model_name": "kimi-k2.6",
+          "test_type": "tool_call",
+          "success": true,
+          "response": "Tool: get_weather, Args: {'city': 'San Francisco'}",
+          "error": "",
+          "duration_ms": 3267.565965652466,
+          "labels": [
+            "low_cost",
+            "vision",
+            "coding",
+            "websearch",
+            "tool_calling",
+            "thinking"
+          ]
+        },
+        {
+          "model": "kimi_k2.6-nonthinking",
+          "provider": "moonshot",
+          "provider_model_name": "kimi-k2.6",
+          "test_type": "inference",
+          "success": true,
+          "response": "4",
+          "error": "",
+          "duration_ms": 2448.559284210205,
+          "labels": [
+            "low_cost",
+            "fast",
+            "vision",
+            "coding",
+            "websearch",
+            "tool_calling"
+          ]
+        },
+        {
+          "model": "kimi_k2.6-nonthinking",
+          "provider": "moonshot",
+          "provider_model_name": "kimi-k2.6",
+          "test_type": "tool_call",
+          "success": true,
+          "response": "Tool: get_weather, Args: {'city': 'San Francisco'}",
+          "error": "",
+          "duration_ms": 2049.391984939575,
+          "labels": [
+            "low_cost",
+            "fast",
+            "vision",
+            "coding",
+            "websearch",
+            "tool_calling"
+          ]
+        }
+      ]
     },
     "deepseek": {
       "display_name": "DeepSeek",

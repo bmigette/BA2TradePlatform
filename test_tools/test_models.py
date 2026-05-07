@@ -127,7 +127,7 @@ def get_models_for_provider(provider: str) -> List[Tuple[str, str, Dict]]:
         PROVIDER_ANTHROPIC: ["claude_3.5_haiku", "claude_3.5_sonnet", "claude_4_sonnet"],
         PROVIDER_XAI: ["grok3_mini", "grok3", "grok4_fast"],
         PROVIDER_DEEPSEEK: ["deepseek_chat", "deepseek_coder", "deepseek_reasoner"],
-        PROVIDER_MOONSHOT: ["kimi_k2.5", "kimi_k2", "kimi_k1.5"],
+        PROVIDER_MOONSHOT: ["kimi_k2.6", "kimi_k2.6-nonthinking", "kimi_k2.5", "kimi_k2", "kimi_k1.5"],
         PROVIDER_OPENROUTER: ["gpt4o_mini", "claude_3.5_haiku", "grok3_mini"],
         PROVIDER_BEDROCK: ["llama3_1_8b", "llama3_1_70b"],
     }

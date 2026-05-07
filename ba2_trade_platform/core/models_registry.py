@@ -583,6 +583,35 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "default_model_kwargs": {"thinking": {"type": "disabled"}},
         "context_size": 262144,
     },
+    "kimi_k2.6": {
+        "native_provider": PROVIDER_MOONSHOT,
+        "display_name": "Kimi K2.6",
+        "description": "Moonshot AI's Kimi K2.6 multimodal agentic model with 256K context (thinking enabled by default)",
+        "provider_names": {
+            PROVIDER_MOONSHOT: "kimi-k2.6",
+            PROVIDER_NAGAAI: "kimi-k2.6",
+            PROVIDER_OPENROUTER: "moonshotai/kimi-k2.6",
+        },
+        "labels": [LABEL_LOW_COST, LABEL_VISION, LABEL_CODING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING, LABEL_THINKING],
+        "fixed_temperature": 1.0,  # Kimi K2.6 thinking mode requires temperature=1
+        "fixed_top_p": 0.95,  # Kimi K2.6 only accepts top_p=0.95
+        "context_size": 262144,
+    },
+    "kimi_k2.6-nonthinking": {
+        "native_provider": PROVIDER_MOONSHOT,
+        "display_name": "Kimi K2.6 (Instant)",
+        "description": "Moonshot AI's Kimi K2.6 in instant mode - faster responses without reasoning traces",
+        "provider_names": {
+            PROVIDER_MOONSHOT: "kimi-k2.6",
+            PROVIDER_NAGAAI: "kimi-k2.6",
+            PROVIDER_OPENROUTER: "moonshotai/kimi-k2.6",
+        },
+        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_VISION, LABEL_CODING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "fixed_temperature": 0.6,  # Kimi K2.6 with thinking disabled requires temperature=0.6
+        "fixed_top_p": 0.95,  # Kimi K2.6 only accepts top_p=0.95
+        "default_model_kwargs": {"thinking": {"type": "disabled"}},
+        "context_size": 262144,
+    },
 
     # =========================================================================
     # Google Gemini Family
