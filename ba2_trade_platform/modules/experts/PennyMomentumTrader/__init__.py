@@ -17,6 +17,7 @@ Pipeline phases:
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -228,6 +229,13 @@ class PennyMomentumTrader(LiveExpertInterface):
                 "default": 15,
                 "description": "Maximum finalists from deep triage",
                 "tooltip": "Maximum finalists to carry forward from deep triage, selected by highest confidence score.",
+            },
+            "deep_triage_workers": {
+                "type": "int",
+                "required": True,
+                "default": 3,
+                "description": "Parallel workers for deep triage",
+                "tooltip": "Number of symbols to deep-triage simultaneously. Each worker makes independent LLM and data API calls. Higher values reduce phase 3 duration but increase API concurrency.",
             },
             "max_monitored_symbols": {
                 "type": "int",
@@ -1462,6 +1470,130 @@ class PennyMomentumTrader(LiveExpertInterface):
         # Return full candidate dicts for survivors
         return [c for c in candidates if c.get("symbol") in survivor_set]
 
+    def _triage_one_symbol(
+        self,
+        candidate: Dict[str, Any],
+        deep_model: str,
+        min_confidence: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Gather data and run LLM deep triage for a single symbol.
+
+        Returns a result dict consumed by _phase_3_deep_triage, or None to skip.
+        All shared-state mutations (DB writes, list appends) are intentionally
+        left to the caller so this method is safe to run in a thread pool.
+        """
+        symbol = candidate.get("symbol")
+        if not symbol:
+            return None
+
+        self.logger.debug(f"Phase 3 [{symbol}]: gathering data (news, fundamentals, insider, social)")
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {
+                executor.submit(self._gather_news, symbol): "news",
+                executor.submit(self._gather_fundamentals, symbol): "fundamentals",
+                executor.submit(self._gather_insider, symbol): "insider",
+                executor.submit(self._gather_social, symbol): "social",
+            }
+            gathered = {}
+            for future in as_completed(futures):
+                key = futures[future]
+                try:
+                    gathered[key] = future.result()
+                except Exception as e:
+                    self.logger.warning(f"Phase 3 [{symbol}]: {key} gathering failed: {e}")
+                    gathered[key] = f"No {key} data available."
+
+        now_utc = datetime.now(timezone.utc)
+        _et_offset = -4 if 3 <= now_utc.month <= 11 else -5
+        now_et = now_utc + timedelta(hours=_et_offset)
+        tz_label = "EDT" if _et_offset == -4 else "EST"
+        is_open = self._is_market_open()
+        market_state = "Regular session open (09:30–16:00 ET)" if is_open else (
+            "Pre-market" if now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30)
+            else "After-hours / post-market"
+        )
+        market_context = (
+            f"{market_state}. "
+            f"Current time: {now_et.strftime('%Y-%m-%d %H:%M')} {tz_label}."
+        )
+        cand_price = candidate.get("price")
+        cand_chg = candidate.get("change_percent")
+        if cand_price is not None:
+            sign = "+" if (cand_chg or 0) >= 0 else ""
+            chg_str = f" Today's change: {sign}{cand_chg:.1f}%" if cand_chg is not None else ""
+            if cand_chg is not None and cand_chg != -100:
+                prev_close = cand_price / (1 + cand_chg / 100)
+                chg_str += f" (prev close ~${prev_close:.4f})"
+            market_context += f" Current price: ${cand_price:.4f}.{chg_str}."
+
+        prompt = build_deep_triage_prompt(
+            symbol=symbol,
+            news=gathered.get("news", "No news data available."),
+            insider=gathered.get("insider", "No insider data available."),
+            fundamentals=gathered.get("fundamentals", "No fundamentals data available."),
+            social=gathered.get("social", "No social sentiment data available."),
+            market_context=market_context,
+        )
+
+        try:
+            self.logger.debug(f"Phase 3 [{symbol}]: calling LLM {deep_model}")
+            llm = ModelFactory.create_llm(
+                deep_model,
+                temperature=0.3,
+                expert_instance_id=self.instance.id,
+                use_case="PennyMomentum Deep Triage",
+            )
+            response = llm.invoke(prompt)
+            raw_text = response.content if hasattr(response, "content") else str(response)
+
+            result = self._parse_json_response(raw_text, expected_type=dict)
+            if not result:
+                self.logger.warning(f"Phase 3 [{symbol}]: failed to parse LLM response")
+                return {
+                    "symbol": symbol, "candidate": candidate,
+                    "confidence": None, "result": None,
+                    "raw_text": raw_text, "prompt": prompt,
+                    "filter_entry": {"phase": "deep_triage", "reason": "llm_parse_failed",
+                                     "details": "Failed to parse LLM deep triage response"},
+                }
+
+            confidence = result.get("confidence", 0)
+            self.logger.debug(f"Phase 3 [{symbol}]: confidence={confidence}, catalyst={result.get('catalyst', '')!r}")
+
+            if confidence < min_confidence:
+                self.logger.info(f"{symbol} confidence {confidence} below threshold {min_confidence}, skipping")
+                return {
+                    "symbol": symbol, "candidate": candidate,
+                    "confidence": confidence, "result": None,
+                    "raw_text": raw_text, "prompt": prompt,
+                    "filter_entry": {
+                        "phase": "deep_triage", "reason": "low_confidence",
+                        "details": (
+                            f"Confidence {confidence} below threshold {min_confidence}. "
+                            f"Catalyst: {result.get('catalyst', 'N/A')}. "
+                            f"Risk: {result.get('risk_assessment', 'N/A')}. "
+                            f"Reasoning: {result.get('reasoning', 'N/A')}"
+                        ),
+                    },
+                }
+
+            return {
+                "symbol": symbol, "candidate": candidate,
+                "confidence": confidence, "result": result,
+                "raw_text": raw_text, "prompt": prompt,
+                "filter_entry": None,
+            }
+
+        except Exception as e:
+            self.logger.error(f"Deep triage failed for {symbol}: {e}", exc_info=True)
+            return {
+                "symbol": symbol, "candidate": candidate,
+                "confidence": None, "result": None,
+                "raw_text": "", "prompt": "",
+                "filter_entry": {"phase": "deep_triage", "reason": "deep_triage_error",
+                                 "details": f"Deep triage failed: {e}"},
+            }
+
     def _phase_3_deep_triage(
         self, survivors: List[Dict[str, Any]], market_analysis: MarketAnalysis
     ) -> List[Dict[str, Any]]:
@@ -1478,150 +1610,66 @@ class PennyMomentumTrader(LiveExpertInterface):
         deep_model = self.get_setting_with_interface_default(
             "deep_analysis_llm", log_warning=False
         )
+        min_confidence = int(self.get_setting_with_interface_default(
+            "min_confidence_threshold", log_warning=False
+        ))
+        max_workers = int(self.get_setting_with_interface_default(
+            "deep_triage_workers", log_warning=False
+        ))
 
         deep_triage_results: Dict[str, Dict[str, Any]] = {}
         finalists: List[Dict[str, Any]] = []
         filtered_stocks = dict(market_analysis.state.get("filtered_stocks", {}))
-
-        # Process ALL candidates (input is already bounded by phase 1+2 limits).
-        # max_final_candidates caps the OUTPUT — we take the top N by confidence.
         total_survivors = len(survivors)
-        for idx, candidate in enumerate(survivors, 1):
-            if self._stop_event.is_set():
-                break
 
-            symbol = candidate.get("symbol")
-            if not symbol:
-                continue
+        self.logger.info(f"Phase 3: running deep triage with {max_workers} parallel workers")
 
-            self.logger.info(f"Phase 3: {idx}/{total_survivors} - deep triage {symbol}")
+        # Submit all symbols; collect results as each worker finishes.
+        # All shared-state mutations happen here in the main thread (no locks needed).
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_symbol = {
+                executor.submit(self._triage_one_symbol, candidate, deep_model, min_confidence): candidate
+                for candidate in survivors
+            }
 
-            # Update progress state so UI can show live status during long phase
-            self._update_state(market_analysis, {
-                "deep_triage_progress": {
-                    "current_symbol": symbol,
-                    "processed": idx - 1,
-                    "total": total_survivors,
-                    "passed": len(finalists),
-                },
-            })
+            completed_count = 0
+            for future in as_completed(future_to_symbol):
+                if self._stop_event.is_set():
+                    break
 
-            # Gather data from all configured vendors in parallel
-            self.logger.debug(f"Phase 3 [{symbol}]: gathering data (news, fundamentals, insider, social)")
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                futures = {
-                    executor.submit(self._gather_news, symbol): "news",
-                    executor.submit(self._gather_fundamentals, symbol): "fundamentals",
-                    executor.submit(self._gather_insider, symbol): "insider",
-                    executor.submit(self._gather_social, symbol): "social",
-                }
-                gathered = {}
-                for future in as_completed(futures):
-                    key = futures[future]
-                    try:
-                        gathered[key] = future.result()
-                    except Exception as e:
-                        self.logger.warning(f"Phase 3 [{symbol}]: {key} gathering failed: {e}")
-                        gathered[key] = f"No {key} data available."
-
-            news_text = gathered.get("news", "No news data available.")
-            fundamentals_text = gathered.get("fundamentals", "No fundamentals data available.")
-            insider_text = gathered.get("insider", "No insider data available.")
-            social_text = gathered.get("social", "No social sentiment data available.")
-
-            # Build market context string for strategy timing guidance
-            now_utc = datetime.now(timezone.utc)
-            # EST = UTC-5, EDT = UTC-4 (DST approx Mar–Nov)
-            from datetime import date as _date
-            _month = now_utc.month
-            _et_offset = -4 if 3 <= _month <= 11 else -5
-            now_et = now_utc + timedelta(hours=_et_offset)
-            tz_label = "EDT" if _et_offset == -4 else "EST"
-            is_open = self._is_market_open()
-            market_state = "Regular session open (09:30–16:00 ET)" if is_open else (
-                "Pre-market" if now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30)
-                else "After-hours / post-market"
-            )
-            market_context = (
-                f"{market_state}. "
-                f"Current time: {now_et.strftime('%Y-%m-%d %H:%M')} {tz_label}."
-            )
-            cand_price = candidate.get("price")
-            cand_chg = candidate.get("change_percent")
-            if cand_price is not None:
-                sign = "+" if (cand_chg or 0) >= 0 else ""
-                chg_str = f" Today's change: {sign}{cand_chg:.1f}%" if cand_chg is not None else ""
-                if cand_chg is not None and cand_chg != -100:
-                    prev_close = cand_price / (1 + cand_chg / 100)
-                    chg_str += f" (prev close ~${prev_close:.4f})"
-                market_context += f" Current price: ${cand_price:.4f}.{chg_str}."
-
-            # Build prompt and call LLM
-            prompt = build_deep_triage_prompt(
-                symbol=symbol,
-                news=news_text,
-                insider=insider_text,
-                fundamentals=fundamentals_text,
-                social=social_text,
-                market_context=market_context,
-            )
-
-            try:
-                self.logger.debug(f"Phase 3 [{symbol}]: calling LLM {deep_model}")
-                llm = ModelFactory.create_llm(
-                    deep_model,
-                    temperature=0.3,
-                    expert_instance_id=self.instance.id,
-                    use_case="PennyMomentum Deep Triage",
-                )
-                response = llm.invoke(prompt)
-                raw_text = (
-                    response.content if hasattr(response, "content") else str(response)
-                )
-
-                result = self._parse_json_response(raw_text, expected_type=dict)
-                if not result:
-                    self.logger.warning(f"Phase 3 [{symbol}]: failed to parse LLM response")
-                    filtered_stocks[symbol] = {
-                        "phase": "deep_triage",
-                        "reason": "llm_parse_failed",
-                        "details": "Failed to parse LLM deep triage response",
-                    }
+                completed_count += 1
+                try:
+                    triage = future.result()
+                except Exception as e:
+                    self.logger.error(f"Deep triage worker raised unexpectedly: {e}", exc_info=True)
                     continue
 
-                confidence = result.get("confidence", 0)
-                self.logger.debug(f"Phase 3 [{symbol}]: confidence={confidence}, catalyst={result.get('catalyst', '')!r}")
-                min_confidence = int(self.get_setting_with_interface_default(
-                    "min_confidence_threshold", log_warning=False
-                ))
-                if confidence < min_confidence:
-                    self.logger.info(
-                        f"{symbol} confidence {confidence} below threshold {min_confidence}, skipping"
-                    )
-                    filtered_stocks[symbol] = {
-                        "phase": "deep_triage",
-                        "reason": "low_confidence",
-                        "details": (
-                            f"Confidence {confidence} below threshold {min_confidence}. "
-                            f"Catalyst: {result.get('catalyst', 'N/A')}. "
-                            f"Risk: {result.get('risk_assessment', 'N/A')}. "
-                            f"Reasoning: {result.get('reasoning', 'N/A')}"
-                        ),
-                    }
+                if triage is None:
+                    continue
+
+                symbol = triage["symbol"]
+                self.logger.info(f"Phase 3: {completed_count}/{total_survivors} complete - {symbol}")
+
+                if triage["filter_entry"]:
+                    filtered_stocks[symbol] = triage["filter_entry"]
                     self._update_state(market_analysis, {
                         "filtered_stocks": dict(filtered_stocks),
                         "deep_triage_progress": {
                             "current_symbol": symbol,
-                            "processed": idx,
+                            "processed": completed_count,
                             "total": total_survivors,
                             "passed": len(finalists),
                         },
                     })
                     continue
 
-                # Create ExpertRecommendation
+                # Passed confidence threshold — write to DB and update shared state
+                result = triage["result"]
+                confidence = triage["confidence"]
+                candidate = triage["candidate"]
+                raw_text = triage["raw_text"]
+                prompt = triage["prompt"]
+
                 time_horizon = (
                     TimeHorizon.SHORT_TERM
                     if result.get("strategy") == "intraday"
@@ -1675,29 +1723,25 @@ class PennyMomentumTrader(LiveExpertInterface):
                 if _p is not None and _chg is not None and _chg != -100:
                     result["prev_close"] = _p / (1 + _chg / 100)
                 deep_triage_results[symbol] = result
-                finalists.append(
-                    {
-                        "symbol": symbol,
-                        "confidence": confidence,
-                        "price": candidate.get("price"),
-                        "catalyst": result.get("catalyst", ""),
-                        "strategy": result.get("strategy", ""),
-                    }
-                )
+                finalists.append({
+                    "symbol": symbol,
+                    "confidence": confidence,
+                    "price": candidate.get("price"),
+                    "catalyst": result.get("catalyst", ""),
+                    "strategy": result.get("strategy", ""),
+                })
 
-                # Persist incremental results so UI shows progress during long phase
                 self._update_state(market_analysis, {
                     "deep_triage_results": dict(deep_triage_results),
                     "filtered_stocks": dict(filtered_stocks),
                     "deep_triage_progress": {
                         "current_symbol": symbol,
-                        "processed": idx,
+                        "processed": completed_count,
                         "total": total_survivors,
                         "passed": len(finalists),
                     },
                 })
 
-                # Save per-symbol analysis output
                 self._save_analysis_output(
                     market_analysis,
                     provider_category="llm",
@@ -1708,16 +1752,6 @@ class PennyMomentumTrader(LiveExpertInterface):
                     symbol=symbol,
                     prompt=prompt,
                 )
-
-            except Exception as e:
-                self.logger.error(
-                    f"Deep triage failed for {symbol}: {e}", exc_info=True
-                )
-                filtered_stocks[symbol] = {
-                    "phase": "deep_triage",
-                    "reason": "deep_triage_error",
-                    "details": f"Deep triage failed: {e}",
-                }
 
         # Cap finalists to max_final by confidence (highest confidence first)
         if len(finalists) > max_final:
