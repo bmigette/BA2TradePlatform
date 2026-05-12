@@ -2533,12 +2533,27 @@ class PennyMomentumTrader(LiveExpertInterface):
                                             info["status"] = "triggered"
                                             info["pending_order_id"] = order_id
                                             info["triggered_at"] = datetime.now(timezone.utc).isoformat()
+                                            info.pop("entry_attempts", None)
                                             self._record_trade(
                                                 market_analysis,
                                                 symbol,
                                                 "entry",
                                                 info.get("catalyst", ""),
                                             )
+                                        else:
+                                            attempts = info.get("entry_attempts", 0) + 1
+                                            info["entry_attempts"] = attempts
+                                            if attempts >= 5:
+                                                self.logger.warning(
+                                                    f"Entry for {symbol} failed {attempts} times, "
+                                                    f"marking entry_failed to stop retries"
+                                                )
+                                                info["status"] = "entry_failed"
+                                            else:
+                                                self.logger.warning(
+                                                    f"Entry order failed for {symbol} "
+                                                    f"(attempt {attempts}/5), will retry next tick"
+                                                )
 
                 except Exception as e:
                     self.logger.error(

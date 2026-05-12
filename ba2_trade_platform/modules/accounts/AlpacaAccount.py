@@ -1274,6 +1274,12 @@ class AlpacaAccount(AccountInterface):
                     update_instance(db_order)
             
             return True
+        except APIError as e:
+            if "pending cancel" in str(e).lower():
+                logger.debug(f"Order {order_id} already pending cancel at Alpaca — treating as success")
+                return True
+            logger.error(f"Error cancelling Alpaca order {order_id}: {e}", exc_info=True)
+            return False
         except Exception as e:
             logger.error(f"Error cancelling Alpaca order {order_id}: {e}", exc_info=True)
             return False
