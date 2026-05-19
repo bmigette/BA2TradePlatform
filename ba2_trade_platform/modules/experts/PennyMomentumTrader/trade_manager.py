@@ -260,6 +260,24 @@ class PennyTradeManager:
             if current_qty <= 0:
                 continue
 
+            # Guard: skip if a pending sell order already exists for this transaction.
+            # This prevents duplicate exits when shares are already held_for_orders at the
+            # broker (Alpaca code 40310000 "insufficient qty available").
+            with get_db() as session:
+                existing_sell = session.exec(
+                    select(TradingOrder)
+                    .where(TradingOrder.transaction_id == trans.id)
+                    .where(TradingOrder.side == OrderDirection.SELL)
+                    .where(TradingOrder.status.in_(list(OrderStatus.get_unfilled_statuses())))
+                ).first()
+            if existing_sell:
+                logger.info(
+                    f"PennyTradeManager: exit for {symbol} skipped — "
+                    f"pending sell order {existing_sell.id} (status={existing_sell.status}) already exists"
+                )
+                any_success = True
+                continue
+
             exit_qty = int(current_qty * exit_pct / 100.0)
             if exit_qty <= 0:
                 exit_qty = current_qty  # At minimum close 1 share
