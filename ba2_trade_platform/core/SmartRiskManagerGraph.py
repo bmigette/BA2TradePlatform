@@ -741,15 +741,19 @@ Before calling `recommend_open_*_position()` you MUST anchor SL and TP on real v
 structural levels, NOT on round numbers or a fixed % off entry. Tight stops on volatile names
 have caused ~80% same-day stop-outs in historical runs — this is the single biggest leak.
 
-1. **Gather volatility & structure** for the candidate symbol (use the analyses already in context,
-   or call tools if missing):
-   - ATR(14) — fetch from `tool_output_get_indicator_data_json` of the most recent analysis
-     (`get_analysis_output_detail_tool(analysis_id, "tool_output_get_indicator_data_json")`).
-     Look for `atr`, `atr_14`, or compute from `bb_upper - bb_lower` as a proxy.
-   - Recent realised range — call `get_price_movement_tool(symbol, days=14)` and note
-     max drawdown / max rally over the window.
-   - Structural levels — from the technical analyst section of the analysis, identify the
-     nearest swing low (for BUY) or swing high (for SELL), 50-SMA, and Bollinger lower/upper band.
+1. **Use the "Technical Levels per Symbol" table already in your scratchpad** (pre-loaded from
+   the latest analysis). It contains, per candidate symbol:
+   - `ATR` and `ATR%` (per 1h bar) — bar-volatility
+   - `BB_Lower` / `BB_Upper` — dynamic support / resistance (use BB_Lower as BUY SL anchor,
+     BB_Upper as BUY TP anchor; reverse for SELL)
+   - `10-EMA`, `50-SMA`, `200-SMA` — trend filters
+   - `Trend` — quick flags like `<10EMA <50SMA` indicating chart damage
+   - `SL_Floor%` — the **minimum SL distance** already computed for that symbol (combines
+     1.5 × daily-equiv ATR, the 5% base floor, and the 6% small-cap / high-vol bump). USE
+     THIS DIRECTLY. Do not propose tighter SL than this number.
+   - Cross-check with the "Price Movement Summary" table for recent realised drawdowns and
+     with the technical analyst section of the analysis for explicit swing-low / swing-high
+     mentions (`get_analysis_outputs_batch_tool` if needed).
 
 2. **Minimum SL distance** (hard floor — reject your own proposal if violated):
    - `min_sl_dist_pct = max(1.5 × ATR14_pct, prior_5d_range_pct, 5.0%)`
@@ -1729,6 +1733,124 @@ def check_recent_analyses(state: SmartRiskManagerState) -> Dict[str, Any]:
                         cols.append("N/A")
                 analyses_summary += f"| {sym} | {' | '.join(cols)} |\n"
             analyses_summary += "\n*Negative values indicate price drops — potential buy-the-dip opportunities when combined with bullish analysis signals.*\n"
+
+        # Pre-load technical indicator levels per symbol (ATR, Bollinger, MAs)
+        # so the model can anchor SL/TP without having to call tools per symbol.
+        # Pulls the most-recent indicator series for the symbol (any expert, last 72h),
+        # takes the latest value, and renders an S/R + volatility table.
+        indicator_levels = {}
+        if all_symbols:
+            logger.info(f"Pre-loading indicator levels (ATR/BB/MA) for {len(all_symbols)} symbols")
+            INDICATORS_WANTED = ('atr', 'boll_lb', 'boll_ub', 'boll', 'vwma',
+                                 'close_10_ema', 'close_50_sma', 'close_200_sma',
+                                 'rsi', 'macd', 'macds')
+            try:
+                with get_db() as session:
+                    from sqlmodel import select
+                    from ..core.models import AnalysisOutput, MarketAnalysis
+                    from datetime import datetime, timedelta, timezone
+                    ind_cutoff = datetime.now(timezone.utc) - timedelta(hours=72)
+                    for sym in all_symbols:
+                        latest_aid = session.exec(
+                            select(MarketAnalysis.id)
+                            .where(MarketAnalysis.symbol == sym)
+                            .where(MarketAnalysis.created_at >= ind_cutoff)
+                            .order_by(MarketAnalysis.created_at.desc())
+                            .limit(1)
+                        ).first()
+                        if not latest_aid:
+                            continue
+                        rows = session.exec(
+                            select(AnalysisOutput.text)
+                            .where(AnalysisOutput.market_analysis_id == latest_aid)
+                            .where(AnalysisOutput.name == 'tool_output_get_indicator_data_json')
+                        ).all()
+                        levels = {}
+                        for raw in rows:
+                            if not raw:
+                                continue
+                            try:
+                                payload = json.loads(raw) if isinstance(raw, str) else raw
+                                ind = payload.get('indicator')
+                                if ind not in INDICATORS_WANTED:
+                                    continue
+                                vals = (payload.get('data') or {}).get('values') or []
+                                if not vals:
+                                    continue
+                                # latest non-null value
+                                last_val = next((v for v in reversed(vals)
+                                                 if v is not None), None)
+                                if last_val is not None:
+                                    levels[ind] = float(last_val)
+                            except Exception:
+                                continue
+                        if levels:
+                            indicator_levels[sym] = levels
+            except Exception as ind_err:
+                logger.warning(f"Indicator level pre-load failed: {ind_err}")
+
+        if indicator_levels:
+            analyses_summary += "\n\n## Technical Levels per Symbol (latest 1h-bar values, last 72h)\n"
+            analyses_summary += "*Use these to anchor SL/TP — see SL/TP SIZING RULES in your instructions.*\n"
+            analyses_summary += ("*BB_Lower / BB_Upper = nearest dynamic S/R (use opposite for SL anchor). "
+                                 "VWMA = volume-weighted moving average — strong S/R when retested. "
+                                 "10-EMA / 50-SMA / 200-SMA = trend-based S/R levels. "
+                                 "ATR% = bar-volatility proxy. "
+                                 "RSI < 30 = oversold (caution on SELL entries), > 70 = overbought (caution on BUY entries). "
+                                 "MACD arrow: ↑ = bullish cross, ↓ = bearish cross.*\n\n")
+            analyses_summary += ("| Symbol | Price | ATR | ATR% | BB_Lower | BB_Upper | VWMA | 10-EMA "
+                                 "| 50-SMA | 200-SMA | RSI | MACD | Trend | SL_Floor% |\n")
+            analyses_summary += ("|--------|-------|-----|------|----------|----------|------|--------"
+                                 "|--------|---------|-----|------|-------|-----------|\n")
+            for sym in sorted(indicator_levels.keys()):
+                lv = indicator_levels[sym]
+                price = bid_prices.get(sym) or ask_prices.get(sym)
+                if not price:
+                    continue
+                atr = lv.get('atr')
+                atr_pct = (atr / price * 100.0) if (atr and price) else None
+                # Estimated daily-equivalent ATR%: 1h bar × sqrt(~6.5 bars/day) ≈ ×2.55
+                daily_atr_pct = (atr_pct * 2.55) if atr_pct is not None else None
+                bb_l = lv.get('boll_lb')
+                bb_u = lv.get('boll_ub')
+                vwma = lv.get('vwma')
+                ema10 = lv.get('close_10_ema')
+                sma50 = lv.get('close_50_sma')
+                sma200 = lv.get('close_200_sma')
+                rsi = lv.get('rsi')
+                macd_val = lv.get('macd')
+                macds_val = lv.get('macds')
+                macd_cross = None
+                if macd_val is not None and macds_val is not None:
+                    macd_cross = '↑' if macd_val > macds_val else '↓'
+                trend_bits = []
+                if ema10 and price:
+                    trend_bits.append('>10EMA' if price > ema10 else '<10EMA')
+                if sma50 and price:
+                    trend_bits.append('>50SMA' if price > sma50 else '<50SMA')
+                if sma200 and price:
+                    trend_bits.append('>200SMA' if price > sma200 else '<200SMA')
+                trend = ' '.join(trend_bits) if trend_bits else 'n/a'
+                # SL floor per rules: max(1.5 × daily_ATR%, 5d-range, 5%); bumped to 6% if price<$80 or daily ATR%>3%
+                sl_floor = 5.0
+                if daily_atr_pct is not None:
+                    sl_floor = max(sl_floor, 1.5 * daily_atr_pct)
+                if (price < 80) or (daily_atr_pct is not None and daily_atr_pct > 3.0):
+                    sl_floor = max(sl_floor, 6.0)
+                fmt = lambda v: f"{v:.2f}" if v is not None else "n/a"
+                rsi_str = f"{rsi:.0f}" if rsi is not None else "n/a"
+                macd_str = f"{macd_val:.2f}{macd_cross}" if (macd_val is not None and macd_cross) else "n/a"
+                analyses_summary += (
+                    f"| {sym} | {fmt(price)} | {fmt(atr)} | "
+                    f"{(f'{atr_pct:.2f}%' if atr_pct is not None else 'n/a')} | "
+                    f"{fmt(bb_l)} | {fmt(bb_u)} | {fmt(vwma)} | {fmt(ema10)} | "
+                    f"{fmt(sma50)} | {fmt(sma200)} | {rsi_str} | {macd_str} | "
+                    f"{trend} | {sl_floor:.1f}% |\n"
+                )
+            analyses_summary += ("\n*ATR% is per 1h bar; the SL_Floor% column already converts to "
+                                 "a daily-equivalent floor (1h ATR% × 2.55) and applies the 5% / 6% "
+                                 "rules. For counter-trend / mean-reversion entries (price below 10-EMA "
+                                 "or 50-SMA), widen further to 8% and halve size as per instructions.*\n")
 
         # Handle case where agent_scratchpad might be a list
         current_scratchpad = state["agent_scratchpad"]
