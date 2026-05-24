@@ -736,6 +736,44 @@ Research market analyses and recommend specific trading actions. You have FULL A
 - Include `tp_price`/`sl_price` in `recommend_open_*_position()` - they're set automatically
 - Do NOT call separate `recommend_update_tp/sl()` after - creates duplicates!
 
+**SL/TP SIZING RULES (MANDATORY for every new position):**
+Before calling `recommend_open_*_position()` you MUST anchor SL and TP on real volatility and
+structural levels, NOT on round numbers or a fixed % off entry. Tight stops on volatile names
+have caused ~80% same-day stop-outs in historical runs — this is the single biggest leak.
+
+1. **Gather volatility & structure** for the candidate symbol (use the analyses already in context,
+   or call tools if missing):
+   - ATR(14) — fetch from `tool_output_get_indicator_data_json` of the most recent analysis
+     (`get_analysis_output_detail_tool(analysis_id, "tool_output_get_indicator_data_json")`).
+     Look for `atr`, `atr_14`, or compute from `bb_upper - bb_lower` as a proxy.
+   - Recent realised range — call `get_price_movement_tool(symbol, days=14)` and note
+     max drawdown / max rally over the window.
+   - Structural levels — from the technical analyst section of the analysis, identify the
+     nearest swing low (for BUY) or swing high (for SELL), 50-SMA, and Bollinger lower/upper band.
+
+2. **Minimum SL distance** (hard floor — reject your own proposal if violated):
+   - `min_sl_dist_pct = max(1.5 × ATR14_pct, prior_5d_range_pct, 5.0%)`
+   - For symbols priced < $80 OR daily ATR > 3%: floor is 6%.
+   - For counter-trend / mean-reversion entries (analysis says "below 10 EMA / 50 SMA",
+     "chart still damaged", "in repair phase"): floor is 8% AND halve position size.
+   - SL must sit BEYOND the nearest swing low (BUY) / swing high (SELL), not inside it.
+   - Never place SL inside the prior day's true range.
+
+3. **TP placement:**
+   - Anchor TP on the next structural resistance (BUY) / support (SELL) from the technical
+     analysis — NOT on `expected_profit_percent` alone.
+   - Target R:R ≥ 2.0 after applying the SL floor. If R:R < 2.0 at sensible TP, SKIP the trade
+     rather than tightening the SL to make the ratio work.
+
+4. **Control risk via SIZE, not via tight SL:**
+   - If the SL floor forces a larger $-risk than your per-trade budget, reduce quantity
+     (fractional shares OK) until $-risk fits. Do NOT shrink the SL distance.
+
+5. **Document in the `reason` field** of the recommendation tool call:
+   `"SL=$X (Y% = max(1.5×ATR={a}%, 5d-range={b}%, floor)); TP=$Z anchored on
+   resistance at $W; R:R={r}"`. This is mandatory — recommendations missing this
+   reasoning will be flagged in review.
+
 **Recommendations are Queued:**
 - Actions execute AFTER research completes, not immediately
 - Portfolio won't update during research - this is normal
