@@ -210,10 +210,31 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "tooltip": "Classic (Rules): Traditional rule-based risk management using automation rulesets you configure. Smart (Agentic): AI-powered intelligent risk management that uses the risk_manager_model to make dynamic decisions based on market conditions and portfolio state."
                 },
                 "smart_risk_manager_user_instructions": {
-                    "type": "str", "required": False, "default": "Maximize short term profit with medium risk taking",
+                    "type": "str", "required": False, "default": (
+                        "Maximize short term profit with medium risk taking.\n\n"
+                        "Risk sizing guidance (advisory — use judgement, not strict enforcement):\n"
+                        "- A 'Technical Levels per Symbol' table is pre-loaded in your scratchpad with ATR / ATR%, "
+                        "Bollinger bands (BB_Lower / BB_Upper as dynamic S/R), VWMA, 10-EMA, 50-SMA, 200-SMA, RSI, "
+                        "MACD, a Trend flag, and a suggested SL_Floor%. Use these as guidance when choosing SL/TP — "
+                        "they are inputs to your decision, not hard limits.\n"
+                        "- Recommended anchors: for BUY, place SL near BB_Lower / nearest swing low and TP near "
+                        "BB_Upper / next resistance. Mirror for SELL.\n"
+                        "- SL_Floor% is a suggested minimum SL distance based on volatility. Try to honor it as a "
+                        "default, but you may deviate if the analysis context (e.g. clearly defined nearby support) "
+                        "justifies a different level — just be explicit about why.\n"
+                        "- For counter-trend / mean-reversion entries (Trend shows '<10EMA <50SMA' or analysis flags "
+                        "'chart damaged / in repair phase'), prefer widening SL to ~8% and/or halving position size — "
+                        "or skip the trade if R:R doesn't justify it.\n"
+                        "- Aim for R:R ≈ 2 or better. If you can't reach that with sensible levels, prefer skipping "
+                        "or reducing size rather than tightening SL into intraday noise.\n"
+                        "- Prefer controlling risk via position size (fractional shares OK) rather than by shrinking "
+                        "the SL distance.\n"
+                        "- In the recommendation `reason` field, briefly cite the levels you used (e.g. SL=$X near "
+                        "BB_Lower, TP=$W at BB_Upper, R:R≈R) so the choice can be reviewed."
+                    ),
                     "description": "Smart Risk Manager User Instructions",
                     "help": "Instructions for the AI-powered smart risk manager. This guides the risk manager's decision-making strategy when in Smart mode.",
-                    "tooltip": "Provide high-level instructions to guide the smart risk manager's behavior. Examples: 'Maximize short term profit with medium risk taking', 'Focus on capital preservation with conservative risk', 'Aggressive growth with high risk tolerance'. Only used when risk_manager_mode is set to 'smart'."
+                    "tooltip": "Provide high-level instructions to guide the smart risk manager's behavior. The default includes risk-sizing guidance referencing the pre-loaded Technical Levels table. Only used when risk_manager_mode is set to 'smart'."
                 },
                 "smart_risk_manager_max_iterations": {
                     "type": "int", "required": False, "default": 20,
