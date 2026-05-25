@@ -21,6 +21,55 @@ from ...core.rules_export_import import RulesExportImportUI
 from ...core.rules_documentation import get_event_type_documentation, get_action_type_documentation
 from ..utils.perf_logger import PerfLogger
 
+def _render_reset_default_button(inp, default_value, meta):
+    """
+    Add a small "reset to default" icon button next to a setting input.
+    Returns the button (or None if no default is defined for this setting).
+    Must be called inside the parent layout container so the button is placed
+    in the current ui slot.
+    """
+    if default_value is None:
+        # Render an empty placeholder so 3-col grids stay aligned
+        ui.element('div')
+        return None
+
+    setting_type = meta.get("type") if isinstance(meta, dict) else None
+
+    def _do_reset():
+        try:
+            if setting_type == "bool":
+                inp.value = bool(default_value)
+            elif setting_type == "int":
+                inp.value = str(int(default_value)) if default_value not in (None, "") else "0"
+            elif setting_type == "float":
+                inp.value = str(float(default_value)) if default_value not in (None, "") else "0.0"
+            elif setting_type == "list":
+                if isinstance(default_value, list):
+                    inp.value = default_value
+                else:
+                    import json as _json
+                    inp.value = _json.dumps(default_value) if default_value else "[]"
+            else:
+                # str / select / ModelSelectorInput / fallback
+                inp.value = default_value
+            ui.notify('Reset to default', type='positive', timeout=1500)
+        except Exception as e:
+            ui.notify(f'Could not reset: {e}', type='negative')
+
+    btn = ui.button(icon='restart_alt', on_click=_do_reset).props(
+        'flat dense round size=xs color=grey-7'
+    )
+    # Tooltip showing the default value (truncated for long text)
+    default_preview = str(default_value)
+    if len(default_preview) > 200:
+        default_preview = default_preview[:200] + '...'
+    with btn:
+        ui.tooltip(f'Reset to default: {default_preview}').style(
+            'font-size: 12px; max-width: 360px; white-space: pre-wrap'
+        )
+    return btn
+
+
 # --- InstrumentSettingsTab ---
 class InstrumentSettingsTab:
     """
@@ -2796,9 +2845,9 @@ class ExpertSettingsTab:
                     valid_values = meta.get("valid_values")
                     tooltip_text = meta.get("tooltip")
 
-                    # 2-column grid (same style as expert settings)
+                    # 3-column grid: label / input / reset-default button
                     setting_container = ui.element('div').classes('w-full mb-2').style(
-                        'display: grid; grid-template-columns: 60% 40%; align-items: center; gap: 8px'
+                        'display: grid; grid-template-columns: 55% 38% 7%; align-items: center; gap: 8px'
                     )
                     with setting_container:
                         # Label with tooltip
@@ -2833,6 +2882,8 @@ class ExpertSettingsTab:
                         else:
                             value = current_value if current_value is not None else default_value or ""
                             inp = ui.input(label='', value=str(value)).classes('w-full').props('dense')
+
+                        _render_reset_default_button(inp, default_value, meta)
 
                     self.screener_settings_inputs[key] = inp
 
@@ -3110,9 +3161,9 @@ class ExpertSettingsTab:
                     tooltip_text = meta.get("tooltip")
                     ui_editor_type = meta.get("ui_editor_type")  # Custom UI editor type
                     
-                    # Create a 2-column grid container (60% label / 40% input)
+                    # 3-column grid: 55% label / 38% input / 7% reset-default button
                     setting_container = ui.element('div').classes('w-full mb-2').style(
-                        'display: grid; grid-template-columns: 60% 40%; align-items: center; gap: 8px'
+                        'display: grid; grid-template-columns: 55% 38% 7%; align-items: center; gap: 8px'
                     )
                     with setting_container:
                         # Left column: label with optional tooltip
@@ -3240,7 +3291,10 @@ class ExpertSettingsTab:
                                 inp.props('dense')
                             except Exception:
                                 pass
-                    
+
+                        # 3rd column: reset-to-default button (or placeholder)
+                        _render_reset_default_button(inp, default_value, meta)
+
                     setting_container.move(self.expert_settings_container)
                     
                     self.expert_settings_inputs[key] = inp
