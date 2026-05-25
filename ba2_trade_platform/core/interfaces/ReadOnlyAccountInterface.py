@@ -281,10 +281,7 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
 
                     # If cache is still valid, return immediately
                     if time_diff < config.PRICE_CACHE_TIME:
-                        logger.debug(f"[Account {self.id}] Returning cached {price_type} price for {symbol}: ${cached_data['price']} (age: {time_diff:.1f}s)")
                         return cached_data['price']
-                    else:
-                        logger.debug(f"[Account {self.id}] Cache expired for {cache_key} (age: {time_diff:.1f}s > {config.PRICE_CACHE_TIME}s)")
 
             # Cache miss or expired - need to fetch
             # Use per-symbol lock to prevent duplicate API calls (lock on cache_key to include price_type)
@@ -345,11 +342,9 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                         if time_diff < config.PRICE_CACHE_TIME:
                             # Use cached price
                             result[symbol] = cached_data['price']
-                            logger.debug(f"[Account {self.id}] Returning cached {price_type} price for {symbol}: ${cached_data['price']} (age: {time_diff:.1f}s)")
                         else:
                             # Cache expired
                             symbols_to_fetch.append(symbol)
-                            logger.debug(f"[Account {self.id}] Cache expired for {cache_key} (age: {time_diff:.1f}s > {config.PRICE_CACHE_TIME}s)")
                     else:
                         # Not in cache
                         symbols_to_fetch.append(symbol)

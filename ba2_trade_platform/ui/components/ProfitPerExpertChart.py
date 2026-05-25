@@ -83,8 +83,6 @@ class ProfitPerExpertChart:
                         profits[expert_name] = 0.0
                     profits[expert_name] += profit
                     
-                    logger.debug(f"Transaction {transaction.id}: Expert {expert_name}, Profit: ${profit:.2f}")
-                    
                 except Exception as e:
                     logger.error(f"Error calculating profit for transaction {transaction.id}: {e}", exc_info=True)
                     continue

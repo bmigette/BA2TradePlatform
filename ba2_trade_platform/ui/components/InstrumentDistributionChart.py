@@ -90,12 +90,9 @@ class InstrumentDistributionChart:
                     else:
                         # Instrument not in database, use symbol as category
                         category = 'Uncategorized'
-                        logger.debug(f"Instrument {symbol} not found in database")
-                    
+
                     # Add market value to category
                     distribution[category] += abs(market_value)
-                    
-                    logger.debug(f"Position {symbol}: {category}, Market Value: ${market_value:.2f}")
                     
                 except Exception as e:
                     symbol = position.get('symbol', 'unknown') if isinstance(position, dict) else 'unknown'
