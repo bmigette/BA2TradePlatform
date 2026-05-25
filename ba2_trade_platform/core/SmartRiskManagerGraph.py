@@ -736,47 +736,30 @@ Research market analyses and recommend specific trading actions. You have FULL A
 - Include `tp_price`/`sl_price` in `recommend_open_*_position()` - they're set automatically
 - Do NOT call separate `recommend_update_tp/sl()` after - creates duplicates!
 
-**SL/TP SIZING RULES (MANDATORY for every new position):**
-Before calling `recommend_open_*_position()` you MUST anchor SL and TP on real volatility and
-structural levels, NOT on round numbers or a fixed % off entry. Tight stops on volatile names
-have caused ~80% same-day stop-outs in historical runs — this is the single biggest leak.
+**SL/TP Sizing Guidance (advisory — apply judgement):**
+Tight stops on volatile names have historically caused frequent same-day stop-outs.
+The data below is provided to help you anchor SL/TP on real volatility and structure
+rather than round numbers — treat it as guidance, not a rigid rule set. You retain
+final discretion when the analysis context suggests a different setup.
 
-1. **Use the "Technical Levels per Symbol" table already in your scratchpad** (pre-loaded from
-   the latest analysis). It contains, per candidate symbol:
-   - `ATR` and `ATR%` (per 1h bar) — bar-volatility
-   - `BB_Lower` / `BB_Upper` — dynamic support / resistance (use BB_Lower as BUY SL anchor,
-     BB_Upper as BUY TP anchor; reverse for SELL)
-   - `10-EMA`, `50-SMA`, `200-SMA` — trend filters
-   - `Trend` — quick flags like `<10EMA <50SMA` indicating chart damage
-   - `SL_Floor%` — the **minimum SL distance** already computed for that symbol (combines
-     1.5 × daily-equiv ATR, the 5% base floor, and the 6% small-cap / high-vol bump). USE
-     THIS DIRECTLY. Do not propose tighter SL than this number.
-   - Cross-check with the "Price Movement Summary" table for recent realised drawdowns and
-     with the technical analyst section of the analysis for explicit swing-low / swing-high
-     mentions (`get_analysis_outputs_batch_tool` if needed).
-
-2. **Minimum SL distance** (hard floor — reject your own proposal if violated):
-   - `min_sl_dist_pct = max(1.5 × ATR14_pct, prior_5d_range_pct, 5.0%)`
-   - For symbols priced < $80 OR daily ATR > 3%: floor is 6%.
-   - For counter-trend / mean-reversion entries (analysis says "below 10 EMA / 50 SMA",
-     "chart still damaged", "in repair phase"): floor is 8% AND halve position size.
-   - SL must sit BEYOND the nearest swing low (BUY) / swing high (SELL), not inside it.
-   - Never place SL inside the prior day's true range.
-
-3. **TP placement:**
-   - Anchor TP on the next structural resistance (BUY) / support (SELL) from the technical
-     analysis — NOT on `expected_profit_percent` alone.
-   - Target R:R ≥ 2.0 after applying the SL floor. If R:R < 2.0 at sensible TP, SKIP the trade
-     rather than tightening the SL to make the ratio work.
-
-4. **Control risk via SIZE, not via tight SL:**
-   - If the SL floor forces a larger $-risk than your per-trade budget, reduce quantity
-     (fractional shares OK) until $-risk fits. Do NOT shrink the SL distance.
-
-5. **Document in the `reason` field** of the recommendation tool call:
-   `"SL=$X (Y% = max(1.5×ATR={a}%, 5d-range={b}%, floor)); TP=$Z anchored on
-   resistance at $W; R:R={r}"`. This is mandatory — recommendations missing this
-   reasoning will be flagged in review.
+- A "Technical Levels per Symbol" table is pre-loaded in your scratchpad with per-symbol
+  ATR / ATR%, Bollinger bands (BB_Lower / BB_Upper as dynamic S/R), VWMA, 10-EMA, 50-SMA,
+  200-SMA, RSI, MACD (with cross direction), a Trend flag, and a suggested `SL_Floor%`.
+- `SL_Floor%` is a *suggested* minimum SL distance combining 1.5 × daily-equiv ATR, a 5%
+  base, and a 6% bump for small-cap / high-vol names. Use it as a default; override
+  consciously if the analysis gives a strong reason (e.g. clearly defined nearby support).
+- Suggested anchors: BB_Lower / nearest swing low for BUY SL; BB_Upper / nearest swing
+  high for SELL SL. Mirror for TP. Cross-check with the "Price Movement Summary" and the
+  technical analyst section.
+- For counter-trend / mean-reversion entries (Trend shows `<10EMA <50SMA` or analysis
+  flags "chart damaged / in repair phase"), consider widening SL to ~8% and/or halving
+  position size — or skip the trade if R:R doesn't justify it.
+- Aim for R:R ≥ ~2.0 after sizing the SL. If you can't get there at sensible levels,
+  prefer skipping the trade or reducing size over tightening the SL.
+- Prefer controlling risk via position size (fractional shares OK) rather than by
+  shrinking the SL distance into intraday noise.
+- In the recommendation `reason` field, briefly cite the levels you used so the choice
+  can be reviewed (e.g. `SL=$X (~Y%, above SL_Floor=Z%); TP=$W at BB_Upper; R:R≈R`).
 
 **Recommendations are Queued:**
 - Actions execute AFTER research completes, not immediately
