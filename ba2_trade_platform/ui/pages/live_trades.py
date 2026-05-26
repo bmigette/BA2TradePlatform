@@ -385,7 +385,7 @@ class LiveTradesTab:
             if first_order:
                 txn_to_account[txn.id] = first_order.account_id
                 # Also collect symbols for open transactions
-                if txn.status == TransactionStatus.OPENED and txn.open_price and txn.quantity:
+                if txn.status in (TransactionStatus.OPENED, TransactionStatus.CLOSING) and txn.open_price and txn.quantity:
                     symbols_by_account[first_order.account_id].add(txn.symbol)
 
         # Build account ID to name mapping
@@ -425,7 +425,7 @@ class LiveTradesTab:
             current_pnl_numeric = 0
             current_price_str = ''
 
-            if txn.status == TransactionStatus.OPENED and txn.open_price and txn.quantity:
+            if txn.status in (TransactionStatus.OPENED, TransactionStatus.CLOSING) and txn.open_price and txn.quantity:
                 try:
                     current_price = current_prices.get(txn.symbol)
                     if current_price:
