@@ -212,16 +212,30 @@ def build_deep_triage_prompt(
 
     return f"""{_DEEP_TRIAGE_PREAMBLE}
 {market_context_block}
-Perform a deep triage analysis of {symbol} for a potential penny-stock momentum trade. Evaluate all the data below and determine whether this stock has a tradeable setup.
+Perform a deep triage analysis of {symbol} for a potential penny-stock momentum trade. Your job is to estimate the probability that this stock CONTINUES moving up over the next 1-5 sessions — not whether the setup is "safe" or "clean". Penny momentum trades are inherently risky; the only question is whether the directional edge exists.
+
+DOWNSTREAM CONTEXT (important — affects how you should score):
+Your confidence score feeds a pipeline that has SEPARATE downstream guards:
+- An entry will be REJECTED automatically if the stock has already moved more than the configured "max already moved %" threshold from prior close at the moment of entry.
+- An entry will be REJECTED if RVOL has decayed below half of its session peak by entry time.
+Therefore: DO NOT lower confidence simply because the stock is "extended" or "already gapped". Those concerns are handled later. Score the *quality of the underlying setup* (catalyst, momentum, structure), not whether you would chase it right now.
+
+CONFIDENCE CALIBRATION (use this scale — do NOT be conservative by default):
+- 85-100: Exceptional, multi-factor setup. Confirmed material catalyst, growing volume, insider buying or strong social momentum, no obvious dilution overhang. Rare.
+- 70-84: Strong setup. Identifiable real catalyst (earnings, contract, FDA, M&A, partnership, short squeeze, etc.) with confirmation from volume and/or sentiment. Some risks present but not disqualifying.
+- 55-69: Solid momentum setup with a plausible (even if imperfect) catalyst, OR strong technical/volume signal with thin news but clear retail interest. This is the typical band for "continuation plays" — extended gappers that still have follow-through potential. **A 30-100% pre-market or one-day move with real volume is NORMAL for this band, not a reason to drop below 55.**
+- 40-54: Mixed setup. Catalyst is stale, ambiguous, or weak; momentum exists but with notable risks (heavy dilution announced same day, no fresh news, sector headwinds, low float pump risk).
+- 20-39: Weak setup. No identifiable catalyst, fading volume, or negative price action.
+- 1-19: Disqualifying issues. Ticker/news mismatch, confirmed fraud/SEC action, price decline with no support, sub-penny micro-cap with no liquidity.
 
 ANALYSIS FRAMEWORK:
 - Ticker confusion check: CRITICAL — verify that the news and catalysts actually belong to THIS company ({symbol}), not a different company with a similar or identical ticker on another exchange. If the catalyst is about a different entity (e.g., crypto token, foreign company, or similarly-named stock), assign confidence <= 10 and explain the mismatch.
-- Catalyst identification: Is there a clear, actionable catalyst driving this move? Common examples include earnings beats, contract wins, product launches, short squeeze setups, M&A/strategic transactions, regulatory approvals, or partnership announcements — but this list is not exhaustive. Exercise your own judgment to identify any material catalyst.
+- Catalyst identification: Is there a clear, actionable catalyst driving this move? Common examples include earnings beats, contract wins, product launches, short squeeze setups, M&A/strategic transactions, regulatory approvals, or partnership announcements — but this list is not exhaustive. A "soft" catalyst (sympathy move, sector rotation, multi-day continuation from a prior catalyst, social momentum building) is still a catalyst — score it in the 50-65 band rather than penalizing for not being a fresh press release.
 - News quality: Is the news fresh and material, or stale/irrelevant? Pay particular attention to after-hours and pre-market releases from the prior evening, as these often drive gap-up moves that may not yet appear in standard news feeds. Translate and synthesize any non-English headlines.
 - Insider activity: Distinguish between open-market purchases (bullish signal), open-market sales (bearish signal), and scheduled stock awards/grants such as A-Award transactions (neutral — these are corporate compensation, not a directional bet).
-- Fundamental support: Does revenue/cash position support the current price, or is this purely speculative?
+- Fundamental support: Negative DCF or weak fundamentals is NORMAL for penny-momentum names and is NOT by itself a reason to lower confidence — these are momentum trades, not value bets. Only penalize if fundamentals reveal an imminent solvency issue or undisclosed dilution.
 - Social momentum: Is there growing retail interest that could drive a momentum wave?
-- Risk factors: Dilution risk, reverse split history, SEC issues, or other red flags?
+- Dilution: A same-day announced dilutive offering at a price BELOW current market is a meaningful negative (cap confidence around 45). Generic "small biotechs sometimes dilute" boilerplate is NOT a reason to lower confidence — only price-action-relevant dilution matters.
 - Strategy timing: Use the market context above to gauge whether the catalyst favors an intraday gap-and-run or a multi-day swing setup.
 
 --- NEWS ---
@@ -246,15 +260,15 @@ RESPOND with a single JSON object with exactly these keys:
 - "detailed_report": a thorough markdown-formatted report structured with these exact sections:
     ## News & Sentiment\n<most notable headlines, after-hours/pre-market items, overall sentiment tone>\n\n## Fundamentals\n<revenue, cash, burn rate, dilution history, share structure>\n\n## Technicals\n<price action, volume pattern, RVOL, float dynamics>\n\n## Conclusion\n<overall verdict, key risk/reward, recommended approach>
 
-Example response:
+Example response (typical penny-momentum continuation play — note the calibrated confidence):
 {{
-  "confidence": 72,
-  "catalyst": "Q3 earnings beat with revenue up 40% YoY, raised guidance",
+  "confidence": 62,
+  "catalyst": "Day-2 continuation of partnership announcement; sustained RVOL 6x with bullish social momentum building",
   "strategy": "swing",
-  "expected_profit_pct": 12.0,
-  "risk_assessment": "Low float could cause sharp reversal; company has history of secondary offerings",
-  "reasoning": "Strong earnings catalyst with genuine revenue growth. Social sentiment is building but not yet peaked. The low float amplifies both upside and downside risk.",
-  "detailed_report": "## News & Sentiment\\nQ3 earnings released after-hours beat EPS by $0.12. Revenue up 40% YoY. Multiple headlines on major financial sites. Social sentiment strongly positive with 85% bullish mentions.\\n\\n## Fundamentals\\nRevenue $22M, cash $8M runway ~12 months. No recent dilution. Float 4.2M shares.\\n\\n## Technicals\\nGapped up 18% pre-market on heavy volume. RVOL 8.5x. Clean breakout above prior resistance.\\n\\n## Conclusion\\nStrong multi-factor setup. Primary risk is low float volatility and potential morning sell-the-news. Target +12% within 2 days."
+  "expected_profit_pct": 15.0,
+  "risk_assessment": "Stock already up 45% from prior close so chase risk exists; biotech with prior history of secondary offerings; no fresh headline today",
+  "reasoning": "Setup is a continuation play off yesterday's confirmed catalyst, not a fresh news pop. Volume remains heavy and the technical structure has not broken — typical pattern for multi-day penny runs. Downstream extension guards will handle entry timing, so I score the underlying edge as solid (mid-60s) despite the gap.",
+  "detailed_report": "## News & Sentiment\\nNo fresh news today; prior-session partnership announcement still driving interest. StockTwits trending with 78% bullish.\\n\\n## Fundamentals\\nRevenue $14M, cash $9M, modest burn. No fresh offering filed. Float ~12M shares.\\n\\n## Technicals\\nUp 45% pre-market, RVOL 6.0x sustained from yesterday. Holding above prior-day high.\\n\\n## Conclusion\\nClassic Day-2 momentum continuation. Edge is real but timing matters — let downstream guards manage entry."
 }}
 
 Return ONLY the JSON object, no other text."""

@@ -2487,6 +2487,10 @@ class PennyMomentumTrader(LiveExpertInterface):
                                 )
 
                                 if rvol_decayed:
+                                    info["entry_skip_reason"] = (
+                                        f"RVOL decay: current={current_rvol:.1f}x < "
+                                        f"peak={peak_rvol:.1f}x × {rvol_decay_threshold:.0%}"
+                                    )
                                     self.logger.info(
                                         f"[SKIP] Entry skipped for {symbol}: RVOL decay "
                                         f"(current={current_rvol:.1f}x, peak={peak_rvol:.1f}x, "
@@ -2495,6 +2499,11 @@ class PennyMomentumTrader(LiveExpertInterface):
                                         f", strategy={info.get('strategy', '?')}"
                                     )
                                 elif already_moved:
+                                    info["entry_skip_reason"] = (
+                                        f"Already moved {already_moved_pct:.1f}% from prev close "
+                                        f"(${prev_close:.4f} → ${current_price:.4f}, "
+                                        f"threshold {max_moved_pct:.0f}%)"
+                                    )
                                     self.logger.info(
                                         f"[SKIP] Entry skipped for {symbol}: already moved "
                                         f"{already_moved_pct:.1f}% from prev close "
@@ -2504,6 +2513,7 @@ class PennyMomentumTrader(LiveExpertInterface):
                                         f", strategy={info.get('strategy', '?')}"
                                     )
                                 else:
+                                    info.pop("entry_skip_reason", None)
                                     gap_str = f", gap={already_moved_pct:+.1f}%" if already_moved_pct is not None else ""
                                     rvol_str = f", rvol={current_rvol:.1f}x" if current_rvol is not None else ""
                                     price_str = f"${current_price:.4f}" if current_price is not None else "?"

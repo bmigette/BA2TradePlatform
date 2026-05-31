@@ -1,402 +1,348 @@
-import chromadb
-from chromadb.config import Settings
-from openai import OpenAI
-import numpy as np
-from ... import logger
-import os
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+"""
+SQL-backed memory for TradingAgents.
+
+Replaces the prior ChromaDB / embedding-based FinancialSituationMemory with a
+direct lookup against BA2's MarketAnalysis / ExpertRecommendation / Transaction
+tables. The interface (class name + method signatures) is preserved so existing
+agents and the Reflector keep working without changes.
+
+Why this design (vs. embeddings):
+- Our DB already contains structured past decisions AND their realized outcomes.
+- "Same expert + same symbol, recent first" is strictly more useful to the LLM
+  than similarity-matched paragraphs from arbitrary past situations.
+- No embedding API costs, no chunking, no Chroma corruption issues, deterministic.
+
+What's stored:
+- add_situations(): persists a role-tagged reflection paragraph onto the
+  current MarketAnalysis.state under state["reflections"][<role>]. No new tables.
+- get_memories(): pulls the last N completed analyses for the same
+  expert+symbol, joins with closed Transactions to attach realized P&L, and
+  formats a prompt-friendly text block. Also appends a short cross-ticker
+  recent-outcomes section (last 30 days, same expert).
+"""
+
+from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta, timezone
+
+from ba2_trade_platform.logger import logger
 
 
 class FinancialSituationMemory:
-    def __init__(self, name, config, symbol=None, market_analysis_id=None, expert_instance_id=None):
-        # Get embedding model from config
-        # Format: "Provider/model_name" e.g., "OpenAI/text-embedding-3-small", "NagaAI/text-embedding-3-small", or "Local/all-MiniLM-L6-v2"
-        embedding_selection = config.get("embedding_model", "OpenAI/text-embedding-3-small")
-        
-        # Parse the embedding model selection to get provider and model name
-        if "/" in embedding_selection:
-            provider, model_name = embedding_selection.split("/", 1)
-            provider = provider.lower()
-        else:
-            # Assume OpenAI if no provider prefix
-            provider = "openai"
-            model_name = embedding_selection
-        
-        self.embedding = model_name
-        self.embedding_provider = provider
-        
-        # Initialize embedding client based on provider
-        if provider == "local":
-            # Use local sentence-transformers model (no API calls)
-            try:
-                from sentence_transformers import SentenceTransformer
-                import torch
+    """SQL-backed drop-in replacement for the prior ChromaDB-based memory.
 
-                # Determine device
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-
-                def load_model(force_redownload=False):
-                    """Load the embedding model, optionally forcing redownload."""
-                    cache_folder = None
-                    if force_redownload:
-                        # Clear cached model to force fresh download
-                        import shutil
-                        from huggingface_hub import snapshot_download
-                        from huggingface_hub.constants import HF_HUB_CACHE
-                        model_cache_path = os.path.join(HF_HUB_CACHE, f"models--{model_name.replace('/', '--')}")
-                        if os.path.exists(model_cache_path):
-                            logger.warning(f"Clearing corrupted model cache: {model_cache_path}")
-                            shutil.rmtree(model_cache_path, ignore_errors=True)
-
-                    return SentenceTransformer(
-                        model_name,
-                        device=device,
-                        trust_remote_code=True,
-                        cache_folder=cache_folder
-                    )
-
-                try:
-                    # First attempt: normal load
-                    self.local_embedding_model = load_model()
-                except NotImplementedError as e:
-                    # Handle meta tensor error - usually means corrupted model files
-                    if "meta tensor" in str(e):
-                        logger.warning(f"Meta tensor error (likely corrupted cache), re-downloading model: {e}")
-                        self.local_embedding_model = load_model(force_redownload=True)
-                    else:
-                        raise
-
-                self.client = None  # No OpenAI client needed
-                logger.info(f"Initialized local embedding model: {model_name} on {device}")
-            except ImportError:
-                logger.error("sentence-transformers not installed. Install with: pip install sentence-transformers")
-                raise ImportError("sentence-transformers package required for local embeddings. Install with: pip install sentence-transformers")
-        else:
-            # Use OpenAI-compatible API provider
-            self.local_embedding_model = None
-            
-            # Get provider configuration from models_registry
-            try:
-                from ba2_trade_platform.core.models_registry import PROVIDER_CONFIG
-                from ba2_trade_platform.config import get_app_setting
-                
-                provider_config = PROVIDER_CONFIG.get(provider, {})
-                embedding_backend_url = provider_config.get("base_url", "https://api.openai.com/v1")
-                api_key_setting = provider_config.get("api_key_setting", "openai_api_key")
-                
-                # Get API key from app settings
-                api_key = get_app_setting(api_key_setting)
-                if not api_key:
-                    # Fallback to openai_api_key
-                    api_key = get_app_setting("openai_api_key")
-                    
-            except ImportError:
-                # Fallback for older configurations
-                from ...dataflows.config import get_openai_api_key
-                embedding_backend_url = "https://api.openai.com/v1"
-                api_key = get_openai_api_key()
-                
-            self.client = OpenAI(base_url=embedding_backend_url, api_key=api_key)
-        
-        # Use persistent client with expert-specific subdirectory
-        from ba2_trade_platform.config import CACHE_FOLDER
-        
-        # Sanitize model name for use in filesystem path (replace / with _)
-        model_path_name = model_name.replace("/", "_").replace("\\", "_")
-        
-        if expert_instance_id:
-            # Include symbol and embedding model in path to avoid ChromaDB instance conflicts
-            # This ensures different embedding models have separate databases
-            if symbol:
-                persist_directory = os.path.join(CACHE_FOLDER, "chromadb", f"expert_{expert_instance_id}", model_path_name, symbol)
-            else:
-                persist_directory = os.path.join(CACHE_FOLDER, "chromadb", f"expert_{expert_instance_id}", model_path_name)
-        else:
-            # Fallback for backward compatibility
-            persist_directory = os.path.join(CACHE_FOLDER, "chromadb", "default", model_path_name)
-        
-        # Create directory if it doesn't exist
-        os.makedirs(persist_directory, exist_ok=True)
-        
-        # Use PersistentClient for disk storage with explicit settings to avoid tenant issues
-        # ChromaDB has a bug with tenant validation in some versions, so we use Settings to bypass it
-        chroma_settings = Settings(
-            anonymized_telemetry=False,
-            allow_reset=True,
-            is_persistent=True
-        )
-        
-        try:
-            self.chroma_client = chromadb.PersistentClient(
-                path=persist_directory,
-                settings=chroma_settings
-            )
-        except Exception as e:
-            logger.warning(f"Failed to create PersistentClient with settings: {e}, falling back to simple initialization")
-            # Fallback: try without settings
-            self.chroma_client = chromadb.PersistentClient(path=persist_directory)
-        
-        # Create collection name without analysis_id (only name and symbol)
-        if symbol:
-            collection_name = f"{name}_{symbol}"
-        else:
-            collection_name = name
-        
-        # Sanitize collection name (ChromaDB requires alphanumeric, underscore, hyphen)
-        collection_name = collection_name.replace(' ', '_').replace('.', '_')
-        
-        # Try to get existing collection or create new one
-        try:
-            self.situation_collection = self.chroma_client.get_collection(name=collection_name)
-            logger.debug(f"Retrieved existing ChromaDB collection: {collection_name}")
-        except:
-            self.situation_collection = self.chroma_client.create_collection(name=collection_name)
-            logger.debug(f"Created new ChromaDB collection: {collection_name}")
-
-    def get_embedding(self, text):
-        """Get embeddings for a text, using RecursiveCharacterTextSplitter for long texts.
-        
-        Supports both API-based (OpenAI, etc.) and local (sentence-transformers) embedding models.
-        
-        Returns:
-            list: List of embeddings (one per chunk). If text is short, returns list with single embedding.
-        """
-        if self.embedding_provider == "local":
-            # Use local sentence-transformers model
-            # Most sentence-transformer models have a max length of 256-512 tokens
-            max_chars = 1500  # ~500 tokens * 3 chars/token (conservative for local models)
-            
-            if len(text) <= max_chars:
-                # Text is short enough, get embedding directly
-                embedding = self.local_embedding_model.encode(text, convert_to_numpy=True)
-                return [embedding.tolist()]
-            
-            # Text is too long, use RecursiveCharacterTextSplitter
-            logger.info(f"Text length {len(text)} exceeds limit, splitting into chunks for local embedding")
-            
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1200,  # ~400 tokens, well under most model limits
-                chunk_overlap=200,
-                length_function=len,
-                separators=["\n\n", "\n", ". ", " ", ""]
-            )
-            
-            chunks = text_splitter.split_text(text)
-            logger.info(f"Split text into {len(chunks)} chunks for local embedding")
-            
-            # Get embeddings for all chunks
-            chunk_embeddings = []
-            for chunk in chunks:
-                try:
-                    embedding = self.local_embedding_model.encode(chunk, convert_to_numpy=True)
-                    chunk_embeddings.append(embedding.tolist())
-                except Exception as e:
-                    logger.error(f"Failed to get local embedding for chunk: {e}", exc_info=True)
-                    continue
-            
-            return chunk_embeddings
-        
-        else:
-            # Use API-based embeddings (OpenAI, NagaAI, etc.)
-            # text-embedding-3-small has a max context length of 8192 tokens
-            # Conservative estimate: ~2 characters per token (safe for JSON, code, special chars)
-            max_chars = 16000  # ~8000 tokens * 2 chars/token (conservative)
-            
-            if len(text) <= max_chars:
-                # Text is short enough, get embedding directly
-                response = self.client.embeddings.create(
-                    model=self.embedding, input=text
-                )
-                return [response.data[0].embedding]
-            
-            # Text is too long, use RecursiveCharacterTextSplitter
-            logger.info(f"Text length {len(text)} exceeds limit, splitting into chunks for embedding")
-            
-            # Use RecursiveCharacterTextSplitter for intelligent chunking
-            # chunk_size of 14000 chars ≈ 7000 tokens, leaving buffer for 8192 limit
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=14000,  # Conservative: ~7000 tokens, well under 8192 limit
-                chunk_overlap=500,  # Overlap to preserve context
-                length_function=len,
-                separators=["\n\n", "\n", ". ", " ", ""]  # Try to split at natural boundaries
-            )
-            
-            chunks = text_splitter.split_text(text)
-            logger.info(f"Split text into {len(chunks)} chunks for embedding")
-            
-            # Get embeddings for all chunks
-            chunk_embeddings = []
-            for i, chunk in enumerate(chunks):
-                try:
-                    response = self.client.embeddings.create(
-                        model=self.embedding, input=chunk
-                    )
-                    chunk_embeddings.append(response.data[0].embedding)
-                except Exception as e:
-                    logger.error(f"Failed to get embedding for chunk {i}: {e}", exc_info=True)
-                    continue
-        
-        if not chunk_embeddings:
-            raise ValueError("Failed to get embeddings for any chunks")
-        
-        return chunk_embeddings
-    
-    def add_situations(self, situations_and_advice):
-        """Add financial situations and their corresponding advice. Parameter is a list of tuples (situation, rec)"""
-
-        situations = []
-        advice = []
-        ids = []
-        embeddings = []
-
-        offset = self.situation_collection.count()
-        current_id = offset
-
-        for situation, recommendation in situations_and_advice:
-            # Get embeddings (returns list of embeddings for chunks)
-            situation_embeddings = self.get_embedding(situation)
-            
-            # Add each chunk as a separate document
-            for chunk_idx, embedding in enumerate(situation_embeddings):
-                situations.append(situation)  # Store full situation for each chunk
-                advice.append(recommendation)
-                ids.append(str(current_id))
-                embeddings.append(embedding)
-                current_id += 1
-
-        self.situation_collection.add(
-            documents=situations,
-            metadatas=[{"recommendation": rec} for rec in advice],
-            embeddings=embeddings,
-            ids=ids,
-        )
-
-    def get_memories(self, current_situation, n_matches=1, aggregate_chunks=False):
-        """Find matching recommendations using OpenAI embeddings
-        
-        Args:
-            current_situation (str): The current financial situation to match
-            n_matches (int): Number of matches to return per chunk (default: 1)
-            aggregate_chunks (bool): If True, averages chunk embeddings before querying (faster but less accurate).
-                                    If False, queries with each chunk separately and merges results (default, more accurate).
-        
-        Returns:
-            list: List of matched results with similarity scores
-        """
-        # Get embeddings (returns list)
-        query_embeddings = self.get_embedding(current_situation)
-        
-        if len(query_embeddings) > 1 and not aggregate_chunks:
-            # Query with each chunk separately and merge results
-            logger.debug(f"Querying with {len(query_embeddings)} chunks separately")
-            all_matches = {}  # Use dict to deduplicate by ID
-            
-            for chunk_idx, query_embedding in enumerate(query_embeddings):
-                results = self.situation_collection.query(
-                    query_embeddings=[query_embedding],
-                    n_results=n_matches,
-                    include=["metadatas", "documents", "distances"],
-                )
-                
-                # Collect matches from this chunk
-                for i in range(len(results["documents"][0])):
-                    doc_id = results["ids"][0][i] if "ids" in results else str(i)
-                    similarity = 1 - results["distances"][0][i]
-                    
-                    # Keep best similarity score if document appears in multiple chunk queries
-                    if doc_id not in all_matches or all_matches[doc_id]["similarity_score"] < similarity:
-                        all_matches[doc_id] = {
-                            "matched_situation": results["documents"][0][i],
-                            "recommendation": results["metadatas"][0][i]["recommendation"],
-                            "similarity_score": similarity,
-                            "chunk_match": chunk_idx  # Track which chunk matched
-                        }
-            
-            # Sort by similarity and return top n_matches
-            matched_results = sorted(all_matches.values(), key=lambda x: x["similarity_score"], reverse=True)[:n_matches]
-            
-        else:
-            # Average embeddings if multiple chunks (original behavior)
-            if len(query_embeddings) > 1:
-                logger.debug(f"Averaging {len(query_embeddings)} chunk embeddings")
-                query_embedding = np.mean(query_embeddings, axis=0).tolist()
-            else:
-                query_embedding = query_embeddings[0]
-
-            results = self.situation_collection.query(
-                query_embeddings=[query_embedding],
-                n_results=n_matches,
-                include=["metadatas", "documents", "distances"],
-            )
-
-            matched_results = []
-            for i in range(len(results["documents"][0])):
-                matched_results.append(
-                    {
-                        "matched_situation": results["documents"][0][i],
-                        "recommendation": results["metadatas"][0][i]["recommendation"],
-                        "similarity_score": 1 - results["distances"][0][i],
-                    }
-                )
-
-        return matched_results
-
-
-if __name__ == "__main__":
-    # Example usage
-    matcher = FinancialSituationMemory()
-
-    # Example data
-    example_data = [
-        (
-            "High inflation rate with rising interest rates and declining consumer spending",
-            "Consider defensive sectors like consumer staples and utilities. Review fixed-income portfolio duration.",
-        ),
-        (
-            "Tech sector showing high volatility with increasing institutional selling pressure",
-            "Reduce exposure to high-growth tech stocks. Look for value opportunities in established tech companies with strong cash flows.",
-        ),
-        (
-            "Strong dollar affecting emerging markets with increasing forex volatility",
-            "Hedge currency exposure in international positions. Consider reducing allocation to emerging market debt.",
-        ),
-        (
-            "Market showing signs of sector rotation with rising yields",
-            "Rebalance portfolio to maintain target allocations. Consider increasing exposure to sectors benefiting from higher rates.",
-        ),
-    ]
-
-    # Add the example situations and recommendations
-    matcher.add_situations(example_data)
-
-    # Example query
-    current_situation = """
-    Market showing increased volatility in tech sector, with institutional investors 
-    reducing positions and rising interest rates affecting growth stock valuations
+    Constructor signature is preserved for compatibility with TradingAgentsGraph.
+    Only `name`, `symbol`, `market_analysis_id`, and `expert_instance_id` are
+    actually used; `config` is accepted but ignored.
     """
 
-    try:
-        # Option 1: Average chunk embeddings (default, faster)
-        print("\n=== Option 1: Averaged Embeddings ===")
-        recommendations = matcher.get_memories(current_situation, n_matches=2, aggregate_chunks=True)
+    def __init__(
+        self,
+        name: str,
+        config: Optional[Dict[str, Any]] = None,
+        symbol: Optional[str] = None,
+        market_analysis_id: Optional[int] = None,
+        expert_instance_id: Optional[int] = None,
+    ):
+        self.name = name  # e.g. "bull_memory", "trader_memory"
+        self.symbol = symbol.upper() if symbol else None
+        self.market_analysis_id = market_analysis_id
+        self.expert_instance_id = expert_instance_id
 
-        for i, rec in enumerate(recommendations, 1):
-            print(f"\nMatch {i}:")
-            print(f"Similarity Score: {rec['similarity_score']:.2f}")
-            print(f"Matched Situation: {rec['matched_situation']}")
-            print(f"Recommendation: {rec['recommendation']}")
-        
-        # Option 2: Query with each chunk separately and merge results (more accurate for long texts)
-        print("\n\n=== Option 2: Per-Chunk Querying (merged results) ===")
-        recommendations = matcher.get_memories(current_situation, n_matches=2, aggregate_chunks=False)
+    # ------------------------------------------------------------------
+    # Reflection persistence
+    # ------------------------------------------------------------------
+    def add_situations(self, situations_and_advice):
+        """Persist reflection text onto the current MarketAnalysis state.
 
-        for i, rec in enumerate(recommendations, 1):
-            print(f"\nMatch {i}:")
-            print(f"Similarity Score: {rec['similarity_score']:.2f}")
-            print(f"Matched Situation: {rec['matched_situation']}")
-            print(f"Recommendation: {rec['recommendation']}")
-            if 'chunk_match' in rec:
-                print(f"Best Chunk Match: {rec['chunk_match']}")
+        Compatible signature: `situations_and_advice` is a list of
+        (situation, reflection_text) tuples. Only the reflection text is kept —
+        the situation itself is already implicit in the MarketAnalysis row.
+        """
+        if not situations_and_advice or self.market_analysis_id is None:
+            return
 
-    except Exception as e:
-        print(f"Error during recommendation: {str(e)}")
+        from ba2_trade_platform.core.models import MarketAnalysis
+        from ba2_trade_platform.core.db import get_instance, update_instance
+
+        try:
+            ma = get_instance(MarketAnalysis, self.market_analysis_id)
+            if ma is None:
+                logger.warning(
+                    f"FinancialSituationMemory.add_situations: "
+                    f"MarketAnalysis {self.market_analysis_id} not found"
+                )
+                return
+
+            state = dict(ma.state or {})
+            reflections = dict(state.get("reflections") or {})
+            # Concatenate all reflection texts for this role
+            texts = [text for (_situation, text) in situations_and_advice if text]
+            if not texts:
+                return
+            reflections[self.name] = "\n\n".join(texts)
+            state["reflections"] = reflections
+            ma.state = state
+            update_instance(ma)
+        except Exception as e:
+            logger.warning(
+                f"FinancialSituationMemory.add_situations failed for "
+                f"MA={self.market_analysis_id} role={self.name}: {e}"
+            )
+
+    # ------------------------------------------------------------------
+    # Memory retrieval
+    # ------------------------------------------------------------------
+    def get_memories(self, current_situation, n_matches=2, aggregate_chunks=False):
+        """Return the last N completed analyses for this expert+symbol, with
+        realized outcomes and reflection text formatted for prompt injection.
+
+        Args:
+            current_situation: Ignored (kept for signature compatibility — was
+                used by the prior embedding-based implementation).
+            n_matches: Max number of past analyses to return (per same-symbol).
+            aggregate_chunks: Ignored (compatibility).
+
+        Returns:
+            List of dicts each containing a 'recommendation' key (the
+            formatted text block the agents concatenate into their prompts).
+            Returns an empty list if no expert context is available.
+        """
+        if self.expert_instance_id is None or self.symbol is None:
+            return []
+
+        try:
+            past_blocks = self._fetch_same_symbol_blocks(n_matches)
+            cross_block = self._fetch_cross_ticker_summary()
+        except Exception as e:
+            logger.warning(
+                f"FinancialSituationMemory.get_memories failed for "
+                f"expert={self.expert_instance_id} symbol={self.symbol}: {e}",
+                exc_info=True,
+            )
+            return []
+
+        if not past_blocks and not cross_block:
+            return []
+
+        # Surface results as one entry per past same-symbol analysis, with the
+        # cross-ticker summary appended to the first entry so the LLM always
+        # sees it. Falls back to a single entry containing only the cross-ticker
+        # block when there's no same-symbol history.
+        if not past_blocks:
+            return [{"recommendation": cross_block, "matched_situation": "", "similarity_score": 1.0}]
+
+        if cross_block:
+            past_blocks[0] = past_blocks[0] + "\n\n" + cross_block
+
+        return [
+            {"recommendation": block, "matched_situation": "", "similarity_score": 1.0}
+            for block in past_blocks
+        ]
+
+    # ------------------------------------------------------------------
+    # Internal queries
+    # ------------------------------------------------------------------
+    def _fetch_same_symbol_blocks(self, n_matches: int) -> List[str]:
+        """Format the most recent N completed analyses for this expert+symbol."""
+        from sqlmodel import select, Session
+        from ba2_trade_platform.core.db import get_db
+        from ba2_trade_platform.core.models import (
+            MarketAnalysis,
+            ExpertRecommendation,
+            Transaction,
+        )
+        from ba2_trade_platform.core.types import MarketAnalysisStatus
+
+        blocks: List[str] = []
+        with Session(get_db().bind) as session:
+            # Pull recent completed analyses (excluding the current one)
+            stmt = (
+                select(MarketAnalysis)
+                .where(MarketAnalysis.expert_instance_id == self.expert_instance_id)
+                .where(MarketAnalysis.symbol == self.symbol)
+                .where(MarketAnalysis.status == MarketAnalysisStatus.COMPLETED)
+            )
+            if self.market_analysis_id is not None:
+                stmt = stmt.where(MarketAnalysis.id != self.market_analysis_id)
+            stmt = stmt.order_by(MarketAnalysis.created_at.desc()).limit(n_matches)
+
+            past_mas = list(session.exec(stmt).all())
+
+            for ma in past_mas:
+                # Recommendation associated with this analysis (one expected)
+                rec = session.exec(
+                    select(ExpertRecommendation)
+                    .where(ExpertRecommendation.market_analysis_id == ma.id)
+                    .order_by(ExpertRecommendation.created_at.desc())
+                    .limit(1)
+                ).first()
+
+                # Realized outcome from any closed Transaction tied to this rec
+                outcome = None
+                if rec is not None:
+                    outcome = self._lookup_realized_outcome(session, rec.id)
+
+                blocks.append(self._format_past_analysis(ma, rec, outcome))
+
+        return blocks
+
+    def _fetch_cross_ticker_summary(self) -> str:
+        """Recent closed trades from the same expert across other tickers."""
+        from sqlmodel import select, Session
+        from ba2_trade_platform.core.db import get_db
+        from ba2_trade_platform.core.models import Transaction
+        from ba2_trade_platform.core.types import TransactionStatus, OrderDirection
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        with Session(get_db().bind) as session:
+            stmt = (
+                select(Transaction)
+                .where(Transaction.expert_id == self.expert_instance_id)
+                .where(Transaction.symbol != self.symbol)
+                .where(Transaction.status == TransactionStatus.CLOSED)
+                .where(Transaction.close_date >= cutoff)
+                .where(Transaction.open_price.is_not(None))
+                .where(Transaction.close_price.is_not(None))
+                .where(Transaction.quantity > 0)
+                .order_by(Transaction.close_date.desc())
+                .limit(20)
+            )
+            txns = list(session.exec(stmt).all())
+
+        if not txns:
+            return ""
+
+        wins: List[str] = []
+        losses: List[str] = []
+        for t in txns:
+            try:
+                if t.side == OrderDirection.BUY:
+                    pnl_pct = (t.close_price - t.open_price) / t.open_price * 100
+                else:
+                    pnl_pct = (t.open_price - t.close_price) / t.open_price * 100
+            except (TypeError, ZeroDivisionError):
+                continue
+            entry = f"{t.symbol} {pnl_pct:+.1f}% ({t.side.value if hasattr(t.side, 'value') else t.side})"
+            (wins if pnl_pct >= 0 else losses).append(entry)
+
+        wins_sorted = sorted(wins, key=lambda s: -float(s.split()[1].rstrip('%')))[:5]
+        losses_sorted = sorted(losses, key=lambda s: float(s.split()[1].rstrip('%')))[:5]
+
+        lines = ["=== Recent cross-ticker outcomes (this expert, last 30 days) ==="]
+        if wins_sorted:
+            lines.append("Wins:   " + ", ".join(wins_sorted))
+        if losses_sorted:
+            lines.append("Losses: " + ", ".join(losses_sorted))
+        return "\n".join(lines) if (wins_sorted or losses_sorted) else ""
+
+    @staticmethod
+    def _lookup_realized_outcome(session, recommendation_id: int):
+        """Find a closed Transaction tied (via TradingOrder) to this rec."""
+        from sqlmodel import select
+        from ba2_trade_platform.core.models import Transaction, TradingOrder
+        from ba2_trade_platform.core.types import TransactionStatus, OrderDirection
+
+        order = session.exec(
+            select(TradingOrder)
+            .where(TradingOrder.expert_recommendation_id == recommendation_id)
+            .order_by(TradingOrder.id)
+            .limit(1)
+        ).first()
+        if order is None or order.transaction_id is None:
+            return None
+
+        txn = session.get(Transaction, order.transaction_id)
+        if txn is None or txn.status != TransactionStatus.CLOSED:
+            return None
+        if not (txn.open_price and txn.close_price and txn.quantity):
+            return None
+
+        try:
+            if txn.side == OrderDirection.BUY:
+                pnl_pct = (txn.close_price - txn.open_price) / txn.open_price * 100
+            else:
+                pnl_pct = (txn.open_price - txn.close_price) / txn.open_price * 100
+        except (TypeError, ZeroDivisionError):
+            return None
+
+        days_held = None
+        if txn.open_date and txn.close_date:
+            days_held = (txn.close_date - txn.open_date).days
+
+        return {
+            "pnl_pct": pnl_pct,
+            "days_held": days_held,
+            "close_reason": txn.close_reason,
+        }
+
+    def _format_past_analysis(self, ma, rec, outcome) -> str:
+        """Render one past analysis into a prompt-friendly text block."""
+        date_str = ma.created_at.strftime("%Y-%m-%d") if ma.created_at else "?"
+
+        # Header line with action + confidence
+        if rec is not None:
+            action = rec.recommended_action.value if hasattr(rec.recommended_action, "value") else str(rec.recommended_action)
+            conf = f"{rec.confidence:.0f}" if rec.confidence is not None else "?"
+            expected = (
+                f"{rec.expected_profit_percent:+.1f}%"
+                if rec.expected_profit_percent is not None
+                else "?"
+            )
+            header = f"[{date_str}] {action} (confidence {conf}, expected {expected})"
+        else:
+            header = f"[{date_str}] (no recommendation recorded)"
+
+        lines = [header]
+
+        # Compact summary from the trading_agent_graph state
+        summary = self._extract_summary(ma)
+        if summary:
+            lines.append(f"Summary: {summary}")
+
+        # Realized outcome
+        if outcome is not None:
+            outcome_marker = "✓" if outcome["pnl_pct"] >= 0 else "✗"
+            held = (
+                f" over {outcome['days_held']}d"
+                if outcome["days_held"] is not None
+                else ""
+            )
+            reason = f", closed via {outcome['close_reason']}" if outcome.get("close_reason") else ""
+            lines.append(
+                f"Result: {outcome['pnl_pct']:+.1f}%{held}{reason} {outcome_marker}"
+            )
+        elif rec is not None:
+            lines.append("Result: no position opened or still open.")
+
+        # Past reflection for this role (if previously saved by add_situations)
+        reflection = self._extract_reflection(ma)
+        if reflection:
+            lines.append(f"Reflection ({self.name}): {reflection}")
+
+        # Rec details if no realized outcome (gives the LLM the reasoning to learn from)
+        if outcome is None and rec is not None and rec.details:
+            details = rec.details.strip().replace("\n", " ")
+            if len(details) > 400:
+                details = details[:400] + "…"
+            lines.append(f"Rationale: {details}")
+
+        return "\n".join(lines)
+
+    def _extract_summary(self, ma) -> str:
+        """Extract the compact summary dict from MarketAnalysis state."""
+        state = ma.state or {}
+        tag = state.get("trading_agent_graph") or {}
+        summary = tag.get("final_analysis_summary")
+        if isinstance(summary, dict) and summary:
+            return ", ".join(f"{k}={v}" for k, v in summary.items())
+        return ""
+
+    def _extract_reflection(self, ma) -> str:
+        """Pull the stored reflection paragraph for THIS role from past MA state."""
+        state = ma.state or {}
+        reflections = state.get("reflections") or {}
+        text = reflections.get(self.name)
+        if not text:
+            return ""
+        # Single-line for the prompt
+        return text.strip().replace("\n", " ")

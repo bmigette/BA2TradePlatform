@@ -535,6 +535,16 @@ class PennyMomentumTraderUI:
                 ui.label(
                     f'Last eval: {met_count}/{total_count} conditions met'
                 ).classes(f'text-sm font-bold mt-2 {color}')
+
+                # Entry blocked by post-evaluation guard (RVOL decay / already-moved)?
+                skip_reason = info.get('entry_skip_reason')
+                if skip_reason and met_count == total_count and status == 'watching':
+                    with ui.row().classes('items-center gap-1 mt-1'):
+                        ui.icon('block', color='orange', size='sm')
+                        ui.label(f'Entry blocked: {skip_reason}').classes(
+                            'text-sm font-medium text-orange-700'
+                        )
+
                 self._render_condition_checklist('Evaluated Conditions', conditions_last_eval)
             elif entry_conditions:
                 self._render_condition_checklist('Entry Conditions', entry_conditions)

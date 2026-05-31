@@ -1,10 +1,7 @@
-from langchain_core.messages import AIMessage
-import time
-import json
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-import time
-import json
 from ...prompts import format_bull_researcher_prompt
+from ba2_trade_platform.core.text_utils import extract_text_from_llm_response
+from ba2_trade_platform.logger import logger
+from ..utils.structured_outputs import ResearcherArgument, render_researcher_argument
 
 
 def create_bull_researcher(llm, memory):
@@ -25,7 +22,7 @@ def create_bull_researcher(llm, memory):
         past_memory_str = ""
         if memory is not None:
             past_memories = memory.get_memories(curr_situation, n_matches=2, aggregate_chunks=False)
-            for i, rec in enumerate(past_memories, 1):
+            for rec in past_memories:
                 past_memory_str += rec["recommendation"] + "\n\n"
 
         prompt = format_bull_researcher_prompt(
@@ -36,16 +33,25 @@ def create_bull_researcher(llm, memory):
             macro_report=macro_report,
             history=history,
             current_response=current_response,
-            past_memory_str=past_memory_str
+            past_memory_str=past_memory_str,
         )
 
-        response = llm.invoke(prompt)
-        
-        from ba2_trade_platform.core.text_utils import extract_text_from_llm_response
-        response_text = extract_text_from_llm_response(response.content)
+        structured_arg = None
+        response_text = None
+        try:
+            structured_llm = llm.with_structured_output(ResearcherArgument)
+            structured_arg = structured_llm.invoke(prompt)
+            # ResearcherArgument may come back with stance='BEAR' by accident; force the bull stance
+            if structured_arg.stance != "BULL":
+                structured_arg = structured_arg.model_copy(update={"stance": "BULL"})
+            response_text = render_researcher_argument(structured_arg)
+        except Exception as e:
+            logger.warning(f"Bull researcher structured-output failed ({type(e).__name__}: {e}); falling back to text")
+            response = llm.invoke(prompt)
+            response_text = extract_text_from_llm_response(response.content)
+
         argument = f"Bull Analyst: {response_text}"
 
-        # Store bull messages as a list for proper conversation display
         bull_messages = investment_debate_state.get("bull_messages", [])
         bull_messages.append(argument)
 
@@ -57,8 +63,10 @@ def create_bull_researcher(llm, memory):
             "bear_messages": investment_debate_state.get("bear_messages", []),
             "current_response": argument,
             "count": investment_debate_state["count"] + 1,
-            "judge_decision": investment_debate_state.get("judge_decision", "")
+            "judge_decision": investment_debate_state.get("judge_decision", ""),
         }
+        if structured_arg is not None:
+            new_investment_debate_state["bull_argument_structured"] = structured_arg.model_dump()
 
         return {"investment_debate_state": new_investment_debate_state}
 

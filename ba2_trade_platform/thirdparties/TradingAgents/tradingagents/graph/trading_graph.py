@@ -616,6 +616,36 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             ),
         }
 
+    def _build_checkpointer(self, symbol: str):
+        """Build a LangGraph checkpointer for crash-recovery if enabled.
+
+        Returns a SqliteSaver pointing at a per-ticker SQLite file under
+        CACHE_FOLDER/checkpoints/<TICKER>.db, or None when checkpointing is
+        disabled (default) or langgraph-checkpoint-sqlite is not installed.
+        """
+        if not self.config.get("use_checkpointing", False):
+            return None
+        try:
+            from langgraph.checkpoint.sqlite import SqliteSaver
+        except ImportError:
+            logger.warning(
+                "use_checkpointing=True but langgraph-checkpoint-sqlite is not installed; "
+                "running without checkpointing"
+            )
+            return None
+        try:
+            from ba2_trade_platform.config import CACHE_FOLDER
+            import sqlite3
+            ckpt_dir = os.path.join(CACHE_FOLDER, "tradingagents_checkpoints")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            safe_symbol = "".join(ch for ch in (symbol or "default") if ch.isalnum() or ch in ("-", "_")) or "default"
+            db_path = os.path.join(ckpt_dir, f"{safe_symbol}.db")
+            conn = sqlite3.connect(db_path, check_same_thread=False)
+            return SqliteSaver(conn)
+        except Exception as e:
+            logger.warning(f"Failed to build checkpointer for {symbol}: {e}; running without checkpointing")
+            return None
+
     def _initialize_memories_and_graph(self, symbol: str):
         """Initialize memory collections and create the graph with properly initialized memories.
 
@@ -666,8 +696,14 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             self.config,
         )
 
+        # Optional LangGraph checkpointer for crash recovery (per-ticker SQLite).
+        # When use_checkpointing is enabled in config, the graph saves state after
+        # each node so a crashed run can be resumed by re-invoking with the same
+        # thread_id without redoing completed analyst nodes.
+        checkpointer = self._build_checkpointer(symbol)
+
         # Now create the graph with properly initialized memories
-        self.graph = self.graph_setup.setup_graph(self.selected_analysts)
+        self.graph = self.graph_setup.setup_graph(self.selected_analysts, checkpointer=checkpointer)
 
         status = "with memory" if memory_initialized else "without memory"
         logger.debug(f"Initialized graph {status} for symbol: {symbol}, market_analysis_id: {self.market_analysis_id}")
@@ -696,6 +732,13 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             current_price=current_price
         )
         args = self.propagator.get_graph_args()
+        # When checkpointing is enabled, the checkpointer needs a thread_id so it
+        # can identify which run a resume call is referring to. Bind the thread
+        # to the current MarketAnalysis (one analysis = one resumable run).
+        if self.config.get("use_checkpointing", False) and self.market_analysis_id:
+            cfg = dict(args.get("config") or {})
+            cfg["configurable"] = {"thread_id": f"ma_{self.market_analysis_id}"}
+            args["config"] = cfg
         
         # Sync initial state to MarketAnalysis
         self._sync_state_to_market_analysis(init_agent_state, "initialization")

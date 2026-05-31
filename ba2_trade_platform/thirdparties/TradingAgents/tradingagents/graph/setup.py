@@ -44,7 +44,9 @@ class GraphSetup:
         self.config = config
 
     def setup_graph(
-        self, selected_analysts=["market", "social", "news", "fundamentals", "macro"]
+        self,
+        selected_analysts=["market", "social", "news", "fundamentals", "macro"],
+        checkpointer=None,
     ):
         """Set up and compile the agent workflow graph.
 
@@ -54,6 +56,10 @@ class GraphSetup:
                 - "social": Social media analyst
                 - "news": News analyst
                 - "fundamentals": Fundamentals analyst
+            checkpointer: Optional LangGraph checkpointer for per-node state
+                persistence. When provided, the graph can be resumed from the
+                last successful node after a crash by re-invoking with the same
+                thread_id config.
         """
         if len(selected_analysts) == 0:
             raise ValueError("Trading Agents Graph Setup Error: no analysts selected!")
@@ -237,5 +243,7 @@ class GraphSetup:
         workflow.add_edge("Risk Judge", "Final Summarization")
         workflow.add_edge("Final Summarization", END)
 
-        # Compile and return
+        # Compile and return (with optional checkpointer for crash recovery)
+        if checkpointer is not None:
+            return workflow.compile(checkpointer=checkpointer)
         return workflow.compile()

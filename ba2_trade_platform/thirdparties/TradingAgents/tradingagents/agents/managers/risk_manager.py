@@ -1,13 +1,11 @@
-import time
-import json
 from ...prompts import format_risk_manager_prompt
+from ba2_trade_platform.core.text_utils import extract_text_from_llm_response
+from ba2_trade_platform.logger import logger
+from ..utils.structured_outputs import RiskJudgeVerdict, render_risk_judge_verdict
 
 
 def create_risk_manager(llm, memory):
     def risk_manager_node(state) -> dict:
-
-        company_name = state["company_of_interest"]
-
         history = state["risk_debate_state"]["history"]
         risk_debate_state = state["risk_debate_state"]
         market_research_report = state["market_report"]
@@ -21,19 +19,25 @@ def create_risk_manager(llm, memory):
         past_memory_str = ""
         if memory is not None:
             past_memories = memory.get_memories(curr_situation, n_matches=2, aggregate_chunks=False)
-            for i, rec in enumerate(past_memories, 1):
+            for rec in past_memories:
                 past_memory_str += rec["recommendation"] + "\n\n"
 
         prompt = format_risk_manager_prompt(
             trader_plan=trader_plan,
             past_memory_str=past_memory_str,
-            history=history
+            history=history,
         )
 
-        response = llm.invoke(prompt)
-        
-        from ba2_trade_platform.core.text_utils import extract_text_from_llm_response
-        response_text = extract_text_from_llm_response(response.content)
+        structured_verdict = None
+        response_text = None
+        try:
+            structured_llm = llm.with_structured_output(RiskJudgeVerdict)
+            structured_verdict = structured_llm.invoke(prompt)
+            response_text = render_risk_judge_verdict(structured_verdict)
+        except Exception as e:
+            logger.warning(f"Risk manager structured-output failed ({type(e).__name__}: {e}); falling back to text")
+            response = llm.invoke(prompt)
+            response_text = extract_text_from_llm_response(response.content)
 
         new_risk_debate_state = {
             "judge_decision": response_text,
@@ -47,10 +51,13 @@ def create_risk_manager(llm, memory):
             "current_neutral_response": risk_debate_state["current_neutral_response"],
             "count": risk_debate_state["count"],
         }
+        if structured_verdict is not None:
+            new_risk_debate_state["risk_verdict_structured"] = structured_verdict.model_dump()
 
         return {
             "risk_debate_state": new_risk_debate_state,
             "final_trade_decision": response_text,
+            "risk_judge_verdict": structured_verdict.model_dump() if structured_verdict else {},
         }
 
     return risk_manager_node

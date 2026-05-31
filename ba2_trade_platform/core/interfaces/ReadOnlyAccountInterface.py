@@ -515,6 +515,54 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                         has_changes = True
                         logger.debug(f"Transaction {transaction.id} quantity updated to {calculated_quantity}")
 
+                    # NEVER-OPENED CLEANUP: If all orders are terminal AND nothing ever
+                    # filled (no entry executed, no quantity, no open_date), the transaction
+                    # is a stub from a rejected/canceled order chain. Delete it (cascading
+                    # to its orders) instead of leaving a zero-qty CLOSED row that clutters
+                    # the Live Trades view. Example causes: "asset not found" at broker,
+                    # hedging block on conflicting side, insufficient buying power.
+                    never_opened = (
+                        all_orders_terminal
+                        and not has_filled_entry_order
+                        and transaction.open_date is None
+                        and total_filled_buy == 0
+                        and total_filled_sell == 0
+                        and transaction.status != TransactionStatus.CLOSED
+                    )
+                    if never_opened:
+                        from ..db import log_activity
+                        from ..types import ActivityLogSeverity, ActivityLogType
+                        order_errors = [
+                            (o.id, o.symbol, o.side.value if o.side else None,
+                             o.status.value if o.status else None, o.comment)
+                            for o in orders
+                        ]
+                        log_activity(
+                            severity=ActivityLogSeverity.INFO,
+                            activity_type=ActivityLogType.TRANSACTION_CLOSED,
+                            description=(
+                                f"Deleted never-opened transaction {transaction.id} "
+                                f"({transaction.symbol} {transaction.side.value if transaction.side else '?'}) "
+                                f"- all orders terminal without execution"
+                            ),
+                            data={
+                                "transaction_id": transaction.id,
+                                "symbol": transaction.symbol,
+                                "side": transaction.side.value if transaction.side else None,
+                                "expert_id": transaction.expert_id,
+                                "orders": order_errors,
+                                "reason": "never_opened_cleanup",
+                            },
+                            source_account_id=self.id,
+                        )
+                        logger.info(
+                            f"Deleting never-opened transaction {transaction.id} "
+                            f"({transaction.symbol}): {len(orders)} terminal order(s), no fills"
+                        )
+                        session.delete(transaction)
+                        updated_count += 1
+                        continue
+
                     # Update transaction status based on order states
                     new_status = None
 

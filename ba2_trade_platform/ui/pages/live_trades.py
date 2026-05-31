@@ -611,7 +611,8 @@ class LiveTradesTab:
                 table_name="LiveTradesTable",
                 show_global_filter=True,
                 show_selection=True,
-                dense=True
+                dense=True,
+                auto_refresh_interval=30,
             ),
             on_edit=self._handle_edit_transaction,
             on_close=self._handle_close_transaction,
