@@ -346,6 +346,34 @@ class FMPRating(MarketExpertInterface):
         # Step 5: Clamp final confidence to 0-100%
         confidence = max(0.0, min(100.0, confidence))
         
+        # Conservative-target guards: if a one-sided target (low/high) is already
+        # behind the current price relative to the trade direction, the trade has
+        # no remaining edge from that target alone. Demote to HOLD with a low
+        # confidence floor so the entry ruleset rejects it cleanly.
+        # Applies when target_price_type explicitly picked one tail ('low' or
+        # 'high'), not for averaged/consensus targets.
+        if target_price and current_price:
+            if (signal == OrderRecommendation.BUY
+                    and target_price_type == 'low'
+                    and target_price <= current_price):
+                signal = OrderRecommendation.HOLD
+                confidence = min(confidence, 10.0)
+                self.logger.info(
+                    f"FMPRating: demoting BUY -> HOLD with "
+                    f"target_low=${target_price:.2f} <= current=${current_price:.2f} "
+                    f"(target_price_type='low'); no upside vs. the bear target"
+                )
+            elif (signal == OrderRecommendation.SELL
+                    and target_price_type == 'high'
+                    and target_price >= current_price):
+                signal = OrderRecommendation.HOLD
+                confidence = min(confidence, 10.0)
+                self.logger.info(
+                    f"FMPRating: demoting SELL -> HOLD with "
+                    f"target_high=${target_price:.2f} >= current=${current_price:.2f} "
+                    f"(target_price_type='high'); no downside vs. the bull target"
+                )
+
         # Calculate expected profit
         if signal == OrderRecommendation.BUY and target_price and current_price:
             # Profit potential: (target - current) * confidence * profit_ratio
