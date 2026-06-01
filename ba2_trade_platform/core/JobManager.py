@@ -52,26 +52,22 @@ class JobManager:
     def __init__(self):
         """Initialize the JobManager.
 
-        We configure APScheduler with sane defaults for our workload:
-        - misfire_grace_time=600 (10 min): one cron tick triggers hundreds of
-          (expert, symbol) jobs simultaneously. Default 1s causes the long
-          tail to be silently dropped as "misfired" once the executor pool
-          can't accept them fast enough.
-        - executors: bump pool size to 30 so we can drain a 200+ job tick
-          quickly. Each job is a non-blocking enqueue into the WorkerQueue,
-          so a wider pool just means less queue back-pressure.
+        One cron tick triggers hundreds of (expert, symbol) jobs at once.
+        With APScheduler's default misfire_grace_time of 1 second, jobs that
+        don't run within 1s of their scheduled time are silently dropped.
+        We raise the grace window so jobs queue up and execute as the
+        executor pool drains, rather than being lost.
+
+        Executor pool size stays at the default (10) — scheduled jobs are
+        meant to queue. Each job is a fast non-blocking enqueue into the
+        WorkerQueue, which is where the real concurrency limit should live.
         """
-        from apscheduler.executors.pool import ThreadPoolExecutor
-        executors = {"default": ThreadPoolExecutor(max_workers=30)}
         job_defaults = {
             "coalesce": True,
             "max_instances": 1,
-            "misfire_grace_time": 600,
+            "misfire_grace_time": 600,  # 10 minutes
         }
-        self._scheduler = BackgroundScheduler(
-            executors=executors,
-            job_defaults=job_defaults,
-        )
+        self._scheduler = BackgroundScheduler(job_defaults=job_defaults)
         self._scheduler.start()
         self._running = False
         self._scheduled_jobs: Dict[str, Job] = {}  # Maps job_id to APScheduler Job
