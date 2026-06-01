@@ -29,17 +29,14 @@ ALIAS_TO_TEMPLATE = {
     "FMPSenateWeight":      "senate_weight",
     "TestPenny":            "penny",
     "FMP-nas30-cons-hc":    "fmp_consensus",
-    "FMP-nas30-cons-stat":  "fmp_consensus",
     "FMP-nas30-low-hc":     "fmp_consensus",
-    "FMP-nas30-low-stat":   "fmp_consensus",
+    "FMP-nas30-stat":       "fmp_consensus",
     "FMP-ark26-cons-hc":    "fmp_consensus",
-    "FMP-ark26-cons-stat":  "fmp_consensus",
     "FMP-ark26-low-hc":     "fmp_consensus",
-    "FMP-ark26-low-stat":   "fmp_consensus",
+    "FMP-ark26-stat":       "fmp_consensus",
     "FMP-scr-cons-hc":      "fmp_screener",
-    "FMP-scr-cons-stat":    "fmp_screener",
     "FMP-scr-low-hc":       "fmp_screener",
-    "FMP-scr-low-stat":     "fmp_screener",
+    "FMP-scr-stat":         "fmp_screener",
 }
 
 # Unified FMP schedules (applied to all FMP-* aliases)

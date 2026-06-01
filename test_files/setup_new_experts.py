@@ -693,20 +693,20 @@ def materialize_experts(c, templates: dict[str, list[dict]],
     def template_for(method: str) -> list[dict]:
         return templates["fmp_screener"] if method == "screener" else templates["fmp_consensus"]
 
+    # Static TP/SL variants don't need a target_price_type split: TP/SL are anchored
+    # to order_open_price (+-15%) regardless of analyst targets. Keep one static
+    # variant per entry source, using 'consensus' as the entry-filter target.
     combos = [
         # (alias_suffix, method, instruments_json, target_type, entry_rs, exit_rs)
-        ("nas30-cons-hc",    "static",   nas30_json, "consensus", rs_hc_entry_cons, rs_hc_exit),
-        ("nas30-cons-stat",  "static",   nas30_json, "consensus", rs_static_entry, rs_static_exit),
-        ("nas30-low-hc",     "static",   nas30_json, "low",       rs_hc_entry_low, rs_hc_exit),
-        ("nas30-low-stat",   "static",   nas30_json, "low",       rs_static_entry, rs_static_exit),
-        ("ark26-cons-hc",    "static",   ark26_json, "consensus", rs_hc_entry_cons, rs_hc_exit),
-        ("ark26-cons-stat",  "static",   ark26_json, "consensus", rs_static_entry, rs_static_exit),
-        ("ark26-low-hc",     "static",   ark26_json, "low",       rs_hc_entry_low, rs_hc_exit),
-        ("ark26-low-stat",   "static",   ark26_json, "low",       rs_static_entry, rs_static_exit),
-        ("scr-cons-hc",      "screener", None,       "consensus", rs_hc_entry_cons, rs_hc_exit),
-        ("scr-cons-stat",    "screener", None,       "consensus", rs_static_entry, rs_static_exit),
-        ("scr-low-hc",       "screener", None,       "low",       rs_hc_entry_low, rs_hc_exit),
-        ("scr-low-stat",     "screener", None,       "low",       rs_static_entry, rs_static_exit),
+        ("nas30-cons-hc",  "static",   nas30_json, "consensus", rs_hc_entry_cons, rs_hc_exit),
+        ("nas30-low-hc",   "static",   nas30_json, "low",       rs_hc_entry_low,  rs_hc_exit),
+        ("nas30-stat",     "static",   nas30_json, "consensus", rs_static_entry,  rs_static_exit),
+        ("ark26-cons-hc",  "static",   ark26_json, "consensus", rs_hc_entry_cons, rs_hc_exit),
+        ("ark26-low-hc",   "static",   ark26_json, "low",       rs_hc_entry_low,  rs_hc_exit),
+        ("ark26-stat",     "static",   ark26_json, "consensus", rs_static_entry,  rs_static_exit),
+        ("scr-cons-hc",    "screener", None,       "consensus", rs_hc_entry_cons, rs_hc_exit),
+        ("scr-low-hc",     "screener", None,       "low",       rs_hc_entry_low,  rs_hc_exit),
+        ("scr-stat",       "screener", None,       "consensus", rs_static_entry,  rs_static_exit),
     ]
     for suffix, method, instruments_json, target_type, entry_rs, exit_rs in combos:
         alias = f"FMP-{suffix}"
