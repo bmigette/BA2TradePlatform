@@ -50,8 +50,28 @@ class JobManager:
     """
     
     def __init__(self):
-        """Initialize the JobManager."""
-        self._scheduler = BackgroundScheduler()
+        """Initialize the JobManager.
+
+        We configure APScheduler with sane defaults for our workload:
+        - misfire_grace_time=600 (10 min): one cron tick triggers hundreds of
+          (expert, symbol) jobs simultaneously. Default 1s causes the long
+          tail to be silently dropped as "misfired" once the executor pool
+          can't accept them fast enough.
+        - executors: bump pool size to 30 so we can drain a 200+ job tick
+          quickly. Each job is a non-blocking enqueue into the WorkerQueue,
+          so a wider pool just means less queue back-pressure.
+        """
+        from apscheduler.executors.pool import ThreadPoolExecutor
+        executors = {"default": ThreadPoolExecutor(max_workers=30)}
+        job_defaults = {
+            "coalesce": True,
+            "max_instances": 1,
+            "misfire_grace_time": 600,
+        }
+        self._scheduler = BackgroundScheduler(
+            executors=executors,
+            job_defaults=job_defaults,
+        )
         self._scheduler.start()
         self._running = False
         self._scheduled_jobs: Dict[str, Job] = {}  # Maps job_id to APScheduler Job
@@ -745,8 +765,11 @@ class JobManager:
                     id=job_id,
                     name=f"Analysis: Expert {expert_instance.id}, Symbol {symbol}, Subtype {subtype}",
                     replace_existing=True,
-                    max_instances=1,  # Prevent job overlap
-                    coalesce=True     # Coalesce multiple missed executions
+                    max_instances=1,         # Prevent job overlap
+                    coalesce=True,           # Coalesce multiple missed executions
+                    misfire_grace_time=600,  # Hundreds of jobs share the same trigger time;
+                                              # default 1s drops most of them. 10-minute grace
+                                              # lets the executor work through the burst.
                 )
                 
                 # Note: No lock needed here since caller already holds the lock

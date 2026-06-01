@@ -12,8 +12,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import SQLModel metadata and configure database
 from sqlmodel import SQLModel
-from ba2_trade_platform.config import DB_FILE
+from ba2_trade_platform.config import DB_FILE as _DEFAULT_DB_FILE
 from ba2_trade_platform.core import models  # Import all models to register them with SQLModel
+
+# Allow targeting a non-default DB (e.g. prod) without editing config.py.
+# Set BA2_DB_FILE to point alembic at any sqlite file. Falls back to the
+# default config path otherwise.
+DB_FILE = os.environ.get("BA2_DB_FILE", _DEFAULT_DB_FILE)
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
