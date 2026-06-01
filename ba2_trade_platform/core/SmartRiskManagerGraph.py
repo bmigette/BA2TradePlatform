@@ -19,7 +19,19 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 from sqlmodel import select
 import json
-import langchain
+
+# Optional: the legacy `langchain` package exposes global `debug` / `verbose`
+# flags. It's not a hard dependency of this graph — `langchain-core`,
+# `langchain-openai`, and `langgraph` cover everything we use. If the package
+# isn't installed, expose a tiny shim so the four flag-toggle sites below are
+# safe no-ops instead of NameErrors.
+try:
+    import langchain  # type: ignore[import-not-found]
+except ImportError:
+    class _LangChainShim:
+        debug = False
+        verbose = False
+    langchain = _LangChainShim()  # type: ignore[assignment]
 
 from ..logger import logger
 from .. import config as config_module
