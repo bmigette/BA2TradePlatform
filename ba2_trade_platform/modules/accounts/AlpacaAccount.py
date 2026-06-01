@@ -1627,18 +1627,29 @@ class AlpacaAccount(AccountInterface):
                 if client_order_id:
                     try:
                         order_id = int(client_order_id)
-                        candidate = get_instance(TradingOrder, order_id)
-                        if candidate and candidate.account_id == self.id:
-                            db_order = candidate
-                            # Backfill broker_order_id if missing
-                            if not db_order.broker_order_id:
-                                db_order.broker_order_id = broker_order_id
-                                update_instance(db_order)
-                                mapped_count += 1
-                                logger.info(f"Mapped database order {db_order.id} to broker order {broker_order_id} via client_order_id")
                     except (ValueError, TypeError):
                         # client_order_id is not a valid int (e.g., OCO legs set by Alpaca)
-                        pass
+                        order_id = None
+                    if order_id is not None:
+                        # Use session.get (returns None on miss) instead of get_instance
+                        # (which raises). When a broker still reports a client_order_id
+                        # for a row that no longer exists locally (e.g. after a DB wipe),
+                        # we just skip and let Step 2 try to map by broker_order_id.
+                        with Session(get_db().bind) as session:
+                            candidate = session.get(TradingOrder, order_id)
+                            if candidate and candidate.account_id == self.id:
+                                db_order = candidate
+                                # Backfill broker_order_id if missing
+                                if not db_order.broker_order_id:
+                                    db_order.broker_order_id = broker_order_id
+                                    update_instance(db_order)
+                                    mapped_count += 1
+                                    logger.info(f"Mapped database order {db_order.id} to broker order {broker_order_id} via client_order_id")
+                            elif candidate is None:
+                                logger.debug(
+                                    f"Broker reports client_order_id={order_id} for broker_order_id={broker_order_id}, "
+                                    f"but local TradingOrder {order_id} no longer exists — falling back to broker_order_id match"
+                                )
 
                 # Step 2: Fallback to broker_order_id lookup
                 if not db_order:
