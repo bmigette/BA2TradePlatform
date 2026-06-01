@@ -14,6 +14,36 @@ from .types import OrderRecommendation, OrderStatus, OrderDirection, OrderOpenTy
 from .db import get_instance, get_all_instances, add_instance, update_instance
 
 
+# Serializes account refreshes across all entry points (scheduled job, immediate job,
+# manual triggers). Dependent-order submission funnels through refresh_accounts; running
+# two refreshes concurrently could submit the same dependent order twice.
+_REFRESH_LOCK = threading.Lock()
+
+
+def classify_waiting_trigger(parent_status, trigger_status):
+    """Decide what to do with a WAITING_TRIGGER dependent order given its parent's current
+    status and the configured trigger status.
+
+    Returns one of:
+        "submit" - parent reached the trigger status; submit the dependent now
+        "cancel" - parent reached a different terminal status; the dependent can't fire
+        "wait"   - keep waiting (includes the explicit PARTIALLY_FILLED no-op, H2)
+
+    The trigger match is checked first so a dependent that waits for a terminal trigger
+    (e.g. CANCELED in the cancel-replace flow) submits rather than being cancelled.
+    """
+    if trigger_status is not None and parent_status == trigger_status:
+        return "submit"
+    # H2: a partially-filled parent is still working toward FILLED — keep waiting, never
+    # cancel. (PARTIALLY_FILLED is not terminal, so this is also the implicit default;
+    # the explicit branch documents intent and is robust to status re-categorization.)
+    if parent_status == OrderStatus.PARTIALLY_FILLED:
+        return "wait"
+    if parent_status in OrderStatus.get_terminal_statuses():
+        return "cancel"
+    return "wait"
+
+
 class TradeManager:
 
     """
@@ -43,27 +73,26 @@ class TradeManager:
         
         This method iterates through all account definitions and calls their
         refresh methods to update account information, positions, and orders.
+
+        Guarded by a non-blocking reentrancy lock: if a refresh is already running
+        (e.g. the scheduled job overlapping an immediate/manual refresh), this call
+        returns immediately. This prevents concurrent dependent-order submission.
         """
+        if not _REFRESH_LOCK.acquire(blocking=False):
+            self.logger.info("Account refresh already in progress — skipping this run")
+            return
         try:
             from .models import AccountDefinition
             from ..modules.accounts import get_account_class
             from sqlmodel import select
             from .db import get_db
-            
+
             # Get all account definitions
             account_definitions = get_all_instances(AccountDefinition)
-            
+
             self.logger.info(f"Starting account refresh for {len(account_definitions)} accounts")
-            
-            # Step 1: Capture order statuses before refresh
-            pre_refresh_order_statuses = {}
-            orders = get_all_instances(TradingOrder)
-            for order in orders:
-                pre_refresh_order_statuses[order.id] = order.status
-            
-            self.logger.debug(f"Captured {len(pre_refresh_order_statuses)} order statuses before refresh")
-            
-            # Step 2: Perform account refresh
+
+            # Step 1: Perform account refresh
             for account_def in account_definitions:
                 try:
                     # Get the account class for this provider
@@ -92,201 +121,19 @@ class TradeManager:
                 except Exception as e:
                     self.logger.error(f"Error refreshing account {account_def.name} (ID: {account_def.id}): {e}", exc_info=True)
                     continue
-            
-            # Step 3: Check for order status changes and trigger dependent orders
-            self._check_order_status_changes_and_trigger_dependents(pre_refresh_order_statuses)
-            
-            # Step 4: Also check all WAITING_TRIGGER orders to ensure none are stuck
-            # This catches cases where status changes weren't detected
+
+            # Step 2: Process WAITING_TRIGGER dependent orders whose parent reached its
+            # trigger (single consolidated method; also recalculates TP/SL from fill).
+            # NOTE: the Alpaca PENDING-dependent path (cancel-replace flow) is handled
+            # separately inside each account's refresh_orders().
             self._check_all_waiting_trigger_orders()
-            
+
             self.logger.info("Account refresh completed")
-            
+
         except Exception as e:
             self.logger.error(f"Error during account refresh: {e}", exc_info=True)
-    
-    def _check_order_status_changes_and_trigger_dependents(self, pre_refresh_statuses: Dict[int, OrderStatus]):
-        """
-        Check for order status changes and trigger dependent orders that are in WAITING_TRIGGER state.
-        
-        Args:
-            pre_refresh_statuses: Dictionary mapping order IDs to their status before refresh
-        """
-        try:
-            from sqlmodel import select
-            from .db import get_db
-            from ..modules.accounts import get_account_class
-            from .models import AccountDefinition
-            
-            # PHASE 1: Collect all orders to process WHILE session is open
-            orders_to_submit = []  # List of (order_id, order_data, account_def, symbol, parent_id, trigger_status)
-            status_updates = {}  # Map of order_id -> new_status for terminal status syncs
-            
-            with get_db() as session:
-                # Get all orders that have dependencies (depends_on_order is not None)
-                statement = select(TradingOrder).where(TradingOrder.depends_on_order.isnot(None))
-                dependent_orders = session.exec(statement).all()
-                
-                self.logger.debug(f"Checking {len(dependent_orders)} orders with dependencies for triggering")
-                
-                for dependent_order in dependent_orders:
-                    if dependent_order.status != OrderStatus.WAITING_TRIGGER:
-                        continue  # Only process orders waiting for triggers
-                        
-                    parent_order_id = dependent_order.depends_on_order
-                    trigger_status = dependent_order.depends_order_status_trigger
-                    
-                    if not trigger_status:
-                        self.logger.debug(f"Skipping order {dependent_order.id} - no trigger status defined")
-                        continue  # No trigger status defined
-                        
-                    # Get current parent order status
-                    parent_order = session.get(TradingOrder, parent_order_id)
-                    if not parent_order:
-                        self.logger.warning(f"Parent order {parent_order_id} not found for dependent order {dependent_order.id}")
-                        continue
-                        
-                    current_status = parent_order.status
-                    
-                    self.logger.debug(f"Checking dependent order {dependent_order.id}: parent order {parent_order_id} status is {current_status}, trigger status is {trigger_status}")
-                    
-                    # Check if parent order has reached the trigger status (check BEFORE terminal status check)
-                    if current_status == trigger_status:
-                        self.logger.info(f"Order {parent_order_id} is in status {trigger_status}, triggering dependent order {dependent_order.id}")
-                        
-                        # Copy quantity from parent order if dependent order quantity is 0
-                        if dependent_order.quantity == 0:
-                            if parent_order.quantity > 0:
-                                self.logger.info(
-                                    f"Copying quantity {parent_order.quantity} from parent order {parent_order_id} "
-                                    f"(symbol: {parent_order.symbol}) to dependent order {dependent_order.id} (symbol: {dependent_order.symbol})"
-                                )
-                                dependent_order.quantity = parent_order.quantity
-                            else:
-                                self.logger.error(
-                                    f"Cannot submit dependent order {dependent_order.id} (symbol: {dependent_order.symbol}): "
-                                    f"quantity is 0 and parent order {parent_order_id} (symbol: {parent_order.symbol}) "
-                                    f"also has quantity 0. Setting dependent order to ERROR status."
-                                )
-                                status_updates[dependent_order.id] = OrderStatus.ERROR
-                                continue
-                        
-                        # Get the account for this dependent order
-                        account_def = session.get(AccountDefinition, dependent_order.account_id)
-                        if not account_def:
-                            self.logger.error(f"Account definition {dependent_order.account_id} not found for dependent order {dependent_order.id}")
-                            continue
-                        
-                        # Double-check quantity one more time before adding to submit list
-                        if dependent_order.quantity <= 0:
-                            self.logger.error(
-                                f"Dependent order {dependent_order.id} (symbol: {dependent_order.symbol}) "
-                                f"still has invalid quantity {dependent_order.quantity}. "
-                                f"Parent order {parent_order_id} (symbol: {parent_order.symbol}) quantity: {parent_order.quantity}. "
-                                f"Setting to ERROR status."
-                            )
-                            status_updates[dependent_order.id] = OrderStatus.ERROR
-                            continue
-                        
-                        # Add to submit list (all data needed is extracted - expunge dependent_order to reduce session load)
-                        # Store a copy of order data since we'll lose session access after closing
-                        order_copy = {
-                            'id': dependent_order.id,
-                            'side': dependent_order.side,
-                            'quantity': dependent_order.quantity,
-                            'symbol': dependent_order.symbol,
-                            'order_type': dependent_order.order_type,
-                            'account_id': dependent_order.account_id,
-                            'account_def': account_def,
-                        }
-                        orders_to_submit.append((dependent_order, parent_order_id))
-                    else:
-                        # Parent hasn't reached trigger status yet
-                        # Check if parent is in a different terminal status - if so, cancel dependent order
-                        terminal_statuses = OrderStatus.get_terminal_statuses()
-                        if current_status in terminal_statuses:
-                            self.logger.warning(
-                                f"Parent order {parent_order_id} is in terminal status {current_status} "
-                                f"(but dependent order {dependent_order.id} was waiting for {trigger_status}). "
-                                f"Syncing dependent order to CANCELED"
-                            )
-                            status_updates[dependent_order.id] = OrderStatus.CANCELED
-                
-                # PHASE 1 COMPLETE: Session is still open, now apply any status-only updates
-                for order_id, new_status in status_updates.items():
-                    order_obj = session.get(TradingOrder, order_id)
-                    if order_obj:
-                        order_obj.status = new_status
-                        session.add(order_obj)
-                
-                if status_updates:
-                    session.commit()
-                    self.logger.debug(f"Applied {len(status_updates)} status-only updates")
-                # Session will close here
-            
-            # PHASE 2: Process all order submissions OUTSIDE of session context
-            # This prevents the session from holding locks during broker API calls and writes
-            submitted_count = 0
-            for dependent_order, parent_order_id in orders_to_submit:
-                try:
-                    account_def = get_instance(AccountDefinition, dependent_order.account_id)
-                    if not account_def:
-                        self.logger.error(f"Account definition {dependent_order.account_id} not found for dependent order {dependent_order.id}")
-                        # Update status to ERROR
-                        dependent_order.status = OrderStatus.ERROR
-                        update_instance(dependent_order)
-                        continue
-                    
-                    account_class = get_account_class(account_def.provider)
-                    if not account_class:
-                        self.logger.error(f"Account provider {account_def.provider} not found for dependent order {dependent_order.id}")
-                        dependent_order.status = OrderStatus.ERROR
-                        update_instance(dependent_order)
-                        continue
-                    
-                    account = account_class(account_def.id)
-
-                    if not getattr(account, 'supports_trading', True):
-                        self.logger.error(f"Account {account_def.id} ({account_def.provider}) is read-only, cannot submit orders")
-                        dependent_order.status = OrderStatus.ERROR
-                        update_instance(dependent_order)
-                        continue
-
-                    self.logger.info(
-                        f"Submitting dependent order {dependent_order.id}: {dependent_order.side.value} "
-                        f"{dependent_order.quantity} {dependent_order.symbol} @ {dependent_order.order_type.value} "
-                        f"(triggered by parent order {parent_order_id})"
-                    )
-                    submitted_order = account.submit_order(dependent_order)
-
-                    if submitted_order:
-                        self.logger.info(f"Successfully submitted dependent order {dependent_order.id} triggered by parent order {parent_order_id}")
-                        submitted_count += 1
-                    else:
-                        self.logger.error(
-                            f"Failed to submit dependent order {dependent_order.id} (symbol: {dependent_order.symbol}) - "
-                            f"setting to ERROR status"
-                        )
-                        dependent_order.status = OrderStatus.ERROR
-                        update_instance(dependent_order)
-                        
-                except Exception as submit_error:
-                    self.logger.error(
-                        f"Exception submitting dependent order {dependent_order.id} (symbol: {dependent_order.symbol}, "
-                        f"qty: {dependent_order.quantity}): {submit_error}",
-                        exc_info=True
-                    )
-                    dependent_order.status = OrderStatus.ERROR
-                    try:
-                        update_instance(dependent_order)
-                    except Exception as update_error:
-                        self.logger.error(f"Could not update order {dependent_order.id} to ERROR status: {update_error}")
-            
-            if submitted_count > 0:
-                self.logger.info(f"Triggered {submitted_count} dependent orders")
-                
-        except Exception as e:
-            self.logger.error(f"Error checking order status changes: {e}", exc_info=True)
+        finally:
+            _REFRESH_LOCK.release()
     
     def _check_all_waiting_trigger_orders(self):
         """
@@ -335,9 +182,12 @@ class TradeManager:
                         current_status = parent_order.status
                         
                         self.logger.debug(f"Checking order {dependent_order.id}: parent {parent_order_id} status is {current_status}, trigger is {trigger_status}")
-                        
-                        # Check if parent order has reached the trigger status (check BEFORE terminal status check)
-                        if current_status == trigger_status:
+
+                        # Decide: submit (parent reached trigger), cancel (parent hit a
+                        # different terminal status), or wait (still in flight, incl. the
+                        # explicit PARTIALLY_FILLED no-op).
+                        action = classify_waiting_trigger(current_status, trigger_status)
+                        if action == "submit":
                             self.logger.info(f"Parent order {parent_order_id} is in trigger status {trigger_status}, processing dependent order {dependent_order.id}")
                             
                             # Get the account for this dependent order
@@ -513,17 +363,20 @@ class TradeManager:
                             
                             # Add to submit list
                             orders_to_submit.append((dependent_order, parent_order_id))
+                        elif action == "cancel":
+                            # Parent reached a different terminal status - dependent can't fire
+                            self.logger.warning(
+                                f"Parent order {parent_order_id} is in terminal status {current_status} "
+                                f"(but dependent order {dependent_order.id} was waiting for {trigger_status}). "
+                                f"Syncing dependent order to CANCELED"
+                            )
+                            status_updates[dependent_order.id] = OrderStatus.CANCELED
                         else:
-                            # Parent hasn't reached trigger status yet
-                            # Check if parent is in a different terminal status - if so, cancel dependent order
-                            terminal_statuses = OrderStatus.get_terminal_statuses()
-                            if current_status in terminal_statuses:
-                                self.logger.warning(
-                                    f"Parent order {parent_order_id} is in terminal status {current_status} "
-                                    f"(but dependent order {dependent_order.id} was waiting for {trigger_status}). "
-                                    f"Syncing dependent order to CANCELED"
-                                )
-                                status_updates[dependent_order.id] = OrderStatus.CANCELED
+                            # action == "wait": parent still in flight (incl. PARTIALLY_FILLED) — keep waiting
+                            self.logger.debug(
+                                f"Dependent order {dependent_order.id} waiting: parent {parent_order_id} "
+                                f"status {current_status} has not reached trigger {trigger_status}"
+                            )
                     
                     except Exception as order_error:
                         self.logger.error(f"Error processing waiting order {dependent_order.id}: {order_error}", exc_info=True)

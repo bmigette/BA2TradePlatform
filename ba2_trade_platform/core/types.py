@@ -134,8 +134,12 @@ class OrderStatus(str, Enum):
     def get_unfilled_statuses(cls):
         """
         Return a set of order statuses that indicate the order is not yet filled.
-        These are statuses where the order is still pending or waiting.
-        
+
+        Semantics: "sent to the broker, but not yet filled". This set deliberately
+        EXCLUDES the unsent WAITING_TRIGGER state (an order that exists only in our DB and
+        has not been submitted). Use get_active_statuses() when you mean "any in-flight
+        order, including not-yet-submitted triggers".
+
         Unfilled statuses include:
         - PENDING: Order is pending
         - NEW: Order is new
@@ -181,6 +185,26 @@ class OrderStatus(str, Enum):
         return {
             cls.PENDING,
             cls.WAITING_TRIGGER,
+        }
+
+    @classmethod
+    def get_active_statuses(cls):
+        """
+        Return a set of order statuses that indicate the order is still "in flight":
+        not terminal and not fully filled.
+
+        This is the union of get_unfilled_statuses() (sent-but-not-filled) plus the two
+        states that set excludes: WAITING_TRIGGER (staged, not yet submitted) and
+        PARTIALLY_FILLED (working at the broker with shares already filled). Use this when
+        the question is "is this order still active?" rather than "was it sent to the
+        broker?".
+
+        Returns:
+            set: Set of OrderStatus values representing in-flight orders
+        """
+        return cls.get_unfilled_statuses() | {
+            cls.WAITING_TRIGGER,
+            cls.PARTIALLY_FILLED,
         }
 
 

@@ -39,6 +39,24 @@ class TestOrderStatusGroups:
         executed = OrderStatus.get_executed_statuses()
         assert terminal.isdisjoint(executed)
 
+    def test_unfilled_statuses_excludes_waiting_trigger(self):
+        """Documented contract: get_unfilled_statuses() means 'sent to broker, not
+        filled' and must NOT include the unsent WAITING_TRIGGER state."""
+        assert OrderStatus.WAITING_TRIGGER not in OrderStatus.get_unfilled_statuses()
+
+    def test_active_statuses_superset_of_unfilled_plus_inflight(self):
+        active = OrderStatus.get_active_statuses()
+        # Everything unfilled is active
+        assert OrderStatus.get_unfilled_statuses().issubset(active)
+        # Plus the in-flight states excluded from unfilled
+        assert OrderStatus.WAITING_TRIGGER in active
+        assert OrderStatus.PARTIALLY_FILLED in active
+
+    def test_active_statuses_excludes_done_states(self):
+        active = OrderStatus.get_active_statuses()
+        assert OrderStatus.FILLED not in active
+        assert OrderStatus.get_terminal_statuses().isdisjoint(active)
+
 
 class TestNumericEventHelpers:
     @pytest.mark.parametrize("event_value", [

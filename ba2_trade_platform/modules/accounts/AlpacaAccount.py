@@ -796,10 +796,20 @@ class AlpacaAccount(AccountInterface):
         """
         if not self._check_authentication():
             return None
-            
+
+        # Idempotency guard: an order that already carries a broker_order_id was already
+        # sent to the broker. Never re-submit it — this protects against the race where a
+        # concurrent refresh picks the same dependent order before its status is committed.
+        if trading_order.broker_order_id:
+            logger.warning(
+                f"Order {trading_order.id} already has broker_order_id "
+                f"{trading_order.broker_order_id} — skipping re-submission"
+            )
+            return trading_order
+
         from sqlmodel import Session
         from ...core.db import add_instance
-        
+
         try:
             # Step 1: Create database record if it doesn't exist yet
             if trading_order.id is None:
@@ -1909,16 +1919,23 @@ class AlpacaAccount(AccountInterface):
     def _check_and_submit_dependent_orders(self) -> int:
         """
         Check for PENDING orders with depends_on_order and submit them if dependency is met.
-        
+
+        Division of responsibility (do not confuse the two dependent-order paths):
+        - THIS method handles **PENDING** dependents that have **no explicit**
+          depends_order_status_trigger and fire on *any terminal status* of the parent.
+          It is the live handler for the OCO cancel-replace flow, where a replacement
+          TP/SL order is created with status=PENDING + depends_on_order = the old order,
+          waiting for that old order to reach CANCELED (see _replace_broker_*_order).
+        - **WAITING_TRIGGER** dependents (the common entry-fill TP/SL case, exact-match
+          trigger) are handled by TradeManager._check_all_waiting_trigger_orders, NOT here.
+
+        Called from refresh_orders().
+
         This handles the workflow where:
         1. Order A is PENDING_CANCEL waiting for cancellation
         2. Order A transitions to CANCELED
         3. Order B (depends_on_order=A, status=PENDING) should now be submitted
-        
-        Also handles:
-        - TP/SL orders waiting for entry order to fill
-        - Any order waiting for its parent to reach a specific status
-        
+
         Returns:
             int: Number of dependent orders submitted
         """
