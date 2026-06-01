@@ -3400,9 +3400,9 @@ class AlpacaAccount(AccountInterface):
         all_orders: list
     ) -> bool:
         """Handle TP/SL adjustment when entry is filled - ALWAYS uses OCO at broker."""
-        
+
         logger.info(f"[OCO-Only] Creating broker OCO order for filled entry {entry_order.id}: TP=${effective_tp:.2f}, SL=${effective_sl:.2f}")
-        
+
         # Cancel ALL existing TP/SL/OCO orders
         orders_to_cancel = []
         if existing_tp:
@@ -3411,17 +3411,19 @@ class AlpacaAccount(AccountInterface):
             orders_to_cancel.append(existing_sl)
         if existing_oco:
             orders_to_cancel.append(existing_oco)
-        
+
         for order in all_orders:
             if order not in orders_to_cancel:
                 orders_to_cancel.append(order)
-        
+
+        broker_order_ids_to_confirm: list[str] = []
         if orders_to_cancel:
             logger.info(f"Cancelling {len(orders_to_cancel)} existing orders before creating new OCO")
             for order in orders_to_cancel:
                 if order.broker_order_id:
                     try:
                         self.cancel_order(order.id)
+                        broker_order_ids_to_confirm.append(order.broker_order_id)
                         logger.info(f"Cancelled broker order {order.id}")
                     except Exception as e:
                         logger.warning(f"Failed to cancel broker order {order.id}: {e}")
@@ -3429,9 +3431,66 @@ class AlpacaAccount(AccountInterface):
                     order.status = OrderStatus.CANCELED
                     session.add(order)
             session.commit()
-        
+
+        # CRITICAL: wait for Alpaca to actually release the held_for_orders
+        # quantity from the cancelled orders before submitting the new OCO.
+        # Otherwise Alpaca rejects the new OCO with
+        # `{"code":40310000,"message":"insufficient qty","held_for_orders":"1"}`
+        # because it considers the shares still committed to the old order.
+        if broker_order_ids_to_confirm:
+            self._wait_for_orders_terminal(broker_order_ids_to_confirm)
+
         # Create new OCO order at broker
         return self._create_broker_oco_order(session, transaction, entry_order, effective_tp, effective_sl)
+
+    def _wait_for_orders_terminal(
+        self,
+        broker_order_ids: list[str],
+        max_wait_seconds: float = 5.0,
+        poll_interval_seconds: float = 0.25,
+    ) -> bool:
+        """Poll Alpaca until the given orders all reach a terminal status, or
+        until the timeout. Used to avoid a race where we submit a replacement
+        OCO before Alpaca has released the held_for_orders quantity from a
+        just-cancelled order.
+
+        Returns True if all orders reached a terminal status within the
+        timeout, False if we timed out (we still proceed in that case — the
+        caller can decide what to do).
+        """
+        if not broker_order_ids:
+            return True
+
+        terminal_statuses = {"canceled", "cancelled", "filled", "expired", "rejected", "done_for_day", "replaced"}
+        deadline = time.time() + max_wait_seconds
+        remaining = list(broker_order_ids)
+
+        while remaining and time.time() < deadline:
+            still_pending: list[str] = []
+            for bro_id in remaining:
+                try:
+                    o = self.client.get_order_by_id(bro_id)
+                    status_str = str(getattr(o, "status", "")).lower().split(".")[-1]
+                    if status_str not in terminal_statuses:
+                        still_pending.append(bro_id)
+                except Exception as e:
+                    # If we can't fetch the order, assume it's gone (Alpaca prunes IDs
+                    # very rarely but we don't want to block forever on a 404).
+                    logger.debug(f"Could not fetch order {bro_id} during cancel-wait: {e}")
+            remaining = still_pending
+            if remaining:
+                time.sleep(poll_interval_seconds)
+
+        if remaining:
+            logger.warning(
+                f"Timed out waiting for {len(remaining)} cancelled order(s) to "
+                f"reach terminal status after {max_wait_seconds:.1f}s: {remaining}. "
+                f"Submitting replacement OCO anyway — Alpaca may reject with "
+                f"'insufficient qty / held_for_orders'."
+            )
+            return False
+        logger.debug(f"All {len(broker_order_ids)} cancelled orders confirmed terminal at broker")
+        return True
     
     # ==================== END OCO-ONLY HANDLERS ====================
     
