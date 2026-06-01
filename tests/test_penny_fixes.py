@@ -409,17 +409,17 @@ class TestTPTierTracking:
 
         assert next_tier == 0
 
-    def test_source_tracks_triggered_tiers(self):
-        """Verify Phase 5 code tracks triggered_tp_tiers in monitored info."""
+    def test_source_tracks_triggered_tier_ids(self):
+        """Verify Phase 5 code tracks fired tiers by stable id in monitored info."""
         source = _read_source("__init__.py")
-        assert 'triggered_tp_tiers' in source
-        assert 'triggered_tiers.append(tier_idx)' in source
-        assert 'info["triggered_tp_tiers"] = triggered_tiers' in source
+        assert 'triggered_tp_tier_ids' in source
+        assert 'triggered_ids.append(tp_tier.get("id"))' in source
+        assert 'info["triggered_tp_tier_ids"] = triggered_ids' in source
 
-    def test_source_skips_triggered_tiers(self):
-        """Verify Phase 5 code skips already-triggered tiers."""
+    def test_source_skips_triggered_tiers_by_id(self):
+        """Verify Phase 5 code skips already-triggered tiers by id, not index."""
         source = _read_source("__init__.py")
-        assert "if tier_idx in triggered_tiers:" in source
+        assert 'if tp_tier.get("id") in triggered_ids:' in source
 
 
 # ===========================================================================
@@ -804,7 +804,9 @@ class TestExitConditionUpdateMethod:
             method_source = source[idx:]
         assert "validate_condition_set" in method_source
 
-    def test_resets_triggered_tiers_on_tp_change(self):
+    def test_merges_tiers_without_blind_reset_on_tp_change(self):
+        """On a TP refresh the code must MERGE tiers (preserving fired ids), not
+        blindly wipe the fired set — that blind reset was the tier re-fire bug."""
         source = _read_source("__init__.py")
         idx = source.index("def _update_exit_conditions_via_llm(")
         next_def_search = source[idx + 1:]
@@ -813,8 +815,10 @@ class TestExitConditionUpdateMethod:
             method_source = source[idx:idx + 1 + next_idx]
         else:
             method_source = source[idx:]
-        assert 'triggered_tp_tiers' in method_source
-        assert "[]" in method_source  # Reset to empty list
+        assert "merge_tier_update" in method_source
+        assert "triggered_tp_tier_ids" in method_source
+        # The old blind reset must be gone.
+        assert 'info["triggered_tp_tiers"] = []' not in method_source
 
     def test_gathers_fresh_news_and_social(self):
         source = _read_source("__init__.py")

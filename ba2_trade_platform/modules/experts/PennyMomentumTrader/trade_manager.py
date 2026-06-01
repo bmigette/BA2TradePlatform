@@ -23,6 +23,25 @@ from ba2_trade_platform.core.types import (
 from ba2_trade_platform.logger import logger
 
 
+def find_open_entry_buy(session, transaction_id: int):
+    """Return the entry BUY order for a transaction that is still working at the
+    broker, or None.
+
+    A SELL submitted while an opposing BUY is open is rejected by Alpaca as a wash
+    trade. An entry buy counts as "open" when it is partially filled or in any
+    unfilled status. Dependent legs (TP/SL, i.e. ``depends_on_order`` set) are never
+    treated as the entry order.
+    """
+    open_statuses = list(OrderStatus.get_unfilled_statuses()) + [OrderStatus.PARTIALLY_FILLED]
+    return session.exec(
+        select(TradingOrder)
+        .where(TradingOrder.transaction_id == transaction_id)
+        .where(TradingOrder.side == OrderDirection.BUY)
+        .where(TradingOrder.depends_on_order.is_(None))
+        .where(TradingOrder.status.in_(open_statuses))
+    ).first()
+
+
 class PennyTradeManager:
     """Position sizing and trade execution for PennyMomentumTrader."""
 
@@ -282,6 +301,12 @@ class PennyTradeManager:
             if exit_qty <= 0:
                 exit_qty = current_qty  # At minimum close 1 share
 
+            # Detect an entry BUY still working at the broker. Submitting an opposing
+            # SELL while it is open triggers Alpaca's wash-trade rejection, so stage
+            # the exit to fire once the entry reaches FILLED.
+            with get_db() as session:
+                open_buy = find_open_entry_buy(session, trans.id)
+
             order = TradingOrder(
                 account_id=self.account_id,
                 symbol=symbol,
@@ -292,7 +317,58 @@ class PennyTradeManager:
                 status=OrderStatus.PENDING,
                 open_type=OrderOpenType.AUTOMATIC,
                 comment=f"PennyMomentum exit: {reason}",
+                # Stepped exits are deliberately sized (often a partial of the
+                # position); never let transaction qty-sync resize them.
+                data={"fixed_quantity": True},
             )
+
+            if open_buy is not None:
+                # Stage as a triggered order; TradeManager submits it once the entry
+                # buy reaches FILLED. Avoids the wash-trade rejection entirely.
+                order.status = OrderStatus.WAITING_TRIGGER
+                order.depends_on_order = open_buy.id
+                order.depends_order_status_trigger = OrderStatus.FILLED
+                try:
+                    new_id = add_instance(order)
+                    if new_id:
+                        any_success = True
+                        logger.info(
+                            f"PennyTradeManager: exit for {symbol} staged as WAITING_TRIGGER "
+                            f"(order {new_id} x{exit_qty}, depends on entry order "
+                            f"{open_buy.id} reaching FILLED) — avoids wash trade"
+                        )
+                        from ba2_trade_platform.core.db import log_activity
+                        from ba2_trade_platform.core.types import ActivityLogSeverity, ActivityLogType
+                        log_activity(
+                            severity=ActivityLogSeverity.INFO,
+                            activity_type=ActivityLogType.ORDER_SUBMITTED,
+                            description=(
+                                f"PennyMomentumTrader exit staged (waiting for entry fill): "
+                                f"SELL {symbol} x{exit_qty} ({exit_pct:.0f}%) | Reason: {reason}"
+                            ),
+                            data={
+                                "symbol": symbol,
+                                "qty": exit_qty,
+                                "exit_pct": exit_pct,
+                                "reason": reason,
+                                "order_id": new_id,
+                                "transaction_id": trans.id,
+                                "depends_on_order": open_buy.id,
+                            },
+                            source_expert_id=self.expert_instance_id,
+                            source_account_id=self.account_id,
+                        )
+                    else:
+                        logger.error(
+                            f"PennyTradeManager: failed to stage WAITING_TRIGGER exit "
+                            f"for {symbol} — add_instance returned no id"
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"PennyTradeManager: failed to stage exit for {symbol}: {e}",
+                        exc_info=True,
+                    )
+                continue
 
             try:
                 submitted = self.account.submit_order(

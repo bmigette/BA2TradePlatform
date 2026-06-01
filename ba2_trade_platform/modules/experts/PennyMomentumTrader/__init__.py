@@ -43,6 +43,7 @@ from .prompts import (
     build_quick_filter_prompt,
 )
 from .trade_manager import PennyTradeManager
+from .tier_tracking import merge_tier_update, migrate_triggered_state
 
 
 class PennyMomentumTrader(LiveExpertInterface):
@@ -2187,6 +2188,10 @@ class PennyMomentumTrader(LiveExpertInterface):
 
                         exit_conds = info.get("exit_conditions", {})
 
+                        # Ensure take-profit tiers carry stable ids and the fired set is
+                        # id-based (migrates legacy index-based triggered_tp_tiers in place).
+                        migrate_triggered_state(info)
+
                         # Hard EOD exit for intraday strategies
                         if info.get("strategy") == "intraday":
                             market_close = self._get_market_close_today()
@@ -2315,13 +2320,15 @@ class PennyMomentumTrader(LiveExpertInterface):
                                     )
                                 continue
 
-                        # Check take profit tiers (skip already-triggered tiers)
+                        # Check take profit tiers (skip already-triggered tiers).
+                        # Tiers are tracked by stable id, not index, so a tier fires
+                        # exactly once even when the LLM rewrites the tier list.
                         take_profit = exit_conds.get("take_profit", [])
-                        triggered_tiers = info.get("triggered_tp_tiers", [])
+                        triggered_ids = info.get("triggered_tp_tier_ids", [])
                         for tier_idx, tp_tier in enumerate(take_profit):
-                            if tier_idx in triggered_tiers:
-                                continue
                             if not isinstance(tp_tier, dict):
+                                continue
+                            if tp_tier.get("id") in triggered_ids:
                                 continue
                             tp_condition = tp_tier.get("condition")
                             tp_exit_pct = tp_tier.get("exit_pct", 100.0)
@@ -2340,8 +2347,8 @@ class PennyMomentumTrader(LiveExpertInterface):
                                     reason=f"take profit tier {tier_idx + 1} ({tp_exit_pct}%)",
                                 )
                                 if exit_ok:
-                                    triggered_tiers.append(tier_idx)
-                                    info["triggered_tp_tiers"] = triggered_tiers
+                                    triggered_ids.append(tp_tier.get("id"))
+                                    info["triggered_tp_tier_ids"] = triggered_ids
                                     self._record_trade(
                                         market_analysis,
                                         symbol,
@@ -2379,7 +2386,7 @@ class PennyMomentumTrader(LiveExpertInterface):
                             if not tp_condition:
                                 continue
                             tp_exit_pct = tp_tier.get("exit_pct", 100.0)
-                            already_triggered = tier_idx in triggered_tiers
+                            already_triggered = tp_tier.get("id") in triggered_ids
                             tp_details = evaluator.get_condition_details(tp_condition, symbol, entry_price)
                             tp_status = evaluator.get_condition_status(tp_condition, symbol, entry_price)
                             for k, v in tp_status.items():
@@ -2738,9 +2745,24 @@ class PennyMomentumTrader(LiveExpertInterface):
                 if "stop_loss" in updated:
                     info["exit_conditions"]["stop_loss"] = updated["stop_loss"]
                 if "take_profit" in updated:
-                    info["exit_conditions"]["take_profit"] = updated["take_profit"]
-                    # Reset triggered tiers since conditions changed
-                    info["triggered_tp_tiers"] = []
+                    # Merge the LLM's new tiers with the existing ones, preserving each
+                    # surviving tier's stable id (and thus its fired status) by position.
+                    # A tier that already fired never re-arms, even if its condition is
+                    # rewritten; genuinely new tiers can still fire.
+                    # Ensure existing tiers carry ids first (idempotent).
+                    migrate_triggered_state(info)
+                    old_tiers = info["exit_conditions"].get("take_profit", []) or []
+                    next_id = info.get("_next_tier_id", 0)
+                    merged, next_id = merge_tier_update(
+                        old_tiers, updated["take_profit"], next_id
+                    )
+                    info["exit_conditions"]["take_profit"] = merged
+                    info["_next_tier_id"] = next_id
+                    # Keep only fired ids that still correspond to a surviving tier.
+                    surviving_ids = {t["id"] for t in merged if isinstance(t, dict) and t.get("id")}
+                    info["triggered_tp_tier_ids"] = [
+                        tid for tid in info.get("triggered_tp_tier_ids", []) if tid in surviving_ids
+                    ]
 
                 self.logger.info(f"Exit conditions updated for {symbol}")
 

@@ -100,7 +100,16 @@ class TransactionHelper:
             # Update all dependent orders (TP/SL)
             for dep_order in dependent_orders:
                 old_qty = dep_order.quantity
-                
+
+                # Partial-exit orders (e.g. PennyMomentum stepped take-profit) carry a
+                # deliberate quantity smaller than the position. Never resize them.
+                if dep_order.data and dep_order.data.get("fixed_quantity"):
+                    logger.debug(
+                        f"Skipped dependent order {dep_order.id} (fixed_quantity, "
+                        f"keeping qty={dep_order.quantity})"
+                    )
+                    continue
+
                 # For WAITING_TRIGGER orders, only set qty once entry order is filled
                 if dep_order.status == OrderStatus.WAITING_TRIGGER:
                     if entry_order and entry_order.status in OrderStatus.get_executed_statuses():
