@@ -2597,7 +2597,35 @@ class AlpacaAccount(AccountInterface):
                 if not transaction_in_session:
                     logger.error(f"Transaction {transaction.id} not found in database")
                     return False
-                
+
+                # Manual-override lock enforcement: if the user has locked a side,
+                # drop any non-manual update to that side BEFORE any work happens.
+                # Manual updates always pass through and also set/keep the lock.
+                if source == "manual":
+                    if new_tp_price is not None:
+                        transaction_in_session.tp_manual_override = True
+                    if new_sl_price is not None:
+                        transaction_in_session.sl_manual_override = True
+                else:
+                    if new_tp_price is not None and transaction_in_session.tp_manual_override:
+                        logger.info(
+                            f"Transaction {transaction.id}: ignoring {source or 'auto'} TP adjustment "
+                            f"to ${new_tp_price:.2f} — TP is manually locked (current ${transaction_in_session.take_profit})"
+                        )
+                        new_tp_price = None
+                    if new_sl_price is not None and transaction_in_session.sl_manual_override:
+                        logger.info(
+                            f"Transaction {transaction.id}: ignoring {source or 'auto'} SL adjustment "
+                            f"to ${new_sl_price:.2f} — SL is manually locked (current ${transaction_in_session.stop_loss})"
+                        )
+                        new_sl_price = None
+                    if new_tp_price is None and new_sl_price is None:
+                        logger.debug(
+                            f"Transaction {transaction.id}: all sides of {source or 'auto'} TP/SL "
+                            f"adjustment are manually locked — nothing to do"
+                        )
+                        return True  # Not a failure — caller asked for changes that are blocked by policy
+
                 # 2. Early skip check: if values unchanged and valid orders exist WITH CORRECT PRICES, skip adjustment
                 tp_unchanged = (new_tp_price is None or 
                                (transaction_in_session.take_profit is not None and 

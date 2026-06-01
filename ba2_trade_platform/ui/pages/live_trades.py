@@ -821,27 +821,81 @@ class LiveTradesTab:
                     step=1
                 ).classes('w-full').props('hint="Increase or decrease position size"')
 
+                tp_label = 'Take Profit Price' + (' 🔒 (manual override)' if txn.tp_manual_override else '')
                 tp_input = ui.number(
-                    label='Take Profit Price',
+                    label=tp_label,
                     value=txn.take_profit if txn.take_profit else None,
                     format='%.2f',
                     prefix='$'
                 ).classes('w-full')
 
+                sl_label = 'Stop Loss Price' + (' 🔒 (manual override)' if txn.sl_manual_override else '')
                 sl_input = ui.number(
-                    label='Stop Loss Price',
+                    label=sl_label,
                     value=txn.stop_loss if txn.stop_loss else None,
                     format='%.2f',
                     prefix='$'
                 ).classes('w-full')
 
-                with ui.row().classes('w-full justify-end gap-2'):
-                    ui.button('Cancel', on_click=dialog.close).props('flat')
-                    ui.button('Update', on_click=lambda: self._update_position(
-                        transaction_id, qty_input.value, tp_input.value, sl_input.value, dialog
-                    )).props('color=primary')
+                if txn.tp_manual_override or txn.sl_manual_override:
+                    locked = []
+                    if txn.tp_manual_override: locked.append('TP')
+                    if txn.sl_manual_override: locked.append('SL')
+                    ui.label(
+                        f'⚠️ {" and ".join(locked)} locked — automation will not modify until reverted.'
+                    ).classes('text-xs text-orange-600')
+
+                with ui.row().classes('w-full justify-between items-center gap-2'):
+                    ui.button(
+                        'Revert (re-enable automation)',
+                        icon='restore',
+                        on_click=lambda: self._revert_tpsl_manual_override(transaction_id, dialog),
+                    ).props('flat color=warning')
+                    with ui.row().classes('gap-2'):
+                        ui.button('Cancel', on_click=dialog.close).props('flat')
+                        ui.button('Update', on_click=lambda: self._update_position(
+                            transaction_id, qty_input.value, tp_input.value, sl_input.value, dialog
+                        )).props('color=primary')
 
         dialog.open()
+
+    def _revert_tpsl_manual_override(self, transaction_id: int, dialog):
+        """Clear tp_manual_override / sl_manual_override flags so the next
+        automation cycle (ruleset / smart risk manager / expert) is free to
+        adjust TP and SL again."""
+        from ...core.models import Transaction
+        from ...core.db import update_instance
+
+        try:
+            txn = get_instance(Transaction, transaction_id)
+            if not txn:
+                ui.notify('Transaction not found', type='negative')
+                return
+            had_tp_lock = txn.tp_manual_override
+            had_sl_lock = txn.sl_manual_override
+            if not (had_tp_lock or had_sl_lock):
+                ui.notify('TP/SL are not currently manually overridden', type='info')
+                return
+            txn.tp_manual_override = False
+            txn.sl_manual_override = False
+            update_instance(txn)
+
+            cleared = []
+            if had_tp_lock: cleared.append('TP')
+            if had_sl_lock: cleared.append('SL')
+            ui.notify(
+                f'{" and ".join(cleared)} lock cleared — automation will manage from next cycle.',
+                type='positive',
+            )
+            logger.info(
+                f"Cleared manual override on transaction {transaction_id} for {txn.symbol}: "
+                f"tp={had_tp_lock}, sl={had_sl_lock}"
+            )
+            dialog.close()
+            self._refresh_transactions()
+        except Exception as e:
+            ui.notify(f'Error reverting overrides: {str(e)}', type='negative')
+            logger.error(f"Error reverting overrides for transaction {transaction_id}: {e}", exc_info=True)
 
     def _update_position(self, transaction_id, new_quantity, tp_price, sl_price, dialog):
         """Update position quantity and/or TP/SL for a transaction."""

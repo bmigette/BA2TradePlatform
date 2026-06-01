@@ -169,6 +169,11 @@ class Transaction(SQLModel, table=True):
     close_price: float | None = Field(default=None)
     stop_loss: float | None = Field(default=None)
     take_profit: float | None = Field(default=None)
+    # Manual override locks: when True, non-manual adjustment sources
+    # (ruleset, smart_risk_manager, expert) must NOT change the corresponding
+    # value. Cleared by an explicit "revert" action from the UI.
+    tp_manual_override: bool = Field(default=False)
+    sl_manual_override: bool = Field(default=False)
     open_date: DateTime | None = Field(default=None)
     close_date: DateTime | None = Field(default=None)
     close_reason: str | None = Field(default=None, description="Reason for closing (tp_sl_filled, manual_close, smart_risk_manager, broker_closed, etc.)")
