@@ -108,10 +108,13 @@ class YFinanceDataProvider(MarketDataProviderInterface):
                         f"first={data.index[0] if len(data) > 0 else 'N/A'}, "
                         f"last={data.index[-1] if len(data) > 0 else 'N/A'}")
             
-            # Reset index to make Date/Datetime a column
+            # Reset index to make the timestamp a column. yfinance >=1.4 may
+            # return a DatetimeIndex with name=None (yields a column called
+            # 'index'); older versions used 'Date' for daily and 'Datetime' for
+            # intraday. Force the name before reset to normalize all variants.
+            if data.index.name in (None, "index"):
+                data.index.name = "Date"
             data = data.reset_index()
-            
-            # Handle both 'Date' (daily) and 'Datetime' (intraday) column names
             if 'Datetime' in data.columns:
                 data = data.rename(columns={'Datetime': 'Date'})
             
