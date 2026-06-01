@@ -2740,7 +2740,25 @@ class ScheduledJobsTab:
                 expert_instances = []
         
         enabled_experts = [ei for ei in expert_instances if ei.enabled]
-        
+
+        # Exclude live experts — they manage their own internal scheduling and
+        # don't go through the JobManager's cron-based dispatch, so their
+        # execution_schedule_* settings are not representative of what runs.
+        try:
+            from ...core.interfaces import LiveExpertInterface
+            from ...modules.experts import get_expert_class
+            def _is_live(ei):
+                try:
+                    cls = get_expert_class(ei.expert)
+                    return cls is not None and issubclass(cls, LiveExpertInterface)
+                except Exception:
+                    return False
+            enabled_experts = [ei for ei in enabled_experts if not _is_live(ei)]
+        except Exception:
+            # Best effort — if the live-expert check fails for any reason, fall
+            # through with the unfiltered list rather than blanking the view.
+            pass
+
         # Generate colors for experts (use hashing for consistent colors)
         def get_expert_color(expert_id):
             """Generate consistent color for expert based on ID."""
