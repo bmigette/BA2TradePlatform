@@ -3399,97 +3399,92 @@ class AlpacaAccount(AccountInterface):
         existing_oco: TradingOrder | None,
         all_orders: list
     ) -> bool:
-        """Handle TP/SL adjustment when entry is filled - ALWAYS uses OCO at broker."""
+        """Handle TP/SL adjustment when entry is filled - ALWAYS uses OCO at broker.
 
-        logger.info(f"[OCO-Only] Creating broker OCO order for filled entry {entry_order.id}: TP=${effective_tp:.2f}, SL=${effective_sl:.2f}")
+        When an existing live broker order needs to be replaced, we don't
+        submit the new OCO inline (Alpaca would reject with 'insufficient qty
+        / held_for_orders' until the cancel fully clears). Instead we create
+        the new OCO in WAITING_TRIGGER state linked to the cancellation of the
+        outgoing order — TradeManager will submit it on the next refresh once
+        the parent reaches CANCELED.
+        """
+        logger.info(f"[OCO-Only] Adjusting broker OCO for filled entry {entry_order.id}: TP=${effective_tp:.2f}, SL=${effective_sl:.2f}")
 
-        # Cancel ALL existing TP/SL/OCO orders
-        orders_to_cancel = []
-        if existing_tp:
-            orders_to_cancel.append(existing_tp)
-        if existing_sl:
-            orders_to_cancel.append(existing_sl)
-        if existing_oco:
-            orders_to_cancel.append(existing_oco)
-
+        # Gather all existing TP/SL/OCO orders that need to go away
+        existing_set: list[TradingOrder] = []
+        for o in (existing_tp, existing_sl, existing_oco):
+            if o is not None and o not in existing_set:
+                existing_set.append(o)
         for order in all_orders:
-            if order not in orders_to_cancel:
-                orders_to_cancel.append(order)
+            if order is not entry_order and order not in existing_set:
+                existing_set.append(order)
 
-        broker_order_ids_to_confirm: list[str] = []
-        if orders_to_cancel:
-            logger.info(f"Cancelling {len(orders_to_cancel)} existing orders before creating new OCO")
-            for order in orders_to_cancel:
-                if order.broker_order_id:
-                    try:
-                        self.cancel_order(order.id)
-                        broker_order_ids_to_confirm.append(order.broker_order_id)
-                        logger.info(f"Cancelled broker order {order.id}")
-                    except Exception as e:
-                        logger.warning(f"Failed to cancel broker order {order.id}: {e}")
-                else:
-                    order.status = OrderStatus.CANCELED
-                    session.add(order)
+        # Split into "live at broker" vs "DB-only / already terminal"
+        terminal_statuses = OrderStatus.get_terminal_statuses()
+        live_broker_orders = [
+            o for o in existing_set
+            if o.broker_order_id and o.status not in terminal_statuses
+        ]
+        db_only_orders = [o for o in existing_set if o not in live_broker_orders]
+
+        # 1. DB-only / dead orders: just mark cancelled inline
+        for order in db_only_orders:
+            if order.status not in terminal_statuses:
+                order.status = OrderStatus.CANCELED
+                session.add(order)
+        if db_only_orders:
             session.commit()
 
-        # CRITICAL: wait for Alpaca to actually release the held_for_orders
-        # quantity from the cancelled orders before submitting the new OCO.
-        # Otherwise Alpaca rejects the new OCO with
-        # `{"code":40310000,"message":"insufficient qty","held_for_orders":"1"}`
-        # because it considers the shares still committed to the old order.
-        if broker_order_ids_to_confirm:
-            self._wait_for_orders_terminal(broker_order_ids_to_confirm)
+        # 2. No live broker order — straight path, submit immediately
+        if not live_broker_orders:
+            return self._create_broker_oco_order(session, transaction, entry_order, effective_tp, effective_sl)
 
-        # Create new OCO order at broker
-        return self._create_broker_oco_order(session, transaction, entry_order, effective_tp, effective_sl)
+        # 3. Live broker order(s) — chain the new OCO behind the cancellation
+        #    of the most recent (highest-id) live order, then cancel all live
+        #    orders. TradeManager's _check_order_status_changes_and_trigger_dependents
+        #    will submit the new OCO once that parent reaches CANCELED.
+        live_broker_orders.sort(key=lambda o: o.id, reverse=True)
+        parent_for_trigger = live_broker_orders[0]
 
-    def _wait_for_orders_terminal(
-        self,
-        broker_order_ids: list[str],
-        max_wait_seconds: float = 5.0,
-        poll_interval_seconds: float = 0.25,
-    ) -> bool:
-        """Poll Alpaca until the given orders all reach a terminal status, or
-        until the timeout. Used to avoid a race where we submit a replacement
-        OCO before Alpaca has released the held_for_orders quantity from a
-        just-cancelled order.
-
-        Returns True if all orders reached a terminal status within the
-        timeout, False if we timed out (we still proceed in that case — the
-        caller can decide what to do).
-        """
-        if not broker_order_ids:
-            return True
-
-        terminal_statuses = {"canceled", "cancelled", "filled", "expired", "rejected", "done_for_day", "replaced"}
-        deadline = time.time() + max_wait_seconds
-        remaining = list(broker_order_ids)
-
-        while remaining and time.time() < deadline:
-            still_pending: list[str] = []
-            for bro_id in remaining:
-                try:
-                    o = self.client.get_order_by_id(bro_id)
-                    status_str = str(getattr(o, "status", "")).lower().split(".")[-1]
-                    if status_str not in terminal_statuses:
-                        still_pending.append(bro_id)
-                except Exception as e:
-                    # If we can't fetch the order, assume it's gone (Alpaca prunes IDs
-                    # very rarely but we don't want to block forever on a 404).
-                    logger.debug(f"Could not fetch order {bro_id} during cancel-wait: {e}")
-            remaining = still_pending
-            if remaining:
-                time.sleep(poll_interval_seconds)
-
-        if remaining:
-            logger.warning(
-                f"Timed out waiting for {len(remaining)} cancelled order(s) to "
-                f"reach terminal status after {max_wait_seconds:.1f}s: {remaining}. "
-                f"Submitting replacement OCO anyway — Alpaca may reject with "
-                f"'insufficient qty / held_for_orders'."
-            )
+        order_quantity = transaction.quantity
+        if not order_quantity or order_quantity <= 0:
+            logger.error(f"Cannot stage replacement OCO for transaction {transaction.id}: invalid quantity {order_quantity}")
             return False
-        logger.debug(f"All {len(broker_order_ids)} cancelled orders confirmed terminal at broker")
+
+        new_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
+        comment = self._generate_tpsl_comment("TPSL", self.id, transaction.id, entry_order.id)
+        waiting_oco = TradingOrder(
+            account_id=self.id,
+            symbol=entry_order.symbol,
+            quantity=order_quantity,
+            side=new_side,
+            order_type=CoreOrderType.OCO,
+            limit_price=effective_tp,
+            stop_price=effective_sl,
+            transaction_id=transaction.id,
+            status=OrderStatus.WAITING_TRIGGER,
+            depends_on_order=parent_for_trigger.id,
+            depends_order_status_trigger=OrderStatus.CANCELED,
+            open_type=OrderOpenType.AUTOMATIC,
+            comment=comment + f" (chained on cancel of {parent_for_trigger.id})",
+            created_at=datetime.now(timezone.utc),
+        )
+        session.add(waiting_oco)
+        session.commit()
+        logger.info(
+            f"Staged replacement OCO {waiting_oco.id} (WAITING_TRIGGER) for "
+            f"transaction {transaction.id} — will submit when order {parent_for_trigger.id} "
+            f"reaches CANCELED at broker"
+        )
+
+        # Submit cancel to broker for ALL live orders
+        for order in live_broker_orders:
+            try:
+                self.cancel_order(order.id)
+                logger.info(f"Submitted cancel for broker order {order.id} (broker_id={order.broker_order_id})")
+            except Exception as e:
+                logger.warning(f"Failed to cancel broker order {order.id}: {e}")
+
         return True
     
     # ==================== END OCO-ONLY HANDLERS ====================
