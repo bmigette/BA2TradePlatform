@@ -3168,21 +3168,33 @@ class ScheduledJobsTab:
                         if not isinstance(schedule_config, dict):
                             continue
                         
-                        days = schedule_config.get('days', {})
                         times = schedule_config.get('times', [])
-                        
-                        # Skip if no schedule is defined
-                        if not any(days.values()) or not times:
-                            continue
-                        
-                        # Get enabled weekdays with short names
-                        day_names = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
-                        short_weekday_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-                        
-                        enabled_weekdays = []
-                        for i, day_name in enumerate(day_names):
-                            if days.get(day_name, False):
-                                enabled_weekdays.append(short_weekday_names[i])
+
+                        if schedule_config.get('frequency') == 'monthly':
+                            # Monthly Nth-weekday schedule (e.g. "1st Mon (monthly)")
+                            if not times:
+                                continue
+                            ord_label = {1: '1st', 2: '2nd', 3: '3rd'}.get(
+                                schedule_config.get('ordinal'), str(schedule_config.get('ordinal'))
+                            )
+                            weekday_label = str(schedule_config.get('weekday', ''))[:3].capitalize()
+                            weekdays_display = f"{ord_label} {weekday_label} (monthly)"
+                        else:
+                            days = schedule_config.get('days', {})
+
+                            # Skip if no schedule is defined
+                            if not any(days.values()) or not times:
+                                continue
+
+                            # Get enabled weekdays with short names
+                            day_names = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+                            short_weekday_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+
+                            enabled_weekdays = []
+                            for i, day_name in enumerate(day_names):
+                                if days.get(day_name, False):
+                                    enabled_weekdays.append(short_weekday_names[i])
+                            weekdays_display = ', '.join(enabled_weekdays) if enabled_weekdays else 'None'
                         
                         # Get account name for this expert instance
                         account_name = account_names.get(expert_instance.account_id, '') if expert_instance.account_id else ''
@@ -3218,7 +3230,7 @@ class ScheduledJobsTab:
                                     'expert_instance_id': expert_instance.id,
                                     'job_type': job_type_display,
                                     'subtype': subtype.value,
-                                    'weekdays': ', '.join(enabled_weekdays) if enabled_weekdays else 'None',
+                                    'weekdays': weekdays_display,
                                     'times': ', '.join(times) if times else 'Not specified',
                                     'actions': 'actions',
                                     'expert_disabled': False

@@ -1630,13 +1630,7 @@ class ExpertSettingsTab:
                                 with ui.card().classes('w-full'):
                                     ui.label('Schedule for analyzing new market entry opportunities:').classes('text-body2 mb-2')
 
-                                    ui.label('Select days when the expert should analyze for new positions:').classes('text-body2 mb-2')
-                                    with ui.row().classes('w-full gap-2 mb-4'):
-                                        self.enter_market_schedule_days = {}
-                                        for day in ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']:
-                                            # Default weekdays to True, weekends to False for enter market
-                                            default_value = day not in ['Saturday', 'Sunday']
-                                            self.enter_market_schedule_days[day.lower()] = ui.checkbox(day, value=default_value).classes('mb-2')
+                                    self._build_schedule_frequency_controls('enter_market')
 
                                     ui.label('Execution times (24-hour format, e.g., 09:30, 15:00):').classes('text-body2 mb-2')
                                     try:
@@ -1663,16 +1657,13 @@ class ExpertSettingsTab:
                                             ui.button('Add Time', on_click=self._add_time_input_enter_market, icon='add_alarm').props('flat')
 
                             # Open Positions Analysis Schedule
-                            with ui.expansion('💼 Open Positions Analysis Schedule', value=False).classes('w-full mb-4'):
+                            # Captured so it can be hidden for experts that rebalance in one batch
+                            # run (schedules_open_positions=False), via _update_open_positions_schedule_visibility.
+                            with ui.expansion('💼 Open Positions Analysis Schedule', value=False).classes('w-full mb-4') as self.open_positions_schedule_expansion:
                                 with ui.card().classes('w-full'):
                                     ui.label('Schedule for analyzing existing open positions:').classes('text-body2 mb-2')
-                                    ui.label('Select days when the expert should analyze open positions:').classes('text-body2 mb-2')
-                                    with ui.row().classes('w-full gap-2 mb-4'):
-                                        self.open_positions_schedule_days = {}
-                                        for day in ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']:
-                                            # Default weekdays to True, weekends to False for open positions
-                                            default_value = day not in ['Saturday', 'Sunday']
-                                            self.open_positions_schedule_days[day.lower()] = ui.checkbox(day, value=default_value).classes('mb-2')
+
+                                    self._build_schedule_frequency_controls('open_positions')
 
                                     ui.label('Execution times (24-hour format, e.g., 09:30, 15:00):').classes('text-body2 mb-2')
                                     try:
@@ -2101,6 +2092,99 @@ class ExpertSettingsTab:
                         child.set_visibility(False)
                         break
     
+    def _build_schedule_frequency_controls(self, kind: str):
+        """Build Weekly|Monthly frequency controls for a schedule editor section.
+
+        ``kind`` is 'enter_market' or 'open_positions'. Creates these instance
+        attributes (so the existing getters/loaders keep working):
+          {kind}_frequency         - ui.toggle Weekly|Monthly
+          {kind}_weekly_container  - column holding the day checkboxes
+          {kind}_schedule_days     - dict day->checkbox (weekly)
+          {kind}_monthly_container - column holding ordinal + weekday selects
+          {kind}_ordinal_select    - ui.select 1st/2nd/3rd (value is int 1-3)
+          {kind}_weekday_select    - ui.select Monday..Sunday (value is lowercase name)
+        """
+        freq = ui.toggle(
+            ['Weekly', 'Monthly'], value='Weekly',
+            on_change=lambda e, k=kind: self._apply_schedule_frequency_visibility(k),
+        ).props('no-caps').classes('mb-2')
+        setattr(self, f'{kind}_frequency', freq)
+
+        # Weekly: day checkboxes (unchanged behaviour/output)
+        weekly_container = ui.column().classes('w-full')
+        setattr(self, f'{kind}_weekly_container', weekly_container)
+        with weekly_container:
+            ui.label('Select days when the expert should run:').classes('text-body2 mb-2')
+            with ui.row().classes('w-full gap-2 mb-2'):
+                days_map = {}
+                for day in ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']:
+                    default_value = day not in ['Saturday', 'Sunday']
+                    days_map[day.lower()] = ui.checkbox(day, value=default_value).classes('mb-2')
+        setattr(self, f'{kind}_schedule_days', days_map)
+
+        # Monthly: ordinal (1st/2nd/3rd) + weekday
+        monthly_container = ui.column().classes('w-full')
+        setattr(self, f'{kind}_monthly_container', monthly_container)
+        with monthly_container:
+            ui.label('Run on the Nth weekday of each month:').classes('text-body2 mb-2')
+            with ui.row().classes('w-full gap-4 mb-2'):
+                ordinal_select = ui.select(
+                    {1: '1st', 2: '2nd', 3: '3rd'}, value=1, label='Which',
+                ).classes('w-32')
+                weekday_select = ui.select(
+                    {
+                        'monday': 'Monday', 'tuesday': 'Tuesday', 'wednesday': 'Wednesday',
+                        'thursday': 'Thursday', 'friday': 'Friday', 'saturday': 'Saturday',
+                        'sunday': 'Sunday',
+                    },
+                    value='monday', label='Weekday',
+                ).classes('w-40')
+        setattr(self, f'{kind}_ordinal_select', ordinal_select)
+        setattr(self, f'{kind}_weekday_select', weekday_select)
+
+        self._apply_schedule_frequency_visibility(kind)
+
+    def _apply_schedule_frequency_visibility(self, kind: str):
+        """Show the weekly day checkboxes or the monthly Nth-weekday controls."""
+        freq = getattr(self, f'{kind}_frequency', None)
+        weekly = getattr(self, f'{kind}_weekly_container', None)
+        monthly = getattr(self, f'{kind}_monthly_container', None)
+        if not (freq and weekly and monthly):
+            return
+        is_monthly = freq.value == 'Monthly'
+        weekly.set_visibility(not is_monthly)
+        monthly.set_visibility(is_monthly)
+
+    def _collect_execution_times(self, time_inputs, label=''):
+        """Extract validated 'HH:MM' strings from a list of time input widgets."""
+        times = []
+        for time_input in time_inputs or []:
+            try:
+                time_value = time_input.value.strip() if time_input.value else ""
+                if time_value and ':' in time_value:
+                    hours, minutes = time_value.split(':')
+                    if 0 <= int(hours) <= 23 and 0 <= int(minutes) <= 59:
+                        times.append(time_value)
+            except (ValueError, AttributeError) as e:
+                logger.warning(f"Error parsing {label} time '{getattr(time_input, 'value', None)}': {e}")
+        return times
+
+    def _update_open_positions_schedule_visibility(self):
+        """Hide the open-positions schedule editor for experts that handle exits
+        in their enter-market batch run (schedules_open_positions=False)."""
+        if not hasattr(self, 'open_positions_schedule_expansion'):
+            return
+        expert_type = self.expert_select.value if hasattr(self, 'expert_select') else None
+        show = True
+        if expert_type:
+            expert_class = self._get_expert_class(expert_type)
+            if expert_class is not None:
+                try:
+                    show = expert_class.get_expert_properties().get('schedules_open_positions', True)
+                except Exception:
+                    show = True
+        self.open_positions_schedule_expansion.set_visibility(bool(show))
+
     def _get_schedule_config(self):
         """Get the current schedule configuration as a JSON-serializable dict."""
         schedule = {
@@ -2129,89 +2213,55 @@ class ExpertSettingsTab:
     
     def _get_enter_market_schedule_config(self):
         """Get the current enter market schedule configuration as a JSON-serializable dict."""
-        schedule = {
-            'days': {},
-            'times': []
-        }
-        
-        # Get selected days
+        times = self._collect_execution_times(getattr(self, 'enter_market_execution_times', []), 'enter_market')
+
+        # Monthly Nth-weekday shape
+        freq = getattr(self, 'enter_market_frequency', None)
+        if freq is not None and freq.value == 'Monthly':
+            from ...core.JobManager import assemble_monthly_schedule
+            cfg = assemble_monthly_schedule(
+                ordinal=self.enter_market_ordinal_select.value,
+                weekday=self.enter_market_weekday_select.value,
+                times=times or ['09:30'],
+            )
+            logger.info(f"Enter market schedule config (monthly): {cfg}")
+            return cfg
+
+        # Weekly shape (default)
+        schedule = {'days': {}, 'times': times}
         if hasattr(self, 'enter_market_schedule_days'):
             for day, checkbox in self.enter_market_schedule_days.items():
-                try:
-                    schedule['days'][day] = checkbox.value
-                    logger.debug(f"Reading enter_market schedule day {day}: {checkbox.value}")
-                except Exception as e:
-                    logger.error(f"Error reading enter_market schedule day {day}: {e}")
+                schedule['days'][day] = checkbox.value
         else:
             logger.warning("No enter_market_schedule_days attribute found")
-        
-        # Get execution times
-        if hasattr(self, 'enter_market_execution_times'):
-            logger.debug(f"Found {len(self.enter_market_execution_times)} enter_market execution time inputs")
-            for time_input in self.enter_market_execution_times:
-                try:
-                    time_value = time_input.value.strip() if time_input.value else ""
-                    logger.debug(f"Reading enter_market time input: '{time_value}'")
-                    if time_value and ':' in time_value:
-                        hours, minutes = time_value.split(':')
-                        hours_int = int(hours)
-                        minutes_int = int(minutes)
-                        if 0 <= hours_int <= 23 and 0 <= minutes_int <= 59:
-                            schedule['times'].append(time_value)
-                            logger.debug(f"Added valid enter_market time: {time_value}")
-                        else:
-                            logger.warning(f"Invalid enter_market time range: {time_value}")
-                except ValueError as e:
-                    logger.warning(f"Error parsing enter_market time '{time_value}': {e}")
-                except Exception as e:
-                    logger.error(f"Unexpected error reading enter_market time input: {e}")
-        else:
-            logger.warning("No enter_market_execution_times attribute found")
-        
+
         logger.info(f"Enter market schedule config: {schedule}")
         return schedule
     
     def _get_open_positions_schedule_config(self):
         """Get the current open positions schedule configuration as a JSON-serializable dict."""
-        schedule = {
-            'days': {},
-            'times': []
-        }
-        
-        # Get selected days
+        times = self._collect_execution_times(getattr(self, 'open_positions_execution_times', []), 'open_positions')
+
+        # Monthly Nth-weekday shape
+        freq = getattr(self, 'open_positions_frequency', None)
+        if freq is not None and freq.value == 'Monthly':
+            from ...core.JobManager import assemble_monthly_schedule
+            cfg = assemble_monthly_schedule(
+                ordinal=self.open_positions_ordinal_select.value,
+                weekday=self.open_positions_weekday_select.value,
+                times=times or ['09:30'],
+            )
+            logger.info(f"Open positions schedule config (monthly): {cfg}")
+            return cfg
+
+        # Weekly shape (default)
+        schedule = {'days': {}, 'times': times}
         if hasattr(self, 'open_positions_schedule_days'):
             for day, checkbox in self.open_positions_schedule_days.items():
-                try:
-                    schedule['days'][day] = checkbox.value
-                    logger.debug(f"Reading open_positions schedule day {day}: {checkbox.value}")
-                except Exception as e:
-                    logger.error(f"Error reading open_positions schedule day {day}: {e}")
+                schedule['days'][day] = checkbox.value
         else:
             logger.warning("No open_positions_schedule_days attribute found")
-        
-        # Get execution times
-        if hasattr(self, 'open_positions_execution_times'):
-            logger.debug(f"Found {len(self.open_positions_execution_times)} open_positions execution time inputs")
-            for time_input in self.open_positions_execution_times:
-                try:
-                    time_value = time_input.value.strip() if time_input.value else ""
-                    logger.debug(f"Reading open_positions time input: '{time_value}'")
-                    if time_value and ':' in time_value:
-                        hours, minutes = time_value.split(':')
-                        hours_int = int(hours)
-                        minutes_int = int(minutes)
-                        if 0 <= hours_int <= 23 and 0 <= minutes_int <= 59:
-                            schedule['times'].append(time_value)
-                            logger.debug(f"Added valid open_positions time: {time_value}")
-                        else:
-                            logger.warning(f"Invalid open_positions time range: {time_value}")
-                except ValueError as e:
-                    logger.warning(f"Error parsing open_positions time '{time_value}': {e}")
-                except Exception as e:
-                    logger.error(f"Unexpected error reading open_positions time input: {e}")
-        else:
-            logger.warning("No open_positions_execution_times attribute found")
-        
+
         logger.info(f"Open positions schedule config: {schedule}")
         return schedule
     
@@ -2526,16 +2576,32 @@ class ExpertSettingsTab:
         if not hasattr(self, 'enter_market_times_container') or self.enter_market_times_container is None:
             logger.warning('_load_enter_market_schedule_config: enter_market_times_container not available')
             return
-            
-        # Load days
-        days = schedule_config.get('days', {})
-        if hasattr(self, 'enter_market_schedule_days'):
-            for day, checkbox in self.enter_market_schedule_days.items():
-                default_value = day not in ['saturday', 'sunday']
-                new_value = days.get(day, default_value)
-                checkbox.value = new_value
-                logger.debug(f'Set enter market day {day} to {new_value}')
-        
+
+        # Frequency (weekly vs monthly Nth-weekday)
+        is_monthly = isinstance(schedule_config, dict) and schedule_config.get('frequency') == 'monthly'
+        if hasattr(self, 'enter_market_frequency'):
+            self.enter_market_frequency.value = 'Monthly' if is_monthly else 'Weekly'
+
+        if is_monthly:
+            if hasattr(self, 'enter_market_ordinal_select'):
+                try:
+                    self.enter_market_ordinal_select.value = int(schedule_config.get('ordinal', 1))
+                except (TypeError, ValueError):
+                    self.enter_market_ordinal_select.value = 1
+            if hasattr(self, 'enter_market_weekday_select'):
+                self.enter_market_weekday_select.value = str(schedule_config.get('weekday', 'monday')).lower()
+        else:
+            # Load days
+            days = schedule_config.get('days', {})
+            if hasattr(self, 'enter_market_schedule_days'):
+                for day, checkbox in self.enter_market_schedule_days.items():
+                    default_value = day not in ['saturday', 'sunday']
+                    new_value = days.get(day, default_value)
+                    checkbox.value = new_value
+                    logger.debug(f'Set enter market day {day} to {new_value}')
+
+        self._apply_schedule_frequency_visibility('enter_market')
+
         # Load times
         times = schedule_config.get('times', ['09:30'])
         logger.info(f'Loading enter market times: {times}')
@@ -2566,16 +2632,32 @@ class ExpertSettingsTab:
         if not hasattr(self, 'open_positions_times_container') or self.open_positions_times_container is None:
             logger.warning('_load_open_positions_schedule_config: open_positions_times_container not available')
             return
-            
-        # Load days
-        days = schedule_config.get('days', {})
-        if hasattr(self, 'open_positions_schedule_days'):
-            for day, checkbox in self.open_positions_schedule_days.items():
-                default_value = day not in ['saturday', 'sunday']
-                new_value = days.get(day, default_value)
-                checkbox.value = new_value
-                logger.debug(f'Set open positions day {day} to {new_value}')
-        
+
+        # Frequency (weekly vs monthly Nth-weekday)
+        is_monthly = isinstance(schedule_config, dict) and schedule_config.get('frequency') == 'monthly'
+        if hasattr(self, 'open_positions_frequency'):
+            self.open_positions_frequency.value = 'Monthly' if is_monthly else 'Weekly'
+
+        if is_monthly:
+            if hasattr(self, 'open_positions_ordinal_select'):
+                try:
+                    self.open_positions_ordinal_select.value = int(schedule_config.get('ordinal', 1))
+                except (TypeError, ValueError):
+                    self.open_positions_ordinal_select.value = 1
+            if hasattr(self, 'open_positions_weekday_select'):
+                self.open_positions_weekday_select.value = str(schedule_config.get('weekday', 'monday')).lower()
+        else:
+            # Load days
+            days = schedule_config.get('days', {})
+            if hasattr(self, 'open_positions_schedule_days'):
+                for day, checkbox in self.open_positions_schedule_days.items():
+                    default_value = day not in ['saturday', 'sunday']
+                    new_value = days.get(day, default_value)
+                    checkbox.value = new_value
+                    logger.debug(f'Set open positions day {day} to {new_value}')
+
+        self._apply_schedule_frequency_visibility('open_positions')
+
         # Load times
         times = schedule_config.get('times', ['15:00'])
         logger.info(f'Loading open positions times: {times}')
@@ -2623,6 +2705,8 @@ class ExpertSettingsTab:
         except Exception:
             is_live = False
         self.execution_schedule_section.set_visibility(not is_live)
+        # Hide the open-positions editor for experts that rebalance in one batch run
+        self._update_open_positions_schedule_visibility()
 
     def _update_risk_manager_visibility(self):
         """Hide risk manager settings for experts that manage their own risk."""

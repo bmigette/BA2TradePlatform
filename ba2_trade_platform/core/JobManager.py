@@ -52,6 +52,20 @@ def build_monthly_cron(ordinal: int, weekday: str, hour: int, minute: int) -> Cr
     return CronTrigger(day=f"{_ORDINALS[ordinal]} {wd}", hour=hour, minute=minute)
 
 
+def assemble_monthly_schedule(ordinal: int, weekday: str, times: List[str]) -> Dict[str, Any]:
+    """Build the monthly schedule config dict consumed by ``_parse_schedule``.
+
+    Kept next to ``_parse_schedule``/``build_monthly_cron`` so the UI and the parser
+    share one definition of the monthly shape and cannot drift apart.
+    """
+    return {
+        "frequency": "monthly",
+        "ordinal": int(ordinal),
+        "weekday": str(weekday).lower(),
+        "times": list(times),
+    }
+
+
 def should_schedule_open_positions(expert_properties: Dict[str, Any]) -> bool:
     """Whether the open-positions analysis job should be scheduled for an expert.
 

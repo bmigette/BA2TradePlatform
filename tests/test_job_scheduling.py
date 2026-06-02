@@ -41,3 +41,14 @@ def test_open_positions_suppressed_when_flag_false():
     assert should_schedule_open_positions({"schedules_open_positions": False}) is False
     assert should_schedule_open_positions({}) is True  # default on
     assert should_schedule_open_positions({"schedules_open_positions": True}) is True
+
+
+def test_assemble_monthly_schedule_round_trips_through_parse():
+    # The UI builds its monthly config via assemble_monthly_schedule; that exact
+    # shape must parse back into the matching CronTrigger.
+    from ba2_trade_platform.core.JobManager import assemble_monthly_schedule, JobManager
+    cfg = assemble_monthly_schedule(ordinal=1, weekday="monday", times=["09:30"])
+    assert cfg == {"frequency": "monthly", "ordinal": 1, "weekday": "monday", "times": ["09:30"]}
+    jm = JobManager.__new__(JobManager)
+    trig = jm._parse_schedule(cfg)
+    assert "day='1st mon'" in str(trig)
