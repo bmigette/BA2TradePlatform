@@ -2,6 +2,7 @@ import pandas as pd
 from ba2_trade_platform.modules.experts.FactorRanker.factors import (
     momentum_12_1,
     earnings_surprise,
+    value_score,
 )
 
 
@@ -34,3 +35,12 @@ def test_earnings_surprise_within_window():
     assert round(out["A"], 1) == 2.0   # (1.2-1.0)/0.1
     assert round(out["B"], 1) == -1.0
     assert out["C"] == 0.0             # outside drift window -> no signal
+
+
+def test_value_score_cheaper_is_higher():
+    data = {
+        "CHEAP": {"eps_ttm": 5.0, "price": 50.0, "fcf_ttm": 10.0, "enterprise_value": 100.0},
+        "RICH":  {"eps_ttm": 1.0, "price": 100.0, "fcf_ttm": 1.0, "enterprise_value": 500.0},
+    }
+    out = value_score(data)
+    assert out["CHEAP"] > out["RICH"]

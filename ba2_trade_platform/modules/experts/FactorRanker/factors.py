@@ -43,3 +43,16 @@ def earnings_surprise(data: Dict[str, dict], drift_window_days: int = 60) -> Dic
             continue
         out[sym] = (float(d["actual"]) - float(d["estimate"])) / std
     return out
+
+
+def value_score(data: Dict[str, dict]) -> Dict[str, float]:
+    """Composite value: equal-weight of earnings yield (E/P) and FCF/EV yield.
+
+    Higher = cheaper. Missing inputs for a leg contribute 0 to that leg.
+    """
+    out: Dict[str, float] = {}
+    for sym, d in data.items():
+        ey = (d["eps_ttm"] / d["price"]) if d.get("eps_ttm") and d.get("price") else 0.0
+        fcfy = (d["fcf_ttm"] / d["enterprise_value"]) if d.get("fcf_ttm") and d.get("enterprise_value") else 0.0
+        out[sym] = 0.5 * ey + 0.5 * fcfy
+    return out
