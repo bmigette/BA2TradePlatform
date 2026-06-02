@@ -6,10 +6,10 @@ This document provides comprehensive information about all available trading exp
 
 The BA2 Trade Platform uses a plugin-based expert system where each expert can:
 - Analyze financial instruments using different methodologies
-- Generate trading recommendations (BUY/SELL/HOLD)
+- Either **generate trading recommendations** (BUY/SELL/HOLD, scored by the SmartRiskManager) **or self-execute** their own orders (e.g. PennyMomentumTrader, FactorRanker)
 - Provide confidence scores and expected profit estimates
-- Configure instrument selection methods (static, dynamic, or expert-driven)
-- Run on customizable schedules
+- Configure instrument selection methods (static, dynamic, expert-driven, or screener)
+- Run on customizable weekly or monthly schedules
 
 ## Available Experts
 
@@ -105,15 +105,50 @@ The BA2 Trade Platform uses a plugin-based expert system where each expert can:
 - `max_trade_exec_days`: Maximum days since trade execution (default: 60)
 - `should_expand_instrument_jobs`: Expand instrument jobs (default: False)
 
+### 6. PennyMomentumTrader
+**Live intraday penny-stock momentum trader with catalyst triggers and staged exits**
+
+- **Type**: Live, self-executing momentum trader (`LiveExpertInterface`)
+- **Methodology**: Screens for penny-stock momentum candidates, deep-triages them, opens positions on catalysts, and manages staged (tiered) exits intraday
+- **Data Sources**: Market data + `StockScreener`, social/news catalysts
+- **Instrument Selection**: Expert-driven (`can_recommend_instruments=True`, `should_expand_instrument_jobs=False`)
+- **Key Features**:
+  - **Self-executing**: places and manages its own orders — does **not** use the SmartRiskManager (`uses_risk_manager=False`) and creates **no** `ExpertRecommendation` records (order/expert attribution flows through `Transaction.expert_id`)
+  - Screener-based candidate universe with confidence-weighted position sizing
+  - Tiered take-profit / stop exits, wash-trade-safe exit staging
+- **Settings**: numerous (screener filters, triage thresholds, tier/exit configuration) — configure in the Expert Settings UI.
+
+### 7. FactorRanker
+**Configurable cross-sectional multi-factor equity ranker (momentum / value / quality / PEAD)**
+
+- **Type**: Systematic factor / portfolio expert (self-executing)
+- **Methodology**: Ranks a candidate universe each rebalance by a weighted blend of factors and holds the long-only top slice
+- **Data Sources**: FMP daily prices, income/balance/cash-flow statements, company profile, earnings; `StockScreener` for screener universes
+- **Instrument Selection**: Expert-driven — one **batch run per rebalance** (`should_expand_instrument_jobs=False`)
+- **Key Features**:
+  - Factors: **momentum** (12-1), **value** (E/P + FCF/EV), **quality** (ROE + gross profitability − accruals), **PEAD** (post-earnings-announcement drift / SUE)
+  - Universe from static `enabled_instruments` *or* the `StockScreener` (`universe_source`)
+  - Long-only top-N construction (equal or score weighting, per-name cap, gross exposure)
+  - **Self-rebalancing** via `FactorPortfolioManager` (diffs targets vs holdings → buy/sell deltas) — **no `ExpertRecommendation`, no SmartRiskManager** (`uses_risk_manager=False`)
+  - Renders **only** the Enter-Market schedule (`schedules_open_positions=False`); supports weekly *or* monthly (Nth-weekday) schedules
+
+**Key Settings**: `universe_source`, `factor_weight_momentum` / `factor_weight_value` / `factor_weight_quality` / `factor_weight_pead`, `top_n`, `weighting`, `max_weight_per_name`, `gross_exposure`, `winsorize_pct`, `pead_drift_window_days`, `min_price` (+ `screener_*` when `universe_source=screener`).
+
+📖 **Full guide:** [docs/FACTORRANKER_EXPERT.md](docs/FACTORRANKER_EXPERT.md)
+
 ## Expert Properties Comparison
 
-| Expert | Can Recommend Instruments | Typical Use Case |
-|--------|---------------------------|------------------|
-| TradingAgents | No | Complex AI-driven analysis with debate system |
-| FinnHubRating | No | Analyst consensus tracking |
-| FMPRating | No | Price target analysis |
-| FMPSenateTraderWeight | No | Sophisticated government trading analysis |
-| FMPSenateTraderCopy | **Yes** | Simple government trade copying |
+| Expert | Can Recommend Instruments | Self-executing¹ | Typical Use Case |
+|--------|---------------------------|-----------------|------------------|
+| TradingAgents | No | No | Complex AI-driven analysis with debate system |
+| FinnHubRating | No | No | Analyst consensus tracking |
+| FMPRating | No | No | Price target analysis |
+| FMPSenateTraderWeight | No | No | Sophisticated government trading analysis |
+| FMPSenateTraderCopy | **Yes** | No | Simple government trade copying |
+| PennyMomentumTrader | **Yes** | **Yes** | Live intraday penny-stock momentum |
+| FactorRanker | **Yes** | **Yes** | Systematic multi-factor equity ranking |
+
+¹ *Self-executing* experts place and manage their own orders via a dedicated manager (no `ExpertRecommendation`, no SmartRiskManager); order/expert attribution flows through `Transaction.expert_id`.
 
 ## Instrument Selection Methods
 
@@ -129,8 +164,13 @@ The BA2 Trade Platform uses a plugin-based expert system where each expert can:
 
 ### Expert-Driven Selection
 - **Expert Decides**: The expert algorithm determines which instruments to analyze
-- **Used by**: FMPSenateTraderCopy (can recommend its own instruments)
+- **Used by**: FMPSenateTraderCopy, PennyMomentumTrader, FactorRanker (can recommend their own instruments)
 - **Best for**: Autonomous trading systems that discover opportunities
+
+### Screener Selection
+- **Filter-Based**: Instruments resolved at run time from `StockScreener` filters (market cap, price, volume, …)
+- **Used by**: PennyMomentumTrader; FactorRanker when `universe_source="screener"`
+- **Best for**: Strategies that rank/trade a broad, dynamically-filtered universe
 
 ## Job Scheduling and Management
 
@@ -139,11 +179,16 @@ The BA2 Trade Platform uses a plugin-based expert system where each expert can:
 - Follow traditional scheduling patterns
 - Suitable for portfolio-based strategies
 
-### Self-Managing Experts (FMPSenateTraderCopy)
+### Self-Managing Experts (FMPSenateTraderCopy, PennyMomentumTrader, FactorRanker)
 - Can recommend their own instruments
-- Use `should_expand_instrument_jobs: False` to prevent job duplication
-- Run analysis and discover trading opportunities autonomously
-- Ideal for discovery-based trading strategies
+- Use `should_expand_instrument_jobs: False` to run a single batch job (no per-symbol duplication)
+- Run analysis and discover/rank trading opportunities autonomously
+- Ideal for discovery-based and portfolio/factor strategies
+
+### Weekly vs Monthly Schedules
+- Each analysis schedule (Enter-Market, Open-Positions) can fire **weekly** (chosen days + time) or **monthly** on the **Nth weekday** (e.g. *1st Monday*, *3rd Tuesday*).
+- Experts that handle entries and exits in a single batch run (e.g. FactorRanker) set `schedules_open_positions=False` and render only the Enter-Market schedule.
+- **Tip:** when running many self-executing experts that hit the same data API, stagger their schedule times to avoid rate-limiting.
 
 ## Configuration Best Practices
 
@@ -171,6 +216,8 @@ The BA2 Trade Platform uses a plugin-based expert system where each expert can:
 | FMPRating | FMP_API_KEY | Financial Modeling Prep |
 | FMPSenateTraderWeight | FMP_API_KEY | Financial Modeling Prep |
 | FMPSenateTraderCopy | FMP_API_KEY | Financial Modeling Prep |
+| PennyMomentumTrader | FMP_API_KEY (+ catalyst sources) | Financial Modeling Prep, social/news |
+| FactorRanker | FMP_API_KEY | Financial Modeling Prep |
 
 ## Risk and Compliance Notes
 
@@ -194,7 +241,7 @@ To add a new expert to the platform:
    - `get_settings_definitions()`: Configuration options
    - `run_analysis()`: Main analysis logic
    - `render_market_analysis()`: UI rendering
-3. **Define Properties**: Set `can_recommend_instruments` if applicable
+3. **Define Properties** (`get_expert_properties`): e.g. `can_recommend_instruments`, `should_expand_instrument_jobs`, `schedules_open_positions`, `uses_risk_manager` (set `False` for self-executing experts that manage their own orders)
 4. **Register Expert**: Add to `ba2_trade_platform/modules/experts/__init__.py`
 5. **Test Integration**: Verify settings, scheduling, and analysis functionality
 

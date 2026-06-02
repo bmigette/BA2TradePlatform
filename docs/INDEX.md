@@ -65,14 +65,15 @@ Major features and capabilities.
 - `INSTRUMENT_ACCOUNT_SHARE_SUMMARY.md` - Account sharing
 - `INSTRUMENT_WEIGHT_SUMMARY.md` - Position weighting
 
-### 🤖 Expert Implementations (6)
-AI trading experts documentation.
+### 🤖 Expert Implementations (7)
+AI trading experts documentation. See [`../EXPERTS.md`](../EXPERTS.md) for the full catalog.
 
 **FMP Senate Trade (Latest):**
 - ⭐ `FMP_TRADER_STATISTICS_ENHANCEMENT.md` - Complete implementation (Oct 10, 2025)
 - `TEST_FMP_SENATE_TRADE.md` - Testing guide
 
 **Other Experts:**
+- ⭐ `FACTORRANKER_EXPERT.md` - Cross-sectional multi-factor equity ranker (momentum/value/quality/PEAD)
 - `FINNHUB_RATING_EXPERT.md` - Finnhub ratings
 - `FINNHUB_RATING_QUICKSTART.md` - Quick start
 - `FINNHUB_RATING_UPDATES.md` - Updates

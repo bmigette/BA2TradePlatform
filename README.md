@@ -114,8 +114,10 @@ The platform includes multiple AI trading experts with different strategies and 
 | **FMPRating** | Price target analyzer | FMP analyst data | Profit potential calculation |
 | **FMPSenateTraderWeight** | Government trading tracker (sophisticated) | FMP Senate/House data | Portfolio allocation analysis |
 | **FMPSenateTraderCopy** | Government trading tracker (simple copy) | FMP Senate/House data | 100% confidence copy trading, can recommend instruments |
+| **PennyMomentumTrader** | Live intraday penny-stock momentum trader | Market data, screener, social/news catalysts | Self-executing live expert, screener universe, staged exits |
+| **FactorRanker** | Cross-sectional multi-factor equity ranker | FMP fundamentals & prices, StockScreener | momentum / value / quality / PEAD factors, static or screener universe, self-rebalancing top-N (no recommendations) |
 
-📖 **For detailed documentation on all experts, their settings, and configuration options, see [EXPERTS.md](EXPERTS.md)**
+📖 **For detailed documentation on all experts, their settings, and configuration options, see [EXPERTS.md](EXPERTS.md)** — and the dedicated [FactorRanker guide](docs/FACTORRANKER_EXPERT.md).
 
 ## 📋 Requirements
 
