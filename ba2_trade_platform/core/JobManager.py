@@ -52,6 +52,16 @@ def build_monthly_cron(ordinal: int, weekday: str, hour: int, minute: int) -> Cr
     return CronTrigger(day=f"{_ORDINALS[ordinal]} {wd}", hour=hour, minute=minute)
 
 
+def should_schedule_open_positions(expert_properties: Dict[str, Any]) -> bool:
+    """Whether the open-positions analysis job should be scheduled for an expert.
+
+    Defaults to True (backward compatible). Experts that handle entries and exits
+    in a single batch run (e.g. FactorRanker) set ``schedules_open_positions=False``
+    in their ``get_expert_properties`` so no separate OPEN_POSITIONS job is created.
+    """
+    return expert_properties.get('schedules_open_positions', True)
+
+
 class ControlMessageType(Enum):
     """Types of control messages for JobManager."""
     REFRESH_EXPERT_SCHEDULES = "refresh_expert_schedules"
@@ -607,18 +617,23 @@ class JobManager:
             else:
                 logger.debug(f"No execution_schedule_enter_market setting found for expert instance {expert_instance.id}")
             
-            # Schedule jobs for open_positions (ALWAYS created regardless of instrument selection method)
-            open_positions_schedule = self._get_expert_setting(expert_instance.id, "execution_schedule_open_positions")
-            if open_positions_schedule:
-                logger.debug(f"Found execution_schedule_open_positions for expert {expert_instance.id}: {open_positions_schedule}")
-                
-                # For OPEN_POSITIONS, use special "OPEN_POSITIONS" symbol instead of enabled_instruments
-                # This will be expanded at execution time to only analyze instruments with actual open positions
-                logger.debug(f"Creating OPEN_POSITIONS job (will expand to open positions at execution time)")
-                self._create_scheduled_job(expert_instance, "OPEN_POSITIONS", open_positions_schedule, AnalysisUseCase.OPEN_POSITIONS)
-                logger.debug(f"Completed OPEN_POSITIONS job creation")
+            # Schedule jobs for open_positions, unless the expert handles exits in its
+            # enter_market batch run (schedules_open_positions=False).
+            expert_properties = expert_class.get_expert_properties() if expert_class else {}
+            if should_schedule_open_positions(expert_properties):
+                open_positions_schedule = self._get_expert_setting(expert_instance.id, "execution_schedule_open_positions")
+                if open_positions_schedule:
+                    logger.debug(f"Found execution_schedule_open_positions for expert {expert_instance.id}: {open_positions_schedule}")
+
+                    # For OPEN_POSITIONS, use special "OPEN_POSITIONS" symbol instead of enabled_instruments
+                    # This will be expanded at execution time to only analyze instruments with actual open positions
+                    logger.debug(f"Creating OPEN_POSITIONS job (will expand to open positions at execution time)")
+                    self._create_scheduled_job(expert_instance, "OPEN_POSITIONS", open_positions_schedule, AnalysisUseCase.OPEN_POSITIONS)
+                    logger.debug(f"Completed OPEN_POSITIONS job creation")
+                else:
+                    logger.debug(f"No execution_schedule_open_positions setting found for expert instance {expert_instance.id}")
             else:
-                logger.debug(f"No execution_schedule_open_positions setting found for expert instance {expert_instance.id}")
+                logger.info(f"Expert {expert_instance.id} has schedules_open_positions=False - skipping OPEN_POSITIONS job creation")
             
             logger.debug(f"Completed job scheduling for expert instance {expert_instance.id}")
                 

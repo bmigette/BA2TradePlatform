@@ -34,3 +34,10 @@ def test_parse_schedule_weekly_still_works():
     jm = JobManager.__new__(JobManager)
     trig = jm._parse_schedule({"days": {"monday": True, "wednesday": True}, "times": ["09:30"]})
     assert trig is not None  # weekly path unchanged
+
+
+def test_open_positions_suppressed_when_flag_false():
+    from ba2_trade_platform.core.JobManager import should_schedule_open_positions
+    assert should_schedule_open_positions({"schedules_open_positions": False}) is False
+    assert should_schedule_open_positions({}) is True  # default on
+    assert should_schedule_open_positions({"schedules_open_positions": True}) is True
