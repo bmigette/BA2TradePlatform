@@ -30,6 +30,28 @@ from .types import WorkerTaskStatus
 from .types import AnalysisUseCase
 
 
+_ORDINALS = {1: "1st", 2: "2nd", 3: "3rd"}
+_WEEKDAY_ABBR = {
+    "monday": "mon", "tuesday": "tue", "wednesday": "wed", "thursday": "thu",
+    "friday": "fri", "saturday": "sat", "sunday": "sun",
+}
+
+
+def build_monthly_cron(ordinal: int, weekday: str, hour: int, minute: int) -> CronTrigger:
+    """Build a CronTrigger firing on the Nth weekday of each month (e.g. 1st Monday).
+
+    APScheduler natively supports the "<ordinal> <weekday>" day expression
+    (e.g. "1st mon"), which is robust to month length and weekends.
+    Only ordinals 1-3 are supported (per product decision).
+    """
+    if ordinal not in _ORDINALS:
+        raise ValueError(f"ordinal must be 1, 2 or 3 (got {ordinal})")
+    wd = _WEEKDAY_ABBR.get(weekday.lower())
+    if not wd:
+        raise ValueError(f"invalid weekday {weekday!r}")
+    return CronTrigger(day=f"{_ORDINALS[ordinal]} {wd}", hour=hour, minute=minute)
+
+
 class ControlMessageType(Enum):
     """Types of control messages for JobManager."""
     REFRESH_EXPERT_SCHEDULES = "refresh_expert_schedules"
