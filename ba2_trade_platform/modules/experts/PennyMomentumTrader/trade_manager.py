@@ -4,7 +4,7 @@ PennyTradeManager - Position sizing and trade execution for PennyMomentumTrader.
 Manages:
 1. Pre-calculating position sizes weighted by confidence score
 2. Clamping quantities to available balance at execution time
-3. Creating ExpertRecommendation + TradingOrder records for entries
+3. Creating expert-attributed Transaction + TradingOrder records for entries
 4. Handling partial and full exits
 """
 
@@ -14,11 +14,11 @@ from sqlmodel import select
 
 from ba2_trade_platform.core.db import get_db, get_instance, add_instance
 from ba2_trade_platform.core.models import (
-    ExpertInstance, ExpertRecommendation, TradingOrder, Transaction,
+    ExpertInstance, TradingOrder, Transaction,
 )
 from ba2_trade_platform.core.types import (
-    OrderDirection, OrderOpenType, OrderRecommendation, OrderStatus,
-    OrderType, RiskLevel, TimeHorizon, TransactionStatus,
+    OrderDirection, OrderOpenType, OrderStatus,
+    OrderType, TransactionStatus,
 )
 from ba2_trade_platform.logger import logger
 
@@ -117,9 +117,10 @@ class PennyTradeManager:
         """
         Execute a buy entry for *symbol*.
 
-        Creates an ExpertRecommendation and a TradingOrder, then submits
-        through the account interface. Clamps qty to available balance and
-        per-instrument limit at execution time.
+        Creates an expert-attributed Transaction and a TradingOrder linked to it,
+        then submits through the account interface. Clamps qty to available balance
+        and per-instrument limit at execution time. No ExpertRecommendation is
+        created — attribution flows through Transaction.expert_id.
 
         Returns:
             The TradingOrder id on success, or None on failure.
@@ -152,30 +153,26 @@ class PennyTradeManager:
             )
             return None
 
-        # --- ExpertRecommendation ---
-        time_horizon = (
-            TimeHorizon.SHORT_TERM
-            if strategy == "intraday"
-            else TimeHorizon.MEDIUM_TERM
-        )
-        rec = ExpertRecommendation(
-            instance_id=self.expert_instance_id,
+        # --- Transaction (expert-attributed) ---
+        # Pre-create the transaction stamped with expert_id so order/expert
+        # attribution flows through Transaction.expert_id (the same path
+        # FactorRanker and the SmartRiskManager use). No ExpertRecommendation is
+        # created; the entry order links to this transaction instead.
+        transaction = Transaction(
             symbol=symbol,
-            recommended_action=OrderRecommendation.BUY,
-            expected_profit_percent=0.0,
-            price_at_date=current_price,
-            confidence=confidence,
-            risk_level=RiskLevel.HIGH,  # Penny stocks are always HIGH risk
-            time_horizon=time_horizon,
-            details=f"Catalyst: {catalyst}",
-            market_analysis_id=market_analysis_id,
-            data={
+            quantity=clamped_qty,
+            side=OrderDirection.BUY,
+            open_price=current_price,
+            status=TransactionStatus.WAITING,
+            expert_id=self.expert_instance_id,
+            meta_data={
                 "strategy": strategy,
                 "catalyst": catalyst,
                 "exit_conditions": exit_conditions,
+                "market_analysis_id": market_analysis_id,
             },
         )
-        rec_id = add_instance(rec)
+        transaction_id = add_instance(transaction)
 
         # --- TradingOrder (submit_order handles persistence + broker call) ---
         if limit_slippage_pct > 0:
@@ -195,7 +192,7 @@ class PennyTradeManager:
             status=OrderStatus.PENDING,
             open_type=OrderOpenType.AUTOMATIC,
             comment=f"PennyMomentum entry: {catalyst}",
-            expert_recommendation_id=rec_id,
+            transaction_id=transaction_id,
             good_for='day',  # Expire at EOD; re-evaluated each day by the monitor
         )
 
