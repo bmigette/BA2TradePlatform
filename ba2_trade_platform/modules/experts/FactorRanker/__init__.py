@@ -61,6 +61,11 @@ class FactorRanker(MarketExpertInterface):
     @classmethod
     def get_settings_definitions(cls) -> Dict[str, Any]:
         return {
+            "universe_source": {
+                "type": "str", "required": False, "default": "static",
+                "choices": ["static", "screener"],
+                "description": "Candidate universe: 'static' (enabled_instruments) or 'screener' (StockScreener filters).",
+            },
             "factor_weights": {
                 "type": "json", "required": False,
                 "default": {"momentum": 1.0, "value": 1.0, "quality": 1.0, "pead": 0.0},
