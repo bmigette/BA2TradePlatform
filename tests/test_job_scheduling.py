@@ -20,3 +20,17 @@ def test_build_monthly_cron_rejects_bad_ordinal():
     import pytest
     with pytest.raises(ValueError):
         build_monthly_cron(ordinal=5, weekday="monday", hour=9, minute=30)
+
+
+def test_parse_schedule_monthly():
+    from ba2_trade_platform.core.JobManager import JobManager
+    jm = JobManager.__new__(JobManager)
+    trig = jm._parse_schedule({"frequency": "monthly", "ordinal": 2, "weekday": "friday", "times": ["10:00"]})
+    assert "day='2nd fri'" in str(trig)
+
+
+def test_parse_schedule_weekly_still_works():
+    from ba2_trade_platform.core.JobManager import JobManager
+    jm = JobManager.__new__(JobManager)
+    trig = jm._parse_schedule({"days": {"monday": True, "wednesday": True}, "times": ["09:30"]})
+    assert trig is not None  # weekly path unchanged

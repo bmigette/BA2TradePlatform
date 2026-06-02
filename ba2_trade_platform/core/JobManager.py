@@ -805,6 +805,24 @@ class JobManager:
     def _parse_schedule(self, schedule_setting: str) -> Optional[Any]:
         """Parse schedule setting into APScheduler trigger."""
         try:
+            # Handle monthly Nth-weekday configuration (e.g. 1st Monday).
+            # Backward compatible: absence of "frequency" => weekly path below.
+            if isinstance(schedule_setting, dict) and schedule_setting.get('frequency') == 'monthly':
+                times = schedule_setting.get('times', ['09:30'])
+                if not times:
+                    logger.warning("No times specified in monthly schedule")
+                    return None
+                hour, minute = map(int, times[0].split(':'))
+                logger.info(
+                    f"Creating monthly cron trigger: ordinal={schedule_setting.get('ordinal')}, "
+                    f"weekday={schedule_setting.get('weekday')}, hour={hour}, minute={minute}"
+                )
+                return build_monthly_cron(
+                    ordinal=int(schedule_setting['ordinal']),
+                    weekday=schedule_setting['weekday'],
+                    hour=hour, minute=minute,
+                )
+
             # Handle dict schedule configuration (JSON format)
             if isinstance(schedule_setting, dict) and 'days' in schedule_setting and 'times' in schedule_setting:
                 logger.debug(f"Parsing JSON schedule: {schedule_setting}")
