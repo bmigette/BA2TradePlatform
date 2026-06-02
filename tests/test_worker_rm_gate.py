@@ -84,3 +84,31 @@ def test_factorranker_resolves_to_false():
 def test_fmprating_resolves_to_true():
     # FMPRating does not opt out, so it uses the platform risk manager.
     assert expert_uses_risk_manager(FMPRating) is True
+
+
+# --------------------------------------------------------------------------- #
+# expert_schedules_open_positions resolver (open-positions schedule visibility)
+# --------------------------------------------------------------------------- #
+
+from ba2_trade_platform.core.utils import expert_schedules_open_positions
+
+
+def test_schedules_open_positions_false_via_properties():
+    class _Exp:
+        @classmethod
+        def get_expert_properties(cls):
+            return {"schedules_open_positions": False}
+    assert expert_schedules_open_positions(_Exp) is False
+
+
+def test_schedules_open_positions_defaults_true():
+    class _Exp:
+        @classmethod
+        def get_expert_properties(cls):
+            return {}
+    assert expert_schedules_open_positions(_Exp) is True
+
+
+def test_schedules_open_positions_factorranker_is_false():
+    from ba2_trade_platform.modules.experts.FactorRanker import FactorRanker
+    assert expert_schedules_open_positions(FactorRanker) is False

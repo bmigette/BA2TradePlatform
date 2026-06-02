@@ -92,6 +92,29 @@ def expert_uses_risk_manager(expert_class) -> bool:
         return True
 
 
+def expert_schedules_open_positions(expert_class) -> bool:
+    """Resolve whether an expert class schedules a separate open-positions job.
+
+    Experts that handle entries and exits in a single batch run (e.g. FactorRanker)
+    declare ``schedules_open_positions=False`` and have no OPEN_POSITIONS job — so
+    UI views must not render an open-positions schedule for them. Read robustly:
+    ``get_expert_properties()`` first, then the ``schedules_open_positions`` class
+    attribute, defaulting to True (backward-compatible). Errors also default to True.
+
+    Args:
+        expert_class: The expert class (not instance) to inspect.
+
+    Returns:
+        bool: True if the expert has an open-positions schedule, False otherwise.
+    """
+    class_attr_default = getattr(expert_class, "schedules_open_positions", True)
+    try:
+        return bool(expert_class.get_expert_properties().get("schedules_open_positions", class_attr_default))
+    except Exception as e:
+        logger.warning(f"expert_schedules_open_positions: failed to resolve for {expert_class!r}, defaulting to True: {e}")
+        return True
+
+
 def get_market_analysis_id_from_order_id(order_id: int) -> Optional[int]:
     """
     Get the market analysis ID associated with an order via its linked recommendation.

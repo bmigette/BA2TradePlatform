@@ -2811,11 +2811,18 @@ class ScheduledJobsTab:
                     'days': {}
                 }
                 
+                # Experts that handle exits in their enter-market batch run have no
+                # OPEN_POSITIONS job — don't render an open-positions schedule for them.
+                from ...core.utils import expert_schedules_open_positions
+                shows_open_positions = expert_schedules_open_positions(type(expert))
+
                 # Process both schedule types
                 for schedule_key, schedule_type in [
                     ('execution_schedule_enter_market', 'enter_market'),
                     ('execution_schedule_open_positions', 'open_positions')
                 ]:
+                    if schedule_type == 'open_positions' and not shows_open_positions:
+                        continue
                     schedule_setting = expert.settings.get(schedule_key)
                     if not schedule_setting:
                         continue
@@ -3139,14 +3146,21 @@ class ScheduledJobsTab:
                     
                     # Get enabled instruments for this expert
                     enabled_instruments = expert.get_enabled_instruments()
-                    
+
+                    # Experts that handle exits in their enter-market batch run have no
+                    # OPEN_POSITIONS job — skip the open-positions schedule for them.
+                    from ...core.utils import expert_schedules_open_positions
+                    shows_open_positions = expert_schedules_open_positions(type(expert))
+
                     # Process both schedule types
                     schedule_configs = [
                         ('execution_schedule_enter_market', 'Enter Market', AnalysisUseCase.ENTER_MARKET),
                         ('execution_schedule_open_positions', 'Open Positions', AnalysisUseCase.OPEN_POSITIONS)
                     ]
-                    
+
                     for schedule_key, job_type_display, subtype in schedule_configs:
+                        if schedule_key == 'execution_schedule_open_positions' and not shows_open_positions:
+                            continue
                         # Apply analysis type filter
                         if self.analysis_type_filter != 'all':
                             if self.analysis_type_filter == 'enter_market' and schedule_key != 'execution_schedule_enter_market':
