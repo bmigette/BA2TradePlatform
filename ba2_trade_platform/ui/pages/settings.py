@@ -1264,9 +1264,15 @@ class ExpertSettingsTab:
     This tab manages three main categories of settings:
     
     1. **General Settings** (saved as ExpertSetting records):
-       - execution_schedule_enter_market (JSON): Schedule configuration for entering market containing:
-         - days: Dict of weekday names (monday, tuesday, etc.) to boolean values
-         - times: List of execution times in HH:MM format
+       - execution_schedule_enter_market (JSON): Schedule configuration for entering market.
+         Weekly shape:
+           - days: Dict of weekday names (monday, tuesday, etc.) to boolean values
+           - times: List of execution times in HH:MM format
+         Monthly Nth-weekday shape (e.g. 1st Monday):
+           - frequency: "monthly"
+           - ordinal: 1, 2 or 3 (1st/2nd/3rd)
+           - weekday: lowercase weekday name (monday..sunday)
+           - times: List of execution times in HH:MM format
        - enable_buy (bool): Whether the expert can place BUY orders (default: True)
        - enable_sell (bool): Whether the expert can place SELL orders (default: False)
     
