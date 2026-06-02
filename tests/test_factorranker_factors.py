@@ -3,6 +3,7 @@ from ba2_trade_platform.modules.experts.FactorRanker.factors import (
     momentum_12_1,
     earnings_surprise,
     value_score,
+    quality_score,
 )
 
 
@@ -44,3 +45,12 @@ def test_value_score_cheaper_is_higher():
     }
     out = value_score(data)
     assert out["CHEAP"] > out["RICH"]
+
+
+def test_quality_score_higher_for_profitable_low_accruals():
+    data = {
+        "GOOD": {"roe": 0.25, "gross_profit": 50.0, "total_assets": 100.0, "accruals_ratio": 0.02},
+        "BAD":  {"roe": 0.02, "gross_profit": 5.0,  "total_assets": 100.0, "accruals_ratio": 0.20},
+    }
+    out = quality_score(data)
+    assert out["GOOD"] > out["BAD"]

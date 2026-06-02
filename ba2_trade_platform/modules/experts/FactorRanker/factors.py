@@ -56,3 +56,18 @@ def value_score(data: Dict[str, dict]) -> Dict[str, float]:
         fcfy = (d["fcf_ttm"] / d["enterprise_value"]) if d.get("fcf_ttm") and d.get("enterprise_value") else 0.0
         out[sym] = 0.5 * ey + 0.5 * fcfy
     return out
+
+
+def quality_score(data: Dict[str, dict]) -> Dict[str, float]:
+    """Quality = ROE + gross profitability (gross_profit/total_assets) - accruals_ratio.
+
+    Higher = more profitable with cleaner (lower-accrual) earnings. Missing inputs
+    contribute 0 to their term.
+    """
+    out: Dict[str, float] = {}
+    for sym, d in data.items():
+        roe = d.get("roe") or 0.0
+        gp = (d["gross_profit"] / d["total_assets"]) if d.get("gross_profit") and d.get("total_assets") else 0.0
+        accr = d.get("accruals_ratio") or 0.0
+        out[sym] = roe + gp - accr
+    return out
