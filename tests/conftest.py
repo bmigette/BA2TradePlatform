@@ -161,6 +161,15 @@ class MockAccount(AccountInterface):
     def _set_order_tp_sl_impl(self, trading_order, tp_price, sl_price):
         return True
 
+    def adjust_tp(self, transaction, new_tp_price, source=""):
+        return True
+
+    def adjust_sl(self, transaction, new_sl_price, source=""):
+        return True
+
+    def adjust_tp_sl(self, transaction, new_tp_price=None, new_sl_price=None, source=""):
+        return True
+
     def get_dividends(self, symbol=None, start_date=None, end_date=None):
         return []
 

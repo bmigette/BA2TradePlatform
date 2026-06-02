@@ -702,52 +702,45 @@ class TestVolumeConditions:
 class TestRVOLConditions:
     """Tests for the rvol_above condition type."""
 
-    def test_rvol_above_true(self):
-        """RVOL should be high when today's volume is much larger than average."""
-        # 20 historical days with 1000 volume each, today has 5000
-        volumes = [1000] * 20 + [5000]
+    @staticmethod
+    def _make_30m_slot_df(today_volume):
+        """Build 30m bars at a fixed 10:00 ET slot: 20 prior weekdays @ 1000 volume
+        plus today's bar at `today_volume`. RVOL = today_volume / 1000."""
+        import pytz
+        from datetime import timedelta
+        tz = pytz.timezone("US/Eastern")
+        timestamps = []
+        d = tz.localize(datetime(2026, 2, 2, 10, 0))  # a Monday
+        while len(timestamps) < 21:
+            if d.weekday() < 5:
+                timestamps.append(d)
+            d += timedelta(days=1)
+        volumes = [1000] * 20 + [today_volume]
         df = _make_ohlcv_df([10.0] * 21, volumes=volumes)
+        df.index = pd.DatetimeIndex(timestamps, tz=tz)
+        return df
+
+    def test_rvol_above_true(self):
+        """RVOL high when the latest 30m bar's volume far exceeds the same-slot average.
+
+        _get_rvol uses 30-minute bars: current-slot volume / avg volume at the same
+        (hour, minute) slot across prior days. 5000 / mean(1000) = 5.0 >= 2.0.
+        """
         provider = MockOHLCVProvider()
-        provider.set_default(df)
+        provider.set_default(self._make_30m_slot_df(today_volume=5000))
         ev = ConditionEvaluator(provider)
-
-        # Mock datetime to be mid-session (12:30 ET = 3 hours in = ~46% of day)
-        with patch("ba2_trade_platform.modules.experts.PennyMomentumTrader.conditions.datetime") as mock_dt:
-            import pytz
-            et = pytz.timezone("US/Eastern")
-            mock_now = et.localize(datetime(2026, 3, 19, 12, 30, 0))
-            mock_dt.now.return_value = mock_now
-            mock_dt.side_effect = lambda *args, **kw: datetime(*args, **kw)
-
-            result = ev.evaluate_single(
-                {"type": "rvol_above", "threshold": 2.0}, "X"
-            )
-            # raw_rvol = 5000/1000 = 5.0, fraction ~= 180/390 ~= 0.46
-            # rvol = 5.0 / 0.46 ~= 10.8 >> 2.0
-            assert result is True
+        assert ev.evaluate_single({"type": "rvol_above", "threshold": 2.0}, "X") is True
 
     def test_rvol_above_false(self):
-        """RVOL should be low when today's volume is below average."""
-        # 20 historical days with 1000 volume each, today has only 200
-        volumes = [1000] * 20 + [200]
-        df = _make_ohlcv_df([10.0] * 21, volumes=volumes)
+        """RVOL low when the latest 30m bar's volume is below the same-slot average.
+
+        200 / mean(1000) = 0.2 < 2.0.
+        """
         provider = MockOHLCVProvider()
-        provider.set_default(df)
+        provider.set_default(self._make_30m_slot_df(today_volume=200))
         ev = ConditionEvaluator(provider)
-
-        with patch("ba2_trade_platform.modules.experts.PennyMomentumTrader.conditions.datetime") as mock_dt:
-            import pytz
-            et = pytz.timezone("US/Eastern")
-            mock_now = et.localize(datetime(2026, 3, 19, 12, 30, 0))
-            mock_dt.now.return_value = mock_now
-            mock_dt.side_effect = lambda *args, **kw: datetime(*args, **kw)
-
-            result = ev.evaluate_single(
-                {"type": "rvol_above", "threshold": 2.0}, "X"
-            )
-            # raw_rvol = 200/1000 = 0.2, fraction ~= 0.46
-            # rvol = 0.2 / 0.46 ~= 0.43 < 2.0
-            assert result is False
+        result = ev.evaluate_single({"type": "rvol_above", "threshold": 2.0}, "X")
+        assert result is False
 
     def test_rvol_above_no_data(self):
         """RVOL should return False when no data is available."""

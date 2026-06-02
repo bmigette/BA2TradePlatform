@@ -46,6 +46,8 @@ class StubLiveExpert(LiveExpertInterface):
             },
             "monitoring_interval_seconds": 60,
             "market_close_time": "16:00",
+            "premarket_minutes": 0,
+            "market_open_time": "09:30",
         }
         if settings_override:
             self._fake_settings.update(settings_override)
