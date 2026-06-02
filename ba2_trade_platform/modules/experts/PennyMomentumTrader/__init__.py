@@ -25,11 +25,10 @@ from ....core.interfaces import LiveExpertInterface
 from ....core.models import (
     AnalysisOutput,
     ExpertInstance,
-    ExpertRecommendation,
     MarketAnalysis,
 )
 from ....core.db import add_instance, get_db, get_instance
-from ....core.types import MarketAnalysisStatus, OrderRecommendation, RiskLevel, TimeHorizon
+from ....core.types import MarketAnalysisStatus
 from ....core.ModelFactory import ModelFactory
 from ....logger import get_expert_logger
 
@@ -1671,31 +1670,9 @@ class PennyMomentumTrader(LiveExpertInterface):
                 raw_text = triage["raw_text"]
                 prompt = triage["prompt"]
 
-                time_horizon = (
-                    TimeHorizon.SHORT_TERM
-                    if result.get("strategy") == "intraday"
-                    else TimeHorizon.MEDIUM_TERM
-                )
-                rec = ExpertRecommendation(
-                    instance_id=self.instance.id,
-                    symbol=symbol,
-                    recommended_action=OrderRecommendation.BUY,
-                    expected_profit_percent=result.get("expected_profit_pct", 0),
-                    price_at_date=candidate.get("price"),
-                    confidence=confidence,
-                    risk_level=RiskLevel.HIGH,
-                    time_horizon=time_horizon,
-                    details=result.get("reasoning", ""),
-                    market_analysis_id=market_analysis.id,
-                    data={
-                        "catalyst": result.get("catalyst", ""),
-                        "strategy": result.get("strategy", ""),
-                        "risk_assessment": result.get("risk_assessment", ""),
-                        "detailed_report": result.get("detailed_report", ""),
-                    },
-                )
-                add_instance(rec)
-
+                # No ExpertRecommendation is created (consistency with FactorRanker).
+                # The candidate is recorded for the UI/audit via the analysis state
+                # (deep_triage_results, below) and the EXPERT_RECOMMENDATION activity log.
                 from ....core.db import log_activity
                 from ....core.types import ActivityLogSeverity, ActivityLogType
                 log_activity(
