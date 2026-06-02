@@ -5,7 +5,8 @@ tested directly against known inputs. The expert orchestrates these; data
 fetching lives in ``data.py`` and execution in ``portfolio.py``.
 """
 
-from typing import Dict
+from typing import Dict, List
+import numpy as np
 import pandas as pd
 
 
@@ -71,3 +72,44 @@ def quality_score(data: Dict[str, dict]) -> Dict[str, float]:
         accr = d.get("accruals_ratio") or 0.0
         out[sym] = roe + gp - accr
     return out
+
+
+def cross_sectional_zscore(values: Dict[str, float], winsorize_pct: float = 0.0) -> Dict[str, float]:
+    """Z-score raw factor values across the universe (mean 0, std 1).
+
+    Optionally winsorize the tails at ``winsorize_pct`` before standardizing.
+    If the cross-section has zero dispersion, all z-scores are 0.
+    """
+    syms = list(values)
+    arr = np.array([values[s] for s in syms], dtype=float)
+    if winsorize_pct > 0 and len(arr) > 2:
+        lo, hi = np.quantile(arr, [winsorize_pct, 1 - winsorize_pct])
+        arr = np.clip(arr, lo, hi)
+    mu, sd = arr.mean(), arr.std()
+    z = (arr - mu) / sd if sd > 0 else np.zeros_like(arr)
+    return {s: float(z[i]) for i, s in enumerate(syms)}
+
+
+def composite_score(factor_values: Dict[str, Dict[str, float]], weights: Dict[str, float],
+                    winsorize_pct: float = 0.0) -> Dict[str, float]:
+    """Weighted sum of per-factor cross-sectional z-scores.
+
+    ``factor_values`` maps factor name -> {symbol: raw value}. Each factor is
+    z-scored across the universe, then multiplied by its weight and summed.
+    A weight of 0 disables that factor.
+    """
+    symbols = set().union(*[set(v) for v in factor_values.values()]) if factor_values else set()
+    out = {s: 0.0 for s in symbols}
+    for fname, vals in factor_values.items():
+        w = weights.get(fname, 0.0)
+        if w == 0.0:
+            continue
+        z = cross_sectional_zscore(vals, winsorize_pct)
+        for s in symbols:
+            out[s] += w * z.get(s, 0.0)
+    return out
+
+
+def rank_symbols(composite: Dict[str, float]) -> List[str]:
+    """Symbols sorted by composite score, highest first."""
+    return [s for s, _ in sorted(composite.items(), key=lambda kv: kv[1], reverse=True)]
