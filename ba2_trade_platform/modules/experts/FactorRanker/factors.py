@@ -25,3 +25,21 @@ def momentum_12_1(prices: Dict[str, pd.Series], lookback: int = 252, skip: int =
         p_end = float(s.iloc[-skip - 1])
         out[sym] = (p_end / p_start - 1.0) if p_start > 0 else 0.0
     return out
+
+
+def earnings_surprise(data: Dict[str, dict], drift_window_days: int = 60) -> Dict[str, float]:
+    """Standardized unexpected earnings (SUE), zeroed outside the post-earnings drift window.
+
+    ``data[sym]`` carries ``actual``, ``estimate``, ``estimate_std`` and ``days_since``
+    (days since the earnings report). SUE = (actual - estimate) / estimate_std, but only
+    while ``days_since`` is within ``drift_window_days`` and the std is positive; otherwise 0.
+    """
+    out: Dict[str, float] = {}
+    for sym, d in data.items():
+        days = d.get("days_since")
+        std = d.get("estimate_std") or 0.0
+        if days is None or days > drift_window_days or std <= 0:
+            out[sym] = 0.0
+            continue
+        out[sym] = (float(d["actual"]) - float(d["estimate"])) / std
+    return out
