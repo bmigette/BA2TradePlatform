@@ -48,6 +48,7 @@ def test_run_analysis_ranks_and_rebalances():
     prices = {"A": _ramp(100, 300), "B": _ramp(100, 150), "C": _ramp(100, 100)}
 
     pm_instance = MagicMock()
+    pm_instance.get_holdings.return_value = ({}, {})  # empty portfolio (first run)
     with patch("ba2_trade_platform.modules.experts.FactorRanker.data.fetch_close_prices", return_value=prices) as fetch_px, \
          patch("ba2_trade_platform.modules.experts.FactorRanker.FactorPortfolioManager", return_value=pm_instance) as PM:
         expert.run_analysis("EXPERT", ma)
@@ -66,6 +67,31 @@ def test_run_analysis_ranks_and_rebalances():
     book = ma.state["factor_ranker"]
     assert [row["symbol"] for row in book["ranking"]] == ["A", "B", "C"]
     assert book["targets"] == targets
+
+    # First run, empty portfolio -> top-N are BUY, the rest "—".
+    actions = {row["symbol"]: row["action"] for row in book["ranking"]}
+    assert actions == {"A": "BUY", "B": "BUY", "C": "—"}
+
+
+def test_run_analysis_action_reflects_holdings():
+    """action shows BUY (new), HOLD (kept), SELL (dropped) vs current holdings."""
+    acct = create_account_definition()
+    inst = create_expert_instance(account_id=acct.id, expert="FactorRanker")
+    ma = create_market_analysis(symbol="EXPERT", expert_instance_id=inst.id)
+    expert = _make_expert(inst.id)
+    prices = {"A": _ramp(100, 300), "B": _ramp(100, 150), "C": _ramp(100, 100)}
+
+    pm_instance = MagicMock()
+    # Currently hold A (stays in top-2) and C (ranked last, drops out of top-2).
+    pm_instance.get_holdings.return_value = ({"A": 10.0, "C": 20.0}, {})
+    with patch("ba2_trade_platform.modules.experts.FactorRanker.data.fetch_close_prices", return_value=prices), \
+         patch("ba2_trade_platform.modules.experts.FactorRanker.FactorPortfolioManager", return_value=pm_instance):
+        expert.run_analysis("EXPERT", ma)
+
+    actions = {row["symbol"]: row["action"] for row in ma.state["factor_ranker"]["ranking"]}
+    assert actions["A"] == "HOLD"   # in target and already held
+    assert actions["B"] == "BUY"    # in target, not held
+    assert actions["C"] == "SELL"   # held but dropped from the top-N
 
 
 def test_run_analysis_skips_when_universe_empty():

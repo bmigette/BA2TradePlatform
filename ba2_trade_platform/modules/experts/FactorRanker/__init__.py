@@ -172,9 +172,11 @@ class FactorRanker(MarketExpertInterface):
                 gross_exposure=float(self.get_setting_with_interface_default("gross_exposure")),
             )
 
-            FactorPortfolioManager(self.id).rebalance(targets)
+            pm = FactorPortfolioManager(self.id)
+            held = set(pm.get_holdings()[0])  # symbols currently held (before rebalance)
+            pm.rebalance(targets)
 
-            book = self._build_book(ranked, comp, factor_values, targets, weights, winsorize_pct)
+            book = self._build_book(ranked, comp, factor_values, targets, weights, winsorize_pct, held)
             market_analysis.state = {"factor_ranker": book}
             self._write_output(market_analysis, "Ranked book", "factor_ranking", book)
             market_analysis.status = MarketAnalysisStatus.COMPLETED
@@ -270,21 +272,36 @@ class FactorRanker(MarketExpertInterface):
             return calc(inputs, drift_window_days=window)
         return calc(inputs)
 
-    def _build_book(self, ranked, comp, factor_values, targets, weights, winsorize_pct) -> Dict[str, Any]:
-        """Assemble the ranked-book dict stored in MarketAnalysis.state / shown in the UI."""
+    def _build_book(self, ranked, comp, factor_values, targets, weights, winsorize_pct, held=None) -> Dict[str, Any]:
+        """Assemble the ranked-book dict stored in MarketAnalysis.state / shown in the UI.
+
+        ``action`` is the intended trade for this rebalance, comparing the target
+        book to the symbols currently held (``held``): BUY (new), HOLD (kept),
+        SELL (dropped holding), "—" (ranked but neither targeted nor held).
+        """
+        held = held or set()
         zscores = {
             name: cross_sectional_zscore(vals, winsorize_pct)
             for name, vals in factor_values.items()
         }
         ranking = []
         for i, sym in enumerate(ranked):
+            in_target = sym in targets
+            if in_target and sym not in held:
+                action = "BUY"
+            elif in_target:
+                action = "HOLD"
+            elif sym in held:
+                action = "SELL"
+            else:
+                action = "—"
             ranking.append({
                 "symbol": sym,
                 "rank": i + 1,
                 "composite": round(comp.get(sym, 0.0), 4),
                 "factors": {name: round(z.get(sym, 0.0), 4) for name, z in zscores.items()},
                 "target_weight": round(targets.get(sym, 0.0), 4),
-                "action": "HOLD" if sym in targets else "—",
+                "action": action,
             })
         return {
             "rebalanced_at": datetime.now(timezone.utc).isoformat(),
