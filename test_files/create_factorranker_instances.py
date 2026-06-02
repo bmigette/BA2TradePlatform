@@ -215,9 +215,12 @@ def configure_instance(expert, config: dict) -> None:
         for key, value in config["screener"].items():
             expert.save_setting(key, value)
 
-    # Factor / rank overrides (factor_weights, top_n, weighting, and where
-    # listed max_weight_per_name / pead_drift_window_days).
-    expert.save_setting("factor_weights", config["factors"])
+    # Per-factor weights (one float each; 0 disables a factor).
+    for fname in ("momentum", "value", "quality", "pead"):
+        expert.save_setting(f"factor_weight_{fname}", float(config["factors"].get(fname, 0.0)))
+
+    # Factor / rank overrides (top_n, weighting, and where listed
+    # max_weight_per_name / pead_drift_window_days).
     for key, value in config["overrides"].items():
         expert.save_setting(key, value)
 
@@ -272,7 +275,8 @@ def main() -> int:
     print()
     print(f"Verification round-trip (instance id={verify_id}, "
           f"alias={CONFIGS[0]['alias']}):")
-    print(f"  factor_weights          = {settings.get('factor_weights')}")
+    print(f"  factor weights          = " + ", ".join(
+        f"{f}={settings.get('factor_weight_' + f)}" for f in ("momentum", "value", "quality", "pead")))
     print(f"  universe_source         = {settings.get('universe_source')}")
     print(f"  instrument_selection    = {settings.get('instrument_selection_method')}")
     print(f"  top_n                   = {settings.get('top_n')}")

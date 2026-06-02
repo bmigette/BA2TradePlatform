@@ -67,10 +67,23 @@ class FactorRanker(MarketExpertInterface):
                 "choices": ["static", "screener"],
                 "description": "Candidate universe: 'static' (enabled_instruments) or 'screener' (StockScreener filters).",
             },
-            "factor_weights": {
-                "type": "json", "required": False,
-                "default": {"momentum": 1.0, "value": 1.0, "quality": 1.0, "pead": 0.0},
-                "description": "Per-factor weights; 0 disables a factor (momentum/value/quality/pead).",
+            # One float per factor (0 disables it). Kept as separate scalar settings
+            # rather than one JSON blob so each renders as a simple number field.
+            "factor_weight_momentum": {
+                "type": "float", "required": False, "default": 1.0,
+                "description": "Momentum factor weight (0 disables it).",
+            },
+            "factor_weight_value": {
+                "type": "float", "required": False, "default": 1.0,
+                "description": "Value factor weight (0 disables it).",
+            },
+            "factor_weight_quality": {
+                "type": "float", "required": False, "default": 1.0,
+                "description": "Quality factor weight (0 disables it).",
+            },
+            "factor_weight_pead": {
+                "type": "float", "required": False, "default": 0.0,
+                "description": "Post-earnings-drift (PEAD) factor weight (0 disables it).",
             },
             "top_n": {
                 "type": "int", "required": False, "default": 20,
@@ -135,7 +148,7 @@ class FactorRanker(MarketExpertInterface):
                 self._mark_skipped(market_analysis, "No candidate instruments configured")
                 return
 
-            weights = self.get_setting_with_interface_default("factor_weights") or {}
+            weights = self._factor_weights()
             winsorize_pct = float(self.get_setting_with_interface_default("winsorize_pct") or 0.0)
 
             # Fetch + compute only the enabled factors (weight > 0).
@@ -236,6 +249,14 @@ class FactorRanker(MarketExpertInterface):
             self.logger.debug("FactorRanker: min_dollar_volume guard is reserved and not enforced in v1")
 
         return universe
+
+    def _factor_weights(self) -> Dict[str, float]:
+        """Assemble the per-factor weight dict from the individual float settings
+        (factor_weight_momentum / _value / _quality / _pead)."""
+        return {
+            name: float(self.get_setting_with_interface_default(f"factor_weight_{name}") or 0.0)
+            for name in _FACTOR_PIPELINE
+        }
 
     def _compute_factor(self, name, fetch_name, calc, universe) -> Dict[str, float]:
         """Fetch a factor's inputs in bulk and run its calculator.

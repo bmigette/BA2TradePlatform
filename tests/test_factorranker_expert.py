@@ -17,7 +17,10 @@ def _ramp(start, end, n=260):
 def _make_expert(inst_id, **overrides):
     expert = FactorRanker(inst_id)
     settings = {
-        "factor_weights": {"momentum": 1.0, "value": 0.0, "quality": 0.0, "pead": 0.0},
+        "factor_weight_momentum": 1.0,
+        "factor_weight_value": 0.0,
+        "factor_weight_quality": 0.0,
+        "factor_weight_pead": 0.0,
         "top_n": 2,
         "weighting": "equal",
         "max_weight_per_name": 1.0,
