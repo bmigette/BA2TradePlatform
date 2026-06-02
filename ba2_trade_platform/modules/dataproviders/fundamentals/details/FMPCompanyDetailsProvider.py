@@ -541,20 +541,25 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
                 "retrieved_at": datetime.now().isoformat()
             }
             
+            # FMP dates parse as naive; normalize end_date to naive so the
+            # comparison never mixes offset-naive and offset-aware datetimes
+            # (FactorRanker passes a tz-aware as_of).
+            end_date_cmp = end_date.replace(tzinfo=None) if end_date.tzinfo else end_date
+
             filtered_earnings = []
             for earning in earnings_data:
                 # Parse the date from the earning record
                 earning_date_str = earning.get("date", "")
                 if not earning_date_str:
                     continue
-                
+
                 try:
                     earning_date = datetime.strptime(earning_date_str, "%Y-%m-%d")
                 except:
                     continue
-                
+
                 # Filter by end_date
-                if earning_date > end_date:
+                if earning_date > end_date_cmp:
                     continue
                 
                 # Build earnings entry
@@ -665,20 +670,24 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
                 "retrieved_at": datetime.now().isoformat()
             }
             
+            # FMP dates parse as naive; normalize as_of_date to naive so the
+            # comparison never mixes offset-naive and offset-aware datetimes.
+            as_of_cmp = as_of_date.replace(tzinfo=None) if as_of_date.tzinfo else as_of_date
+
             filtered_estimates = []
             for estimate in estimates_data:
                 # Parse the date from the estimate record
                 estimate_date_str = estimate.get("date", "")
                 if not estimate_date_str:
                     continue
-                
+
                 try:
                     estimate_date = datetime.strptime(estimate_date_str, "%Y-%m-%d")
                 except:
                     continue
-                
+
                 # Only include future estimates (after as_of_date)
-                if estimate_date < as_of_date:
+                if estimate_date < as_of_cmp:
                     continue
                 
                 # Build estimate entry
