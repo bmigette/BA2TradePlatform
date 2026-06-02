@@ -203,10 +203,17 @@ class FactorRanker(MarketExpertInterface):
             return []
 
     def _resolve_universe(self) -> List[str]:
-        """Candidate pool to rank: the configured enabled instruments, after the
-        min_price liquidity guard. (``get_enabled_instruments`` returns the
-        "EXPERT" marker for expert-selection, so read the config directly.)"""
-        universe = list(self._get_enabled_instruments_config().keys())
+        """Candidate pool to rank, after the min_price liquidity guard.
+
+        ``universe_source`` selects how the pool is built: ``screener`` runs the
+        configured StockScreener; ``static`` (default) uses the enabled_instruments
+        config. (``get_enabled_instruments`` returns the "EXPERT" marker for
+        expert-selection, so read the config directly.)"""
+        source = (self.get_setting_with_interface_default("universe_source") or "static").lower()
+        if source == "screener":
+            universe = self._screen_universe()
+        else:
+            universe = list(self._get_enabled_instruments_config().keys())
 
         min_price = float(self.get_setting_with_interface_default("min_price") or 0.0)
         if min_price > 0 and universe:
