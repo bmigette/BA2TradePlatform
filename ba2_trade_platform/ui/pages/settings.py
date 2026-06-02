@@ -2726,7 +2726,8 @@ class ExpertSettingsTab:
         if expert_class is None:
             self.risk_manager_section.set_visibility(True)
             return
-        uses_rm = getattr(expert_class, 'uses_risk_manager', True)
+        from ...core.utils import expert_uses_risk_manager
+        uses_rm = expert_uses_risk_manager(expert_class)
         self.risk_manager_section.set_visibility(bool(uses_rm))
     
     def _update_instrument_selection_options(self):

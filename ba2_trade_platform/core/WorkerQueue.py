@@ -1465,11 +1465,21 @@ class WorkerQueue:
                             logger.debug(f"[RISK_MGR_TRIGGER] ===== END (expert instance record not found) =====")
                             return
                         
+                        # Respect the expert class's risk-manager opt-out BEFORE entering
+                        # any classic/smart RM logic. Experts that self-execute their
+                        # trades (e.g. FactorRanker via FactorPortfolioManager) declare
+                        # uses_risk_manager=False and must not trigger the RM here.
+                        from .utils import expert_uses_risk_manager
+                        if not expert_uses_risk_manager(type(expert)):
+                            logger.info(f"[RISK_MGR_TRIGGER] expert {expert_instance_id} declares uses_risk_manager=False — skipping RM trigger")
+                            logger.debug(f"[RISK_MGR_TRIGGER] ===== END (expert manages own risk) =====")
+                            return
+
                         # Check risk_manager_mode setting with validation and error logging
                         from .utils import get_risk_manager_mode
                         from .db import log_activity
                         from .types import ActivityLogSeverity, ActivityLogType
-                        
+
                         settings = expert.settings or {}
                         risk_manager_mode = get_risk_manager_mode(settings)
                         

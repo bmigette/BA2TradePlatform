@@ -68,6 +68,30 @@ def get_expert_instance_from_id(expert_instance_id: int, use_cache: bool = True)
         return expert_class(expert_instance_id)
 
 
+def expert_uses_risk_manager(expert_class) -> bool:
+    """Resolve whether an expert class relies on the platform's risk manager.
+
+    Experts can opt out of the platform risk manager (classic/smart) when they
+    self-execute their trades (e.g. FactorRanker via FactorPortfolioManager).
+    The signal is read robustly: ``get_expert_properties()`` takes precedence,
+    then the ``uses_risk_manager`` class attribute, defaulting to True. Any
+    error resolving the value also defaults to True (safe / backward-compatible).
+
+    Args:
+        expert_class: The expert class (not instance) to inspect.
+
+    Returns:
+        bool: True if the platform risk manager should be triggered for this
+        expert, False if the expert manages its own risk/execution.
+    """
+    class_attr_default = getattr(expert_class, "uses_risk_manager", True)
+    try:
+        return bool(expert_class.get_expert_properties().get("uses_risk_manager", class_attr_default))
+    except Exception as e:
+        logger.warning(f"expert_uses_risk_manager: failed to resolve for {expert_class!r}, defaulting to True: {e}")
+        return True
+
+
 def get_market_analysis_id_from_order_id(order_id: int) -> Optional[int]:
     """
     Get the market analysis ID associated with an order via its linked recommendation.
