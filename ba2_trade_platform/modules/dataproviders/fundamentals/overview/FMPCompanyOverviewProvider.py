@@ -14,6 +14,7 @@ from ba2_trade_platform.core.interfaces import CompanyFundamentalsOverviewInterf
 from ba2_trade_platform.core.provider_utils import log_provider_call
 from ba2_trade_platform.logger import logger
 from ba2_trade_platform.config import get_app_setting
+from ...fmp_common import fmp_list_call
 
 
 class FMPCompanyOverviewProvider(CompanyFundamentalsOverviewInterface):
@@ -130,9 +131,15 @@ class FMPCompanyOverviewProvider(CompanyFundamentalsOverviewInterface):
         
         try:
             # Make FMP API request for company profile using fmpsdk
-            # API returns array with single profile object
-            profile_data = fmpsdk.company_profile(apikey=self.api_key, symbol=symbol.upper())
-            
+            # API returns array with single profile object. fmp_list_call
+            # normalizes FMP error dicts (HTTP 200 + {"Error Message": ...})
+            # so we never index an error dict with [0].
+            profile_data = fmp_list_call(
+                lambda: fmpsdk.company_profile(apikey=self.api_key, symbol=symbol.upper()),
+                symbol=symbol,
+                endpoint="company_profile",
+            )
+
             if not profile_data or len(profile_data) == 0:
                 raise ValueError(f"No profile data found for symbol {symbol}")
             

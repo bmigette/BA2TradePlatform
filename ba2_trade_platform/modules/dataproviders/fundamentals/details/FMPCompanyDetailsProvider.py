@@ -16,6 +16,7 @@ from ba2_trade_platform.core.interfaces import CompanyFundamentalsDetailsInterfa
 from ba2_trade_platform.core.provider_utils import validate_date_range
 from ba2_trade_platform.config import get_app_setting
 from ba2_trade_platform.logger import logger
+from ...fmp_common import fmp_list_call, FMPError
 
 
 class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
@@ -102,11 +103,15 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
         try:
             # FMP balance_sheet_statement returns list of balance sheets
             period = "annual" if frequency == "annual" else "quarter"
-            balance_data = fmpsdk.balance_sheet_statement(
-                apikey=self.api_key,
+            balance_data = fmp_list_call(
+                lambda: fmpsdk.balance_sheet_statement(
+                    apikey=self.api_key,
+                    symbol=symbol,
+                    period=period,
+                    limit=lookback_periods or 10  # Default to 10 periods
+                ),
                 symbol=symbol,
-                period=period,
-                limit=lookback_periods or 10  # Default to 10 periods
+                endpoint="balance_sheet_statement",
             )
             
             if not balance_data:
@@ -198,11 +203,15 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
         try:
             # FMP income_statement returns list of income statements
             period = "annual" if frequency == "annual" else "quarter"
-            income_data = fmpsdk.income_statement(
-                apikey=self.api_key,
+            income_data = fmp_list_call(
+                lambda: fmpsdk.income_statement(
+                    apikey=self.api_key,
+                    symbol=symbol,
+                    period=period,
+                    limit=lookback_periods or 10
+                ),
                 symbol=symbol,
-                period=period,
-                limit=lookback_periods or 10
+                endpoint="income_statement",
             )
             
             if not income_data:
@@ -286,11 +295,15 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
         try:
             # FMP cash_flow_statement returns list of cash flow statements
             period = "annual" if frequency == "annual" else "quarter"
-            cashflow_data = fmpsdk.cash_flow_statement(
-                apikey=self.api_key,
+            cashflow_data = fmp_list_call(
+                lambda: fmpsdk.cash_flow_statement(
+                    apikey=self.api_key,
+                    symbol=symbol,
+                    period=period,
+                    limit=lookback_periods or 10
+                ),
                 symbol=symbol,
-                period=period,
-                limit=lookback_periods or 10
+                endpoint="cash_flow_statement",
             )
             
             if not cashflow_data:
@@ -512,9 +525,13 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             
             # Fetch earnings data using FMP SDK
             # Note: FMP earnings endpoint returns actual vs estimated EPS
-            earnings_data = fmpsdk.historical_earning_calendar(
-                apikey=self.api_key,
-                symbol=symbol
+            earnings_data = fmp_list_call(
+                lambda: fmpsdk.historical_earning_calendar(
+                    apikey=self.api_key,
+                    symbol=symbol
+                ),
+                symbol=symbol,
+                endpoint="historical_earning_calendar",
             )
             
             if not earnings_data:
@@ -647,7 +664,32 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             response = requests.get(url, params=params, timeout=30)
             response.raise_for_status()
             estimates_data = response.json()
-            
+
+            # FMP returns rate-limit / API errors as HTTP 200 with a JSON dict
+            # (e.g. {"Error Message": "Limit Reach."}). Detect, log the raw
+            # payload, and raise so the outer except returns the error string
+            # instead of iterating a dict.
+            if isinstance(estimates_data, dict):
+                err = (estimates_data.get("Error Message")
+                       or estimates_data.get("error")
+                       or estimates_data.get("message"))
+                if err:
+                    logger.error(
+                        f"FMP analyst-estimates error for {symbol}. "
+                        f"Payload: {estimates_data!r}"
+                    )
+                    raise FMPError(
+                        f"FMP analyst-estimates error for {symbol}: {err}"
+                    )
+                # Unexpected dict shape (no error key) — also not iterable as records.
+                logger.error(
+                    f"FMP analyst-estimates unexpected payload for {symbol}. "
+                    f"Payload: {estimates_data!r}"
+                )
+                raise FMPError(
+                    f"FMP analyst-estimates returned unexpected payload for {symbol}"
+                )
+
             if not estimates_data:
                 logger.warning(f"No earnings estimates found for {symbol}")
                 if format_type == "dict":

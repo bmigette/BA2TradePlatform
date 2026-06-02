@@ -108,6 +108,58 @@ def _first_statement(result: Optional[dict], key: str) -> dict:
     return items[0] if items else {}
 
 
+def _require_statement(result, key: str, label: str) -> dict:
+    """Validate a provider result and return its most-recent record dict.
+
+    The FMP providers return one of three shapes on failure that must NOT be
+    treated as usable data:
+      * an error *string* (statement methods' outer except),
+      * a dict with an ``"error"`` key (earnings methods' outer except),
+      * an unexpected shape missing the expected ``key``.
+
+    Per the FactorRanker contract, any of these — or an empty record list —
+    means the symbol must be dropped, so we raise a clear ValueError that the
+    per-symbol caller logs and skips on.
+
+    Args:
+        result: Raw provider return value.
+        key: Expected container key ("statements"/"earnings"/"estimates").
+        label: Human-readable name for the dataset, used in the error message.
+
+    Returns:
+        The most recent record dict.
+
+    Raises:
+        ValueError: If the result is not a usable dict containing a non-empty
+            list under ``key``.
+    """
+    if not isinstance(result, dict):
+        raise ValueError(f"{label} unavailable (provider returned {type(result).__name__}: {result!r})")
+    if "error" in result:
+        raise ValueError(f"{label} error: {result['error']}")
+    if key not in result:
+        raise ValueError(f"{label} unexpected shape (missing '{key}'): {result!r}")
+    items = result.get(key) or []
+    if not items:
+        raise ValueError(f"{label} empty")
+    return items[0]
+
+
+def _require_metrics(result, label: str) -> dict:
+    """Validate an overview provider result and return its ``metrics`` dict.
+
+    Raises ValueError (caught and logged per-symbol) when the result is not a
+    usable dict carrying a ``metrics`` mapping.
+    """
+    if not isinstance(result, dict):
+        raise ValueError(f"{label} unavailable (provider returned {type(result).__name__}: {result!r})")
+    if "error" in result:
+        raise ValueError(f"{label} error: {result['error']}")
+    if "metrics" not in result or not isinstance(result["metrics"], dict):
+        raise ValueError(f"{label} unexpected shape (missing 'metrics'): {result!r}")
+    return result["metrics"]
+
+
 def fetch_close_prices(symbols, lookback_days: int = 400) -> Dict[str, pd.Series]:
     """{symbol: daily Close Series}. Symbols that fail to fetch are omitted."""
     from ....modules.dataproviders.ohlcv.FMPOHLCVProvider import FMPOHLCVProvider
@@ -133,22 +185,43 @@ def fetch_value_inputs(symbols, as_of: Optional[datetime] = None) -> Dict[str, d
     out: Dict[str, dict] = {}
     for sym in symbols:
         try:
-            ov = overview.get_fundamentals_overview(sym, as_of_date=as_of, format_type="dict")
-            metrics = (ov or {}).get("metrics", {})
-            income = _first_statement(details.get_income_statement(sym, "annual", as_of, lookback_periods=1, format_type="dict"), "statements")
-            balance = _first_statement(details.get_balance_sheet(sym, "annual", as_of, lookback_periods=1, format_type="dict"), "statements")
-            cashflow = _first_statement(details.get_cashflow_statement(sym, "annual", as_of, lookback_periods=1, format_type="dict"), "statements")
+            metrics = _require_metrics(
+                overview.get_fundamentals_overview(sym, as_of_date=as_of, format_type="dict"),
+                "overview",
+            )
+            income = _require_statement(
+                details.get_income_statement(sym, "annual", as_of, lookback_periods=1, format_type="dict"),
+                "statements", "income statement",
+            )
+            balance = _require_statement(
+                details.get_balance_sheet(sym, "annual", as_of, lookback_periods=1, format_type="dict"),
+                "statements", "balance sheet",
+            )
+            cashflow = _require_statement(
+                details.get_cashflow_statement(sym, "annual", as_of, lookback_periods=1, format_type="dict"),
+                "statements", "cash flow statement",
+            )
+            # Value requires a positive price — no failsafe default.
+            price = metrics.get("price")
+            if not price or price <= 0:
+                logger.warning(
+                    f"FactorRanker: dropping {sym} from value inputs "
+                    f"(data unavailable): no positive price (price={price!r})"
+                )
+                continue
             total_debt = (balance.get("short_term_debt") or 0.0) + (balance.get("long_term_debt") or 0.0)
             out[sym] = build_value_inputs(
                 eps_ttm=income.get("eps"),
-                price=metrics.get("price"),
+                price=price,
                 fcf_ttm=cashflow.get("free_cash_flow"),
                 market_cap=metrics.get("market_cap"),
                 total_debt=total_debt,
                 cash=balance.get("cash_and_cash_equivalents"),
             )
         except Exception as e:
-            logger.warning(f"FactorRanker: value fetch failed for {sym}: {e}")
+            logger.warning(
+                f"FactorRanker: dropping {sym} from value inputs (data unavailable): {e}"
+            )
     return out
 
 
@@ -160,18 +233,42 @@ def fetch_quality_inputs(symbols, as_of: Optional[datetime] = None) -> Dict[str,
     out: Dict[str, dict] = {}
     for sym in symbols:
         try:
-            income = _first_statement(details.get_income_statement(sym, "annual", as_of, lookback_periods=1, format_type="dict"), "statements")
-            balance = _first_statement(details.get_balance_sheet(sym, "annual", as_of, lookback_periods=1, format_type="dict"), "statements")
-            cashflow = _first_statement(details.get_cashflow_statement(sym, "annual", as_of, lookback_periods=1, format_type="dict"), "statements")
-            out[sym] = build_quality_inputs(
+            income = _require_statement(
+                details.get_income_statement(sym, "annual", as_of, lookback_periods=1, format_type="dict"),
+                "statements", "income statement",
+            )
+            balance = _require_statement(
+                details.get_balance_sheet(sym, "annual", as_of, lookback_periods=1, format_type="dict"),
+                "statements", "balance sheet",
+            )
+            cashflow = _require_statement(
+                details.get_cashflow_statement(sym, "annual", as_of, lookback_periods=1, format_type="dict"),
+                "statements", "cash flow statement",
+            )
+            inputs = build_quality_inputs(
                 net_income=income.get("net_income"),
                 equity=balance.get("total_shareholder_equity"),
                 gross_profit=income.get("gross_profit"),
                 total_assets=balance.get("total_assets"),
                 operating_cash_flow=cashflow.get("operating_cash_flow"),
             )
+            # Quality requires at least one usable signal: ROE present, or both
+            # gross_profit and total_assets (for gross profitability). Otherwise
+            # the symbol carries no quality information — drop it, don't default.
+            has_signal = inputs.get("roe") is not None or (
+                inputs.get("gross_profit") is not None and inputs.get("total_assets") is not None
+            )
+            if not has_signal:
+                logger.warning(
+                    f"FactorRanker: dropping {sym} from quality inputs "
+                    f"(data unavailable): no ROE and no gross_profit/total_assets pair"
+                )
+                continue
+            out[sym] = inputs
         except Exception as e:
-            logger.warning(f"FactorRanker: quality fetch failed for {sym}: {e}")
+            logger.warning(
+                f"FactorRanker: dropping {sym} from quality inputs (data unavailable): {e}"
+            )
     return out
 
 
@@ -183,8 +280,25 @@ def fetch_pead_inputs(symbols, as_of: Optional[datetime] = None) -> Dict[str, di
     out: Dict[str, dict] = {}
     for sym in symbols:
         try:
-            earnings = _first_statement(details.get_past_earnings(sym, "quarterly", as_of, lookback_periods=1, format_type="dict"), "earnings")
-            estimates = _first_statement(details.get_earnings_estimates(sym, "quarterly", as_of, lookback_periods=1, format_type="dict"), "estimates")
+            # Earnings are the critical PEAD input — drop the symbol if missing/error.
+            earnings = _require_statement(
+                details.get_past_earnings(sym, "quarterly", as_of, lookback_periods=1, format_type="dict"),
+                "earnings", "past earnings",
+            )
+            # Estimates only feed the (optional) dispersion std; if they are
+            # missing/error we keep the symbol with estimate_std=None rather than
+            # dropping it, since SUE still needs only actual vs estimate.
+            try:
+                estimates = _require_statement(
+                    details.get_earnings_estimates(sym, "quarterly", as_of, lookback_periods=1, format_type="dict"),
+                    "estimates", "earnings estimates",
+                )
+            except Exception as est_err:
+                logger.warning(
+                    f"FactorRanker: {sym} earnings estimates unavailable "
+                    f"(continuing without dispersion std): {est_err}"
+                )
+                estimates = {}
             report_date = _parse_date(earnings.get("report_date"))
             out[sym] = {
                 "actual": earnings.get("reported_eps"),
@@ -195,7 +309,9 @@ def fetch_pead_inputs(symbols, as_of: Optional[datetime] = None) -> Dict[str, di
                 "days_since": days_since(report_date, as_of),
             }
         except Exception as e:
-            logger.warning(f"FactorRanker: PEAD fetch failed for {sym}: {e}")
+            logger.warning(
+                f"FactorRanker: dropping {sym} from PEAD inputs (data unavailable): {e}"
+            )
     return out
 
 
