@@ -13,6 +13,7 @@ from typing import Any, Dict, List
 from ....core.db import add_instance, update_instance
 from ....core.interfaces import MarketExpertInterface
 from ....core.models import AnalysisOutput, MarketAnalysis
+from ....core.StockScreener import StockScreener
 from ....core.types import MarketAnalysisStatus
 from ....logger import get_expert_logger
 
@@ -183,6 +184,23 @@ class FactorRanker(MarketExpertInterface):
     # ------------------------------------------------------------------
     # Pipeline helpers
     # ------------------------------------------------------------------
+
+    def _screen_universe(self) -> List[str]:
+        """Resolve the candidate universe by running the configured StockScreener.
+
+        Reads the expert's ``screener_*`` settings (already part of the base
+        interface) and returns the matched symbols (uppercased). Failures degrade
+        to an empty universe rather than raising, so one bad screen doesn't crash
+        the rebalance.
+        """
+        try:
+            result = StockScreener(dict(self.settings)).screen()
+            syms = [r["symbol"].upper() for r in (result.get("results") or []) if r.get("symbol")]
+            self.logger.info(f"FactorRanker: screener returned {len(syms)} candidates")
+            return syms
+        except Exception as e:
+            self.logger.error(f"FactorRanker: screener universe resolution failed: {e}", exc_info=True)
+            return []
 
     def _resolve_universe(self) -> List[str]:
         """Candidate pool to rank: the configured enabled instruments, after the
