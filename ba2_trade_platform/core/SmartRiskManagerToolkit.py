@@ -512,8 +512,9 @@ class SmartRiskManagerToolkit:
         Use get_historical_analyses(symbol) to get deeper history for a specific symbol.
         
         Args:
-            max_age_hours: Maximum age of analyses to return (default 72 hours)
-            
+            max_age_hours: Maximum age of analyses to return (default 24 hours —
+                the tradable window; callers may pass a larger value for context)
+
         Returns:
             List of analysis summaries with metadata, sorted by timestamp DESC
         """
