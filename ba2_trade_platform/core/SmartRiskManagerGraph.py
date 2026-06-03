@@ -783,6 +783,25 @@ final discretion when the analysis context suggests a different setup.
 - In the recommendation `reason` field, briefly cite the levels you used so the choice
   can be reviewed (e.g. `SL=$X (~Y%, above SL_Floor=Z%); TP=$W at BB_Upper; R:R≈R`).
 
+**Signal Strength & Sizing (BUY / OVERWEIGHT / UNDERWEIGHT / SELL):**
+- **Strong BUY / SELL** (high conviction, typically >70% confidence): size up to the
+  full per-symbol limit above, subject to R:R and SL/TP guidance.
+- **OVERWEIGHT** = mild bullish, **UNDERWEIGHT** = mild bearish — these are lower-conviction
+  signals, NOT "do nothing". Treat OVERWEIGHT as a candidate for a **reduced-size** BUY
+  (roughly 1/4–1/2 of the per-symbol limit) and UNDERWEIGHT as a reason to trim/avoid longs
+  (or a small SELL only if shorting is enabled).
+- Still apply the 24h Tradable Universe rule, the Direction Policy, risk limits and R:R ≥ ~2.0
+  to these smaller positions — a small size is not an excuse for a bad setup.
+
+**Avoid Prolonged Inactivity (don't sit in 100% cash by default):**
+- If, during this run, no strong BUY/SELL setup qualifies but there IS at least one
+  OVERWEIGHT (or, where shorting is enabled, UNDERWEIGHT) candidate that meets the 24h
+  rule, risk limits and an acceptable R:R, prefer opening **ONE small starter position**
+  on the best such candidate rather than staying fully in cash.
+- This is a tie-breaker for an idle account, NOT a mandate: never force a trade that breaches
+  the Direction Policy, position limits, or R:R. If nothing clears the bar, staying in cash
+  is acceptable — say so in your summary.
+
 **Recommendations are Queued:**
 - Actions execute AFTER research completes, not immediately
 - Portfolio won't update during research - this is normal
