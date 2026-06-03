@@ -224,6 +224,24 @@ def configure_instance(expert, config: dict) -> None:
     for key, value in config["overrides"].items():
         expert.save_setting(key, value)
 
+    # Materialize the remaining FactorRanker settings to their interface defaults
+    # so every field is explicit in the UI (no blank/None fields). Only fills
+    # settings not already set above.
+    from ba2_trade_platform.modules.experts.FactorRanker import FactorRanker
+    settings_now = expert.settings
+    for key, meta in FactorRanker.get_settings_definitions().items():
+        default = meta.get("default")
+        if settings_now.get(key) is None and default is not None:
+            expert.save_setting(key, default)
+
+    # Base position-sizing settings (otherwise blank in the UI). Keep the
+    # per-instrument cap coherent with the per-name weight cap.
+    eff_max_weight = expert.get_setting_with_interface_default("max_weight_per_name")
+    expert.save_setting(
+        "max_virtual_equity_per_instrument_percent", round(float(eff_max_weight) * 100.0, 1)
+    )
+    expert.save_setting("min_available_balance_pct", 10.0)
+
 
 # -------- main -------------------------------------------------------------
 

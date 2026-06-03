@@ -2388,18 +2388,25 @@ class ExpertSettingsTab:
             if hasattr(self, 'allow_automated_trade_modification_checkbox'):
                 self.allow_automated_trade_modification_checkbox.value = allow_automated_trade_modification
             
-            # Load risk management settings
-            max_virtual_equity_per_instrument = settings_source.get('max_virtual_equity_per_instrument_percent', 10.0)
+            # Load risk management settings.
+            # NOTE: settings_source contains every definition key (pre-filled with
+            # None when no DB row exists), so .get(key, default) returns None rather
+            # than the default. Treat a stored None as "use the interface default".
+            max_virtual_equity_per_instrument = settings_source.get('max_virtual_equity_per_instrument_percent')
+            if max_virtual_equity_per_instrument is None:
+                max_virtual_equity_per_instrument = 10.0
             if isinstance(max_virtual_equity_per_instrument, str):
                 max_virtual_equity_per_instrument = float(max_virtual_equity_per_instrument)
-            
+
             if hasattr(self, 'max_virtual_equity_per_instrument_input'):
                 self.max_virtual_equity_per_instrument_input.value = str(max_virtual_equity_per_instrument)
-            
-            min_available_balance_pct = settings_source.get('min_available_balance_pct', 10.0)
+
+            min_available_balance_pct = settings_source.get('min_available_balance_pct')
+            if min_available_balance_pct is None:
+                min_available_balance_pct = 10.0
             if isinstance(min_available_balance_pct, str):
                 min_available_balance_pct = float(min_available_balance_pct)
-            
+
             if hasattr(self, 'min_available_balance_pct_input'):
                 self.min_available_balance_pct_input.value = str(min_available_balance_pct)
             
