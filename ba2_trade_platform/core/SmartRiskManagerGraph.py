@@ -692,9 +692,17 @@ Research market analyses and recommend specific trading actions. You have FULL A
 ## PORTFOLIO CONTEXT
 {agent_scratchpad}
 
-## POSITION SIZE LIMITS
-- **Max per symbol:** {max_position_pct}% of equity = ${max_position_equity:.2f}
-- Calculate: quantity × current_price ≤ ${max_position_equity:.2f}
+## POSITION SIZE LIMITS & RISK-BASED SIZING
+- **Risk target per trade:** {risk_per_trade_pct}% of equity, sized from your stop loss.
+  When you provide an `sl_price`, the system AUTO-SIZES the position so that
+  entry→stop-loss loss ≈ {risk_per_trade_pct}% of equity (it overrides the `quantity`
+  you pass). So: **choose the SL deliberately — it determines the size.** A tighter SL
+  ⇒ larger position; a wider SL ⇒ smaller position. Pass a sensible `quantity` anyway as
+  a fallback for when no SL is given.
+- **Notional ceiling (hard cap):** {max_position_pct}% of equity = ${max_position_equity:.2f}.
+  The risk-based size is clamped to this notional cap and to available balance. If the cap
+  binds, realized risk will be below the {risk_per_trade_pct}% target — that's expected.
+- Always include an `sl_price` on new positions so risk sizing can work.
 
 ## AVAILABLE TOOLS
 
@@ -782,6 +790,21 @@ final discretion when the analysis context suggests a different setup.
   shrinking the SL distance into intraday noise.
 - In the recommendation `reason` field, briefly cite the levels you used so the choice
   can be reviewed (e.g. `SL=$X (~Y%, above SL_Floor=Z%); TP=$W at BB_Upper; R:R≈R`).
+
+**Manage Winners (press strength, protect gains):**
+- This is an ACTIVE, frequent-trading mandate — don't just open and wait. On every run,
+  review open positions for management actions, not only new entries.
+- **Move to breakeven:** once a position is up ≈ 1R (gain ≈ the initial entry→SL distance),
+  use `recommend_update_stop_loss` to pull the SL to ~breakeven so the trade can't turn red.
+- **Trail to let winners run:** as a winner extends, ratchet the SL up behind structure
+  (e.g. below the 10-EMA / latest higher-low for longs; mirror for shorts) instead of
+  closing early. Prefer trailing over a fixed TP when the trend is intact.
+- **Pyramid into strength:** if a held winner still has a fresh (≤24h) bullish signal and
+  room under the notional cap, you may ADD with `recommend_adjust_quantity` — but only with
+  the combined position's stop set so total risk stays within the {risk_per_trade_pct}%
+  target. Never average DOWN into losers.
+- **Cut quickly:** if the thesis breaks or price closes through the stop structure, close or
+  tighten rather than hoping.
 
 **Signal Strength & Sizing (BUY / OVERWEIGHT / UNDERWEIGHT / SELL):**
 - **Strong BUY / SELL** (high conviction, typically >70% confidence): size up to the
@@ -1553,15 +1576,18 @@ def check_recent_analyses(state: SmartRiskManagerState) -> Dict[str, Any]:
                 logger.warning(f"Price pre-caching failed: {precache_err}")
         
         # Fetch ALL recent analyses (no symbol filter).
-        # Default discovery window is 24h: only symbols analyzed in the last day are
-        # tradable (see the TRADABLE UNIVERSE rule in RESEARCH_PROMPT). The agent can
-        # still pull older history on demand via get_all_recent_analyses_tool /
-        # get_historical_analyses_tool with an explicit larger window.
+        # Discovery window is configurable (smart_risk_manager_analysis_window_hours,
+        # default 24h): only symbols analyzed within it are tradable (see the TRADABLE
+        # UNIVERSE rule in RESEARCH_PROMPT). The agent can still pull older history on
+        # demand via get_all_recent_analyses_tool / get_historical_analyses_tool.
         # Now get_analysis_summary() will use cached prices instead of making individual API calls
-        all_analyses = toolkit.get_recent_analyses(max_age_hours=24)
+        analysis_window_hours = toolkit.expert.get_setting_with_interface_default(
+            "smart_risk_manager_analysis_window_hours"
+        ) or 24
+        all_analyses = toolkit.get_recent_analyses(max_age_hours=analysis_window_hours)
 
         # Build summary for scratchpad
-        analyses_summary = f"\n\n## Recent Market Analyses (Last 24 hours)\n"
+        analyses_summary = f"\n\n## Recent Market Analyses (Last {analysis_window_hours} hours)\n"
         analyses_summary += f"Total analyses available: {len(all_analyses)}\n\n"
         
         # Load ExpertRecommendation data from database for all analyses
@@ -2493,7 +2519,9 @@ class SmartRiskManagerGraph:
             for symbols analyzed within the last 24 hours.
             """
             if max_age_hours is None:
-                max_age_hours = 24
+                max_age_hours = self.toolkit.expert.get_setting_with_interface_default(
+                    "smart_risk_manager_analysis_window_hours"
+                ) or 24
             return self.toolkit.get_recent_analyses(max_age_hours=max_age_hours)
         
         @tool
@@ -2841,7 +2869,8 @@ class SmartRiskManagerGraph:
             max_position_pct = expert.get_setting_with_interface_default("max_virtual_equity_per_instrument_percent")
             current_equity = float(portfolio_status.get("account_virtual_equity", 0))
             max_position_equity = current_equity * (max_position_pct / 100.0)
-            
+            risk_per_trade_pct = expert.get_setting_with_interface_default("risk_per_trade_pct")
+
             # Get expert-specific instructions
             expert_instructions = ""
             try:
@@ -2916,6 +2945,7 @@ class SmartRiskManagerGraph:
                 expert_instructions=formatted_expert_instructions,
                 max_position_pct=max_position_pct,
                 max_position_equity=max_position_equity,
+                risk_per_trade_pct=risk_per_trade_pct,
                 hedging_check_note=hedging_check_note,
                 hedging_instructions=hedging_instructions,
                 locked_symbols_section=locked_symbols_section

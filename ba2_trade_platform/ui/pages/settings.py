@@ -1755,6 +1755,16 @@ class ExpertSettingsTab:
                                     ui.label('%').classes('text-sm')
                                 ui.label('Minimum available balance percentage required to enter new market positions. Lower values (5-10%) allow more aggressive trading, higher values (15-25%) provide more conservative risk management.').classes('text-body2 text-grey-7 ml-2')
 
+                                # Risk Per Trade (Smart Risk Manager risk-based sizing)
+                                with ui.row().classes('items-center gap-2 mt-2'):
+                                    ui.label('Risk per trade (%):').classes('text-sm font-medium')
+                                    self.risk_per_trade_pct_input = ui.input(
+                                        value='5.0',
+                                        placeholder='5.0'
+                                    ).classes('w-20')
+                                    ui.label('%').classes('text-sm')
+                                ui.label('Smart Risk Manager: target loss if the stop is hit, as % of virtual equity. Position is sized from entry→stop distance, then capped by "Max equity per instrument" above. Set that notional cap high enough for this target to be reachable. 0 disables risk-based sizing.').classes('text-body2 text-grey-7 ml-2')
+
                         # Risk manager section - hidden for experts that manage their own risk
                         with ui.column().classes('w-full') as self.risk_manager_section:
                             ui.separator().classes('my-4')
@@ -1835,6 +1845,17 @@ class ExpertSettingsTab:
                                     step=1
                                 ).classes('w-full')
                                 ui.label('Maximum number of analysis cycles the smart risk manager can perform. Higher values allow more thorough analysis but take longer. Recommended: 5-15.').classes('text-body2 text-grey-7 ml-2')
+
+                                # Smart Risk Manager Analysis Window (hours)
+                                ui.label('Analysis Window (hours):').classes('text-sm font-medium mt-2')
+                                self.smart_risk_manager_analysis_window_hours_input = ui.number(
+                                    label='Analysis Discovery Window (hours)',
+                                    value=24,
+                                    min=1,
+                                    max=168,
+                                    step=1
+                                ).classes('w-full')
+                                ui.label('How far back the risk manager looks for analyses when deciding which symbols are tradable to OPEN. Lower it for a more frequent/intraday trader. The agent can still pull older analyses for context. (Screener experts keep a 24h execution floor.)').classes('text-body2 text-grey-7 ml-2')
 
                             ui.separator().classes('my-4')
                         
@@ -2409,7 +2430,15 @@ class ExpertSettingsTab:
 
             if hasattr(self, 'min_available_balance_pct_input'):
                 self.min_available_balance_pct_input.value = str(min_available_balance_pct)
-            
+
+            risk_per_trade_pct = settings_source.get('risk_per_trade_pct')
+            if risk_per_trade_pct is None:
+                risk_per_trade_pct = 5.0
+            if isinstance(risk_per_trade_pct, str):
+                risk_per_trade_pct = float(risk_per_trade_pct)
+            if hasattr(self, 'risk_per_trade_pct_input'):
+                self.risk_per_trade_pct_input.value = str(risk_per_trade_pct)
+
             # Load AI model settings
             risk_manager_model = settings_source.get('risk_manager_model', 'nagaai/gpt5')
             if hasattr(self, 'risk_manager_model_input'):
@@ -2441,7 +2470,14 @@ class ExpertSettingsTab:
                 if smart_risk_manager_max_iterations is None:
                     smart_risk_manager_max_iterations = 10
                 self.smart_risk_manager_max_iterations_input.value = int(smart_risk_manager_max_iterations)
-            
+
+            # Load smart risk manager analysis window (hours)
+            smart_risk_manager_analysis_window_hours = settings_source.get('smart_risk_manager_analysis_window_hours', 24)
+            if hasattr(self, 'smart_risk_manager_analysis_window_hours_input'):
+                if smart_risk_manager_analysis_window_hours is None:
+                    smart_risk_manager_analysis_window_hours = 24
+                self.smart_risk_manager_analysis_window_hours_input.value = int(smart_risk_manager_analysis_window_hours)
+
             # Load ruleset assignments from ExpertInstance model or imported data
             if hasattr(self, 'enter_market_ruleset_select') and hasattr(self, 'enter_market_ruleset_map'):
                 # Check if we have an imported ruleset name
@@ -3971,7 +4007,12 @@ class ExpertSettingsTab:
             min_balance_value = float(self.min_available_balance_pct_input.value or 10.0)
             expert.save_setting('min_available_balance_pct', min_balance_value, setting_type="float")
             logger.debug(f'Saved risk management: min_available_balance_pct={min_balance_value}%')
-        
+
+        if hasattr(self, 'risk_per_trade_pct_input'):
+            risk_per_trade_value = float(self.risk_per_trade_pct_input.value or 5.0)
+            expert.save_setting('risk_per_trade_pct', risk_per_trade_value, setting_type="float")
+            logger.debug(f'Saved risk management: risk_per_trade_pct={risk_per_trade_value}%')
+
         # Save AI model settings
         if hasattr(self, 'risk_manager_model_input'):
             expert.save_setting('risk_manager_model', self.risk_manager_model_input.value, setting_type="str")
@@ -4000,7 +4041,17 @@ class ExpertSettingsTab:
                 max_iterations = 10  # Default value
             expert.save_setting('smart_risk_manager_max_iterations', max_iterations, setting_type="int")
             logger.debug(f'Saved smart risk manager max iterations: {max_iterations}')
-        
+
+        # Save smart risk manager analysis window (hours)
+        if hasattr(self, 'smart_risk_manager_analysis_window_hours_input'):
+            try:
+                value = self.smart_risk_manager_analysis_window_hours_input.value
+                analysis_window_hours = int(value) if value is not None else 24
+            except (ValueError, TypeError):
+                analysis_window_hours = 24  # Default value
+            expert.save_setting('smart_risk_manager_analysis_window_hours', analysis_window_hours, setting_type="int")
+            logger.debug(f'Saved smart risk manager analysis window: {analysis_window_hours}h')
+
         # Save instrument selection method (moved to main panel)
         if hasattr(self, 'instrument_selection_method_select'):
             expert.save_setting('instrument_selection_method', self.instrument_selection_method_select.value, setting_type="str")

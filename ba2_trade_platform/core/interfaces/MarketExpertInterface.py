@@ -107,7 +107,12 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 "max_virtual_equity_per_instrument_percent": {
                     "type": "float", "required": False, "default": 10.0,
                     "description": "Maximum virtual equity allocation per instrument (%)",
-                    "tooltip": "Maximum percentage of virtual trading balance that can be allocated to a single instrument. This helps maintain portfolio diversification. Recommended: 5-15%. Lower values (5-10%) provide better diversification, higher values (10-15%) allow larger positions in high-confidence trades."
+                    "tooltip": "Maximum percentage of virtual trading balance that can be allocated to a single instrument. This helps maintain portfolio diversification. Recommended: 5-15%. Lower values (5-10%) provide better diversification, higher values (10-15%) allow larger positions in high-confidence trades. NOTE: this is a NOTIONAL ceiling and acts as the upper bound for risk_per_trade_pct sizing — if it is too low, the risk-per-trade target cannot be reached."
+                },
+                "risk_per_trade_pct": {
+                    "type": "float", "required": False, "default": 5.0,
+                    "description": "Target risk per trade (% of virtual equity), sized from entry→stop distance",
+                    "tooltip": "When > 0 and the trade has a stop loss, the Smart Risk Manager sizes the position so that entry→stop-loss loss ≈ this % of virtual equity (qty = risk_budget / |entry - SL|). The position is still capped by 'max equity per instrument (%)' (notional) and available balance — so set that notional cap high enough for this risk target to be reachable. Set to 0 to disable risk-based sizing and use the model-chosen quantity."
                 },
                 # AI Model Settings
                 "risk_manager_model": {
@@ -241,6 +246,12 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "description": "Smart Risk Manager Maximum Iterations",
                     "help": "Maximum number of iterations the smart risk manager will run before stopping. Prevents infinite loops and controls execution time.",
                     "tooltip": "Controls how many analysis cycles the smart risk manager can perform before being forced to stop. Higher values allow more thorough analysis but take longer to execute. Recommended: 10-25 iterations. Only used when risk_manager_mode is set to 'smart'."
+                },
+                "smart_risk_manager_analysis_window_hours": {
+                    "type": "int", "required": False, "default": 24,
+                    "description": "Smart Risk Manager analysis discovery window (hours)",
+                    "help": "How far back the smart risk manager looks for analyses when deciding which symbols are tradable. Lower it for a more frequent/intraday trader; raise it to consider a wider set. The agent can still pull older analyses for context via tool calls.",
+                    "tooltip": "Default discovery/tradable window in hours (default 24). Only symbols with a completed analysis within this window are eligible to OPEN new positions. For screener experts a 24h execution floor still applies. Only used when risk_manager_mode is set to 'smart'."
                 },
                 "smart_risk_manager_parallel_tool_calls": {
                     "type": "bool", "required": False, "default": True,
