@@ -809,7 +809,8 @@ class RatingChangeCondition(FlagCondition):
     
     def evaluate(self) -> bool:
         try:
-            recommendations = self.get_previous_recommendations(self.account.id, limit=2)
+            recommendations = self.get_previous_recommendations(
+                self.expert_recommendation.instance_id, limit=2)
             if len(recommendations) < 2:
                 self._previous_action = None
                 self._current_action = None
@@ -885,8 +886,74 @@ class RatingPositiveToNeutralCondition(RatingChangeCondition):
     """Check if rating changed from positive to neutral."""
     def __init__(self, account: AccountInterface, instrument_name: str,
                  expert_recommendation: ExpertRecommendation, existing_order: Optional[TradingOrder] = None):
-        super().__init__(account, instrument_name, expert_recommendation, 
+        super().__init__(account, instrument_name, expert_recommendation,
                         OrderRecommendation.BUY, OrderRecommendation.HOLD, existing_order)
+
+
+# Ordinal rank of the 5 trading grades, bearish -> bullish. ERROR/unknown grades
+# are deliberately absent so any transition involving them yields no signal.
+_RATING_RANK = {
+    OrderRecommendation.SELL: 0,
+    OrderRecommendation.UNDERWEIGHT: 1,
+    OrderRecommendation.HOLD: 2,
+    OrderRecommendation.OVERWEIGHT: 3,
+    OrderRecommendation.BUY: 4,
+}
+
+
+class RatingDirectionCondition(FlagCondition):
+    """Base for rating_upgraded / rating_downgraded: compares the ordinal rank of
+    the two most recent recommendations for this instance + instrument."""
+
+    def _rank_delta(self) -> Optional[int]:
+        recommendations = self.get_previous_recommendations(
+            self.expert_recommendation.instance_id, limit=2)
+        if len(recommendations) < 2:
+            self._previous_action = None
+            self._current_action = None
+            return None
+        previous = recommendations[1].recommended_action
+        current = recommendations[0].recommended_action
+        self._previous_action = previous
+        self._current_action = current
+        if previous not in _RATING_RANK or current not in _RATING_RANK:
+            return None
+        return _RATING_RANK[current] - _RATING_RANK[previous]
+
+    def get_actual_value_display(self) -> Optional[str]:
+        prev = getattr(self, '_previous_action', None)
+        curr = getattr(self, '_current_action', None)
+        if prev is not None and curr is not None:
+            return f"Rating: {prev.value} -> {curr.value}"
+        return "Rating: insufficient history"
+
+
+class RatingUpgradedCondition(RatingDirectionCondition):
+    """True when the latest recommendation's grade rank rose vs the previous one."""
+    def evaluate(self) -> bool:
+        try:
+            delta = self._rank_delta()
+            return delta is not None and delta > 0
+        except Exception as e:
+            logger.error(f"Error evaluating rating upgraded condition: {e}", exc_info=True)
+            return False
+
+    def get_description(self) -> str:
+        return f"Check if rating was upgraded (rank increased) for {self.instrument_name}"
+
+
+class RatingDowngradedCondition(RatingDirectionCondition):
+    """True when the latest recommendation's grade rank fell vs the previous one."""
+    def evaluate(self) -> bool:
+        try:
+            delta = self._rank_delta()
+            return delta is not None and delta < 0
+        except Exception as e:
+            logger.error(f"Error evaluating rating downgraded condition: {e}", exc_info=True)
+            return False
+
+    def get_description(self) -> str:
+        return f"Check if rating was downgraded (rank decreased) for {self.instrument_name}"
 
 
 # Numeric Condition Implementations
@@ -1526,6 +1593,8 @@ def create_condition(event_type: ExpertEventType, account: AccountInterface,
         ExpertEventType.F_CURRENT_RATING_NEUTRAL: CurrentRatingNeutralCondition,
         ExpertEventType.F_CURRENT_RATING_UNDERWEIGHT: CurrentRatingUnderweightCondition,
         ExpertEventType.F_CURRENT_RATING_NEGATIVE: CurrentRatingNegativeCondition,
+        ExpertEventType.F_RATING_UPGRADED: RatingUpgradedCondition,
+        ExpertEventType.F_RATING_DOWNGRADED: RatingDowngradedCondition,
         ExpertEventType.F_HIGHRISK: HighRiskCondition,
         ExpertEventType.F_MEDIUMRISK: MediumRiskCondition,
         ExpertEventType.F_LOWRISK: LowRiskCondition,

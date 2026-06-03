@@ -14,6 +14,8 @@ from ba2_trade_platform.core.TradeConditions import (
     HighRiskCondition, MediumRiskCondition, LowRiskCondition,
     ConfidenceCondition, ExpectedProfitTargetPercentCondition,
     DaysOpenedCondition, ProfitLossPercentCondition,
+    RatingUpgradedCondition, RatingDowngradedCondition,
+    RatingNeutralToPositiveCondition,
     create_condition, CompareCondition,
 )
 from ba2_trade_platform.core.types import (
@@ -203,6 +205,81 @@ class TestDaysOpenedCondition:
         rec = _make_recommendation()
         cond = DaysOpenedCondition(account, "AAPL", rec, ">", 5.0, existing_order=None)
         assert cond.evaluate() is False
+
+
+class TestRatingUpgradeDowngradeConditions:
+    """rating_upgraded / rating_downgraded compare the ordinal rank of the two
+    most recent recommendations for the same instance+symbol.
+    Rank: SELL < UNDERWEIGHT < HOLD < OVERWEIGHT < BUY."""
+
+    def _setup(self, prev_action, curr_action):
+        acct_def = create_account_definition()
+        # Offset so expert-instance id differs from account id (guards the
+        # historical bug of scoping previous recs by account.id).
+        create_expert_instance(account_id=acct_def.id)
+        ei = create_expert_instance(account_id=acct_def.id)
+        assert ei.id != acct_def.id
+        now = datetime.now(timezone.utc)
+        create_recommendation(instance_id=ei.id, symbol="AAPL",
+                              recommended_action=prev_action,
+                              created_at=now - timedelta(hours=1))
+        curr = create_recommendation(instance_id=ei.id, symbol="AAPL",
+                              recommended_action=curr_action, created_at=now)
+        return MockAccount(acct_def.id), curr
+
+    def test_upgraded_hold_to_overweight(self):
+        account, curr = self._setup(OrderRecommendation.HOLD, OrderRecommendation.OVERWEIGHT)
+        assert RatingUpgradedCondition(account, "AAPL", curr).evaluate() is True
+
+    def test_upgraded_overweight_to_buy(self):
+        account, curr = self._setup(OrderRecommendation.OVERWEIGHT, OrderRecommendation.BUY)
+        assert RatingUpgradedCondition(account, "AAPL", curr).evaluate() is True
+
+    def test_upgraded_false_when_unchanged(self):
+        account, curr = self._setup(OrderRecommendation.OVERWEIGHT, OrderRecommendation.OVERWEIGHT)
+        assert RatingUpgradedCondition(account, "AAPL", curr).evaluate() is False
+
+    def test_upgraded_false_on_downgrade(self):
+        account, curr = self._setup(OrderRecommendation.BUY, OrderRecommendation.HOLD)
+        assert RatingUpgradedCondition(account, "AAPL", curr).evaluate() is False
+
+    def test_downgraded_buy_to_overweight(self):
+        account, curr = self._setup(OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT)
+        assert RatingDowngradedCondition(account, "AAPL", curr).evaluate() is True
+
+    def test_downgraded_hold_to_sell(self):
+        account, curr = self._setup(OrderRecommendation.HOLD, OrderRecommendation.SELL)
+        assert RatingDowngradedCondition(account, "AAPL", curr).evaluate() is True
+
+    def test_downgraded_false_on_upgrade(self):
+        account, curr = self._setup(OrderRecommendation.UNDERWEIGHT, OrderRecommendation.HOLD)
+        assert RatingDowngradedCondition(account, "AAPL", curr).evaluate() is False
+
+    def test_insufficient_history_returns_false(self):
+        acct_def = create_account_definition()
+        ei = create_expert_instance(account_id=acct_def.id)
+        curr = create_recommendation(instance_id=ei.id, symbol="AAPL",
+                                     recommended_action=OrderRecommendation.BUY)
+        assert RatingUpgradedCondition(MockAccount(acct_def.id), "AAPL", curr).evaluate() is False
+
+
+class TestRatingChangeScopesByInstanceId:
+    """Regression: rating-change conditions must scope previous recommendations
+    by the recommendation's instance_id, not the account id."""
+
+    def test_neutral_to_positive_reads_by_instance_id(self):
+        acct_def = create_account_definition()
+        create_expert_instance(account_id=acct_def.id)  # offset ids
+        ei = create_expert_instance(account_id=acct_def.id)
+        assert ei.id != acct_def.id
+        now = datetime.now(timezone.utc)
+        create_recommendation(instance_id=ei.id, symbol="AAPL",
+                              recommended_action=OrderRecommendation.HOLD,
+                              created_at=now - timedelta(hours=1))
+        curr = create_recommendation(instance_id=ei.id, symbol="AAPL",
+                              recommended_action=OrderRecommendation.BUY, created_at=now)
+        cond = RatingNeutralToPositiveCondition(MockAccount(acct_def.id), "AAPL", curr)
+        assert cond.evaluate() is True
 
 
 class TestCreateConditionFactory:

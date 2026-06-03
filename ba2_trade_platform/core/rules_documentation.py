@@ -92,7 +92,19 @@ def get_event_type_documentation() -> dict:
             "type": "boolean",
             "example": "Buy signal weakening - consider taking profits"
         },
-        
+        ExpertEventType.F_RATING_UPGRADED.value: {
+            "name": "Rating: Upgraded",
+            "description": "Triggers when the expert's grade moved UP the 5-grade scale (SELL < UNDERWEIGHT < HOLD < OVERWEIGHT < BUY) vs the previous recommendation - e.g. HOLD→OVERWEIGHT or OVERWEIGHT→BUY. Covers OVERWEIGHT/UNDERWEIGHT moves the 3-bucket events cannot express.",
+            "type": "boolean",
+            "example": "Analysts turning more bullish - consider entering or adding"
+        },
+        ExpertEventType.F_RATING_DOWNGRADED.value: {
+            "name": "Rating: Downgraded",
+            "description": "Triggers when the expert's grade moved DOWN the 5-grade scale vs the previous recommendation - e.g. BUY→OVERWEIGHT or HOLD→SELL.",
+            "type": "boolean",
+            "example": "Analysts turning less bullish - consider trimming or exiting"
+        },
+
         # Current Rating States
         ExpertEventType.F_CURRENT_RATING_POSITIVE.value: {
             "name": "Current Rating is Positive",

@@ -10,6 +10,50 @@ from ...core.types import MarketAnalysisStatus, OrderRecommendation, RiskLevel, 
 from ...logger import get_expert_logger
 
 
+# Standard analyst-consensus values for the 5 rating buckets (bearish -> bullish).
+RATING_VALUES = {"strongBuy": 5, "buy": 4, "hold": 3, "sell": 2, "strongSell": 1}
+
+# Default consensus-mean thresholds: the inclusive lower bound of each grade on
+# the 1-5 scale. mean >= buy -> BUY, >= overweight -> OVERWEIGHT, >= hold -> HOLD,
+# >= underweight -> UNDERWEIGHT, else SELL.
+DEFAULT_RATING_THRESHOLDS = {"buy": 4.5, "overweight": 3.5, "hold": 2.5, "underweight": 1.5}
+
+
+def consensus_from_counts(counts: Dict[str, Any], thresholds: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+    """Map Finnhub analyst rating counts to a 5-grade recommendation.
+
+    Uses the consensus mean on a 1-5 scale (strongSell=1 ... strongBuy=5) and
+    buckets it into SELL/UNDERWEIGHT/HOLD/OVERWEIGHT/BUY. Confidence is the share
+    (0-100) of analysts on the dominant side of the chosen grade.
+
+    Returns a dict with: signal (OrderRecommendation), confidence (float),
+    mean (float|None), total (int).
+    """
+    t = thresholds or DEFAULT_RATING_THRESHOLDS
+    sb = counts.get("strongBuy", 0) or 0
+    b = counts.get("buy", 0) or 0
+    h = counts.get("hold", 0) or 0
+    s = counts.get("sell", 0) or 0
+    ss = counts.get("strongSell", 0) or 0
+    total = sb + b + h + s + ss
+    if total <= 0:
+        return {"signal": OrderRecommendation.HOLD, "confidence": 0.0, "mean": None, "total": 0}
+
+    mean = (5 * sb + 4 * b + 3 * h + 2 * s + 1 * ss) / total
+    if mean >= t["buy"]:
+        signal, agree = OrderRecommendation.BUY, sb + b
+    elif mean >= t["overweight"]:
+        signal, agree = OrderRecommendation.OVERWEIGHT, sb + b
+    elif mean >= t["hold"]:
+        signal, agree = OrderRecommendation.HOLD, h
+    elif mean >= t["underweight"]:
+        signal, agree = OrderRecommendation.UNDERWEIGHT, s + ss
+    else:
+        signal, agree = OrderRecommendation.SELL, s + ss
+    confidence = (agree / total) * 100.0
+    return {"signal": signal, "confidence": confidence, "mean": mean, "total": total}
+
+
 class FinnHubRating(MarketExpertInterface):
     """
     FinnHubRating Expert Implementation
@@ -42,15 +86,41 @@ class FinnHubRating(MarketExpertInterface):
     
     @classmethod
     def get_settings_definitions(cls) -> Dict[str, Any]:
-        """Define configurable settings for FinnHubRating expert."""
+        """Define configurable settings for FinnHubRating expert.
+
+        The analyst consensus mean (1=strongSell .. 5=strongBuy) is bucketed into
+        the 5-grade scale using these inclusive lower-bound thresholds.
+        """
         return {
-            "strong_factor": {
-                "type": "float", 
-                "required": True, 
-                "default": 2.0,
-                "description": "Weight multiplier for strong buy/sell ratings",
-                "tooltip": "Strong buy and strong sell ratings are multiplied by this factor when calculating confidence. Higher values (2-3) give more weight to strong ratings."
-            }
+            "buy_threshold": {
+                "type": "float", "required": True, "default": DEFAULT_RATING_THRESHOLDS["buy"],
+                "description": "Consensus mean (1-5) at or above which the rating is BUY (strong bullish)",
+                "tooltip": "Default 4.5 — needs a strong-buy-leaning analyst consensus."
+            },
+            "overweight_threshold": {
+                "type": "float", "required": True, "default": DEFAULT_RATING_THRESHOLDS["overweight"],
+                "description": "Consensus mean at or above which the rating is OVERWEIGHT (mild bullish)",
+                "tooltip": "Default 3.5 — buy-leaning consensus below the BUY threshold."
+            },
+            "hold_threshold": {
+                "type": "float", "required": True, "default": DEFAULT_RATING_THRESHOLDS["hold"],
+                "description": "Consensus mean at or above which the rating is HOLD (neutral)",
+                "tooltip": "Default 2.5 — below this becomes UNDERWEIGHT/SELL."
+            },
+            "underweight_threshold": {
+                "type": "float", "required": True, "default": DEFAULT_RATING_THRESHOLDS["underweight"],
+                "description": "Consensus mean at or above which the rating is UNDERWEIGHT (mild bearish); below it is SELL",
+                "tooltip": "Default 1.5 — below this becomes SELL (strong bearish)."
+            },
+        }
+
+    def _get_rating_thresholds(self) -> Dict[str, float]:
+        """Read the consensus-mean bucket thresholds from settings (with defaults)."""
+        return {
+            "buy": float(self.get_setting("buy_threshold")),
+            "overweight": float(self.get_setting("overweight_threshold")),
+            "hold": float(self.get_setting("hold_threshold")),
+            "underweight": float(self.get_setting("underweight_threshold")),
         }
     
     def _fetch_recommendation_trends(self, symbol: str) -> list:
@@ -105,20 +175,19 @@ class FinnHubRating(MarketExpertInterface):
         except requests.exceptions.RequestException as e:
             raise ValueError(f"Finnhub API request failed for {symbol}: {e}")
     
-    def _calculate_recommendation(self, trends_data: list, strong_factor: float) -> Dict[str, Any]:
+    def _calculate_recommendation(self, trends_data: list, thresholds: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
         """
-        Calculate trading recommendation from trends data.
-        
-        Uses the most recent recommendation period and calculates:
-        - Buy score: (strong_buy * strong_factor) + buy
-        - Sell score: (strong_sell * strong_factor) + sell
-        - Confidence: (max(buy_score, sell_score) / total_weighted_recommendations)
-        - Signal: BUY if buy_score > sell_score, SELL if sell_score > buy_score, HOLD otherwise
-        
+        Calculate a 5-grade trading recommendation from trends data.
+
+        Uses the most recent recommendation period and the analyst consensus mean
+        (1=strongSell .. 5=strongBuy), bucketed into BUY/OVERWEIGHT/HOLD/
+        UNDERWEIGHT/SELL via the configured thresholds. Confidence is the share of
+        analysts on the dominant side of the chosen grade.
+
         Args:
             trends_data: List of recommendation trend periods from Finnhub
-            strong_factor: Weight multiplier for strong ratings
-            
+            thresholds: Optional consensus-mean bucket thresholds (defaults applied)
+
         Returns:
             Dictionary with recommendation details
         """
@@ -127,80 +196,48 @@ class FinnHubRating(MarketExpertInterface):
                 'signal': OrderRecommendation.HOLD,
                 'confidence': 0.0,
                 'details': 'No recommendation data available',
-                'buy_score': 0,
-                'sell_score': 0,
-                'hold_score': 0,
-                'period': None
+                'mean': None,
+                'total': 0,
+                'counts': {},
+                'period': None,
             }
-        
+
         # Use the most recent period (first item in list)
         latest = trends_data[0]
-        
-        # Extract counts
-        strong_buy = latest.get('strongBuy', 0)
-        buy = latest.get('buy', 0)
-        hold = latest.get('hold', 0)
-        sell = latest.get('sell', 0)
-        strong_sell = latest.get('strongSell', 0)
         period = latest.get('period', 'Unknown')
-        
-        # Calculate weighted scores (hold is also treated as a score now)
-        buy_score = (strong_buy * strong_factor) + buy
-        sell_score = (strong_sell * strong_factor) + sell
-        hold_score = hold  # Hold ratings are counted as-is
-        
-        # Total weighted recommendations
-        total_weighted = buy_score + sell_score + hold_score
-        
-        # Determine signal
-        if buy_score > sell_score and buy_score > hold_score:
-            signal = OrderRecommendation.BUY
-            dominant_score = buy_score
-        elif sell_score > buy_score and sell_score > hold_score:
-            signal = OrderRecommendation.SELL
-            dominant_score = sell_score
-        else:
-            signal = OrderRecommendation.HOLD
-            dominant_score = hold_score
-        
-        # Calculate confidence (ratio of dominant signal to total) - stored as 1-100 scale
-        confidence = (dominant_score / total_weighted * 100) if total_weighted > 0 else 0.0
-        
-        # Build details string
+        counts = {k: latest.get(k, 0) for k in ('strongBuy', 'buy', 'hold', 'sell', 'strongSell')}
+
+        result = consensus_from_counts(counts, thresholds)
+        signal = result['signal']
+        confidence = result['confidence']
+        mean = result['mean']
+        total = result['total']
+        mean_str = f"{mean:.2f}" if mean is not None else "N/A"
+
         details = f"""Finnhub Recommendation Trends Analysis (Period: {period})
 
 Analyst Ratings:
-- Strong Buy: {strong_buy}
-- Buy: {buy}
-- Hold: {hold}
-- Sell: {sell}
-- Strong Sell: {strong_sell}
+- Strong Buy: {counts['strongBuy']}
+- Buy: {counts['buy']}
+- Hold: {counts['hold']}
+- Sell: {counts['sell']}
+- Strong Sell: {counts['strongSell']}
 
-Weighted Scores (Strong Factor: {strong_factor}x):
-- Buy Score: {buy_score:.1f}
-- Hold Score: {hold_score:.1f}
-- Sell Score: {sell_score:.1f}
-- Total Weighted: {total_weighted:.1f}
+Consensus Mean (1=Strong Sell .. 5=Strong Buy): {mean_str}  ({total} analysts)
 
 Recommendation: {signal.value}
-Confidence: {confidence:.1f}%
-
-Calculation Method:
-Buy Score = (Strong Buy × {strong_factor}) + Buy = ({strong_buy} × {strong_factor}) + {buy} = {buy_score:.1f}
-Hold Score = Hold = {hold}
-Sell Score = (Strong Sell × {strong_factor}) + Sell = ({strong_sell} × {strong_factor}) + {sell} = {sell_score:.1f}
-Confidence = Dominant Score / Total × 100 = {dominant_score:.1f} / {total_weighted:.1f} × 100 = {confidence:.1f}%
+Confidence (agreement on dominant side): {confidence:.1f}%
 """
-        
+
         return {
             'signal': signal,
             'confidence': confidence,
             'details': details,
-            'buy_score': buy_score,
-            'sell_score': sell_score,
-            'hold_score': hold_score,
+            'mean': mean,
+            'total': total,
+            'counts': counts,
             'period': period,
-            'raw_data': latest
+            'raw_data': latest,
         }
     
     def _create_expert_recommendation(self, recommendation_data: Dict[str, Any], 
@@ -307,14 +344,14 @@ Confidence = Dominant Score / Total × 100 = {dominant_score:.1f} / {total_weigh
             market_analysis.status = MarketAnalysisStatus.RUNNING
             update_instance(market_analysis)
             
-            # Get strong factor setting
-            strong_factor = self.settings.get('strong_factor', 2.0)
-            
+            # Get consensus-mean bucket thresholds
+            thresholds = self._get_rating_thresholds()
+
             # Fetch recommendation trends from Finnhub (raises ValueError on error)
             trends_data = self._fetch_recommendation_trends(symbol)
-            
+
             # Calculate recommendation
-            recommendation_data = self._calculate_recommendation(trends_data, strong_factor)
+            recommendation_data = self._calculate_recommendation(trends_data, thresholds)
             
             # Get current price
             current_price = self._get_current_price(symbol)
@@ -337,19 +374,18 @@ Confidence = Dominant Score / Total × 100 = {dominant_score:.1f} / {total_weigh
                 'signal': recommendation_data['signal'].value if hasattr(recommendation_data['signal'], 'value') else recommendation_data['signal'],
                 'confidence': recommendation_data['confidence'],
                 'details': recommendation_data['details'],
-                'buy_score': recommendation_data['buy_score'],
-                'sell_score': recommendation_data['sell_score'],
-                'hold_score': recommendation_data['hold_score'],
+                'mean': recommendation_data['mean'],
+                'total': recommendation_data['total'],
                 'period': str(recommendation_data['period']) if recommendation_data['period'] else None
             }
-            
+
             # Store analysis state
             market_analysis.state = {
                 'finnhub_rating': {
                     'recommendation': sanitized_recommendation,
                     'api_response': sanitized_trends,
                     'settings': {
-                        'strong_factor': strong_factor
+                        'thresholds': thresholds
                     },
                     'expert_recommendation_id': recommendation_id,
                     'analysis_timestamp': datetime.now(timezone.utc).isoformat(),
@@ -600,47 +636,39 @@ Confidence = Dominant Score / Total × 100 = {dominant_score:.1f} / {total_weigh
                     ui.separator().classes('my-2')
                     ui.label(f'Total Analysts: {total}').classes('text-sm').style('color: #00d4aa')
             
-            # Weighted scores
-            buy_score = rec.get('buy_score', 0)
-            sell_score = rec.get('sell_score', 0)
-            hold_score = rec.get('hold_score', 0)
-            strong_factor = settings.get('strong_factor', 2.0)
-            
+            # Consensus mean
+            mean = rec.get('mean')
+            total = rec.get('total', 0)
+            mean_str = f'{mean:.2f}' if isinstance(mean, (int, float)) else 'N/A'
+
             with ui.card_section():
-                ui.label('Weighted Scoring').classes('text-subtitle1 text-weight-medium mb-2').style('color: #e2e8f0')
-                ui.label(f'Strong Factor: {strong_factor}x').classes('text-sm mb-2').style('color: #a0aec0')
-                
-                with ui.grid(columns=3).classes('w-full gap-4'):
+                ui.label('Consensus').classes('text-subtitle1 text-weight-medium mb-2').style('color: #e2e8f0')
+                with ui.grid(columns=2).classes('w-full gap-4'):
                     with ui.card().style('background-color: rgba(0, 212, 170, 0.15)'):
-                        ui.label('Buy Score').classes('text-caption').style('color: #a0aec0')
-                        ui.label(f'{buy_score:.1f}').classes('text-h5').style('color: #00d4aa')
-                    
-                    with ui.card().style('background-color: rgba(255, 169, 77, 0.15)'):
-                        ui.label('Hold Score').classes('text-caption').style('color: #a0aec0')
-                        ui.label(f'{hold_score:.1f}').classes('text-h5').style('color: #ffa94d')
-                    
-                    with ui.card().style('background-color: rgba(255, 107, 107, 0.15)'):
-                        ui.label('Sell Score').classes('text-caption').style('color: #a0aec0')
-                        ui.label(f'{sell_score:.1f}').classes('text-h5').style('color: #ff6b6b')
-            
+                        ui.label('Consensus Mean (1-5)').classes('text-caption').style('color: #a0aec0')
+                        ui.label(mean_str).classes('text-h5').style('color: #00d4aa')
+                    with ui.card().style('background-color: rgba(160, 174, 192, 0.15)'):
+                        ui.label('Analysts').classes('text-caption').style('color: #a0aec0')
+                        ui.label(str(total)).classes('text-h5').style('color: #e2e8f0')
+
             # Methodology
             with ui.expansion('Calculation Methodology', icon='info').classes('w-full').style('color: #e2e8f0'):
                 with ui.card_section().style('background-color: #141c28'):
                     ui.markdown('''
-**Confidence Calculation:**
+**5-Grade Consensus Mapping:**
 
-The confidence score is calculated by weighting strong buy/sell ratings and comparing all scores:
+Each analyst rating is scored on a 1-5 scale (Strong Sell = 1 ... Strong Buy = 5),
+and the **consensus mean** is bucketed into a grade:
 
-1. **Buy Score** = (Strong Buy × Strong Factor) + Buy
-2. **Hold Score** = Hold
-3. **Sell Score** = (Strong Sell × Strong Factor) + Sell  
-4. **Total Weighted** = Buy Score + Hold Score + Sell Score
-5. **Confidence** = Dominant Score / Total Weighted
+| Consensus mean | Grade |
+|---|---|
+| ≥ 4.5 | **BUY** (strong bullish) |
+| 3.5 – 4.5 | **OVERWEIGHT** (mild bullish) |
+| 2.5 – 3.5 | **HOLD** (neutral) |
+| 1.5 – 2.5 | **UNDERWEIGHT** (mild bearish) |
+| < 1.5 | **SELL** (strong bearish) |
 
-**Recommendation Logic:**
-- **BUY**: Buy Score > Sell Score AND Buy Score > Hold Score
-- **SELL**: Sell Score > Buy Score AND Sell Score > Hold Score
-- **HOLD**: Otherwise (Hold Score is highest)
+**Confidence** = share of analysts on the dominant side of the chosen grade.
 
-**Strong Factor**: Multiplier for strong buy/sell ratings (default: 2x)
+Thresholds are configurable per instance (buy / overweight / hold / underweight).
                     ''').classes('text-sm')

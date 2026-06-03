@@ -285,6 +285,13 @@ class ExpertEventType(str, Enum):
     F_RATING_NEUTRAL_TO_POSITIVE = "rating_neutral_to_positive"
     F_RATING_POSITIVE_TO_NEGATIVE = "rating_positive_to_negative"
     F_RATING_POSITIVE_TO_NEUTRAL = "rating_positive_to_neutral"
+    # Ordinal rating moves across the full 5-grade scale
+    # (SELL < UNDERWEIGHT < HOLD < OVERWEIGHT < BUY): fire whenever the latest
+    # recommendation's grade rank rose (upgraded) or fell (downgraded) vs the
+    # previous one. Covers OVERWEIGHT/UNDERWEIGHT transitions that the 3-bucket
+    # rating_*_to_* events cannot express.
+    F_RATING_UPGRADED = "rating_upgraded"
+    F_RATING_DOWNGRADED = "rating_downgraded"
     F_CURRENT_RATING_POSITIVE = "current_rating_positive"
     F_CURRENT_RATING_OVERWEIGHT = "current_rating_overweight"
     F_CURRENT_RATING_NEUTRAL = "current_rating_neutral"
