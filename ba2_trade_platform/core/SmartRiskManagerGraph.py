@@ -692,17 +692,14 @@ Research market analyses and recommend specific trading actions. You have FULL A
 ## PORTFOLIO CONTEXT
 {agent_scratchpad}
 
-## POSITION SIZE LIMITS & RISK-BASED SIZING
-- **Risk target per trade:** {risk_per_trade_pct}% of equity, sized from your stop loss.
-  When you provide an `sl_price`, the system AUTO-SIZES the position so that
-  entry→stop-loss loss ≈ {risk_per_trade_pct}% of equity (it overrides the `quantity`
-  you pass). So: **choose the SL deliberately — it determines the size.** A tighter SL
-  ⇒ larger position; a wider SL ⇒ smaller position. Pass a sensible `quantity` anyway as
-  a fallback for when no SL is given.
-- **Notional ceiling (hard cap):** {max_position_pct}% of equity = ${max_position_equity:.2f}.
-  The risk-based size is clamped to this notional cap and to available balance. If the cap
-  binds, realized risk will be below the {risk_per_trade_pct}% target — that's expected.
-- Always include an `sl_price` on new positions so risk sizing can work.
+## POSITION SIZE LIMITS
+- **Max per symbol (hard ceiling):** {max_position_pct}% of equity = ${max_position_equity:.2f}.
+  This is a MAXIMUM, not a target — do NOT default every position to the cap. Size by
+  conviction: scale toward the cap for your highest-conviction setups and take smaller
+  positions for weaker/OVERWEIGHT ones.
+- Calculate: quantity × current_price ≤ ${max_position_equity:.2f} (the system enforces
+  this ceiling and will trim an oversized order down to it).
+- Always include an `sl_price` so the position is risk-managed from the start.
 
 ## AVAILABLE TOOLS
 
@@ -800,9 +797,9 @@ final discretion when the analysis context suggests a different setup.
   (e.g. below the 10-EMA / latest higher-low for longs; mirror for shorts) instead of
   closing early. Prefer trailing over a fixed TP when the trend is intact.
 - **Pyramid into strength:** if a held winner still has a fresh (≤24h) bullish signal and
-  room under the notional cap, you may ADD with `recommend_adjust_quantity` — but only with
-  the combined position's stop set so total risk stays within the {risk_per_trade_pct}%
-  target. Never average DOWN into losers.
+  room under the per-symbol notional cap, you may ADD with `recommend_adjust_quantity` —
+  keeping the combined position within that cap and raising the stop so the add is
+  protected. Never average DOWN into losers.
 - **Cut quickly:** if the thesis breaks or price closes through the stop structure, close or
   tighten rather than hoping.
 
@@ -2869,7 +2866,6 @@ class SmartRiskManagerGraph:
             max_position_pct = expert.get_setting_with_interface_default("max_virtual_equity_per_instrument_percent")
             current_equity = float(portfolio_status.get("account_virtual_equity", 0))
             max_position_equity = current_equity * (max_position_pct / 100.0)
-            risk_per_trade_pct = expert.get_setting_with_interface_default("risk_per_trade_pct")
 
             # Get expert-specific instructions
             expert_instructions = ""
@@ -2945,7 +2941,6 @@ class SmartRiskManagerGraph:
                 expert_instructions=formatted_expert_instructions,
                 max_position_pct=max_position_pct,
                 max_position_equity=max_position_equity,
-                risk_per_trade_pct=risk_per_trade_pct,
                 hedging_check_note=hedging_check_note,
                 hedging_instructions=hedging_instructions,
                 locked_symbols_section=locked_symbols_section

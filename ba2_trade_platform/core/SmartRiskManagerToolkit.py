@@ -22,33 +22,6 @@ from .interfaces import MarketExpertInterface
 from .TransactionHelper import TransactionHelper
 
 
-def compute_risk_based_quantity(
-    entry_price: Optional[float],
-    sl_price: Optional[float],
-    virtual_equity: Optional[float],
-    risk_per_trade_pct: Optional[float],
-) -> Optional[int]:
-    """Whole-share quantity sized so the entry->stop-loss loss is ~risk_per_trade_pct%
-    of virtual equity: qty = (risk_per_trade_pct% * virtual_equity) / |entry - sl|.
-
-    Returns None when risk-based sizing cannot/should not be applied (feature disabled,
-    no stop loss, non-positive prices, zero stop distance, or a sub-1-share result) — in
-    which case the caller keeps the model-chosen quantity.
-    """
-    if not risk_per_trade_pct or risk_per_trade_pct <= 0:
-        return None
-    if entry_price is None or sl_price is None or virtual_equity is None:
-        return None
-    if entry_price <= 0 or virtual_equity <= 0:
-        return None
-    stop_distance = abs(entry_price - sl_price)
-    if stop_distance <= 0:
-        return None
-    risk_budget = virtual_equity * (risk_per_trade_pct / 100.0)
-    qty = int(risk_budget / stop_distance)  # floor to whole shares
-    return qty if qty >= 1 else None
-
-
 class SmartRiskManagerToolkit:
     """
     Toolkit providing access to portfolio data, market analyses, and trading actions
@@ -2082,28 +2055,6 @@ class SmartRiskManagerToolkit:
                     "direction": direction
                 }
 
-            # Risk-based sizing: when a stop loss is provided and risk_per_trade_pct > 0,
-            # size the position so entry->SL loss is ~risk_per_trade_pct% of virtual equity
-            # (overriding the model-chosen quantity). Clamp to affordable balance here; the
-            # per-instrument notional cap below clamps it further (and we warn if that cap
-            # prevents the risk target from being reached).
-            risk_sized = False
-            risk_per_trade_pct = self.expert.get_setting_with_interface_default("risk_per_trade_pct")
-            risk_qty = compute_risk_based_quantity(current_price, sl_price, virtual_equity, risk_per_trade_pct)
-            if risk_qty is not None:
-                affordable_qty = int(available_balance / current_price) if current_price > 0 else 0
-                sized = min(risk_qty, affordable_qty) if affordable_qty > 0 else risk_qty
-                if sized >= 1:
-                    if sized != quantity:
-                        stop_distance = abs(current_price - sl_price)
-                        logger.info(
-                            f"Risk-based sizing: {symbol} qty {quantity} -> {sized} "
-                            f"(target {risk_per_trade_pct}% of ${virtual_equity:.2f} equity, "
-                            f"stop dist ${stop_distance:.2f}, risk_qty={risk_qty}, affordable={affordable_qty})"
-                        )
-                    quantity = sized
-                    risk_sized = True
-
             position_value = current_price * quantity
 
             # Check if expert has enough available balance for this position
@@ -2153,18 +2104,6 @@ class SmartRiskManagerToolkit:
                 position_value = current_price * quantity
                 quantity_was_adjusted = True
                 logger.info(f"Automatically adjusted quantity from {original_quantity} to {quantity} to respect max position size limit ({max_position_pct}% of equity = ${max_position_value:.2f})")
-
-                # Surface the sizing conflict: the notional per-instrument cap clamped a
-                # risk-based position below its risk_per_trade_pct target. Raise
-                # max_virtual_equity_per_instrument_percent for this expert if you want the
-                # full risk target to be reachable.
-                if risk_sized and sl_price:
-                    realized_risk_pct = (quantity * abs(current_price - sl_price) / virtual_equity * 100.0) if virtual_equity > 0 else 0.0
-                    logger.warning(
-                        f"Risk-based sizing for {symbol} was capped by the per-instrument notional limit "
-                        f"({max_position_pct}% of equity): realized risk ~{realized_risk_pct:.2f}% vs target "
-                        f"{risk_per_trade_pct}%. Raise max_virtual_equity_per_instrument_percent to reach the target."
-                    )
 
             # Create transaction BEFORE submitting orders
             # Safety check: ensure quantity is positive

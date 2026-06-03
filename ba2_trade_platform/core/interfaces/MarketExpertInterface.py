@@ -107,12 +107,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 "max_virtual_equity_per_instrument_percent": {
                     "type": "float", "required": False, "default": 10.0,
                     "description": "Maximum virtual equity allocation per instrument (%)",
-                    "tooltip": "Maximum percentage of virtual trading balance that can be allocated to a single instrument. This helps maintain portfolio diversification. Recommended: 5-15%. Lower values (5-10%) provide better diversification, higher values (10-15%) allow larger positions in high-confidence trades. NOTE: this is a NOTIONAL ceiling and acts as the upper bound for risk_per_trade_pct sizing — if it is too low, the risk-per-trade target cannot be reached."
-                },
-                "risk_per_trade_pct": {
-                    "type": "float", "required": False, "default": 5.0,
-                    "description": "Target risk per trade (% of virtual equity), sized from entry→stop distance",
-                    "tooltip": "When > 0 and the trade has a stop loss, the Smart Risk Manager sizes the position so that entry→stop-loss loss ≈ this % of virtual equity (qty = risk_budget / |entry - SL|). The position is still capped by 'max equity per instrument (%)' (notional) and available balance — so set that notional cap high enough for this risk target to be reachable. Set to 0 to disable risk-based sizing and use the model-chosen quantity."
+                    "tooltip": "Maximum percentage of virtual trading balance that can be allocated to a single instrument. This is a NOTIONAL CEILING (a max, not a target) — the risk manager sizes by conviction up to this cap, never beyond it. Recommended: 5-15%. Lower values (5-10%) provide better diversification, higher values (10-15%) allow larger positions in high-confidence trades."
                 },
                 # AI Model Settings
                 "risk_manager_model": {

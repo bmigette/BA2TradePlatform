@@ -1755,16 +1755,6 @@ class ExpertSettingsTab:
                                     ui.label('%').classes('text-sm')
                                 ui.label('Minimum available balance percentage required to enter new market positions. Lower values (5-10%) allow more aggressive trading, higher values (15-25%) provide more conservative risk management.').classes('text-body2 text-grey-7 ml-2')
 
-                                # Risk Per Trade (Smart Risk Manager risk-based sizing)
-                                with ui.row().classes('items-center gap-2 mt-2'):
-                                    ui.label('Risk per trade (%):').classes('text-sm font-medium')
-                                    self.risk_per_trade_pct_input = ui.input(
-                                        value='5.0',
-                                        placeholder='5.0'
-                                    ).classes('w-20')
-                                    ui.label('%').classes('text-sm')
-                                ui.label('Smart Risk Manager: target loss if the stop is hit, as % of virtual equity. Position is sized from entry→stop distance, then capped by "Max equity per instrument" above. Set that notional cap high enough for this target to be reachable. 0 disables risk-based sizing.').classes('text-body2 text-grey-7 ml-2')
-
                         # Risk manager section - hidden for experts that manage their own risk
                         with ui.column().classes('w-full') as self.risk_manager_section:
                             ui.separator().classes('my-4')
@@ -2430,14 +2420,6 @@ class ExpertSettingsTab:
 
             if hasattr(self, 'min_available_balance_pct_input'):
                 self.min_available_balance_pct_input.value = str(min_available_balance_pct)
-
-            risk_per_trade_pct = settings_source.get('risk_per_trade_pct')
-            if risk_per_trade_pct is None:
-                risk_per_trade_pct = 5.0
-            if isinstance(risk_per_trade_pct, str):
-                risk_per_trade_pct = float(risk_per_trade_pct)
-            if hasattr(self, 'risk_per_trade_pct_input'):
-                self.risk_per_trade_pct_input.value = str(risk_per_trade_pct)
 
             # Load AI model settings
             risk_manager_model = settings_source.get('risk_manager_model', 'nagaai/gpt5')
@@ -4007,11 +3989,6 @@ class ExpertSettingsTab:
             min_balance_value = float(self.min_available_balance_pct_input.value or 10.0)
             expert.save_setting('min_available_balance_pct', min_balance_value, setting_type="float")
             logger.debug(f'Saved risk management: min_available_balance_pct={min_balance_value}%')
-
-        if hasattr(self, 'risk_per_trade_pct_input'):
-            risk_per_trade_value = float(self.risk_per_trade_pct_input.value or 5.0)
-            expert.save_setting('risk_per_trade_pct', risk_per_trade_value, setting_type="float")
-            logger.debug(f'Saved risk management: risk_per_trade_pct={risk_per_trade_value}%')
 
         # Save AI model settings
         if hasattr(self, 'risk_manager_model_input'):
