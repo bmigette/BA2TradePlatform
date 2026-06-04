@@ -4734,48 +4734,21 @@ class PerformanceTab:
     
     def render(self):
         logger.debug("[RENDER] PerformanceTab.render() - START")
-        
+
         # Get all accounts to allow filtering
         accounts = get_all_instances(AccountDefinition)
-        
+
         if not accounts:
             with ui.card():
                 ui.label('No accounts configured. Please add an account first.').classes('text-gray-500')
             return
-        
-        # Account selector
-        with ui.card().classes('w-full mb-4'):
-            ui.label('Account Selection').classes('text-lg font-bold mb-2')
-            
-            selected_account_id = accounts[0].id if accounts else None
-            
-            def render_performance_for_account(account_id: int):
-                """Render performance analytics for selected account."""
-                performance_container.clear()
-                with performance_container:
-                    # Import here to avoid circular dependency
-                    from .performance import PerformanceTab as PerformanceAnalytics
-                    analytics = PerformanceAnalytics(account_id)
-                    analytics.render()
-            
-            # Account dropdown
-            account_options = {acc.id: acc.name for acc in accounts}
-            
-            def on_account_change(e):
-                render_performance_for_account(e.value)
-            
-            ui.select(
-                options=account_options,
-                value=selected_account_id,
-                label='Select Account'
-            ).on_value_change(on_account_change).classes('w-64')
-        
-        # Performance content container
-        performance_container = ui.column().classes('w-full')
-        
-        # Initial render with first account
-        if selected_account_id:
-            render_performance_for_account(selected_account_id)
+
+        # Use the global account selector (header dropdown) instead of a local one.
+        # None means "All accounts". Switching the global account soft-reloads the
+        # page, so this re-renders with the new scope automatically.
+        from .performance import PerformanceTab as PerformanceAnalytics
+        selected_account_id = get_selected_account_id()
+        PerformanceAnalytics(selected_account_id).render()
 
 def _extract_yf_close_prices(hist_data, symbol):
     """Extract close prices from yfinance DataFrame, handling MultiIndex columns."""

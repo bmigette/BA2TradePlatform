@@ -39,6 +39,7 @@ class BalanceUsagePerExpertChart:
                 }
             }
         """
+        from collections import defaultdict
         balance_data = {}
 
         # Get global account filter
@@ -47,7 +48,7 @@ class BalanceUsagePerExpertChart:
 
         with get_db() as session:
             from ...core.types import TransactionStatus, OrderType
-            from ...core.utils import get_account_instance_from_id, get_expert_instance_from_id
+            from ...core.utils import get_account_instance_from_id
 
             # Get all active expert instances (with account filter)
             expert_query = select(ExpertInstance).where(ExpertInstance.enabled == True)
@@ -58,20 +59,35 @@ class BalanceUsagePerExpertChart:
                     return {}
 
             experts = session.exec(expert_query).all()
+            expert_by_id = {e.id: e for e in experts}
 
+            def _expert_name(e):
+                return f"{e.alias or e.expert}-{e.id}"
+
+            # Account-instance cache shared across this calculation.
+            account_cache: Dict[int, object] = {}
+
+            def _get_account(acc_id):
+                if acc_id is None:
+                    return None
+                if acc_id not in account_cache:
+                    account_cache[acc_id] = get_account_instance_from_id(acc_id, session=session)
+                return account_cache[acc_id]
+
+            # Virtual balance = account balance * virtual_equity_pct. Fetch each
+            # account's balance once (get_balance is cached) instead of calling the
+            # per-expert get_virtual_balance (which re-fetches balance every time).
+            balance_by_account: Dict[int, Optional[float]] = {}
             for expert in experts:
-                expert_name = f"{expert.alias or expert.expert}-{expert.id}"
-
-                # Get virtual balance for this expert
-                expert_interface = get_expert_instance_from_id(expert.id)
-                if not expert_interface:
+                acc_id = expert.account_id
+                if acc_id not in balance_by_account:
+                    acct = _get_account(acc_id)
+                    balance_by_account[acc_id] = acct.get_balance() if acct else None
+                account_balance = balance_by_account[acc_id]
+                if account_balance is None:
                     continue
-
-                virtual_balance = expert_interface.get_virtual_balance()
-                if virtual_balance is None:
-                    continue
-
-                balance_data[expert_name] = {
+                virtual_balance = account_balance * ((expert.virtual_equity_pct or 100.0) / 100.0)
+                balance_data[_expert_name(expert)] = {
                     'pending': 0.0,
                     'filled': 0.0,
                     'available': 0.0,  # Will be computed as total - filled - pending
@@ -92,57 +108,53 @@ class BalanceUsagePerExpertChart:
                     return balance_data
 
             transactions = session.exec(query).all()
+            if not transactions:
+                for name, data in balance_data.items():
+                    data['available'] = max(0, data['total'] - data['filled'] - data['pending'])
+                return dict(sorted(balance_data.items(), key=lambda x: x[1]['total'], reverse=True))
 
-            # Prefetch prices for all symbols in bulk
-            if transactions:
-                unique_symbols = list(set(t.symbol for t in transactions))
+            # Map each transaction to its account via a SINGLE orders query
+            # (avoids a per-transaction "first order" lookup — the old N+1).
+            txn_ids = [t.id for t in transactions]
+            account_by_txn: Dict[int, int] = {}
+            order_rows = session.exec(
+                select(TradingOrder.transaction_id, TradingOrder.account_id)
+                .where(TradingOrder.transaction_id.in_(txn_ids))
+            ).all()
+            for tid, acc_id in order_rows:
+                if acc_id is not None and tid not in account_by_txn:
+                    account_by_txn[tid] = acc_id
 
+            # Bulk-prefetch bid prices grouped by account (one API call per account,
+            # not one per transaction — the main slowdown in the "All accounts" view).
+            symbols_by_account = defaultdict(set)
+            for t in transactions:
+                acc_id = account_by_txn.get(t.id)
+                if acc_id is not None:
+                    symbols_by_account[acc_id].add(t.symbol)
+            prices_by_account: Dict[int, Dict[str, float]] = {}
+            for acc_id, syms in symbols_by_account.items():
+                acct = _get_account(acc_id)
+                if not acct:
+                    continue
                 try:
-                    first_order = session.exec(
-                        select(TradingOrder)
-                        .where(TradingOrder.transaction_id == transactions[0].id)
-                        .limit(1)
-                    ).first()
-
-                    if first_order and first_order.account_id:
-                        account_interface = get_account_instance_from_id(first_order.account_id, session=session)
-                        account_interface.get_instrument_current_price(unique_symbols, price_type='bid')
-                        account_interface.get_instrument_current_price(unique_symbols, price_type='ask')
+                    prices_by_account[acc_id] = acct.get_instrument_current_price(list(syms), price_type='bid') or {}
                 except Exception as e:
-                    logger.warning(f"Failed to proactively prefetch prices: {e}")
+                    logger.warning(f"Failed to prefetch prices for account {acc_id}: {e}")
+                    prices_by_account[acc_id] = {}
 
             for transaction in transactions:
                 try:
-                    expert = session.get(ExpertInstance, transaction.expert_id)
+                    expert = expert_by_id.get(transaction.expert_id)
                     if not expert:
                         continue
 
-                    expert_name = f"{expert.alias or expert.expert}-{expert.id}"
-
+                    expert_name = _expert_name(expert)
                     if expert_name not in balance_data:
                         continue
 
-                    # Get account interface for market price
-                    account_interface = None
-                    try:
-                        first_order = session.exec(
-                            select(TradingOrder)
-                            .where(TradingOrder.transaction_id == transaction.id)
-                            .limit(1)
-                        ).first()
-
-                        if first_order and first_order.account_id:
-                            account_interface = get_account_instance_from_id(first_order.account_id, session=session)
-                    except Exception as e:
-                        logger.debug(f"Could not get account interface for transaction {transaction.id}: {e}")
-
-                    market_price = None
-                    if account_interface:
-                        try:
-                            market_price = account_interface.get_instrument_current_price(transaction.symbol)
-                        except Exception as e:
-                            logger.debug(f"Could not get market price for {transaction.symbol}: {e}")
-
+                    acc_id = account_by_txn.get(transaction.id)
+                    market_price = prices_by_account.get(acc_id, {}).get(transaction.symbol) if acc_id is not None else None
                     if not market_price:
                         continue
 

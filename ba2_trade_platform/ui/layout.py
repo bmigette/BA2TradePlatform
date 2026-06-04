@@ -109,9 +109,10 @@ def _render_account_filter_dropdown():
         # Convert "all" back to None for storage
         account_id = None if new_value == "all" else new_value
         set_selected_account_id(account_id)
-        # Soft reload via NiceGUI navigation (faster than full browser reload)
-        # Gets current path and navigates to it, triggering page re-render
-        current_path = await ui.run_javascript('window.location.pathname')
+        # Soft reload via NiceGUI navigation (faster than full browser reload).
+        # Preserve the hash (active tab) so switching accounts stays on the current
+        # tab instead of resetting to the first one.
+        current_path = await ui.run_javascript('window.location.pathname + window.location.hash')
         ui.navigate.to(current_path)
     
     with ui.row().classes('items-center gap-1 mr-4'):

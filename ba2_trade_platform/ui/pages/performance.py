@@ -21,22 +21,37 @@ import pandas as pd
 import numpy as np
 from collections import defaultdict
 from ba2_trade_platform.ui.utils.perf_logger import PerfLogger
+from ba2_trade_platform.ui.account_filter_context import get_expert_ids_for_account
 
 
 class PerformanceTab:
     """Trade performance analytics and visualization tab."""
     
-    def __init__(self, account_id: int):
+    def __init__(self, account_id: Optional[int]):
         """
         Initialize performance tab for an account.
-        
+
         Args:
-            account_id: Account ID to analyze
+            account_id: Account ID to analyze, or None to include all accounts
+                (driven by the global account selector).
         """
         self.account_id = account_id
         self.date_range_days = 30  # Default to last 30 days
-        self.selected_experts = []  # Empty means all experts
+        self.selected_experts = []  # Empty means all experts (within the account scope)
         self.data_loaded = False
+
+    def _effective_expert_ids(self) -> Optional[List[int]]:
+        """Expert ids the queries should be scoped to.
+
+        - Explicit expert filter selected -> those experts.
+        - Otherwise, if an account is selected globally -> that account's experts.
+        - Otherwise (account = All, no filter) -> None (no expert scoping).
+        """
+        if self.selected_experts:
+            return self.selected_experts
+        if self.account_id is not None:
+            return get_expert_ids_for_account(self.account_id) or []
+        return None
         
     def _get_closed_transactions(self) -> List[Transaction]:
         """Get all closed transactions for the account within date range."""
@@ -50,10 +65,10 @@ class PerformanceTab:
                 Transaction.close_date >= cutoff_date
             )
             
-            # Filter by selected experts if any
-            if self.selected_experts:
-                query = query.filter(Transaction.expert_id.in_(self.selected_experts))
-            
+            expert_ids = self._effective_expert_ids()
+            if expert_ids is not None:
+                query = query.filter(Transaction.expert_id.in_(expert_ids))
+
             return query.all()
         finally:
             session.close()
@@ -71,10 +86,10 @@ class PerformanceTab:
                 Transaction.close_date >= cutoff_date
             )
             
-            # Filter by selected experts if any
-            if self.selected_experts:
-                query = query.filter(Transaction.expert_id.in_(self.selected_experts))
-            
+            expert_ids = self._effective_expert_ids()
+            if expert_ids is not None:
+                query = query.filter(Transaction.expert_id.in_(expert_ids))
+
             return query.all()
         finally:
             session.close()
@@ -428,10 +443,11 @@ class PerformanceTab:
                 # Expert filter
                 session = get_db()
                 try:
-                    experts = session.query(ExpertInstance).filter(
-                        ExpertInstance.account_id == self.account_id
-                    ).all()
-                    
+                    expert_q = session.query(ExpertInstance)
+                    if self.account_id is not None:
+                        expert_q = expert_q.filter(ExpertInstance.account_id == self.account_id)
+                    experts = expert_q.all()
+
                     if experts:
                         ui.label("Expert Instances:").classes('self-center ml-8')
                         # Use alias if available, otherwise use "ClassName-ID" format
