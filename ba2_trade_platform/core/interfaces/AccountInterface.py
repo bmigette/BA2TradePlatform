@@ -660,8 +660,25 @@ class AccountInterface(ReadOnlyAccountInterface):
             logger.warning(f"Could not load expert {expert_instance.expert} for position size validation: {e}")
             return None
     
+    def _get_transaction_entry_order(self, transaction_id) -> Optional[TradingOrder]:
+        """Return the first (entry) order for a transaction, loaded within a session.
+
+        Avoids lazy-loading ``transaction.trading_orders`` on a detached Transaction
+        (which raises 'not bound to a Session' and silently skips validation).
+        """
+        if transaction_id is None:
+            return None
+        from sqlmodel import select
+        with get_db() as session:
+            return session.exec(
+                select(TradingOrder)
+                .where(TradingOrder.transaction_id == transaction_id)
+                .order_by(TradingOrder.id)
+                .limit(1)
+            ).first()
+
     def _validate_single_position_size(self, trading_order: TradingOrder, transaction, expert_instance,
-                                       current_price: float, max_position_pct: float, 
+                                       current_price: float, max_position_pct: float,
                                        virtual_equity: float) -> List[str]:
         """
         Validate that position size doesn't exceed expert's per-instrument limit.
@@ -686,11 +703,10 @@ class AccountInterface(ReadOnlyAccountInterface):
         
         # Check if this is adding to an existing position
         is_adding_to_position = False
-        if transaction.trading_orders:
-            entry_order = transaction.trading_orders[0]
-            if entry_order.side == trading_order.side:
-                is_adding_to_position = True
-        
+        entry_order = self._get_transaction_entry_order(transaction.id)
+        if entry_order and entry_order.side == trading_order.side:
+            is_adding_to_position = True
+
         if is_adding_to_position:
             # Calculate the new total position value after this order
             new_total_qty = current_position_qty + trading_order.quantity
@@ -758,11 +774,10 @@ class AccountInterface(ReadOnlyAccountInterface):
             
             # Check if adding to existing position
             is_adding_to_position = False
-            if transaction.trading_orders:
-                entry_order = transaction.trading_orders[0]
-                if entry_order.side == trading_order.side:
-                    is_adding_to_position = True
-            
+            entry_order = self._get_transaction_entry_order(transaction.id)
+            if entry_order and entry_order.side == trading_order.side:
+                is_adding_to_position = True
+
             if not is_adding_to_position:
                 # New position - check if order value exceeds available balance
                 order_value = current_price * trading_order.quantity
