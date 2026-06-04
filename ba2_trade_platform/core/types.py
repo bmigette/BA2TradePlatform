@@ -70,6 +70,7 @@ class OrderStatus(str, Enum):
     CANCELED = "canceled"
     PENDING = "pending"
     WAITING_TRIGGER = "waiting_trigger"
+    WASHTRADE_LOCKED = "washtrade_locked"
     ACCEPTED = "accepted"
     REJECTED = "rejected"
     PENDING_NEW = "pending_new"
@@ -178,13 +179,17 @@ class OrderStatus(str, Enum):
         Unsent statuses include:
         - PENDING: Order is pending submission to broker
         - WAITING_TRIGGER: Order is waiting for trigger condition (legacy)
-        
+        - WASHTRADE_LOCKED: Order is held back because an opposite-side order is
+          working at the broker (would be rejected as a wash trade); exists only
+          in the DB until the symbol clears.
+
         Returns:
             set: Set of OrderStatus values representing unsent states
         """
         return {
             cls.PENDING,
             cls.WAITING_TRIGGER,
+            cls.WASHTRADE_LOCKED,
         }
 
     @classmethod
@@ -204,6 +209,7 @@ class OrderStatus(str, Enum):
         """
         return cls.get_unfilled_statuses() | {
             cls.WAITING_TRIGGER,
+            cls.WASHTRADE_LOCKED,
             cls.PARTIALLY_FILLED,
         }
 

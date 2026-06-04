@@ -142,7 +142,25 @@ class AccountInterface(ReadOnlyAccountInterface):
         
         # Log successful validation (using captured values to avoid any potential issues)
         logger.info(f"Order validation passed for {symbol} - {side.value} {quantity} @ {order_type.value}")
-        
+
+        # Wash-trade lock (broker-agnostic): hold a primary open/close order when an
+        # opposite-side order is already working at the broker for this symbol — most
+        # brokers (e.g. Alpaca, code 40310000) reject the second one as a wash trade.
+        # The order stays in the DB as WASHTRADE_LOCKED and is re-submitted by
+        # TradeManager once the symbol clears. Protective TP/SL legs are exempt.
+        if self._is_washtrade_lock_candidate(trading_order):
+            blocker = self._find_opposing_working_order(symbol, side)
+            if blocker is not None:
+                trading_order.status = OrderStatus.WASHTRADE_LOCKED
+                update_instance(trading_order)
+                blocker_status = blocker.status.value if hasattr(blocker.status, 'value') else blocker.status
+                logger.info(
+                    f"Order {trading_order.id} ({symbol} {side.value}) set WASHTRADE_LOCKED: "
+                    f"opposite-side order {blocker.id} ({blocker.side.value}, {blocker_status}) "
+                    f"is working at the broker; will retry on next refresh"
+                )
+                return trading_order
+
         # Call the child class implementation (this will update the order with broker_order_id)
         # Pass tp_price and sl_price for brokers that support bracket orders
         # The trading_order object is now detached but all attributes are accessible
@@ -185,6 +203,42 @@ class AccountInterface(ReadOnlyAccountInterface):
         
         return result
     
+    # Order types that open or close a primary position (vs dependent TP/SL legs).
+    _PRIMARY_ORDER_TYPES = {
+        OrderType.MARKET, OrderType.BUY_LIMIT, OrderType.SELL_LIMIT,
+        OrderType.BUY_STOP, OrderType.SELL_STOP,
+        OrderType.BUY_STOP_LIMIT, OrderType.SELL_STOP_LIMIT,
+    }
+
+    def _is_washtrade_lock_candidate(self, trading_order: TradingOrder) -> bool:
+        """Only primary open/close orders are subject to the wash-trade lock.
+
+        Dependent protective legs (TP/SL, OCO/bracket) carry ``depends_on_order``
+        and are exempt — they are inherently opposite-side and brokers accept them
+        as complex orders.
+        """
+        if getattr(trading_order, 'depends_on_order', None) is not None:
+            return False
+        return trading_order.order_type in self._PRIMARY_ORDER_TYPES
+
+    def _find_opposing_working_order(self, symbol: str, side: OrderDirection) -> Optional[TradingOrder]:
+        """Return the first order on this account for ``symbol`` on the side opposite
+        to ``side`` that is working at the broker (unfilled or partially filled).
+
+        Orders that are not live at the broker — WASHTRADE_LOCKED, WAITING_TRIGGER,
+        terminal — do not count, so two opposing locked orders cannot deadlock.
+        """
+        from sqlmodel import select
+        working = OrderStatus.get_unfilled_statuses() | {OrderStatus.PARTIALLY_FILLED}
+        with get_db() as session:
+            statement = select(TradingOrder).where(
+                TradingOrder.account_id == self.id,
+                TradingOrder.symbol == symbol,
+                TradingOrder.side != side,
+                TradingOrder.status.in_(working),
+            )
+            return session.exec(statement).first()
+
     def _handle_transaction_requirements(self, trading_order: TradingOrder) -> None:
         """
         Handle transaction creation/validation requirements based on order type.

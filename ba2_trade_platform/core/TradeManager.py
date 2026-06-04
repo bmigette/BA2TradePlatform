@@ -128,6 +128,11 @@ class TradeManager:
             # separately inside each account's refresh_orders().
             self._check_all_waiting_trigger_orders()
 
+            # Step 3: Re-submit WASHTRADE_LOCKED orders whose symbol is now clear of an
+            # opposite-side order working at the broker (runs after Step 1 re-synced
+            # broker order state).
+            self._check_all_washtrade_locked_orders()
+
             self.logger.info("Account refresh completed")
 
         except Exception as e:
@@ -135,6 +140,77 @@ class TradeManager:
         finally:
             _REFRESH_LOCK.release()
     
+    def _check_all_washtrade_locked_orders(self):
+        """Re-submit WASHTRADE_LOCKED orders whose symbol no longer has an opposite-side
+        order working at the broker.
+
+        Called each refresh after broker order state has been re-synced (Step 1). For
+        each locked order, re-run the opposing-order scan via the account; if the symbol
+        is clear, reset to PENDING and re-submit through ``submit_order`` (which re-runs
+        validation and the wash-trade gate). Still-blocked orders are left locked.
+        """
+        from sqlmodel import select
+        from .db import get_db
+        from ..modules.accounts import get_account_class
+        from .models import AccountDefinition
+
+        with get_db() as session:
+            locked = session.exec(
+                select(TradingOrder).where(TradingOrder.status == OrderStatus.WASHTRADE_LOCKED)
+            ).all()
+            locked_ids = [o.id for o in locked]
+
+        if not locked_ids:
+            self.logger.debug("No WASHTRADE_LOCKED orders to check")
+            return
+
+        self.logger.info(f"Checking {len(locked_ids)} WASHTRADE_LOCKED orders")
+        account_cache: Dict[int, Any] = {}
+
+        for order_id in locked_ids:
+            try:
+                order = get_instance(TradingOrder, order_id)
+                if not order or order.status != OrderStatus.WASHTRADE_LOCKED:
+                    continue  # changed since we listed it
+
+                account = account_cache.get(order.account_id)
+                if account is None:
+                    account_def = get_instance(AccountDefinition, order.account_id)
+                    if not account_def:
+                        self.logger.error(f"Account {order.account_id} not found for locked order {order_id}")
+                        continue
+                    account_class = get_account_class(account_def.provider)
+                    if not account_class:
+                        self.logger.warning(f"No account class for provider {account_def.provider}")
+                        continue
+                    account = account_class(account_def.id)
+                    account_cache[order.account_id] = account
+
+                blocker = account._find_opposing_working_order(order.symbol, order.side)
+                if blocker is not None:
+                    self.logger.debug(
+                        f"Order {order_id} ({order.symbol} {order.side.value}) still locked: "
+                        f"opposite-side order {blocker.id} working at broker"
+                    )
+                    continue
+
+                # Infer whether this is a closing order (side opposite to its position).
+                is_closing = False
+                if order.transaction_id:
+                    txn = get_instance(Transaction, order.transaction_id)
+                    if txn and txn.side != order.side:
+                        is_closing = True
+
+                self.logger.info(
+                    f"Symbol {order.symbol} clear — re-submitting WASHTRADE_LOCKED order {order_id} "
+                    f"(is_closing_order={is_closing})"
+                )
+                order.status = OrderStatus.PENDING
+                update_instance(order)
+                account.submit_order(order, is_closing_order=is_closing)
+            except Exception as e:
+                self.logger.error(f"Error processing WASHTRADE_LOCKED order {order_id}: {e}", exc_info=True)
+
     def _check_all_waiting_trigger_orders(self):
         """
         Check all orders in WAITING_TRIGGER status to see if their parent orders have reached the trigger status.

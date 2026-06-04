@@ -667,6 +667,7 @@ def get_order_status_color(status: OrderStatus) -> str:
         OrderStatus.OPEN: 'blue',
         OrderStatus.PENDING: 'orange',
         OrderStatus.WAITING_TRIGGER: 'purple',
+        OrderStatus.WASHTRADE_LOCKED: 'amber',
         OrderStatus.CANCELED: 'grey',
         OrderStatus.REJECTED: 'red',
         OrderStatus.ERROR: 'red',

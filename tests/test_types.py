@@ -32,7 +32,7 @@ class TestOrderStatusGroups:
 
     def test_unsent_statuses(self):
         unsent = OrderStatus.get_unsent_statuses()
-        assert unsent == {OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER}
+        assert unsent == {OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER, OrderStatus.WASHTRADE_LOCKED}
 
     def test_terminal_and_executed_do_not_overlap(self):
         terminal = OrderStatus.get_terminal_statuses()
