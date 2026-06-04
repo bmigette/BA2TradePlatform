@@ -210,6 +210,15 @@ class AccountInterface(ReadOnlyAccountInterface):
         OrderType.BUY_STOP_LIMIT, OrderType.SELL_STOP_LIMIT,
     }
 
+    # Order types that actually trigger a broker wash-trade rejection on the
+    # opposite side. Alpaca (code 40310000) rejects only against opposing
+    # MARKET/STOP orders — LIMIT and STOP_LIMIT orders (e.g. protective TP/SL
+    # legs working at the broker) do NOT cause a wash trade, so they must not
+    # lock a new order.
+    _WASHTRADE_BLOCKING_ORDER_TYPES = {
+        OrderType.MARKET, OrderType.BUY_STOP, OrderType.SELL_STOP,
+    }
+
     def _is_washtrade_lock_candidate(self, trading_order: TradingOrder) -> bool:
         """Only primary open/close orders are subject to the wash-trade lock.
 
@@ -236,6 +245,7 @@ class AccountInterface(ReadOnlyAccountInterface):
                 TradingOrder.symbol == symbol,
                 TradingOrder.side != side,
                 TradingOrder.status.in_(working),
+                TradingOrder.order_type.in_(self._WASHTRADE_BLOCKING_ORDER_TYPES),
             )
             return session.exec(statement).first()
 

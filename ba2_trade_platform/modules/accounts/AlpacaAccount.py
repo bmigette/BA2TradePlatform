@@ -543,6 +543,30 @@ class AlpacaAccount(AccountInterface):
         except Exception as e:
             logger.error(f"Error inserting OCO order legs for order {parent_order.id}: {e}", exc_info=True)
     
+    @staticmethod
+    def _map_order_type(alpaca_type, side: OrderDirection) -> "CoreOrderType":
+        """Map an Alpaca order type to our directional OrderType.
+
+        Alpaca's ``type`` is non-directional (market/limit/stop/stop_limit/
+        trailing_stop); our OrderType is directional for limit/stop variants, so
+        we combine it with the order side. Falls back to MARKET for unknown types.
+        """
+        if alpaca_type is None:
+            return CoreOrderType.MARKET
+        t = str(getattr(alpaca_type, "value", alpaca_type)).lower()
+        is_buy = side == OrderDirection.BUY
+        if t == "market":
+            return CoreOrderType.MARKET
+        if t == "limit":
+            return CoreOrderType.BUY_LIMIT if is_buy else CoreOrderType.SELL_LIMIT
+        if t == "stop":
+            return CoreOrderType.BUY_STOP if is_buy else CoreOrderType.SELL_STOP
+        if t == "stop_limit":
+            return CoreOrderType.BUY_STOP_LIMIT if is_buy else CoreOrderType.SELL_STOP_LIMIT
+        if t == "trailing_stop":
+            return CoreOrderType.TRAILING_STOP
+        return CoreOrderType.MARKET
+
     def alpaca_order_to_tradingorder(self, order):
         """
         Convert an Alpaca order object to a TradingOrder object.
@@ -555,13 +579,11 @@ class AlpacaAccount(AccountInterface):
             nullable=False
         )
         
-        order_type = self._sanitize_enum_field(
-            getattr(order, "type", None),
-            OrderType,
-            "order_type",
-            nullable=False,
-            default_value=OrderType.MARKET
-        )
+        # Alpaca's order type is non-directional (market/limit/stop/stop_limit);
+        # combine it with side to get our directional OrderType. (A plain
+        # _sanitize_enum_field would collapse limit/stop/stop_limit to MARKET
+        # because our enum values are directional.)
+        order_type = self._map_order_type(getattr(order, "type", None), side)
 
         status = self._sanitize_enum_field(
             getattr(order, "status", None), 

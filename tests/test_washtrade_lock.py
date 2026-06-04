@@ -74,6 +74,31 @@ class TestFindOpposingWorkingOrder:
                              side=OrderDirection.BUY, status=OrderStatus.NEW)
         assert acct._find_opposing_working_order("AAPL", OrderDirection.SELL) is None
 
+    def test_limit_order_not_counted(self):
+        """Alpaca only wash-trade-blocks against market/stop orders; an opposing
+        LIMIT order (e.g. a take-profit leg) must not lock."""
+        acct = _acct()
+        create_trading_order(account_id=acct.id, symbol="AAPL",
+                             side=OrderDirection.SELL, status=OrderStatus.NEW,
+                             order_type=OrderType.SELL_LIMIT)
+        assert acct._find_opposing_working_order("AAPL", OrderDirection.BUY) is None
+
+    def test_stop_limit_order_not_counted(self):
+        """An opposing STOP-LIMIT order (e.g. a stop-loss leg) must not lock."""
+        acct = _acct()
+        create_trading_order(account_id=acct.id, symbol="AAPL",
+                             side=OrderDirection.SELL, status=OrderStatus.HELD,
+                             order_type=OrderType.SELL_STOP_LIMIT)
+        assert acct._find_opposing_working_order("AAPL", OrderDirection.BUY) is None
+
+    def test_stop_order_counted(self):
+        """A plain STOP order (becomes a market order) does trigger a wash trade."""
+        acct = _acct()
+        create_trading_order(account_id=acct.id, symbol="AAPL",
+                             side=OrderDirection.BUY, status=OrderStatus.NEW,
+                             order_type=OrderType.BUY_STOP)
+        assert acct._find_opposing_working_order("AAPL", OrderDirection.SELL) is not None
+
 
 class TestSubmitOrderGate:
     def test_locks_when_opposing_working_order_exists(self):
