@@ -117,10 +117,10 @@ class FinnHubRating(MarketExpertInterface):
     def _get_rating_thresholds(self) -> Dict[str, float]:
         """Read the consensus-mean bucket thresholds from settings (with defaults)."""
         return {
-            "buy": float(self.get_setting("buy_threshold")),
-            "overweight": float(self.get_setting("overweight_threshold")),
-            "hold": float(self.get_setting("hold_threshold")),
-            "underweight": float(self.get_setting("underweight_threshold")),
+            "buy": float(self.get_setting_with_interface_default("buy_threshold")),
+            "overweight": float(self.get_setting_with_interface_default("overweight_threshold")),
+            "hold": float(self.get_setting_with_interface_default("hold_threshold")),
+            "underweight": float(self.get_setting_with_interface_default("underweight_threshold")),
         }
     
     def _fetch_recommendation_trends(self, symbol: str) -> list:

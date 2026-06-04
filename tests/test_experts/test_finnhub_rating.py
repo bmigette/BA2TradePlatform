@@ -58,6 +58,14 @@ class TestCalculateRecommendation:
         assert 0.0 <= self._calc(trends)["confidence"] <= 100.0
 
 
+class TestRatingThresholds:
+    def test_get_rating_thresholds_returns_defaults(self):
+        from ba2_trade_platform.modules.experts.FinnHubRating import DEFAULT_RATING_THRESHOLDS
+        expert = _make_expert()
+        thresholds = expert._get_rating_thresholds()
+        assert thresholds == {k: float(v) for k, v in DEFAULT_RATING_THRESHOLDS.items()}
+
+
 class TestSettingsDefinitions:
     def test_has_threshold_settings(self):
         from ba2_trade_platform.modules.experts.FinnHubRating import FinnHubRating
