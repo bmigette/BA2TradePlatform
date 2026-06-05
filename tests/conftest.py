@@ -26,6 +26,7 @@ from ba2_trade_platform.core.types import (
     ExpertEventRuleType, AnalysisUseCase, MarketAnalysisStatus,
 )
 from ba2_trade_platform.core.interfaces.AccountInterface import AccountInterface
+from ba2_trade_platform.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 from ba2_trade_platform.core.interfaces.MarketExpertInterface import MarketExpertInterface
 
 
@@ -67,7 +68,7 @@ def db_session(test_engine):
 # MockAccount — concrete AccountInterface for tests
 # ---------------------------------------------------------------------------
 
-class MockAccount(AccountInterface):
+class MockAccount(AccountInterface, OptionsAccountInterface):
     """Test double for AccountInterface with configurable canned responses."""
 
     def __init__(self, id_or_definition):
@@ -82,6 +83,9 @@ class MockAccount(AccountInterface):
         self._balance = 100_000.0
         self._positions = []
         self._submit_order_result = True
+        self._option_positions = []          # list[OptionPosition]
+        self._submitted_option_orders = []   # capture for assertions
+        self._atm_iv = {"AAPL": 0.30, "MSFT": 0.28, "GOOGL": 0.33}
         # Initialize price cache for this account
         with self._CACHE_LOCK:
             if self.id not in self._GLOBAL_PRICE_CACHE:
@@ -181,6 +185,72 @@ class MockAccount(AccountInterface):
 
     def is_drip_enabled(self):
         return False
+
+    # --- OptionsAccountInterface (canned doubles) ---
+    def _mk_contract(self, underlying, right, strike, expiry):
+        from ba2_trade_platform.core.option_types import OptionContract
+        spot = self._prices.get(underlying, 100.0)
+        intrinsic = max(0.0, (spot - strike) if right.value == "call" else (strike - spot))
+        mid = round(intrinsic + 2.0, 2)
+        occ = f"{underlying}{expiry:%y%m%d}{'C' if right.value == 'call' else 'P'}{int(strike * 1000):08d}"
+        return OptionContract(
+            symbol=occ, underlying=underlying, option_type=right, strike=strike, expiry=expiry,
+            bid=mid - 0.1, ask=mid + 0.1, last=mid, implied_volatility=0.30,
+            delta=0.5, gamma=0.02, theta=-0.03, vega=0.1, open_interest=1000, volume=250)
+
+    def get_option_chain(self, underlying, expiry_min, expiry_max, option_type=None,
+                         strike_min=None, strike_max=None):
+        from ba2_trade_platform.core.types import OptionRight
+        expiry = expiry_max
+        spot = self._prices.get(underlying, 100.0)
+        rights = [option_type] if option_type else [OptionRight.CALL, OptionRight.PUT]
+        out = []
+        for r in rights:
+            for k in (round(spot * 0.95), round(spot), round(spot * 1.05)):
+                if strike_min is not None and k < strike_min:
+                    continue
+                if strike_max is not None and k > strike_max:
+                    continue
+                out.append(self._mk_contract(underlying, r, float(k), expiry))
+        return out
+
+    def get_option_quote(self, contract_symbol):
+        from ba2_trade_platform.core.option_types import OptionQuote
+        return OptionQuote(symbol=contract_symbol, bid=2.0, ask=2.2, last=2.1,
+                           implied_volatility=0.30, delta=0.5, gamma=0.02, theta=-0.03, vega=0.1)
+
+    def get_atm_implied_volatility(self, underlying):
+        return self._atm_iv.get(underlying, 0.30)
+
+    def get_option_positions(self):
+        return self._option_positions
+
+    def _submit_option_order_impl(self, trading_order, legs, leg_orders=None):
+        from ba2_trade_platform.core.types import OrderStatus
+        trading_order.status = OrderStatus.FILLED
+        trading_order.filled_qty = trading_order.quantity
+        trading_order.broker_order_id = f"mock-opt-{trading_order.id}"
+        if leg_orders:
+            for i, lo in enumerate(leg_orders):
+                lo.status = OrderStatus.FILLED
+                lo.filled_qty = lo.quantity
+                lo.broker_order_id = f"mock-opt-{trading_order.id}-leg{i}"
+        self._submitted_option_orders.append(trading_order)
+        return trading_order
+
+    def close_option_position(self, position, order_type="limit", limit_price=None):
+        from ba2_trade_platform.core.option_types import OptionLeg
+        from ba2_trade_platform.core.types import OrderDirection
+        close_side = OrderDirection.SELL if position.side == OrderDirection.BUY else OrderDirection.BUY
+        intent = "sell_to_close" if position.side == OrderDirection.BUY else "buy_to_close"
+        leg = OptionLeg(contract_symbol=position.contract_symbol, side=close_side,
+                        position_intent=intent, option_type=position.option_type,
+                        strike=position.strike, expiry=position.expiry, underlying=position.underlying)
+        return self.submit_option_order([leg], int(position.quantity), order_type, limit_price,
+                                        option_strategy="close")
+
+    def get_iv_rank(self, underlying, lookback_days=252, min_samples=20):
+        return 50.0  # deterministic stub for tests (Task 11 makes this real)
 
 
 # ---------------------------------------------------------------------------
