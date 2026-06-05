@@ -9,6 +9,15 @@ from ...core.db import get_db, update_instance, add_instance
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, RiskLevel, TimeHorizon
 from ...logger import get_expert_logger
 from ...config import get_app_setting
+from ..dataproviders.fmp_common import fmp_http_get, FMPError, TTLCache
+
+
+# Process-wide short-TTL caches so the many experts that analyze overlapping
+# universes don't each re-fetch the same symbol's FMP data within a run. Keyed by
+# symbol; shared across all FMPRating instances.
+_FMP_CACHE_TTL_SECONDS = 900  # 15 minutes
+_CONSENSUS_CACHE = TTLCache(_FMP_CACHE_TTL_SECONDS)
+_UPGRADE_CACHE = TTLCache(_FMP_CACHE_TTL_SECONDS)
 
 
 class FMPRating(MarketExpertInterface):
@@ -82,61 +91,36 @@ class FMPRating(MarketExpertInterface):
         if not self._api_key:
             self.logger.error("Cannot fetch price target consensus: FMP API key not configured")
             return None
-        
-        try:
-            url = f"https://financialmodelingprep.com/api/v4/price-target-consensus"
-            params = {
-                "symbol": symbol,
-                "apikey": self._api_key
-            }
-            
+
+        def _do_fetch():
+            url = "https://financialmodelingprep.com/api/v4/price-target-consensus"
+            params = {"symbol": symbol, "apikey": self._api_key}
             self.logger.debug(f"Fetching FMP price target consensus for {symbol}")
-            
-            # Retry logic with 60s timeout
-            max_retries = 3
-            timeout = 60
-            response = None
-            
-            for attempt in range(1, max_retries + 1):
-                try:
-                    response = requests.get(url, params=params, timeout=timeout)
-                    response.raise_for_status()
-                    break  # Success
-                except requests.exceptions.ReadTimeout:
-                    if attempt < max_retries:
-                        self.logger.warning(f"FMP price target consensus timeout for {symbol} (attempt {attempt}/{max_retries}), retrying...")
-                        continue
-                    else:
-                        error_msg = f"Failed to fetch price target consensus for {symbol} after {max_retries} attempts (timeout)"
-                        self.logger.error(error_msg)
-                        raise ValueError(error_msg)
-                except requests.exceptions.RequestException as e:
-                    error_msg = f"Failed to fetch FMP price target consensus for {symbol}: {e}"
-                    self.logger.error(error_msg)
-                    raise ValueError(error_msg) from e
-            
+            try:
+                # Shared backoff-retry helper handles HTTP 429 / 5xx / transient errors.
+                response = fmp_http_get(url, params, symbol=symbol,
+                                        endpoint="price-target-consensus", timeout=60)
+            except FMPError as e:
+                # Surface as ValueError to preserve the existing caller contract.
+                raise ValueError(str(e)) from e
+
             data = response.json()
             self.logger.debug(f"Received price target consensus data for {symbol}")
-            
-            # FMP returns a list with one item, extract the first element
+
+            # FMP returns a list with one item; extract the first element.
             if isinstance(data, list) and len(data) > 0:
                 return data[0]
             elif isinstance(data, dict):
                 return data
-            elif isinstance(data, list) and len(data) == 0:
+            elif isinstance(data, list):
                 self.logger.warning(f"No price target consensus data for {symbol} (empty list — likely no analyst coverage)")
                 return None
             else:
-                self.logger.warning(f"Unexpected price target consensus format for {symbol}: {type(data)} — {data!r:.200}")
+                self.logger.warning(f"Unexpected price target consensus format for {symbol}: {type(data)}")
                 return None
-            
-        except ValueError:
-            # Re-raise ValueError (from our error handling above)
-            raise
-        except Exception as e:
-            error_msg = f"Unexpected error fetching price target consensus for {symbol}: {e}"
-            self.logger.error(error_msg)
-            raise ValueError(error_msg) from e
+
+        # Deduped across experts within the TTL window.
+        return _CONSENSUS_CACHE.get_or_call(symbol, _do_fetch)
     
     def _fetch_upgrade_downgrade(self, symbol: str) -> Optional[list]:
         """
@@ -151,52 +135,23 @@ class FMPRating(MarketExpertInterface):
         if not self._api_key:
             self.logger.error("Cannot fetch upgrade/downgrade data: FMP API key not configured")
             return None
-        
-        try:
-            url = f"https://financialmodelingprep.com/api/v4/upgrades-downgrades-consensus"
-            params = {
-                "symbol": symbol,
-                "apikey": self._api_key
-            }
-            
+
+        def _do_fetch():
+            url = "https://financialmodelingprep.com/api/v4/upgrades-downgrades-consensus"
+            params = {"symbol": symbol, "apikey": self._api_key}
             self.logger.debug(f"Fetching FMP upgrade/downgrade consensus for {symbol}")
-            
-            # Retry logic with 60s timeout
-            max_retries = 3
-            timeout = 60
-            response = None
-            
-            for attempt in range(1, max_retries + 1):
-                try:
-                    response = requests.get(url, params=params, timeout=timeout)
-                    response.raise_for_status()
-                    break  # Success
-                except requests.exceptions.ReadTimeout:
-                    if attempt < max_retries:
-                        self.logger.warning(f"FMP upgrade/downgrade timeout for {symbol} (attempt {attempt}/{max_retries}), retrying...")
-                        continue
-                    else:
-                        error_msg = f"Failed to fetch upgrade/downgrade for {symbol} after {max_retries} attempts (timeout)"
-                        self.logger.error(error_msg)
-                        raise ValueError(error_msg)
-                except requests.exceptions.RequestException as e:
-                    error_msg = f"Failed to fetch FMP upgrade/downgrade for {symbol}: {e}"
-                    self.logger.error(error_msg)
-                    raise ValueError(error_msg) from e
-            
+            try:
+                response = fmp_http_get(url, params, symbol=symbol,
+                                        endpoint="upgrades-downgrades-consensus", timeout=60)
+            except FMPError as e:
+                raise ValueError(str(e)) from e
+
             data = response.json()
             self.logger.debug(f"Received {len(data) if isinstance(data, list) else 0} upgrade/downgrade records")
-            
-            # Return the list as-is (we'll use it to count analysts)
+            # Return the list as-is (used to count analysts).
             return data if isinstance(data, list) else None
-            
-        except ValueError:
-            # Re-raise ValueError (from our error handling above)
-            raise
-        except Exception as e:
-            error_msg = f"Unexpected error fetching upgrade/downgrade for {symbol}: {e}"
-            self.logger.error(error_msg)
-            raise ValueError(error_msg) from e
+
+        return _UPGRADE_CACHE.get_or_call(symbol, _do_fetch)
     
     def _calculate_recommendation(self, consensus_data: Dict[str, Any], 
                                  upgrade_data: list,
