@@ -44,6 +44,21 @@ def classify_waiting_trigger(parent_status, trigger_status):
     return "wait"
 
 
+def rebase_price_to_fill(target_price, reference_price, fill_price):
+    """Re-scale a TP/SL target that was computed off a pre-fill reference so it keeps
+    the same proportional distance from the order's ACTUAL fill.
+
+    new = fill * (target / reference)
+
+    Sign-agnostic (works for stops below and targets above) and a no-op when the
+    reference already equals the fill. Returns target_price unchanged if any input
+    is missing or the reference is non-positive.
+    """
+    if not target_price or not reference_price or not fill_price or reference_price <= 0:
+        return target_price
+    return round(fill_price * (target_price / reference_price), 4)
+
+
 class TradeManager:
 
     """
@@ -333,10 +348,43 @@ class TradeManager:
                                     status_updates[dependent_order.id] = OrderStatus.ERROR
                                     continue
                             
-                            # ===== NEW: Recalculate TP/SL prices from stored percent if available =====
+                            # ===== Re-base the STOP-LOSS to the parent's actual fill =====
+                            # Market entries compute TP/SL at enter time off a PRE-FILL
+                            # reference (the market order has no fill yet), so a fill that
+                            # differs from that reference leaves the stop at the wrong
+                            # distance. Re-scale the SL proportionally against the real fill
+                            # using the reference anchor stored on the order. The TP
+                            # (limit_price) is intentionally left untouched.
+                            transaction_updated = False
+                            try:
+                                ref_price = (dependent_order.data or {}).get("tpsl_reference_price") \
+                                    if isinstance(dependent_order.data, dict) else None
+                                if ref_price and parent_order.open_price and dependent_order.stop_price:
+                                    new_sl = rebase_price_to_fill(
+                                        dependent_order.stop_price, ref_price, parent_order.open_price)
+                                    if new_sl and abs(new_sl - dependent_order.stop_price) > 1e-9:
+                                        old_sl = dependent_order.stop_price
+                                        dependent_order.stop_price = new_sl
+                                        self.logger.info(
+                                            f"Re-based SL for order {dependent_order.id} to parent fill: "
+                                            f"${old_sl:.4f} -> ${new_sl:.4f} "
+                                            f"(ref ${ref_price:.4f}, fill ${parent_order.open_price:.4f})"
+                                        )
+                                        txn = session.get(Transaction, dependent_order.transaction_id) \
+                                            if dependent_order.transaction_id else None
+                                        if txn:
+                                            txn.stop_loss = new_sl
+                                            session.add(txn)
+                                        if isinstance(dependent_order.data, dict):
+                                            dependent_order.data["sl_rebased_to_fill"] = True
+                                            dependent_order.data["parent_filled_price"] = parent_order.open_price
+                            except (KeyError, TypeError, ValueError) as rebase_err:
+                                self.logger.warning(
+                                    f"Could not re-base SL for order {dependent_order.id}: {rebase_err}")
+
+                            # ===== Legacy: percent-based recalc (kept as fallback) =====
                             # This ensures TP/SL prices use the parent's filled price, not stale market data
                             # If percent is not stored, it will be calculated and stored as a fallback
-                            transaction_updated = False
                             if dependent_order.data and isinstance(dependent_order.data, dict):
                                 try:
                                     # Check if this is a TP order (has tp_percent in data)

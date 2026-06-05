@@ -3031,7 +3031,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     comment=oco_comment,
                     data={
                         "tp_percent_target": self._calculate_tp_percent(entry_order, transaction.take_profit) if transaction.take_profit else 0,
-                        "sl_percent_target": self._calculate_sl_percent(entry_order, transaction.stop_loss) if transaction.stop_loss else 0
+                        "sl_percent_target": self._calculate_sl_percent(entry_order, transaction.stop_loss) if transaction.stop_loss else 0,
+                        "tpsl_reference_price": self._tpsl_reference_price(entry_order)
                     },
                     created_at=datetime.now(timezone.utc)
                 )
@@ -3813,6 +3814,33 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         if not entry_order.open_price or entry_order.open_price == 0:
             return 0.0
         return ((entry_order.open_price - sl_price) / entry_order.open_price) * 100
+
+    def _tpsl_reference_price(self, entry_order: TradingOrder):
+        """Best pre-fill anchor the TP/SL were computed against, so a pending OCO can be
+        re-based to the entry's ACTUAL fill on trigger.
+
+        Prefers the realized fill if present, else the limit price, else the originating
+        recommendation's snapshot price (what the rule's order_open_price/current-price
+        reference resolved to for a not-yet-filled market order), else the live price.
+        """
+        if entry_order.open_price:
+            return entry_order.open_price
+        if entry_order.limit_price:
+            return entry_order.limit_price
+        rec_id = getattr(entry_order, "expert_recommendation_id", None)
+        if rec_id:
+            try:
+                from ...core.db import get_instance
+                from ...core.models import ExpertRecommendation
+                rec = get_instance(ExpertRecommendation, rec_id)
+                if rec and getattr(rec, "price_at_date", None):
+                    return rec.price_at_date
+            except Exception:
+                pass
+        try:
+            return self.get_instrument_current_price(entry_order.symbol)
+        except Exception:
+            return None
     
     def _create_broker_oco_order(self, session: Session, transaction: Transaction, entry_order: TradingOrder, tp_price: float, sl_price: float) -> bool:
         """Create new OCO order at broker with both TP and SL."""
@@ -3851,7 +3879,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 comment=oco_comment,
                 data={
                     "tp_percent_target": self._calculate_tp_percent(entry_order, tp_price),
-                    "sl_percent_target": self._calculate_sl_percent(entry_order, sl_price)
+                    "sl_percent_target": self._calculate_sl_percent(entry_order, sl_price),
+                    "tpsl_reference_price": self._tpsl_reference_price(entry_order)
                 },
                 created_at=datetime.now(timezone.utc)
             )
