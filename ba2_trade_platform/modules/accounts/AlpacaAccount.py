@@ -4881,3 +4881,308 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         return self.submit_option_order(
             [leg], int(position.quantity), order_type, limit_price, option_strategy="close")
 
+    # ------------------------------------------------------------------
+    # Option assignment / exercise / expiry reconciliation (Phase C2)
+    # ------------------------------------------------------------------
+    @alpaca_api_retry
+    def get_option_activities(self, after: "datetime | None" = None,
+                              activity_types=("OPASN", "OPEXC", "OPEXP", "OPCSH")) -> List[dict]:
+        """Fetch raw broker option lifecycle activities (assignment/exercise/
+        expiry/cash-settle) from the Trading API ``/v2/account/activities``.
+
+        The alpaca-py ``TradingClient`` does NOT wrap the multi-type activities
+        endpoint, so we use its inherited REST ``get(path, data)`` helper
+        directly (same mechanism already used by ``get_dividends`` /
+        ``get_balance_history``). Returns a list of raw activity dicts. Network
+        failures are logged and an empty list returned (never raises).
+
+        NOT unit-tested against the network; ``reconcile_option_assignments`` is
+        the tested core that consumes these dicts.
+        """
+        if not self._check_authentication():
+            return []
+
+        try:
+            params: Dict[str, Any] = {
+                "activity_types": ",".join(activity_types),
+            }
+            if after is not None:
+                params["after"] = after.isoformat() if hasattr(after, "isoformat") else str(after)
+
+            raw = self.client.get("/account/activities", params)
+            if raw is None:
+                return []
+            if not isinstance(raw, list):
+                raw = [raw]
+            logger.debug(f"[Account {self.id}] Retrieved {len(raw)} option activities")
+            return raw
+        except Exception as e:
+            logger.error(f"[Account {self.id}] Error fetching option activities: {e}", exc_info=True)
+            return []
+
+    def _find_option_order_for_contract(self, occ: str) -> "Optional[TradingOrder]":
+        """Most recent filled/open OPTION TradingOrder for this contract on this
+        account, used to attribute the activity to its originating expert."""
+        from ...core.types import AssetClass
+        with get_db() as session:
+            stmt = (
+                select(TradingOrder)
+                .where(TradingOrder.account_id == self.id)
+                .where(TradingOrder.asset_class == AssetClass.OPTION)
+                .where(TradingOrder.contract_symbol == occ)
+                .order_by(TradingOrder.id.desc())
+            )
+            return session.exec(stmt).first()
+
+    def reconcile_option_assignments(self, activities: List[dict]) -> List[dict]:
+        """Idempotently reconcile broker option lifecycle activities against the
+        local Transaction ledger.
+
+        For each activity dict (keys: id, activity_type, symbol [OCC], qty,
+        price, ...):
+
+        - IDEMPOTENCY: skip if an ``OptionActivity`` row already exists for
+          (account_id, activity_id). Each handled activity records exactly one
+          ``OptionActivity`` audit row, so re-running the same batch is a no-op.
+        - The originating option ``TradingOrder`` (asset_class OPTION, matching
+          contract_symbol on this account) provides attribution to the expert
+          via its transaction's ``expert_id``.
+
+        Handled activity types (documented semantics):
+        - OPASN on a SHORT PUT  (order side SELL, right PUT): cash-secured put
+          assigned -> open an equity LONG Transaction (qty = 100 * contracts,
+          open_price = strike, expert-attributed, meta_data.origin=
+          "csp_assignment"); close the short-put option Transaction
+          (close_reason="assigned").
+        - OPASN on a SHORT CALL (order side SELL, right CALL): shares called away
+          -> close the expert's OPENED equity long for the underlying
+          (close_reason="called_away", close_price=strike); close the
+          short-call option Transaction (close_reason="assigned"). If no equity
+          long is found, record result "called_away_no_long" (still closes the
+          option leg).
+        - OPEXP (expiry): close the option Transaction (close_reason="expired",
+          close_price=0.0).
+        - OPEXC (exercise): close the option Transaction (close_reason=
+          "exercised"). Equity-leg reconciliation is best-effort/logged for now.
+        - Anything else (e.g. OPCSH) or any malformed/unmappable activity:
+          recorded with result "unhandled: ..." and skipped (never crashes the
+          batch).
+
+        Returns a list of per-activity result dicts.
+        """
+        from ...core.models import OptionActivity
+        from ...core.types import AssetClass, OptionRight, OrderDirection, TransactionStatus
+
+        results: List[dict] = []
+
+        for activity in activities:
+            activity_id = activity.get("id")
+            activity_type = activity.get("activity_type")
+            symbol = activity.get("symbol")
+
+            # Skip activities without an id - we cannot dedup them safely.
+            if not activity_id:
+                logger.warning(
+                    f"[Account {self.id}] Option activity missing id; skipping: {activity}")
+                results.append({"activity_id": None, "result": "skipped_no_id"})
+                continue
+
+            try:
+                qty = float(activity.get("qty")) if activity.get("qty") is not None else None
+            except (TypeError, ValueError):
+                qty = None
+            try:
+                price = float(activity.get("price")) if activity.get("price") is not None else None
+            except (TypeError, ValueError):
+                price = None
+
+            # IDEMPOTENCY: skip if already processed for this account.
+            try:
+                with get_db() as session:
+                    existing = session.exec(
+                        select(OptionActivity)
+                        .where(OptionActivity.account_id == self.id)
+                        .where(OptionActivity.activity_id == str(activity_id))
+                    ).first()
+                if existing is not None:
+                    logger.debug(
+                        f"[Account {self.id}] Option activity {activity_id} already "
+                        f"processed; skipping (idempotent).")
+                    results.append({"activity_id": activity_id, "result": "already_processed"})
+                    continue
+            except Exception as e:
+                logger.error(
+                    f"[Account {self.id}] Idempotency check failed for {activity_id}: {e}",
+                    exc_info=True)
+                # Fail closed: do not apply effects we can't dedup.
+                results.append({"activity_id": activity_id, "result": f"unhandled: idempotency_check_failed: {e}"})
+                continue
+
+            result_str = "unhandled: unknown"
+            try:
+                result_str = self._apply_option_activity(
+                    activity_id=str(activity_id),
+                    activity_type=activity_type,
+                    symbol=symbol,
+                    qty=qty,
+                    price=price,
+                )
+            except Exception as e:
+                # Never crash the batch on a single bad activity.
+                logger.error(
+                    f"[Account {self.id}] Failed to reconcile option activity "
+                    f"{activity_id} ({activity_type} {symbol}): {e}", exc_info=True)
+                result_str = f"unhandled: exception: {e}"
+
+            # Always record an audit/idempotency row, even for unhandled ones.
+            try:
+                add_instance(OptionActivity(
+                    account_id=self.id,
+                    activity_id=str(activity_id),
+                    activity_type=str(activity_type) if activity_type is not None else "",
+                    symbol=symbol,
+                    qty=qty,
+                    price=price,
+                    result=result_str,
+                ))
+            except Exception as e:
+                logger.error(
+                    f"[Account {self.id}] Failed to persist OptionActivity audit row "
+                    f"for {activity_id}: {e}", exc_info=True)
+
+            results.append({"activity_id": activity_id, "result": result_str})
+
+        return results
+
+    def _apply_option_activity(self, activity_id: str, activity_type, symbol,
+                               qty, price) -> str:
+        """Apply the effect of a single (not-yet-processed) option activity to
+        the Transaction ledger. Returns a result string. Raises on truly
+        unexpected errors (caught by the caller). Returns an "unhandled: ..."
+        string for expected-but-unmappable inputs (malformed symbol, etc.)."""
+        from ...core.types import AssetClass, OptionRight, OrderDirection, TransactionStatus
+
+        contracts = qty if qty is not None else 0.0
+
+        # Parse OCC symbol; malformed -> unhandled (no crash).
+        if not symbol:
+            return "unhandled: missing symbol"
+        try:
+            underlying, expiry, right, strike = self._parse_occ_symbol(symbol)
+        except Exception as e:
+            return f"unhandled: bad OCC symbol {symbol!r}: {e}"
+
+        # Locate the originating option order + its transaction (attribution).
+        opt_order = self._find_option_order_for_contract(symbol)
+        opt_txn = None
+        expert_id = None
+        order_side = None
+        if opt_order is not None:
+            order_side = opt_order.side
+            if opt_order.transaction_id is not None:
+                opt_txn = get_instance(Transaction, opt_order.transaction_id)
+                if opt_txn is not None:
+                    expert_id = opt_txn.expert_id
+
+        atype = str(activity_type).upper() if activity_type is not None else ""
+
+        # --- OPASN: assignment ---
+        if atype == "OPASN":
+            # Short option assigned. Determine PUT vs CALL from the contract.
+            is_short = (order_side == OrderDirection.SELL)
+            if right == OptionRight.PUT and is_short:
+                # Cash-secured put assigned -> we BUY 100*contracts shares @ strike.
+                share_qty = 100.0 * contracts
+                equity_txn = Transaction(
+                    symbol=underlying,
+                    quantity=share_qty,
+                    side=OrderDirection.BUY,
+                    open_price=strike,
+                    status=TransactionStatus.OPENED,
+                    open_date=datetime.now(timezone.utc),
+                    expert_id=expert_id,
+                    close_reason=None,
+                    meta_data={"origin": "csp_assignment", "activity_id": activity_id,
+                               "contract": symbol},
+                )
+                add_instance(equity_txn)
+                self._close_txn(opt_txn, close_reason="assigned")
+                return (f"csp_assignment: opened equity long {underlying} "
+                        f"{share_qty}@{strike}; closed short put txn")
+
+            if right == OptionRight.CALL and is_short:
+                # Short call assigned -> shares called away. Close held equity long.
+                held = self._find_open_equity_long(underlying, expert_id)
+                self._close_txn(opt_txn, close_reason="assigned")
+                if held is not None:
+                    self._close_txn(held, close_reason="called_away", close_price=strike)
+                    return (f"called_away: closed equity long {underlying} @ {strike}; "
+                            f"closed short call txn")
+                logger.warning(
+                    f"[Account {self.id}] Short CALL {symbol} assigned but no OPENED "
+                    f"equity long found for {underlying} (expert {expert_id}).")
+                return "called_away_no_long: closed short call txn, no equity long to close"
+
+            # Long option assigned is not a normal flow; record + log.
+            logger.warning(
+                f"[Account {self.id}] OPASN on non-short option {symbol} "
+                f"(order_side={order_side}, right={right}); recording without ledger change.")
+            return f"unhandled: OPASN on non-short option (side={order_side}, right={right})"
+
+        # --- OPEXP: expiry ---
+        if atype == "OPEXP":
+            if opt_txn is not None:
+                self._close_txn(opt_txn, close_reason="expired", close_price=0.0)
+                return "expired: closed option txn"
+            return "unhandled: expiry with no matching option txn"
+
+        # --- OPEXC: exercise ---
+        if atype == "OPEXC":
+            if opt_txn is not None:
+                self._close_txn(opt_txn, close_reason="exercised")
+                # Equity-leg handling for exercise is best-effort/minimal for now.
+                return "exercised: closed option txn (equity leg not reconciled)"
+            return "unhandled: exercise with no matching option txn"
+
+        # --- OPCSH / anything else: no specific handler ---
+        return f"unhandled: no handler for activity_type {atype!r}"
+
+    def _find_open_equity_long(self, underlying: str, expert_id):
+        """Find an OPENED equity LONG (side BUY) Transaction for the underlying.
+
+        When ``expert_id`` is known (the usual case - the short call was written
+        by an expert) the search is RESTRICTED to that expert's transactions:
+        ``Transaction`` has no ``account_id`` column, so expert attribution is
+        the only scoping that prevents closing another account's/expert's long.
+        Only when the option was unattributed (``expert_id`` is None) do we fall
+        back to the most recent unattributed open long. Returns None if none.
+        """
+        from ...core.types import OrderDirection, TransactionStatus
+        with get_db() as session:
+            stmt = (
+                select(Transaction)
+                .where(Transaction.symbol == underlying)
+                .where(Transaction.side == OrderDirection.BUY)
+                .where(Transaction.status == TransactionStatus.OPENED)
+                .order_by(Transaction.id.desc())
+            )
+            if expert_id is not None:
+                stmt = stmt.where(Transaction.expert_id == expert_id)
+            else:
+                stmt = stmt.where(Transaction.expert_id.is_(None))
+            return session.exec(stmt).first()
+
+    def _close_txn(self, txn, close_reason: str, close_price=None) -> None:
+        """Close a Transaction (set CLOSED + reason + optional close_price + date)
+        and persist. No-op if txn is None."""
+        from ...core.types import TransactionStatus
+        if txn is None:
+            return
+        txn.status = TransactionStatus.CLOSED
+        txn.close_reason = close_reason
+        if close_price is not None:
+            txn.close_price = close_price
+        if not txn.close_date:
+            txn.close_date = datetime.now(timezone.utc)
+        update_instance(txn)
+

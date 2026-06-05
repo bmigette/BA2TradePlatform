@@ -19,7 +19,7 @@ from ba2_trade_platform.core.models import (
     Ruleset, EventAction, RulesetEventActionLink, AppSetting,
     TradeActionResult, ActivityLog, Instrument, Position,
     AnalysisOutput, PersistedQueueTask, LLMUsageLog, SmartRiskManagerJob,
-    OptionIVSnapshot,
+    OptionIVSnapshot, OptionActivity,
 )
 from ba2_trade_platform.core.types import (
     OrderStatus, OrderDirection, OrderType, OrderOpenType,

@@ -777,3 +777,23 @@ class OptionIVSnapshot(SQLModel, table=True):
     underlying: str = Field(index=True)
     atm_iv: float
     recorded_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
+
+
+class OptionActivity(SQLModel, table=True):
+    """Audit + idempotency record for a processed broker option lifecycle event.
+
+    One row is written per broker activity (assignment / exercise / expiry /
+    cash-settle) that reconciliation has seen. The (account_id, activity_id)
+    pair is the idempotency key: if a row already exists for an activity_id on
+    an account, reconciliation skips it so effects are applied exactly once.
+    """
+    __tablename__ = "option_activity"
+    id: int | None = Field(default=None, primary_key=True)
+    account_id: int = Field(foreign_key="accountdefinition.id", ondelete="CASCADE", index=True)
+    activity_id: str = Field(index=True, description="Broker activity id (idempotency key)")
+    activity_type: str
+    symbol: str | None = Field(default=None)
+    qty: float | None = Field(default=None)
+    price: float | None = Field(default=None)
+    processed_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
+    result: str | None = Field(default=None, description="What reconciliation did")
