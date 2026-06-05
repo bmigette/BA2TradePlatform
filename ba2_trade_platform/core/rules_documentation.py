@@ -192,6 +192,12 @@ def get_event_type_documentation() -> dict:
             "type": "boolean",
             "example": "Avoid writing a second covered call (require NOT has_covered_call before sell_covered_call)"
         },
+        ExpertEventType.F_HAS_PROTECTIVE_PUT.value: {
+            "name": "Has Protective Put",
+            "description": "Triggers when a long put (protective put) is currently open on the underlying symbol for this expert.",
+            "type": "boolean",
+            "example": "Avoid stacking a second hedge (require NOT has_protective_put before buy_protective_put)"
+        },
 
         # Numeric Events (N_ prefix)
         ExpertEventType.N_EXPECTED_PROFIT_TARGET_PERCENT.value: {
@@ -416,6 +422,17 @@ def get_action_type_documentation() -> dict:
             ],
             "parameters": "long/short strike params (e.g. long delta or percent_otm, short strike width), dte_min, dte_max, max_risk sizing (pct_equity / net debit), min_open_interest, max_spread_pct",
             "example": "When bearish and percent_to_new_target >= 5%, open_bear_put_spread (long ~0.40 delta / short -5% OTM, 30-60 DTE)"
+        },
+        ExpertActionType.BUY_PROTECTIVE_PUT.value: {
+            "name": "Buy Protective Put",
+            "description": "Buy a put against a held equity long as a downside hedge (one contract per 100 shares). Used in open_positions rules; caps losses below the put strike while keeping full upside, at the cost of the premium paid.",
+            "use_cases": [
+                "Hedge a long equity position against a drawdown while keeping upside",
+                "Insure gains ahead of an uncertain catalyst (e.g. earnings) without selling shares",
+                "Set a defined floor on a position you want to hold through volatility"
+            ],
+            "parameters": "strike_method/param (OTM, e.g. percent_otm or delta), dte_min, dte_max, min_open_interest, max_spread_pct",
+            "example": "When has_position and percent_below_recent_high >= 5% and not has_protective_put, buy_protective_put (5% OTM, 30-45 DTE)"
         },
         ExpertActionType.CLOSE_OPTION.value: {
             "name": "Close Option",

@@ -186,6 +186,36 @@ def test_sell_covered_call_requires_long(monkeypatch, mock_account, mock_expert_
     assert cap["limit_price"] == 2.0                         # sell at BID
 
 
+def test_buy_protective_put_requires_long(monkeypatch, mock_account, mock_expert_instance, sample_recommendation):
+    # No held long -> skip, no submit
+    chain = [_put(140, delta=-0.30, bid=2.0, ask=2.2, oi=2000)]
+    monkeypatch.setattr(mock_account, "get_option_chain", lambda *a, **k: chain, raising=False)
+    submitted = {}
+    monkeypatch.setattr(mock_account, "submit_option_order", lambda *a, **k: submitted.update(x=1), raising=False)
+    action = create_action(action_type=ExpertActionType.BUY_PROTECTIVE_PUT, instrument_name="AAPL",
+        account=mock_account, order_recommendation=OrderRecommendation.HOLD, existing_order=None,
+        expert_recommendation=sample_recommendation, strike_method="percent_otm", strike_param=5.0,
+        dte_min=20, dte_max=45, min_open_interest=100, max_spread_pct=20.0)
+    res = action.execute()
+    assert res["success"] is False and "x" not in submitted
+
+    # With a held 200-share equity long -> 2 contracts
+    txn_id = add_instance(Transaction(symbol="AAPL", quantity=200, side=OrderDirection.BUY,
+        status=TransactionStatus.OPENED, open_price=150.0, expert_id=mock_expert_instance.id))
+    add_instance(TradingOrder(account_id=mock_account.id, symbol="AAPL", quantity=200,
+        side=OrderDirection.BUY, order_type=OrderType.MARKET, status=OrderStatus.FILLED,
+        filled_qty=200, open_price=150.0, transaction_id=txn_id))  # equity (asset_class defaults EQUITY)
+    cap = _capture_submit(monkeypatch, mock_account)
+    res2 = action.execute()
+    assert res2["success"] is True
+    assert cap["quantity"] == 2                              # floor(200/100)
+    assert cap["legs"][0].option_type == OptionRight.PUT
+    assert cap["legs"][0].side == OrderDirection.BUY
+    assert cap["legs"][0].position_intent == "buy_to_open"
+    assert cap["option_strategy"] == "protective_put"
+    assert cap["limit_price"] == 2.2                         # buy at ASK
+
+
 def test_buy_call_sizing_respects_virtual_equity_pct(monkeypatch, mock_account_def):
     from tests.factories import create_expert_instance, create_recommendation
     from tests.conftest import MockAccount

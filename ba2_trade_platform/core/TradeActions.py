@@ -1897,6 +1897,80 @@ class SellCoveredCallAction(_OptionEntryAction):
         return f"Sell covered call on {self.instrument_name}"
 
 
+class BuyProtectivePutAction(_OptionEntryAction):
+    """Buy a protective put against a held equity long (one contract per 100 shares)."""
+
+    OPTION_TYPE = OptionRight.PUT
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.BUY_PROTECTIVE_PUT.value
+
+    def _held_equity_shares(self) -> float:
+        """Sum filled equity BUY quantity across this expert's OPENED transactions for the symbol."""
+        instance_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
+        if not instance_id:
+            return 0.0
+        from sqlmodel import select, Session
+        from .models import Transaction
+        total = 0.0
+        with Session(get_db().bind) as session:
+            txns = session.exec(
+                select(Transaction).where(
+                    Transaction.symbol == self.instrument_name,
+                    Transaction.expert_id == instance_id,
+                    Transaction.status == TransactionStatus.OPENED,
+                )
+            ).all()
+            txn_ids = [t.id for t in txns]
+            if not txn_ids:
+                return 0.0
+            orders = session.exec(
+                select(TradingOrder).where(TradingOrder.transaction_id.in_(txn_ids))
+            ).all()
+            for o in orders:
+                if o.asset_class == AssetClass.OPTION:
+                    continue
+                if o.status not in OrderStatus.get_executed_statuses():
+                    continue
+                qty = o.filled_qty
+                if not qty:
+                    continue
+                if o.side == OrderDirection.BUY:
+                    total += abs(float(qty))
+                else:
+                    total -= abs(float(qty))
+        return total
+
+    def _build_and_submit(self) -> Dict[str, Any]:
+        held = self._held_equity_shares()
+        quantity = int(math.floor(held / 100.0)) if held > 0 else 0
+        if quantity < 1:
+            return self._result(False,
+                                f"No held equity long to protect with a put on {self.instrument_name} "
+                                f"(shares={held})")
+        chain = self._chain(self.OPTION_TYPE)
+        if not chain:
+            return self._result(False, f"Empty option chain for {self.instrument_name}")
+        spot = self._spot()
+        contract = select_single(
+            chain, method=self.strike_method, strike_param=self.strike_param, spot=spot,
+            option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
+            today=self._today(), target_price=self._consensus_target(),
+            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+        if contract is None:
+            return self._result(False, f"No liquid put contract for protective put on {self.instrument_name}")
+        if contract.ask is None or contract.ask <= 0:
+            return self._result(False, f"No ask price for {contract.symbol}")
+        limit_price = contract.ask                          # buy at ASK
+        leg = OptionLeg(contract_symbol=contract.symbol, side=OrderDirection.BUY,
+                        position_intent="buy_to_open", option_type=self.OPTION_TYPE,
+                        strike=contract.strike, expiry=contract.expiry, underlying=contract.underlying)
+        return self._submit_option_order([leg], quantity, limit_price, "protective_put")
+
+    def get_description(self) -> str:
+        return f"Buy protective put on {self.instrument_name}"
+
+
 class CloseOptionAction(TradeAction):
     """Close an existing option position via account.close_option_position()."""
 
@@ -2028,6 +2102,7 @@ def create_action(action_type: ExpertActionType, instrument_name: str, account: 
         ExpertActionType.SELL_COVERED_CALL: SellCoveredCallAction,
         ExpertActionType.BUY_PUT: BuyPutAction,
         ExpertActionType.OPEN_BEAR_PUT_SPREAD: OpenBearPutSpreadAction,
+        ExpertActionType.BUY_PROTECTIVE_PUT: BuyProtectivePutAction,
         ExpertActionType.CLOSE_OPTION: CloseOptionAction,
     }
     

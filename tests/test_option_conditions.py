@@ -89,3 +89,21 @@ def test_has_covered_call(mock_account, mock_expert_instance, sample_recommendat
     cond = create_condition(ExpertEventType.F_HAS_COVERED_CALL, mock_account, "AAPL",
                             sample_recommendation)
     assert cond.evaluate() is True
+
+
+def test_has_protective_put(mock_account, mock_expert_instance, sample_recommendation):
+    txn_id = add_instance(Transaction(symbol="AAPL", quantity=1, side=OrderDirection.BUY,
+                                      status=TransactionStatus.OPENED, open_price=2.0,
+                                      expert_id=mock_expert_instance.id))
+    add_instance(TradingOrder(account_id=mock_account.id, symbol="AAPL", quantity=1,
+                              side=OrderDirection.BUY, order_type=OrderType.BUY_LIMIT,
+                              status=OrderStatus.FILLED, filled_qty=1, transaction_id=txn_id,
+                              asset_class=AssetClass.OPTION, option_type=OptionRight.PUT,
+                              underlying_symbol="AAPL", option_strategy="protective_put"))
+    cond = create_condition(ExpertEventType.F_HAS_PROTECTIVE_PUT, mock_account, "AAPL",
+                            sample_recommendation)
+    assert cond.evaluate() is True
+    # different symbol -> False
+    cond2 = create_condition(ExpertEventType.F_HAS_PROTECTIVE_PUT, mock_account, "MSFT",
+                             sample_recommendation)
+    assert cond2.evaluate() is False

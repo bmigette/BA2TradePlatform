@@ -1812,6 +1812,53 @@ class HasCoveredCallCondition(FlagCondition):
         return f"Covered call found: {'Yes' if has else 'No'}"
 
 
+class HasProtectivePutCondition(FlagCondition):
+    """Check if this expert has an open protective put (long PUT) on the underlying."""
+
+    def evaluate(self) -> bool:
+        try:
+            from .db import get_db
+            from .models import Transaction, TradingOrder
+            from .types import TransactionStatus, AssetClass, OrderStatus, OptionRight, OrderDirection
+            from sqlmodel import select
+
+            expert_id = self.expert_recommendation.instance_id
+            terminal = OrderStatus.get_terminal_statuses()
+
+            with get_db() as session:
+                statement = (
+                    select(TradingOrder)
+                    .join(Transaction, TradingOrder.transaction_id == Transaction.id)
+                    .where(
+                        Transaction.expert_id == expert_id,
+                        Transaction.status == TransactionStatus.OPENED,
+                        TradingOrder.asset_class == AssetClass.OPTION,
+                        TradingOrder.underlying_symbol == self.instrument_name,
+                        TradingOrder.option_type == OptionRight.PUT,
+                        TradingOrder.side == OrderDirection.BUY,
+                        TradingOrder.option_strategy == "protective_put",
+                    )
+                )
+                rows = [o for o in session.exec(statement).all() if o.status not in terminal]
+                self._has = len(rows) > 0
+
+            return self._has
+
+        except Exception as e:
+            logger.error(
+                f"Error checking protective put for {self.instrument_name}: {e}", exc_info=True)
+            return False
+
+    def get_description(self) -> str:
+        return f"Check if this expert has an open protective put for {self.instrument_name}"
+
+    def get_actual_value_display(self) -> Optional[str]:
+        has = getattr(self, '_has', None)
+        if has is None:
+            return None
+        return f"Protective put found: {'Yes' if has else 'No'}"
+
+
 # Factory function to create conditions based on event type
 
 
@@ -1875,6 +1922,7 @@ def create_condition(event_type: ExpertEventType, account: AccountInterface,
         ExpertEventType.N_IV_RANK: IVRankCondition,
         ExpertEventType.F_HAS_OPTION_POSITION: HasOptionPositionCondition,
         ExpertEventType.F_HAS_COVERED_CALL: HasCoveredCallCondition,
+        ExpertEventType.F_HAS_PROTECTIVE_PUT: HasProtectivePutCondition,
     }
     condition_class = condition_map.get(event_type)
     if not condition_class:

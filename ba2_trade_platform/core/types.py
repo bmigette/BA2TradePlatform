@@ -323,6 +323,7 @@ class ExpertEventType(str, Enum):
     # Option-related flags
     F_HAS_OPTION_POSITION = "has_option_position"  # Expert has an open option position
     F_HAS_COVERED_CALL = "has_covered_call"        # Expert has an open covered call
+    F_HAS_PROTECTIVE_PUT = "has_protective_put"    # Expert has an open protective put
 
     # N = Number/Count
     N_EXPECTED_PROFIT_TARGET_PERCENT = "expected_profit_target_percent"
@@ -356,6 +357,7 @@ class ExpertActionType(str, Enum):
     SELL_COVERED_CALL = "sell_covered_call"
     BUY_PUT = "buy_put"
     OPEN_BEAR_PUT_SPREAD = "open_bear_put_spread"
+    BUY_PROTECTIVE_PUT = "buy_protective_put"
     CLOSE_OPTION = "close_option"
 
 class MarketAnalysisStatus(str, Enum):
@@ -458,6 +460,7 @@ def get_option_action_values():
         ExpertActionType.SELL_COVERED_CALL.value,
         ExpertActionType.BUY_PUT.value,
         ExpertActionType.OPEN_BEAR_PUT_SPREAD.value,
+        ExpertActionType.BUY_PROTECTIVE_PUT.value,
         ExpertActionType.CLOSE_OPTION.value,
     ]
 

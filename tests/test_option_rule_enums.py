@@ -11,6 +11,7 @@ def test_new_event_enum_values():
     assert ExpertEventType.N_IV_RANK.value == "iv_rank"
     assert ExpertEventType.F_HAS_OPTION_POSITION.value == "has_option_position"
     assert ExpertEventType.F_HAS_COVERED_CALL.value == "has_covered_call"
+    assert ExpertEventType.F_HAS_PROTECTIVE_PUT.value == "has_protective_put"
 
 
 def test_new_action_enum_values():
@@ -19,6 +20,7 @@ def test_new_action_enum_values():
     assert ExpertActionType.SELL_COVERED_CALL.value == "sell_covered_call"
     assert ExpertActionType.BUY_PUT.value == "buy_put"
     assert ExpertActionType.OPEN_BEAR_PUT_SPREAD.value == "open_bear_put_spread"
+    assert ExpertActionType.BUY_PROTECTIVE_PUT.value == "buy_protective_put"
     assert ExpertActionType.CLOSE_OPTION.value == "close_option"
 
 
@@ -31,7 +33,7 @@ def test_numeric_events_include_new_option_events():
 def test_option_action_classifier():
     vals = get_option_action_values()
     for a in ("buy_call", "open_bull_call_spread", "sell_covered_call",
-              "buy_put", "open_bear_put_spread", "close_option"):
+              "buy_put", "open_bear_put_spread", "buy_protective_put", "close_option"):
         assert a in vals
         assert is_option_action(a)
     assert not is_option_action("buy")
