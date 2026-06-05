@@ -212,3 +212,51 @@ class OptionsAccountInterface(ABC):
             series = [r.atm_iv for r in rows]   # read while session is open
         current = self.get_atm_implied_volatility(underlying)
         return self._iv_rank_from_series(series, current, min_samples)
+
+    # --- Cash / buying-power reserve (short-premium defense-in-depth) -------
+    @staticmethod
+    def option_reserve_required(strategy: str, quantity: int, *, strike: float | None = None,
+                               spread_width: float | None = None, net_credit: float | None = None) -> float:
+        """Cash/BP that a short-premium strategy must reserve. 0 for long/debit strategies."""
+        if quantity <= 0:
+            return 0.0
+        if strategy == "cash_secured_put":
+            if strike is None:
+                return 0.0
+            return strike * 100.0 * quantity
+        if strategy in ("bear_call_spread", "credit_spread"):
+            if spread_width is None or net_credit is None:
+                return 0.0
+            max_loss = (spread_width - net_credit)
+            return max(0.0, max_loss) * 100.0 * quantity
+        return 0.0
+
+    def reserved_option_buying_power(self) -> float:
+        """Sum of stored reserves across this account's OPEN short-premium option orders."""
+        from ...core.db import get_db
+        from ...core.models import TradingOrder
+        from ...core.types import AssetClass, OrderStatus
+        from sqlmodel import select
+        terminal = OrderStatus.get_terminal_statuses()
+        total = 0.0
+        with get_db() as session:
+            rows = session.exec(select(TradingOrder).where(
+                TradingOrder.account_id == self.id,
+                TradingOrder.asset_class == AssetClass.OPTION,
+            )).all()
+            for o in rows:
+                if o.status in terminal:
+                    continue
+                data = o.data or {}
+                total += float(data.get("option_reserve", 0) or 0)
+        return total
+
+    def available_option_buying_power(self) -> float:
+        bal = self.get_balance() or 0.0
+        return bal - self.reserved_option_buying_power()
+
+    def check_option_buying_power(self, required: float) -> bool:
+        """True if `required` reserve fits in available buying power."""
+        if required <= 0:
+            return True
+        return required <= self.available_option_buying_power()
