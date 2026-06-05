@@ -354,6 +354,8 @@ class ExpertActionType(str, Enum):
     BUY_CALL = "buy_call"
     OPEN_BULL_CALL_SPREAD = "open_bull_call_spread"
     SELL_COVERED_CALL = "sell_covered_call"
+    BUY_PUT = "buy_put"
+    OPEN_BEAR_PUT_SPREAD = "open_bear_put_spread"
     CLOSE_OPTION = "close_option"
 
 class MarketAnalysisStatus(str, Enum):
@@ -449,11 +451,13 @@ def get_share_adjustment_action_values():
 
 
 def get_option_action_values():
-    """Return list of option action type values (BUY_CALL/SPREAD/COVERED_CALL/CLOSE_OPTION)."""
+    """Return list of option action type values (CALL/PUT entries + COVERED_CALL/CLOSE_OPTION)."""
     return [
         ExpertActionType.BUY_CALL.value,
         ExpertActionType.OPEN_BULL_CALL_SPREAD.value,
         ExpertActionType.SELL_COVERED_CALL.value,
+        ExpertActionType.BUY_PUT.value,
+        ExpertActionType.OPEN_BEAR_PUT_SPREAD.value,
         ExpertActionType.CLOSE_OPTION.value,
     ]
 

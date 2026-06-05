@@ -11,7 +11,8 @@ NEW_EVENTS = [
 ]
 NEW_ACTIONS = [
     ExpertActionType.BUY_CALL, ExpertActionType.OPEN_BULL_CALL_SPREAD,
-    ExpertActionType.SELL_COVERED_CALL, ExpertActionType.CLOSE_OPTION,
+    ExpertActionType.SELL_COVERED_CALL, ExpertActionType.BUY_PUT,
+    ExpertActionType.OPEN_BEAR_PUT_SPREAD, ExpertActionType.CLOSE_OPTION,
 ]
 
 

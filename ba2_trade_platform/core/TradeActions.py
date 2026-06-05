@@ -1730,6 +1730,99 @@ class OpenBullCallSpreadAction(_OptionEntryAction):
         return f"Open bull call spread on {self.instrument_name}"
 
 
+class BuyPutAction(_OptionEntryAction):
+    """Buy a single long put (debit) selected from the chain."""
+
+    OPTION_TYPE = OptionRight.PUT
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.BUY_PUT.value
+
+    def _build_and_submit(self) -> Dict[str, Any]:
+        chain = self._chain(self.OPTION_TYPE)
+        if not chain:
+            return self._result(False, f"Empty option chain for {self.instrument_name}")
+        spot = self._spot()
+        contract = select_single(
+            chain, method=self.strike_method, strike_param=self.strike_param, spot=spot,
+            option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
+            today=self._today(), target_price=self._consensus_target(),
+            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+        if contract is None:
+            return self._result(False, f"No liquid put contract for {self.instrument_name}")
+        if contract.ask is None or contract.ask <= 0:
+            return self._result(False, f"No ask price for {contract.symbol}")
+        limit_price = contract.ask                          # buy at ASK
+        quantity = self._size(limit_price, self.sizing)
+        if quantity < 1:
+            return self._result(False,
+                                f"Insufficient budget to size long_put for {self.instrument_name} "
+                                f"(premium={limit_price})")
+        leg = OptionLeg(contract_symbol=contract.symbol, side=OrderDirection.BUY,
+                        position_intent="buy_to_open", option_type=self.OPTION_TYPE,
+                        strike=contract.strike, expiry=contract.expiry, underlying=contract.underlying)
+        return self._submit_option_order([leg], quantity, limit_price, "long_put")
+
+    def get_description(self) -> str:
+        return f"Buy long put on {self.instrument_name}"
+
+
+class OpenBearPutSpreadAction(_OptionEntryAction):
+    """Open a bear put (debit) vertical spread: buy higher strike, sell lower strike."""
+
+    OPTION_TYPE = OptionRight.PUT
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.OPEN_BEAR_PUT_SPREAD.value
+
+    def _build_and_submit(self) -> Dict[str, Any]:
+        chain = self._chain(self.OPTION_TYPE)
+        if not chain:
+            return self._result(False, f"Empty option chain for {self.instrument_name}")
+        spot = self._spot()
+        long_param, short_param = self._spread_params()
+        pair = select_vertical_spread(
+            chain, method=self.strike_method, long_param=long_param, short_param=short_param,
+            spot=spot, option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
+            today=self._today(), target_price=self._consensus_target(),
+            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+        if pair is None:
+            return self._result(False, f"No liquid bear put spread for {self.instrument_name}")
+        # For a PUT debit spread the selector returns (long, short) with long.strike > short.strike.
+        long_c, short_c = pair
+        if long_c.ask is None or short_c.bid is None:
+            return self._result(False, f"Missing quote for spread legs on {self.instrument_name}")
+        net_debit = round(long_c.ask - short_c.bid, 4)      # buy long@ask, sell short@bid
+        if net_debit <= 0:
+            return self._result(False,
+                                f"Non-positive net debit ({net_debit}) for {self.instrument_name} spread")
+        quantity = self._size(net_debit, self.sizing)
+        if quantity < 1:
+            return self._result(False,
+                                f"Insufficient budget to size bear_put_spread for {self.instrument_name} "
+                                f"(net_debit={net_debit})")
+        long_leg = OptionLeg(contract_symbol=long_c.symbol, side=OrderDirection.BUY,
+                             position_intent="buy_to_open", option_type=self.OPTION_TYPE,
+                             strike=long_c.strike, expiry=long_c.expiry, underlying=long_c.underlying)
+        short_leg = OptionLeg(contract_symbol=short_c.symbol, side=OrderDirection.SELL,
+                              position_intent="sell_to_open", option_type=self.OPTION_TYPE,
+                              strike=short_c.strike, expiry=short_c.expiry, underlying=short_c.underlying)
+        return self._submit_option_order([long_leg, short_leg], quantity, net_debit, "bear_put_spread")
+
+    def _spread_params(self) -> Tuple[Any, Any]:
+        """Split strike_param into (long, short) params for the two legs."""
+        sp = self.strike_param
+        if isinstance(sp, dict):
+            return sp.get("long"), sp.get("short")
+        if isinstance(sp, (list, tuple)) and len(sp) == 2:
+            return sp[0], sp[1]
+        # Single value: use the same param for both legs (selector dedups by strike).
+        return sp, sp
+
+    def get_description(self) -> str:
+        return f"Open bear put spread on {self.instrument_name}"
+
+
 class SellCoveredCallAction(_OptionEntryAction):
     """Sell a covered call against a held equity long (one contract per 100 shares)."""
 
@@ -1933,6 +2026,8 @@ def create_action(action_type: ExpertActionType, instrument_name: str, account: 
         ExpertActionType.BUY_CALL: BuyCallAction,
         ExpertActionType.OPEN_BULL_CALL_SPREAD: OpenBullCallSpreadAction,
         ExpertActionType.SELL_COVERED_CALL: SellCoveredCallAction,
+        ExpertActionType.BUY_PUT: BuyPutAction,
+        ExpertActionType.OPEN_BEAR_PUT_SPREAD: OpenBearPutSpreadAction,
         ExpertActionType.CLOSE_OPTION: CloseOptionAction,
     }
     

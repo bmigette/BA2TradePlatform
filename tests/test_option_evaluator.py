@@ -62,12 +62,14 @@ def test_create_trade_action_builds_buy_call(mock_account, sample_recommendation
 
 
 def test_get_action_type_maps_all_option_actions(mock_account, sample_recommendation):
-    """All four option action classes map back to their enum members."""
+    """All option action classes map back to their enum members."""
     ev = TradeActionEvaluator(account=mock_account)
     cases = {
         ExpertActionType.BUY_CALL: _option_cfg(),
         ExpertActionType.OPEN_BULL_CALL_SPREAD: {**_option_cfg(), "action_type": "open_bull_call_spread"},
         ExpertActionType.SELL_COVERED_CALL: {**_option_cfg(), "action_type": "sell_covered_call"},
+        ExpertActionType.BUY_PUT: {**_option_cfg(), "action_type": "buy_put"},
+        ExpertActionType.OPEN_BEAR_PUT_SPREAD: {**_option_cfg(), "action_type": "open_bear_put_spread"},
         ExpertActionType.CLOSE_OPTION: {**_option_cfg(), "action_type": "close_option"},
     }
     for enum_member, cfg in cases.items():
@@ -183,4 +185,63 @@ def test_buy_call_option_action_executes(monkeypatch):
     # The option action executed (not skipped as unknown type).
     assert captured.get("called") is True
     assert captured["option_strategy"] == "long_call"
+    assert any(r.get("success") for r in results)
+
+
+def _canned_put_chain():
+    return [OptionContract(
+        symbol="AAPL150P", underlying="AAPL", option_type=OptionRight.PUT,
+        strike=150.0, expiry=None, bid=4.9, ask=5.1, last=5.0,
+        implied_volatility=0.30, delta=-0.50, gamma=0.02, theta=-0.03, vega=0.1,
+        open_interest=2000, volume=250)]
+
+
+def test_buy_put_option_action_executes(monkeypatch):
+    """A buy_put action in an EventAction is wired and executes (not silently skipped)."""
+    from datetime import date, timedelta
+    acct_def = create_account_definition()
+    account = MockAccount(acct_def.id)
+    ei = create_expert_instance(account_id=acct_def.id)
+    rec = create_recommendation(instance_id=ei.id, recommended_action=OrderRecommendation.SELL)
+
+    chain = _canned_put_chain()
+    for c in chain:
+        c.expiry = date.today() + timedelta(days=35)
+    monkeypatch.setattr(account, "get_option_chain", lambda *a, **k: chain, raising=False)
+
+    captured = {}
+
+    def fake_submit(legs, quantity, order_type="limit", limit_price=None,
+                    option_strategy=None, expert_recommendation_id=None, transaction_id=None):
+        captured.update(called=True, legs=legs, quantity=quantity,
+                        option_strategy=option_strategy, limit_price=limit_price)
+        return TradingOrder(account_id=account.id, symbol="AAPL", quantity=quantity,
+                            side=OrderDirection.BUY, order_type=OrderType.BUY_LIMIT,
+                            status=OrderStatus.FILLED)
+
+    monkeypatch.setattr(account, "submit_option_order", fake_submit, raising=False)
+
+    rs = Ruleset(name="Enter via put", type=ExpertEventRuleType.TRADING_RECOMMENDATION_RULE,
+                 subtype=AnalysisUseCase.ENTER_MARKET.value)
+    rs_id = add_instance(rs)
+    ea = EventAction(
+        name="Buy put on bearish",
+        type=ExpertEventRuleType.TRADING_RECOMMENDATION_RULE,
+        triggers={"trigger_0": {"event_type": ExpertEventType.F_BEARISH.value}},
+        actions={"action_0": {"action_type": "buy_put", "strike_method": "delta",
+                              "strike_param": 0.50, "dte_min": 20, "dte_max": 45,
+                              "sizing": 2.0, "min_open_interest": 100, "max_spread_pct": 20.0}},
+        continue_processing=False,
+    )
+    ea_id = add_instance(ea)
+    link_rule_to_ruleset(rs_id, ea_id, order_index=0)
+
+    ev = TradeActionEvaluator(account=account)
+    summaries = ev.evaluate("AAPL", rec, rs_id)
+    assert len(summaries) > 0
+    assert len(ev.trade_actions) == 1
+
+    results = ev.execute(submit_to_broker=True)
+    assert captured.get("called") is True
+    assert captured["option_strategy"] == "long_put"
     assert any(r.get("success") for r in results)

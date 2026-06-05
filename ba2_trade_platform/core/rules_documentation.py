@@ -395,6 +395,28 @@ def get_action_type_documentation() -> dict:
             "parameters": "strike_method/param (OTM, e.g. percent_otm or delta), dte_min, dte_max, min_open_interest, max_spread_pct",
             "example": "When has_position and iv_rank >= 60 and not has_covered_call, sell_covered_call (5% OTM, 30-45 DTE)"
         },
+        ExpertActionType.BUY_PUT.value: {
+            "name": "Buy Put",
+            "description": "Open a long put option on the underlying - a directional, leveraged bearish play where the maximum loss is the premium paid (premium-at-risk).",
+            "use_cases": [
+                "Take leveraged bearish exposure with capped downside (premium only)",
+                "Hedge or speculate on a decline when iv_rank is low (cheap volatility)",
+                "Express a high-conviction bearish thesis without shorting shares"
+            ],
+            "parameters": "strike_method (delta | percent_otm | consensus_target), strike_param, dte_min, dte_max, sizing (pct_equity), min_open_interest, max_spread_pct",
+            "example": "When bearish and iv_rank <= 30 and not has_option_position, buy_put (delta ~0.40, 30-60 DTE, 2% equity)"
+        },
+        ExpertActionType.OPEN_BEAR_PUT_SPREAD.value: {
+            "name": "Open Bear Put Spread",
+            "description": "Open a debit put spread (buy a higher-strike put, sell a lower-strike put). Defined-risk bearish structure where maximum loss equals the net debit paid and profit is capped at the short strike.",
+            "use_cases": [
+                "Bearish exposure with strictly defined, smaller cost than an outright put",
+                "Reduce premium outlay by selling downside when targeting a specific price level",
+                "Trade a moderate down-move while capping risk to the net debit"
+            ],
+            "parameters": "long/short strike params (e.g. long delta or percent_otm, short strike width), dte_min, dte_max, max_risk sizing (pct_equity / net debit), min_open_interest, max_spread_pct",
+            "example": "When bearish and percent_to_new_target >= 5%, open_bear_put_spread (long ~0.40 delta / short -5% OTM, 30-60 DTE)"
+        },
         ExpertActionType.CLOSE_OPTION.value: {
             "name": "Close Option",
             "description": "Close a held option position (long call, spread, or short covered call). Used for take-profit, stop-loss, time-stop, or thesis-flip exits.",

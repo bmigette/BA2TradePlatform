@@ -30,6 +30,13 @@ def _call(strike, *, delta=0.5, bid=2.0, ask=2.2, oi=1000, exp=None):
         gamma=0.0, theta=0.0, vega=0.0, open_interest=oi, volume=100)
 
 
+def _put(strike, *, delta=-0.5, bid=2.0, ask=2.2, oi=1000, exp=None):
+    return OptionContract(symbol=f"AAPL{int(strike)}P", underlying="AAPL",
+        option_type=OptionRight.PUT, strike=float(strike), expiry=exp or _exp(35),
+        bid=bid, ask=ask, last=(bid+ask)/2, implied_volatility=0.3, delta=delta,
+        gamma=0.0, theta=0.0, vega=0.0, open_interest=oi, volume=100)
+
+
 def _capture_submit(monkeypatch, account):
     captured = {}
     def fake(legs, quantity, order_type="limit", limit_price=None, option_strategy=None,
@@ -97,6 +104,53 @@ def test_bull_call_spread_two_legs(monkeypatch, mock_account, mock_expert_instan
     assert short_leg.side == OrderDirection.SELL and short_leg.position_intent == "sell_to_open"
     assert long_leg.strike == 150.0 and short_leg.strike == 160.0
     assert cap["option_strategy"] == "bull_call_spread"
+    # net debit = long.ask - short.bid = 6.1 - 1.9 = 4.2
+    assert abs(cap["limit_price"] - 4.2) < 1e-9
+    # budget 100000*5% = 5000; qty = floor(5000/(4.2*100)) = 11
+    assert cap["quantity"] == 11
+
+
+def test_buy_put_submits_long_put(monkeypatch, mock_account, mock_expert_instance, sample_recommendation):
+    chain = [_put(150, delta=-0.50, bid=4.9, ask=5.1, oi=2000)]
+    monkeypatch.setattr(mock_account, "get_option_chain", lambda *a, **k: chain, raising=False)
+    cap = _capture_submit(monkeypatch, mock_account)
+    action = create_action(action_type=ExpertActionType.BUY_PUT, instrument_name="AAPL",
+        account=mock_account, order_recommendation=OrderRecommendation.SELL,
+        existing_order=None, expert_recommendation=sample_recommendation,
+        strike_method="delta", strike_param=0.50, dte_min=20, dte_max=45,
+        sizing=2.0, min_open_interest=100, max_spread_pct=20.0)
+    res = action.execute()
+    assert res["success"] is True
+    assert len(cap["legs"]) == 1
+    leg = cap["legs"][0]
+    assert leg.option_type == OptionRight.PUT and leg.side == OrderDirection.BUY
+    assert leg.position_intent == "buy_to_open"
+    assert cap["option_strategy"] == "long_put"
+    assert cap["limit_price"] == 5.1                       # buy at ASK
+    # budget = 100000 * 100% * 2% = 2000; qty = floor(2000/(5.1*100)) = 3
+    assert cap["quantity"] == 3
+
+
+def test_bear_put_spread_two_legs(monkeypatch, mock_account, mock_expert_instance, sample_recommendation):
+    # Bear put debit spread: BUY higher strike (bigger |delta|), SELL lower strike.
+    chain = [_put(160, delta=-0.55, bid=5.9, ask=6.1, oi=2000),
+             _put(150, delta=-0.30, bid=1.9, ask=2.1, oi=2000)]
+    monkeypatch.setattr(mock_account, "get_option_chain", lambda *a, **k: chain, raising=False)
+    cap = _capture_submit(monkeypatch, mock_account)
+    action = create_action(action_type=ExpertActionType.OPEN_BEAR_PUT_SPREAD, instrument_name="AAPL",
+        account=mock_account, order_recommendation=OrderRecommendation.SELL, existing_order=None,
+        expert_recommendation=sample_recommendation, strike_method="delta",
+        strike_param={"long": 0.55, "short": 0.30}, dte_min=20, dte_max=45,
+        sizing=5.0, min_open_interest=100, max_spread_pct=20.0)
+    res = action.execute()
+    assert res["success"] is True
+    assert len(cap["legs"]) == 2
+    long_leg, short_leg = cap["legs"]
+    assert long_leg.side == OrderDirection.BUY and long_leg.position_intent == "buy_to_open"
+    assert short_leg.side == OrderDirection.SELL and short_leg.position_intent == "sell_to_open"
+    # For a PUT debit spread the long is the HIGHER strike, the short the LOWER.
+    assert long_leg.strike == 160.0 and short_leg.strike == 150.0
+    assert cap["option_strategy"] == "bear_put_spread"
     # net debit = long.ask - short.bid = 6.1 - 1.9 = 4.2
     assert abs(cap["limit_price"] - 4.2) < 1e-9
     # budget 100000*5% = 5000; qty = floor(5000/(4.2*100)) = 11
