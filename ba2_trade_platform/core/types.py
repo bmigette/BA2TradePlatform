@@ -320,7 +320,10 @@ class ExpertEventType(str, Enum):
     F_LOWRISK = "lowrisk"
     F_NEW_TARGET_HIGHER = "new_target_higher"  # New expert target is higher than current TP (with 2% tolerance)
     F_NEW_TARGET_LOWER = "new_target_lower"    # New expert target is lower than current TP (with 2% tolerance)
-    
+    # Option-related flags
+    F_HAS_OPTION_POSITION = "has_option_position"  # Expert has an open option position
+    F_HAS_COVERED_CALL = "has_covered_call"        # Expert has an open covered call
+
     # N = Number/Count
     N_EXPECTED_PROFIT_TARGET_PERCENT = "expected_profit_target_percent"
     N_PERCENT_TO_CURRENT_TARGET = "percent_to_current_target"  # Distance from current price to current TP
@@ -332,6 +335,10 @@ class ExpertEventType(str, Enum):
     N_CONFIDENCE = "confidence"
     N_INSTRUMENT_ACCOUNT_SHARE = "instrument_account_share"    # Current instrument value as % of expert virtual equity
     N_PERCENT_OPEN_TO_NEW_TARGET = "percent_open_to_new_target"  # Distance from open price to new expert target as %
+    # Option-related numeric events
+    N_PERCENT_BELOW_RECENT_HIGH = "percent_below_recent_high"  # Percent the current price is below the recent high
+    N_PERCENT_ABOVE_RECENT_LOW = "percent_above_recent_low"    # Percent the current price is above the recent low
+    N_IV_RANK = "iv_rank"                                      # Implied volatility rank (0-100)
 
 
 class ExpertActionType(str, Enum):
@@ -343,6 +350,11 @@ class ExpertActionType(str, Enum):
     INCREASE_INSTRUMENT_SHARE = "increase_instrument_share"
     DECREASE_INSTRUMENT_SHARE = "decrease_instrument_share"
     STOP_PROCESSING = "stop_processing"
+    # Option-related actions
+    BUY_CALL = "buy_call"
+    OPEN_BULL_CALL_SPREAD = "open_bull_call_spread"
+    SELL_COVERED_CALL = "sell_covered_call"
+    CLOSE_OPTION = "close_option"
 
 class MarketAnalysisStatus(str, Enum):
     PENDING = "pending"
@@ -413,7 +425,10 @@ def get_numeric_event_values():
         ExpertEventType.N_DAYS_OPENED.value,
         ExpertEventType.N_CONFIDENCE.value,
         ExpertEventType.N_INSTRUMENT_ACCOUNT_SHARE.value,
-        ExpertEventType.N_PERCENT_OPEN_TO_NEW_TARGET.value
+        ExpertEventType.N_PERCENT_OPEN_TO_NEW_TARGET.value,
+        ExpertEventType.N_PERCENT_BELOW_RECENT_HIGH.value,
+        ExpertEventType.N_PERCENT_ABOVE_RECENT_LOW.value,
+        ExpertEventType.N_IV_RANK.value
     ]
 
 
@@ -433,6 +448,16 @@ def get_share_adjustment_action_values():
     ]
 
 
+def get_option_action_values():
+    """Return list of option action type values (BUY_CALL/SPREAD/COVERED_CALL/CLOSE_OPTION)."""
+    return [
+        ExpertActionType.BUY_CALL.value,
+        ExpertActionType.OPEN_BULL_CALL_SPREAD.value,
+        ExpertActionType.SELL_COVERED_CALL.value,
+        ExpertActionType.CLOSE_OPTION.value,
+    ]
+
+
 def is_numeric_event(event_value):
     """Check if an event value corresponds to a numeric event type."""
     return event_value in get_numeric_event_values()
@@ -446,6 +471,11 @@ def is_adjustment_action(action_value):
 def is_share_adjustment_action(action_value):
     """Check if an action value corresponds to a share adjustment action type."""
     return action_value in get_share_adjustment_action_values()
+
+
+def is_option_action(action_value):
+    """Check if an action value corresponds to an option action type."""
+    return action_value in get_option_action_values()
 
 
 def get_action_type_display_label(action_value):
