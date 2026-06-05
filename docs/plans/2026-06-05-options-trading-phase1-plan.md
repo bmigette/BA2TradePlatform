@@ -194,7 +194,7 @@ class OptionContract:
     def mid(self) -> Optional[float]:
         if self.bid is not None and self.ask is not None:
             return round((self.bid + self.ask) / 2, 4)
-        return self.last
+        return None  # never proxy mid from last trade (stale on illiquid options)
 
     @property
     def spread_pct(self) -> Optional[float]:
@@ -224,7 +224,7 @@ class OptionQuote:
     def mid(self) -> Optional[float]:
         if self.bid is not None and self.ask is not None:
             return round((self.bid + self.ask) / 2, 4)
-        return self.last
+        return None  # never proxy mid from last trade (stale on illiquid options)
 
 
 @dataclass
