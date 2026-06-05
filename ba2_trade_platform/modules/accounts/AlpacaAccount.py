@@ -1305,13 +1305,17 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             logger.info(f"Cancelled Alpaca order: broker_order_id={broker_order_id}" + 
                        (f", database_id={db_order_id}" if db_order_id else ""))
             
-            # Update the order status in our database if we found it
+            # Mark the order PENDING_CANCEL — NOT optimistically CANCELED. The cancel
+            # has only been *requested*; the account refresh promotes it to CANCELED
+            # once the broker confirms (and the qty is actually released). This keeps a
+            # dependent replacement (e.g. a trailing-stop OCO swap) waiting until the
+            # cancellation is real, instead of firing early and getting rejected.
             if db_order_id:
                 db_order = get_instance(TradingOrder, db_order_id)
                 if db_order:
-                    db_order.status = OrderStatus.CANCELED
+                    db_order.status = OrderStatus.PENDING_CANCEL
                     update_instance(db_order)
-            
+
             return True
         except APIError as e:
             if "pending cancel" in str(e).lower():
@@ -1739,17 +1743,20 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     alpaca_filled_qty = getattr(raw_order, 'filled_qty', None)
                     alpaca_open_price = getattr(raw_order, 'filled_avg_price', None)
 
-                    # Special handling for PENDING_CANCEL orders: Can only transition to CANCELLED
-                    # PENDING_CANCEL means we're waiting for cancellation before replacing the order
-                    # Ignore all broker state updates except transition to CANCELLED
+                    # PENDING_CANCEL: we've requested a cancel and are waiting for the broker
+                    # to confirm it (a dependent replacement triggers on the real CANCELED, so
+                    # it must not fire until the broker actually releases the qty). Advance only
+                    # once the order reaches a FINAL broker state — CANCELED (confirmed) or a
+                    # completion the cancel raced (FILLED/EXPIRED/REJECTED/...); otherwise stay
+                    # PENDING_CANCEL and keep waiting.
                     if db_order.status == OrderStatus.PENDING_CANCEL:
-                        if alpaca_status == OrderStatus.CANCELED:
-                            logger.info(f"Order {db_order.id} transitioned from PENDING_CANCEL to CANCELED as expected")
-                            db_order.status = OrderStatus.CANCELED
+                        resolved = OrderStatus.resolve_pending_cancel(alpaca_status)
+                        if resolved is not None and resolved != db_order.status:
+                            logger.info(f"Order {db_order.id} PENDING_CANCEL -> {resolved.value} (broker reported {alpaca_status})")
+                            db_order.status = resolved
                             has_changes = True
                         else:
-                            # Ignore broker state - order is waiting for cancellation
-                            logger.debug(f"Order {db_order.id} in PENDING_CANCEL - ignoring broker state {alpaca_status}, waiting for CANCELED")
+                            logger.debug(f"Order {db_order.id} in PENDING_CANCEL - broker {alpaca_status}, still waiting for confirmation")
                     # Normal status update for non-PENDING_CANCEL orders
                     elif db_order.status != alpaca_status:
                         logger.debug(f"Order {db_order.id} status changed: {db_order.status} -> {alpaca_status}")

@@ -117,7 +117,24 @@ class OrderStatus(str, Enum):
             cls.ERROR,
             cls.REPLACED,
         }
-    
+
+    @classmethod
+    def resolve_pending_cancel(cls, broker_status):
+        """Next status for an order we marked PENDING_CANCEL, given the broker's
+        reported status on refresh.
+
+        Returns the broker status once the order reaches a FINAL state — CANCELED
+        (the cancel was confirmed) or FILLED / EXPIRED / REJECTED / ... (the order
+        completed before the cancel landed). Returns ``None`` while it is still
+        working or still cancelling, so the order stays PENDING_CANCEL and a
+        dependent replacement keeps waiting until the broker truly releases it.
+        """
+        if broker_status is None:
+            return None
+        if broker_status == cls.FILLED or broker_status in cls.get_terminal_statuses():
+            return broker_status
+        return None
+
     @classmethod
     def get_executed_statuses(cls):
         """
