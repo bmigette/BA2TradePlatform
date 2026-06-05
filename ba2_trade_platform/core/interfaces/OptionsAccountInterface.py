@@ -84,14 +84,19 @@ class OptionsAccountInterface(ABC):
         if len(legs) > 4:
             raise ValueError("Alpaca supports a maximum of 4 option legs")
 
+        first = legs[0]
         is_multi = len(legs) > 1
-        net_side = OrderDirection.BUY if (limit_price is None or limit_price >= 0) else OrderDirection.SELL
+        if limit_price is None:
+            net_side = first.side
+        else:
+            net_side = OrderDirection.BUY if limit_price >= 0 else OrderDirection.SELL
+
+        side_for_type = net_side if is_multi else first.side
         if order_type == "market":
             core_type = CoreOrderType.MARKET
         else:
-            core_type = CoreOrderType.BUY_LIMIT if net_side == OrderDirection.BUY else CoreOrderType.SELL_LIMIT
+            core_type = CoreOrderType.BUY_LIMIT if side_for_type == OrderDirection.BUY else CoreOrderType.SELL_LIMIT
 
-        first = legs[0]
         parent = TradingOrder(
             account_id=self.id,
             symbol=(first.underlying or first.contract_symbol),
