@@ -9,7 +9,7 @@ from ...core.db import get_db, get_all_instances, delete_instance, add_instance,
 from ...modules.accounts import providers
 from ...core.interfaces import AccountInterface
 from ...core.utils import get_account_instance_from_id, get_expert_instance_from_id
-from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, is_share_adjustment_action, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label
+from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, is_share_adjustment_action, is_option_action, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label
 from ...core.cleanup import preview_cleanup, execute_cleanup, get_cleanup_statistics
 from yahooquery import Ticker, search as yq_search
 from nicegui.events import UploadEventArguments
@@ -4778,6 +4778,14 @@ class TradeSettingsTab:
                 value_input = None
                 reference_select = None
                 target_percent_input = None
+                # Option-action parameter widgets (one set per action row).
+                strike_method_select = None
+                strike_param_input = None
+                dte_min_input = None
+                dte_max_input = None
+                sizing_input = None
+                min_oi_input = None
+                max_spread_input = None
 
                 def update_action_inputs():
                     action_value_container.clear()
@@ -4816,7 +4824,61 @@ class TradeSettingsTab:
                                 step=0.1,
                                 format='%.1f'
                             ).classes('w-32').props('dense')
-                
+                    elif selected_type and is_option_action(selected_type):
+                        # Option action - show strike/dte/sizing/liquidity params inline.
+                        # CLOSE_OPTION takes no params (it resolves the contract from the
+                        # held position), so only render widgets for entry actions.
+                        with action_value_container:
+                            nonlocal strike_method_select, strike_param_input, dte_min_input, \
+                                dte_max_input, sizing_input, min_oi_input, max_spread_input
+
+                            is_close = selected_type == ExpertActionType.CLOSE_OPTION.value
+                            if not is_close:
+                                strike_method_select = ui.select(
+                                    options=['delta', 'percent_otm', 'consensus_target'],
+                                    label='Strike Method',
+                                    value=(action_config.get('strike_method', 'delta') if action_config else 'delta')
+                                ).classes('w-40').props('dense')
+                                strike_param_input = ui.input(
+                                    label='Strike Param',
+                                    value=str(action_config.get('strike_param', '')) if action_config else '',
+                                    placeholder='0.30 or {"long":0.45,"short":0.25}'
+                                ).classes('w-44').props('dense')
+                                dte_min_input = ui.number(
+                                    label='DTE min',
+                                    value=action_config.get('dte_min', 20) if action_config else 20,
+                                    min=0,
+                                    format='%d'
+                                ).classes('w-24').props('dense')
+                                dte_max_input = ui.number(
+                                    label='DTE max',
+                                    value=action_config.get('dte_max', 45) if action_config else 45,
+                                    min=0,
+                                    format='%d'
+                                ).classes('w-24').props('dense')
+                                sizing_input = ui.number(
+                                    label='Sizing %',
+                                    value=action_config.get('sizing', 2.0) if action_config else 2.0,
+                                    min=0.0,
+                                    step=0.1,
+                                    format='%.1f'
+                                ).classes('w-24').props('dense')
+                                min_oi_input = ui.number(
+                                    label='Min OI',
+                                    value=action_config.get('min_open_interest', 100) if action_config else 100,
+                                    min=0,
+                                    format='%d'
+                                ).classes('w-24').props('dense')
+                                max_spread_input = ui.number(
+                                    label='Max Spread %',
+                                    value=action_config.get('max_spread_pct', 15.0) if action_config else 15.0,
+                                    min=0.0,
+                                    step=0.5,
+                                    format='%.1f'
+                                ).classes('w-28').props('dense')
+                            else:
+                                ui.label('Closes the held option position (no parameters).').classes('text-sm text-gray-500')
+
                 # Initial setup
                 update_action_inputs()
                 action_select.on('update:model-value', lambda: update_action_inputs())
@@ -4827,7 +4889,14 @@ class TradeSettingsTab:
                     'type_select': action_select,
                     'value_input': lambda: value_input,
                     'reference_select': lambda: reference_select,
-                    'target_percent_input': lambda: target_percent_input
+                    'target_percent_input': lambda: target_percent_input,
+                    'strike_method_select': lambda: strike_method_select,
+                    'strike_param_input': lambda: strike_param_input,
+                    'dte_min_input': lambda: dte_min_input,
+                    'dte_max_input': lambda: dte_max_input,
+                    'sizing_input': lambda: sizing_input,
+                    'min_oi_input': lambda: min_oi_input,
+                    'max_spread_input': lambda: max_spread_input
                 }
     
     def _remove_action_row(self, action_id, action_card):
@@ -4901,7 +4970,41 @@ class TradeSettingsTab:
                     else:
                         ui.notify(f'Target percent is required for action {action_type}', type='negative')
                         return
-                
+
+                elif is_option_action(action_type):
+                    # Option action - persist strike/dte/sizing/liquidity params.
+                    # CLOSE_OPTION carries no params (resolved from the held position).
+                    if action_type != ExpertActionType.CLOSE_OPTION.value:
+                        sm = action_refs['strike_method_select']()
+                        sp = action_refs['strike_param_input']()
+                        dmin = action_refs['dte_min_input']()
+                        dmax = action_refs['dte_max_input']()
+                        sz = action_refs['sizing_input']()
+                        moi = action_refs['min_oi_input']()
+                        msp = action_refs['max_spread_input']()
+
+                        if sm:
+                            action_config['strike_method'] = sm.value
+                        if sp and sp.value:
+                            raw = sp.value.strip()
+                            # Allow a JSON dict for spreads (e.g. {"long":0.45,"short":0.25}),
+                            # otherwise parse a single float; fall back to the raw string.
+                            import json as _json
+                            try:
+                                action_config['strike_param'] = _json.loads(raw) if raw.startswith('{') else float(raw)
+                            except (ValueError, _json.JSONDecodeError):
+                                action_config['strike_param'] = raw
+                        if dmin and dmin.value is not None:
+                            action_config['dte_min'] = int(dmin.value)
+                        if dmax and dmax.value is not None:
+                            action_config['dte_max'] = int(dmax.value)
+                        if sz and sz.value is not None:
+                            action_config['sizing'] = float(sz.value)
+                        if moi and moi.value is not None:
+                            action_config['min_open_interest'] = int(moi.value)
+                        if msp and msp.value is not None:
+                            action_config['max_spread_pct'] = float(msp.value)
+
                 actions_data[action_id] = action_config
             
             if is_edit:
