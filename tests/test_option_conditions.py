@@ -107,3 +107,31 @@ def test_has_protective_put(mock_account, mock_expert_instance, sample_recommend
     cond2 = create_condition(ExpertEventType.F_HAS_PROTECTIVE_PUT, mock_account, "MSFT",
                              sample_recommendation)
     assert cond2.evaluate() is False
+
+
+def test_days_to_earnings(monkeypatch, mock_account, sample_recommendation):
+    from datetime import date, timedelta
+    from ba2_trade_platform.core.TradeConditions import DaysToEarningsCondition
+
+    # Earnings 5 days from today (monkeypatch the data seam — no network).
+    next_earnings = date.today() + timedelta(days=5)
+    monkeypatch.setattr(DaysToEarningsCondition, "_next_earnings_date",
+                        lambda self, symbol: next_earnings, raising=True)
+
+    cond = create_condition(ExpertEventType.N_DAYS_TO_EARNINGS, mock_account, "AAPL",
+                            sample_recommendation, operator_str="<=", value=7.0)
+    assert cond.evaluate() is True            # 5 days <= 7
+    assert cond.get_actual_value_display() == "5d"
+
+    cond2 = create_condition(ExpertEventType.N_DAYS_TO_EARNINGS, mock_account, "AAPL",
+                             sample_recommendation, operator_str=">=", value=10.0)
+    assert cond2.evaluate() is False          # 5 days < 10
+
+    # No earnings date available -> calculated_value None, evaluate False.
+    monkeypatch.setattr(DaysToEarningsCondition, "_next_earnings_date",
+                        lambda self, symbol: None, raising=True)
+    cond3 = create_condition(ExpertEventType.N_DAYS_TO_EARNINGS, mock_account, "AAPL",
+                             sample_recommendation, operator_str="<=", value=7.0)
+    assert cond3.evaluate() is False
+    assert cond3.get_calculated_value() is None
+    assert cond3.get_actual_value_display() is None

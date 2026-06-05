@@ -1721,6 +1721,90 @@ class IVRankCondition(CompareCondition):
         return f"{self.calculated_value:.1f}"
 
 
+class DaysToEarningsCondition(CompareCondition):
+    """Compare the number of calendar days until the underlying's next earnings.
+
+    calculated_value = (next_earnings_date - today).days. Useful for timing volatility
+    plays (e.g. buy a straddle a few days before earnings) or for AVOIDING entries that
+    would straddle an earnings event. The next-earnings date is fetched via the
+    monkeypatchable `_next_earnings_date` seam (best-effort, FMP-backed). When no
+    upcoming earnings date is available the calculated value is None and evaluate
+    returns False (the condition simply does not fire).
+    """
+
+    def _next_earnings_date(self, symbol: str):
+        """Best-effort next (future) earnings date for ``symbol``, or None.
+
+        Thin seam over FMP's per-symbol earnings calendar (which includes upcoming
+        announcements). Isolated so tests can monkeypatch it without any network I/O.
+        Returns a ``datetime.date`` or None.
+        """
+        from datetime import date as _date
+        try:
+            import fmpsdk
+            from ..config import get_app_setting
+
+            api_key = get_app_setting("FMP_API_KEY")
+            if not api_key:
+                logger.warning("FMP_API_KEY not configured; cannot fetch earnings date")
+                return None
+            # historical/earning_calendar/{symbol} returns past AND upcoming earnings rows.
+            rows = fmpsdk.historical_earning_calendar(api_key, symbol, limit=20)
+            if not rows:
+                return None
+            today = _date.today()
+            future = []
+            for row in rows:
+                ds = row.get("date") if isinstance(row, dict) else None
+                if not ds:
+                    continue
+                try:
+                    d = datetime.strptime(ds, "%Y-%m-%d").date()
+                except (ValueError, TypeError):
+                    continue
+                if d >= today:
+                    future.append(d)
+            if not future:
+                return None
+            return min(future)
+        except Exception as e:
+            logger.error(f"Error fetching next earnings date for {symbol}: {e}", exc_info=True)
+            return None
+
+    def evaluate(self) -> bool:
+        try:
+            from datetime import date as _date
+
+            next_earnings = self._next_earnings_date(self.instrument_name)
+            if next_earnings is None:
+                logger.warning(f"No upcoming earnings date for {self.instrument_name}")
+                self.calculated_value = None
+                return False
+
+            days = (next_earnings - _date.today()).days
+            self.calculated_value = days
+
+            logger.info(
+                f"Days to earnings for {self.instrument_name}: {days} "
+                f"(next earnings {next_earnings.isoformat()})")
+
+            return self.operator_func(days, self.value)
+
+        except Exception as e:
+            logger.error(f"Error evaluating days to earnings condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if days until {self.instrument_name}'s next earnings is "
+                f"{self.operator_str} {self.value}")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{int(self.calculated_value)}d"
+
+
 class HasOptionPositionCondition(FlagCondition):
     """Check if this expert has an open option position for the underlying."""
 
@@ -1920,6 +2004,7 @@ def create_condition(event_type: ExpertEventType, account: AccountInterface,
         ExpertEventType.N_PERCENT_BELOW_RECENT_HIGH: PercentBelowRecentHighCondition,
         ExpertEventType.N_PERCENT_ABOVE_RECENT_LOW: PercentAboveRecentLowCondition,
         ExpertEventType.N_IV_RANK: IVRankCondition,
+        ExpertEventType.N_DAYS_TO_EARNINGS: DaysToEarningsCondition,
         ExpertEventType.F_HAS_OPTION_POSITION: HasOptionPositionCondition,
         ExpertEventType.F_HAS_COVERED_CALL: HasCoveredCallCondition,
         ExpertEventType.F_HAS_PROTECTIVE_PUT: HasProtectivePutCondition,

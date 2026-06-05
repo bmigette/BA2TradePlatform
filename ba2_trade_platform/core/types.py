@@ -340,6 +340,7 @@ class ExpertEventType(str, Enum):
     N_PERCENT_BELOW_RECENT_HIGH = "percent_below_recent_high"  # Percent the current price is below the recent high
     N_PERCENT_ABOVE_RECENT_LOW = "percent_above_recent_low"    # Percent the current price is above the recent low
     N_IV_RANK = "iv_rank"                                      # Implied volatility rank (0-100)
+    N_DAYS_TO_EARNINGS = "days_to_earnings"                    # Calendar days until the next earnings announcement
 
 
 class ExpertActionType(str, Enum):
@@ -360,6 +361,8 @@ class ExpertActionType(str, Enum):
     BUY_PROTECTIVE_PUT = "buy_protective_put"
     SELL_CASH_SECURED_PUT = "sell_cash_secured_put"
     OPEN_BEAR_CALL_SPREAD = "open_bear_call_spread"
+    OPEN_STRADDLE = "open_straddle"
+    OPEN_STRANGLE = "open_strangle"
     CLOSE_OPTION = "close_option"
 
 class MarketAnalysisStatus(str, Enum):
@@ -434,7 +437,8 @@ def get_numeric_event_values():
         ExpertEventType.N_PERCENT_OPEN_TO_NEW_TARGET.value,
         ExpertEventType.N_PERCENT_BELOW_RECENT_HIGH.value,
         ExpertEventType.N_PERCENT_ABOVE_RECENT_LOW.value,
-        ExpertEventType.N_IV_RANK.value
+        ExpertEventType.N_IV_RANK.value,
+        ExpertEventType.N_DAYS_TO_EARNINGS.value
     ]
 
 
@@ -465,6 +469,8 @@ def get_option_action_values():
         ExpertActionType.BUY_PROTECTIVE_PUT.value,
         ExpertActionType.SELL_CASH_SECURED_PUT.value,
         ExpertActionType.OPEN_BEAR_CALL_SPREAD.value,
+        ExpertActionType.OPEN_STRADDLE.value,
+        ExpertActionType.OPEN_STRANGLE.value,
         ExpertActionType.CLOSE_OPTION.value,
     ]
 

@@ -302,3 +302,68 @@ def test_cash_secured_put_option_action_executes(monkeypatch):
     assert captured["option_strategy"] == "cash_secured_put"
     assert captured["limit_price"] == 4.9                   # sell at BID
     assert any(r.get("success") for r in results)
+
+
+def test_open_straddle_option_action_executes(monkeypatch):
+    """An open_straddle action in an EventAction is wired and executes (2 legs)."""
+    from datetime import date, timedelta
+    acct_def = create_account_definition()
+    account = MockAccount(acct_def.id)
+    ei = create_expert_instance(account_id=acct_def.id)
+    rec = create_recommendation(instance_id=ei.id, recommended_action=OrderRecommendation.BUY)
+
+    exp = date.today() + timedelta(days=35)
+    call_chain = [OptionContract(symbol="AAPL150C", underlying="AAPL",
+                  option_type=OptionRight.CALL, strike=150.0, expiry=exp, bid=4.9, ask=5.1,
+                  last=5.0, implied_volatility=0.30, delta=0.50, gamma=0.02, theta=-0.03,
+                  vega=0.1, open_interest=2000, volume=250)]
+    put_chain = [OptionContract(symbol="AAPL150P", underlying="AAPL",
+                 option_type=OptionRight.PUT, strike=150.0, expiry=exp, bid=4.4, ask=4.6,
+                 last=4.5, implied_volatility=0.30, delta=-0.50, gamma=0.02, theta=-0.03,
+                 vega=0.1, open_interest=2000, volume=250)]
+
+    def fake_chain(*args, **kwargs):
+        opt = kwargs.get("option_type")
+        if opt is None and len(args) >= 4:
+            opt = args[3]
+        return put_chain if opt == OptionRight.PUT else call_chain
+
+    monkeypatch.setattr(account, "get_option_chain", fake_chain, raising=False)
+
+    captured = {}
+
+    def fake_submit(legs, quantity, order_type="limit", limit_price=None,
+                    option_strategy=None, expert_recommendation_id=None, transaction_id=None):
+        captured.update(called=True, legs=legs, quantity=quantity,
+                        option_strategy=option_strategy, limit_price=limit_price)
+        return TradingOrder(account_id=account.id, symbol="AAPL", quantity=quantity,
+                            side=OrderDirection.BUY, order_type=OrderType.BUY_LIMIT,
+                            status=OrderStatus.FILLED)
+
+    monkeypatch.setattr(account, "submit_option_order", fake_submit, raising=False)
+
+    rs = Ruleset(name="Enter via straddle", type=ExpertEventRuleType.TRADING_RECOMMENDATION_RULE,
+                 subtype=AnalysisUseCase.ENTER_MARKET.value)
+    rs_id = add_instance(rs)
+    ea = EventAction(
+        name="Straddle on bullish",
+        type=ExpertEventRuleType.TRADING_RECOMMENDATION_RULE,
+        triggers={"trigger_0": {"event_type": ExpertEventType.F_BULLISH.value}},
+        actions={"action_0": {"action_type": "open_straddle", "strike_method": "percent_otm",
+                              "strike_param": 0, "dte_min": 20, "dte_max": 45,
+                              "sizing": 10.0, "min_open_interest": 100, "max_spread_pct": 20.0}},
+        continue_processing=False,
+    )
+    ea_id = add_instance(ea)
+    link_rule_to_ruleset(rs_id, ea_id, order_index=0)
+
+    ev = TradeActionEvaluator(account=account)
+    summaries = ev.evaluate("AAPL", rec, rs_id)
+    assert len(summaries) > 0
+    assert len(ev.trade_actions) == 1
+
+    results = ev.execute(submit_to_broker=True)
+    assert captured.get("called") is True
+    assert captured["option_strategy"] == "straddle"
+    assert len(captured["legs"]) == 2
+    assert any(r.get("success") for r in results)

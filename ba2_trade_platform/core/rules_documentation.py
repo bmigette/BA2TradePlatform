@@ -273,6 +273,12 @@ def get_event_type_documentation() -> dict:
             "description": "Implied-volatility percentile (0-100) over the stored trailing ATM-IV window. Low IV rank favors buying premium (long calls/spreads); high IV rank favors selling premium (covered calls). Used with numeric comparisons.",
             "type": "numeric",
             "example": "Buy calls only in cheap volatility: iv_rank <= 30"
+        },
+        ExpertEventType.N_DAYS_TO_EARNINGS.value: {
+            "name": "Days to Earnings",
+            "description": "Calendar days until the underlying's next earnings announcement (best-effort, FMP-backed). Lower values mean earnings are imminent. Use it to TIME long-volatility entries just before earnings (straddle/strangle) or to AVOID opening positions that would straddle the event. If no upcoming earnings date is available the condition does not fire. Used with numeric comparisons.",
+            "type": "numeric",
+            "example": "Enter a straddle into earnings: days_to_earnings <= 5"
         }
     }
 
@@ -455,6 +461,28 @@ def get_action_type_documentation() -> dict:
             ],
             "parameters": "long/short strike params (short = closer/lower-strike sold leg, long = further-OTM/higher-strike bought leg), dte_min, dte_max, max-loss sizing (pct_equity / (width - net credit)), min_open_interest, max_spread_pct",
             "example": "When bearish and iv_rank >= 60, open_bear_call_spread (short ~0.30 delta / long +5 strikes, 30-45 DTE). Net credit limit is negative; max-loss (width - credit) is reserved."
+        },
+        ExpertActionType.OPEN_STRADDLE.value: {
+            "name": "Open Long Straddle",
+            "description": "Buy an at-the-money call AND an at-the-money put at the SAME strike (the strike nearest spot) and SAME expiry. Long-volatility debit structure that profits from a large move in EITHER direction. Net debit = call.ask + put.ask is paid up front; the position loses if the underlying stays near the strike. Commonly used to play an expected volatility expansion (e.g. ahead of earnings).",
+            "use_cases": [
+                "Play an expected big move ahead of a catalyst (earnings, FDA, ruling) when direction is unknown",
+                "Buy volatility when iv_rank is low (cheap) and days_to_earnings is small",
+                "Express a market-neutral, long-gamma view"
+            ],
+            "parameters": "dte_min, dte_max, net-debit sizing (pct_equity / (call.ask + put.ask)), min_open_interest, max_spread_pct. The strike is chosen ATM automatically (same strike for both legs).",
+            "example": "When iv_rank <= 30 and days_to_earnings <= 5, open_straddle (ATM call + put, 20-45 DTE, 10% equity by net debit)."
+        },
+        ExpertActionType.OPEN_STRANGLE.value: {
+            "name": "Open Long Strangle",
+            "description": "Buy an out-of-the-money call (above spot) AND an out-of-the-money put (below spot) at DIFFERENT strikes, both OTM by a configurable percent (default 5%). Cheaper long-volatility variant of the straddle: lower net debit but it needs a larger move to pay off. Net debit = call.ask + put.ask is paid up front.",
+            "use_cases": [
+                "Cheaper long-volatility play when you expect an outsized move",
+                "Buy volatility when iv_rank is low (cheap) into a catalyst",
+                "Express a market-neutral, long-gamma view with a wider break-even than a straddle"
+            ],
+            "parameters": "strike_param = OTM distance percent for BOTH legs (default 5%), dte_min, dte_max, net-debit sizing (pct_equity / (call.ask + put.ask)), min_open_interest, max_spread_pct.",
+            "example": "When iv_rank <= 30 and days_to_earnings <= 5, open_strangle (5% OTM call + put, 20-45 DTE, 10% equity by net debit)."
         },
         ExpertActionType.CLOSE_OPTION.value: {
             "name": "Close Option",

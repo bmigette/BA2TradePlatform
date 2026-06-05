@@ -6,7 +6,8 @@ from ba2_trade_platform.core.types import ExpertEventType, ExpertActionType
 
 NEW_EVENTS = [
     ExpertEventType.N_PERCENT_BELOW_RECENT_HIGH, ExpertEventType.N_PERCENT_ABOVE_RECENT_LOW,
-    ExpertEventType.N_IV_RANK, ExpertEventType.F_HAS_OPTION_POSITION,
+    ExpertEventType.N_IV_RANK, ExpertEventType.N_DAYS_TO_EARNINGS,
+    ExpertEventType.F_HAS_OPTION_POSITION,
     ExpertEventType.F_HAS_COVERED_CALL, ExpertEventType.F_HAS_PROTECTIVE_PUT,
 ]
 NEW_ACTIONS = [
@@ -14,6 +15,7 @@ NEW_ACTIONS = [
     ExpertActionType.SELL_COVERED_CALL, ExpertActionType.BUY_PUT,
     ExpertActionType.OPEN_BEAR_PUT_SPREAD, ExpertActionType.BUY_PROTECTIVE_PUT,
     ExpertActionType.SELL_CASH_SECURED_PUT, ExpertActionType.OPEN_BEAR_CALL_SPREAD,
+    ExpertActionType.OPEN_STRADDLE, ExpertActionType.OPEN_STRANGLE,
     ExpertActionType.CLOSE_OPTION,
 ]
 

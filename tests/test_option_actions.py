@@ -345,6 +345,84 @@ def test_bear_call_spread_credit(monkeypatch, mock_account, mock_expert_instance
     assert (order.data or {}).get("option_reserve") == (10.0 - 2.0) * 100.0 * qty
 
 
+def _capture_chain_by_right(monkeypatch, account, call_chain, put_chain):
+    """Patch get_option_chain to return CALL or PUT chain based on option_type arg.
+
+    _chain() calls get_option_chain(symbol, expiry_min, expiry_max, option_type) so
+    the 4th positional (or 'option_type' kw) selects which canned chain to return.
+    """
+    def fake(*args, **kwargs):
+        opt = kwargs.get("option_type")
+        if opt is None and len(args) >= 4:
+            opt = args[3]
+        if opt == OptionRight.PUT:
+            return put_chain
+        return call_chain
+    monkeypatch.setattr(account, "get_option_chain", fake, raising=False)
+
+
+def test_open_straddle_two_legs(monkeypatch, mock_account, mock_expert_instance, sample_recommendation):
+    # ATM straddle: BUY a call AND a put at the SAME strike nearest spot (150).
+    call_chain = [_call(145, bid=6.9, ask=7.1, oi=2000),
+                  _call(150, bid=4.9, ask=5.1, oi=2000),
+                  _call(155, bid=2.9, ask=3.1, oi=2000)]
+    put_chain = [_put(145, bid=2.9, ask=3.1, oi=2000),
+                 _put(150, bid=4.4, ask=4.6, oi=2000),
+                 _put(155, bid=6.9, ask=7.1, oi=2000)]
+    _capture_chain_by_right(monkeypatch, mock_account, call_chain, put_chain)
+    cap = _capture_submit(monkeypatch, mock_account)
+    action = create_action(action_type=ExpertActionType.OPEN_STRADDLE, instrument_name="AAPL",
+        account=mock_account, order_recommendation=OrderRecommendation.BUY, existing_order=None,
+        expert_recommendation=sample_recommendation, strike_method="percent_otm",
+        strike_param=0, dte_min=20, dte_max=45, sizing=10.0,
+        min_open_interest=100, max_spread_pct=20.0)
+    res = action.execute()
+    assert res["success"] is True
+    assert len(cap["legs"]) == 2
+    call_leg = next(l for l in cap["legs"] if l.option_type == OptionRight.CALL)
+    put_leg = next(l for l in cap["legs"] if l.option_type == OptionRight.PUT)
+    # SAME strike (150) for both legs
+    assert call_leg.strike == 150.0 and put_leg.strike == 150.0
+    # both legs BUY / buy_to_open
+    assert call_leg.side == OrderDirection.BUY and call_leg.position_intent == "buy_to_open"
+    assert put_leg.side == OrderDirection.BUY and put_leg.position_intent == "buy_to_open"
+    assert cap["option_strategy"] == "straddle"
+    # net debit = call.ask + put.ask = 5.1 + 4.6 = 9.7 (positive)
+    assert abs(cap["limit_price"] - 9.7) < 1e-9
+    # budget = 100000 * 10% = 10000; qty = floor(10000/(9.7*100)) = 10
+    assert cap["quantity"] == 10
+
+
+def test_open_strangle_two_legs(monkeypatch, mock_account, mock_expert_instance, sample_recommendation):
+    # OTM strangle: BUY an OTM call (above spot) AND an OTM put (below spot), DIFFERENT strikes.
+    # spot=150, 5% OTM -> call target 157.5 (nearest 155), put target 142.5 (nearest 145).
+    call_chain = [_call(150, bid=4.9, ask=5.1, oi=2000),
+                  _call(155, bid=2.9, ask=3.1, oi=2000)]
+    put_chain = [_put(150, bid=4.4, ask=4.6, oi=2000),
+                 _put(145, bid=2.4, ask=2.6, oi=2000)]
+    _capture_chain_by_right(monkeypatch, mock_account, call_chain, put_chain)
+    cap = _capture_submit(monkeypatch, mock_account)
+    action = create_action(action_type=ExpertActionType.OPEN_STRANGLE, instrument_name="AAPL",
+        account=mock_account, order_recommendation=OrderRecommendation.BUY, existing_order=None,
+        expert_recommendation=sample_recommendation, strike_method="percent_otm",
+        strike_param=5.0, dte_min=20, dte_max=45, sizing=10.0,
+        min_open_interest=100, max_spread_pct=20.0)
+    res = action.execute()
+    assert res["success"] is True
+    assert len(cap["legs"]) == 2
+    call_leg = next(l for l in cap["legs"] if l.option_type == OptionRight.CALL)
+    put_leg = next(l for l in cap["legs"] if l.option_type == OptionRight.PUT)
+    # OTM call ABOVE spot, OTM put BELOW spot -> DIFFERENT strikes
+    assert call_leg.strike == 155.0 and put_leg.strike == 145.0
+    assert call_leg.side == OrderDirection.BUY and call_leg.position_intent == "buy_to_open"
+    assert put_leg.side == OrderDirection.BUY and put_leg.position_intent == "buy_to_open"
+    assert cap["option_strategy"] == "strangle"
+    # net debit = call.ask + put.ask = 3.1 + 2.6 = 5.7
+    assert abs(cap["limit_price"] - 5.7) < 1e-9
+    # budget = 100000 * 10% = 10000; qty = floor(10000/(5.7*100)) = 17
+    assert cap["quantity"] == 17
+
+
 def test_close_option_calls_close(monkeypatch, mock_account, mock_expert_instance, sample_recommendation):
     # Seed an OPEN long call option order on a transaction; CloseOption should close it.
     txn_id = add_instance(Transaction(symbol="AAPL", quantity=2, side=OrderDirection.BUY,
