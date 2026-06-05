@@ -409,3 +409,59 @@ def test_submit_option_order_impl_multileg_writeback(mock_account_def):
     db_sell = get_instance(TradingOrder, cs_id)
     assert db_buy.broker_order_id == "leg-buy"
     assert db_sell.broker_order_id == "leg-sell"
+
+
+# ---------------------------------------------------------------------------
+# Task 10: close_option_position
+# ---------------------------------------------------------------------------
+from ba2_trade_platform.core.option_types import OptionPosition
+from ba2_trade_platform.core.types import OrderDirection as _OrderDirection
+
+
+def test_close_long_option_builds_sell_to_close(monkeypatch):
+    acct = _make_alpaca()
+    captured = {}
+    def fake_submit(legs, quantity, order_type="limit", limit_price=None,
+                    option_strategy=None, expert_recommendation_id=None, transaction_id=None):
+        captured.update(legs=legs, quantity=quantity, order_type=order_type,
+                        limit_price=limit_price, option_strategy=option_strategy)
+        return "SUBMITTED"
+    monkeypatch.setattr(acct, "submit_option_order", fake_submit, raising=False)
+
+    pos = OptionPosition(contract_symbol="AAPL260116C00150000", underlying="AAPL",
+                         option_type=OptionRight.CALL, strike=150.0, expiry=date(2026, 1, 16),
+                         side=_OrderDirection.BUY, quantity=2, avg_entry_price=5.2)
+    result = acct.close_option_position(pos, order_type="limit", limit_price=6.0)
+    assert result == "SUBMITTED"
+    assert len(captured["legs"]) == 1
+    leg = captured["legs"][0]
+    assert leg.contract_symbol == "AAPL260116C00150000"
+    assert leg.side == _OrderDirection.SELL                  # opposite of long
+    assert leg.position_intent == "sell_to_close"
+    assert leg.option_type == OptionRight.CALL
+    assert leg.strike == 150.0
+    assert leg.expiry == date(2026, 1, 16)
+    assert leg.underlying == "AAPL"
+    assert captured["quantity"] == 2
+    assert captured["order_type"] == "limit"
+    assert captured["limit_price"] == 6.0
+    assert captured["option_strategy"] == "close"
+
+
+def test_close_short_option_builds_buy_to_close(monkeypatch):
+    acct = _make_alpaca()
+    captured = {}
+    def fake_submit(legs, quantity, order_type="limit", limit_price=None,
+                    option_strategy=None, expert_recommendation_id=None, transaction_id=None):
+        captured.update(legs=legs, quantity=quantity)
+        return "SUBMITTED"
+    monkeypatch.setattr(acct, "submit_option_order", fake_submit, raising=False)
+
+    pos = OptionPosition(contract_symbol="AAPL260116C00160000", underlying="AAPL",
+                         option_type=OptionRight.CALL, strike=160.0, expiry=date(2026, 1, 16),
+                         side=_OrderDirection.SELL, quantity=1, avg_entry_price=2.0)
+    acct.close_option_position(pos)
+    leg = captured["legs"][0]
+    assert leg.side == _OrderDirection.BUY                   # opposite of short
+    assert leg.position_intent == "buy_to_close"
+    assert captured["quantity"] == 1

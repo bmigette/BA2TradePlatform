@@ -4869,8 +4869,17 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         return trading_order
 
     def close_option_position(self, position, order_type="limit", limit_price=None):
-        # TODO(Task 10): implement closing of held option positions.
-        raise NotImplementedError("Implemented in Task 10")
+        from ba2_trade_platform.core.option_types import OptionLeg
+        from ba2_trade_platform.core.types import OrderDirection
+        close_side = OrderDirection.SELL if position.side == OrderDirection.BUY else OrderDirection.BUY
+        intent = "sell_to_close" if position.side == OrderDirection.BUY else "buy_to_close"
+        leg = OptionLeg(
+            contract_symbol=position.contract_symbol, side=close_side, position_intent=intent,
+            option_type=position.option_type, strike=position.strike, expiry=position.expiry,
+            underlying=position.underlying,
+        )
+        return self.submit_option_order(
+            [leg], int(position.quantity), order_type, limit_price, option_strategy="close")
 
     def get_iv_rank(self, underlying, lookback_days=252, min_samples=20):
         # TODO(Task 11): implement IV rank from stored ATM-IV history.
