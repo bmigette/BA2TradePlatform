@@ -320,11 +320,17 @@ class Transaction(SQLModel, table=True):
     def get_pending_open_equity(self, account_interface=None) -> float:
         """
         Calculate the equity value of pending unfilled orders.
-        Uses market price for pending orders.
-        
+
+        Equity orders are valued at the underlying market price (so
+        account_interface is needed for them); option orders are valued from
+        their own premium (limit_price/open_price) x multiplier and do NOT
+        require the underlying price, so account_interface may be None for
+        option-only transactions.
+
         Args:
-            account_interface: Account interface for getting current market price (required)
-        
+            account_interface: Account interface for the underlying market price
+                (optional; only used to value equity orders).
+
         Returns:
             float: Total equity value of pending orders
         """
