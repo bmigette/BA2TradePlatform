@@ -1,6 +1,6 @@
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, LimitOrderRequest, StopOrderRequest, StopLimitOrderRequest, ReplaceOrderRequest, TakeProfitRequest, StopLossRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderClass
+from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, LimitOrderRequest, StopOrderRequest, StopLimitOrderRequest, ReplaceOrderRequest, TakeProfitRequest, StopLossRequest, OptionLegRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderClass, PositionIntent
 from alpaca.common.exceptions import APIError
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone, timedelta
@@ -4734,9 +4734,139 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
         return positions
 
+    def _build_option_order_request(self, trading_order, legs):
+        """Build an Alpaca option order request (PURE - no network, no DB).
+
+        single leg -> Market/LimitOrderRequest with symbol=<OCC>, side, qty.
+        2-4 legs   -> Market/LimitOrderRequest with order_class=MLEG, legs=[...],
+                      qty=<overall>, and NO top-level symbol.
+
+        Options must use TimeInForce.DAY. For MLEG limit orders, a positive
+        limit_price is a net debit and a negative one is a net credit.
+        """
+        def _to_side(direction):
+            return OrderSide.BUY if direction == OrderDirection.BUY else OrderSide.SELL
+
+        def _to_intent(intent):
+            if not intent:
+                return None
+            return PositionIntent(str(intent).lower())
+
+        is_market = trading_order.order_type == CoreOrderType.MARKET
+        tif = TimeInForce.DAY
+        coid = str(trading_order.id)
+
+        if len(legs) == 1:
+            leg = legs[0]
+            req_kwargs = dict(
+                symbol=leg.contract_symbol,
+                qty=trading_order.quantity,
+                side=_to_side(leg.side),
+                time_in_force=tif,
+                client_order_id=coid,
+            )
+            intent = _to_intent(leg.position_intent)
+            if intent is not None:
+                req_kwargs["position_intent"] = intent
+            if is_market:
+                return MarketOrderRequest(**req_kwargs)
+            return LimitOrderRequest(limit_price=trading_order.limit_price, **req_kwargs)
+
+        # Multi-leg (2-4 legs) -> MLEG
+        leg_requests = [
+            OptionLegRequest(
+                symbol=lg.contract_symbol,
+                ratio_qty=lg.ratio_qty,
+                side=_to_side(lg.side),
+                position_intent=_to_intent(lg.position_intent),
+            )
+            for lg in legs
+        ]
+        req_kwargs = dict(
+            qty=trading_order.quantity,
+            order_class=OrderClass.MLEG,
+            legs=leg_requests,
+            time_in_force=tif,
+            client_order_id=coid,
+        )
+        if is_market:
+            return MarketOrderRequest(**req_kwargs)
+        return LimitOrderRequest(limit_price=trading_order.limit_price, **req_kwargs)
+
+    @alpaca_api_retry
     def _submit_option_order_impl(self, trading_order, legs, leg_orders=None):
-        # TODO(Task 9): implement single + multi-leg option order submission.
-        raise NotImplementedError("Implemented in Task 9")
+        """Submit an option order to Alpaca and write the broker response back
+        onto the already-persisted parent (and, for multi-leg, the leg children).
+
+        The OptionsAccountInterface.submit_option_order wrapper has already
+        persisted the parent TradingOrder (and leg children for multi-leg) and
+        created a Transaction, and wraps this call in a try/except that marks
+        the parent ERROR on exception. So here we build the request, submit it,
+        write the broker ids/status back, persist, and return the parent.
+        Genuine errors are allowed to propagate.
+        """
+        req = self._build_option_order_request(trading_order, legs)
+        alpaca_order = self.client.submit_order(req)
+        logger.info(
+            f"Successfully submitted option order to Alpaca: "
+            f"broker_order_id={alpaca_order.id}, legs={len(legs)}"
+        )
+
+        # Invalidate balance cache - a submitted order changes buying power.
+        self.invalidate_balance_cache()
+
+        # Reuse the equity path's status mapping so we don't hand-roll a partial map.
+        result_order = self.alpaca_order_to_tradingorder(alpaca_order)
+
+        trading_order.broker_order_id = str(alpaca_order.id) if alpaca_order.id else None
+        if result_order.status:
+            trading_order.status = result_order.status
+        if result_order.filled_qty is not None:
+            trading_order.filled_qty = result_order.filled_qty
+
+        broker_legs = getattr(alpaca_order, "legs", None)
+        if broker_legs:
+            trading_order.legs_broker_ids = [str(l.id) for l in broker_legs]
+
+        update_instance(trading_order)
+        logger.info(
+            f"Updated option order {trading_order.id} in database: "
+            f"broker_order_id={trading_order.broker_order_id}, status={trading_order.status}"
+        )
+
+        # Multi-leg: match each persisted child to its broker leg and write back.
+        if leg_orders and broker_legs:
+            remaining = list(broker_legs)
+            for idx, child in enumerate(leg_orders):
+                matched = None
+                # Prefer matching by contract symbol.
+                for bl in remaining:
+                    if getattr(bl, "symbol", None) == child.contract_symbol:
+                        matched = bl
+                        break
+                # Fall back to positional matching.
+                if matched is None and idx < len(remaining):
+                    matched = remaining[idx]
+                if matched is None:
+                    logger.warning(
+                        f"Could not match child option leg {child.id} "
+                        f"({child.contract_symbol}) to a broker leg"
+                    )
+                    continue
+                remaining.remove(matched)
+                child.broker_order_id = str(matched.id) if matched.id else None
+                child_result = self.alpaca_order_to_tradingorder(matched)
+                if child_result.status:
+                    child.status = child_result.status
+                if child_result.filled_qty is not None:
+                    child.filled_qty = child_result.filled_qty
+                update_instance(child)
+                logger.debug(
+                    f"Updated option leg child {child.id}: "
+                    f"broker_order_id={child.broker_order_id}, status={child.status}"
+                )
+
+        return trading_order
 
     def close_option_position(self, position, order_type="limit", limit_price=None):
         # TODO(Task 10): implement closing of held option positions.

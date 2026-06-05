@@ -245,3 +245,167 @@ def test_get_option_positions_short_with_positive_qty():
     assert len(positions) == 1
     assert positions[0].side == OrderDirection.SELL
     assert positions[0].quantity == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 9: option order submission (request building + writeback)
+# ---------------------------------------------------------------------------
+
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
+from ba2_trade_platform.core.option_types import OptionLeg
+from ba2_trade_platform.core.models import TradingOrder
+from ba2_trade_platform.core.types import (
+    OrderDirection, OrderType, AssetClass, OrderStatus,
+)
+from ba2_trade_platform.core.db import add_instance, get_instance
+
+
+def _opt_order(**kw):
+    base = dict(account_id=1, symbol="AAPL", quantity=2, side=OrderDirection.BUY,
+                order_type=OrderType.BUY_LIMIT, status=OrderStatus.PENDING, limit_price=5.2,
+                asset_class=AssetClass.OPTION, multiplier=100, id=12345)
+    base.update(kw)
+    return TradingOrder(**base)
+
+
+def test_build_single_leg_limit_request():
+    acct = _make_alpaca()
+    order = _opt_order()
+    leg = OptionLeg(contract_symbol="AAPL260116C00150000", side=OrderDirection.BUY,
+                    position_intent="buy_to_open")
+    req = acct._build_option_order_request(order, [leg])
+    assert isinstance(req, LimitOrderRequest)
+    assert req.symbol == "AAPL260116C00150000"
+    assert req.side == OrderSide.BUY
+    assert float(req.qty) == 2
+    assert float(req.limit_price) == 5.2
+    assert req.time_in_force == TimeInForce.DAY
+    assert getattr(req, "order_class", None) in (None,)  # not an MLEG
+    assert not getattr(req, "legs", None)
+
+
+def test_build_single_leg_market_request():
+    acct = _make_alpaca()
+    order = _opt_order(order_type=OrderType.MARKET, limit_price=None)
+    leg = OptionLeg(contract_symbol="AAPL260116C00150000", side=OrderDirection.BUY,
+                    position_intent="buy_to_open")
+    req = acct._build_option_order_request(order, [leg])
+    assert isinstance(req, MarketOrderRequest)
+    assert req.symbol == "AAPL260116C00150000"
+    assert req.time_in_force == TimeInForce.DAY
+
+
+def test_build_multi_leg_mleg_request():
+    acct = _make_alpaca()
+    order = _opt_order(quantity=1, limit_price=4.0, side=OrderDirection.BUY,
+                       order_type=OrderType.BUY_LIMIT, symbol="AAPL", contract_symbol=None)
+    legs = [
+        OptionLeg(contract_symbol="AAPL260116C00150000", side=OrderDirection.BUY,
+                  position_intent="buy_to_open"),
+        OptionLeg(contract_symbol="AAPL260116C00160000", side=OrderDirection.SELL,
+                  position_intent="sell_to_open"),
+    ]
+    req = acct._build_option_order_request(order, legs)
+    assert req.order_class == OrderClass.MLEG
+    assert float(req.qty) == 1
+    assert float(req.limit_price) == 4.0       # positive => debit
+    assert getattr(req, "symbol", None) in (None,)   # no top-level symbol on MLEG
+    assert len(req.legs) == 2
+    syms = {l.symbol for l in req.legs}
+    assert syms == {"AAPL260116C00150000", "AAPL260116C00160000"}
+
+
+def test_submit_option_order_impl_writeback(mock_account_def):
+    from types import SimpleNamespace
+    import threading
+    acct = _make_alpaca()
+    acct.id = mock_account_def.id
+    acct._balance_cache_lock = threading.RLock()
+    acct._balance_cache_time = 0.0
+    # persist a parent option order
+    parent = _opt_order(account_id=mock_account_def.id, id=None)
+    parent.contract_symbol = "AAPL260116C00150000"
+    pid = add_instance(parent, expunge_after_flush=True)
+    parent = get_instance(TradingOrder, pid)
+    leg = OptionLeg(contract_symbol="AAPL260116C00150000", side=OrderDirection.BUY,
+                    position_intent="buy_to_open")
+
+    captured = {}
+    # Realistic alpaca order shape: the equity-path mapper reads side/type/status.
+    fake_order = SimpleNamespace(id="broker-xyz", side="buy", type="limit",
+                                 status="filled", qty="2", filled_qty="2", legs=None)
+
+    class FakeClient:
+        def submit_order(self, req):
+            captured["req"] = req
+            return fake_order
+    acct.client = FakeClient()
+
+    result = acct._submit_option_order_impl(parent, [leg], None)
+    assert result.broker_order_id == "broker-xyz"
+    # re-fetch from DB to confirm persistence
+    db_parent = get_instance(TradingOrder, pid)
+    assert db_parent.broker_order_id == "broker-xyz"
+    assert db_parent.status == OrderStatus.FILLED
+
+
+def test_submit_option_order_impl_multileg_writeback(mock_account_def):
+    from types import SimpleNamespace
+    import threading
+    acct = _make_alpaca()
+    acct.id = mock_account_def.id
+    acct._balance_cache_lock = threading.RLock()
+    acct._balance_cache_time = 0.0
+
+    parent = _opt_order(account_id=mock_account_def.id, id=None, quantity=1,
+                        symbol="AAPL", contract_symbol=None, limit_price=4.0)
+    pid = add_instance(parent, expunge_after_flush=True)
+    parent = get_instance(TradingOrder, pid)
+
+    child_buy = TradingOrder(account_id=mock_account_def.id, symbol="AAPL260116C00150000",
+                             quantity=1, side=OrderDirection.BUY, order_type=OrderType.BUY_LIMIT,
+                             status=OrderStatus.PENDING, asset_class=AssetClass.OPTION,
+                             multiplier=100, contract_symbol="AAPL260116C00150000",
+                             position_intent="buy_to_open", parent_order_id=pid)
+    child_sell = TradingOrder(account_id=mock_account_def.id, symbol="AAPL260116C00160000",
+                              quantity=1, side=OrderDirection.SELL, order_type=OrderType.SELL_LIMIT,
+                              status=OrderStatus.PENDING, asset_class=AssetClass.OPTION,
+                              multiplier=100, contract_symbol="AAPL260116C00160000",
+                              position_intent="sell_to_open", parent_order_id=pid)
+    cb_id = add_instance(child_buy, expunge_after_flush=True)
+    cs_id = add_instance(child_sell, expunge_after_flush=True)
+    child_buy = get_instance(TradingOrder, cb_id)
+    child_sell = get_instance(TradingOrder, cs_id)
+
+    legs = [
+        OptionLeg(contract_symbol="AAPL260116C00150000", side=OrderDirection.BUY,
+                  position_intent="buy_to_open"),
+        OptionLeg(contract_symbol="AAPL260116C00160000", side=OrderDirection.SELL,
+                  position_intent="sell_to_open"),
+    ]
+    fake_legs = [SimpleNamespace(id="leg-buy", symbol="AAPL260116C00150000",
+                                 side="buy", type="limit", status="accepted",
+                                 qty="1", filled_qty="0"),
+                 SimpleNamespace(id="leg-sell", symbol="AAPL260116C00160000",
+                                 side="sell", type="limit", status="accepted",
+                                 qty="1", filled_qty="0")]
+    fake_order = SimpleNamespace(id="parent-broker", side="buy", type="limit",
+                                 status="accepted", qty="1", filled_qty="0",
+                                 legs=fake_legs)
+
+    class FakeClient:
+        def submit_order(self, req):
+            return fake_order
+    acct.client = FakeClient()
+
+    result = acct._submit_option_order_impl(parent, legs, [child_buy, child_sell])
+    assert result.broker_order_id == "parent-broker"
+    db_parent = get_instance(TradingOrder, pid)
+    assert db_parent.broker_order_id == "parent-broker"
+    assert db_parent.legs_broker_ids == ["leg-buy", "leg-sell"]
+    # children matched by contract_symbol
+    db_buy = get_instance(TradingOrder, cb_id)
+    db_sell = get_instance(TradingOrder, cs_id)
+    assert db_buy.broker_order_id == "leg-buy"
+    assert db_sell.broker_order_id == "leg-sell"
